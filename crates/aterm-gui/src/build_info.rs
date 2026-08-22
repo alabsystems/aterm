@@ -88,8 +88,10 @@ pub const TRUST_VERIFY: &str = env!("ATERM_TRUST_VERIFY");
 /// derives it from the same `ATERM_UPDATE_PUBKEY` input consumed by
 /// `aterm-update`; the release cutter independently cross-checks this record
 /// against both runtime diagnostics and the permanent channel authority.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub const EMBEDDED_UPDATE_PIN_SHA256: &str = env!("ATERM_UPDATE_PIN_SHA256");
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
     let bytes = value.as_bytes();
     assert!(bytes.len() == 64);
@@ -110,6 +112,7 @@ const fn update_pin_record_bytes(value: &str) -> [u8; 64] {
 #[cfg(target_vendor = "apple")]
 #[used]
 #[unsafe(link_section = "__DATA,__aterm_upin")]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 static ATERM_UPDATE_PIN_RECORD: [u8; 64] = update_pin_record_bytes(EMBEDDED_UPDATE_PIN_SHA256);
 
 /// Short (8-hex) slug of the producing compiler's commit — the version-suffix slug.

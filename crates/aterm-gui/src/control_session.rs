@@ -1334,12 +1334,16 @@ fn meta_status(
 ) -> String {
     let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let (title, cwd) = {
+        use crate::cwd_native::ReportedCwd as _;
         let t = term_lock(term);
         (
             t.title().to_string(),
-            t.current_working_directory()
+            // Same native conversion the `cwd` verb uses — `meta` reported the
+            // engine's `/C:/Users//m6-an` URI path before, so the two verbs must
+            // keep sharing one boundary or they will disagree.
+            t.native_working_directory()
                 .filter(|c| !c.is_empty())
-                .map(str::to_string),
+                .map(|c| c.into_owned()),
         )
     };
     let state = {

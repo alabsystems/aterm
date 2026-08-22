@@ -223,7 +223,7 @@ pub fn install_tombstone_shim(layout: &Layout, tool: &ToolName) -> io::Result<()
     // Windows: a `cmd`-escaped `echo`). Built with `push_str` (no `format!`, Trust gate).
     let mut message = String::from("atpkg: ");
     message.push_str(tool.as_str());
-    message.push_str(" was yanked/revoked — run `atpkg update`");
+    message.push_str(" was yanked/revoked — run `aterm pkg update`");
     // Atomic install through the platform backend (Unix: an executable `sh` script
     // temp+rename; Windows: a `.cmd` batch wrapper), replacing whatever shim was there.
     platform::install_tombstone_shim(&shim, &message)

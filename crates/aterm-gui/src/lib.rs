@@ -129,6 +129,7 @@ mod control_auth;
 #[cfg(test)]
 mod control_connection_conformance;
 mod crash_signal;
+mod cwd_native;
 #[cfg(windows)]
 mod explorer_win;
 /// The seamless handoff's out-of-band transport: the single-use `SCM_RIGHTS`
@@ -140,6 +141,10 @@ mod handoff_rendezvous;
 mod hdr_win;
 #[cfg(test)]
 mod instance_retention_conformance;
+/// Windows taskbar jump list (right-click menu on the taskbar button): the
+/// tasks-only cut, registered best-effort after first present.
+#[cfg(windows)]
+mod jumplist_win;
 mod palette;
 mod pinned_dir;
 /// The native Windows application-runtime (DWM chrome): `AppRt` peer of `AppRtMacOS`.
@@ -252,26 +257,19 @@ mod scroll_motion;
 // which has no Windows analog (Windows uses HANDLE inheritance, and the outgoing side in
 // `app_input` is `#[cfg(unix)]`). On non-unix the incoming adoption is a no-op, so an update
 // re-spawns a fresh shell rather than re-adopting the running one.
-#[cfg(unix)]
+// ONE module on every platform. `seamless.rs` already carries its own
+// `#[cfg(not(unix))]` arms for each unix-only piece — `PrearmedIncomingFds`,
+// `ReadySignal`/`CommitReceiver` (`Infallible`), `take_ready_fd`, `take_commit_fd` —
+// so the non-unix build gets the inert lane from the SAME file the unix build reads.
+//
+// It used to be shadowed here by a hand-written inline stub, which is precisely how
+// this drifted: every surface upstream added to the real module (`nonce`, `layout`,
+// `layout_digest`, `screen_digest`, `prearm_incoming_fds`, `take_target_identity`, …)
+// had to be mirrored into the stub by hand, and none of it was — so Windows stopped
+// compiling while the module's own non-unix arms sat there unused. A shared consumer
+// must not read from two different definitions.
 mod seamless;
-#[cfg(not(unix))]
-mod seamless {
-    use crate::session_store::WindowCarry;
-    use crate::spawn::Adopted;
-    /// The consumed incoming handoff — mirrors the `#[cfg(unix)]` `seamless::IncomingHandoff`
-    /// shape so the cross-platform consumer in `main` compiles unchanged. No seamless-update
-    /// lane on this platform yet, so it is ALWAYS empty (`adopted` empty, `window` None) and
-    /// the update re-spawns a fresh shell.
-    #[derive(Default)]
-    pub(crate) struct IncomingHandoff {
-        pub adopted: Vec<Adopted>,
-        pub window: Option<WindowCarry>,
-    }
-    /// No seamless-update lane on this platform yet: always fall back to a fresh spawn.
-    pub(crate) fn take_incoming() -> IncomingHandoff {
-        IncomingHandoff::default()
-    }
-}
+mod secure_input;
 #[cfg(target_os = "macos")]
 mod memory_pressure;
 /// Per-session tooltip/context-menu composer (session-metadata stage 2).
@@ -313,14 +311,43 @@ use input::{InputEvent, InputOutcome, Source};
 use platform::AppRt;
 use spawn::{SessionFactory, spawn_session};
 
-// Default glyph rasterization size in PHYSICAL px. On a 2× Retina display the
-// HiDPI auto-scale (`resumed`) renders this at `round(12·2)=24` px = 12 logical
-// points — matching iTerm2's default 12 pt (macOS Terminal's 11 pt is close),
-// paired with the SF Mono default face (the library candidate lead; see
-// `default_font_family`) for the native Mac look. The old 13 px base rendered a touch large and, with
-// the heavier then-default Menlo, read bolder than iTerm. Override with
-// `$ATERM_FONT_PX`, config `font_px`, or live Cmd +/-/0.
+// Default glyph rasterization size in PHYSICAL px — DELIBERATELY platform-split.
+// Do NOT collapse these two arms back into one shared constant: the number is a
+// 1× seed denominated in the host OS's LOGICAL unit, and those units are not the
+// same size, so no single value can be right on both.
+//
+// The auto-scale law is `round(FONT_PX · scale)` (`font_px_for_scale`, applied at
+// `attach_os_window` / `on_scale_factor_changed`), so FONT_PX is always the size
+// at 1× and the physical size tracks the display. What differs is what one logical
+// px is WORTH in type:
+//
+//   * macOS — 1 logical px == 1 point. 12 is 12 pt, and on a 2× Retina panel
+//     `round(12·2)=24` physical px is still 12 pt: iTerm2's default (macOS
+//     Terminal's 11 pt is close), paired with the SF Mono default face (the
+//     library candidate lead; see `default_font_family`) for the native Mac look.
+//     The old 13 px base rendered a touch large and, with the heavier then-default
+//     Menlo, read bolder than iTerm. macOS ALSO depends on 12 being the seed that
+//     lands the 24 px Retina target, so this arm is load-bearing beyond taste.
+//
+//   * Windows — 1 logical px == 1/96 in, so a point is 96/72 = 4/3 logical px and
+//     the same 12 would be **9 pt at EVERY DPI**. The HiDPI gate is not the bug:
+//     at 150% it opens and yields `round(12·1.5)=18` physical px, which is still
+//     12 logical px, which is still 9 pt. 9 pt is far under every native
+//     reference — Windows Terminal ships Cascadia Mono at 12 pt (= 16 logical px),
+//     conhost's Consolas is 16 px, VS Code's terminal is 14. 16 restores 12 pt,
+//     and `round(16·1.5)=24` at 144 dpi is 12 pt again.
+//
+// Linux/BSD share Windows' 1/96-in logical px and so inherit the same 9 pt, but
+// they are left at 12 here rather than swept along: the toolkit-scale story there
+// (Xft.dpi, GDK_SCALE, fractional Wayland scales) is its own judgement call and
+// was not part of the Windows pass that split this. Treat the `not(windows)` arm
+// as "macOS-tuned, Linux untouched", not as a blessed cross-platform value.
+//
+// Override with `$ATERM_FONT_PX`, config `font_px`, or live Cmd/Ctrl +/-/0.
+#[cfg(not(windows))]
 const FONT_PX: f32 = 12.0;
+#[cfg(windows)]
+const FONT_PX: f32 = 16.0;
 
 /// Whether `--verbose` / `$ATERM_VERBOSE` is set. Gates the routine startup
 /// plumbing notices (containment mode, OS-sandbox status) so a normal
@@ -518,7 +545,10 @@ fn headroom_override() -> usize {
 /// advance ≈ 0.6 em, line ≈ 1.2 em
 /// (Monaco/Menlo at the 12 px default → 7×14). The post-join
 /// `request_inner_size` correction in `attach_os_window` replaces it before the
-/// window is ever shown, so precision only bounds the one hidden resize.
+/// window is ever shown, so precision only bounds the one hidden resize. On a
+/// WARM Windows launch the L1 early-reveal path replaces it even earlier —
+/// pre-join, from the persisted REAL metrics (`restore::load_cell_metrics`) —
+/// which is why this estimate may stay a heuristic: it is never on glass.
 fn seed_cell_px(px: f32) -> (usize, usize) {
     (
         (px * 0.6).round().max(1.0) as usize,
@@ -683,6 +713,23 @@ fn effect_tick_interval(panel: Option<Duration>) -> Duration {
         None => AURORA_TICK_INTERVAL,
     }
 }
+
+/// How many frame intervals ONE animating decoration frame keeps the chrome-
+/// decoration lane armed (see `WindowState::deco_anim_until`).
+///
+/// It has to exceed the round trip it is covering, which is one full lane
+/// period: the redraw refreshes the latch at `frame_started`, `about_to_wait`
+/// arms `fired + interval`, that slot fires, and only THEN does the next redraw
+/// refresh the latch again. So the latch must outlive `render + interval +
+/// render` — 4 intervals leaves a whole interval of slack for two frames' render
+/// cost, i.e. it holds as long as a frame renders in under ~3x the panel period.
+/// A loop slower than that is not idle, so a stimulus is arriving anyway.
+///
+/// Bigger is not free in the other direction: this is exactly the tail a stopped
+/// decoration pays before the lane parks (4 early-out redraws, ~67 ms at 60 Hz,
+/// no presents — the RepaintKey is unchanged by definition once it stopped
+/// moving). 4 is the smallest value that covers the round trip with slack.
+const DECO_ANIM_LEVEL_FRAMES: u32 = 4;
 
 /// Throttle for re-querying the panel's live EDR headroom
 /// (`maximumExtendedDynamicRangeColorComponentValue`) during the aurora present.
@@ -1231,11 +1278,16 @@ mod win32 {
     unsafe extern "system" {
         fn MessageBeep(utype: u32) -> i32;
         fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, utype: u32) -> i32;
+        fn GetActiveWindow() -> isize;
     }
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn AttachConsole(pid: u32) -> i32;
         fn GetStdHandle(kind: u32) -> isize;
+        fn SetStdHandle(kind: u32, handle: isize) -> i32;
+        fn RegisterApplicationRestart(pwz_commandline: *const u16, dw_flags: u32) -> i32;
+        fn LoadLibraryW(name: *const u16) -> isize;
+        fn GetProcAddress(module: isize, name: *const u8) -> isize;
     }
     // shell32 is on the approved tiny-FFI allowlist (see `app_mouse`'s ShellExecuteW).
     #[link(name = "shell32")]
@@ -1278,7 +1330,9 @@ mod win32 {
 
     /// `ATTACH_PARENT_PROCESS` — attach to the console of whoever launched us.
     const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
-    /// `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE` ((u32)-11 / (u32)-12).
+    /// `STD_INPUT_HANDLE` / `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE`
+    /// ((u32)-10 / (u32)-11 / (u32)-12).
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
     const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
     const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
 
@@ -1293,21 +1347,51 @@ mod win32 {
 
     /// A `windows_subsystem = "windows"` binary starts with NO std handles, so a
     /// console launch (`aterm-gui --help`, dev `cargo run`) would print nothing.
-    /// Reattach to the parent's console — but ONLY when stdout/stderr are both
-    /// absent: a redirected launch (`aterm-gui > out.txt`) inherited real handles
-    /// that must not be clobbered. Must run before the first print in `main`
-    /// (Rust's stdio resolves its handle per write, so prints after this land on
-    /// the attached console).
+    /// Reattach to the parent's console whenever EITHER of stdout/stderr is
+    /// absent, then hand back every handle the parent DID supply.
+    ///
+    /// The previous shape — attach only when stdout AND stderr were both absent
+    /// — silently dropped the un-redirected stream of a half-redirected launch:
+    /// `aterm --version > out.txt` left stderr NULL (Rust maps a NULL handle to
+    /// `Ok(len)`, so every diagnostic vanished without an error), and
+    /// `aterm-ctl … 2> err.txt` lost stdout the same way. Measured from cmd.exe
+    /// with a GUI-subsystem probe: `> o.txt` arrives as OUT=456 ERR=0, `2> e.txt`
+    /// as OUT=0 ERR=524 — one real handle, one hole.
+    ///
+    /// The obvious `&&`→`||` flip alone is WRONG and was rejected: AttachConsole
+    /// rewrites ALL THREE std handles, the redirected ones included (measured:
+    /// OUT 552→692 even under an explicit `> out.txt`), which would send the
+    /// redirected stream to the console instead of the file — regressing the
+    /// `aterm --version > out.txt` capture that `build.ps1` (its version-stamp
+    /// step) depends on. So: snapshot the parent-supplied handles FIRST, attach,
+    /// then `SetStdHandle` back whatever the parent had supplied; only the holes
+    /// keep the console handles AttachConsole installed. Must run before the
+    /// first print in `main` (Rust's stdio resolves its handle per write, so
+    /// prints after this land on the right stream).
     pub(super) fn attach_parent_console() {
-        // SAFETY: plain handle queries and a flag-only AttachConsole call; no
-        // pointers cross the boundary. Failure (no parent console: an Explorer
-        // launch) is the normal windowed case and is ignored.
+        // SAFETY: plain handle queries, a flag-only AttachConsole call, and
+        // SetStdHandle writes of handles this process already owned; no pointers
+        // cross the boundary. Failure (no parent console: an Explorer launch) is
+        // the normal windowed case and is ignored — the restore loop is then a
+        // no-op because nothing was rewritten.
         unsafe {
-            let out = GetStdHandle(STD_OUTPUT_HANDLE);
-            let err = GetStdHandle(STD_ERROR_HANDLE);
             let absent = |h: isize| h == 0 || h == -1;
-            if absent(out) && absent(err) {
-                AttachConsole(ATTACH_PARENT_PROCESS);
+            // Snapshot BEFORE attaching — AttachConsole clobbers all three.
+            let parent = [
+                (STD_INPUT_HANDLE, GetStdHandle(STD_INPUT_HANDLE)),
+                (STD_OUTPUT_HANDLE, GetStdHandle(STD_OUTPUT_HANDLE)),
+                (STD_ERROR_HANDLE, GetStdHandle(STD_ERROR_HANDLE)),
+            ];
+            let (out, err) = (parent[1].1, parent[2].1);
+            if (absent(out) || absent(err)) && AttachConsole(ATTACH_PARENT_PROCESS) != 0 {
+                for (kind, handle) in parent {
+                    if !absent(handle) {
+                        // The parent supplied this one (a redirection or an
+                        // inherited pipe) — put it back over the console handle
+                        // AttachConsole just installed.
+                        let _ = SetStdHandle(kind, handle);
+                    }
+                }
             }
         }
     }
@@ -1324,6 +1408,33 @@ mod win32 {
         // call; the API copies the string. No pointers escape.
         unsafe {
             let _ = SetCurrentProcessExplicitAppUserModelID(wide.as_ptr());
+        }
+    }
+
+    /// Register this process for OS-driven relaunch (`RegisterApplicationRestart`):
+    /// after a Windows-Update / Restart-Manager reboot, and with the
+    /// "Automatically save my restartable apps…" sign-in setting, Windows brings
+    /// aterm back on its own — the behaviour every restartable Windows app opts
+    /// into and aterm never did. `dwFlags = 0` also accepts restart-after-crash
+    /// and restart-after-hang; that is deliberate: a terminal that vanishes and
+    /// quietly returns (with the crash-evidence banner saying WHY — see
+    /// `logging::take_crash_evidence`) beats one that just vanishes. A boot-crash
+    /// cannot loop: the API's own guard only restarts a process that stayed alive
+    /// ≥ 60 seconds, so a build that dies at startup is restarted at most once.
+    ///
+    /// The registered command line is `--window` (the router's explicit
+    /// window-mode flag; the exe name is added by the OS) so the relaunch is
+    /// unambiguously window-shaped no matter what launched the original process.
+    /// The relaunch only PAYS OFF because the end-session hook
+    /// (`platform_win`'s WM_QUERYENDSESSION subclass) persists the session
+    /// manifest before the reboot — the two ship together. Best-effort: the
+    /// HRESULT is ignored (failure degrades to today's no-relaunch behaviour).
+    pub(super) fn register_application_restart() {
+        let wide: Vec<u16> = "--window".encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that outlives
+        // the call; the API copies the string. No pointers escape.
+        unsafe {
+            let _ = RegisterApplicationRestart(wide.as_ptr(), 0);
         }
     }
 
@@ -1351,6 +1462,232 @@ mod win32 {
         // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the (modal,
         // synchronous) call; the owner HWND is either 0 or a live winit window's.
         unsafe { MessageBoxW(owner_hwnd, body.as_ptr(), title.as_ptr(), style) == IDYES }
+    }
+
+    // ---- TaskDialogIndirect (comctl32 v6) confirm --------------------------------
+    //
+    // The close/quit confirmation needs buttons that carry the prompt's REAL verbs
+    // ("Close" / "Quit" + Cancel). `MessageBoxW` was rejected for exactly this at the
+    // Windows apprt's old `confirm` stub: its button labels are fixed (Yes/No/OK/
+    // Cancel), so copy that says "Quit" over buttons that say "Yes" reads wrong.
+    // `TaskDialogIndirect` takes arbitrary button text and is the documented
+    // follow-up now the side-by-side manifest (crates/aterm/build.rs, RT_MANIFEST
+    // with Common-Controls v6) ships in the real exe.
+    //
+    // RESOLVED AT RUNTIME (LoadLibraryW + GetProcAddress), NOT import-linked, and
+    // that is load-bearing: an import is resolved at process load against the
+    // activation context's comctl32, and only the shipped `aterm.exe` carries the
+    // v6 manifest. The dev `aterm-gui.exe` (if its resources were skipped) and
+    // every cargo TEST executable resolve classic comctl32 5.82, which has no
+    // `TaskDialogIndirect` export — a static import would make those binaries fail
+    // AT LOAD with "entry point not found". Runtime resolution turns the same
+    // situation into `None` → the caller's existing titlebar-warning fallback.
+
+    /// `TASKDIALOG_BUTTON` — 1-byte packed, exactly as the SDK declares it
+    /// (`pshpack1.h` around the taskdialog block in CommCtrl.h).
+    #[repr(C, packed)]
+    struct TaskDialogButton {
+        id: i32,
+        text: *const u16,
+    }
+
+    /// `TASKDIALOGCONFIG` — 1-byte packed (see above); 160 bytes on x64. The two
+    /// icon unions collapse to their pointer-sized member.
+    #[repr(C, packed)]
+    struct TaskDialogConfig {
+        cb_size: u32,
+        hwnd_parent: isize,
+        hinstance: isize,
+        flags: u32,
+        common_buttons: u32,
+        window_title: *const u16,
+        main_icon: isize,
+        main_instruction: *const u16,
+        content: *const u16,
+        c_buttons: u32,
+        buttons: *const TaskDialogButton,
+        default_button: i32,
+        c_radio_buttons: u32,
+        radio_buttons: *const TaskDialogButton,
+        default_radio_button: i32,
+        verification_text: *const u16,
+        expanded_information: *const u16,
+        expanded_control_text: *const u16,
+        collapsed_control_text: *const u16,
+        footer_icon: isize,
+        footer: *const u16,
+        callback: isize,
+        callback_data: isize,
+        cx_width: u32,
+    }
+
+    /// `TDF_ALLOW_DIALOG_CANCELLATION` — Esc / the caption ✕ answer `IDCANCEL`,
+    /// mirroring AppKit's Escape-cancels behaviour on the macOS `NSAlert`.
+    const TDF_ALLOW_DIALOG_CANCELLATION: u32 = 0x0008;
+    /// `TDF_POSITION_RELATIVE_TO_WINDOW` — center over the owner, not the monitor.
+    const TDF_POSITION_RELATIVE_TO_WINDOW: u32 = 0x1000;
+    /// `TDCBF_CANCEL_BUTTON` — the stock Cancel; using the COMMON button (rather
+    /// than a second custom one) is what wires Esc/✕ to it for free.
+    const TDCBF_CANCEL_BUTTON: u32 = 0x0008;
+    /// `TD_WARNING_ICON` (`MAKEINTRESOURCEW(-1)`): the caution glyph, matching
+    /// both the `MB_ICONWARNING` paste dialog above and the macOS alert's default
+    /// `NSAlertStyleWarning`.
+    const TD_WARNING_ICON: isize = 0xFFFF;
+    /// Our one custom (proceed) button. Any value ≥ 8 avoids the stock ID*
+    /// range (IDCANCEL is 2, which the common Cancel button answers with).
+    const ID_PROCEED: i32 = 100;
+
+    /// `TaskDialogIndirect`'s signature (out-params for the radio button and the
+    /// verification checkbox are documented as optionally NULL).
+    type TaskDialogIndirectFn = unsafe extern "system" fn(
+        *const TaskDialogConfig,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+    ) -> i32;
+
+    /// Resolve `TaskDialogIndirect` once per process, or `None` when this
+    /// binary's activation context provides only classic comctl32 (no v6
+    /// manifest — test executables, a resource-less dev build).
+    fn task_dialog_indirect() -> Option<TaskDialogIndirectFn> {
+        use std::sync::OnceLock;
+        static ADDR: OnceLock<isize> = OnceLock::new();
+        let addr = *ADDR.get_or_init(|| {
+            let dll: Vec<u16> = "comctl32.dll"
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            // SAFETY: `dll` is NUL-terminated UTF-16 for the duration of the
+            // call; the returned module handle is process-global and never
+            // freed (comctl32 stays loaded for the process lifetime — the
+            // balloon/notify path and, in the manifested exe, every themed
+            // control already depend on it). `GetProcAddress` takes the
+            // NUL-terminated ASCII export name.
+            unsafe {
+                let module = LoadLibraryW(dll.as_ptr());
+                if module == 0 {
+                    0
+                } else {
+                    GetProcAddress(module, c"TaskDialogIndirect".as_ptr().cast::<u8>())
+                }
+            }
+        });
+        if addr == 0 {
+            return None;
+        }
+        // SAFETY: the address came from GetProcAddress for this exact export;
+        // the transmute only reinterprets it as its documented signature.
+        Some(unsafe { std::mem::transmute::<isize, TaskDialogIndirectFn>(addr) })
+    }
+
+    /// A blocking proceed/Cancel confirmation via `TaskDialogIndirect`, with the
+    /// affirmative button carrying the caller's REAL verb (`proceed` — "Close" /
+    /// "Quit"). Returns `Some(true)` to proceed, `Some(false)` on Cancel/Esc/✕,
+    /// or `None` when the dialog is unavailable (no comctl32 v6 in this process)
+    /// or fails — the caller then falls back to the titlebar-warning confirm.
+    ///
+    /// Owner: `GetActiveWindow()` — the close/quit gesture (Alt+F4, the caption
+    /// ✕, a menu action) always runs with one of our windows active, and owning
+    /// the dialog to it makes it properly modal (the owner is disabled, so a
+    /// second Alt+F4 cannot stack a second dialog) and centers it over the
+    /// window being closed. A programmatic path with no active window falls back
+    /// to an ownerless dialog, which still blocks this (UI) thread.
+    ///
+    /// Buttons mirror the macOS `NSAlert` exactly: PROCEED is the default
+    /// (Return), Cancel answers Escape.
+    pub(super) fn confirm_proceed_cancel(
+        title: &str,
+        body: &str,
+        proceed: &str,
+    ) -> Option<bool> {
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        let func = task_dialog_indirect()?;
+        let caption = wide("aterm");
+        let title = wide(title);
+        let body = wide(body);
+        let proceed = wide(proceed);
+        let button = TaskDialogButton {
+            id: ID_PROCEED,
+            text: proceed.as_ptr(),
+        };
+        // SAFETY: a plain query of this thread's active window (may be 0).
+        let owner = unsafe { GetActiveWindow() };
+        let config = TaskDialogConfig {
+            cb_size: std::mem::size_of::<TaskDialogConfig>() as u32,
+            hwnd_parent: owner,
+            hinstance: 0,
+            flags: TDF_ALLOW_DIALOG_CANCELLATION
+                | if owner != 0 {
+                    TDF_POSITION_RELATIVE_TO_WINDOW
+                } else {
+                    0
+                },
+            common_buttons: TDCBF_CANCEL_BUTTON,
+            window_title: caption.as_ptr(),
+            main_icon: TD_WARNING_ICON,
+            main_instruction: title.as_ptr(),
+            content: body.as_ptr(),
+            c_buttons: 1,
+            buttons: &button,
+            default_button: ID_PROCEED,
+            c_radio_buttons: 0,
+            radio_buttons: std::ptr::null(),
+            default_radio_button: 0,
+            verification_text: std::ptr::null(),
+            expanded_information: std::ptr::null(),
+            expanded_control_text: std::ptr::null(),
+            collapsed_control_text: std::ptr::null(),
+            footer_icon: 0,
+            footer: std::ptr::null(),
+            callback: 0,
+            callback_data: 0,
+            cx_width: 0,
+        };
+        let mut pressed: i32 = 0;
+        // SAFETY: `config` and every buffer it points at outlive the (modal,
+        // synchronous) call; `pressed` is a valid out-param; the radio/
+        // verification out-params are documented optional and passed NULL.
+        let hr = unsafe { func(&config, &mut pressed, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if hr < 0 {
+            // A failed dialog (out of memory, comctl misconfiguration) must not
+            // read as an ANSWER either way — hand the decision to the fallback.
+            return None;
+        }
+        // `ID_PROCEED` proceeds; anything else (IDCANCEL == 2 from the common
+        // button, Esc, the caption ✕) cancels.
+        Some(pressed == ID_PROCEED)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{TaskDialogButton, TaskDialogConfig};
+
+        /// The hand-packed `TASKDIALOGCONFIG` must reproduce the SDK's x64
+        /// layout EXACTLY (`pshpack1.h` → `sizeof == 160`) — the mirror of
+        /// `crash_signal`'s `ExceptionRecord` offset test. A field-order typo
+        /// here would not fail to compile; it would hand comctl32 a garbage
+        /// config and draw a broken dialog (or fail with E_INVALIDARG at the
+        /// exact moment the user tries to close a busy window).
+        #[cfg(target_pointer_width = "64")]
+        #[test]
+        fn task_dialog_config_layout_matches_the_sdk() {
+            assert_eq!(core::mem::size_of::<TaskDialogConfig>(), 160);
+            assert_eq!(core::mem::size_of::<TaskDialogButton>(), 12);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, cb_size), 0);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, hwnd_parent), 4);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, flags), 20);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, common_buttons), 24);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, window_title), 28);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, main_icon), 36);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, main_instruction), 44);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, content), 52);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, c_buttons), 60);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, buttons), 64);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, default_button), 72);
+            assert_eq!(core::mem::offset_of!(TaskDialogConfig, cx_width), 156);
+        }
     }
 }
 
@@ -1488,6 +1825,12 @@ struct RepaintKey {
     /// epoch ever advances for it; without this term the settled-screen early-out
     /// (FL-1) would swallow both the frame that draws it and the frame that
     /// erases it. `0` when no composition is active.
+    ///
+    /// One term covers EVERY paint surface the composition can be routed to
+    /// ([`crate::app_input::PreeditOwner`]: the grid overlay, the find well, the
+    /// inline rename well), because it fingerprints the composition itself rather
+    /// than any one surface's layout — each surface re-derives its own paint from
+    /// these same bytes on any presented frame.
     preedit_fp: u64,
     /// M1b sub-row scroll: the banked fractional-pixel residual presented this
     /// frame (the grid-band translate amount). A frac-only change dirties NO cell
@@ -2114,6 +2457,7 @@ enum Wake {
     /// A click in the menu-bar OPERATOR status item (status_item.rs): posted by
     /// its AppKit action target, dispatched on `App` by the event loop (the
     /// `MenuAction` relay pattern, in the status item's own tag namespace).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     OperatorAction { action: status_item::OperatorAction },
     /// The status-item menu is opening (its `NSMenuDelegate` relay): kick a
     /// background sibling scan so the NEXT open renders fresh fleet rows —
@@ -3266,6 +3610,28 @@ impl Backend {
         }
     }
 
+    /// Declare which TOP grid rows are host chrome (the in-grid tab strip) and what
+    /// tone their surface extends into the window's padding gutters, so an in-grid
+    /// band reaches the window edges instead of floating inside a margin of theme
+    /// background. `None` clears it. See [`aterm_render::ChromeBleed`].
+    fn set_chrome_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
+        match self {
+            Backend::Cpu(r) => r.set_chrome_bleed(bleed),
+            Backend::Gpu(g) => g.set_chrome_bleed(bleed),
+        }
+    }
+
+    /// The bleed currently in force — read back by
+    /// `app_render::tab_strip_bleed_tests` so the wiring from the compose path to the
+    /// renderer stays under test on both backends.
+    #[cfg(test)]
+    fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
+        match self {
+            Backend::Cpu(r) => r.chrome_bleed(),
+            Backend::Gpu(g) => g.chrome_bleed(),
+        }
+    }
+
     /// LIGHT per-window size switch (W12 mixed-DPI): re-target the shared
     /// renderer's active rasterization size to `px` WITHOUT tearing down the
     /// resident glyph atlas (both backends keep every in-use size's glyphs — the
@@ -3782,6 +4148,15 @@ impl BackendSlot {
 
     fn set_head(&mut self, head: usize) {
         self.ready_mut().set_head(head);
+    }
+
+    fn set_chrome_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
+        self.ready_mut().set_chrome_bleed(bleed);
+    }
+
+    #[cfg(test)]
+    fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
+        self.ready().chrome_bleed()
     }
 
     fn activate_px(&mut self, px: f32) {
@@ -4380,6 +4755,19 @@ fn register_terminal_tab(
 #[derive(Default)]
 struct SessionPool {
     sessions: std::collections::HashMap<u64, PooledSession>,
+    /// Bumped by every [`SessionPool::insert`] — a monotone witness that the
+    /// live set gained a session id nobody downstream has seen yet.
+    ///
+    /// WHY (MPT-4): the status sweep's O(1) deadline gate can only skip the
+    /// whole-pool scan while it knows every live session's deadline. An
+    /// UNOBSERVED session has no slot and `StatusObserver::due` reports it due
+    /// immediately, so a gate keyed on the known deadlines alone would make a
+    /// brand-new tab wait out a whole observation interval for its first
+    /// classification. Comparing this epoch against the one recorded at the
+    /// last completed sweep answers "could there be an id I have never seen?"
+    /// in one `u64` compare. Removal does NOT bump it: a slot for a dead
+    /// session can only make the gate open EARLY, which is safe.
+    insert_epoch: u64,
 }
 
 struct PooledSession {
@@ -4399,6 +4787,9 @@ impl SessionPool {
     /// Take ownership of a freshly-spawned session with one view. Returns its id.
     fn insert(&mut self, session: Session) -> u64 {
         let id = session.id;
+        // See `insert_epoch`: this is the ONE way an id nobody has classified
+        // yet can enter the live set.
+        self.insert_epoch = self.insert_epoch.wrapping_add(1);
         self.sessions.insert(
             id,
             PooledSession {
@@ -4496,6 +4887,10 @@ impl SessionPool {
     /// Iterate every live session (for window-level apply-to-all operations).
     fn iter(&self) -> impl Iterator<Item = &Session> {
         self.sessions.values().map(|p| &p.session)
+    }
+    /// See [`SessionPool::insert_epoch`].
+    fn insert_epoch(&self) -> u64 {
+        self.insert_epoch
     }
 }
 
@@ -6112,6 +6507,56 @@ struct WindowState {
     /// is not driving. Unused off Windows (the pump is never posted there).
     #[cfg_attr(not(windows), allow(dead_code))]
     last_effect_pump_at: Option<Instant>,
+    /// CHROME-DECORATION MOTION, as a LEVEL with an expiry: "a redraw drew a
+    /// decoration mid-motion no longer ago than this instant". Robi walking his
+    /// round, the typed dog's bounce/fade envelope, the reduced-motion sing still
+    /// draining to rest, a companion that just accepted a wince cue.
+    ///
+    /// These live in `redraw_window`/`redraw_compose`, NOT in any of the
+    /// cursor-effect engines, so [`Self::cursor_fx_active`] cannot see them and
+    /// they used to buy their next frame with a bare `request_redraw()` from
+    /// INSIDE the redraw handler. That is a spin on Windows and only accidentally
+    /// bounded on macOS: winit's Windows backend re-invalidates the HWND from the
+    /// `mem::take(redraw_requested)` immediately after `DefWindowProcW` validates
+    /// it, so `MsgWaitForMultipleObjectsEx` returns instantly, `StartCause` is
+    /// `WaitCancelled`, and the armed `WaitUntil` is never reached — measured at
+    /// 52k wakes/sec and 99.8% of a core with Robi on screen. macOS free-runs on
+    /// that path too (`queue_redraw` signals the run-loop source `cleared()` is
+    /// about to re-enter), just at redraw cost rather than at 44 kHz.
+    ///
+    /// So the sites refresh this LATCH instead of asking for a frame, and
+    /// `about_to_wait` reads it as one of the inputs to the SAME phase-locked
+    /// `next_trail_tick` deadline every other effect uses — one owner, one
+    /// cadence, one consumption site (`take_due_trail_tick`).
+    ///
+    /// WHY A LEVEL AND NOT A ONE-SHOT REQUEST (the first cut of this fix, and the
+    /// reason it was wrong): the lane it feeds is level-triggered on the way OUT —
+    /// `about_to_wait`'s else-arm calls [`Self::park_terminal_effect_scheduler`],
+    /// which drops `next_trail_tick`. A flag consumed by the park that ARMS the
+    /// deadline is therefore already gone by the next park, so any event-loop turn
+    /// between the arm and the fire that does not redraw THIS window — a stray
+    /// `WaitCancelled` from a mouse-move, a background pane's `Wake::Output`,
+    /// another window's blink — took the else-arm and deleted the pending tick.
+    /// Robi has no backup: `terminal_effect_frame_active` is focus-gated on its
+    /// cursor-fx term and `WordDecorations::robi` never writes `active_until`, so
+    /// an unfocused (or steady-cursor) window re-armed nothing and he froze
+    /// mid-stride, permanently. A level recomputed by every redraw is what
+    /// `park_terminal_effect_scheduler` already assumes of every other input.
+    ///
+    /// WHY AN EXPIRY AND NOT A PLAIN `bool` CLEARED AT THE TOP OF THE REDRAW: that
+    /// couples the latch's lifetime to redraw control flow again, one level up. A
+    /// redraw can return before the decoration region (retry-gated present,
+    /// backend rebuild, a route that draws no chrome), and a wipe on such a frame
+    /// is the same permanent freeze wearing a different hat. An expiry has no
+    /// control-flow coupling at all: it survives any number of non-redrawing
+    /// parks, and it cannot spin forever either, because a decoration that stops
+    /// refreshing it stops paying [`DECO_ANIM_LEVEL_FRAMES`] frames later.
+    ///
+    /// It is refreshed BEFORE the RepaintKey early-out on purpose. A frame whose
+    /// fingerprint happens to repeat (a pose that bakes to the same sprite) still
+    /// owes the next one, and arming a deadline — unlike re-requesting a redraw —
+    /// costs one wake per frame interval whether or not the frame presented.
+    deco_anim_until: Option<Instant>,
     /// The next selection-autoscroll repeat deadline. Armed by `selection_autoscroll`
     /// ONLY while a selection drag is held past a grid edge; `None` (pure `Wait`) once
     /// the pointer re-enters the grid or the button releases. Mirrors `next_blink`.
@@ -6194,6 +6639,20 @@ struct WindowState {
     /// SWITCHED to mid-stale is never shown at the old geometry. SHARED (Cmd-Shift-O)
     /// sessions are excluded from the scoping — they stay eager on every tab.
     panes_stale: bool,
+    /// The views that were on this window's glass at its last SUCCESSFUL
+    /// present, in the plan's own left-to-right order.
+    ///
+    /// Latency honesty, cheaply (MPT-3). `present_latency_ns` books
+    /// output→present waits from each visible pane's `last_output_ns`; a stamp
+    /// armed while its pane was HIDDEN measures an interval nobody was
+    /// watching, so it must be thrown away before the pane's first present.
+    /// Comparing this vector against the current plan answers "did the visible
+    /// SET change?" in a <= 4-element `u64` compare, so the discard runs on the
+    /// rare frame that reveals something instead of on every frame — and only
+    /// for the panes that are NEWLY here, so a resize or divider drag (geometry
+    /// moves, membership does not) never drops a real measurement. Empty until
+    /// the first present, which is exactly "nothing was on this glass yet".
+    last_visible_views: Vec<tab_model::ViewId>,
     /// W1 (kill the compositor stretch): the RAW OS-window inner size in physical
     /// px — what the swapchain/softbuffer surface MUST be sized to (never the
     /// grid-quantized frame, which the compositor would rescale into the window).
@@ -6377,6 +6836,17 @@ struct WindowState {
     /// than the column because an equal-share relayout moves the column under a
     /// stationary pointer whenever a tab opens or closes between the two clicks.
     strip_press: Option<(Instant, tab_model::TabId)>,
+    /// The last in-grid strip press on BARE BAND — background cells no chip, `+`,
+    /// `↻` or `✕` claims. The band's own tiny double-click FSM, sibling to
+    /// [`Self::strip_press`] and separate for the same reason that one is
+    /// separate from the grid's streak: a chip press must not count toward a
+    /// band double-click or vice versa. Windows reads it for the
+    /// double-click-maximize reflex (`handle_tab_strip_click`); a chip/away
+    /// press breaks it via [`App::clear_strip_press`]. No tab key — bare band
+    /// has no identity beyond "not a chip", and the equal-share relayout that
+    /// motivates `strip_press`'s tab key cannot move background under a
+    /// stationary pointer between two presses that opened no chip.
+    strip_band_press: Option<Instant>,
     /// The live inline SESSION-RENAME edit on this window's tab strip, or `None`
     /// when nothing is being edited. See [`app_rename::TabRenameEdit`] for why
     /// it is keyed on a session id and carries the tab id only for positioning.
@@ -6422,6 +6892,30 @@ struct WindowState {
     /// icon pixels are generated from tab_bar's primitive IR and cached alongside the
     /// strip cells, then cloned into `input_scratch.images` after each prepend.
     cached_strip_images: Vec<(usize, aterm_core::grid::extra::ImageRef)>,
+    /// The rename well's caret COLUMN in the last painted strip row, `None` when
+    /// that paint drew no rename field. Cached with `cached_strip_rows` under the
+    /// same fingerprint (which already folds the rename text + preedit bytes), so
+    /// a cache-hit frame can re-anchor the IME candidate window on the well
+    /// without re-running the field's scroll math ([`crate::app_input::
+    /// PreeditOwner::Rename`] — the anchor used to stay on the GRID caret).
+    cached_strip_rename_caret: Option<usize>,
+    /// THE PIXEL BAND (Windows) — per-STRIP-ROW `ImageRef` slices of the one
+    /// UI-font band raster ([`tab_bar::pixel_band`]), rebuilt with (and cached
+    /// exactly as long as) `cached_strip_rows`. Non-empty ⇒ the splice lays these
+    /// over the strip rows INSTEAD of `cached_strip_images` (the band bakes the
+    /// icon/status marks itself, vertically centred); empty ⇒ the byte-identical
+    /// legacy cell strip (no UI face installed, or the raster declined).
+    #[cfg(windows)]
+    cached_strip_band: Vec<Vec<(usize, aterm_core::grid::extra::ImageRef)>>,
+    /// The band-geometry + font-epoch key `cached_strip_band` was rastered for:
+    /// `(cell_w, cell_h, band_top_px, scale bits, chrome-font epoch)`. A separate
+    /// term ANDed into the strip cache hit because the cells are a pure function
+    /// of the [`StripCacheKey`] but the band PIXELS also depend on the window's
+    /// metrics (mixed-DPI, font size), its scale, and on the asynchronously
+    /// landing chrome faces — a scale flip or the font landing must repaint the
+    /// band even when cols and titles happen to be unchanged.
+    #[cfg(windows)]
+    strip_band_key: (usize, usize, usize, u32, u64),
     /// The last `(segment_count, selected)` this window's NATIVE titlebar tab strip
     /// (`refresh_window_tabs` → `toolbar::set_window_tabs`) was told to render — a
     /// faithful shadow of the `NSSegmentedControl`. Written AT the push point, so a tab
@@ -6493,14 +6987,17 @@ struct WindowState {
     /// composed (CJK input, dead keys), or empty when no composition is active.
     /// While non-empty, direct key sends are SUPPRESSED so composing keystrokes
     /// don't ALSO emit raw bytes; the committed text arrives via `Ime::Commit`.
-    /// Rendered INLINE at the cursor (`RenderInput::overlay_ime_preedit`),
-    /// underlined per the platform convention, with the title indicator kept as
-    /// the accessibility-visible echo.
+    /// Painted INLINE where the user is looking, per [`App::preedit_owner`]'s
+    /// routing (the same precedence `on_ime_commit` uses): rendered at the grid
+    /// cursor by `RenderInput::overlay_ime_preedit` (underlined per the platform
+    /// convention, with the title indicator kept as the accessibility-visible
+    /// echo), or spliced into the open find well / the inline rename well when
+    /// one of those has focus. Native views run their own text-input pipeline.
     preedit: String,
     /// The platform-reported caret START within `preedit` (byte offset), from
     /// winit `Ime::Preedit`'s cursor range — where the cursor draws inside the
-    /// composition. `None` (platform gave no range) parks it after the last
-    /// composed cell.
+    /// composition, for the grid overlay and the field splices alike. `None`
+    /// (platform gave no range) parks it after the last composed cell.
     preedit_caret: Option<usize>,
     /// Whether the LAST presented frame drew the inline composition — the
     /// stream-fade `fade_shown` pattern: the frame that ERASES a composition
@@ -6905,6 +7402,190 @@ impl WindowState {
             .map(|engine| Duration::from_millis(engine.current_period_ms()))
     }
 
+    /// A redraw just drew a CHROME DECORATION mid-motion: hold the shared effects
+    /// lane open for [`DECO_ANIM_LEVEL_FRAMES`] more frame intervals.
+    ///
+    /// Called from the five decoration sites in `redraw_window`/`redraw_compose`,
+    /// each of them UPSTREAM of that path's RepaintKey early-out — a pose whose
+    /// sub-pixel advance bakes to the same sprite is a frame the early-out
+    /// correctly refuses to present, and it still owes the next one.
+    ///
+    /// Monotonic in the only direction that matters: it never shortens a latch a
+    /// livelier decoration already extended, so on a frame that draws two of them
+    /// (a dog cameo over a walking Robi) the longer hold wins regardless of the
+    /// order the arms run in.
+    fn note_deco_animating(&mut self, now: Instant) {
+        let until = now + effect_tick_interval(self.frame_interval) * DECO_ANIM_LEVEL_FRAMES;
+        if self.deco_anim_until.is_none_or(|held| held < until) {
+            self.deco_anim_until = Some(until);
+        }
+    }
+
+    /// Whether a CHROME DECORATION still owes this window frames — the fourth
+    /// input to the shared effects arm, beside [`Self::terminal_effect_frame_active`],
+    /// [`Self::static_cursor_cat_deadline`] and the stream fade.
+    ///
+    /// A method for the same reason `terminal_effect_frame_active` is one: it is
+    /// the REAL scheduling decision, and it must stay regression-testable without
+    /// an OS event-loop fixture. Two laws in one place:
+    ///
+    /// * A LEVEL, not a request. `&self`, no consumption: every park between the
+    ///   arm and the fire reads the same answer, so an event-loop turn that does
+    ///   not redraw this window cannot take the else-arm and park the tick the
+    ///   decoration armed. That was the freeze (see `deco_anim_until`).
+    /// * Live, but only ARM behind the canonical front-terminal boundary. The
+    ///   front tab can go native between the redraw that refreshed the latch and
+    ///   this park, and native content may never own a terminal-effects clock
+    ///   (the rule `cursor_fx_active` and `matrix_rain_frame_period` already
+    ///   keep). Returning `false` there routes the park through
+    ///   [`Self::park_terminal_effect_scheduler`], which DROPS the latch rather
+    ///   than deferring it; a terminal that comes back refreshes it on its very
+    ///   first frame.
+    fn deco_anim_frame_active(&self, now: Instant) -> bool {
+        self.deco_anim_until.is_some_and(|until| now < until) && self.front_terminal().is_some()
+    }
+
+    /// THE TERMINAL-EFFECTS LANE'S WHOLE PARK DECISION, for one window, in one
+    /// place: which of the three arms this park takes, what it leaves in
+    /// `next_trail_tick`, and the deadline (if any) it owes the fold.
+    ///
+    /// Extracted from `about_to_wait` because it is the real scheduling decision
+    /// and the codebase's rule for those is that they stay drivable without an OS
+    /// event-loop fixture — the same reason [`Self::terminal_effect_frame_active`]
+    /// and [`Self::static_cursor_cat_deadline`] are methods. The property that
+    /// most needs pinning is a SEQUENCE, not a predicate: arm, then park again on
+    /// a turn that redrew nothing, and the armed tick must still be there.
+    ///
+    /// `has_glass` is `os_window.is_some()`, passed rather than read, because a
+    /// test cannot fabricate a winit `Window` and the arms are vacuous without
+    /// it. It is the only input that is not this window's own state.
+    ///
+    /// The three arms, in order:
+    ///
+    /// 1. FRAME CADENCE — a live cursor effect, a drying stream fade, or a chrome
+    ///    decoration mid-motion. Arms (or KEEPS) the phase-locked
+    ///    `next_trail_tick`.
+    /// 2. The reduced-motion cat's bounded one-shot erase.
+    /// 3. PARK — drop every clock in this lane; the loop returns to pure `Wait`.
+    ///
+    /// Arm 1 preempts arm 2, and that asymmetry is safe in the direction it goes:
+    /// arm 1 is the FRAME cadence, strictly finer than arm 2's bounded one-shot,
+    /// so a pending reduced-motion erase can only land earlier, never later. Once
+    /// the decorations rest, arm 2 re-arms the one-shot exactly as before.
+    fn plan_terminal_effect_lane(
+        &mut self,
+        now: Instant,
+        cursor_cat_motion: bool,
+        has_glass: bool,
+    ) -> Option<Instant> {
+        // M2 stream fade shares the frame-paced wake: while any ink is still
+        // drying (or the LAST present painted a tint that must be settled to
+        // exact bytes), keep presenting; disarm the moment everything is dry (0%
+        // idle). Deliberately NOT focus-gated, unlike the aurora terms: a focus
+        // loss mid-fade demotes the motion policy to Reduced (a bypass), and the
+        // erase frame that settles the tinted pixels to exact bytes must still
+        // present on the unfocused window.
+        let fade_wake = self.front_terminal().is_some()
+            && !self.is_split()
+            && (self.fade_shown || self.stream_fade.is_active(now));
+        // A LEVEL read, not a consumption: every park between the arm and the
+        // fire gets the same answer, so a `WaitCancelled` turn that redraws some
+        // OTHER window cannot fall through to the park arm and delete the tick
+        // this decoration armed. See `deco_anim_until` for the freeze that taught
+        // us the difference.
+        let deco_wake = self.deco_anim_frame_active(now);
+        // LUMEN cursor aurora: while any light is alive on a focused window,
+        // re-present so the comet/bloom/ring/sparks animate, then disarm (→ pure
+        // `Wait`, 0% idle) the moment they decay to nothing. The cadence is the
+        // PANEL's own refresh ([`effect_tick_interval`]): the grid's content
+        // presents at the panel rate, so an effect train pinned to 60 fps hands a
+        // 120 Hz ProMotion panel the same comet twice and lands every second
+        // frame ~8.3 ms stale. Coarse-only effects still take their own deadlines
+        // below, so the extra wakes are confined to light that is actually MOVING.
+        if has_glass && (deco_wake || self.terminal_effect_frame_active(now, cursor_cat_motion)) {
+            let aurora_interval = effect_tick_interval(self.frame_interval);
+            // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember tail.
+            // If the ONLY live cursor effect is the glow's slowly-cooling ember
+            // (no moving light, no rainbow/cat/trail/deco, no fade), poll at the
+            // glow's coarse ember cadence — the present gate dedups the
+            // imperceptible frames, so a keypress never lands behind a needless
+            // 60 fps re-tick. Any moving light or other effect keeps the full
+            // frame cadence.
+            let cursor_dependents =
+                self.cursor_dependents_need_frame_cadence(now, cursor_cat_motion);
+            debug_assert_eq!(
+                self.cursor_fx_active(now, cursor_cat_motion),
+                self.cursor_glow.is_active() || cursor_dependents,
+                "cursor activity and frame-cadence sets must stay identical"
+            );
+            // `deco_wake` belongs on the FRAME-cadence side, not merely in the
+            // branch predicate: without it a live glow's coarse ~90 ms ember
+            // deadline would win the `phase_locked_effect_deadline` selection
+            // below and pace Robi's walk at ~11 fps — the exact drift the
+            // `cursor_dependents` split was introduced to end.
+            let others_need_cadence = fade_wake || cursor_dependents || deco_wake;
+            let glow_deadline = self.cursor_glow.next_change_deadline(now, aurora_interval);
+            let needs_frame_cadence = others_need_cadence || self.cursor_glow.needs_frame_cadence();
+            // PHASE-LOCKED re-arm: continue the previous deadline train (`fired +
+            // interval`) so the effective cadence stays the cap instead of
+            // `interval + frame cost`. A fired deadline more than one interval old
+            // (an overloaded frame) falls back to `now + interval` — no catch-up
+            // burst, the next period is full.
+            //
+            // KEEPING an already-armed slot is doubly load-bearing now. It
+            // phase-locks, AND it is what makes a repeat park CONTINUOUS: a turn
+            // that arrives between the arm and the fire finds the slot already
+            // there, keeps it, folds it, and costs no extra wake — the whole
+            // point of the lane being level-triggered on both edges.
+            let last_fire = self.last_trail_fire.take();
+            let fresh = crate::app_render::phase_locked_effect_deadline(
+                now,
+                aurora_interval,
+                last_fire,
+                glow_deadline,
+                needs_frame_cadence,
+            );
+            // ...but a FRAME-CADENCE arm may not INHERIT a coarser slot. This was
+            // a plain `get_or_insert_with`, which meant that when this arm ran
+            // over a `next_trail_tick` the else-if below had armed — the reduced-
+            // motion cat's one-shot erase, bounded only by the cat's
+            // `discovery_until`, i.e. SECONDS — the decoration silently took that
+            // deadline instead of its own frame interval.
+            //
+            // That is not merely the wrong cadence, it re-opens the freeze this
+            // whole revision exists to close: `deco_anim_until` holds for
+            // `DECO_ANIM_LEVEL_FRAMES` frames, so a slot seconds away expires the
+            // latch long before it fires, and any unrelated wake in that gap then
+            // takes the park arm and drops the slot with nothing left to re-arm
+            // it. Clamping restores the invariant this arm's comment always
+            // claimed: it is strictly finer than the one-shot, so a pending erase
+            // can only land EARLIER, never later — and the tick that refreshes
+            // the latch is always due inside it.
+            //
+            // Confined to `needs_frame_cadence`: the coarse-only path (a glow
+            // ember alone, ~90 ms) legitimately owns a slot longer than a frame
+            // and keeps the old byte-for-byte behaviour.
+            let d = match self.next_trail_tick {
+                Some(held) if !needs_frame_cadence || held <= fresh => held,
+                _ => fresh,
+            };
+            self.next_trail_tick = Some(d);
+            Some(d)
+        } else if has_glass
+            && let Some(d) = self.static_cursor_cat_deadline(now, cursor_cat_motion)
+        {
+            // One bounded hold, one erase wake. No frame cadence and no bob/fade
+            // work under reduced motion.
+            self.next_trail_tick = Some(d);
+            Some(d)
+        } else {
+            // Effects idle or no terminal surface: drop every scheduler clock. A
+            // fresh terminal burst starts a fresh deadline train.
+            self.park_terminal_effect_scheduler();
+            None
+        }
+    }
+
     /// The reduced-motion cat's one-shot erase deadline, gated by the same
     /// canonical terminal-front boundary as the animated effects lane.
     ///
@@ -6934,6 +7615,19 @@ impl WindowState {
         self.next_trail_tick = None;
         self.last_trail_fire = None;
         self.last_effect_pump_at = None;
+        // The decoration latch rides the same lane, so it parks with it. Reaching
+        // here means the lane's own predicate said no, which for the decorations
+        // is one of two things: the latch already expired (this is a no-op), or
+        // the front tab went native/glass-less under a still-live latch — the one
+        // case where dropping it is the POINT. Native content may not own a
+        // terminal-effects clock, and a terminal that comes back refreshes the
+        // latch on its very first frame.
+        //
+        // What this must NOT be is the edge-triggered arrangement this replaced:
+        // when the latch is live and the tab is a terminal, the caller takes the
+        // frame-cadence arm instead and never reaches this line, so a pending
+        // decoration tick survives every park that does not redraw the window.
+        self.deco_anim_until = None;
     }
 
     /// Drain every state/timer/render channel owned exclusively by fun effects.
@@ -7370,6 +8064,7 @@ impl WindowState {
             next_trail_tick: None,
             last_trail_fire: None,
             last_effect_pump_at: None,
+            deco_anim_until: None,
             next_autoscroll: None,
             scroll_glide: None,
             overscroll: None,
@@ -7385,6 +8080,7 @@ impl WindowState {
             #[cfg(target_os = "linux")]
             initial_frame_settle: None,
             panes_stale: false,
+            last_visible_views: Vec::new(),
             win_px: None,
             last_present_at: None,
             content_pending: false,
@@ -7416,12 +8112,18 @@ impl WindowState {
             last_strip_fp: None,
             strip_hover: None,
             strip_press: None,
+            strip_band_press: None,
             rename_edit: None,
             cached_strip_rows: Vec::new(),
             strip_row_pool: Vec::new(),
             strip_titles_scratch: Vec::new(),
             strip_metadata_scratch: Vec::new(),
             cached_strip_images: Vec::new(),
+            cached_strip_rename_caret: None,
+            #[cfg(windows)]
+            cached_strip_band: Vec::new(),
+            #[cfg(windows)]
+            strip_band_key: (0, 0, 0, 0, 0),
             // Seed from canonical content; a detached native-only window has no
             // compatibility projection but still has one real tab-strip entry.
             strip_shadow: std::cell::Cell::new(strip_shadow),
@@ -9737,9 +10439,12 @@ impl App {
     /// occupies. `resumed` samples only the PRIMARY monitor once, which over- or
     /// under-paces any window living on a different-refresh display (a 120 Hz
     /// laptop panel next to a 60 Hz external, or the reverse); this keeps each
-    /// window coalescing at its own display's cadence. Cheap: compares the cached
-    /// `MonitorHandle` and returns unless the monitor really changed, so the
-    /// continuous `Moved` stream during a drag costs one handle compare per event.
+    /// window coalescing at its own display's cadence. The refresh-rate read runs
+    /// on EVERY call (a mode change keeps the monitor's identity — W6, see the
+    /// inline note), while the cached-`MonitorHandle` compare still gates the
+    /// expensive tail (EDR re-query, retry re-arm, forced redraw), so the
+    /// continuous `Moved` stream during a drag pays two user32 reads per event
+    /// and nothing more.
     fn refresh_frame_interval(&mut self, wid: WindowId) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -9748,16 +10453,39 @@ impl App {
             return;
         };
         let mon = w.current_monitor();
-        if mon == ws.monitor {
-            return;
-        }
-        // Same period math as `resumed`: refresh_rate_millihertz is Hz×1000, so the
-        // period is 1e12/mHz ns. Unknown refresh → fall back to the app default.
-        ws.frame_interval = mon
+        // W6: the refresh-RATE read does NOT hide behind the monitor-identity
+        // guard below. The identity is the HMONITOR on Windows, and a display
+        // MODE change (Settings ▸ 60→144 Hz, a game flipping the rate, a TV
+        // renegotiating over HDMI) keeps the same HMONITOR — so a guard-first
+        // shape kept pacing at the boot-time interval forever: `Moved` compared
+        // equal, `Focused(true)` compared equal, no `WM_DISPLAYCHANGE` arm exists
+        // in vendored winit, and on a single-monitor machine there is no other
+        // display to drag to. With a Mailbox swapchain the CPU floor IS the frame
+        // rate, so the staleness was visible, not theoretical. The read is two
+        // user32 calls (`GetMonitorInfoW` + `EnumDisplaySettingsExW`), cheap
+        // enough for the continuous `Moved` stream during a drag — the same
+        // guard-for-the-expensive-half shape as `refresh_edr_headroom` and
+        // `verify_chrome_appearance`. Same period math as `resumed`:
+        // refresh_rate_millihertz is Hz×1000, so the period is 1e12/mHz ns.
+        let interval = mon
             .as_ref()
             .and_then(|m| m.refresh_rate_millihertz())
             .filter(|&mhz| mhz > 0)
             .map(|mhz| Duration::from_nanos(1_000_000_000_000u64 / u64::from(mhz)));
+        if mon == ws.monitor {
+            // Same panel: apply a GOOD reading (the heal this exists for), but
+            // keep the current interval across a transiently failing query — a
+            // driver mid-modeswitch answering None must not wipe a known-good
+            // cadence back to the app default between two frames.
+            if interval.is_some() {
+                ws.frame_interval = interval;
+            }
+            return;
+        }
+        // A DIFFERENT monitor: overwrite unconditionally — `None` (unknown
+        // refresh) deliberately falls back to the app default rather than
+        // keeping the OLD panel's cadence.
+        ws.frame_interval = interval;
         ws.monitor = mon;
         // A different monitor is also a real surface stimulus. If the old
         // drawable had exhausted its bounded retry train while occluded or in
@@ -10033,10 +10761,15 @@ impl App {
     /// no cwd reported (or the window/session is gone) → the spawn falls back to
     /// `factory.cwd`. The lock is held only for the read; the owned `String` outlives it.
     fn focused_pane_cwd(&self, wid: WindowId) -> Option<String> {
+        use crate::cwd_native::ReportedCwd as _;
         let s = self.session_by_id(self.focused_session_id(wid)?)?;
+        // Native form, not the engine's RFC 8089 URI path: this string becomes
+        // `Command::current_dir`, and on Windows `/C:/Users//x` names a directory
+        // `C:` under the current drive's root, so the spawn would fail (or land
+        // somewhere absurd) instead of opening where the user is looking.
         term_lock(&s.term)
-            .current_working_directory()
-            .map(String::from)
+            .native_working_directory()
+            .map(|cwd| cwd.into_owned())
     }
 
     /// Publish window `wid`'s canonical focused content and, only when that content
@@ -11105,6 +11838,43 @@ impl App {
             )
     }
 
+    /// Re-sample the OS accessibility/appearance preferences (Reduce Motion via
+    /// `AppRt::reduce_motion`, High Contrast / reduced transparency / text scale
+    /// via `AppRt::native_appearance_preferences`) and settle every consumer:
+    /// glides land, an active aurora/pet/rain stops on its next tick, native
+    /// views re-contrast. Repaints only when a sampled fact actually CHANGED, so
+    /// calling this on a rare event with nothing flipped costs two queries and
+    /// nothing else.
+    ///
+    /// Callers, by platform:
+    /// * macOS — the `Wake::ReduceMotionChanged` arm, posted by the
+    ///   NSWorkspace observer (`platform.rs`): a real change notification.
+    /// * Windows — the `ThemeChanged` and focus-gain window events. There is no
+    ///   live observer there yet (`observe_reduce_motion` returns `None` until
+    ///   the §3.2 `WM_SETTINGCHANGE` hook, W0), and both re-sample targets are
+    ///   process-global, so before this seam a Settings flip reached a RUNNING
+    ///   window only at the next window ATTACH. Refocusing aterm — which is what
+    ///   a user does right after toggling "Animation effects" in Settings — now
+    ///   closes the visible case; the hook remains the durable fix (it would
+    ///   also catch flips made while aterm keeps focus).
+    fn resample_os_preferences(&mut self) {
+        let v = self.apprt.reduce_motion();
+        // `motion = "full"` may override this OS fact; the shared edge
+        // reducer checks effective per-window policy and settles only
+        // windows that actually became Reduced.
+        let motion_changed = self.apply_system_reduce_motion(v, Instant::now());
+        let appearance_changed = native_appearance::install_preferences(
+            self.apprt.native_appearance_preferences(),
+        );
+        if motion_changed || appearance_changed {
+            for ws in self.windows.values() {
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+            }
+        }
+    }
+
     /// Focus change: an unfocused window draws the cursor as a steady hollow
     /// block regardless of DECSCUSR (standard terminal behavior) and stops
     /// blink scheduling; regaining focus restores the app's style and re-arms
@@ -11218,6 +11988,12 @@ impl App {
                 w.request_redraw();
             }
         }
+        // Secure Keyboard Entry's TN2150 gate: engaged only while ANY aterm
+        // window is focused. A focus handoff between two aterm windows may
+        // deliver false-then-true — one balanced disable/enable pair, exactly
+        // the release-on-deactivation behavior Apple asks of fair
+        // secure-input citizens (and what iTerm2 does on the same edge).
+        crate::secure_input::set_app_active(self.windows.values().any(|w| w.focused));
         // Republish the per-window-correct notification suppression set: this
         // window's focus changed, so its active tab joins/leaves the muted set.
         self.recompute_notify_suppress();
@@ -11471,15 +12247,51 @@ impl App {
         let Some(wid) = self.frontmost_window else {
             return;
         };
+        self.paste_clipboard_into(wid);
+    }
+
+    /// The window-targeted core of [`Self::paste_clipboard`], split out so a
+    /// POINTER gesture (the Windows right-click paste, `app_mouse`) can paste
+    /// into the window under the pointer rather than whatever `frontmost_window`
+    /// last said — the two are the same window in practice on Windows (a click
+    /// activates first), but the gesture should not depend on that ordering.
+    fn paste_clipboard_into(&mut self, wid: WindowId) {
         // Read the system clipboard via the platform backend: macOS in-process
         // NSPasteboard (direct UTF-8, no subprocess and no locale transcoding),
         // Windows in-process. Both are instant, so deliver on the UI thread.
         #[cfg(not(target_os = "linux"))]
         {
-            let Some(text) = control::pbpaste() else {
+            if let Some(text) = control::pbpaste() {
+                self.deliver_paste(wid, text, Source::Human);
+                // Load-bearing on Windows only: it skips the CF_HDROP arm
+                // below once text pasted. On macOS nothing follows this block,
+                // so a bare `return` is the needless_return lint on one
+                // platform and required control flow on the other.
+                #[cfg(windows)]
                 return;
-            };
-            self.deliver_paste(wid, text, Source::Human);
+            }
+            // No TEXT on the clipboard — on Windows, check for a FILE LIST
+            // (audit S9): Explorer's Ctrl+C puts up CF_HDROP with no
+            // CF_UNICODETEXT, so before this arm a copied file pasted NOTHING
+            // (while dragging the same file worked). The paths take the
+            // drag-and-drop contract verbatim (`paths_paste_insertion`:
+            // per-path shell escape + trailing space, ends in a space so
+            // nothing executes) and route through the SAME `deliver_paste`
+            // seam as text — the pastejacking guard applies uniformly (inert
+            // here by construction: Win32 filenames cannot contain a newline).
+            // PRECEDENCE IS TEXT-FIRST, above: when both formats are up
+            // (Explorer's "Copy as path" offers text alongside the HDROP) the
+            // text is what the user chose to copy. Deliberately NOT in
+            // `pbpaste` itself — the find bar and rename editor share that
+            // reader and must never receive quoted path spam (see
+            // `clipboard_win::get_paths`).
+            #[cfg(windows)]
+            if let Some(paths) = crate::clipboard_win::get_paths() {
+                let text = input::paths_paste_insertion(&paths);
+                if !text.is_empty() {
+                    self.deliver_paste(wid, text, Source::Human);
+                }
+            }
         }
         // Linux/X11: the own-selection read is instant (stored slot, no round-trip),
         // so deliver it synchronously. A FOREIGN owner requires a `ConvertSelection`
@@ -12118,13 +12930,30 @@ impl App {
         // deserves a refresh on the next epoch move it hasn't consumed.
         let stale = self.title_drift.seen.get(&session).copied() != Some(live_epoch)
             || self.windows.values().any(|ws| {
-                ws.tab_set.tabs().iter().any(|tab| {
-                    self.view_store
-                        .get(tab.focus)
-                        .copied()
-                        .and_then(tab_model::View::terminal_session)
-                        == Some(session)
-                }) && ws.tab_title_epochs.get(&session).copied() != Some(live_epoch)
+                // MPT-5 (the cheap half): the two conjuncts are pure, and they
+                // were in the wrong order. In the STEADY state — the flood
+                // case, and the only one that runs at the reader's batch rate —
+                // the first disjunct above is false, so this runs on every
+                // burst; and for the window that actually labels the session,
+                // the per-window epoch cache is CURRENT, so the whole
+                // conjunction is decided by one `HashMap` probe. Testing the
+                // O(tabs) tree walk first paid ~30 `Tab` touches and ~30
+                // `view_store` probes per window per burst to reach the same
+                // answer — ~90k probes/s at 30 tabs and 3000 bursts/s, for a
+                // predicate whose cheap half already settles it.
+                //
+                // This is NOT the reverse index MPT-5 asks for: a window that
+                // does not label the session has no cache entry, so it still
+                // pays the walk to prove that. It is the part that is provably
+                // free — `A && B` is `B && A` for pure `A`, `B`.
+                ws.tab_title_epochs.get(&session).copied() != Some(live_epoch)
+                    && ws.tab_set.tabs().iter().any(|tab| {
+                        self.view_store
+                            .get(tab.focus)
+                            .copied()
+                            .and_then(tab_model::View::terminal_session)
+                            == Some(session)
+                    })
             });
         if !stale {
             return;
@@ -12168,10 +12997,11 @@ impl App {
         // be stale — a flood keeps moving; consuming the LIVE value here is
         // what makes a flush absorb every change since the last one).
         let Some((live_epoch, live_title, live_cwd, timeline)) = s.term.try_lock().ok().map(|t| {
+            use crate::cwd_native::ReportedCwd as _;
             (
                 t.title_epoch(),
                 t.title().to_string(),
-                t.current_working_directory().map(str::to_string),
+                t.native_working_directory().map(|cwd| cwd.into_owned()),
                 s.ctx.timeline.clone(),
             )
         }) else {
@@ -12737,6 +13567,23 @@ impl ApplicationHandler<Wake> for App {
         // Park point: the loop finished this iteration and is about to sleep in the
         // OS event wait, so the watchdog's heartbeat legitimately freezes here.
         crate::watchdog::beat(crate::watchdog::Breadcrumb::AboutToWait);
+        // Windows end-session persistence: keep a fresh layout snapshot published
+        // for the WM_QUERYENDSESSION wndproc chain (`platform_win`), which cannot
+        // read `App` (it re-enters while `run_app` holds the `&mut` borrow) and so
+        // writes this pre-captured copy when a shutdown/restart/sign-out arrives —
+        // the case where the graceful-exit `restore::write` below `run_app` never
+        // runs. TTL-debounced (one cheap in-memory layout walk every ~2 s); a
+        // restore-disabled config RETRACTS the snapshot so end-session honours the
+        // same gate as the graceful exit. Never headless — a headless run's layout
+        // must not overwrite the user's manifest (the exit path's rule).
+        #[cfg(windows)]
+        if !self.headless && platform_win::end_session_snapshot_due() {
+            platform_win::set_end_session_snapshot(
+                self.config
+                    .restore_session_or_default()
+                    .then(|| self.capture_restore_manifest()),
+            );
+        }
         // A title snapshot that lost a nonblocking terminal-lock race is retried from
         // this event-loop-owned lane. Its short fixed deadline below preserves
         // one-shot OSC/block transitions without ever waiting on the parser mutex.
@@ -12817,6 +13664,9 @@ impl ApplicationHandler<Wake> for App {
             {
                 ws.last_present = None;
                 w.set_visible(true);
+                // L1 reveal ledger (first-write-wins): the deadline fallback can
+                // be a handoff boot's first actual reveal — record it honestly.
+                crate::metrics::mark_first_window_visible();
                 w.request_redraw();
             }
         }
@@ -13141,84 +13991,34 @@ impl ApplicationHandler<Wake> for App {
                     metrics::DeadlineOwner::FrameCap,
                 );
             }
-            // LUMEN cursor aurora: while any light is alive on a
-            // focused window, re-present so the comet/bloom/ring/sparks animate, then
-            // disarm (→ pure `Wait`, 0% idle) the moment they decay to nothing. The
-            // cadence is the PANEL's own refresh ([`effect_tick_interval`]): the
-            // grid's content presents at the panel rate, so an effect train
-            // pinned to 60 fps hands a 120 Hz ProMotion panel the same comet
-            // twice and lands every second frame ~8.3 ms stale. Coarse-only
-            // effects still take their own deadlines below, so the extra wakes
-            // are confined to light that is actually MOVING.
-            // M2 stream fade joins the same frame-paced wake: while any ink is
-            // still drying (or the LAST present painted a tint that must be
-            // settled to exact bytes), keep presenting; disarm the moment
-            // everything is dry (0% idle). Deliberately NOT focus-gated, unlike
-            // the aurora terms: a focus loss mid-fade demotes the motion policy
-            // to Reduced (a bypass), and the erase frame that settles the tinted
-            // pixels to exact bytes must still present on the unfocused window.
+            // THE TERMINAL-EFFECTS LANE: the LUMEN cursor aurora, the M2 stream
+            // fade, the reduced-motion cat's one-shot erase — and now the CHROME
+            // DECORATIONS. Robi, the typed dog, the reduced-motion sing still and
+            // the companion's wince follow-up are drawn by
+            // `redraw_window`/`redraw_compose` out of their own state machines, so
+            // not one of them shows up in `cursor_fx_active` — Robi in particular
+            // is deliberately un-focus-gated chrome furniture with no engine
+            // behind him at all. They used to buy their next frame with a
+            // `request_redraw()` from inside the redraw handler, which on Windows
+            // re-invalidates the HWND before the wait is ever entered and
+            // free-runs the loop at ~52k wakes/sec (see `deco_anim_until`).
+            //
+            // The whole three-way decision lives in `plan_terminal_effect_lane`
+            // rather than inline here (which is where the per-arm reasoning moved
+            // with it): it is the REAL scheduling decision, and the property that
+            // matters most about it — that a park which does not redraw this
+            // window PRESERVES the pending tick instead of dropping it — is a
+            // sequence, only pinnable if it can be driven without an OS event
+            // loop.
             let now = Instant::now();
-            let terminal_front = ws.front_terminal().is_some();
-            let fade_wake = terminal_front
-                && !ws.is_split()
-                && (ws.fade_shown || ws.stream_fade.is_active(now));
-            if ws.os_window.is_some() && ws.terminal_effect_frame_active(now, cursor_cat_motion) {
-                let aurora_interval = effect_tick_interval(ws.frame_interval);
-                // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember
-                // tail. If the ONLY live cursor effect is the glow's slowly-
-                // cooling ember (no moving light, no rainbow/cat/trail/deco, no
-                // fade), poll at the glow's coarse ember cadence — the present
-                // gate dedups the imperceptible frames, so a keypress never lands
-                // behind a needless 60 fps re-tick. Any moving light or other
-                // effect keeps the full frame cadence.
-                let cursor_dependents =
-                    ws.cursor_dependents_need_frame_cadence(now, cursor_cat_motion);
-                debug_assert_eq!(
-                    ws.cursor_fx_active(now, cursor_cat_motion),
-                    ws.cursor_glow.is_active() || cursor_dependents,
-                    "cursor activity and frame-cadence sets must stay identical"
-                );
-                let others_need_cadence = fade_wake || cursor_dependents;
-                let glow_deadline = ws.cursor_glow.next_change_deadline(now, aurora_interval);
-                let needs_frame_cadence =
-                    others_need_cadence || ws.cursor_glow.needs_frame_cadence();
-                // PHASE-LOCKED re-arm: continue the previous deadline train
-                // (`fired + interval`) so the effective cadence stays the cap
-                // instead of `interval + frame cost`. A fired deadline more than
-                // one interval old (an overloaded frame) falls back to
-                // `now + interval` — no catch-up burst, the next period is full.
-                let last_fire = ws.last_trail_fire.take();
-                let d = *ws.next_trail_tick.get_or_insert_with(|| {
-                    crate::app_render::phase_locked_effect_deadline(
-                        now,
-                        aurora_interval,
-                        last_fire,
-                        glow_deadline,
-                        needs_frame_cadence,
-                    )
-                });
+            let has_glass = ws.os_window.is_some();
+            if let Some(d) = ws.plan_terminal_effect_lane(now, cursor_cat_motion, has_glass) {
                 fold_owned_deadline(
                     &mut deadline,
                     &mut deadline_owner,
                     d,
                     metrics::DeadlineOwner::CursorEffect,
                 );
-            } else if ws.os_window.is_some()
-                && let Some(d) = ws.static_cursor_cat_deadline(now, cursor_cat_motion)
-            {
-                // One bounded hold, one erase wake. No frame cadence and no
-                // bob/fade work under reduced motion.
-                ws.next_trail_tick = Some(d);
-                fold_owned_deadline(
-                    &mut deadline,
-                    &mut deadline_owner,
-                    d,
-                    metrics::DeadlineOwner::CursorEffect,
-                );
-            } else {
-                // Effects idle or no terminal surface: drop every scheduler
-                // clock. A fresh terminal burst starts a fresh deadline train.
-                ws.park_terminal_effect_scheduler();
             }
             // PHOSPHOR rain: while the engine is active (raining OR draining
             // — deliberately NOT focus-gated, the fade_wake precedent: an
@@ -13744,13 +14544,48 @@ impl ApplicationHandler<Wake> for App {
         // SEAMLESS WINDOW CARRY: reappear where the outgoing window was. Applied
         // after attach (winit has no reliable pre-create position on macOS) —
         // the move happens before the first present, so there is no visible hop.
-        if let Some((x, y)) = self.seamless_position.take()
+        let carried_position = self.seamless_position.take();
+        if let Some((x, y)) = carried_position
             && let Some(w) = self
                 .windows
                 .get(&target_id)
                 .and_then(|ws| ws.os_window.as_ref())
         {
             w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+        }
+        // W3: the BOOTSTRAP window's persisted frame. `apply_restore_manifest`
+        // (deferred to `about_to_wait`) maps the manifest's first window onto
+        // this one for its TABS, but historically applied no geometry to it at
+        // all — quitting reopened window 1 at the OS default position (and,
+        // before the grid seed in `run`, at the config-default size), losing
+        // both halves of "come back exactly where it was". Applied HERE, before
+        // the first present, for the same no-visible-hop reason as the carry
+        // above; the manifest is still un-drained (`pending_restore` is consumed
+        // in `about_to_wait`), so this is a read, not a steal. The seamless
+        // carry outranks it: the carry is the LIVE position snapshotted at
+        // handoff, the manifest an earlier write. Position first — validated
+        // against the monitors that exist NOW (W4, the undocked-laptop case) —
+        // then the maximized state, because winit's `set_outer_position` clears
+        // the OS MAXIMIZED flag and the position is what picks the monitor the
+        // maximize lands on. `Some(true)` only: an old manifest's `None` must
+        // never force a state change.
+        if carried_position.is_none()
+            && let Some(w) = self
+                .windows
+                .get(&target_id)
+                .and_then(|ws| ws.os_window.as_ref())
+        {
+            let first = self.pending_restore.as_ref().and_then(|m| m.windows.first());
+            let outer = first.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)));
+            let maximized = first.and_then(|wl| wl.maximized);
+            if let Some((x, y)) = outer
+                && crate::app_window::restored_position_on_screen(w, x, y)
+            {
+                w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            if maximized == Some(true) {
+                w.set_maximized(true);
+            }
         }
         // OVERLAP HANDOFF: the window was created HIDDEN (reveal-at-first-
         // present), and macOS does not reliably deliver `RedrawRequested` to a
@@ -14686,23 +15521,9 @@ impl ApplicationHandler<Wake> for App {
             // burst coalesces to the latest value) and repaint every window so
             // each policy consumer settles — an active aurora clears on its next
             // tick, sparkles go static, the scene re-geometries, the demo freezes.
-            Wake::ReduceMotionChanged => {
-                let v = self.apprt.reduce_motion();
-                // `motion = "full"` may override this OS fact; the shared edge
-                // reducer checks effective per-window policy and settles only
-                // windows that actually became Reduced.
-                let motion_changed = self.apply_system_reduce_motion(v, Instant::now());
-                let appearance_changed = native_appearance::install_preferences(
-                    self.apprt.native_appearance_preferences(),
-                );
-                if motion_changed || appearance_changed {
-                    for ws in self.windows.values() {
-                        if let Some(w) = ws.os_window.as_ref() {
-                            w.request_redraw();
-                        }
-                    }
-                }
-            }
+            // (macOS posts this; the Windows seams call the same reducer directly —
+            // see `resample_os_preferences`.)
+            Wake::ReduceMotionChanged => self.resample_os_preferences(),
             // Self-healing: a ledger threshold event from the background update
             // thread (persistent failure) — surface it.
             Wake::UpdateHealth { title, body } => {
@@ -14865,7 +15686,7 @@ impl ApplicationHandler<Wake> for App {
             Wake::PkgSeedUnusable { detail } => {
                 aterm_log::info!("atpkg seed unusable: {detail}");
                 self.surface_nonmodal_update_status(
-                    "⚠ No ALab toolchain for this Mac's architecture",
+                    "⚠ No ALab toolchain for this machine's architecture",
                 );
             }
             Wake::PkgSeed { installed, pending } => {
@@ -15165,6 +15986,16 @@ impl ApplicationHandler<Wake> for App {
                     if self.pending_deminiaturize_focus == Some(wid) {
                         self.pending_deminiaturize_focus = None;
                     }
+                    // H5 partial: Windows has no live `WM_SETTINGCHANGE` observer
+                    // yet (§3.2/W0), and focus-gain is exactly when a Settings
+                    // flip made in another window becomes user-visible — so
+                    // re-sample the OS reduce-motion / appearance preferences
+                    // here. Two `SystemParametersInfoW` reads on a rare event;
+                    // a no-op repaint-wise unless a sampled fact changed. macOS
+                    // needs none of this (its NSWorkspace observer posts
+                    // `Wake::ReduceMotionChanged` live).
+                    #[cfg(windows)]
+                    self.resample_os_preferences();
                 }
                 self.on_focus(wid, f);
             }
@@ -15427,6 +16258,14 @@ impl ApplicationHandler<Wake> for App {
                 // Also re-resolve aterm's OWN rendered theme if `theme` config uses a
                 // `dark:…,light:…` split (a no-op for a single, non-split theme).
                 self.sync_app_theme_to_appearance(appearance);
+                // H5 partial: an OS light/dark move often travels WITH an
+                // accessibility change (activating a High Contrast scheme flips
+                // the apps theme too), and this is the one live OS-appearance
+                // event Windows delivers without the §3.2 hook — so re-sample the
+                // reduce-motion / appearance preferences on the same edge.
+                // Cheap (two SPI reads) and idempotent; see the focus-gain twin.
+                #[cfg(windows)]
+                self.resample_os_preferences();
             }
             _ => {}
         }
@@ -15579,7 +16418,15 @@ mod cg_capture {
 /// through `PATH` would let an earlier entry supply a fake `atpkg`.
 fn co_located_atpkg() -> Option<std::path::PathBuf> {
     let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
-    let candidate = exe.parent()?.join("atpkg");
+    // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): the bare `join("atpkg")`
+    // probe came up empty on EVERY Windows install — `atpkg.exe` sits right next
+    // to the exe, bare `atpkg` does not — so the toolchain lane never started and
+    // Settings ▸ Packages reported "Package manager unavailable" as if this were
+    // a dev build. The CLI's sibling probe (`aterm-cli`'s `front_door_path_env`)
+    // already spells it this way.
+    let candidate = exe
+        .parent()?
+        .join(format!("atpkg{}", std::env::consts::EXE_SUFFIX));
     candidate.is_file().then_some(candidate)
 }
 
@@ -16114,6 +16961,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // AppUserModelID (design §6). Harmless on a console `--version` run.
     #[cfg(windows)]
     win32::set_app_user_model_id();
+    // Windows lifecycle: opt into OS-driven relaunch (update reboot / "restart
+    // apps after sign-in" / post-crash), paired with the end-session manifest
+    // save in `platform_win` so the relaunched process restores the session.
+    #[cfg(windows)]
+    win32::register_application_restart();
     // Raise the timer resolution to 1ms so the winit `WaitUntil` deadlines that pace
     // every animation (the cursor-trail comet, blink) land on a steady cadence instead
     // of Windows' coarse ~15.6ms default grid — the fix for the "gappy/laggy" trail and
@@ -16269,6 +17121,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     #[cfg(target_os = "macos")]
     let out_of_band_handoff = handoff_rendezvous::rendezvous_present();
     #[cfg(not(target_os = "macos"))]
+    #[allow(unused_variables)] // read only by the macOS lanes below
     let out_of_band_handoff = false;
     // The proof term the PARENT hashed its expectation over — stated on the wire,
     // because a launched attempt that fell back to the fork lane still expects
@@ -16587,6 +17440,37 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             (false, Some(explicit)) => explicit,
             (false, None) => true,
         };
+    // H1 (Windows Mica/Acrylic): when the config asks for a client-area backdrop
+    // (`background_material != none`), latch the DirectComposition VISUAL
+    // swapchain BEFORE the backend build below creates the wgpu instance — the
+    // presentation system is an instance-level property and cannot be changed
+    // later. Gates, each load-bearing:
+    //   * GPU only — the CPU softbuffer path has no per-pixel alpha to present,
+    //     and a `WS_EX_NOREDIRECTIONBITMAP` window has no GDI surface for
+    //     softbuffer to blit into at all.
+    //   * windowed only — headless has no window, no DWM, and the introspection
+    //     captures must stay byte-identical.
+    //   * `hdr_glow` OFF — the scRGB EDR swapchain and the composition visual
+    //     are mutually exclusive (unverified colour/alpha semantics of a
+    //     linear-light DComp visual); HDR wins here, with a diagnostic, and the
+    //     renderer-side `set_hdr_glow` guard covers the reload direction.
+    // The default (`background_material = "none"`) takes none of these branches:
+    // the HWND swapchain path is byte-identical to before H1.
+    #[cfg(windows)]
+    if want_gpu
+        && !headless
+        && config.background_material_or_default() != app_config::BackgroundMaterial::None
+    {
+        if config.hdr_glow_or_default() {
+            eprintln!(
+                "aterm-gui: background_material and hdr_glow are mutually exclusive on Windows \
+                 (the DirectComposition backdrop swapchain cannot carry the scRGB EDR tag); \
+                 keeping hdr_glow — set hdr_glow = false to see the backdrop"
+            );
+        } else {
+            aterm_gpu::request_dx12_visual_swapchain();
+        }
+    }
     // Renderer theme (window clear colour, cursor, selection) from config; the
     // engine themes the CELLS, this themes the chrome around them.
     let theme = config.theme_for_with_assets(
@@ -16673,6 +17557,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 }
                 Err(e) => {
                     eprintln!("aterm-gui: GPU unavailable ({e}); using CPU renderer");
+                    // H1 (Windows Mica/Acrylic): withdraw the visual-swapchain
+                    // request so windows attached AFTER this failure are created
+                    // WITHOUT `WS_EX_NOREDIRECTIONBITMAP` (softbuffer needs the
+                    // redirection surface). A first window that raced ahead of
+                    // this failure may already carry the style — creation
+                    // overlaps this build by design (#7) — and cannot shed it
+                    // (the style is CreateWindowEx-only); that double-failure
+                    // window renders black until restart, so say so.
+                    #[cfg(windows)]
+                    if aterm_gpu::dx12_visual_swapchain_requested() {
+                        aterm_gpu::withdraw_dx12_visual_swapchain();
+                        eprintln!(
+                            "aterm-gui: background_material needs the GPU renderer; the backdrop \
+                             is disabled this run (an already-created window may render blank — \
+                             remove background_material or fix the GPU to recover)"
+                        );
+                    }
                     (Backend::Cpu(build_cpu()), false)
                 }
             }
@@ -17050,6 +17951,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // the baseline env, the engine config, the shell-integration decision, the
     // cwd, and the latency state). `spawn_session` stands up the PTY + engine +
     // policy + OSC52 + reader thread per tab; session 0 is created the same way so
+    // Secure Keyboard Entry, at LAUNCH: record the user's standing wish before
+    // the first shell can prompt for anything — a password typed into the
+    // first prompt is exactly what the switch exists to guard. Engagement
+    // itself waits for the focus gate (`secure_input::set_app_active`, from
+    // `on_focus`): protection is live precisely when keystrokes can reach
+    // this process, and never taxes the desktop while aterm is backgrounded
+    // (TN2150). The config commit path re-records on every save, WITH a
+    // user-facing banner on refusal; at launch the module's log line is the
+    // only channel — no window exists yet to carry a banner.
+    let _ = secure_input::set_desired(config.secure_keyboard_entry_or_default());
     // the single-session startup is byte-identical to the old inline code.
     let session_factory = SessionFactory {
         spawn_cap,
@@ -17108,6 +18019,33 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         restore::take().filter(|manifest| !manifest.is_empty())
     } else {
         None
+    };
+    // W3: a COLD restore's first window reopens at its PERSISTED grid, not the
+    // config default — the size half of window 1's geometry (the position and
+    // maximized halves apply post-attach in `resumed`, where an OS window
+    // exists). Seeded HERE, before session 0 spawns, so the PTY's first winsize
+    // and the created frame are right from the start instead of hopping after
+    // the deferred restore. Precedence: carry > env > manifest > config — the
+    // seamless carry is the LIVE frame at handoff (it outranks everything, and
+    // on the adopt path the manifest IS the handoff layout, so deferring to the
+    // carry also keeps the two sources from fighting); an explicit
+    // `--columns`/`--lines` is a per-launch request that beats the persisted
+    // session; a config `columns` is the static default restore exists to
+    // supersede. A MAXIMIZED capture is deliberately NOT seeded: its rows/cols
+    // are the maximized grid, and building the normal (restore-down) frame at
+    // that size would leave un-maximizing with a monitor-sized window — the
+    // config-default frame is the closest honest restore-down we have without
+    // persisting the normal rect's size too.
+    let (rows, cols) = match restore_manifest.as_ref().and_then(|m| m.windows.first()) {
+        Some(wl) if carry_frame.is_none() && wl.maximized != Some(true) => (
+            app_config::explicit_initial_lines()
+                .unwrap_or(wl.rows)
+                .clamp(5, 300),
+            app_config::explicit_initial_columns()
+                .unwrap_or(wl.cols)
+                .clamp(20, 500),
+        ),
+        _ => (rows, cols),
     };
     // Session 0: on the adopt path, the shell whose id matches the manifest's first leaf
     // (so session 0 lands in its original first pane); fall back to any handed-off shell
@@ -17445,6 +18383,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // W9: malformed variable-font requests were skipped by the same startup
     // generation and ride the shared warning banner.
     cfg_warns.extend(vf_warns);
+    // L6: evidence that the PREVIOUS run crashed (a non-empty fatal-signal
+    // marker or a panic report in the log dir — see `logging::take_crash_evidence`)
+    // rides the same one-shot banner. Until this line, `crash_signal` carefully
+    // PRESERVED those artifacts and nothing ever read them, so a crash was
+    // completely silent at the next launch. Skipped headless: the scan CONSUMES
+    // (renames) the artifact, and a windowless run has no banner surface — it
+    // must not eat the notice the next windowed launch would have shown.
+    if !headless && let Some(crash_notice) = logging::take_crash_evidence() {
+        cfg_warns.push(crash_notice);
+    }
     for w in &cfg_warns {
         eprintln!("aterm-gui: {w}");
     }
@@ -20716,6 +21664,423 @@ mod multi_window_tests {
         assert!(
             fresh.windows[&wid].cursor_glow.reflow_hint_armed(),
             "an out-of-band re-grid is its own gesture and is licensed"
+        );
+    }
+
+    /// MPT-1 BEHAVIOUR IDENTITY, end to end: an all-tabs WIDTH settle across a
+    /// multi-tab, multi-pane window gives EVERY pane its off-screen history
+    /// back — whoever ran the rewrap, in whatever order, and however many
+    /// workers were allowed to run at once.
+    ///
+    /// This is the one property a concurrency change can break. A job that is
+    /// dropped without `finish_resize_offload` / `abort_resize_offload` leaves
+    /// `scrollback_detached_for_reflow` latched true forever and makes that
+    /// session's tiered history permanently invisible (audit #5) — which reads,
+    /// from out here, as `scrollback_lines() == 0` that never recovers. The
+    /// quiescence poll is PER-SESSION on purpose: libtest runs this alongside
+    /// other tests that submit their own reflow jobs, so a process-global
+    /// counter would be a flaky witness while "my panes have their history
+    /// back" is exact.
+    #[test]
+    fn an_all_tabs_width_settle_returns_every_panes_history() {
+        fn history(app: &App, id: u64) -> usize {
+            let term = app.pool.get(id).expect("pooled session").term.clone();
+            let t = super::term_lock(&term);
+            t.grid().scrollback_lines()
+        }
+        fn settled(app: &App, ids: &[u64]) -> bool {
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if ids.iter().all(|&id| history(app, id) > 0) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.rows = 24;
+            ws.cols = 100;
+        }
+        app.resize_panes_scoped(wid, false);
+        // Three tabs x two panes: the shape whose per-pane hand-off count is
+        // what used to become a thread count.
+        let _ = app.split_active_stub_tab(wid);
+        for _ in 0..2 {
+            let sid = app.next_session_id;
+            app.push_stub_tab(wid, stub_session(sid));
+            let _ = app.split_active_stub_tab(wid);
+        }
+        let mut ids: Vec<u64> = app.pool.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        assert_eq!(ids.len(), 6, "three tabs x two panes");
+
+        // REAL off-screen history in every pane — an empty store re-attaches
+        // vacuously and would prove nothing.
+        for &id in &ids {
+            let term = app.pool.get(id).expect("pooled session").term.clone();
+            let mut t = super::term_lock(&term);
+            for i in 0..200u32 {
+                t.process(format!("line {i:04} of session {id}\r\n").as_bytes());
+            }
+        }
+        assert!(settled(&app, &ids), "the staging resizes converged");
+        let before: Vec<usize> = ids.iter().map(|&id| history(&app, id)).collect();
+        assert!(
+            before.iter().all(|&n| n >= 100),
+            "every pane must own real off-screen history before the settle"
+        );
+
+        // THE SETTLE: one eager AllTabs WIDTH change over all six panes.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.cols = 72;
+        }
+        app.resize_panes_scoped(wid, false);
+        assert!(
+            settled(&app, &ids),
+            "a pane never got its history back — the settle dropped a job and \
+             wedged that session's detach window"
+        );
+        for (&id, &n0) in ids.iter().zip(before.iter()) {
+            let n = history(&app, id);
+            assert!(
+                n >= n0,
+                "session {id}: the rewrap lost history ({n0} -> {n} lines)"
+            );
+        }
+        // The CONCURRENCY invariant, read from the process-global gauge: it is
+        // a high-water mark, so it stays a valid assertion even with other
+        // tests' jobs in flight — if ANY instant ever had more workers running
+        // than the bound allows, this fails.
+        let peak = usize::try_from(crate::app_render::reflow_gauge::snapshot().peak)
+            .unwrap_or(usize::MAX);
+        let ceiling = crate::app_render::reflow_worker_ceiling();
+        assert!(
+            peak <= ceiling,
+            "{peak} reflow workers ran at once, above the pool ceiling {ceiling}"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// MPT-2 PARITY: hoisting the `active_only` filter UPSTREAM of the layout
+    /// must not change WHICH panes a scoped pass reaches. The one contract that
+    /// crosses the tab boundary is SHARED (`views > 1`) sessions — they stay
+    /// eager on every tab so their element-wise-min geometry cannot desync a
+    /// co-viewer — so the upstream predicate has to be `any_leaf(views > 1)`
+    /// and not `ti == active`. This pins all three outcomes at once: the active
+    /// tab reflows, a plain background tab stays deferred, and a SHARED session
+    /// sitting in a background tab is still driven to the min across its
+    /// FOREGROUND viewers.
+    #[test]
+    fn a_scoped_resize_still_reaches_a_shared_background_tab() {
+        let mut app = App::headless_for_test(); // window 0 = 24x80, tab 0 = session 0
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, stub_session(1)); // tab 1 = session 1 (plain)
+        app.push_stub_tab(wid, stub_session(2)); // tab 2 = session 2
+        // Share TAB 0's session into a SECOND window (views 1 -> 2) and give
+        // that window a DISTINCT grid, so the shared min-geometry is a real
+        // observable target rather than "unchanged" (which a deferred tab and a
+        // reached one would look identical under).
+        app.switch_tab_in(wid, 0);
+        let other = app
+            .open_active_session_in_new_window_logical()
+            .expect("the front window has an active session to share");
+        if let Some(ws) = app.windows.get_mut(&other) {
+            ws.rows = 20;
+            ws.cols = 60;
+        }
+        app.frontmost_window = Some(wid);
+        app.switch_tab_in(wid, 2);
+        assert_eq!(app.pool.views(0), Some(2), "session 0 is shared");
+
+        let size = |app: &App, id: u64| {
+            let t = super::term_lock(&app.pool.get(id).expect("pooled session").term);
+            (t.rows(), t.cols())
+        };
+        // Grow window 0's grid and run ONE live-drag (active-only) pass.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.rows = 30;
+            ws.cols = 100;
+        }
+        app.resize_panes_scoped(wid, true);
+
+        assert_eq!(size(&app, 2), (30, 100), "the ACTIVE tab reflows this tick");
+        assert_eq!(
+            size(&app, 1),
+            (24, 80),
+            "a plain BACKGROUND tab stays deferred — laying it out is exactly \
+             the work the upstream filter exists to skip"
+        );
+        assert_eq!(
+            size(&app, 0),
+            (20, 60),
+            "the SHARED session in a BACKGROUND tab is still driven to the \
+             element-wise min across its foreground viewers"
+        );
+        assert!(
+            app.windows[&wid].panes_stale,
+            "a deferred background tab marks the window panes_stale"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// MPT-3 HONESTY: a `Wake::Output` stamp armed while its pane was OFF this
+    /// window's glass is never booked as render latency, and the walk that
+    /// books latency only ever touches the ACTIVE tab's panes.
+    ///
+    /// The first three assertions are a PARITY pin — they held before the walk
+    /// was narrowed to the active plan and they hold after, because a hidden
+    /// pane's stamp was discarded by the per-present sweep then and is
+    /// discarded at the reveal now. The last block is the ONE deliberate
+    /// divergence, and it is the artifact the old sweep could not catch: a
+    /// stamp armed while hidden and revealed by a tab switch with NO present in
+    /// between used to be booked in full — a whole second of "render latency"
+    /// for an interval nobody was watching.
+    #[test]
+    fn a_revealed_panes_stale_output_stamp_is_discarded_not_booked() {
+        use std::sync::atomic::Ordering::Relaxed;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, stub_session(1)); // tab 1 = session 1 (now active)
+        app.switch_tab_in(wid, 0); // tab 0 (session 0) is what this glass shows
+        let arm = |app: &App, id: u64, age_ns: u64| {
+            // THE EPOCH HAS TO BE OLDER THAN THE AGE BEING SIMULATED. `lat_epoch`
+            // starts when this `App` is built, so on a microseconds-old epoch
+            // `now - age` saturates to ZERO — which is precisely the walk's
+            // "unarmed" sentinel. Every assertion below would then pass over a
+            // dark pool, including the two that must FAIL if the discard breaks.
+            // Waiting the epoch out (once, for the longest age this test uses)
+            // is what makes the stamps real; it is not politeness.
+            while (app.lat_epoch.elapsed().as_nanos() as u64) <= age_ns {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            let now = app.lat_epoch.elapsed().as_nanos() as u64;
+            let stamp = now - age_ns;
+            assert!(stamp > 0, "a zero stamp reads as UNARMED, not as aged");
+            app.pool
+                .get(id)
+                .expect("pooled session")
+                .last_output_ns
+                .store(stamp, Relaxed);
+        };
+        // Establish the visible set with one present-time walk.
+        assert_eq!(app.present_latency_ns(wid), 0, "nothing armed, nothing booked");
+
+        // PARITY 1: a burst in the HIDDEN tab is not this glass's latency.
+        arm(&app, 1, 1_000_000_000);
+        assert_eq!(
+            app.present_latency_ns(wid),
+            0,
+            "a hidden pane's wait must never be booked against the visible \
+             window's present"
+        );
+        // PARITY 2: the VISIBLE pane's burst is booked, then consumed.
+        arm(&app, 0, 2_000_000);
+        let dt = app.present_latency_ns(wid);
+        assert!(
+            (2_000_000..5_000_000_000).contains(&dt),
+            "the visible pane's 2 ms wait must be booked (got {dt} ns)"
+        );
+        assert_eq!(
+            app.present_latency_ns(wid),
+            0,
+            "a booked stamp must be consumed so the next burst restarts the clock"
+        );
+
+        // THE ONE DELIBERATE DIVERGENCE: arm the hidden pane and reveal it with
+        // NO present in between, so nothing had a chance to sweep the stamp.
+        arm(&app, 1, 1_000_000_000);
+        app.switch_tab_in(wid, 1);
+        assert_eq!(
+            app.present_latency_ns(wid),
+            0,
+            "a stamp that aged through an unwatched interval must be discarded \
+             at the reveal, not booked as a second of render latency"
+        );
+        // ...and the pane keeps working: a burst arriving while it IS on the
+        // glass is booked normally.
+        arm(&app, 1, 3_000_000);
+        let dt = app.present_latency_ns(wid);
+        assert!(
+            (3_000_000..5_000_000_000).contains(&dt),
+            "the newly revealed pane must book its own honest waits (got {dt} ns)"
+        );
+    }
+
+    /// MPT-4 PARITY: the O(1) deadline gate in front of the status sweep must
+    /// never defer a classification the whole-pool scan would have made.
+    ///
+    /// Two things could go wrong and both are pinned here. (1) The gate could
+    /// close while a session IS due — the sweep would then silently stop
+    /// classifying and a finished build would show busy forever. (2) A
+    /// BRAND-NEW session has no slot, and `due()` reports an unknown id as due
+    /// immediately; if the gate keyed only on the known slots' deadlines, that
+    /// newcomer would wait out a whole observation interval for its first
+    /// classification. The pool's insert epoch is what forces the gate open for
+    /// it, and this test is the reason that epoch exists.
+    #[test]
+    fn the_status_gate_never_defers_a_classification_the_scan_would_make() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        assert!(
+            app.config.tab_status_or_default(),
+            "the fixture must have the classifier ON, or this proves nothing"
+        );
+        // First sweep: session 0 has no slot, so it is due and gets classified.
+        assert!(app.session_status.due(0, t0), "an unobserved session is due");
+        let _ = app.observe_session_statuses(t0);
+        let inside = t0 + std::time::Duration::from_millis(1);
+        assert!(
+            !app.session_status.due(0, inside),
+            "a just-classified session is rate-limited for one interval"
+        );
+        // GATED: nothing is due, so the sweep answers empty — the same answer
+        // the O(sessions) scan gave, in O(1).
+        assert!(
+            app.observe_session_statuses(inside).is_empty(),
+            "a sweep inside the interval publishes nothing"
+        );
+
+        // A BRAND-NEW session must be classified on the very NEXT wake, not one
+        // interval later: its insert moves the pool epoch, which forces the
+        // gate open even though every KNOWN slot is still rate-limited.
+        app.push_stub_tab(wid, stub_session(1));
+        let after = inside + std::time::Duration::from_millis(1);
+        assert!(
+            app.session_status.due(1, after),
+            "the newcomer has no slot, so the scan would have classified it"
+        );
+        let _ = app.observe_session_statuses(after);
+        assert!(
+            !app.session_status.due(1, after),
+            "the newcomer was NOT classified on the next wake — the gate \
+             deferred work the whole-pool scan would have done"
+        );
+
+        // Past the interval everything is due again and the sweep resumes.
+        let later = t0 + std::time::Duration::from_secs(2);
+        assert!(app.session_status.due(0, later), "the interval expires");
+        let _ = app.observe_session_statuses(later);
+        assert!(
+            !app.session_status.due(0, later),
+            "the expired session was re-observed"
+        );
+    }
+
+    /// MPT-4, THE CONTENDED HALF. The classify path takes each session's
+    /// terminal with `try_lock` and SKIPS the session when the PTY reader holds
+    /// it — which, under exactly the output flood this gate exists to survive,
+    /// is not rare. A session skipped that way still has NO slot, so the
+    /// whole-pool scan the gate replaces would retry it on the very next wake.
+    /// The gate must too: banking the pool epoch over an unclassified newcomer
+    /// would park its first status behind some OTHER session's interval.
+    ///
+    /// This is the one hole a deadline-keyed gate can have that the scan cannot,
+    /// so it is pinned from outside with a genuinely held lock rather than
+    /// argued about in a comment.
+    #[test]
+    fn the_status_gate_stays_open_over_a_session_it_could_not_classify() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        let _ = app.observe_session_statuses(t0); // session 0 earns a slot
+        let inside = t0 + std::time::Duration::from_millis(1);
+        assert!(
+            app.observe_session_statuses(inside).is_empty(),
+            "the gate closes once every live session is classified and current"
+        );
+
+        // A newcomer whose terminal lock is HELD, standing in for its PTY
+        // reader mid-batch. The insert opens the gate; the held lock is what
+        // makes the sweep unable to act on it.
+        app.push_stub_tab(wid, stub_session(1));
+        let term = app.pool.get(1).expect("pooled session").term.clone();
+        let held = super::term_lock(&term);
+        let t1 = inside + std::time::Duration::from_millis(1);
+        let _ = app.observe_session_statuses(t1);
+        assert!(
+            app.session_status.due(1, t1),
+            "the contended session was not classified — the premise of this test"
+        );
+        drop(held);
+
+        // THE GUARD: the very next wake must still reach it, exactly as the
+        // whole-pool scan would have.
+        let t2 = t1 + std::time::Duration::from_millis(1);
+        let _ = app.observe_session_statuses(t2);
+        assert!(
+            !app.session_status.due(1, t2),
+            "the gate closed over a session it had never classified — its first \
+             status now waits out another session's whole interval"
+        );
+    }
+
+    /// MPT-5 (the reordered gate): the per-window conjunction that catches "a
+    /// window STARTED labeling this session since the last flush" must keep
+    /// firing after the two conjuncts are evaluated in the other order, and
+    /// must keep NOT firing in the steady state.
+    ///
+    /// Reordering two pure predicates cannot change a `&&`, but this pins the
+    /// two outcomes that matter anyway, because both failure modes are silent:
+    /// a false negative leaves a stale label on a tab forever, and a false
+    /// positive re-flushes at the debounce ceiling (10/s per session) for the
+    /// life of the process.
+    #[test]
+    fn the_title_drift_gate_fires_for_a_newly_labeling_window_and_not_otherwise() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        // One flush puts the gate in its steady state: the App-level consumed
+        // epoch equals the live one, so the cheap FIRST disjunct is false and
+        // the per-window conjunction is what decides — exactly the flood case.
+        app.observe_title_drift(0, t0);
+        let live = {
+            let t = super::term_lock(&app.pool.get(0).expect("pooled session").term);
+            t.title_epoch()
+        };
+        assert_eq!(
+            app.title_drift.seen.get(&0).copied(),
+            Some(live),
+            "the first observation consumes the live epoch"
+        );
+        let flushed_at = app.title_drift.last_flush.get(&0).copied();
+        assert!(flushed_at.is_some(), "the first observation flushed");
+
+        // STEADY STATE: nothing changed, so the gate must return without
+        // flushing and without marking the session pending.
+        let quiet = t0 + std::time::Duration::from_millis(500);
+        app.observe_title_drift(0, quiet);
+        assert_eq!(
+            app.title_drift.last_flush.get(&0).copied(),
+            flushed_at,
+            "an unchanged session must not re-flush — at the debounce ceiling \
+             that is 10 whole-strip rebuilds a second, forever"
+        );
+        assert!(
+            !app.title_drift.pending.contains(&0),
+            "an unchanged session must not go pending"
+        );
+
+        // A WINDOW THAT JUST STARTED LABELING IT: drop that window's per-window
+        // epoch cache, which is exactly the state a tab move/open leaves behind.
+        // The gate must notice and act.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.tab_title_epochs.remove(&0);
+        }
+        let later = quiet + std::time::Duration::from_millis(500);
+        app.observe_title_drift(0, later);
+        assert!(
+            app.title_drift.last_flush.get(&0).copied() != flushed_at
+                || app.title_drift.pending.contains(&0),
+            "a window that started labeling this session since the last flush \
+             was not refreshed — its tab keeps a stale label"
         );
     }
 
@@ -24748,12 +26113,21 @@ mod tests {
             // The top pad is tighter than (or equal to) the all-edge pad.
             assert!(v.pad_top <= v.pad, "top pad never exceeds the base pad");
         }
-        // Concrete values: FONT_PX=12, PAD_LOGICAL_PX=12, PAD_TOP_LOGICAL_PX=2,
-        // round(·scale), font clamped.
+        // Concrete values: PAD_LOGICAL_PX=12, PAD_TOP_LOGICAL_PX=2, round(·scale),
+        // font clamped — and FONT_PX, which is platform-split at its definition
+        // because it is denominated in the host's LOGICAL unit (12 on macOS/Linux
+        // where 1 logical px == 1 pt; 16 on Windows where 1 logical px == 1/96 in,
+        // so 16 is the same 12 pt). The literals are gated rather than derived from
+        // FONT_PX on purpose: writing `FONT_PX * s` here would restate the very
+        // multiplication under test and the proof would pass for any constant.
+        #[cfg(not(windows))]
+        let (f1x, f2x, f3x) = (12.0, 24.0, 36.0);
+        #[cfg(windows)]
+        let (f1x, f2x, f3x) = (16.0, 32.0, 48.0);
         assert_eq!(
             MetricsView::for_scale(1.0),
             MetricsView {
-                font_px: 12.0,
+                font_px: f1x,
                 pad: 12,
                 pad_top: 2,
                 head: 0
@@ -24762,7 +26136,7 @@ mod tests {
         assert_eq!(
             MetricsView::for_scale(2.0),
             MetricsView {
-                font_px: 24.0,
+                font_px: f2x,
                 pad: 24,
                 pad_top: 4,
                 head: 0
@@ -24771,7 +26145,7 @@ mod tests {
         assert_eq!(
             MetricsView::for_scale(3.0),
             MetricsView {
-                font_px: 36.0,
+                font_px: f3x,
                 pad: 36,
                 pad_top: 6,
                 head: 0

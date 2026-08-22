@@ -250,9 +250,24 @@ fn indicator_segs(v: &FindBarView, c: &BandColors) -> Vec<Seg> {
 /// `esc` is spelled out: U+238B (⎋) is a font-fallback lottery — it renders as blank in
 /// one monospace face and as a reload-looking circular arrow in another, which is worse
 /// than useless for the one key that gets you out.
+///
+/// PER PLATFORM, because a hint that names keys the keyboard does not have is
+/// worse than no hint — aterm's own ratified rule (`palette.rs` blanks its
+/// accelerator column off macOS because a ⌘ glyph "would MISLEAD", and `cli.rs`
+/// splits its KEYS help the same way). Off macOS the same commands answer to
+/// Ctrl+S / Ctrl+R (the emacs arms in `on_key_search_mode`, which always worked
+/// but were never taught) and the toggles to Alt+C / Alt+R (the VS Code find
+/// widget's chords; the seeded ⌥⌘ spelling is Win+Alt on Windows, where
+/// Win+Alt+R belongs to the Xbox Game Bar).
 fn hint_text(cols: usize) -> &'static str {
+    #[cfg(target_os = "macos")]
     const FULL: &str = "⌘S next  ⌘R prev  ⌥⌘C case  ⌥⌘R regex  ⏎ accept  esc cancel";
+    #[cfg(target_os = "macos")]
     const SHORT: &str = "⌘S/⌘R next/prev  ⏎ accept  esc cancel";
+    #[cfg(not(target_os = "macos"))]
+    const FULL: &str = "Ctrl+S next  Ctrl+R prev  Alt+C case  Alt+R regex  ⏎ accept  esc cancel";
+    #[cfg(not(target_os = "macos"))]
+    const SHORT: &str = "Ctrl+S/R next/prev  ⏎ accept  esc cancel";
     const TINY: &str = "⏎ accept  esc cancel";
     let room = cols.saturating_sub(LEFT_PAD + RIGHT_PAD);
     for hint in [FULL, SHORT] {
@@ -860,10 +875,25 @@ mod tests {
     fn chord_hints_use_glyphs_that_render() {
         let cols = 100;
         let s = all(&paint(&view("q"), cols));
-        assert!(s.contains("⌘S next"), "{s}");
-        assert!(s.contains("⌘R prev"), "{s}");
-        assert!(s.contains("⌥⌘C case"), "{s}");
-        assert!(s.contains("⌥⌘R regex"), "{s}");
+        // PER PLATFORM, like `hint_text` itself: ⌘/⌥ glyphs exist only on a Mac
+        // keyboard — a Windows find bar must never teach ⌥⌘R, which there means
+        // Win+Alt+R, the Xbox Game Bar chord.
+        #[cfg(target_os = "macos")]
+        {
+            assert!(s.contains("⌘S next"), "{s}");
+            assert!(s.contains("⌘R prev"), "{s}");
+            assert!(s.contains("⌥⌘C case"), "{s}");
+            assert!(s.contains("⌥⌘R regex"), "{s}");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(s.contains("Ctrl+S next"), "{s}");
+            assert!(s.contains("Ctrl+R prev"), "{s}");
+            assert!(s.contains("Alt+C case"), "{s}");
+            assert!(s.contains("Alt+R regex"), "{s}");
+            assert!(!s.contains('⌘'), "no command glyph off macOS: {s}");
+            assert!(!s.contains('⌥'), "no option glyph off macOS: {s}");
+        }
         assert!(s.contains("⏎ accept"), "{s}");
         assert!(s.contains("esc cancel"), "{s}");
         assert!(

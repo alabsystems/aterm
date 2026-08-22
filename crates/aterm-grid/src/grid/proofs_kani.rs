@@ -90,6 +90,7 @@ impl Grid {
         }
 
         Self {
+            viewport_cache: super::ViewportRowCache::default(),
             storage: GridStorage::kani_stub(pages, row_storage, rows, cols, 0),
         }
     }
@@ -140,6 +141,7 @@ impl Grid {
         }
 
         Self {
+            viewport_cache: super::ViewportRowCache::default(),
             storage: GridStorage::kani_stub(pages, row_storage, rows, cols, max_scrollback),
         }
     }
@@ -207,6 +209,7 @@ impl Grid {
         }
 
         Self {
+            viewport_cache: super::ViewportRowCache::default(),
             storage: GridStorage::kani_stub(
                 PageStore::new(), // Empty PageStore (unused)
                 row_storage,

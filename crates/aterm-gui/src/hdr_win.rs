@@ -14,6 +14,18 @@
 //! scaling — so a query failure or an HDR-off display leaves the aurora inert and the
 //! present byte-identical to SDR. `edr_max = MaxLuminance / SDR-white` (relative, like
 //! macOS's `NSScreen` value); `sdr_white_scale = SDR-white / 80` (scRGB reference).
+//!
+//! **Measured composition law (2026-08, AMD 780M, Windows 11 HDR on, SDR-white
+//! 240 nits → scale 3.0):** DWM composes every SDR-drawn pixel (GDI, the
+//! `DWMWA_CAPTION_COLOR` tint) onto the FP16 scRGB desktop as
+//! `srgb_piecewise_to_linear(byte) × scale` — exactly 3.0 × the piecewise decode,
+//! not a 2.2 power — and aterm's scRGB present (`fs_blit`: decode × this scale)
+//! lands byte-for-byte on the same linear values, caption == grid == gutter.
+//! Verify it with an FP16 capture (`Windows.Graphics.Capture` at
+//! `R16G16B16A16Float`): a GDI screen grab (`BitBlt` / `CopyFromScreen`) reads an
+//! f16 swapchain back at 80 nits == white (no `/scale`), so it reports the EDR
+//! present `scale×` lifted in linear light (`#111318` → `#23262E` at 3.0) while
+//! reading SDR windows byte-exact — a capture artefact, not a presented colour.
 #![cfg(windows)]
 
 use core::ffi::c_void;

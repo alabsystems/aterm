@@ -477,6 +477,17 @@ pub(crate) struct Config {
     /// explicit-copy behaviour). The selection is left highlighted either way,
     /// so Cmd-C still works. See [`Config::copy_on_select_or_default`].
     pub(crate) copy_on_select: Option<bool>,
+    /// RIGHT-CLICK gesture in the terminal grid: `"copy_paste"` — the
+    /// conhost/Windows-Terminal convention (a right press with VT mouse tracking
+    /// OFF copies the selection if one exists, else pastes) — or `"off"` (the
+    /// press is left to the seam: reported to a tracking app, inert otherwise).
+    /// ABSENT takes the PLATFORM default: `copy_paste` on Windows (both native
+    /// terminals ship it, so a Windows hand expects it), `off` everywhere else
+    /// (macOS right-click means "context menu"; Linux pastes on MIDDLE click —
+    /// seeding a second paste button there would be surprising, not native).
+    /// Maps to [`RightClickGesture`] via [`Config::right_click_or_default`]; an
+    /// unknown value warns and falls back to the platform default.
+    pub(crate) right_click: Option<String>,
     /// Show the subtle TOP-RIGHT build/version badge (`v{version} · {build}`) so the
     /// running build is answerable at a glance without opening About. Default OFF.
     /// Toggleable via the native Settings tab ▸ Window ▸ "Show build/version badge". See
@@ -741,6 +752,16 @@ pub(crate) struct Config {
     /// and returns no clipboard contents, so enabling this has no shipping GUI
     /// effect; Manual diagnoses an authored `true` value.
     pub(crate) allow_osc52_query: Option<bool>,
+    /// SECURE KEYBOARD ENTRY (`secure_keyboard_entry`, default OFF): while on
+    /// AND aterm is frontmost, macOS blocks other processes from observing
+    /// this app's keystrokes (`EnableSecureEventInput` — the guard iTerm2
+    /// exposes under this name, with the same focus scoping: TN2150 instructs
+    /// releasing on deactivation, and `crate::secure_input` gates engagement
+    /// on any-window-focused, so a backgrounded aterm never suppresses other
+    /// apps' global hotkeys). Process-level, recorded at launch and on every
+    /// config commit; macOS-only — Wayland is secure by default, X11 cannot
+    /// be secured, and the Settings row says so instead of pretending.
+    pub(crate) secure_keyboard_entry: Option<bool>,
     /// Security opt-in for XTWINOPS (`CSI t`). The GUI installs no window
     /// callback, so only the engine's window-title and text-grid-size fallback
     /// reports work; manipulation and most state/geometry requests are ignored.
@@ -2650,6 +2671,14 @@ impl Config {
         self.robi.unwrap_or(false)
     }
 
+    /// Secure Keyboard Entry (`secure_keyboard_entry`): fail-closed default OFF
+    /// like every other security opt-in — the OS mechanism has real side
+    /// effects (it suppresses other apps' global hotkeys while active), so it
+    /// is the user's call, never a surprise.
+    pub(crate) fn secure_keyboard_entry_or_default(&self) -> bool {
+        self.secure_keyboard_entry.unwrap_or(false)
+    }
+
     /// Rainbow sparkles on the post-update celebration (default ON — opt-OUT).
     pub(crate) fn notice_sparkle_or_default(&self) -> bool {
         self.notice_sparkle.unwrap_or(true)
@@ -4202,6 +4231,26 @@ impl Config {
         }
     }
 
+    /// Resolve the grid right-click gesture ([`RightClickGesture`]) from config
+    /// `right_click`. The DEFAULT when the key is absent is PER-PLATFORM
+    /// ([`RightClickGesture::PLATFORM_DEFAULT`]): `copy_paste` on Windows, `off`
+    /// elsewhere. An unknown / malformed value warns and falls back to that same
+    /// platform default (the `window_theme` fail-safe shape).
+    pub(crate) fn right_click_or_default(&self) -> RightClickGesture {
+        match self.right_click.as_deref() {
+            None => RightClickGesture::PLATFORM_DEFAULT,
+            Some(s) => match RightClickGesture::parse(s) {
+                Some(g) => g,
+                None => {
+                    eprintln!(
+                        "aterm-gui: config right_click: expected copy_paste|off, got {s:?}; using the platform default"
+                    );
+                    RightClickGesture::PLATFORM_DEFAULT
+                }
+            },
+        }
+    }
+
     /// Resolve the GPU-present colour-space tag ([`WindowColorspace`]) from config
     /// `window_colorspace`. The DEFAULT when the key is absent is
     /// [`WindowColorspace::Srgb`] — the colour-managed interpretation. An unknown /
@@ -4798,6 +4847,48 @@ impl WindowTheme {
             "auto" => Some(Self::Auto),
             "light" => Some(Self::Light),
             "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+}
+
+/// What a RIGHT press in the terminal grid does when no app is tracking the
+/// mouse. Resolved from config `right_click` via
+/// [`Config::right_click_or_default`], consumed by the right-button pre-dispatch
+/// arm in `app_mouse::on_mouse_input`. Deliberately NOT an `Option<bool>`: the
+/// gesture is a semantics choice (section-4 decision #2 — paste vs context menu
+/// vs both), so the key is an open enum a future `"menu"` variant can join
+/// without a config break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightClickGesture {
+    /// The conhost / Windows Terminal convention: copy the selection if one
+    /// exists (and clear it), else paste the clipboard — tracking OFF only.
+    CopyPaste,
+    /// Leave the right button to the seam: reported to a tracking app, inert
+    /// otherwise (the pre-gesture behaviour on every platform).
+    Off,
+}
+
+impl RightClickGesture {
+    /// The per-platform default when the key is absent: `CopyPaste` on Windows
+    /// (conhost QuickEdit and Windows Terminal both ship it — a Windows user's
+    /// hand expects the gesture), `Off` elsewhere (macOS right-click culturally
+    /// means "context menu", and Linux already pastes on MIDDLE click). A
+    /// `cfg!` const, not two `#[cfg]` items, so the non-Windows arm stays
+    /// type-checked on every platform build.
+    pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(windows) {
+        Self::CopyPaste
+    } else {
+        Self::Off
+    };
+
+    /// Parse a config `right_click` value (case-insensitive, trimmed):
+    /// `copy_paste` (alias `copy-paste`) or `off`. `None` on any other value
+    /// (caller falls back to [`Self::PLATFORM_DEFAULT`]).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "copy_paste" | "copy-paste" => Some(Self::CopyPaste),
+            "off" => Some(Self::Off),
             _ => None,
         }
     }
@@ -5789,6 +5880,24 @@ pub(crate) fn resolve_initial_lines(config: &Config) -> u16 {
         .or(config.lines)
         .unwrap_or(24)
         .clamp(5, 300)
+}
+
+/// The EXPLICIT launch-time grid overrides alone — `$ATERM_COLUMNS`/`$ATERM_LINES`
+/// (set by `--columns`/`--lines`), WITHOUT the config fallback the resolvers
+/// above fold in. W3's cold-restore grid seed needs the distinction: an explicit
+/// `aterm --columns 200` is a per-launch request that outranks the persisted
+/// session's grid, while a config `columns` is a static default that restore
+/// exists to supersede (config > manifest would mean quitting a resized window
+/// never reopens at its own size, i.e. no size restore for anyone who sets the
+/// key). Unclamped on purpose — callers clamp alongside the value they merge
+/// with, keeping one clamp per decision.
+pub(crate) fn explicit_initial_columns() -> Option<u16> {
+    env_u16("ATERM_COLUMNS")
+}
+
+/// Row twin of [`explicit_initial_columns`].
+pub(crate) fn explicit_initial_lines() -> Option<u16> {
+    env_u16("ATERM_LINES")
 }
 
 /// An explicit render-scale override from `$ATERM_FORCE_SCALE` (set directly or by
@@ -6798,34 +6907,7 @@ impl App {
         // Reset the per-window GPU caches (the swapchain stays valid — same device) and
         // the introspection scratch, and force a repaint. NOTE: the swapchains and OS
         // windows are untouched, so no surface is orphaned.
-        self.introspect_gpu = aterm_gpu::WindowGpu::new();
-        for ws in self.windows.values_mut() {
-            if let Some(
-                PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
-            ) = &mut ws.present
-            {
-                // M3 phase B + capture colour: per-screen EDR headroom,
-                // reference-white scaling, and the compositor's colour-space
-                // tag survive the cache reset. They are surface/monitor state,
-                // not render caches.
-                let edr = window_gpu.edr_max();
-                let sdr_white_scale = window_gpu.sdr_white_scale();
-                let capture_color_space = window_gpu.capture_color_space();
-                *window_gpu = aterm_gpu::WindowGpu::new();
-                window_gpu.set_edr_max(edr);
-                window_gpu.set_sdr_white_scale(sdr_white_scale);
-                window_gpu.set_capture_color_space(capture_color_space);
-            }
-            ws.last_present = None;
-            // Headless has no winit redraw edge to acknowledge: image capture
-            // renders synchronously, while an in-flight Virtual recording owns
-            // its own paced timer. Reopen its gate without manufacturing a fake
-            // outstanding OS request. Windowed targets use the coupled helper
-            // after their geometry is rebuilt below.
-            if ws.os_window.is_none() {
-                let _ = ws.present_retry.on_external_stimulus();
-            }
-        }
+        self.reset_gpu_window_caches();
         // Re-grid EVERY window that has an OS window for the new cell metrics (from
         // ITS OWN inner_size), then repaint it. At n==1 this is the one window —
         // identical to the old front-only re-grid. W1: also refresh each window's
@@ -6875,6 +6957,45 @@ impl App {
             self.apply_window_vibrancy();
         }
         true
+    }
+
+    /// Reset every per-window GPU cache (`WindowGpu`: offscreen + dirty-gate /
+    /// scissor state) and the introspection scratch after the renderer's face
+    /// or device changed, keeping the surface/monitor state (EDR headroom,
+    /// reference-white scale, capture colour space) that is NOT a render cache.
+    /// Extracted verbatim from [`Self::rebuild_backend_with_prepared`]; the H1
+    /// fail-soft rebuild (`retry_attach_on_opaque_swapchain`) calls it too, where
+    /// the device itself was replaced — a `Virtual` target holding old-device
+    /// textures must not survive into the fresh context.
+    pub(crate) fn reset_gpu_window_caches(&mut self) {
+        self.introspect_gpu = aterm_gpu::WindowGpu::new();
+        for ws in self.windows.values_mut() {
+            if let Some(
+                PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
+            ) = &mut ws.present
+            {
+                // M3 phase B + capture colour: per-screen EDR headroom,
+                // reference-white scaling, and the compositor's colour-space
+                // tag survive the cache reset. They are surface/monitor state,
+                // not render caches.
+                let edr = window_gpu.edr_max();
+                let sdr_white_scale = window_gpu.sdr_white_scale();
+                let capture_color_space = window_gpu.capture_color_space();
+                *window_gpu = aterm_gpu::WindowGpu::new();
+                window_gpu.set_edr_max(edr);
+                window_gpu.set_sdr_white_scale(sdr_white_scale);
+                window_gpu.set_capture_color_space(capture_color_space);
+            }
+            ws.last_present = None;
+            // Headless has no winit redraw edge to acknowledge: image capture
+            // renders synchronously, while an in-flight Virtual recording owns
+            // its own paced timer. Reopen its gate without manufacturing a fake
+            // outstanding OS request. Windowed targets use the coupled helper
+            // after their geometry is rebuilt by the caller.
+            if ws.os_window.is_none() {
+                let _ = ws.present_retry.on_external_stimulus();
+            }
+        }
     }
 
     /// Hand the renderer's resolved PRIMARY face bytes (+ the discovered real
@@ -6941,6 +7062,20 @@ impl App {
             // consumer, so a non-`none` material warns once.
             KnobChange::BackgroundMaterial(m) => {
                 if self.backend.is_gpu() {
+                    // H1 (Windows Mica/Acrylic): mirror the knob onto the GPU
+                    // renderer FIRST, so the redraw `apply_window_vibrancy`
+                    // nudges reconciles the swapchain composite mode against
+                    // the new value (Opaque ⇄ PreMultiplied on a DComp visual
+                    // instance). Both directions matter live: material → none
+                    // MUST go opaque (with no DWM backdrop installed behind the
+                    // visual, margin alpha would expose the windows behind);
+                    // none → material re-engages the margins — but only when
+                    // the instance was BUILT visual (material set at launch).
+                    // A reload onto a plain HWND-swapchain instance stays
+                    // DWM-chrome-only, which `window_set_vibrancy` diagnoses.
+                    if let Some(g) = self.backend.gpu_mut() {
+                        g.set_backdrop_margins(m != BackgroundMaterial::None);
+                    }
                     self.apply_window_vibrancy();
                 } else if m != BackgroundMaterial::None {
                     warn_background_material_unimplemented_once();
@@ -7000,6 +7135,15 @@ impl App {
             Backend::Gpu(g) => g.set_theme(new_theme),
         }
         self.introspect_gpu.invalidate_present();
+        // LINUX CSD: the header band's light/dark variant is resolved FROM this
+        // terminal theme when config `window_theme` is Auto (chrome_theme_for_apprt),
+        // so a live theme swap must re-push it or the header keeps the OLD side.
+        // Resolved before the windows borrow; macOS/Windows deliberately skip the
+        // re-push — their chrome already tracks via `window_set_background_color`
+        // below / the DWM config policy, and their `window_set_appearance` does
+        // strictly more work than a variant flip.
+        #[cfg(target_os = "linux")]
+        let linux_chrome_theme = self.chrome_theme_for_apprt();
         let bg = new_theme.bg;
         let apprt = &self.apprt;
         let toolbars = &self._toolbars;
@@ -7016,6 +7160,8 @@ impl App {
             }
             if let Some(w) = ws.os_window.as_ref() {
                 apprt.window_set_background_color(w, bg);
+                #[cfg(target_os = "linux")]
+                apprt.window_set_appearance(w, linux_chrome_theme);
                 w.request_redraw();
             }
             // Keep the native toolbar strip's appearance pinned to the (possibly
@@ -7086,6 +7232,26 @@ impl App {
                     w.request_redraw();
                 }
             }
+        }
+        // W5: re-derive the whole-cell RESIZE INCREMENTS from the metrics just
+        // refreshed. The increments are a `PhysicalSize` the WM stores verbatim,
+        // so a per-monitor DPI change (drag to the other monitor on Windows,
+        // where this event is the WM_DPICHANGED translation) leaves the OLD
+        // scale's cell box in force: a 150%→100% move keeps snapping edge drags
+        // in ~26 px steps against a ~17 px cell — coarser than a whole cell, so
+        // most stops leave a remainder and the padding bands go uneven. The
+        // attach site and the font/theme rebuild both set increments; this event
+        // was the one metrics-changing path that forgot to (a regression from
+        // the W12 per-window-DPI rework, which replaced the heavy
+        // `rebuild_backend` — increments refresh included — with the light
+        // per-window record update above). `win_cell_size` reads the refreshed
+        // `ws.metrics.font_px`, so the borrow must end first; the unattached
+        // (headless) case is a no-op via the `os_window` map below, matching the
+        // attach gate above. macOS re-applies increments itself at
+        // `windowWillStartLiveResize`, so this is redundant-but-harmless there.
+        let (cw, ch) = self.win_cell_size(wid);
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
         }
     }
 
@@ -7553,6 +7719,17 @@ impl App {
                     &admitted_baseline,
                     crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
                 );
+                // The fence is re-armed here with no worker sample scheduled, so
+                // anything already in the semantic queue would sit until some
+                // unrelated event happened to pump. That is the abandonment that
+                // reported itself as a 30s wedged event loop. It matters on this
+                // arm specifically because
+                // `apply_reconciled_prepared_config_generation` reaches it from a
+                // reconciliation completion, i.e. from the exact probe a queued
+                // control caller is parked behind.
+                self.reject_pending_native_config(&format!(
+                    "config generation could not be admitted: {error}"
+                ));
                 aterm_log::warn!("native config service rejected watcher snapshot: {error}");
                 return;
             }
@@ -7655,6 +7832,19 @@ impl App {
         // `App::sync_app_theme_to_appearance`). Resolve the engine/renderer theme for
         // the CURRENT OS appearance so a reload preserves the active light/dark side.
         self.config = config.clone();
+        // Secure Keyboard Entry is PROCESS-level (Carbon secure input), so a
+        // config commit records the wish here, once, beside the swap — not per
+        // window or per session (engagement is focus-gated in secure_input).
+        // Idempotent: an unchanged value is free. The refusal, if any, is
+        // carried to the `warns` banner below — a SECURITY toggle that
+        // silently fails to take is the one failure this feature must never
+        // have, and the config swap has already succeeded by this line, so
+        // without the banner the Settings row would show ON over a protection
+        // that is off.
+        let secure_input_refusal = crate::secure_input::set_desired(
+            self.config.secure_keyboard_entry_or_default(),
+        )
+        .err();
         if let Some(voice) = audition_voice {
             // After the swap, so the preview plays at the NEW volume/master and
             // under the new look — the settings the user just wrote.
@@ -7822,6 +8012,18 @@ impl App {
         // Restart-only edits (columns/lines) ride the SAME banner as dropped-rule
         // warnings — both are "your edit didn't fully take effect" messages.
         warns.extend(restart_notices);
+        // …and so does a refused Secure Keyboard Entry transition (see the
+        // apply site above): same class exactly — an edit that did not take.
+        if let Some(status) = secure_input_refusal {
+            warns.push(format!(
+                "secure_keyboard_entry: the OS refused the change (OSStatus {status}) —                  Secure Keyboard Entry is NOT {}",
+                if self.config.secure_keyboard_entry_or_default() {
+                    "on"
+                } else {
+                    "off"
+                }
+            ));
+        }
         // W5h: an unresolvable `font_family` warns (like themes) instead of
         // silently reducing to the built-in candidates. Uses the same
         // effective family (env > config > platform default) the rebuild will try.
@@ -7927,9 +8129,11 @@ impl App {
             self.window_theme = new_window_theme;
         }
         {
-            // Every platform receives the raw Light/Dark/Auto policy; Auto keeps
-            // following the live OS appearance through the platform seam.
-            let chrome_theme = self.window_theme_for_chrome();
+            // macOS/Windows receive the raw Light/Dark/Auto policy (Auto keeps
+            // following the live OS appearance through the platform seam); on Linux
+            // the one resolution seam maps Auto onto the terminal theme's darkness
+            // so the CSD header tracks the body (see `chrome_theme_for_apprt`).
+            let chrome_theme = self.chrome_theme_for_apprt();
             let apprt = &self.apprt;
             for ws in self.windows.values() {
                 if let Some(w) = ws.os_window.as_ref() {
@@ -11086,6 +11290,72 @@ mod window_theme_tests {
         // Direct parser: unknown -> None (caller defaults).
         assert_eq!(WindowTheme::parse("nope"), None);
         assert_eq!(WindowTheme::parse("auto"), Some(WindowTheme::Auto));
+    }
+}
+
+#[cfg(test)]
+mod right_click_tests {
+    use super::{Config, RightClickGesture};
+
+    fn cfg(toml: &str) -> Config {
+        toml::from_str(toml).expect("valid toml")
+    }
+
+    /// The absent-key default is PER-PLATFORM: the conhost/WT gesture on Windows,
+    /// off elsewhere — asserted against `cfg!` so the same test is honest on
+    /// whichever platform runs it.
+    #[test]
+    fn right_click_defaults_per_platform_when_absent() {
+        let expected = if cfg!(windows) {
+            RightClickGesture::CopyPaste
+        } else {
+            RightClickGesture::Off
+        };
+        assert_eq!(RightClickGesture::PLATFORM_DEFAULT, expected);
+        assert_eq!(Config::default().right_click_or_default(), expected);
+        assert_eq!(cfg("font_px = 14.0").right_click_or_default(), expected);
+    }
+
+    /// Both explicit values parse, case-insensitive and trimmed, and the dash
+    /// alias is accepted — so EITHER platform can opt into the other's default
+    /// (the config-escape the semantics decision requires).
+    #[test]
+    fn right_click_explicit_values_override_the_platform_default() {
+        assert_eq!(
+            cfg("right_click = \"copy_paste\"").right_click_or_default(),
+            RightClickGesture::CopyPaste
+        );
+        assert_eq!(
+            cfg("right_click = \"off\"").right_click_or_default(),
+            RightClickGesture::Off
+        );
+        assert_eq!(
+            cfg("right_click = \" Copy-Paste \"").right_click_or_default(),
+            RightClickGesture::CopyPaste
+        );
+        assert_eq!(
+            cfg("right_click = \"OFF\"").right_click_or_default(),
+            RightClickGesture::Off
+        );
+    }
+
+    /// Unknown / empty values fall back to the platform default (warn-and-default,
+    /// the `window_theme` fail-safe shape), and the direct parser returns `None`.
+    #[test]
+    fn right_click_invalid_falls_back_to_platform_default() {
+        assert_eq!(
+            cfg("right_click = \"menu\"").right_click_or_default(),
+            RightClickGesture::PLATFORM_DEFAULT
+        );
+        assert_eq!(
+            cfg("right_click = \"\"").right_click_or_default(),
+            RightClickGesture::PLATFORM_DEFAULT
+        );
+        assert_eq!(RightClickGesture::parse("nope"), None);
+        assert_eq!(
+            RightClickGesture::parse("copy_paste"),
+            Some(RightClickGesture::CopyPaste)
+        );
     }
 }
 

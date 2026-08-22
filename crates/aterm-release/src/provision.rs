@@ -2354,7 +2354,8 @@ mod tests {
 
     /// A fresh Ed25519 keypair as base64 PKCS#8 — the shape `signing_key` carries — with
     /// the public identity it derives, which is what the audit compares against the key
-    /// this machine actually holds.
+    /// this machine actually holds. Its only callers are the macOS-gated audit tests.
+    #[cfg(target_os = "macos")]
     fn signing_key_b64() -> (String, String) {
         use ring::signature::KeyPair as _;
         let rng = ring::rand::SystemRandom::new();

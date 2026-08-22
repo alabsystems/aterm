@@ -1,6 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
+// The menu-bar status item is an AppKit surface; off macOS the types compile
+// for the shared Wake plumbing and everything else is intentionally idle.
+#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+
 //! The menu-bar OPERATOR status item (macOS `NSStatusItem`).
 //!
 //! aterm's fleet can be supervised by an OPERATOR — a designated session running

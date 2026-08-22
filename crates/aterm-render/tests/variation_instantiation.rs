@@ -591,3 +591,223 @@ fn rb_variation_cache_tracks_coords() {
         "stale-cache regression: old instance's variations must be cleared"
     );
 }
+
+/// A variable MONO face installed on this host, or `None`. There is no variable
+/// fixture committed to the tree — both committed faces (DejaVu Sans Mono and the
+/// JetBrains Mono fixture) are static, which is exactly what makes them the anchor
+/// for the `None` case in [`nonvariable_bold_still_takes_the_synthetic_path`]. So
+/// the portable bold-instance proof has to borrow a real `wght` axis from the host
+/// and skip when the host has none.
+#[cfg(not(target_os = "macos"))]
+fn host_variable_mono() -> Option<Vec<u8>> {
+    // Cascadia Mono is aterm's Windows default primary and ships with Windows 11 as
+    // a VARIABLE face (`wght` 200..400..700) — the whole reason this gap was worth
+    // closing. The rest are the usual Linux placements of the same family.
+    const CANDIDATES: &[&str] = &[
+        r"C:\Windows\Fonts\CascadiaMono.ttf",
+        r"C:\Windows\Fonts\CascadiaCode.ttf",
+        "/usr/share/fonts/truetype/cascadia-code/CascadiaMono.ttf",
+        "/usr/share/fonts/truetype/cascadia-code/CascadiaCode.ttf",
+        "/usr/share/fonts/cascadia-code/CascadiaMono.ttf",
+    ];
+    CANDIDATES.iter().find_map(|p| {
+        let bytes = std::fs::read(p).ok()?;
+        // "Variable" is not enough: the file must actually carry a `wght` axis,
+        // since that is the only axis a bold instance can be built on.
+        variation::probe(&bytes, 0)?
+            .axes
+            .iter()
+            .any(|a| a.tag == WGHT_TAG)
+            .then_some(bytes)
+    })
+}
+
+/// Synthetic BOLD as `apply_synthetic_style` performs it: a horizontal max-dilation
+/// by `e` px that widens the bitmap and leaves the advance alone. Reproduced here
+/// rather than reached through the crate, so the assertions below are statements
+/// about OBSERVABLE pixels — "the bold cell IS / IS NOT the dilation of the regular
+/// one" — that stay honest if the private helper is renamed or re-tuned.
+#[cfg(not(target_os = "macos"))]
+fn dilate(cov: &[u8], w: usize, h: usize, e: usize) -> Vec<u8> {
+    let nw = w + e;
+    let mut out = vec![0u8; nw * h];
+    for y in 0..h {
+        for x in 0..nw {
+            let mut m = 0u8;
+            for k in 0..=e {
+                if let Some(i) = x.checked_sub(k)
+                    && i < w
+                {
+                    m = m.max(cov[y * w + i]);
+                }
+            }
+            out[y * nw + x] = m;
+        }
+    }
+    out
+}
+
+/// The portable twin of [`sf_mono_ct_raster_ink_tracks_the_instance`]: OFF macOS, a
+/// BOLD cell on a variable primary draws the REAL `wght`≈700 instance through
+/// [`variation::varied_glyph_raster`], not a synthetic dilation of the regular one.
+///
+/// This is the regression that shipped. The W9 resolver is platform-independent, so
+/// `vf_bold_coords` was computed correctly on Windows and then thrown away by two
+/// `#[cfg(not(target_os = "macos"))]` stubs — one in `vf_bold_mono_raster` (the
+/// by-CHAR arm), one in the by-GLYPH-ID arm that plain primary text actually takes.
+/// Every SGR-bold cell fell back to `embolden`, a horizontal max-dilation that keeps
+/// the ADVANCE, so at a 7px Windows cell a 1px stem became a 2px stem bleeding into
+/// the neighbouring column — "command" reading as "commmand".
+///
+/// Both arms are checked, because patching only one leaves bold broken for whatever
+/// the other draws. Byte equality against a freshly-instantiated reference raster is
+/// the proof (the stem LUT is the identity at the default `stem_gamma = 1.0`, so the
+/// renderer's coverage is that raster verbatim); the `assert_ne!` against the
+/// dilation then states the negative outright, so a revert fails loudly instead of
+/// merely differing.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn portable_bold_draws_the_real_instance_not_a_dilation() {
+    let Some(bytes) = host_variable_mono() else {
+        eprintln!("SKIP: no variable mono face installed on this host");
+        return;
+    };
+    if std::env::var_os("ATERM_STEM_GAMMA").is_some() {
+        // A non-identity LUT warps the antialiased fringe of the renderer's
+        // coverage but not of the raw reference raster below, so byte equality
+        // would be comparing two different transforms.
+        eprintln!("SKIP: ATERM_STEM_GAMMA set (coverage is not the raw raster)");
+        return;
+    }
+    let px = 16.0;
+    let theme = aterm_render::Theme::default();
+    let mut r = aterm_render::Renderer::from_bytes(&bytes, px, theme).expect("renderer");
+    let bold_coords = r
+        .debug_vf_bold_coords()
+        .expect("a wght axis reaching 700 yields a bold instance")
+        .to_vec();
+
+    // The regular key is id-addressed, so it hands us the primary gid for free.
+    let reg = r.glyph_key('M');
+    assert_eq!(reg.glyph_class, aterm_render::GlyphClass::MonoGid);
+    let gid = reg.ch_or_id as u16;
+    let (ww, wh, wxmin, wymin, _wadv, want) =
+        variation::varied_glyph_raster(&bytes, 0, &bold_coords, gid, px)
+            .expect("the bold instance rasterizes");
+
+    // ARM 1 — by CHAR (`vf_bold_mono_raster`): a styled primary glyph is
+    // re-addressed by char so a real bold sibling FILE could serve it. This
+    // renderer was built `from_bytes`, so it has no primary path and hence no
+    // sibling — the instance is the only real bold available.
+    let bold_char = r.glyph_key_styled('M', aterm_render::StyleBits::BOLD);
+    assert_eq!(
+        bold_char.glyph_class,
+        aterm_render::GlyphClass::Mono,
+        "a styled primary glyph is char-addressed"
+    );
+    let img_char = r.glyph_image(bold_char).clone();
+    assert_eq!(
+        (
+            img_char.width(),
+            img_char.height(),
+            img_char.xmin(),
+            img_char.ymin()
+        ),
+        (ww, wh, wxmin, wymin),
+        "by-char bold must carry the bold INSTANCE's metrics"
+    );
+    assert_eq!(
+        img_char.bytes(),
+        &want[..],
+        "by-char bold must be the bold instance's coverage, byte for byte"
+    );
+
+    // ARM 2 — by GLYPH ID, the arm plain primary text takes. `ligature_key` builds
+    // exactly the `mono_gid` + style key the row planner emits for a bold run.
+    let bold_gid = r.ligature_key(gid, aterm_render::StyleBits::BOLD);
+    let img_gid = r.glyph_image(bold_gid).clone();
+    assert_eq!(
+        (img_gid.width(), img_gid.height()),
+        (ww, wh),
+        "by-gid bold must carry the bold INSTANCE's metrics"
+    );
+    assert_eq!(
+        img_gid.bytes(),
+        &want[..],
+        "by-gid bold must be the bold instance's coverage, byte for byte"
+    );
+
+    // The negative: bold must not BE the dilation, must not exceed its footprint
+    // (that widening under an unchanged advance is precisely the cell bleed), and
+    // must still be genuinely heavier than regular — a "real instance" that lost
+    // weight would be a different bug wearing this fix's clothes.
+    let reg_img = r.glyph_image(reg).clone();
+    let e = (px / 18.0).round().max(1.0) as usize;
+    let synthetic = dilate(reg_img.bytes(), reg_img.width(), reg_img.height(), e);
+    assert_ne!(
+        img_char.bytes(),
+        &synthetic[..],
+        "bold must not be the synthetic dilation of regular"
+    );
+    assert!(
+        img_char.width() <= reg_img.width() + e,
+        "the real instance must not exceed the dilation's footprint: {} vs {}",
+        img_char.width(),
+        reg_img.width() + e
+    );
+    let ink = |b: &[u8]| -> u64 { b.iter().map(|&c| u64::from(c)).sum() };
+    assert!(
+        ink(img_char.bytes()) > ink(reg_img.bytes()),
+        "a real 700-weight glyph must out-ink the 400: {} vs {}",
+        ink(img_char.bytes()),
+        ink(reg_img.bytes())
+    );
+}
+
+/// The `None` case, which the fix must PRESERVE: a face with no usable `wght` axis
+/// (Consolas, Courier New, the bundled DejaVu — most static fonts) has no bold
+/// instance to draw, so both arms must still fall through to the synthetic
+/// dilation. The contract is "use the real instance WHEN one exists", never "assume
+/// one exists".
+///
+/// Pinned on the committed DejaVu so it runs on every host, and on BOTH arms, since
+/// each has its own `vf_bold_*` early-out to get wrong.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn nonvariable_bold_still_takes_the_synthetic_path() {
+    if std::env::var_os("ATERM_STEM_GAMMA").is_some() {
+        eprintln!("SKIP: ATERM_STEM_GAMMA set (coverage is not the raw raster)");
+        return;
+    }
+    let dejavu = include_bytes!("../assets/DejaVuSansMono.ttf");
+    let px = 16.0;
+    let mut r = aterm_render::Renderer::from_bytes(dejavu, px, aterm_render::Theme::default())
+        .expect("embedded face builds");
+    assert!(
+        r.debug_vf_bold_coords().is_none(),
+        "a static face offers no bold instance"
+    );
+
+    let reg = r.glyph_key('M');
+    let reg_img = r.glyph_image(reg).clone();
+    let e = (px / 18.0).round().max(1.0) as usize;
+    let synthetic = dilate(reg_img.bytes(), reg_img.width(), reg_img.height(), e);
+
+    let bold_char = r.glyph_key_styled('M', aterm_render::StyleBits::BOLD);
+    let img_char = r.glyph_image(bold_char).clone();
+    assert_eq!(
+        img_char.width(),
+        reg_img.width() + e,
+        "by-char bold on a static face stays the dilation"
+    );
+    assert_eq!(img_char.bytes(), &synthetic[..], "…and IS that dilation");
+
+    let bold_gid = r.ligature_key(reg.ch_or_id as u16, aterm_render::StyleBits::BOLD);
+    let img_gid = r.glyph_image(bold_gid).clone();
+    assert_eq!(
+        img_gid.width(),
+        reg_img.width() + e,
+        "by-gid bold on a static face stays the dilation"
+    );
+    assert_eq!(img_gid.bytes(), &synthetic[..], "…and IS that dilation");
+}

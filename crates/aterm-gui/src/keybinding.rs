@@ -218,6 +218,11 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
     ("cmd+alt+right", "Focus Pane Right"),
     ("cmd+alt+up", "Focus Pane Up"),
     ("cmd+alt+down", "Focus Pane Down"),
+    // SELECTION CUSTODY Phase 2: the deliberate return to live / to the oldest
+    // retained line. Registered here because this table is the single source both
+    // `--list-keybinds` and `--validate-config`'s shadow detector read.
+    ("cmd+down", "Scroll to Live"),
+    ("cmd+up", "Scroll to Top"),
     ("cmd+=", "Font Increase"),
     ("cmd+shift+=", "Font Increase"),
     ("cmd+-", "Font Decrease"),
@@ -330,14 +335,31 @@ fn modifier_bit(word: &str) -> Option<u8> {
 }
 
 /// Map a config key word (the final `+`-segment) to a [`KeyToken`]. A single
-/// character is a `Char`; a multi-letter word is matched against the named-key
-/// table (Enter, Tab, arrows, F-keys, …). Returns `None` for an unknown name.
+/// character is a `Char`; `plus`/`minus`/`equal` are word spellings of characters
+/// (only `plus` is strictly necessary — see below); any other multi-letter word is
+/// matched against the named-key table (Enter, Tab, arrows, F-keys, …). Returns
+/// `None` for an unknown name.
 fn key_token(word: &str) -> Option<KeyToken> {
     let mut chars = word.chars();
     let first = chars.next()?;
     if chars.next().is_none() {
         // Single character: fold to lowercase so case is carried only by SHIFT.
         return Some(KeyToken::Char(first.to_ascii_lowercase()));
+    }
+    // SPELLED-OUT PUNCTUATION. `+` is the segment separator and `Chord::parse`
+    // splits on it with no escape, so `"ctrl++"` is not a hard-to-read chord — it
+    // is a parse error ("empty segment"), and the `+` key was therefore not
+    // bindable AT ALL. That is not cosmetic off a US layout: on de-DE/Nordic
+    // layouts `+` is an unshifted MAIN-ROW key (so `ctrl+shift+=` never fires) and
+    // on EVERY layout the numpad `+` arrives as `Character("+")`, which no `=`
+    // spelling matches. `minus`/`equal` are spelled alongside it so a config never
+    // has to know which one of the three is the special one; both also have plain
+    // single-character spellings that keep working.
+    match word {
+        "plus" => return Some(KeyToken::Char('+')),
+        "minus" => return Some(KeyToken::Char('-')),
+        "equal" | "equals" => return Some(KeyToken::Char('=')),
+        _ => {}
     }
     let named = match word {
         "enter" | "return" => NamedKey::Enter,
@@ -522,6 +544,113 @@ impl Keybindings {
         (Keybindings { map }, warns)
     }
 
+    /// The (chord, action-name) seed table behind [`Self::platform_defaults`]:
+    /// pairs parsed through the SAME machinery as user config, so a default can
+    /// never diverge from what a user could write. macOS = none.
+    ///
+    /// `pub(crate)` — not a private local — because two DOCUMENTATION surfaces
+    /// print it: `--list-keybinds` (diagnostics.rs) and `--help`'s KEYS section
+    /// (cli.rs). Both used to carry hand-written copies; the diagnostics one
+    /// printed the macOS `cmd+*` table on Windows (where `cmd` is the Win key —
+    /// chords the shell steals) and the help one had drifted to omit several
+    /// seeded chords. Generating both from THIS const makes that drift
+    /// impossible. Order is presentation order, so keep related chords adjacent.
+    #[cfg(target_os = "macos")]
+    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] = &[];
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] = &[
+        ("ctrl+shift+c", "copy"),
+        ("ctrl+shift+v", "paste"),
+        // The Windows-native muscle memory (Windows Terminal defaults): plain
+        // Ctrl+V pastes — the deliberate WT tradeoff (it shadows bash's
+        // quoted-insert ^V; rebindable) — plus the classic Insert pair.
+        ("ctrl+v", "paste"),
+        ("shift+insert", "paste"),
+        ("ctrl+insert", "copy"),
+        ("ctrl+shift+t", "new_tab"),
+        ("ctrl+shift+w", "close_tab"),
+        ("ctrl+shift+n", "new_window"),
+        ("ctrl+shift+f", "find"),
+        ("ctrl+shift+d", "split_vertical"),
+        ("ctrl+shift+e", "split_horizontal"),
+        ("ctrl+shift+return", "toggle_pane_zoom"),
+        // PANE FOCUS. Without these a split was a one-way door off macOS: the
+        // splits above were seeded but nothing moved the keyboard between the
+        // panes they create, `menu.rs` has no pane-focus MenuAction (so the
+        // palette does not expose it either) and there is no control verb — a
+        // Ctrl+Shift+D user was left reaching for the mouse. Alt+arrow is what
+        // `docs/NATIVE_WINDOWS_DESIGN.md` §9 names ("Alt+←/→ pane nav",
+        // milestone W4) and what Windows Terminal binds `moveFocus` to.
+        //
+        // It does shadow two things, both accepted and both rebindable: the
+        // PTY's `ESC[1;3<A-D>` (no stock shell or `less`/`vim` mapping uses
+        // it), and — because the find bar is consulted BELOW the keybinding
+        // block in `on_key` — ⌥←/⌥→ word motion inside an OPEN find field. The
+        // latter is a macOS text-field idiom that Windows spells Ctrl+arrow
+        // anyway, and pane nav is reachable from nowhere else.
+        ("alt+left", "focus_pane_left"),
+        ("alt+right", "focus_pane_right"),
+        ("alt+up", "focus_pane_up"),
+        ("alt+down", "focus_pane_down"),
+        ("ctrl+shift+right", "next_tab"),
+        ("ctrl+shift+left", "prev_tab"),
+        ("ctrl+pagedown", "next_tab"),
+        ("ctrl+pageup", "prev_tab"),
+        // The document-window reflex every Windows app answers. Ctrl+Tab is
+        // indistinguishable from a bare Tab in the LEGACY encoding, so nothing
+        // that works today loses a keystroke; a kitty-protocol app does lose
+        // its `ESC[9;5u`, which is the same trade Windows Terminal makes.
+        ("ctrl+tab", "next_tab"),
+        ("ctrl+shift+tab", "prev_tab"),
+        // Jump-to-prompt (OSC-133 marks): the WezTerm/iTerm2 chord. Up/Down
+        // are free here (left/right are tab nav), so no shadow.
+        ("ctrl+shift+up", "jump_prev_prompt"),
+        ("ctrl+shift+down", "jump_next_prompt"),
+        // Zoom: Ctrl+= and Ctrl+Shift+= (the latter is "Ctrl++" on a US layout,
+        // where `+` is Shift+`=` and the chord lookup runs on the UNSHIFTED base
+        // key). `ctrl+plus` is the other half of the same reflex and is NOT
+        // redundant: it is the only spelling that catches the numpad `+` (which
+        // no layout composes from `=`) and the de-DE/Nordic MAIN-ROW `+`, an
+        // unshifted key in its own right. Zoom OUT and RESET need no such twin —
+        // `-` and `0` are unshifted on all of those layouts.
+        ("ctrl+=", "font_increase"),
+        ("ctrl+shift+=", "font_increase"),
+        ("ctrl+plus", "font_increase"),
+        ("ctrl+-", "font_decrease"),
+        ("ctrl+0", "font_reset"),
+        ("ctrl+shift+s", "toggle_settings"),
+        ("ctrl+shift+a", "toggle_about"),
+        ("ctrl+shift+p", "open_palette"),
+        // NOTE: jump-to-tab-N is intentionally NOT seeded, on EITHER spelling.
+        // Both candidate chords collide with something a keyboard already owes
+        // its user, and neither collision is ours to accept by default:
+        //
+        // * bare Alt+digit (the GNOME-Terminal convention) is readline/emacs/vim
+        //   META-DIGIT, the numeric argument — and it fires BEFORE the PTY
+        //   encoder, so the digit would never reach the app at all;
+        // * Ctrl+Alt+digit (the Windows Terminal chord) IS AltGr on Windows. The
+        //   tempting counter-argument — "winit filters the Ctrl and Alt bits out
+        //   under AltGr" — is only half true, and the false half is a de-DE
+        //   regression: `keyboard_layout.rs:277` reads
+        //       let filter_out_altgr = layout.has_alt_graph && key_pressed(VK_RMENU);
+        //   so the bits are cleared only while the RIGHT Alt is down. Windows
+        //   equally accepts LeftCtrl+LeftAlt as AltGr for composition — that is
+        //   in fact how winit DETECTS AltGr (same file, :412-424, comparing the
+        //   CONTROL|ALT character against the unmodified one) — so on de-DE the
+        //   documented alternate spelling of `{`, `[` and `]`, LCtrl+LAlt+7/8/9,
+        //   arrives here as a plain `ctrl+alt+<digit>` chord. Seeding it would
+        //   switch tabs while a German user typed a brace into their shell.
+        //
+        // Windows Terminal ships Ctrl+Alt+digit anyway, so the chord is
+        // defensible — but it is an OWNER's call to trade brace input for tab
+        // jumping by default, not a polish patch's, and this file already
+        // carried a reasoned rejection of jump-to-tab that a default must not
+        // silently overturn. Tab nav stays covered by next/prev (Ctrl+Tab,
+        // Ctrl+Shift+Left/Right, Ctrl+PageUp/Down), and a user who wants N-jump
+        // has both spellings available: `switch_tab_N` parses and dispatches, so
+        // `ctrl+alt+1 = "switch_tab_1"` in `[keybindings]` works today.
+    ];
+
     /// The platform's BUILT-IN default keybindings. macOS ships an EMPTY table — the
     /// hardcoded Cmd-* chords in `on_key` ARE the convention there, so the no-config
     /// path stays byte-identical. Every other platform (Linux/X11) seeds the standard
@@ -532,52 +661,8 @@ impl Keybindings {
     /// any of these can be rebound.
     #[must_use]
     pub fn platform_defaults() -> Keybindings {
-        // (chord, action) pairs parsed through the SAME machinery as user config, so
-        // a default can never diverge from what a user could write. macOS = none.
-        #[cfg(target_os = "macos")]
-        let pairs: &[(&str, &str)] = &[];
-        #[cfg(not(target_os = "macos"))]
-        let pairs: &[(&str, &str)] = &[
-            ("ctrl+shift+c", "copy"),
-            ("ctrl+shift+v", "paste"),
-            // The Windows-native muscle memory (Windows Terminal defaults): plain
-            // Ctrl+V pastes — the deliberate WT tradeoff (it shadows bash's
-            // quoted-insert ^V; rebindable) — plus the classic Insert pair.
-            ("ctrl+v", "paste"),
-            ("shift+insert", "paste"),
-            ("ctrl+insert", "copy"),
-            ("ctrl+shift+t", "new_tab"),
-            ("ctrl+shift+w", "close_tab"),
-            ("ctrl+shift+n", "new_window"),
-            ("ctrl+shift+f", "find"),
-            ("ctrl+shift+d", "split_vertical"),
-            ("ctrl+shift+e", "split_horizontal"),
-            ("ctrl+shift+return", "toggle_pane_zoom"),
-            ("ctrl+shift+right", "next_tab"),
-            ("ctrl+shift+left", "prev_tab"),
-            ("ctrl+pagedown", "next_tab"),
-            ("ctrl+pageup", "prev_tab"),
-            // Jump-to-prompt (OSC-133 marks): the WezTerm/iTerm2 chord. Up/Down
-            // are free here (left/right are tab nav), so no shadow.
-            ("ctrl+shift+up", "jump_prev_prompt"),
-            ("ctrl+shift+down", "jump_next_prompt"),
-            // Zoom: Ctrl+= and Ctrl+Shift+= (the latter is "Ctrl++" on most layouts).
-            ("ctrl+=", "font_increase"),
-            ("ctrl+shift+=", "font_increase"),
-            ("ctrl+-", "font_decrease"),
-            ("ctrl+0", "font_reset"),
-            ("ctrl+shift+s", "toggle_settings"),
-            ("ctrl+shift+a", "toggle_about"),
-            ("ctrl+shift+p", "open_palette"),
-            // NOTE: jump-to-tab-N is intentionally NOT seeded. The GNOME-Terminal
-            // Alt+1..9 convention would shadow readline/emacs/vim META-DIGIT numeric
-            // arguments (Alt+digit), a real regression for TUI users — and it fires
-            // BEFORE the PTY encoder, so the digit never reaches the app. Tab nav is
-            // covered by next/prev (Ctrl+Shift+Left/Right, Ctrl+PageUp/Down); users
-            // who want N-jump can bind switch_tab_N themselves in [keybindings].
-        ];
         let mut map = HashMap::new();
-        for (chord_str, action_str) in pairs {
+        for (chord_str, action_str) in Self::PLATFORM_DEFAULT_PAIRS {
             // These are compile-time constants; a parse failure is a build-time bug,
             // so assert in debug yet fall open (skip) in release rather than panic.
             match (Chord::parse(chord_str), Action::parse(action_str)) {
@@ -1095,6 +1180,116 @@ mod tests {
                 "user [keybindings] overlay must win over the platform default"
             );
         }
+    }
+
+    /// ZOOM IN IS REACHABLE FROM A `+` KEY. `Chord::parse` splits on `+` with no
+    /// escape, so `"ctrl++"` cannot be written at all — which left `+` unbindable
+    /// and zoom-in unreachable wherever `+` is not Shift+`=`: the de-DE/Nordic
+    /// MAIN-ROW `+`, and the NUMPAD `+` on every layout including en-US (both
+    /// arrive as `Character("+")` with no Shift). `plus` is the spelling that fixes
+    /// it, for the seed AND for a user's own config.
+    #[test]
+    fn plus_is_bindable_and_seeded_for_zoom_in() {
+        assert_eq!(
+            Chord::parse("ctrl+plus").unwrap(),
+            Chord {
+                mods: MOD_CTRL,
+                key: KeyToken::Char('+')
+            }
+        );
+        // The three spellings agree; `minus`/`equal` exist so a config never has to
+        // know that only `+` is special.
+        assert_eq!(Chord::parse("ctrl+minus"), Chord::parse("ctrl+-"));
+        assert_eq!(Chord::parse("ctrl+equal"), Chord::parse("ctrl+="));
+        // `ctrl++` remains a parse ERROR (the separator wins) — `plus` is the
+        // escape hatch, not a second syntax.
+        assert!(Chord::parse("ctrl++").is_err());
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            let kb = Keybindings::resolved(None);
+            // Unshifted `+`: de-DE/Nordic main row, and the numpad everywhere.
+            assert_eq!(
+                kb.lookup(&ch("+"), ModifiersState::CONTROL),
+                Some(Action::FontIncrease),
+                "Ctrl+Plus zooms in"
+            );
+            // The US main row still arrives as the UNSHIFTED base `=` plus Shift,
+            // which is the pre-existing seed — unchanged.
+            assert_eq!(
+                kb.lookup(&ch("="), ModifiersState::CONTROL | ModifiersState::SHIFT),
+                Some(Action::FontIncrease),
+                "Ctrl+Shift+= still zooms in"
+            );
+        }
+    }
+
+    /// PANE FOCUS AND TAB NAV EXIST OFF macOS. The splits were seeded and their
+    /// panes were then unreachable from the keyboard: no `focus_pane_*` default, no
+    /// pane-focus MenuAction (so no palette row either) and no control verb. Same
+    /// for the two chords every Windows document window answers.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn platform_defaults_seed_pane_focus_and_tab_nav() {
+        let kb = Keybindings::resolved(None);
+        let named = WinitKey::Named;
+        let alt = ModifiersState::ALT;
+        assert_eq!(
+            kb.lookup(&named(NamedKey::ArrowLeft), alt),
+            Some(Action::FocusPaneLeft)
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::ArrowRight), alt),
+            Some(Action::FocusPaneRight)
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::ArrowUp), alt),
+            Some(Action::FocusPaneUp)
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::ArrowDown), alt),
+            Some(Action::FocusPaneDown)
+        );
+        assert_eq!(
+            kb.lookup(&named(NamedKey::Tab), ModifiersState::CONTROL),
+            Some(Action::NextTab),
+            "Ctrl+Tab"
+        );
+        assert_eq!(
+            kb.lookup(
+                &named(NamedKey::Tab),
+                ModifiersState::CONTROL | ModifiersState::SHIFT
+            ),
+            Some(Action::PrevTab),
+            "Ctrl+Shift+Tab"
+        );
+        // JUMP-TO-TAB-N STAYS UNSEEDED ON BOTH SPELLINGS, and that is a decision
+        // worth pinning rather than a hole nobody filled. Bare Alt+digit is
+        // readline/vim's META-DIGIT numeric argument, which fires before the PTY
+        // encoder and would never reach the app; Ctrl+Alt+digit is how Windows
+        // spells AltGr for the LeftCtrl+LeftAlt composition, so on de-DE it is the
+        // documented alternate spelling of `{`, `[` and `]` (7/8/9). winit clears
+        // the Ctrl/Alt bits only while the RIGHT Alt is down
+        // (`keyboard_layout.rs:277`), so those braces arrive here as an ordinary
+        // ctrl+alt chord and a seed would eat them.
+        let ctrl_alt = ModifiersState::CONTROL | ModifiersState::ALT;
+        for n in 1..=9u8 {
+            assert_eq!(
+                kb.lookup(&ch(&n.to_string()), ctrl_alt),
+                None,
+                "Ctrl+Alt+{n} must stay free — it is AltGr+{n} on de-DE"
+            );
+            assert_eq!(kb.lookup(&ch(&n.to_string()), ModifiersState::ALT), None);
+        }
+        // …but the action exists and the chord parses, so a user who wants the
+        // Windows Terminal behaviour can have it in one config line.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+alt+2".to_string(), "switch_tab_2".to_string());
+        assert_eq!(
+            Keybindings::resolved(Some(&table)).lookup(&ch("2"), ctrl_alt),
+            Some(Action::SwitchTab(2)),
+            "opt-in still works"
+        );
     }
 
     // ---- [key_sequences] input policy ------------------------------------

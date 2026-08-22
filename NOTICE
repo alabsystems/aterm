@@ -18,8 +18,10 @@ This source distribution includes modified copies of these upstream crates:
 - winnow 0.7.15, MIT (`vendor/winnow/`)
 
 Each vendored crate retains its upstream license text. The winit copy contains
-aterm modifications to macOS application behavior and Wayland seat/data-device
-handling; modified and added files carry prominent notices.
+aterm modifications to macOS application behavior, Wayland seat/data-device
+handling, and Windows modal size/move event delivery (a WM_TIMER pump so timed
+events keep flowing during caption drags and edge resizes); modified and added
+files carry prominent notices.
 
 `crates/aterm-lz4/` is a modified, block-mode-only subset derived from
 lz4_flex 0.11.5 by Pascal Seitz and contributors. Its upstream-derived files

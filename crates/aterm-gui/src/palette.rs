@@ -442,6 +442,20 @@ impl PaletteState {
                 MenuAction::RenameSession => {
                     row.enabled = live.terminal_front && live.can_rename;
                 }
+                // "Check for Updates…" drives the IN-APP updater, which exists
+                // only on macOS (`aterm_update::enabled()` is cfg-gated there).
+                // Off macOS the row used to sit enabled and silently no-op —
+                // the check never starts and no staged build can exist — so it
+                // greys out (and the socket `invoke` refuses by name) instead,
+                // the same honesty rule as RenameSession/ToggleMatrixRain
+                // above. NOT gated on live updater state: on macOS the action
+                // always at least opens the Software Update route, so the row
+                // stays unconditionally enabled there (byte-identical
+                // behaviour). The Settings route itself remains reachable off
+                // macOS via Settings… — only the dead update VERB is refused.
+                MenuAction::SoftwareUpdate => {
+                    row.enabled = cfg!(target_os = "macos");
+                }
                 MenuAction::Copy => row.enabled = live.has_selection,
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
                 MenuAction::ReopenClosedTab => row.enabled = live.can_reopen_closed_tab,

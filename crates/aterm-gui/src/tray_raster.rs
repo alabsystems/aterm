@@ -778,6 +778,18 @@ pub(crate) fn prepare_ui_fonts_for_direct_view_test() {
     fonts.ui_semibold = ui.semibold.clone();
 }
 
+/// The inverse seam: return THIS test thread's chrome stack to the cold,
+/// UI-face-less store. Libtest reuses worker threads, so a test that asserts
+/// the "no UI face installed" branch (the strip band's decline path) cannot
+/// assume a cold thread — an earlier test on the same worker may have prepared
+/// the faces.
+#[cfg(test)]
+pub(crate) fn clear_ui_fonts_for_test() {
+    let mut fonts = lock_fonts();
+    fonts.ui_regular = None;
+    fonts.ui_semibold = None;
+}
+
 /// An owned, immutable semantic renderer input for deterministic direct-view
 /// tests. The production host supplies the same kind of [`PreparedSemanticFont`]
 /// through `ViewCx`; these tests inject that boundary value directly so an
@@ -1263,6 +1275,67 @@ pub(crate) fn baseline_centered_at(cy: f32, size: f32) -> f32 {
 struct UiFontAssets {
     regular: Option<Arc<fontdue::Font>>,
     semibold: Option<Arc<fontdue::Font>>,
+    /// T3, the FULL cut for one caller: when the regular is a VARIABLE face
+    /// with a `wght` axis (Segoe UI Variable on Win11), its raw bytes and the
+    /// resolved semibold coords, so a pixel-space painter can instance the
+    /// real wght-600 cut through `aterm_render::variation::varied_glyph_raster`
+    /// instead of the static sibling. `None` for a static regular — and the
+    /// bytes are retained ONLY in the variable case (macOS's Helvetica Neue
+    /// collection is ~9 MB that nobody would read).
+    variable_semibold: Option<UiVariableSemibold>,
+}
+
+/// The variable UI face instanced at SEMIBOLD, for the one painter that draws
+/// outside fontdue (the Windows strip band's active label —
+/// [`crate::tab_bar::pixel_band`]). fontdue has no variation API, so
+/// `ChromeFonts::ui_semibold` above stays the static `seguisb.ttf`; this is the
+/// honest way to the Win11 "Segoe UI Variable Semibold" without pairing the
+/// variable file with itself (two wght-400 faces and no contrast).
+#[derive(Clone)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct UiVariableSemibold {
+    /// The whole font file (ttf-parser borrows it per raster).
+    pub(crate) bytes: Arc<[u8]>,
+    /// Collection index the regular was parsed at.
+    pub(crate) index: u32,
+    /// The `(tag, value)` instance coords — `wght` pulled to the Fluent
+    /// semibold (600), clamped onto the face's own axis; every other axis
+    /// (`opsz`) stays at its default, the Text optical size.
+    pub(crate) coords: Vec<(u32, f32)>,
+    /// The SAME regular face parsed from `bytes`: its cmap resolves glyph ids
+    /// for the varied raster (identical glyph numbering — one file), and its
+    /// `kern` pairs are the static kerning a weight instance shares.
+    pub(crate) cmap: Arc<fontdue::Font>,
+}
+
+/// The CSS/OpenType weight the chrome's `UiBold` stands for (Fluent's
+/// "Semibold" — `seguisb.ttf` is 600 too, so the static and variable paths
+/// name the same weight).
+const UI_SEMIBOLD_WGHT: f32 = 600.0;
+
+/// Resolve [`UiVariableSemibold`] for a just-parsed regular, or `None` when the
+/// face is static, has no `wght` axis, or its axis cannot reach a weight that
+/// is visibly heavier than the regular (a face whose `wght` tops out near 400
+/// would hand `UiBold` a look-alike — the exact contrast loss the "never pair
+/// SegUIVar with itself" rule guards against, in another coat).
+fn variable_semibold_of(
+    bytes: Vec<u8>,
+    index: u32,
+    regular: &Arc<fontdue::Font>,
+) -> Option<UiVariableSemibold> {
+    use aterm_render::variation::{REGULAR_WGHT, WGHT_TAG, clamp_axis, probe};
+    let probe = probe(&bytes, index)?;
+    let wght = probe.axes.iter().find(|axis| axis.tag == WGHT_TAG)?;
+    let weight = clamp_axis(wght, UI_SEMIBOLD_WGHT);
+    if weight < REGULAR_WGHT + 100.0 {
+        return None;
+    }
+    Some(UiVariableSemibold {
+        bytes: bytes.into(),
+        index,
+        coords: vec![(WGHT_TAG, weight)],
+        cmap: Arc::clone(regular),
+    })
 }
 
 struct UiFontCandidate {
@@ -1313,12 +1386,41 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"))
         .join("Fonts");
-    vec![UiFontCandidate {
-        regular_path: root.join("segoeui.ttf"),
-        regular_index: 0,
-        semibold_path: root.join("seguisb.ttf"),
-        semibold_index: 0,
-    }]
+    vec![
+        // T3 — the Win11 UI cut. `SegUIVar.ttf` is a variable font whose `fvar`
+        // DEFAULT instance (wght 400, opsz 10.5) carries name id 17 "Regular" and
+        // IS "Segoe UI Variable Text" — the exact face Win11 sets its own chrome
+        // in at 12–23 px. fontdue parses only a variable font's default-instance
+        // outlines, which here is precisely the instance we want, so pointing
+        // `regular_path` at the file lands the Fluent regular with no variation
+        // machinery at all.
+        //
+        // The fontdue SEMIBOLD deliberately stays the STATIC `seguisb.ttf`.
+        // Pairing SegUIVar with itself would silently install TWO wght-400 faces
+        // (`resolve_ui_font_assets` accepts any pair that parses — it cannot see
+        // weights), and every `UiBold` heading would lose its contrast with no
+        // error anywhere. fontdue has no variation API, so instancing wght 600
+        // out of SegUIVar happens OUTSIDE it: the resolver also keeps the
+        // variable file's bytes + the semibold coords (`UiVariableSemibold`),
+        // and the one painter that draws through the portable varied rasterizer
+        // — the strip band's active label — takes the real "Segoe UI Variable
+        // Semibold". Every fontdue-drawn `UiBold` (Settings/About headings)
+        // keeps the static Win10 semibold: the same weight, a sibling cut.
+        UiFontCandidate {
+            regular_path: root.join("SegUIVar.ttf"),
+            regular_index: 0,
+            semibold_path: root.join("seguisb.ttf"),
+            semibold_index: 0,
+        },
+        // Win10 (no SegUIVar on disk): the static Segoe UI pair, exactly the
+        // faces this platform's own chrome uses there.
+        UiFontCandidate {
+            regular_path: root.join("segoeui.ttf"),
+            regular_index: 0,
+            semibold_path: root.join("seguisb.ttf"),
+            semibold_index: 0,
+        },
+    ]
 }
 
 #[cfg(target_os = "linux")]
@@ -1352,17 +1454,20 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
     Vec::new()
 }
 
-fn parse_ui_font(path: &std::path::Path, index: u32) -> Option<Arc<fontdue::Font>> {
+/// Parse one UI face; the file bytes ride back beside it so the resolver can
+/// keep them for a variable face ([`variable_semibold_of`]) — fontdue copies
+/// what it parses and does not retain the buffer, so this is the only handle.
+fn parse_ui_font(path: &std::path::Path, index: u32) -> Option<(Arc<fontdue::Font>, Vec<u8>)> {
     let bytes = std::fs::read(path).ok()?;
-    fontdue::Font::from_bytes(
-        bytes,
+    let font = fontdue::Font::from_bytes(
+        &bytes[..],
         fontdue::FontSettings {
             collection_index: index,
             ..fontdue::FontSettings::default()
         },
     )
-    .ok()
-    .map(Arc::new)
+    .ok()?;
+    Some((Arc::new(font), bytes))
 }
 
 #[cfg(test)]
@@ -1375,20 +1480,39 @@ static UI_FONT_RESOLVE_ATTEMPTS: std::sync::atomic::AtomicU64 =
 fn resolve_ui_font_assets() -> UiFontAssets {
     #[cfg(test)]
     UI_FONT_RESOLVE_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut first_regular = None;
+    let mut first_regular: Option<(Arc<fontdue::Font>, Vec<u8>, u32)> = None;
     for candidate in ui_font_candidates() {
         let regular = parse_ui_font(&candidate.regular_path, candidate.regular_index);
         let semibold = parse_ui_font(&candidate.semibold_path, candidate.semibold_index);
-        if regular.is_some() && semibold.is_some() {
-            return UiFontAssets { regular, semibold };
-        }
-        if first_regular.is_none() {
-            first_regular = regular;
+        match (regular, semibold) {
+            (Some((regular, bytes)), Some((semibold, _))) => {
+                let variable_semibold =
+                    variable_semibold_of(bytes, candidate.regular_index, &regular);
+                return UiFontAssets {
+                    regular: Some(regular),
+                    semibold: Some(semibold),
+                    variable_semibold,
+                };
+            }
+            (Some(regular), None) if first_regular.is_none() => {
+                first_regular = Some((regular.0, regular.1, candidate.regular_index));
+            }
+            _ => {}
         }
     }
-    UiFontAssets {
-        regular: first_regular,
-        semibold: None,
+    match first_regular {
+        Some((regular, bytes, index)) => {
+            // No static semibold anywhere: a variable regular can still
+            // instance its own — the band's active label keeps its weight even
+            // where `UiBold`'s fontdue slot falls back to the regular.
+            let variable_semibold = variable_semibold_of(bytes, index, &regular);
+            UiFontAssets {
+                regular: Some(regular),
+                semibold: None,
+                variable_semibold,
+            }
+        }
+        None => UiFontAssets::default(),
     }
 }
 
@@ -1419,10 +1543,89 @@ pub(crate) fn warm_chrome_font_assets() {
 #[cfg(test)]
 pub(crate) fn warm_chrome_font_assets() {}
 
+/// The pixel tab strip's font-readiness fingerprint (Windows band —
+/// [`crate::tab_bar::pixel_band`]): the chrome-face install epoch with the UI
+/// regular's presence folded in. The strip band raster is cached on the GUI side
+/// keyed on everything the pixels are a function of; the fonts are one of those
+/// inputs, and they LAND ASYNCHRONOUSLY (backend construction installs them via
+/// [`set_chrome_fonts`] after the first frames may already have painted). Folding
+/// this value into the band's cache key makes the landing a cache miss, so the
+/// frame that replaces the tofu-free mono fallback with real Segoe is the same
+/// frame every other chrome surface re-rasters on — no bespoke invalidation hook.
+///
+/// `semantic_ready_epoch` moves on every [`install_chrome_faces_locked`] (and on
+/// semantic-cascade landings, which merely cost one harmless band rebuild); the
+/// presence bit covers the test seam (`prepare_ui_fonts_for_direct_view_test`)
+/// which installs UI faces without bumping the epoch.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_band_font_epoch() -> u64 {
+    let fonts = lock_fonts();
+    fonts
+        .semantic_ready_epoch
+        .wrapping_shl(1)
+        .wrapping_add(u64::from(fonts.ui_regular.is_some()))
+}
+
+/// Is a real proportional UI face installed at all? The Windows strip band
+/// declines wholesale ([`crate::tab_bar::pixel_band::raster_band`] → `None`)
+/// until it is — the first frames before `set_chrome_fonts` lands (and every
+/// unit test that never installs faces) keep the byte-identical cell strip
+/// instead of a half-pixel band whose labels would be mono anyway.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_band_ui_ready() -> bool {
+    lock_fonts().ui_regular.is_some()
+}
+
+/// The variable semibold instance for the strip band's ACTIVE label, or `None`
+/// when the host's UI regular is static (Win10 Segoe UI, Helvetica, Noto) —
+/// the caller then draws `TextFace::UiBold` through the fontdue path (the
+/// static `seguisb.ttf` sibling, or the regular where even that is absent).
+///
+/// Guarded on IDENTITY: handed out only while the INSTALLED regular is the very
+/// face these bytes were parsed from (`Arc::ptr_eq` against the prepared
+/// asset), so a test seam or a future per-window face swap can never pair
+/// one file's cmap with another file's outlines.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_band_variable_semibold() -> Option<UiVariableSemibold> {
+    let installed = lock_fonts().ui_regular.clone()?;
+    prepared_ui_font_assets()
+        .variable_semibold
+        .clone()
+        .filter(|variable| Arc::ptr_eq(&variable.cmap, &installed))
+}
+
+/// Can the chrome stack draw EVERY char of `s` as real ink — the UI face first,
+/// then the terminal cascade ([`select_chrome_face`]: real bold sibling / user
+/// primary / embedded DejaVu)? This is exactly the per-char routing
+/// [`Canvas::text`]'s proportional arm performs, asked ahead of time: a char that
+/// fails BOTH is one the pen would silently skip (advance-only), which for a tab
+/// TITLE means a hole where a glyph should be. The Windows strip band asks this
+/// per label and honestly falls back to the cell-grid painter for any segment
+/// that fails — a colour emoji or CJK title then renders through the terminal
+/// renderer's full fallback/emoji machinery (mono-quantised, but REAL), instead
+/// of vanishing from a proportional run.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn strip_band_run_coverable(s: &str) -> bool {
+    let mut fonts = lock_fonts();
+    if fonts.ui_regular.is_none() {
+        return false;
+    }
+    let ui = fonts.ui_regular.clone();
+    s.chars().all(|ch| {
+        ch == ' '
+            || ui
+                .as_deref()
+                .is_some_and(|font| font.lookup_glyph_index(ch) != 0)
+            || fonts.face_for(TextWeight::Regular, ch).is_some()
+    })
+}
+
 /// Slight negative tracking (em) applied per glyph advance of the UI face — SF reads a
 /// touch loose at panel sizes when advanced naively. Applied IDENTICALLY by the raster
-/// pen ([`Canvas::text`]) and the measure ([`ui_text_width`]), so they cannot drift.
-const UI_TRACKING_EM: f32 = -0.008;
+/// pen ([`Canvas::text`]) and the measure ([`ui_text_width`]), so they cannot drift —
+/// and by the strip band's variable-instance pen (`tab_bar::pixel_band`), so an
+/// active label's tracking matches its inactive neighbours'.
+pub(crate) const UI_TRACKING_EM: f32 = -0.008;
 
 /// Width of `s` at size `px` in the UI face: real per-glyph advances plus
 /// `horizontal_kern` plus the same [`UI_TRACKING_EM`] the raster pen applies. Falls
@@ -3064,6 +3267,61 @@ mod tests {
         .expect("cold-to-prepared font transition exits cleanly");
     }
 
+    /// T3: the Win11 variable cut LEADS the Windows UI-face candidates and is
+    /// paired with the STATIC semibold — never with itself (two wght-400 faces
+    /// would erase every `UiBold` heading's contrast with no error anywhere).
+    /// The static Segoe UI pair stays behind it for Win10 hosts.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ui_face_candidates_lead_with_segoe_ui_variable_over_a_static_semibold() {
+        let candidates = ui_font_candidates();
+        let file = |path: &std::path::Path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default()
+        };
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(file(&candidates[0].regular_path), "seguivar.ttf");
+        assert_eq!(file(&candidates[0].semibold_path), "seguisb.ttf");
+        assert_eq!(file(&candidates[1].regular_path), "segoeui.ttf");
+        assert_eq!(file(&candidates[1].semibold_path), "seguisb.ttf");
+        for candidate in &candidates {
+            assert_ne!(
+                candidate.regular_path, candidate.semibold_path,
+                "a candidate must never pair a face with itself"
+            );
+        }
+    }
+
+    /// The strip band's readiness/coverage seams follow the installed UI face:
+    /// cold store ⇒ not ready and nothing coverable; prepared store ⇒ ready, a
+    /// Latin label coverable, and a char the embedded fallback stack lacks not.
+    #[test]
+    fn strip_band_seams_follow_the_installed_ui_face() {
+        clear_ui_fonts_for_test();
+        assert!(!strip_band_ui_ready());
+        assert!(!strip_band_run_coverable("Settings"));
+        let cold = strip_band_font_epoch();
+        prepare_ui_fonts_for_direct_view_test();
+        if !strip_band_ui_ready() {
+            // Host without a resolvable system UI face (CI): the decline
+            // branch above is the whole contract.
+            return;
+        }
+        assert_ne!(
+            strip_band_font_epoch(),
+            cold,
+            "the UI face landing must move the band's font fingerprint"
+        );
+        assert!(strip_band_run_coverable("Settings · pwsh 7"));
+        assert!(
+            !strip_band_run_coverable("\u{1F680}"),
+            "a colour emoji is covered by neither the UI face nor the embedded cascade"
+        );
+        clear_ui_fonts_for_test();
+    }
+
     #[test]
     fn ui_font_assets_are_host_prepared_and_compile_raster_without_resolver_io() {
         use crate::native_ui::{
@@ -3118,7 +3376,10 @@ mod tests {
             _ => panic!("immutable UI asset identity changed during compile/raster"),
         }
 
-        let source = include_str!("tray_raster.rs");
+        // Line-ending agnostic: a Windows checkout (`core.autocrlf`) hands
+        // `include_str!` CRLF text, and a `\n`-only marker then never splits —
+        // the scan silently widened to this whole test module.
+        let source = include_str!("tray_raster.rs").replace("\r\n", "\n");
         let canvas = source
             .split("struct Canvas")
             .nth(1)

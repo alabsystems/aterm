@@ -156,6 +156,96 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
     if rc == 0 { None } else { Some(free_to_caller) }
 }
 
+/// `BY_HANDLE_FILE_INFORMATION`. Only the volume serial and the two file-index halves
+/// are read; the rest is declared to get the layout right. `FILETIME` is two `u32`s.
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+// The identity query, declared dependency-free like `GetDiskFreeSpaceExW` above.
+// `std::os::windows::fs::MetadataExt` exposes these same two fields, but ONLY behind
+// the unstable `windows_by_handle` feature — which a crate that must also build on
+// stable cannot require. `GetFileInformationByHandle` is the stable route to the
+// identical kernel data.
+unsafe extern "system" {
+    fn CreateFileW(
+        lp_file_name: *const u16,
+        dw_desired_access: u32,
+        dw_share_mode: u32,
+        lp_security_attributes: *mut core::ffi::c_void,
+        dw_creation_disposition: u32,
+        dw_flags_and_attributes: u32,
+        h_template_file: *mut core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    fn GetFileInformationByHandle(
+        h_file: *mut core::ffi::c_void,
+        lp_file_information: *mut ByHandleFileInformation,
+    ) -> i32;
+    fn CloseHandle(h_object: *mut core::ffi::c_void) -> i32;
+}
+
+/// The OS-level identity of the directory at `dir`: `(volume serial, 64-bit file
+/// index)` — the NTFS analogue of POSIX `(dev, ino)`, and the value that must not
+/// change across an enumeration for that enumeration to be trustworthy.
+///
+/// Opened with `FILE_FLAG_OPEN_REPARSE_POINT` so the identity is the LINK's own, never
+/// its target's — matching `symlink_metadata`, whose result the caller vets separately.
+/// Fails **CLOSED**: `None` on any error, which a caller must treat as "identity
+/// unknown" (i.e. a failure), never as "unchanged".
+#[must_use]
+pub fn directory_identity(dir: &Path) -> Option<(u32, u64)> {
+    const FILE_SHARE_ALL: u32 = 0x0000_0007; // READ | WRITE | DELETE
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // required to open a DIRECTORY
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
+    wide.push(0);
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the call; the
+    // security-attributes and template-file params are optional and passed as NULL,
+    // which the API accepts. Desired access is 0 — `FILE_READ_ATTRIBUTES` is implied,
+    // and it is all the identity query needs.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle.is_null() || handle as isize == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: `handle` is a live handle from the successful `CreateFileW` above, and
+    // `info` is a valid, correctly-laid-out writable out-param.
+    let rc = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    // SAFETY: `handle` is live and not closed anywhere else; closed exactly once.
+    unsafe { CloseHandle(handle) };
+    if rc == 0 {
+        return None;
+    }
+    Some((
+        info.volume_serial_number,
+        (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+    ))
+}
+
 /// Remove whatever indirection currently sits at `link` (a junction is a directory
 /// reparse point → `remove_dir` unlinks just the junction, not its target's contents;
 /// a stale plain file → `remove_file`). Both attempts are best-effort. `pub` so callers

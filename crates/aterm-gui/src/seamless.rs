@@ -2306,10 +2306,25 @@ pub(crate) fn commit_and_exit(
 /// The readiness signal's owned type is UNINHABITED off unix (`Infallible`),
 /// so `Option<ReadySignal>` is statically always-`None` there and
 /// every match arm handling `Some` compiles away.
+///
+/// Local empty enums rather than `Infallible` for one reason: the shared consumer in
+/// `lib.rs` names `ReadySignal::raw_fd` as a function value, and an inherent method
+/// cannot be hung on a foreign type. Uninhabitedness — the property the paragraph
+/// above depends on — is identical either way.
 #[cfg(not(unix))]
-pub(crate) type ReadySignal = std::convert::Infallible;
+pub(crate) enum ReadySignal {}
 #[cfg(not(unix))]
-pub(crate) type CommitReceiver = std::convert::Infallible;
+pub(crate) enum CommitReceiver {}
+
+#[cfg(not(unix))]
+impl ReadySignal {
+    /// Unreachable by construction: `match *self {}` is the compiler's own proof
+    /// that no value of this type exists to have called it.
+    #[must_use]
+    pub(crate) fn raw_fd(&self) -> i32 {
+        match *self {}
+    }
+}
 
 /// Consume + validate the overlap-handoff readiness fd ([`ENV_READY_FD`]),
 /// clearing the env var immediately (the [`take_incoming`] idiom). Fail-closed:
@@ -2715,6 +2730,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
             tab_order: Vec::new(),
@@ -4681,6 +4697,7 @@ mod f4_adoption_proof_asymmetry {
             active_tab: 0,
             outer_x: Some(120),
             outer_y: Some(64),
+            maximized: None,
             tabs: Vec::new(),
             native_tabs: Vec::new(),
             tab_order: Vec::new(),

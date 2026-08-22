@@ -684,6 +684,9 @@ const APP_MENU: &[MenuEntry] = &[
     },
     Separator,
     // The ONE update entry point: opens the Software Update route and checks in one gesture.
+    // macOS-only as a live verb: off macOS the in-app updater lane does not exist, so the
+    // palette's resolve pass disables this row (`palette::PaletteState::resolve`) rather
+    // than letting it silently no-op.
     Item {
         label: "Check for Updates…",
         action: MenuAction::SoftwareUpdate,

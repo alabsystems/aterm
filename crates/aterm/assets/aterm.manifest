@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  SPDX-License-Identifier: Apache-2.0
+  Copyright 2026 Andrew Yates
+
+  The Win32 side-by-side manifest for THE shipped executable, embedded as
+  RT_MANIFEST (type 24, id 1) by crates/aterm/build.rs.
+
+  Until this file existed the shipped exe had NO resource section at all
+  (`resource_rva=0`, sections `.text .rdata .data .pdata .reloc`), so every
+  process-wide default below was whatever a bare 1990s Win32 binary gets.
+
+  DELIBERATELY ABSENT — read before adding: there is no <dpiAware> and no
+  <dpiAwareness>. winit calls SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)
+  itself at event-loop bring-up (vendor/winit/src/platform_impl/windows/dpi.rs:20,
+  from event_loop.rs:199), and a manifest declaration is applied by the LOADER,
+  before any of our code runs — so it wins, and winit's call then fails with
+  ERROR_ACCESS_DENIED (silently: winit ignores the result). Declaring anything
+  here would therefore SILENTLY take ownership of the DPI mode away from the code
+  that actually reasons about it, and a stale/weaker value would break per-monitor
+  DPI — which is one of the things Windows already gets right today. Leave it out.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity
+      type="win32"
+      name="Aterm.Terminal"
+      version="1.0.0.0"
+      processorArchitecture="*"/>
+
+  <!--
+    Common-Controls v6. This is the one entry with a visible consequence beyond
+    looks: without it comctl32 v5 is bound, and every common-control surface
+    draws the classic grey 3D chrome — including the multiline-paste MessageBoxW
+    at crates/aterm-gui/src/lib.rs (win32::confirm_yes_no). It is also a hard
+    PREREQUISITE, not a nicety: TaskDialogIndirect lives only in comctl32 v6, so
+    the close/quit confirmation named as the follow-up at
+    crates/aterm-gui/src/platform_win.rs is unreachable until this binds.
+
+    The publicKeyToken is Microsoft's fixed one for this assembly; it is part of
+    the identity, not a checksum of anything here.
+  -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+          type="win32"
+          name="Microsoft.Windows.Common-Controls"
+          version="6.0.0.0"
+          processorArchitecture="*"
+          publicKeyToken="6595b64144ccf1df"
+          language="*"/>
+    </dependentAssembly>
+  </dependency>
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <!--
+        longPathAware lifts MAX_PATH (260) for the *W path APIs a terminal hits
+        constantly: cwd tracking, OSC 7 / OSC 9;9 round-trips, drag-and-drop
+        paths, the toolchain store under %LOCALAPPDATA%. Note this is only half
+        the switch — it does nothing unless the machine also has
+        HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled=1. It
+        costs nothing when that key is off, so it is unconditionally correct to
+        declare; it just is not a guarantee.
+      -->
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+      <!--
+        activeCodePage=UTF-8 sets the process ANSI codepage to 65001, so the
+        remaining *A entry points and the CRT's narrow functions stop mangling
+        non-ASCII. aterm is UTF-8 end to end (the grid, the PTY, the config), so
+        this closes a mismatch rather than opening one.
+
+        NOT the console codepage: that is separate and already handled where it
+        matters (crates/aterm-cli/src/driver_windows.rs calls
+        SetConsoleOutputCP(65001) around the CLI session). It also does not
+        propagate to spawned children — a shell under ConPTY keeps the system
+        default unless it manifests its own.
+
+        Requires Windows 10 1903+, and is only honoured because the Win10/11
+        supportedOS GUID below is present.
+      -->
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+
+  <!--
+    supportedOS is a SHIMMING declaration, not a support claim: Windows applies
+    the compatibility shims of the newest OS the binary does NOT list, and hands
+    real behaviour (true GetVersionEx, activeCodePage above, modern
+    common-control metrics) to one that lists the running OS. The Win10/11 GUID
+    is the only load-bearing line here; the four older ones are the conventional
+    ladder and cost nothing.
+
+    aterm's real floor is set by ConPTY (Windows 10 1809), not by this block —
+    see crates/aterm-pty/src/windows/. Do not read the Vista/7/8 GUIDs as a
+    promise that aterm runs there.
+  -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <supportedOS Id="{e2011457-1546-43c5-a5fe-008deee3d3f0}"/><!-- Vista -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/><!-- 7 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/><!-- 8 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/><!-- 8.1 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/><!-- 10 / 11 -->
+    </application>
+  </compatibility>
+
+  <!--
+    asInvoker: a terminal must NEVER auto-elevate. It is also the loader default,
+    but stating it is what stops the installer-detection heuristic from guessing
+    elevation for a binary whose name or resources look setup-ish, and it is what
+    keeps a shell launched from aterm at the user's own token.
+  -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>

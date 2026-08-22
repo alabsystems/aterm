@@ -62,7 +62,12 @@ pub fn scrollback_text_only() -> bool {
 /// from `line`/search/copy of history). A true spacer has bit 10 set, is not
 /// itself `WIDE`, and immediately follows a `WIDE` main cell.
 #[inline]
-fn is_spacer(cells: &[Cell], idx: usize) -> bool {
+// `pub(in crate::grid)`: the ring fast materializer
+// (`scroll_materialize::materialize_from_row_extras`) must skip EXACTLY the
+// cells this skips, or its columns diverge from the Line round trip's. Shared,
+// not re-implemented — a second copy of this predicate is a silent divergence
+// waiting to happen.
+pub(in crate::grid) fn is_spacer(cells: &[Cell], idx: usize) -> bool {
     cells[idx].is_wide_continuation()
         && !cells[idx].is_wide()
         && idx > 0
@@ -726,12 +731,19 @@ impl ScrolledRowExtras {
     }
 }
 
+/// Monotone read cursors over the four column-sorted `ScrolledRowExtras`
+/// vectors. They are CURSORS, not lookups: each advances only when its next
+/// entry's column matches the column being emitted, so an entry for a skipped
+/// (spacer) column, or an out-of-order entry, is simply never consumed. The
+/// ring fast materializer shares this state and the same three consumers below,
+/// so it inherits that behaviour instead of re-deriving it with random access
+/// — which would differ exactly where the data is unusual.
 #[derive(Default)]
-struct RowToLineCursorState {
+pub(in crate::grid) struct RowToLineCursorState {
     complex_idx: usize,
     combining_idx: usize,
-    rgb_fg_idx: usize,
-    rgb_bg_idx: usize,
+    pub(in crate::grid) rgb_fg_idx: usize,
+    pub(in crate::grid) rgb_bg_idx: usize,
 }
 
 impl Grid {
@@ -1210,14 +1222,9 @@ fn push_cell_text(
         return 1;
     }
 
-    if let Some((_, value)) = extras
-        .complex_chars
-        .get(cursors.complex_idx)
-        .filter(|(col, _)| *col == col_u16)
-    {
+    if let Some(value) = next_complex_char(extras, cursors, col_u16) {
         let char_count = value.chars().count();
         text.push_str(value);
-        cursors.complex_idx += 1;
         char_count
     } else {
         text.push('\u{FFFD}');
@@ -1225,7 +1232,45 @@ fn push_cell_text(
     }
 }
 
-fn resolve_cell_color(
+/// Consume this column's stored complex-char string, if the cursor is on it.
+///
+/// The one place the complex cursor advances. Shared by [`push_cell_text`] (the
+/// Line serializer) and the ring fast materializer.
+pub(in crate::grid) fn next_complex_char<'a>(
+    extras: &'a ScrolledRowExtras,
+    cursors: &mut RowToLineCursorState,
+    col_u16: u16,
+) -> Option<&'a Arc<str>> {
+    let (_, value) = extras
+        .complex_chars
+        .get(cursors.complex_idx)
+        .filter(|(col, _)| *col == col_u16)?;
+    cursors.complex_idx += 1;
+    Some(value)
+}
+
+/// Consume this column's stored combining marks, if the cursor is on them.
+///
+/// The one place the combining cursor advances. Shared by
+/// [`push_combining_marks`] and the ring fast materializer.
+pub(in crate::grid) fn next_combining<'a>(
+    extras: &'a ScrolledRowExtras,
+    cursors: &mut RowToLineCursorState,
+    col_u16: u16,
+) -> Option<&'a [char]> {
+    let (_, combining) = extras
+        .combining
+        .get(cursors.combining_idx)
+        .filter(|(col, _)| *col == col_u16)?;
+    cursors.combining_idx += 1;
+    Some(combining.as_slice())
+}
+
+/// Resolve one channel of a cell's colour the way the Line serializer does:
+/// inline when the cell carries it, else the column's PRE-RESOLVED stored RGB
+/// (extraction already resolved RGB overflow AND `StyleId` at scroll time,
+/// #5890), else the default. Shared with the ring fast materializer.
+pub(in crate::grid) fn resolve_cell_color(
     needs_stored: bool,
     inline_raw: u32,
     stored_colors: &[(u16, [u8; 3])],
@@ -1262,19 +1307,14 @@ fn push_combining_marks(
     cursors: &mut RowToLineCursorState,
     col_u16: u16,
 ) {
-    let Some((_, combining)) = extras
-        .combining
-        .get(cursors.combining_idx)
-        .filter(|(col, _)| *col == col_u16)
-    else {
+    let Some(combining) = next_combining(extras, cursors, col_u16) else {
         return;
     };
 
-    for &c in combining.iter() {
+    for &c in combining {
         text.push(c);
         attrs_rle.push(attrs);
     }
-    cursors.combining_idx += 1;
 }
 
 /// Pack a cell's SGR 58 underline colour into the `0xTT_XXXXXX` form used by
@@ -1296,7 +1336,7 @@ fn packed_underline_color(extra: &crate::CellExtra) -> Option<u32> {
 /// into a single `[start, end)` span; a colour change or a column gap starts a
 /// new span. Restoring by filling each span's `[start, end)` range therefore
 /// reproduces the exact per-column colours (a gap stays uncoloured).
-fn coalesce_underline_spans(per_col: &[(u16, u32)]) -> Vec<UnderlineColorSpan> {
+pub(in crate::grid) fn coalesce_underline_spans(per_col: &[(u16, u32)]) -> Vec<UnderlineColorSpan> {
     let mut spans: Vec<UnderlineColorSpan> = Vec::new();
     for &(col, color) in per_col {
         if let Some(last) = spans.last_mut()

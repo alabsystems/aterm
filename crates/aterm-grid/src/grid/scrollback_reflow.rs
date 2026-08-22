@@ -208,6 +208,18 @@ impl Grid {
             .storage
             .absolute_row_counter
             .saturating_add(added as u64);
+        // SELECTION CUSTODY Phase 3 (independent latent bug, surfaced here): a width
+        // rewrap changes how many rows the SAME history occupies, so every absolute
+        // row number above the splice shifts. That is a wholesale RENUMBERING, not an
+        // ordinary append — exactly the condition `history_renumber_epoch` exists to
+        // signal, and it was not being raised. Absolute-row-keyed caches (the
+        // terminal's incremental search-index refresh, the viewport row cache) would
+        // carry shifted keys forward and go silently stale.
+        //
+        // Same reasoning and the same fix as the Kitty unscroll path in
+        // `scroll_unscroll.rs`, which documents it at length: a spurious rebuild is
+        // harmless, a missed one is silently wrong results.
+        self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
     }
 
     /// Build a single scrollback [`Row`](crate::Row) plus its preserved extras

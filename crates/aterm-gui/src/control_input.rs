@@ -501,7 +501,12 @@ const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldow
 /// emits ONE wheel report per line under a tracking app, so an unbounded count
 /// would let one verb line flood the PTY; 512 covers a large flick (many screens)
 /// while keeping the burst bounded. The seam separately clamps `lines >= 1`.
-const MAX_WHEEL_LINES: i32 = 512;
+///
+/// Defined as the seam's own [`crate::input::MAX_WHEEL_BURST`] rather than a second
+/// 512: the seam has a SECOND per-event burst to bound now (the DEC-1007 alt-scroll
+/// arrows, whose count is the platform's lines-per-detent and so is no longer
+/// bounded by `lines` alone), and the two ceilings must not drift apart.
+const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 
 /// PURE parser for the `mouse` verb -> an engine-neutral mouse [`InputEvent`].
 /// Factored out of [`cmd_mouse`] so the additive `mods=`/`count=`/`side=`/`block=`

@@ -6,8 +6,9 @@
 //!
 //! Without a logger installed every `aterm_log` record — including the
 //! `containment_audit` security denials — is silently discarded. [`init`]
-//! installs one writing to `~/Library/Logs/aterm/aterm.log` (macOS log
-//! convention): a `0600` file in a `0700` dir, same posture as the control
+//! installs one writing to `~/Library/Logs/aterm/aterm.log` on macOS
+//! (Console.app's convention) and `~/.local/state/aterm/logs/aterm.log`
+//! elsewhere (XDG state): a `0600` file in a `0700` dir, same posture as the control
 //! socket. The level comes from `$ATERM_LOG` (`off|error|warn|info|debug|
 //! trace`), default `info`; rotation-lite truncates the file at startup past
 //! [`aterm_log::MAX_LOG_BYTES`].
@@ -105,12 +106,81 @@ fn write_crash_report(
     )
 }
 
-/// Resolve `~/Library/Logs/aterm`, created `0700` (owner-only, like the
-/// control-socket dir — denial records name what a program attempted).
+/// One-shot startup scan for evidence that the PREVIOUS run died without a clean
+/// exit, returning the banner line to surface — or `None` when the last run
+/// ended normally. Both crash artifacts live in [`log_dir`] and, until this scan
+/// existed, NOTHING ever read either of them, so a crash was completely silent
+/// on the next launch (on a GUI-subsystem Explorer launch stderr is null, so the
+/// file really is the only trace):
+///
+///   * `crash-<pid>.log` — the panic hook's report ([`install_panic_hook`]);
+///   * `crash-signal-<pid>-<nanos>.log` — a NON-EMPTY fatal-signal/-exception
+///     marker (`crate::crash_signal`). Empty ones are clean-run leftovers — the
+///     current launch's own freshly-created marker included — which is why the
+///     `len() == 0` skip below is correct even though this runs AFTER
+///     `install_signal_handlers` created ours (and after its sweep, which only
+///     ever removes those same empty markers — ordering against it is moot).
+///
+/// CONSUMING, so the banner shows exactly once: every artifact found is renamed
+/// to `<name>.seen` — renamed, never deleted, because the banner points the user
+/// AT the file and the record must outlive the 8 s notice. A failed rename keeps
+/// the original name in the banner and honestly re-banners next launch rather
+/// than losing the report. The message names the NEWEST artifact (mtime); older
+/// ones are consumed silently in the same pass.
+pub(crate) fn take_crash_evidence() -> Option<String> {
+    take_crash_evidence_in(&log_dir()?)
+}
+
+/// [`take_crash_evidence`] against an explicit directory (unit-testable).
+fn take_crash_evidence_in(dir: &Path) -> Option<String> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Matches BOTH artifact families ("crash-signal-…" shares the prefix);
+        // `aterm.log` and already-consumed "….log.seen" files do not match.
+        if !(name.starts_with("crash-") && name.ends_with(".log")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.len() == 0 {
+            continue; // a clean-run signal marker, not crash evidence
+        }
+        let path = entry.path();
+        let seen = path.with_file_name(format!("{name}.seen"));
+        let path = if std::fs::rename(&path, &seen).is_ok() {
+            seen
+        } else {
+            path
+        };
+        let modified = meta.modified().unwrap_or(UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(t, _)| modified >= *t) {
+            newest = Some((modified, path));
+        }
+    }
+    let (_, path) = newest?;
+    Some(format!(
+        "aterm closed unexpectedly last time \u{2014} crash log at {}",
+        path.display()
+    ))
+}
+
+/// Resolve the per-user log dir, created `0700` (owner-only, like the
+/// control-socket dir — denial records name what a program attempted):
+/// `~/Library/Logs/aterm` on macOS (Console.app's convention); the XDG state
+/// dir `~/.local/state/aterm/logs` elsewhere — a Linux home has no business
+/// growing a `~/Library`, the same rule the atpkg store prefix follows.
 #[cfg(unix)]
 pub(crate) fn log_dir() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    #[cfg(target_os = "macos")]
     let dir = PathBuf::from(home).join("Library/Logs/aterm");
+    #[cfg(not(target_os = "macos"))]
+    let dir = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&home).join(".local/state"))
+        .join("aterm/logs");
     crate::control_auth::ensure_private_dir(&dir).ok()?;
     Some(dir)
 }
@@ -283,6 +353,48 @@ mod tests {
         // A later report from the same pid replaces, not appends.
         write_crash_report(&path, &"second", &"bt").unwrap();
         assert!(!std::fs::read_to_string(&path).unwrap().contains("boom"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_evidence_banners_once_and_preserves_the_artifact() {
+        let dir = std::env::temp_dir().join(format!("aterm-log-seen-{}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        // A previous run's panic report, a NON-empty signal marker, an EMPTY
+        // marker (a clean run's leftover — must be ignored), and the ordinary
+        // log file (wrong prefix — must be ignored).
+        std::fs::write(dir.join("crash-4242.log"), b"panicked at 'boom'").unwrap();
+        std::fs::write(dir.join("crash-signal-4242-7.log"), b"fatal signal 11").unwrap();
+        std::fs::write(dir.join("crash-signal-9999-8.log"), b"").unwrap();
+        std::fs::write(dir.join("aterm.log"), b"routine line").unwrap();
+        let notice = take_crash_evidence_in(&dir).expect("crash evidence must banner");
+        assert!(
+            notice.starts_with("aterm closed unexpectedly last time"),
+            "unexpected banner: {notice}"
+        );
+        assert!(
+            notice.contains(".log.seen"),
+            "the banner must point at the consumed (renamed) artifact: {notice}"
+        );
+        // Consumed = renamed, never deleted: both non-empty artifacts survive
+        // under `.seen` names, so the user can still open what the banner named.
+        assert!(dir.join("crash-4242.log.seen").exists());
+        assert!(dir.join("crash-signal-4242-7.log.seen").exists());
+        assert!(!dir.join("crash-4242.log").exists());
+        // One-shot: a second scan (the next launch) finds nothing to banner —
+        // the empty marker and aterm.log were never candidates.
+        assert!(take_crash_evidence_in(&dir).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn crash_evidence_absent_after_a_clean_run() {
+        let dir = std::env::temp_dir().join(format!("aterm-log-clean-{}", std::process::id()));
+        ensure_private_dir(&dir).unwrap();
+        // A clean run leaves exactly an empty marker + the routine log.
+        std::fs::write(dir.join("crash-signal-1234-5.log"), b"").unwrap();
+        std::fs::write(dir.join("aterm.log"), b"routine line").unwrap();
+        assert!(take_crash_evidence_in(&dir).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

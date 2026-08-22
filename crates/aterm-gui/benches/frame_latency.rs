@@ -71,6 +71,46 @@
 //      and the frame that echoes it (extract + effects + raster) timed.
 //   5. many_tabs_idle/N   — N resident tabs, nothing changing: the
 //      steady-state cost of the settled compose frame as state scales.
+//   6. scrolled_back_repaint — SCR-1's price, and the workload this crate
+//      simply did not have: a presented frame whose viewport is SCROLLED
+//      BACK 200 lines and NOT MOVING. Every workload above sits at
+//      `display_offset == 0`, where a row read is a pointer into the grid
+//      ring; past the offset the SAME per-frame `cell_frame_into` resolves
+//      every visible row through `Grid::visible_row_view` -> the 3-tier
+//      history materializer, with no memo of any kind — so a repaint of an
+//      UNCHANGED scrolled-back window re-materializes all 24 rows from
+//      scratch, every frame, forever (the scroll pill alone holds 900 ms
+//      then fades 300 ms, and the blink/effects keys keep presenting).
+//   7. live_bottom_repaint — THE CONTROL for 6, and the only reason 6's
+//      number means anything: the identical fixture, identical script,
+//      identical effects-off config, differing in EXACTLY ONE THING — the
+//      viewport is at the live bottom. (6 - 7) IS the per-frame history
+//      materialization cost, with the raster, the effects driver, the lock
+//      and the timer floor all cancelling.
+//   8. scrolled_back_wheel — the moving half: one 3-line wheel notch armed
+//      per frame (untimed), the frame timed. A notch exposes 3 NEW rows out
+//      of 24, so this is where an absolute-row-keyed memo should collapse
+//      24 materializations to 3 while 6 collapses them to 0.
+//
+// WHAT THE SCROLLED-BACK ARMS PIN, TWO-SIDED. Reach: `display_offset` is
+// re-read on every sampled frame (the arm really is scrolled back / really is
+// at the bottom / really is moving), and the history is real
+// (`scrollback_lines() >= depth + rows`). IDENTITY: the fill lines are
+// numbered, so the frame's own extracted scratch is read back and every row
+// checked against ONE formula that covers both arms —
+//
+//     viewport row r shows fill line `scrollback_lines() - display_offset() + r`
+//
+// — which is the exact mapping `visible_row_view` performs (row r -> rev_idx
+// d-1-r -> history index total-d+r; history index i IS fill line i because a
+// 5k fill never evicts from a 10k ring). That formula is recomputed from LIVE
+// observables at every check, so it stays correct across scroll moves and
+// across output arriving while scrolled back — which is what makes it a real
+// invalidation guard for any row memo keyed on absolute row identity, not
+// just a content spot-check. The verify pass walks the memo's whole risk
+// surface deliberately: scroll to the bottom and back, feed a line while
+// scrolled back (history grows under the viewport), and change depth —
+// re-asserting identity immediately after each.
 //
 // ONE FINDING THIS BENCH MADE ON ITS FIRST RUN (FL-1), now FIXED: a SETTLED
 // composed window never took the RepaintKey early-out — every scheduled
@@ -174,6 +214,39 @@ const ECHO_LINE: u32 = 60;
 
 /// The grid every fixture presents at (the headless fixture's stub terminal).
 const ROWS: usize = 24;
+
+/// Scrollback fill for the scrolled-back arms, in lines. Comfortably inside
+/// the stub session's 10_000-line grid ring (`Grid::new`'s default), so the
+/// fill is never evicted and history index `i` IS fill line `i` — the fact the
+/// frame-identity formula rests on. The stub session carries NO tiered store
+/// (`Terminal::new`), so these arms price the RING tier: the tier interactive
+/// scrollback actually lives in (the product keeps 10k live ring lines in
+/// front of the tiers). Deep warm/cold tier decode has its own instrument —
+/// `aterm-bench --example scroll_scrub_harness` — and is deliberately not
+/// re-measured here.
+const SB_FILL_LINES: usize = 5_000;
+
+/// Where the scrolled-back arms sit: 200 lines up. Deep enough that EVERY one
+/// of the 24 viewport rows is a history row (so the workload is not diluted by
+/// live rows), shallow enough to be an ordinary "scrolled up to read the build
+/// log" position rather than a jump to the top.
+const SB_DEPTH: usize = 200;
+
+/// One wheel notch, in lines — the delta a mouse wheel step scrolls, i.e. the
+/// number of genuinely NEW rows a scrolling frame exposes out of `ROWS`.
+const SB_WHEEL: usize = 3;
+
+/// How far above [`SB_DEPTH`] the wheel arm travels before reversing. Keeps
+/// the scrub inside the fill forever (it never walks off the top of history,
+/// which would clamp `scroll_display` into a no-op and silently turn the
+/// moving arm into the stationary one).
+const SB_WHEEL_SPAN: usize = 600;
+
+/// Warm-up frames for the scrolled-back arms. Shorter than [`WARM_FRAMES`] on
+/// purpose: these fixtures have every effect OFF, so there is no multi-second
+/// decoration envelope to settle — only the render scratch and the per-window
+/// damage cache, which reach steady state in a handful of frames.
+const SB_WARM_FRAMES: usize = 48;
 
 // ------------------------------------------------------------------ report --
 
@@ -285,6 +358,102 @@ fn f_many_tabs(n: usize) -> (BenchApp, u64, Instant) {
     }
     b.compose(t0);
     (b, active_sid, t0)
+}
+
+/// One numbered fill line. The number is what the identity guard reads back
+/// out of the presented frame, so the format is load-bearing: `sb <n> ...`.
+fn sb_line(i: usize) -> Vec<u8> {
+    format!("sb {i:05} 0123456789 abcdefghij 0123456789 abcdefghij\r\n").into_bytes()
+}
+
+/// A scroll delta as the `i32` `Grid::scroll_display` takes.
+fn sb_delta(lines: usize) -> i32 {
+    i32::try_from(lines).expect("scrollback bench deltas fit i32")
+}
+
+/// The scrolled-back fixture (and, at `depth == 0`, its live-bottom control):
+/// a headless window with EVERY cursor effect off — so the timed span is the
+/// LOCK-A extraction plus the damage-tracked raster and nothing else — over a
+/// real `SB_FILL_LINES`-line history, parked `depth` lines up.
+///
+/// Effects are off in BOTH arms, not to flatter the number but because the
+/// control subtracts them either way; what it must not subtract is a variable
+/// per-frame effects cost riding on one arm's samples. The cursor-effect
+/// driver has its own workload (`effects_off_frame`) two entries up.
+fn f_scrollback(depth: usize) -> (BenchApp, Instant) {
+    let mut b = BenchApp::headless();
+    b.effects_all_off();
+    let t0 = Instant::now();
+    // One `process` call, not 5_000: the fill is untimed setup and the engine
+    // sees the identical byte stream either way.
+    let mut corpus = Vec::with_capacity(SB_FILL_LINES * 48);
+    for i in 0..SB_FILL_LINES {
+        corpus.extend_from_slice(&sb_line(i));
+    }
+    b.feed(0, &corpus);
+    b.present_frame(t0);
+    if depth > 0 {
+        b.scroll_display(sb_delta(depth));
+    }
+    (b, t0)
+}
+
+/// The fill line number the LAST PRESENTED frame shows at viewport row `r`,
+/// or `None` when that row is not a fill line (only the live bottom's trailing
+/// empty cursor row).
+fn sb_row_line(b: &BenchApp, r: usize) -> Option<usize> {
+    let text = b.scratch_row_text(r);
+    let mut it = text.split_whitespace();
+    if it.next()? != "sb" {
+        return None;
+    }
+    it.next()?.parse::<usize>().ok()
+}
+
+/// THE FRAME-IDENTITY PIN (see the file header for the derivation): every
+/// viewport row of the frame just presented must show the fill line the
+/// current `(scrollback_lines, display_offset)` pair says it must. Returns the
+/// number of rows actually checked so the caller can prove the walk was not
+/// vacuous. `filled` is how many fill lines exist right now — rows past it are
+/// the empty cursor line and legitimately carry no number.
+fn assert_sb_identity(b: &BenchApp, filled: usize, ctx: &str) -> usize {
+    let base = b
+        .scrollback_lines()
+        .checked_sub(b.display_offset())
+        .expect("display_offset <= scrollback_lines is a Grid invariant");
+    let mut checked = 0usize;
+    for r in 0..ROWS {
+        let want = base + r;
+        match sb_row_line(b, r) {
+            Some(got) => {
+                assert_eq!(
+                    got, want,
+                    "{ctx}: viewport row {r} shows fill line {got}, expected {want} — the \
+                     presented frame is not the history the viewport points at"
+                );
+                checked += 1;
+            }
+            None => assert!(
+                want >= filled,
+                "{ctx}: viewport row {r} carries no fill line but should show {want}"
+            ),
+        }
+    }
+    checked
+}
+
+/// One wheel notch for the moving arm: `SB_WHEEL` lines, reversing at the ends
+/// of a bounded span so the scrub runs forever over OVERLAPPING viewports and
+/// never clamps at the top of history (a clamped `scroll_display` is a no-op,
+/// which would silently turn this arm into the stationary one).
+fn wheel_arm(b: &mut BenchApp, dir: &mut i32) {
+    let d = b.display_offset();
+    if d >= SB_DEPTH + SB_WHEEL_SPAN {
+        *dir = -1;
+    } else if d <= SB_DEPTH {
+        *dir = 1;
+    }
+    b.scroll_display(sb_delta(SB_WHEEL) * *dir);
 }
 
 // ------------------------------------------------------------------ verify --
@@ -654,6 +823,214 @@ fn verify_many_tabs(n: usize) -> (BenchApp, Instant) {
     (b, now)
 }
 
+/// PROVE the scrolled-back workload's state and, with it, the whole
+/// invalidation surface any materialized-row memo would have to survive.
+///
+/// The guard set:
+///   * REACH: `display_offset == SB_DEPTH` on every sampled frame, and the
+///     history under it is real (`scrollback_lines >= SB_DEPTH + ROWS`), so
+///     all 24 viewport rows resolve through the history materializer and none
+///     through the live ring.
+///   * IDENTITY: every row of every sampled frame matches the one formula
+///     (see the file header) — read back out of the frame the present
+///     actually extracted, not out of the grid.
+///   * INVALIDATION, walked deliberately: bottom -> back (the viewport moves
+///     wholesale), a line ARRIVING while scrolled back (history grows under
+///     the viewport, so every row's history index shifts), and a depth change
+///     (a different, overlapping window). Identity is re-asserted immediately
+///     after each — these are exactly the three ways a row memo goes stale,
+///     and a stale hit is a wrong glyph on screen, which this catches.
+///
+/// Returns the warmed fixture + clock + the history depth for the volume
+/// group; the timed run continues from the verified state.
+fn verify_scrolled_back() -> (BenchApp, Instant, usize) {
+    let (mut b, t0) = f_scrollback(SB_DEPTH);
+    let mut now = t0;
+    for _ in 0..SB_WARM_FRAMES {
+        now += FRAME_DT;
+        b.present_frame(now);
+    }
+    assert_eq!(
+        b.display_offset(),
+        SB_DEPTH,
+        "scrolled_back_repaint: the fixture is not scrolled back"
+    );
+    assert!(
+        b.scrollback_lines() >= SB_DEPTH + ROWS,
+        "scrolled_back_repaint: history is too shallow ({}) for a {SB_DEPTH}-line \
+         scroll with {ROWS} rows — some viewport rows would be LIVE rows",
+        b.scrollback_lines()
+    );
+    let mut checked = 0usize;
+    for _ in 0..SAMPLE_FRAMES {
+        now += FRAME_DT;
+        b.present_frame(now);
+        assert_eq!(
+            b.display_offset(),
+            SB_DEPTH,
+            "scrolled_back_repaint: the viewport moved during the sample window"
+        );
+        checked += assert_sb_identity(&b, SB_FILL_LINES, "scrolled_back_repaint");
+    }
+    let depth = b.scrollback_lines();
+    report(
+        "scrolled_back_repaint",
+        &format!(
+            "offset {SB_DEPTH} | history {depth} lines | history rows/frame {ROWS} | \
+             identity checked {checked}/{}",
+            SAMPLE_FRAMES * ROWS
+        ),
+    );
+    assert_eq!(
+        checked,
+        SAMPLE_FRAMES * ROWS,
+        "scrolled_back_repaint: some viewport row carried no fill line — the guard \
+         walked a frame that is not showing history"
+    );
+
+    // INVALIDATION WALK. Each step changes exactly one thing a row memo can be
+    // keyed wrong on, and identity is re-asserted on the very next frame.
+    b.scroll_to_bottom();
+    now += FRAME_DT;
+    b.present_frame(now);
+    assert_eq!(
+        b.display_offset(),
+        0,
+        "scroll_to_bottom did not reach the bottom"
+    );
+    assert_sb_identity(&b, SB_FILL_LINES, "after scroll_to_bottom");
+    b.scroll_display(sb_delta(SB_DEPTH));
+    now += FRAME_DT;
+    b.present_frame(now);
+    assert_sb_identity(&b, SB_FILL_LINES, "after scrolling back");
+    // Output ARRIVING while scrolled back: `scrollback_lines` grows, so the
+    // history index of every visible row shifts by one under a live memo.
+    let before = b.scrollback_lines();
+    b.feed(0, &sb_line(SB_FILL_LINES));
+    now += FRAME_DT;
+    b.present_frame(now);
+    assert!(
+        b.scrollback_lines() > before,
+        "the fed line did not enter history — the invalidation guard would prove nothing"
+    );
+    assert_sb_identity(
+        &b,
+        SB_FILL_LINES + 1,
+        "after a line arrived while scrolled back",
+    );
+    // A different, OVERLAPPING depth — the wheel-scroll shape, checked once
+    // here even though the moving arm below prices it.
+    b.scroll_display(sb_delta(SB_WHEEL));
+    now += FRAME_DT;
+    b.present_frame(now);
+    assert_sb_identity(&b, SB_FILL_LINES + 1, "after a wheel-sized depth change");
+
+    // Re-park at the verified depth so the timed run measures the stationary
+    // state this workload is named for.
+    b.scroll_to_bottom();
+    b.scroll_display(sb_delta(SB_DEPTH));
+    for _ in 0..8 {
+        now += FRAME_DT;
+        b.present_frame(now);
+    }
+    assert_eq!(b.display_offset(), SB_DEPTH);
+    (b, now, depth)
+}
+
+/// PROVE the CONTROL's state: the identical fixture and script at the LIVE
+/// BOTTOM. Its only difference from `verify_scrolled_back`'s arm is
+/// `display_offset == 0`, which is precisely what makes the subtraction
+/// meaningful — so the guard asserts that difference and nothing else.
+fn verify_live_bottom() -> (BenchApp, Instant) {
+    let (mut b, t0) = f_scrollback(0);
+    let mut now = t0;
+    for _ in 0..SB_WARM_FRAMES {
+        now += FRAME_DT;
+        b.present_frame(now);
+    }
+    let mut checked = 0usize;
+    for _ in 0..SAMPLE_FRAMES {
+        now += FRAME_DT;
+        b.present_frame(now);
+        assert_eq!(
+            b.display_offset(),
+            0,
+            "live_bottom_repaint: the control is not at the live bottom"
+        );
+        checked += assert_sb_identity(&b, SB_FILL_LINES, "live_bottom_repaint");
+    }
+    report(
+        "live_bottom_repaint",
+        &format!(
+            "offset 0 | history {} lines | history rows/frame 0 | identity checked \
+             {checked}/{}",
+            b.scrollback_lines(),
+            SAMPLE_FRAMES * ROWS
+        ),
+    );
+    // ROWS-1, not ROWS: at the bottom the last viewport row is the empty
+    // cursor line, which carries no fill number. That one-row difference IS
+    // the two-sided proof that this arm is at the bottom and the other is not.
+    assert_eq!(
+        checked,
+        SAMPLE_FRAMES * (ROWS - 1),
+        "live_bottom_repaint: the control is not showing the live tail"
+    );
+    (b, now)
+}
+
+/// PROVE the moving arm's state: the viewport really moves every frame, by
+/// exactly one notch, inside the bounded span, and identity holds on every
+/// sampled frame (a scrub is where an absolute-row-keyed memo is most likely
+/// to hand back the wrong row).
+fn verify_wheel() -> (BenchApp, Instant, i32) {
+    let (mut b, t0) = f_scrollback(SB_DEPTH);
+    let mut now = t0;
+    let mut dir = 1i32;
+    for _ in 0..SB_WARM_FRAMES {
+        wheel_arm(&mut b, &mut dir);
+        now += FRAME_DT;
+        b.present_frame(now);
+    }
+    let mut moved = 0usize;
+    let mut checked = 0usize;
+    let (mut lo, mut hi) = (usize::MAX, 0usize);
+    for _ in 0..SAMPLE_FRAMES {
+        let before = b.display_offset();
+        wheel_arm(&mut b, &mut dir);
+        let after = b.display_offset();
+        moved += usize::from(after != before);
+        lo = lo.min(after);
+        hi = hi.max(after);
+        now += FRAME_DT;
+        b.present_frame(now);
+        checked += assert_sb_identity(&b, SB_FILL_LINES, "scrolled_back_wheel");
+    }
+    report(
+        "scrolled_back_wheel",
+        &format!(
+            "moved {moved}/{SAMPLE_FRAMES} frames | offset span {lo}..={hi} | \
+             {SB_WHEEL} lines/notch | identity checked {checked}/{}",
+            SAMPLE_FRAMES * ROWS
+        ),
+    );
+    assert_eq!(
+        moved, SAMPLE_FRAMES,
+        "scrolled_back_wheel: a frame did not move the viewport — the arm clamped \
+         and this is measuring the stationary workload"
+    );
+    assert!(
+        lo >= SB_DEPTH && hi <= SB_DEPTH + SB_WHEEL_SPAN + SB_WHEEL,
+        "scrolled_back_wheel: the scrub left its span ({lo}..={hi})"
+    );
+    assert_eq!(
+        checked,
+        SAMPLE_FRAMES * ROWS,
+        "scrolled_back_wheel: a sampled frame was not showing pure history"
+    );
+    (b, now, dir)
+}
+
 // ---------------------------------------------------------------- counting --
 
 /// Record a COUNT as a criterion measurement — 1 ns == 1 item, verbatim the
@@ -703,6 +1080,9 @@ fn frame_latency(c: &mut Criterion) {
             (n, b, now)
         })
         .collect();
+    let (mut sb_deep, mut sb_deep_now, sb_depth) = verify_scrolled_back();
+    let (mut sb_live, mut sb_live_now) = verify_live_bottom();
+    let (mut sb_wheel, mut sb_wheel_now, mut sb_wheel_dir) = verify_wheel();
 
     {
         let mut group = c.benchmark_group("frame_latency");
@@ -795,6 +1175,53 @@ fn frame_latency(c: &mut Criterion) {
                 });
             });
         }
+        // 6. SCR-1: a presented frame over a SCROLLED-BACK, MOTIONLESS
+        // viewport. Nothing about the grid changed since the last frame and
+        // nothing about the viewport moved, yet the extraction re-resolves all
+        // 24 rows through the 3-tier history materializer. Read this against
+        // `live_bottom_repaint` below: the difference is the whole cost.
+        group.bench_function("scrolled_back_repaint", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    sb_deep_now += FRAME_DT;
+                    let t0 = Instant::now();
+                    black_box(sb_deep.present_frame(sb_deep_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+        // 7. THE CONTROL for 6: identical fixture, identical script, viewport
+        // at the live bottom. Everything except the history read cancels.
+        group.bench_function("live_bottom_repaint", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    sb_live_now += FRAME_DT;
+                    let t0 = Instant::now();
+                    black_box(sb_live.present_frame(sb_live_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
+        // 8. The MOVING half: one wheel notch armed (untimed), the frame
+        // timed. 3 of the 24 rows are new; the other 21 were on the previous
+        // frame.
+        group.bench_function("scrolled_back_wheel", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    wheel_arm(&mut sb_wheel, &mut sb_wheel_dir);
+                    sb_wheel_now += FRAME_DT;
+                    let t0 = Instant::now();
+                    black_box(sb_wheel.present_frame(sb_wheel_now));
+                    total += t0.elapsed();
+                }
+                total
+            });
+        });
         group.finish();
     }
 
@@ -873,6 +1300,20 @@ fn frame_latency(c: &mut Criterion) {
         bench_count(&mut group, "flood_present/bytes_per_frame", FLOOD_CHUNK);
         bench_count(&mut group, "pet_invisible_frame/ink_map_rows", pet_map_rows);
         bench_count(&mut group, "pet_invisible_frame/inked_rows", pet_inked);
+        // The scrolled-back arms' guard-asserted volumes: how many rows the
+        // frame re-materializes (ALL of them today), how deep the history
+        // under it is, and how many of those rows a notch actually replaces.
+        bench_count(
+            &mut group,
+            "scrolled_back_repaint/history_rows_per_frame",
+            ROWS,
+        );
+        bench_count(
+            &mut group,
+            "scrolled_back_repaint/scrollback_depth",
+            sb_depth,
+        );
+        bench_count(&mut group, "scrolled_back_wheel/lines_per_notch", SB_WHEEL);
         group.finish();
     }
 }

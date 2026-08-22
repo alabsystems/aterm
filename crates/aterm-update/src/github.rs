@@ -2080,7 +2080,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
                 // failure 597 still being told its check was "deferred".
                 let msg = if h.manifest_failures >= crate::PERSISTENT_AFTER {
                     format!(
-                        "FAILING ({} consecutive checks since {}): {error} — this Mac \
+                        "FAILING ({} consecutive checks since {}): {error} — this machine \
                      cannot install any release until that is fixed at the publisher",
                         h.manifest_failures,
                         h.class_since("manifest")
@@ -2300,7 +2300,7 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
             if h.manifest_failures >= crate::PERSISTENT_AFTER {
                 format!(
                     "FAILING ({} consecutive checks since {}): manifest(s) fetched but \
-                     rejected (signature/parse) — this Mac cannot install any release \
+                     rejected (signature/parse) — this machine cannot install any release \
                      until that is fixed at the publisher",
                     h.manifest_failures,
                     h.class_since("manifest")

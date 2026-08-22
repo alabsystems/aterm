@@ -23,8 +23,9 @@
 //! (`screen_row == visible_row`, `Live` arm forwards to the same accessors).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
-use super::{Grid, MaterializedRow};
+use super::{Grid, HistoryEpoch, MaterializedRow};
 use crate::extra_collection::CellRenderData;
 use crate::{Cell, CellCoord, CellExtra, Row};
 
@@ -39,8 +40,15 @@ pub enum VisibleRowView<'a> {
         row: &'a Row,
     },
     /// A scrolled-off history row, materialized (cells + paired extras) through
-    /// the unified 3-tier reader.
-    History { mat: MaterializedRow },
+    /// the unified 3-tier reader — SHARED, because a scrolled-back viewport
+    /// reads the same row on frame after frame and the materialization is
+    /// memoized per absolute row (see the `viewport_row_cache` module). The
+    /// `Arc` is the
+    /// price of handing out a memoized row from a `&self` read without a
+    /// borrow guard that two live views could panic on; a refcount bump
+    /// replaces a full `vec![Cell; cols]` + extras map + per-cluster `Arc<str>`
+    /// rebuild.
+    History { mat: Arc<MaterializedRow> },
     /// No such row (out of range, or the history index was unavailable).
     Empty,
 }
@@ -286,11 +294,86 @@ impl Grid {
             // History row: rev_idx 0 == newest scrolled-off line. Single tier-count-
             // independent handle — `try_get_history_line` splits the tiers internally.
             let rev_idx = d - 1 - usize::from(visible_row);
-            match self.materialize_scrollback_row_full(rev_idx, self.cols()) {
+            match self.materialized_history_row(rev_idx, self.cols()) {
                 Some(mat) => VisibleRowView::History { mat },
                 None => VisibleRowView::Empty,
             }
         }
+    }
+
+    /// The ABSOLUTE row number of the history row at `rev_idx` (0 = the newest
+    /// scrolled-off line), or `None` when it cannot be computed exactly.
+    ///
+    /// `absolute_row_counter - visible_rows` is the absolute row of the TOP
+    /// LIVE line, so the newest history line sits exactly one above it.
+    /// Absolute numbers only ever count UP and are never reused, which is what
+    /// lets the row memo key on them with no eviction bookkeeping at all: an
+    /// evicted row's key can never be asked for again.
+    ///
+    /// Deliberately `checked_*` rather than `saturating_*`: saturation would
+    /// collapse distinct rows onto 0 and alias two different rows onto one memo
+    /// slot — the one arithmetic mistake here that produces a WRONG ROW instead
+    /// of a slow one.
+    fn history_absolute_row(&self, rev_idx: usize) -> Option<u64> {
+        let top_live = self
+            .storage
+            .absolute_row_counter
+            .checked_sub(u64::from(self.storage.visible_rows))?;
+        top_live.checked_sub(u64::try_from(rev_idx).ok()?.checked_add(1)?)
+    }
+
+    /// The materialized history row at `rev_idx`: from the memo when the memo
+    /// can prove it describes THIS history, else materialized once and
+    /// memoized. `None` only when the row does not exist.
+    ///
+    /// This is the whole of SCR-1. Before it, a repaint of a motionless
+    /// scrolled-back viewport rebuilt every visible row from the tier store on
+    /// every presented frame — and the frame path has no damage gate, so the
+    /// pill fade, the cursor blink, an effects frame and every mouse-move of a
+    /// selection drag each paid a full viewport of materializations for zero
+    /// new information.
+    fn materialized_history_row(&self, rev_idx: usize, cols: u16) -> Option<Arc<MaterializedRow>> {
+        let Some(abs_row) = self.history_absolute_row(rev_idx) else {
+            // Unkeyable (the absolute counter has not advanced past the
+            // viewport yet). Read straight through rather than guess a key —
+            // an uncacheable row must never share a slot with a real one.
+            return self
+                .materialize_scrollback_row_full(rev_idx, cols)
+                .map(Arc::new);
+        };
+        let epoch = HistoryEpoch {
+            content_gen: self.storage.content_gen,
+            renumber: self.storage.history_renumber_epoch,
+            cols,
+            visible_rows: self.storage.visible_rows,
+        };
+        if let Some(hit) = self.viewport_cache.lookup(epoch, abs_row) {
+            // THE DEBUG NET (see the `viewport_row_cache` module docs): a stale
+            // hit is a wrong glyph or colour on screen, the failure mode with
+            // the worst signal-to-noise, so debug builds pay a full
+            // re-materialize and compare it field-for-field. Compiled out
+            // entirely in release. Second-order benefit: with this in place a
+            // `cfg(test)` build performs exactly the same number of
+            // `row_to_line` / materialize operations as before the memo
+            // existed, so the crate's op-count tests keep measuring what they
+            // always measured.
+            #[cfg(debug_assertions)]
+            {
+                let fresh = self.materialize_scrollback_row_full(rev_idx, cols);
+                debug_assert!(
+                    fresh.as_ref() == Some(&*hit),
+                    "viewport row memo served a stale row for absolute row {abs_row} \
+                     (rev_idx {rev_idx}, cols {cols})"
+                );
+            }
+            return Some(hit);
+        }
+        // The memo borrow is taken INSIDE `lookup`/`store` and never held
+        // across this materialize, so no read path can re-enter it under a live
+        // borrow.
+        let fresh = Arc::new(self.materialize_scrollback_row_full(rev_idx, cols)?);
+        self.viewport_cache.store(epoch, abs_row, &fresh);
+        Some(fresh)
     }
 
     /// The LIVE-frame twin of [`visible_row_view`](Self::visible_row_view): the row
@@ -369,5 +452,187 @@ impl Grid {
     pub fn row_text_screen(&self, screen_row: u16) -> Option<String> {
         let mut s = String::new();
         self.row_text_screen_into(screen_row, &mut s).then_some(s)
+    }
+}
+
+/// SCR-1 pins for the viewport row memo. Every one of these is a DIFFERENTIAL
+/// or IDENTITY test — none of them assert "it is fast", because the memo's only
+/// interesting property is that it is invisible.
+#[cfg(test)]
+mod viewport_cache_tests {
+    use std::sync::Arc;
+
+    use super::VisibleRowView;
+    use crate::Grid;
+
+    /// A 3-row grid with `lines` numbered lines pushed into ring history.
+    fn grid_with_history(lines: usize) -> Grid {
+        let mut grid = Grid::new(3, 8);
+        for i in 0..lines {
+            grid.carriage_return();
+            for ch in format!("L{i:03}").chars() {
+                grid.write_char(ch);
+            }
+            grid.scroll_up(1);
+        }
+        grid
+    }
+
+    /// The shared row behind a HISTORY viewport row (panics if the row is not
+    /// history — every caller below has already scrolled far enough).
+    fn history_row(grid: &Grid, visible_row: u16) -> Arc<super::MaterializedRow> {
+        match grid.visible_row_view(visible_row) {
+            VisibleRowView::History { mat } => mat,
+            _ => panic!("visible row {visible_row} is not a history row"),
+        }
+    }
+
+    /// The row's text, read the way the render/text leaves read it.
+    fn row_text(grid: &Grid, visible_row: u16) -> String {
+        let view = grid.visible_row_view(visible_row);
+        let mut out = String::new();
+        for col in 0..view.len() {
+            if let Some(cell) = view.cell(col) {
+                view.push_cell_text(col, cell, &mut out);
+            }
+        }
+        out
+    }
+
+    /// A repeat read of a MOTIONLESS scrolled-back viewport returns the SAME
+    /// shared row — the stationary-repaint case, which was a full
+    /// re-materialization per row per frame.
+    #[test]
+    fn repeat_read_of_a_motionless_viewport_reuses_the_materialized_row() {
+        let mut grid = grid_with_history(40);
+        grid.scroll_display(10);
+        let first = history_row(&grid, 0);
+        let second = history_row(&grid, 0);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a second read of an unchanged scrolled-back row re-materialized it"
+        );
+    }
+
+    /// The memo is keyed on ROW IDENTITY, not viewport position: after a
+    /// one-line scroll the same history row is at a different viewport index
+    /// and must still be the same shared row. This is the whole reason an
+    /// overlapping wheel notch costs 3 rows instead of 24.
+    #[test]
+    fn a_scrolled_row_keeps_its_materialization_at_its_new_viewport_index() {
+        let mut grid = grid_with_history(40);
+        grid.scroll_display(10);
+        let before = history_row(&grid, 1);
+        let text_before = row_text(&grid, 1);
+        // One line further back: what was viewport row 1 is now viewport row 2.
+        grid.scroll_display(1);
+        let after = history_row(&grid, 2);
+        assert_eq!(
+            row_text(&grid, 2),
+            text_before,
+            "the row that moved down one viewport slot is not the same line"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "an overlapping scroll re-materialized a row it had already built"
+        );
+    }
+
+    /// A CONTENT change drops the whole memo: the next read must rebuild.
+    /// Two-sided against the test above, which proves reads without a content
+    /// change do NOT rebuild.
+    #[test]
+    fn a_content_change_invalidates_every_memoized_row() {
+        let mut grid = grid_with_history(40);
+        grid.scroll_display(10);
+        let before = history_row(&grid, 0);
+        let text_before = row_text(&grid, 0);
+        grid.mark_content_full();
+        let after = history_row(&grid, 0);
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "a content change left stale rows in the memo"
+        );
+        assert_eq!(
+            row_text(&grid, 0),
+            text_before,
+            "the rebuilt row does not match the row it replaced"
+        );
+    }
+
+    /// Output ARRIVING while scrolled back: history grows while
+    /// `display_offset` stays put, so every visible row's history index shifts
+    /// by one and the content under the viewport slides UP by a row (row 0 is
+    /// the OLDEST visible row, `rev_idx = display_offset - 1 - row`, so a new
+    /// history line pushes the old row 0 off the top and lifts the old row 1
+    /// into its place — `scroll_up` deliberately does NOT re-anchor the
+    /// viewport, see `Grid::scroll_display`). The memo must follow the
+    /// CONTENT, never the index: an index-keyed memo would still be showing
+    /// the pre-arrival row 0 here.
+    #[test]
+    fn a_line_arriving_while_scrolled_back_reshuffles_rows_correctly() {
+        let mut grid = grid_with_history(40);
+        grid.scroll_display(10);
+        let text_row0 = row_text(&grid, 0);
+        let text_row1 = row_text(&grid, 1);
+        assert_ne!(text_row0, text_row1, "the fixture rows are not distinct");
+        // One more line into history; the viewport does not move.
+        grid.carriage_return();
+        for ch in "NEW".chars() {
+            grid.write_char(ch);
+        }
+        grid.scroll_up(1);
+        assert_eq!(
+            row_text(&grid, 0),
+            text_row1,
+            "the line that was at viewport row 1 is not at row 0 after one new line"
+        );
+        assert_ne!(
+            row_text(&grid, 0),
+            text_row0,
+            "viewport row 0 still shows the pre-arrival line — a row was served by \
+             INDEX across a history growth"
+        );
+    }
+
+    /// THE DIFFERENTIAL: every visible row of a scrolled-back viewport, read
+    /// through the memo, is byte-identical to a fresh materialization of the
+    /// same row — checked over a scrub that mixes hits and misses.
+    #[test]
+    fn memoized_rows_match_a_fresh_materialize_across_a_scrub() {
+        let mut grid = grid_with_history(60);
+        grid.scroll_display(30);
+        for _ in 0..20 {
+            let offset = grid.display_offset();
+            for r in 0..3u16 {
+                if usize::from(r) >= offset {
+                    continue;
+                }
+                let rev_idx = offset - 1 - usize::from(r);
+                let fresh = grid
+                    .materialize_scrollback_row_full(rev_idx, grid.cols())
+                    .expect("history row exists");
+                let cached = history_row(&grid, r);
+                assert_eq!(
+                    *cached, fresh,
+                    "memoized viewport row {r} (rev_idx {rev_idx}) diverged from a \
+                     fresh materialization"
+                );
+            }
+            // Reverse at the ends so the scrub keeps re-reading rows it has
+            // already built (hits) as well as new ones (misses).
+            grid.scroll_display(-1);
+        }
+    }
+
+    /// A row read at the live bottom is never a history row, so the memo is
+    /// not even consulted — the unscrolled frame is untouched by all of this.
+    #[test]
+    fn an_unscrolled_viewport_reads_live_rows() {
+        let grid = grid_with_history(40);
+        assert!(
+            matches!(grid.visible_row_view(0), VisibleRowView::Live { .. }),
+            "an unscrolled viewport must read the live grid"
+        );
     }
 }

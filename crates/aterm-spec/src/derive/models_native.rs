@@ -1882,6 +1882,13 @@ pub fn native_config_observation_handoff_model() -> Model {
                 sampled = 0;
                 reconciliation_failed = 1;
                 dropped_candidate = if Buggy == 1 { 1 } else { dropped_candidate };
+                // A failed reconciliation ANSWERS its queued callers (with the
+                // error) instead of leaving them pending — 92a43f0d, pinned by
+                // `failed_reconciliation_answers_queued_callers_…`. That commit
+                // changed the shipping lane and not this model; the refinement
+                // gate then failed on the first machine to run both lines
+                // together, which is the gate doing its job one merge late.
+                queued = 0;
             }
             action RetryReconcile when (
                 phase == 0 && gate == 1 && pending > 0 &&

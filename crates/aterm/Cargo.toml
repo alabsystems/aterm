@@ -32,5 +32,16 @@ aterm-log = { path = "../aterm-log" }    # stderr logger for the headless update
 # with piped stdio, because piped stdio takes the WINDOW route instead.
 libc = { workspace = true }
 
+[build-dependencies]
+# Windows only: compile + link the icon, the side-by-side manifest and
+# VS_VERSION_INFO into THE shipped exe (build.rs → OUT_DIR/aterm.rc). It has to
+# live HERE and not in aterm-gui: `embed_resource::compile` emits
+# `cargo:rustc-link-arg-bins`, which reaches only its own package's bins, so
+# aterm-gui's copy only ever decorated `aterm-gui.exe` — never the binary
+# install.ps1 actually ships. Same version aterm-gui already pins, so it adds
+# nothing to the dependency tree. The crate is a documented no-op when the
+# target is not Windows, and build.rs returns before calling it anyway.
+embed-resource = "3"
+
 [lints]
 workspace = true

@@ -2844,7 +2844,11 @@ mod tests {
     const REFUSES_WITHOUT_BLOCKING: std::time::Duration = std::time::Duration::from_secs(30);
 
     fn file_uri(path: &std::path::Path) -> String {
-        format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
+        // Built by the SHIPPING encoder, not a hand-rolled `format!` — the
+        // latter is malformed on Windows (drive letter + backslashes after the
+        // authority slot), so every test funnelling through here failed to even
+        // open its document there.
+        crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 
     fn key(key: Key, mods: Modifiers) -> InputEvent {

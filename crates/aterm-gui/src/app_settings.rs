@@ -2019,8 +2019,13 @@ mod tests {
         ws.next_trail_tick = Some(now + Duration::from_millis(16));
         ws.last_trail_fire = Some(now);
         ws.last_effect_pump_at = Some(now);
+        // The chrome-decoration lane is a scheduler input too, and unlike the
+        // cursor engines it is not focus-gated — so arm it here or the native
+        // boundary below is only asserted for the effects that never needed it.
+        ws.note_deco_animating(now);
         assert!(ws.cursor_fx_active(now, true));
         assert!(ws.terminal_effect_frame_active(now, true));
+        assert!(ws.deco_anim_frame_active(now));
     }
 
     fn assert_native_effect_scheduler_parked(app: &App, now: Instant) {
@@ -2043,6 +2048,11 @@ mod tests {
         assert!(!ws.cursor_fx_active(now, false));
         assert!(!ws.terminal_effect_frame_active(now, true));
         assert_eq!(ws.static_cursor_cat_deadline(now, false), None);
+        // The decoration latch is the one input with no focus gate of its own,
+        // so the canonical-front boundary is the ONLY thing keeping Robi from
+        // pacing a native tab. `park_terminal_effect_scheduler` drops it on the
+        // way through; a terminal that comes back refreshes it on frame one.
+        assert!(!ws.deco_anim_frame_active(now));
         assert_eq!(ws.next_trail_tick, None);
         assert_eq!(ws.last_trail_fire, None);
         assert_eq!(ws.last_effect_pump_at, None);

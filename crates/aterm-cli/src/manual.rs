@@ -72,7 +72,7 @@ KEY USAGE
   aterm                      start an interactive $SHELL (the default; no args)
   aterm <tool> [args]        run a pinned, store-resolved toolchain tool, e.g.
                              `aterm ay`, `aterm ty` (never $PATH — the managed build)
-  aterm pkg <args>           the toolchain package manager (see `aterm help atpkg`)
+  aterm pkg <args>           the toolchain package manager (see `aterm help pkg`)
   aterm doctor               pre-flight health check; exit 0 = ready
   aterm show-config | validate-config | explain-config | list-fonts | list-themes
                              read-only diagnostics; print and exit, no shell spawned
@@ -155,55 +155,100 @@ GOTCHAS
         name: "atpkg",
         tagline: "toolchain package manager — install / update / verify",
         body: Some(
-            r#"atpkg — the toolchain package manager (also reachable as `aterm pkg`).
+            r#"atpkg — the toolchain package manager. You type `aterm pkg`; its own messages
+speak as "atpkg:".
 
 WHAT IT IS
-  atpkg installs and silently self-updates the toolchain programs published by one
-  configurable account (trust, clean, ay, ny, ...), gated by a compile-time-pinned
-  Ed25519 offline root key over a signed, freshness-stamped index. Think "rustup
-  married to a silent updater". Verification happens BEFORE any parse, enforced by
-  construction: the only way to get the bytes the parser consumes is to pass a verify
-  function — handing it unverified bytes does not type-check. `atpkg run` is the engine
+  The batteries behind aterm. atpkg installs and keeps current the toolchain
+  programs published by one configurable account (trust, clean, ay, ny, ...) —
+  and if you launched the aterm app, it has already run: first launch fills the
+  store from a signed seed sealed inside the app, and the windowed app updates it
+  from then on (CLI-only use never auto-updates; see GOTCHAS). Think "rustup
+  married to a silent updater". Nothing installs except through a
+  compile-time-pinned Ed25519 offline root key over a signed, freshness-stamped
+  index, and verification happens BEFORE any parse, enforced by construction: the
+  only way to get the bytes the parser consumes is to pass a verify function —
+  handing it unverified bytes does not type-check. `atpkg run` is the engine
   behind the `aterm <tool>` launcher.
 
-KEY USAGE
-  atpkg list                 installed (program, build) pairs — local, no network
-  atpkg install <program>    verify the signed index, then install/upgrade the pinned build
-  atpkg seed                 first-run batteries bootstrap: fill an EMPTY store from the
-                             signed registry sealed inside the app bundle. Zero network by
-                             construction (a local DirFetcher, never the network chain), so
-                             it installs only what the seal carries; anything newer is the
-                             consented `update` pass's job. The GUI runs it once per launch;
-                             [packages].seed_install (default true) turns it from install
-                             into announce-only when false
-  atpkg update [program]     upgrade all (or one) to the channel pin;
-                             coherence groups apply all-or-nothing (the rustc-locked
-                             tuple moves together)
-  atpkg uninstall <program> | --all
+KEY USAGE (spelled as you type them — daily verbs first)
+  aterm pkg install --default-set
+                             the whole ALab toolset in one step — the usual first
+                             command (the app's first GUI launch already ran it)
+  aterm pkg list             what you have: each program's live build, plus builds
+                             kept for rollback — local, no network. Human table on
+                             a terminal; pipe it (or pass --porcelain) for the
+                             stable tab-separated form scripts parse
+  aterm pkg doctor           is it healthy: every check prints its verdict, warns
+                             included (`status` answers as the same report, signed
+                             with the name you typed)
+  aterm pkg update [program] upgrade all (or one) to the channel pin; coherence
+                             groups apply all-or-nothing (the rustc-locked tuple
+                             moves together)
+  aterm pkg install <program>
+                             one program: verify the signed index, then install the
+                             pinned build
+  aterm pkg verify [program] re-attest installed bytes against the signed root (no
+                             network) — doctor reads health, verify re-proves bytes
+  aterm pkg which <tool>     print the store path a tool resolves to (never $PATH)
+  aterm pkg run <tool> [-- args]
+                             exec the store binary — what `aterm <tool>` dispatches to
+  aterm pkg seed             the first-launch bootstrap, runnable by hand: fill an
+                             EMPTY store from the signed registry sealed inside the
+                             app. Offline by construction — it reads only the in-app
+                             seal, never the network fetch chain — so it installs
+                             exactly what the seal carries; anything newer is the
+                             consented `update`'s job. The GUI runs it once per
+                             launch; [packages].seed_install=false turns it from
+                             install into announce-only
+
+OCCASIONAL (recovery and preference)
+  aterm pkg uninstall <program> | --all
                              remove one program, or the WHOLE managed toolset and its
                              disk (~3.2 GB) in one step — the way out is as single-step
                              as the way in. Either form stops atpkg auto-completing the
                              set; [packages].exclude drops one program while keeping it
-  atpkg which <tool>         print the store path a tool resolves to (never $PATH)
-  atpkg run <tool> [-- args] exec the store binary — what `aterm <tool>` dispatches to
-  atpkg doctor | verify      health surface / re-attest the store against the signed root
+  aterm pkg rollback <program>
+                             reactivate the kept previous build — the undo for a bad
+                             update (the `superseded (kept for rollback)` rows in list)
+  aterm pkg pin | unpin <program>
+                             hold a program at its current build through update passes /
+                             release the hold (pins gate the coherence-group move)
+  aterm pkg gc               reclaim superseded builds and interrupted downloads; it
+                             says what it swept and why
+
+PLUMBING (producer / operator / dev — a first hour never needs these)
+  aterm pkg link <prog> <dir> | unlink | refresh
+                             dev-link a sibling checkout's bins over a program; update
+                             HARD-SKIPS a linked program until unlink; refresh re-asserts
+                             links after a rebuild
+  aterm pkg tree-root <dir>  print the SHA-256 tree_root the publish pipeline signs
+  aterm pkg verify-index | verify-pkg <args…>
+                             run the client's full trust chain over index/roster or
+                             pkg-manifest files on disk (operator / mirror self-check)
+  aterm pkg relocate <stage> producer pack-time: vendor machine-local dylibs into the
+                             staged sysroot so the signed tarball is self-contained
 
 WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see
   what's installed. The managed tools do their own work; atpkg is what lays them down.
   Distinct from `cargo ship`/aterm-release (which CUTS aterm.app itself).
 
-GOTCHAS
-  * The root anchor is COMPILED IN — a committed constant (aterm-update-core::pins), not a
-    build env var — so a plain `cargo build` is fully armed. The kill switch is
-    ATPKG_DISABLE: set it and the network verbs (install/update/rollback) refuse with
-    exit 1; local read/maintenance verbs (list/which/run/doctor/verify/...) still work.
+GOTCHAS (in the order they bite)
+  * PATH: the managed tools are on PATH only in shells started inside aterm (shell.d
+    APPENDS the managed bin/, never shadowing system sudo/ssh/git). In a plain
+    Terminal.app, over ssh, or in CI, use `aterm <tool>` or the export line
+    `aterm pkg doctor` prints. Nothing writes into ~/.zshrc, by design.
   * AUTOMATIC updates ride the windowed app: `aterm --window` runs the update pass on a
     6h loop (ATPKG_UPDATE_INTERVAL_SECS), and the app's own self-update check is likewise
     window-only. Headless or CLI-only usage updates NOTHING automatically — run
     `aterm pkg update` explicitly, or drive it from a scheduler (launchd/cron).
-  * Channel is hard-wired to "stable" today; the real verbs are exactly atpkg's match
-    arms (doctor/which/list/run/uninstall/install/update/rollback/pin/gc/verify/...)."#,
+  * The root anchor is COMPILED IN — a committed constant (aterm-update-core::pins), not a
+    build env var — so a plain `cargo build` is fully armed. The kill switch is
+    ATPKG_DISABLE: set it and the network verbs (install/update/rollback) refuse with
+    exit 1; local read/maintenance verbs (list/which/run/doctor/verify/...) still work.
+  * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
+    test-pinned to the dispatch table — it never advertises a verb that does not run."#,
         ),
     },
     Topic {
@@ -636,7 +681,7 @@ fn agent_page(sid: Option<&str>) -> String {
          \x20 trust  compile AND prove Rust (targo trust check)      ay   decide a formula (SAT/SMT/CHC)\n\
          \x20 clean  Lean-shaped theorem proving                     ty   TLA+ model checking + proving\n\
          \x20 ny     verify a neural network (CROWN/beta-CROWN)       my   exported PyTorch -> Metal (framework)\n\
-         \x20 nn     ML framework (earlier line)                     atpkg install/update/verify the chain\n",
+         \x20 nn     ML framework (earlier line)                     atpkg  install/update/verify the chain (run as `aterm pkg`)\n",
     );
     s.push_str(
         "\nHOUSE RULES (this toolchain is honesty-first)\n  \
@@ -879,6 +924,32 @@ mod tests {
         assert!(
             page.contains("aterm pkg update") && page.contains("scheduler"),
             "must state the headless/CLI update obligation"
+        );
+    }
+
+    /// THE PAGE NAMES EVERY VERB. The old KEY USAGE trailed off in "..." — so the
+    /// only complete roster lived in `aterm pkg --help`, and a reader of the manual
+    /// could not discover `rollback` or `relocate` existed at all. The roster itself
+    /// is guarded on the atpkg side (its tier partition test against the dispatch
+    /// table); this pins the manual to the same 21 names.
+    #[test]
+    fn pkg_manual_names_every_verb() {
+        let (page, code) = render(Some("pkg"), None);
+        assert_eq!(code, 0);
+        for verb in [
+            "doctor", "status", "which", "list", "uninstall", "tree-root", "verify-index",
+            "verify-pkg", "install", "seed", "update", "rollback", "pin", "unpin", "gc",
+            "verify", "link", "unlink", "refresh", "run", "relocate",
+        ] {
+            assert!(
+                page.contains(verb),
+                "the pkg manual page must name the `{verb}` verb"
+            );
+        }
+        // Every invitation to type is spelled the runnable way.
+        assert!(
+            page.contains("aterm pkg install --default-set"),
+            "the usual first command is spelled as typed"
         );
     }
 

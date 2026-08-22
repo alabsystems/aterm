@@ -214,9 +214,9 @@ pub(crate) fn notification() -> (String, String) {
         // releases list, so the honest claim is the one the body already makes —
         // this Mac stays put UNTIL the cause is fixed. (Same false absolute the
         // installer's warning carried, removed in f8279ac5.)
-        "aterm is not updating on this Mac".to_string(),
+        "aterm is not updating on this machine".to_string(),
         format!(
-            "{why}\n\nThis Mac will stay on its current build until you fix it. Then run \
+            "{why}\n\nThis machine will stay on its current build until you fix it. Then run \
              `aterm-ctl update check`."
         ),
     )

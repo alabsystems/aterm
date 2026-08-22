@@ -76,7 +76,44 @@ impl App {
             .windows
             .values()
             .map(|ws| {
-                let pos = ws.os_window.as_ref().and_then(|w| w.outer_position().ok());
+                // W3 (Windows): show state + frame origin, read TOGETHER from
+                // `GetWindowPlacement` when the window is maximized. winit's
+                // `outer_position()` reports the MAXIMIZED frame's origin (the
+                // monitor corner minus the invisible resize border) — persisting
+                // that and re-maximizing on restore would plant the eventual
+                // restore-down frame at the monitor corner instead of where the
+                // user had it. `rcNormalPosition` is the rect the OS itself would
+                // restore down to, so that is what a maximized capture persists.
+                // An UN-maximized window keeps the winit read verbatim (it is
+                // exact there, and byte-identical to the pre-W3 capture).
+                #[cfg(windows)]
+                let (pos, maximized) = {
+                    let placement = ws
+                        .os_window
+                        .as_ref()
+                        .and_then(|w| crate::app_window::placement::read(w));
+                    let pos = ws.os_window.as_ref().and_then(|w| w.outer_position().ok());
+                    match placement {
+                        Some((true, (x, y))) => {
+                            (Some(winit::dpi::PhysicalPosition::new(x, y)), Some(true))
+                        }
+                        Some((false, _)) => (pos, Some(false)),
+                        // Placement unreadable (no HWND yet, or the call failed):
+                        // degrade to exactly the old capture — position only.
+                        None => (pos, None),
+                    }
+                };
+                // Off Windows the field stays un-captured (`None`): the macOS
+                // strip keeps its zoom/solo-band semantics untouched, and the
+                // Unix seamless commit's topology equality must never see a live
+                // show-state bit it did not normalize (see
+                // `commit_layout_topology`). Wiring those platforms up is a
+                // deliberate follow-up, not an oversight.
+                #[cfg(not(windows))]
+                let (pos, maximized) = (
+                    ws.os_window.as_ref().and_then(|w| w.outer_position().ok()),
+                    None::<bool>,
+                );
                 let terminal_tabs = ws
                     .layouts
                     .iter()
@@ -130,6 +167,7 @@ impl App {
                     active_tab: ws.tabs.active,
                     outer_x: pos.map(|p| p.x),
                     outer_y: pos.map(|p| p.y),
+                    maximized,
                     tabs: terminal_tabs,
                     native_tabs,
                     tab_order,
@@ -457,6 +495,7 @@ impl App {
     /// title, read under the session lock. An unknown id (can't happen while the pane
     /// tree and pool are in sync) degrades to empty metadata, never a panic at quit.
     fn restore_session_meta(&self, id: u64) -> (Option<String>, String) {
+        use crate::cwd_native::ReportedCwd as _;
         self.pool.get(id).map_or((None, String::new()), |s| {
             let t = match s.term.try_lock() {
                 Ok(guard) => guard,
@@ -469,7 +508,12 @@ impl App {
                 }
             };
             (
-                t.current_working_directory().map(String::from),
+                // Persist the NATIVE path. The manifest's cwd is replayed into
+                // the next launch's `spawn_session`, so a Windows entry holding
+                // the engine's `/C:/Users//x` URI path would resurrect every pane
+                // in a directory that does not exist. Written native, it also
+                // survives a round trip unchanged (the conversion is idempotent).
+                t.native_working_directory().map(|cwd| cwd.into_owned()),
                 t.title().to_string(),
             )
         })
@@ -502,7 +546,11 @@ impl App {
         let mut windows = manifest.windows.into_iter();
         // The first persisted window maps onto the bootstrap window: session 0 already
         // runs in the persisted first-leaf cwd (seeded in `main`), so its layout is
-        // rebuilt in place around that live session.
+        // rebuilt in place around that live session. Its GEOMETRY is deliberately not
+        // applied here: the grid seeded window 1's creation (`run`), and the
+        // position/maximized state applied post-attach in `resumed` — both strictly
+        // earlier than this deferred (post-first-present) pass, so the bootstrap frame
+        // never visibly hops the way a here-applied move would.
         if let Some(wl) = windows.next()
             && let Some(front) = self.frontmost_window
         {
@@ -527,6 +575,7 @@ impl App {
             if native_only {
                 let previous_front = self.frontmost_window;
                 let outer = (wl.outer_x, wl.outer_y);
+                let maximized = wl.maximized;
                 let wid = self.create_native_restore_window(wl.rows, wl.cols);
                 self.restore_into_window(wid, wl);
                 let restored = self
@@ -542,10 +591,19 @@ impl App {
                     self.close_window_logical(wid);
                     continue;
                 }
+                // W4: validated against the LIVE monitor set first — same
+                // contract as the terminal-window arm below.
                 if let (Some(x), Some(y)) = outer
                     && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                    && crate::app_window::restored_position_on_screen(w, x, y)
                 {
                     w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
+                // W3: maximized LAST — see the ordering note below.
+                if maximized == Some(true)
+                    && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                {
+                    w.set_maximized(true);
                 }
                 self.sync_active_session();
                 continue;
@@ -565,6 +623,7 @@ impl App {
                 .and_then(|id| self.seamless_adopt.iter().position(|a| a.local_id == id))
                 .map(|pos| self.seamless_adopt.remove(pos));
             let outer = (wl.outer_x, wl.outer_y);
+            let maximized = wl.maximized;
             let Some(wid) = self.create_window_internal(el, cwd0.as_deref(), adopt) else {
                 // A window create fails on spawn or GPU-surface trouble — both likely to
                 // repeat. Keep what restored rather than looping on failures. RESIDUAL
@@ -588,11 +647,29 @@ impl App {
             };
             // SEAMLESS/RESTORE: put the reopened window back where it was (before its
             // first present, so there is no visible hop). Best-effort — a missing carry
-            // or an off-screen coordinate just leaves the OS default cascade position.
+            // or an off-desktop coordinate just leaves the cascade position the attach
+            // applied. The off-desktop half is ENFORCED, not assumed (W4): the persisted
+            // point is validated against the monitors that exist NOW, because the set
+            // that existed at capture time is exactly what an undock/unplug changes —
+            // a raw `set_outer_position` here used to reopen those windows entirely
+            // outside the desktop.
             if let (Some(x), Some(y)) = outer
                 && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                && crate::app_window::restored_position_on_screen(w, x, y)
             {
                 w.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+            }
+            // W3: re-maximize AFTER the position lands. The order is load-bearing
+            // twice over: winit's Windows backend clears its MAXIMIZED window flag
+            // inside `set_outer_position` (a moved window is definitionally not
+            // maximized to it), and maximizing FIRST would anchor the frame to
+            // whatever monitor the cascade picked rather than the one the persisted
+            // point names. `Some(true)` only — `None` (an old manifest, or a
+            // platform that does not capture the state) must never force a change.
+            if maximized == Some(true)
+                && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+            {
+                w.set_maximized(true);
             }
             self.restore_into_window(wid, wl);
             // OVERLAP HANDOFF: this extra window was created HIDDEN
@@ -710,6 +787,9 @@ impl App {
             active_tab: _,
             outer_x: _,
             outer_y: _,
+            // Applied by the caller (`apply_restore_manifest`) before the fill,
+            // like the outer position above — window STATE, not tab topology.
+            maximized: _,
             rows: _,
             cols: _,
             tabs: terminal_layouts,
@@ -2505,6 +2585,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Settings {
                 route: "/updates".to_string(),
@@ -2604,6 +2685,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: vec![restore::PaneLayout::leaf(
                 Some("/tmp".to_string()),
                 "shell title is not native identity".to_string(),
@@ -2670,6 +2752,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Settings {
                 route: "/updates".to_string(),
@@ -2711,6 +2794,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: Vec::new(),
             native_tabs: vec![restore::NativeTabRestore::Markdown {
                 uri: "file:///definitely/missing/aterm-restore-document.md".to_string(),
@@ -2771,6 +2855,7 @@ mod tests {
                 active_tab: 0,
                 outer_x: None,
                 outer_y: None,
+                maximized: None,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -2839,6 +2924,7 @@ mod tests {
                 active_tab: 0,
                 outer_x: None,
                 outer_y: None,
+                maximized: None,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -2939,6 +3025,7 @@ mod tests {
                 active_tab: 0,
                 outer_x: None,
                 outer_y: None,
+                maximized: None,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -3029,6 +3116,7 @@ mod tests {
                 active_tab: 0,
                 outer_x: None,
                 outer_y: None,
+                maximized: None,
                 tabs: Vec::new(),
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),

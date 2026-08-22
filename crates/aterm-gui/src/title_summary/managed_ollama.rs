@@ -11,8 +11,12 @@ use super::{
     EndpointOrigin, Job, MAX_RESPONSE_BYTES, TitleSummaryLocality, cancelled_error,
     job_is_authorized,
 };
+// Both are consumed only inside macOS-gated regions in SOME compile targets —
+// gating the imports breaks the targets that do use them, so allow instead.
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg_attr(not(target_os = "macos"), allow(unused_imports))]
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -723,6 +727,9 @@ impl ManagedOllama {
         Err(last_error)
     }
 
+    // Off macOS the attested tail is configured out and several bindings are
+    // write-only on the refusal path.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     fn launch_attested(
         &mut self,
         job: &Job,
@@ -798,24 +805,30 @@ impl ManagedOllama {
                             .to_string(),
                     );
                 }
-                drop(stream);
-                // Ollama lazily maps model weights on its first request. Warm it
-                // with fixed, non-terminal data and pin it in memory, then recheck
-                // the disk anchor. Thus no terminal context is the trigger for
-                // loading potentially substituted weights. Subsequent requests
-                // cheaply revalidate that same anchor before their write boundary.
-                if let Err(error) = warm_managed_model(
-                    job,
-                    authority_epoch,
-                    process,
-                    &target.endpoint,
-                    model_attestation,
-                ) {
-                    self.controller
-                        .stop_if_owned(&target.endpoint, job.authority_epoch);
-                    return Err(error);
+                // The warm-and-return tail is the macOS continuation — the arm
+                // above already returned on every other platform, and leaving the
+                // tail bare would be an unreachable statement there.
+                #[cfg(target_os = "macos")]
+                {
+                    drop(stream);
+                    // Ollama lazily maps model weights on its first request. Warm it
+                    // with fixed, non-terminal data and pin it in memory, then recheck
+                    // the disk anchor. Thus no terminal context is the trigger for
+                    // loading potentially substituted weights. Subsequent requests
+                    // cheaply revalidate that same anchor before their write boundary.
+                    if let Err(error) = warm_managed_model(
+                        job,
+                        authority_epoch,
+                        process,
+                        &target.endpoint,
+                        model_attestation,
+                    ) {
+                        self.controller
+                            .stop_if_owned(&target.endpoint, job.authority_epoch);
+                        return Err(error);
+                    }
+                    return Ok(process);
                 }
-                return Ok(process);
             }
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -831,6 +844,7 @@ impl ManagedOllama {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn warm_managed_model(
     job: &Job,
     authority_epoch: &Arc<AtomicU64>,
@@ -1176,6 +1190,8 @@ fn ollama_codesign_command(all_architectures: bool) -> Result<std::process::Comm
 
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug)]
+// In the test-only compilation off macOS the fields are carried but unread.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(super) struct BoundedCommandOutput {
     status: std::process::ExitStatus,
     stdout: Vec<u8>,

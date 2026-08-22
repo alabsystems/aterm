@@ -69,6 +69,7 @@ struct PresentedFrameCapture {
 /// transaction: the serial proves ordering, while `client` is the exact raw
 /// destination copied from that same CPU softbuffer or GPU swapchain present.
 struct PresentedWindowCapture {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     serial: u64,
     client: crate::PresentedClientFrame,
     frame: PresentedFrameCapture,
@@ -4145,6 +4146,8 @@ impl App {
     /// handler is platform-independent.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn read_native_chrome(&self) -> Vec<String> {
+        // Only the Windows arm below pushes; the mut is platform-conditional.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut out: Vec<String> = Vec::new();
         // Windows: report the REAL native chrome the `AppRtWindows` backend applied,
         // read back from the live HWND via DwmGetWindowAttribute (dark-mode / corner

@@ -3190,6 +3190,9 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         crate::prefs::EDIT_ROBI => {
             " · an invited guest: off until you turn him on · once enabled, typing robi or robot makes him greet you · hidden under reduced motion or serious mode"
         }
+        crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY => {
+            " · macOS only: blocks other processes from observing keystrokes (EnableSecureEventInput — the guard iTerm2 offers under this name) · held only while aterm is frontmost, per Apple's TN2150 fairness guidance, so other apps' global hotkeys and clipboard managers are suppressed only then · applied at launch and on every save"
+        }
         crate::prefs::EDIT_NOTICE_SPARKLE => {
             " · decorative only: the post-update card wears a hue-cycling badge and a ring of twinkling sparkles · reduced motion keeps the colour and holds it still · no other notice is affected"
         }
@@ -4614,10 +4617,15 @@ home = "~/aterm"
 
     #[test]
     fn merged_lexicon_host_warnings_address_external_path_and_exact_custom_word() {
+        // libtest names the thread after the test's FULL PATH, and `:` is not a
+        // legal Windows path character — sanitized, not dropped, because the name
+        // is what keeps the directory unique per test (same fix as
+        // `diagnostics::tests::host_semantics_…`).
+        let thread = std::thread::current();
         let root = std::env::temp_dir().join(format!(
             "aterm-manual-merged-lexicon-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            thread.name().unwrap_or("test").replace(':', "-")
         ));
         std::fs::create_dir_all(&root).unwrap();
         let lexicon = root.join("conflict.toml");

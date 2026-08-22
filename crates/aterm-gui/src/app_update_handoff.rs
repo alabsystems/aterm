@@ -335,6 +335,13 @@ fn commit_layout_topology(
     for window in &mut topology.windows {
         window.outer_x = None;
         window.outer_y = None;
+        // Same class as the position: live SHOW STATE, not topology. Captures
+        // currently write it on Windows only (this fn is unix-gated), but the
+        // derived `PartialEq` covers the field, so normalize it here too —
+        // otherwise the day a unix capture starts recording it, zooming the
+        // window during the successor's boot would kill a healthy Commit
+        // exactly the way dragging it used to.
+        window.maximized = None;
         // BOTH projections, deliberately: the capture writes the same live
         // session's cwd/title into the legacy `tabs` mirror and the canonical
         // `restored_tabs` tree, so normalizing only one of them would leave the
@@ -537,6 +544,7 @@ enum HandoffRollbackWarrant {
     /// than what the fork lane can say at the same point, where `execve` has
     /// already copied the table. Nothing is killed or waited on here — the
     /// successor discovers the vanished rendezvous, refuses itself, and exits.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NeverTransferred,
     /// `wait` consumed the candidate: it terminated and THIS process reaped it.
     /// Available only to its parent, and strictly the best answer — reaping is
@@ -1049,6 +1057,7 @@ enum HandoffCandidateHandle {
     Forked(std::process::Child),
     /// launchd's, not ours. Nothing here may `wait`, and the warrant comes from
     /// [`handoff_candidate_terminated`]'s outside proof.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Launched,
 }
 
@@ -1403,6 +1412,9 @@ fn send_handoff_preparation_failure(
 }
 
 #[cfg(unix)]
+// The worker's muts serve the macOS handoff arms; on other platforms those arms
+// are configured out and the bindings are read-only.
+#[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
 fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::EventLoopProxy<Wake>) {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
@@ -4218,6 +4230,7 @@ mod commit_layout_topology_tests {
             active_tab: 0,
             outer_x: position.map(|(x, _)| x),
             outer_y: position.map(|(_, y)| y),
+            maximized: None,
             tabs: vec![PaneLayout::Leaf {
                 cwd: cwd.map(str::to_string),
                 title: title.to_string(),

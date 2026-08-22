@@ -2727,6 +2727,19 @@ impl App {
                     let alt_word = settings_active
                         && mods.intersects(Modifiers::ALT | Modifiers::META)
                         && !mods.intersects(Modifiers::CTRL | Modifiers::SUPER | Modifiers::HYPER);
+                    // Off macOS, CTRL is the platform word modifier — Ctrl+←/→
+                    // walks words in every Windows/GTK text box — so it joins the
+                    // ⌥ twin for the NAMED-key arms below (its predicate is
+                    // exactly `readline`). The CTRL+letter emacs set is
+                    // untouched: those Character arms match FIRST, so a Ctrl
+                    // chord can only reach an `alt_word` arm on an arrow (or the
+                    // ⌫ arm gated beside them). macOS keeps ⌥ alone — Ctrl+arrow
+                    // is not the word idiom there, and this twin must stay
+                    // byte-identical with `app_input::field_edit_action`'s
+                    // cfg'd `by_word` so the find/rename fields and these
+                    // Settings fields cannot disagree about one chord.
+                    #[cfg(not(target_os = "macos"))]
+                    let alt_word = alt_word || readline;
                     match key {
                         Key::Character('a' | 'A') if readline => {
                             Some(AppEvent::TextInput(TextInputEvent::Home { extend }))
@@ -2769,6 +2782,17 @@ impl App {
                         }
                         Key::Character('f' | 'F') if alt_word => {
                             Some(AppEvent::TextInput(TextInputEvent::WordRight { extend }))
+                        }
+                        // Ctrl+⌫ = backward-kill-word, the other half of the
+                        // Windows word-motion reflex (⌥⌫ keeps today's meaning
+                        // everywhere — this arm exists only off macOS and only
+                        // for CTRL, ahead of the plain ⌫ arm below). Ctrl+⌦ has
+                        // no event to ride (`TextInputEvent` has no
+                        // DeleteWordForward), so forward word delete stays out
+                        // of scope rather than growing the native-input surface.
+                        #[cfg(not(target_os = "macos"))]
+                        Key::Named(NamedKey::Backspace) if readline => {
+                            Some(AppEvent::TextInput(TextInputEvent::DeleteWordBackward))
                         }
                         Key::Character('a' | 'A') if command => {
                             Some(AppEvent::TextInput(TextInputEvent::SelectAll))
@@ -3537,6 +3561,32 @@ impl App {
                     "native config worker stopped during reconciliation".to_string()
                 })?;
                 self.native_config_inflight = true;
+                // Park here; do NOT fail the caller. Parking is bounded because
+                // the probe just dispatched always reports back, and BOTH of its
+                // outcomes settle this queue: a successful sample clears the
+                // fence and re-pumps (`finish_native_config_reconciliation`), so
+                // the request is reduced normally; a failed one runs
+                // `fail_native_config_reconciliation`, which answers every queued
+                // origin with a bounded rejection. The wait is one worker file
+                // read, not the 30s wire deadline that this defect was reported
+                // as -- that deadline came from a queue nothing ever drained, and
+                // draining it is the actual fix.
+                //
+                // REJECTED: failing fast here on a remembered "the last probe
+                // came back broken". It bought no boundedness on top of the
+                // drain, and cost three things. (1) It answered with the PREVIOUS
+                // sample's reason while the fresh one dispatched above -- which
+                // may well succeed -- was still in flight. (2) It converted any
+                // TRANSIENT failure (a momentary lock or AV hold, a half-written
+                // aterm.toml caught mid-save by the watcher) into a hard ERR for
+                // the next `settings set`, where waiting one read would have
+                // succeeded, and made recovery cost an extra command. (3) The
+                // resulting Err is not even truthful for every origin: the
+                // Control escape hatch below can withdraw its own uniquely-tagged
+                // request before replying, but a queued `SeriousMode` intent has
+                // no such tag, so it stayed queued while the user was told
+                // "Serious Mode was not changed" -- and the probe this very call
+                // dispatched could then go on to apply it.
                 return Ok(());
             }
             if self.native_config_pending.is_empty() {
@@ -3705,6 +3755,23 @@ impl App {
         let reconciled_changed = authoritative
             .as_ref()
             .is_some_and(|snapshot| snapshot.revision != before_revision);
+        // The wire reply already distinguishes these outcomes; the log line and
+        // the in-app notice below did not, and claimed a save for every closed
+        // gate. A `Rejected` outcome can fail its preflight BEFORE a single byte
+        // reaches disk, so "Config was saved" was flatly untrue there and sent a
+        // real investigation looking for a phantom partial write. Decide the
+        // wording from the outcome, while it is still in hand.
+        let saved_wording = match &outcome {
+            ConfigPatchOutcome::Applied { .. } => "Config was saved, but its exact disk generation",
+            // The worker lost the race or never produced a proof; either way the
+            // requested edit is not what is on disk now.
+            ConfigPatchOutcome::Indeterminate { .. } => {
+                "Config publication could not be verified, and the current disk generation"
+            }
+            ConfigPatchOutcome::Conflict { .. } | ConfigPatchOutcome::Rejected { .. } => {
+                "Config was NOT saved, and the current disk generation"
+            }
+        };
         self.publish_native_config_origin(
             origin,
             outcome,
@@ -3714,7 +3781,7 @@ impl App {
         );
         if let Some(error) = synchronization_error {
             self.surface_native_config_lane_error(format!(
-                "Config was saved, but its exact disk generation could not be admitted: {error}"
+                "{saved_wording} could not be admitted: {error}"
             ));
         }
         if self.config_watch_admission_pending() || self.native_config_external_pending.is_some() {
@@ -3733,6 +3800,30 @@ impl App {
         }
     }
 
+    /// Single settlement for "a reconciliation worker reported back and the lane
+    /// is still fenced". Two things have to happen together or the lane leaks:
+    /// answer everything that was queued behind this exact sample, and tell the
+    /// user once. The fence itself stays armed, because only an admitted disk
+    /// generation is proof that the ordering authority is back.
+    ///
+    /// It deliberately does NOT re-pump. The fence is still armed and the fence
+    /// check in `pump_native_config` precedes the emptiness check, so pumping
+    /// here would dispatch another worker sample of the same unreadable path and
+    /// loop. Retry is caller-driven instead: the next `settings set` or Settings
+    /// save dispatches a fresh sample, and that is the seam through which a lane
+    /// broken by a transient failure recovers without restarting aterm. Nothing
+    /// remembers that this sample failed, deliberately: a remembered failure
+    /// would only be used to pre-emptively fail the caller that dispatches the
+    /// NEXT sample, i.e. to punish a caller for a diagnosis that its own probe
+    /// is in the middle of disproving.
+    fn fail_native_config_reconciliation(&mut self, error: &str) {
+        self.native_config_service.mark_reconciliation_required();
+        self.reject_pending_native_config(&format!("config reconciliation failed: {error}"));
+        self.surface_native_config_lane_error(format!(
+            "Config reconciliation failed; queued changes were not written: {error}"
+        ));
+    }
+
     pub(crate) fn finish_native_config_reconciliation(
         &mut self,
         completion: NativeConfigReconciliationCompletion,
@@ -3741,10 +3832,16 @@ impl App {
         let prepared = match completion.observation {
             Ok(prepared) => self.rebase_prepared_config_themes(prepared),
             Err(error) => {
-                self.native_config_service.mark_reconciliation_required();
-                self.surface_native_config_lane_error(format!(
-                    "Config reconciliation failed; queued changes remain pending: {error}"
-                ));
+                // This sample was the ONE thing that could have cleared the
+                // fence, and it came back broken. Every request behind it was
+                // waiting for exactly this answer, so record the reason and hand
+                // it to all of them now. The old code kept the fence, said
+                // "queued changes remain pending", and returned -- and since
+                // nothing else ever drains this queue and nothing but a
+                // successful sample ever clears the fence, "pending" meant
+                // "abandoned": a control caller's socket reply sat here until
+                // the 30s wire timeout fired.
+                self.fail_native_config_reconciliation(&error);
                 return;
             }
         };
@@ -3757,8 +3854,10 @@ impl App {
                 .native_config_service
                 .synchronize_prepared_observation(prepared)
             {
-                self.native_config_service.mark_reconciliation_required();
-                self.surface_native_config_lane_error(error);
+                // Same abandonment as the observation arm above: the sample read
+                // fine but the service refused to admit it, so the fence stays
+                // armed with nothing scheduled to retry it.
+                self.fail_native_config_reconciliation(&error);
                 return;
             }
             self.native_config_service.mark_reconciliation_required();
@@ -3799,8 +3898,9 @@ impl App {
         {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.native_config_service.mark_reconciliation_required();
-                self.surface_native_config_lane_error(error);
+                // Ditto: an unadmittable sample leaves no live retry, so answer
+                // the queue instead of holding replies nobody will settle.
+                self.fail_native_config_reconciliation(&error);
                 return;
             }
         };
@@ -3885,7 +3985,17 @@ impl App {
                 self.finish_native_config_external_admission(&admitted_baseline);
             }
             Err(error) => {
+                // Same abandonment shape as the reconciliation arms, and on the
+                // same path: this is reached from
+                // `finish_native_config_reconciliation`'s deferred-generation
+                // drain, so a caller parked behind that probe would be left with
+                // a re-armed fence and NOTHING dispatched to clear it. Answer the
+                // queue here too, or the probe-completion bound below is a
+                // half-truth.
                 self.native_config_service.mark_reconciliation_required();
+                self.reject_pending_native_config(&format!(
+                    "config generation could not be admitted: {error}"
+                ));
                 self.surface_native_config_lane_error(format!(
                     "Manual saved aterm.toml, but its exact generation could not be admitted: {error}"
                 ));
@@ -3946,6 +4056,11 @@ impl App {
                 &baseline,
                 crate::config_watcher::WatchFailureKind::ConfigPreparationFailed,
             );
+            // Reaching here means the worker queue itself is gone, so the fence
+            // just armed above has no sample scheduled and never can have one:
+            // every later pump fails at the same `native_config_queue()`. Queued
+            // requests are therefore unanswerable, not merely delayed.
+            self.reject_pending_native_config(&format!("config preparation failed: {error}"));
             self.surface_native_config_lane_error(error);
         }
     }
@@ -3987,6 +4102,52 @@ impl App {
         self.config_notice =
             crate::config_notice::ConfigNotice::new(vec![message], std::time::Instant::now());
         self.request_redraw_all_windows();
+    }
+
+    /// Answer EVERY still-queued semantic request with one bounded rejection and
+    /// empty the lane.
+    ///
+    /// Call this from every arm that re-arms the write fence WITHOUT leaving a
+    /// worker sample scheduled to clear it. Such an arm invalidates the disk
+    /// baseline each queued request would have to be reduced against, so not one
+    /// of them can be published, and nothing is coming that would change
+    /// that. Leaving them parked "for the next retry" is precisely what
+    /// abandoned control callers: their one-shot `Sender` stayed alive in the
+    /// queue, the control thread blocked on it, and the wire reported a wedged
+    /// event loop 30 seconds later -- from an event loop that was in fact
+    /// turning normally and answering every read verb instantly. The retry is
+    /// still available; it just starts from the caller's NEXT command instead of
+    /// from a request nobody is watching any more.
+    ///
+    /// Nothing in the queue has been reduced yet (`pump_native_config` pops and
+    /// reduces in the same step), so there is no optimistic in-memory state to
+    /// roll back and no authoritative snapshot to republish here.
+    ///
+    /// Callers must NOT pump afterwards: the fence check in `pump_native_config`
+    /// runs BEFORE the emptiness check, so pumping a freshly drained queue would
+    /// dispatch yet another reconciliation and spin the worker against a path it
+    /// already cannot read.
+    pub(crate) fn reject_pending_native_config(&mut self, message: &str) {
+        let abandoned = std::mem::take(&mut self.native_config_pending);
+        if abandoned.is_empty() {
+            return;
+        }
+        aterm_log::warn!(
+            "native config: rejecting {} queued config request(s): {message}",
+            abandoned.len()
+        );
+        for NativeConfigRequest { origin, .. } in abandoned {
+            self.publish_native_config_origin(
+                origin,
+                ConfigPatchOutcome::Rejected {
+                    message: message.to_string(),
+                },
+                None,
+                false,
+                None,
+            );
+        }
+        self.refresh_serious_mode_queued_projection();
     }
 
     fn publish_native_config_origin(
@@ -4372,7 +4533,7 @@ impl App {
                     Ok(status) if status.code() == Some(2) => PackagesCommandOutcome::Failed {
                         operation: busy,
                         message: "Nothing was installed: the registry served no package \
-                                  this Mac can run. This is not a temporary error — \
+                                  this machine can run. This is not a temporary error — \
                                   retrying will not change it."
                             .to_string(),
                     },
@@ -6807,6 +6968,47 @@ mod tests {
                 .map(|request| &request.work),
             Some(NativeConfigWork::SeriousMode(true))
         ));
+    }
+
+    /// Regression: a reconciliation worker that came back broken used to leave
+    /// every queued request "pending" behind a fence that only a SUCCESSFUL
+    /// sample can clear -- and nothing was scheduled to take another sample. A
+    /// blocked `aterm-ctl settings set` therefore held a live one-shot until the
+    /// 30-second wire deadline and then reported a wedged event loop, from a
+    /// loop that was turning normally the whole time.
+    #[test]
+    fn failed_reconciliation_answers_queued_callers_instead_of_leaving_them_pending() {
+        let mut app = App::headless_for_test();
+        app.native_config_service = crate::native_config_service::VersionedConfigService::new(
+            "serious_mode = false\n".to_string(),
+        )
+        .unwrap();
+        let (reply, completion) = std::sync::mpsc::channel();
+        app.enqueue_control_settings_field_intent(
+            crate::prefs::EDIT_FONT_PX.to_string(),
+            Some("14".to_string()),
+            reply,
+        );
+        app.enqueue_serious_mode_intent().unwrap();
+        assert_eq!(app.native_config_pending.len(), 2);
+
+        app.fail_native_config_reconciliation("config path is unreadable");
+
+        assert!(
+            app.native_config_pending.is_empty(),
+            "a fence with no live retry must not retain requests nobody will settle"
+        );
+        assert_eq!(app.serious_mode_queued_projection, None);
+        let error = completion
+            .try_recv()
+            .expect("the control caller's one-shot must be settled, not abandoned")
+            .unwrap_err();
+        assert!(error.contains("config reconciliation failed"), "{error}");
+        assert!(error.contains("config path is unreadable"), "{error}");
+        assert!(
+            app.native_config_service.reconciliation_required(),
+            "only an admitted disk generation may reopen the lane"
+        );
     }
 
     #[test]
@@ -10901,7 +11103,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("draft.md");
         std::fs::write(&path, "draft\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        // The shipping encoder, not a hand-rolled `format!` — the latter is
+        // malformed on Windows (drive letter + backslashes after the authority
+        // slot), so this test could not even open its document there.
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
 
         let mut app = App::headless_for_test();
         app.open_document_tab(crate::native_app::AppKind::Editor, &uri)
@@ -11256,6 +11461,91 @@ mod tests {
         assert_eq!(search(&app).0, "");
     }
 
+    /// Off macOS, Ctrl+←/→ and Ctrl+⌫ are WORD operations in the Settings text
+    /// fields (the cfg'd `alt_word || readline` term): Ctrl+arrow lands exactly
+    /// where Alt+arrow does, Ctrl+⌫ kills exactly what Ctrl+W does, and the
+    /// ctrl-LETTER readline arms stay by-character because they match first.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn settings_search_field_ctrl_arrows_walk_words_off_macos() {
+        use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Appearance));
+        app.dispatch_native_event(
+            wid,
+            AppEvent::Action(crate::native_app::ActionInvocation {
+                id: crate::native_ui::ActionId::new("settings/search"),
+                value: None,
+            }),
+        )
+        .unwrap();
+        app.dispatch_native_event(
+            wid,
+            AppEvent::TextInput(TextInputEvent::Commit("cursor trail".to_string())),
+        )
+        .unwrap();
+
+        let chord = |key, mods| crate::input::InputEvent::Key {
+            key,
+            mods,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        let left = |mods| chord(Key::Named(NamedKey::ArrowLeft), mods);
+        let right = |mods| chord(Key::Named(NamedKey::ArrowRight), mods);
+        let (_, view) = app.active_native_view(wid).unwrap();
+        let search = |app: &App| match app.native_runtime.view_state(view) {
+            Some(crate::native_app::AppViewState::Settings(state)) => (
+                state.search_input.value().to_string(),
+                state.search_input.selection().range(),
+            ),
+            _ => panic!("Settings view"),
+        };
+
+        // Alt+← is the existing word motion; note where it lands from the end.
+        assert!(app.native_input_event(wid, &left(Modifiers::ALT)));
+        let alt_word_stop = search(&app).1;
+        // Back to the end, then Ctrl+←: the SAME stop.
+        assert!(app.native_input_event(
+            wid,
+            &chord(Key::Character('e'), Modifiers::CTRL)
+        ));
+        assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
+        assert_eq!(search(&app).1, alt_word_stop, "Ctrl+← = Alt+← (word left)");
+        assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
+        assert_eq!(search(&app).1, 0..0, "second Ctrl+← reaches the start");
+        // Forward: Ctrl+→ lands exactly where Alt+→ does (emacs-style: the END
+        // of the word, not the start of the next — hence not `alt_word_stop`).
+        assert!(app.native_input_event(wid, &right(Modifiers::CTRL)));
+        let ctrl_right_stop = search(&app).1;
+        assert!(app.native_input_event(wid, &left(Modifiers::CTRL)));
+        assert_eq!(search(&app).1, 0..0, "Ctrl+← undoes the word step");
+        assert!(app.native_input_event(wid, &right(Modifiers::ALT)));
+        assert_eq!(
+            search(&app).1,
+            ctrl_right_stop,
+            "Ctrl+→ = Alt+→ (word right)"
+        );
+        // Ctrl+⌫ from the end kills the last word — exactly Ctrl+W's cut.
+        assert!(app.native_input_event(
+            wid,
+            &chord(Key::Character('e'), Modifiers::CTRL)
+        ));
+        assert!(app.native_input_event(
+            wid,
+            &chord(Key::Named(NamedKey::Backspace), Modifiers::CTRL)
+        ));
+        assert_eq!(search(&app).0, "cursor ", "Ctrl+⌫ = backward-kill-word");
+        // The ctrl-LETTER readline arms match first: ^B is still ONE character.
+        assert!(app.native_input_event(
+            wid,
+            &chord(Key::Character('b'), Modifiers::CTRL)
+        ));
+        assert_eq!(search(&app).1, 6..6, "^B stays by-character");
+    }
+
     #[test]
     fn explicit_font_metrics_seed_initial_and_additional_headless_windows() {
         let mut app = App::headless_for_test();
@@ -11402,7 +11692,12 @@ mod tests {
         let after = project(&model, &app, 0, 0, 0, true);
         assert_step(&model, &state, &after, "FailReconcile");
         state = after;
-        assert_eq!(app.native_config_pending.len(), 1);
+        // The failed reconciliation ANSWERS its queued caller (with the error)
+        // rather than leaving it pending — 92a43f0d, pinned by the dedicated
+        // `failed_reconciliation_answers_queued_callers_…` test. The queue is
+        // therefore EMPTY here; the external observation is its own pending
+        // state and survives for the retry below.
+        assert_eq!(app.native_config_pending.len(), 0);
         assert!(app.native_config_external_pending.is_some());
 
         let themes = std::sync::Arc::clone(&app.native_config_service.snapshot().assets.themes);
@@ -11426,7 +11721,9 @@ mod tests {
             "serious_mode = true\n"
         );
         assert!(app.native_config_external_pending.is_none());
-        assert_eq!(app.native_config_pending.len(), 1);
+        // Still empty: the one queued caller was answered at FailReconcile
+        // above, and nothing requeued since.
+        assert_eq!(app.native_config_pending.len(), 0);
 
         let mut lost = after;
         lost.insert("dropped_candidate", 1);

@@ -1367,7 +1367,7 @@ pub fn spawn_background_check(
                         // reader hunting a download fault that did not exist.
                         let cause = match class {
                             "manifest" => format!(
-                                "the newest release cannot be trusted ({}) — this Mac \
+                                "the newest release cannot be trusted ({}) — this machine \
                                  stays on build {current_build} until it is republished",
                                 h.last_error
                             ),
@@ -1470,7 +1470,7 @@ pub const PERSISTENT_AFTER: u32 = 3;
 /// release channel" latch (`no_token::STRANDED`, `github::LANE`). Cargo runs a crate's
 /// tests in parallel threads of ONE process, so without this an assertion about the
 /// latch can observe a sibling test's transient state and fail intermittently.
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A snapshot of the updater's state for the "Check for Updates" menu and the
@@ -2005,9 +2005,13 @@ mod commit_match_tests {
 
     use super::{
         ReconciledStatusOutcome, StatusReconciliation, commit_matches, compiled_update_pin_sha256,
-        persisted_claims_stage, persistent_notice_is_owed, reconcile_status_outcome,
-        status_reconciliation_projection, update_pubkey_sha256,
+        persisted_claims_stage, reconcile_status_outcome, status_reconciliation_projection,
+        update_pubkey_sha256,
     };
+    // The predicate under test is itself macOS-gated (the notice belongs to the
+    // updater, which has no other lane) — the import and its test ride the same cfg.
+    #[cfg(target_os = "macos")]
+    use super::persistent_notice_is_owed;
 
     #[test]
     fn update_pin_fingerprint_hashes_decoded_key_and_fails_closed() {
@@ -2397,6 +2401,7 @@ mod commit_match_tests {
     ///
     /// MUTATION: make the predicate `announced.is_none()` (the old bool) and the
     /// different-class assertion fails.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_second_persistent_class_still_speaks_but_the_same_one_stays_quiet() {
         // Nothing escalating: nothing to say, whatever was announced before.

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+// Native confirmations exist only where native alerts do; elsewhere the router
+// compiles for the shared key path and the rest is intentionally idle.
+#![cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+
 //! Key routing for the native CONFIRMATION alerts — the multi-line-paste sheet
 //! ([`crate::App::present_multiline_paste_sheet`]) and the app-modal close/quit alert
 //! ([`crate::menu::confirm`]).

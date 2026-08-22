@@ -156,6 +156,12 @@ pub enum DepResult {
     Skipped(String),
 }
 
+/// Every program name a VERIFIED index carries, for [`FlowError::NotReachable`]'s
+/// "it names: …" answer. `BTreeMap` keys, so the order is stable and alphabetical.
+fn index_roster(index: &crate::manifest::Index) -> Vec<String> {
+    index.programs.keys().cloned().collect()
+}
+
 /// Why an install failed, fail-closed at each gate.
 #[derive(Debug)]
 pub enum FlowError {
@@ -172,8 +178,13 @@ pub enum FlowError {
     /// management when the fix is "connect to the internet", and quietly implying the
     /// publisher's signatures are bad.
     Unreachable(String),
-    /// The program is not named in the verified index (unreachable, §5).
-    NotReachable(String),
+    /// The program is not named in the verified index (unreachable, §5). The second
+    /// field is the roster the index DOES name, captured at construction — the one
+    /// moment the just-verified index is in hand — so the error can answer the user's
+    /// immediate next question ("then what IS installable?") without any surface
+    /// re-fetching, and without any trust change: the printed roster is
+    /// master-root-verified. Empty means "roster unknown" and the message stays short.
+    NotReachable(String, Vec<String>),
     /// The requested channel does not exist in the index.
     NoChannel(String),
     /// The program is not pinned in the channel.
@@ -227,12 +238,29 @@ impl std::fmt::Display for FlowError {
             FlowError::Unreachable(why) => {
                 f.write_str("could not reach the toolchain index (")?;
                 f.write_str(why)?;
-                f.write_str(") — this is a network problem, not a signature problem; \
-                             the toolchain retries automatically")
+                // No "…the toolchain retries automatically" tail: that is true only of
+                // the windowed app's 6-hour loop, and this Display reaches foreground
+                // CLI verbs where nothing retries anything. The CLI edge appends the
+                // honest per-verb re-run instead (`print_unreachable_followup`).
+                f.write_str(") — this is a network problem, not a signature problem")
             }
-            FlowError::NotReachable(p) => {
+            FlowError::NotReachable(p, roster) => {
                 f.write_str(p)?;
-                f.write_str(" is not named in the signed index")
+                // The grep-stable phrase, verbatim; the roster rides in a parenthesis.
+                f.write_str(" is not named in the signed index")?;
+                if roster.is_empty() {
+                    return Ok(());
+                }
+                f.write_str(" (it names: ")?;
+                // Whole roster when it is short; first 12 otherwise — the point is a
+                // usable answer, not a wall.
+                if roster.len() <= 12 {
+                    f.write_str(&roster.join(", "))?;
+                } else {
+                    f.write_str(&roster[..12].join(", "))?;
+                    f.write_str(", …")?;
+                }
+                f.write_str(")")
             }
             FlowError::NoChannel(c) => {
                 f.write_str("no channel ")?;
@@ -282,7 +310,9 @@ impl std::fmt::Display for FlowError {
                 f.write_str(e)
             }
             FlowError::Rollback(m) => {
-                f.write_str("rollback: ")?;
+                // No "rollback: " head: the one CLI edge already prints
+                // "atpkg: rollback <p> failed:", and the doubled word read like two
+                // errors stacked.
                 f.write_str(m)
             }
             FlowError::InsufficientDisk {
@@ -297,7 +327,7 @@ impl std::fmt::Display for FlowError {
             }
             FlowError::Linked(p) => {
                 f.write_str(p)?;
-                f.write_str(" is dev-linked; run `atpkg unlink ")?;
+                f.write_str(" is dev-linked; run `aterm pkg unlink ")?;
                 f.write_str(p)?;
                 f.write_str("` to manage it from the registry")
             }
@@ -381,7 +411,7 @@ fn install_inner(
     let index = resolve_verified_index(fetcher, layout, anchor, floor, now_unix)?;
     let repo = index
         .program(program)
-        .ok_or_else(|| FlowError::NotReachable(program.to_string()))?
+        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?
         .repo
         .clone();
     let ch = index
@@ -1144,7 +1174,7 @@ fn apply_group_txn(
             println!(
                 "atpkg: {program} was recalled and there is not room to install its \
                  replacement — its commands are disabled until there is. Free space and \
-                 run `atpkg update`."
+                 run `aterm pkg update`."
             );
         }
         // Stage NOTHING — the group stays coherent on its current builds.
@@ -1502,7 +1532,11 @@ pub fn rollback(
     // 1. The ACTIVE build (shim-derived), never a merely-staged one.
     let current = *crate::ops::active_builds(layout)
         .get(program)
-        .ok_or_else(|| FlowError::Rollback(format!("{program} is not installed/active")))?;
+        .ok_or_else(|| {
+            FlowError::Rollback(format!(
+                "{program} is not installed/active (aterm pkg list shows what is)"
+            ))
+        })?;
     // 2. Resolve + verify-select the SIGNED index so the floor/yank gate is authoritative
     //    (direct fetch — the single-program paths use no §14 cached fallback).
     let candidates = fetcher.index_candidates().map_err(|_| FlowError::NoIndex)?;
@@ -1510,7 +1544,7 @@ pub fn rollback(
     // 3. Reachability — capture the coherence group for the report/warn.
     let coherence_group = index
         .program(program)
-        .ok_or_else(|| FlowError::NotReachable(program.to_string()))?
+        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?
         .coherence_group
         .clone();
     // 4. The channel supplies the authoritative min_build + yank list.
@@ -1674,7 +1708,7 @@ pub fn plan_update(
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
     let p = index
         .program(program)
-        .ok_or_else(|| FlowError::NotReachable(program.to_string()))?;
+        .ok_or_else(|| FlowError::NotReachable(program.to_string(), index_roster(&index)))?;
     Ok(UpdatePlan {
         group: p.coherence_group.clone(),
         decision: decide(ch, program, installed_build),
@@ -2794,7 +2828,17 @@ mod tests {
             installed: None,
         };
         let err = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap_err();
-        assert!(matches!(err, FlowError::NotReachable(_)), "got {err:?}");
+        assert!(matches!(err, FlowError::NotReachable(..)), "got {err:?}");
+        // The refusal answers the follow-up question from the same verified index.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("is not named in the signed index"),
+            "the grep-stable phrase survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("(it names: "),
+            "the verified roster is attached at construction: {rendered}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

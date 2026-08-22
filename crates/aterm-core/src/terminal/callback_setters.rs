@@ -25,6 +25,8 @@ impl Terminal {
     /// (§5.8 ingress bound), so a hostile resize cannot request an
     /// arbitrarily large cell allocation.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        // Captured BEFORE the resize: afterwards both grids carry the new width.
+        let cols_changed = self.grid.cols() != cols;
         if self.modes.alternate_screen {
             // Alt screen active: don't reflow current grid (app-managed content).
             // Saved primary grid should reflow normally.
@@ -40,7 +42,7 @@ impl Terminal {
                 alt.resize_no_reflow(rows, cols);
             }
         }
-        self.finalize_resize();
+        self.finalize_resize(cols_changed);
     }
 
     /// Resize, but move the width-change off-screen scrollback rewrap OFF the
@@ -59,6 +61,8 @@ impl Terminal {
         rows: u16,
         cols: u16,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
+        // Captured BEFORE the resize, as in `resize`.
+        let cols_changed = self.grid.cols() != cols;
         let pending = if self.modes.alternate_screen {
             // Alt active: current (alt) grid is app-managed; the SAVED PRIMARY
             // holds the scrollback that reflows.
@@ -74,7 +78,7 @@ impl Terminal {
             }
             pending
         };
-        self.finalize_resize();
+        self.finalize_resize(cols_changed);
         pending
     }
 
@@ -171,9 +175,30 @@ impl Terminal {
     /// Shared post-resize side effects for [`resize`](Self::resize) and the
     /// offloaded path: selection invalidation, the DEC-2048 in-band size report,
     /// and the debug structural-invariant self-check.
-    fn finalize_resize(&mut self) {
-        // Reflow invalidates all row/col coordinates (#4056).
-        self.text_selection.clear();
+    fn finalize_resize(&mut self, cols_changed: bool) {
+        // SELECTION CUSTODY Phase 3: only a WIDTH change invalidates coordinates.
+        //
+        // This used to clear unconditionally, on the reasoning that "reflow
+        // invalidates all row/col coordinates (#4056)". True for a width change —
+        // rewrap renumbers rows — but a ROWS-ONLY resize (window height, font zoom,
+        // a horizontal divider drag) does not rewrap anything: row identity is
+        // intact and only `visible_rows` moved. Clearing there threw away a
+        // selection for a resize that could not have invalidated it.
+        //
+        // The rows-only case re-runs the EXISTING, kani-proven range check rather
+        // than a second implementation of the same bounds reasoning: delta 0, the
+        // new live-bottom row count, and the actual scrollback floor.
+        //
+        // `cols_changed` must be captured by the CALLER before the resize — by the
+        // time we run, both grids already carry the new width and the old one is
+        // gone.
+        if cols_changed {
+            self.text_selection.clear();
+        } else {
+            let max_rows = i32::from(self.grid.rows());
+            let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
+            self.text_selection.adjust_for_scroll(0, max_rows, floor);
+        }
         // DEC mode 2048: emit an in-band size report on every resize so a
         // subscribed app (neovim 0.10+) learns the new geometry without an ioctl.
         // Honor the response-buffer cap: like the DECSET arm, this writes the

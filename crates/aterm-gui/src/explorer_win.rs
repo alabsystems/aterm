@@ -101,6 +101,26 @@ fn set_string(hk: Hkey, name: Option<&str>, value: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Build the verb's registry command line: `"<exe>" -d "<token>."`.
+///
+/// The trailing dot is load-bearing. Explorer substitutes `%1`/`%V` textually,
+/// and for a drive root that text is `C:\` — so the naive `-d "%V"` expands to
+/// `-d "C:\"`, where the backslash escapes the closing quote under the MSVCRT
+/// argv rules and the operand parses as `C:"` (reproduced: `rustc "C:\"` →
+/// ``couldn't read `C:"``). `Path::is_dir()` then fails and the GUI-subsystem
+/// exe exits 2 into a null stderr — right-clicking a drive was a *silent*
+/// no-op. With the dot the expansion is `-d "C:\."`: the quote survives, and
+/// `C:\.` resolves to the root. Ordinary folders expand to e.g. `C:\src.`,
+/// which Win32 path normalization treats as `C:\src` (trailing dots on a final
+/// component are stripped), so they are unaffected. This is the workaround Git
+/// for Windows ships in its own shell verb (`git_shell\command` = `"--cd=%v."`).
+/// Rejected alternatives: dropping the quotes breaks any path with spaces, and
+/// special-casing drive roots is impossible — the substitution happens in
+/// Explorer long after this one static template is written.
+fn verb_command(exe: &str, token: &str) -> String {
+    format!("\"{exe}\" -d \"{token}.\"")
+}
+
 /// Install the "Open aterm here" verb on directories, directory backgrounds, and
 /// drives, pointing at the CURRENT `aterm-gui.exe` with `-d <path>`.
 pub(crate) fn install() -> io::Result<()> {
@@ -116,7 +136,7 @@ pub(crate) fn install() -> io::Result<()> {
         r1?;
         r2?;
         let cmd = create_key(&format!(r"{base}\command"))?;
-        let r3 = set_string(cmd, None, &format!("\"{exe_s}\" -d \"{arg}\""));
+        let r3 = set_string(cmd, None, &verb_command(&exe_s, arg));
         // SAFETY: `cmd` was opened by create_key above.
         unsafe { RegCloseKey(cmd) };
         r3?;
@@ -132,4 +152,34 @@ pub(crate) fn uninstall() -> io::Result<()> {
         unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, sub.as_ptr()) };
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A drive root's `%1`/`%V` expands to `C:\`, and a backslash directly
+    /// before the closing quote escapes it (see [`verb_command`]'s doc). Guard
+    /// both the raw template and its worst-case expansion, for every verb root.
+    #[test]
+    fn drive_root_expansion_does_not_escape_the_closing_quote() {
+        for (_, token) in VERBS {
+            let template = verb_command(r"C:\apps\aterm\aterm-gui.exe", token);
+            assert!(
+                !template.ends_with("\\\""),
+                "template ends in backslash-quote: {template}"
+            );
+            // Simulate Explorer's textual substitution on a drive root — the
+            // one path that ends in a backslash and cannot be spelled otherwise.
+            let expanded = template.replace(token, r"C:\");
+            assert!(
+                !expanded.ends_with("\\\""),
+                "expanded verb ends in backslash-quote (operand would parse as `C:\"`): {expanded}"
+            );
+            assert!(
+                expanded.ends_with("\\.\""),
+                "expanded verb should end root-dot-quote so the operand stays `C:\\.`: {expanded}"
+            );
+        }
+    }
 }

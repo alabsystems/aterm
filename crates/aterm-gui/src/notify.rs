@@ -45,7 +45,7 @@
 // Real delivery exists on macOS and Windows; elsewhere (Linux) this module is a
 // channel-draining stub (`spawn_delivery`), so the real-notification
 // helpers/fields are intentionally unused there.
-#![cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code, unused_imports))]
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -354,9 +354,10 @@ mod win_balloon {
         fn Shell_NotifyIconW(dwMessage: u32, lpData: *mut NOTIFYICONDATAW) -> i32;
     }
 
-    /// The hidden message-only window + stock icon the balloons hang off.
-    /// Windows have THREAD AFFINITY, so this lives in a `thread_local` — in
-    /// practice only the single delivery thread ever touches it.
+    /// The hidden message-only window + shared icon (the exe's embedded aterm
+    /// icon, or the stock fallback) the balloons hang off. Windows have THREAD
+    /// AFFINITY, so this lives in a `thread_local` — in practice only the
+    /// single delivery thread ever touches it.
     struct Notifier {
         hwnd: HWND,
         hicon: isize,
@@ -420,8 +421,24 @@ mod win_balloon {
                 if hwnd == 0 {
                     return None;
                 }
-                // Stock shared icon: must NOT be destroyed, so no guard.
-                let hicon = LoadIconW(0, IDI_APPLICATION as *const u16);
+                // The balloon's icon: the aterm icon compiled into THIS exe
+                // (resource ordinal 1 — the `1 ICON` crates/aterm/build.rs
+                // embeds; the same ordinal the window chrome loads via
+                // `Icon::from_resource(1, ..)` in app_window.rs, so the two
+                // ends stay coupled by that number). The previous
+                // `LoadIconW(0, IDI_APPLICATION)` put the GENERIC Windows
+                // program glyph in the notification area for every balloon's
+                // 6 s linger. Falls back to that stock icon for a binary with
+                // no resource section (dev `cargo run` when the resource
+                // compiler was missing — build.rs already printed a banner).
+                // Both are SHARED icons (module-resource / system), so
+                // neither may be destroyed — no guard, as before.
+                let own = LoadIconW(hinstance, 1 as *const u16);
+                let hicon = if own != 0 {
+                    own
+                } else {
+                    LoadIconW(0, IDI_APPLICATION as *const u16)
+                };
                 Some(Self { hwnd, hicon })
             }
         }

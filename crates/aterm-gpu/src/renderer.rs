@@ -794,7 +794,7 @@ struct Blit {
     sdr_white_scale: f32, // M3 (Windows scRGB): reference-white scale (SDRwhite/80); 1.0 on macOS/SDR
     visible_y: f32,   // first source row exposed by the frontend crop
     visible_h: f32,   // exposed source height; rows outside are remainder bands
-    _p2: f32,
+    premult: f32,     // H1: !=0: multiply output rgb by the emitted alpha (DComp visual swapchain)
 };
 @group(0) @binding(2) var<uniform> b: Blit;
 
@@ -839,10 +839,23 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
         // (`b.band.a`) too, so the whole window reads as one sheet of glass; the
         // opaque default forces 1.0 (byte-identical chrome).
         let band_a = select(1.0, b.band.a, b.translucent != 0.0);
+        var band_rgb = b.band.rgb;
         if (b.hdr != 0.0) {
-            return vec4<f32>(hdr_grid_encode3(b.band.rgb), band_a);
+            // The SAME reference-white scale as the grid arm below. A band left
+            // at scRGB 1.0 == 80 nits composes 1/scale as bright as the grid
+            // beside it on a Windows HDR desktop (measured in the FP16
+            // composition: a 3 px strip at linear 0.0056 next to a grid at
+            // 0.0168 on a 240-nit SDR-white desktop — a dark frame line around
+            // every non-grid-fit window). The bands are the same sheet as the
+            // grid, so they take the same encode; 1.0 on macOS / SDR.
+            band_rgb = hdr_grid_encode3(band_rgb) * b.sdr_white_scale;
         }
-        return vec4<f32>(b.band.rgb, band_a);
+        // H1: a premultiplied destination (DComp visual swapchain) wants
+        // rgb·a. Identity on every opaque present (band_a == 1.0 there).
+        if (b.premult != 0.0) {
+            band_rgb = band_rgb * band_a;
+        }
+        return vec4<f32>(band_rgb, band_a);
     }
     let c = textureLoad(src_tex, vec2<i32>(p), 0);
     var rgb = c.rgb;
@@ -885,6 +898,16 @@ fn fs_blit(in: VsOut) -> @location(0) vec4<f32> {
     // blurred glass; text/decorations/images stay opaque). The opaque default
     // forces 1.0 — the byte-identical solid present.
     let out_a = select(1.0, c.a, b.translucent != 0.0);
+    // H1 (Windows Mica/Acrylic): the DComp visual swapchain composites
+    // PREMULTIPLIED (DXGI rejects straight alpha for composition), so scale rgb
+    // by the emitted alpha. Opaque pixels (the whole grid body — cells are the
+    // ratified opaque surface) have out_a == 1.0 and pass through byte-identical;
+    // only the padding/chrome-bleed margins carry alpha < 1 and pick up the
+    // multiply, which is exactly what stops the "bright fringe" a straight-alpha
+    // frame would show when DWM treats it as premultiplied.
+    if (b.premult != 0.0) {
+        rgb = rgb * out_a;
+    }
     return vec4<f32>(rgb, out_a);
 }
 "#;
@@ -1266,13 +1289,26 @@ pub(crate) struct BlitUniform {
     /// scRGB `1.0` == 80 nits FIXED, so the grid must scale to the user's SDR-white or
     /// it renders dim. `1.0` on macOS (the extended-linear layer auto-maps 1.0 → SDR
     /// white) and on every SDR present, so those uniform bytes are unchanged in effect.
+    /// Applied to the grid AND the remainder bands (one sheet): this is exactly the
+    /// transform DWM applies to SDR-drawn pixels on an HDR desktop (measured: the
+    /// sRGB piecewise decode × 3.0 at a 240-nit SDR-white, caption == grid in the
+    /// FP16 composition — `aterm_render::hdr::scrgb_present_channel` is the twin).
+    /// A GDI screen grab reads an f16 swapchain back WITHOUT the `/scale`, so it
+    /// shows this present `scale×` lifted; verify with an FP16 capture, not BitBlt.
     sdr_white_scale: f32,
     /// First raw source row exposed by the frontend's vertical crop.
     visible_y: f32,
     /// Height of the exposed source frame. Raw rows outside this interval are
     /// painted as destination bands (never inverted or overlay-washed).
     visible_h: f32,
-    _pad2: f32,
+    /// H1 (Windows Mica/Acrylic): non-zero when the swapchain composites
+    /// PREMULTIPLIED (the DirectComposition visual path — DXGI rejects straight
+    /// alpha for composition swapchains) — the blit multiplies the output rgb by
+    /// the emitted alpha, content and bands alike. Zero everywhere else, so the
+    /// uniform bytes stay the pre-H1 layout (this slot WAS `_pad2`, always 0.0);
+    /// with `translucent == 0` the emitted alpha is 1.0 and the multiply is
+    /// identity, so this is only ever consulted on a translucent present.
+    premult: f32,
 }
 
 impl BlitUniform {
@@ -1296,7 +1332,7 @@ impl BlitUniform {
             sdr_white_scale: 1.0, // 1.0 = no scaling (SDR / macOS); set on the Windows EDR present
             visible_y: 0.0,
             visible_h: 0.0,
-            _pad2: 0.0,
+            premult: 0.0, // set by the present path on the DComp visual swapchain (H1)
         }
     }
 
@@ -1307,6 +1343,15 @@ impl BlitUniform {
     fn with_translucency(mut self, band_a: f32) -> Self {
         self.translucent = 1.0;
         self.band[3] = band_a;
+        self
+    }
+
+    /// H1 (Windows Mica/Acrylic): mark the destination PREMULTIPLIED — the blit
+    /// multiplies its output rgb by the emitted alpha (identity for every opaque
+    /// pixel). Only set together with [`with_translucency`](Self::with_translucency);
+    /// the solid default leaves the slot 0.0 (the pre-H1 pad bytes).
+    fn with_premultiplied_output(mut self) -> Self {
+        self.premult = 1.0;
         self
     }
 
@@ -1690,6 +1735,12 @@ pub struct GpuSurface {
     /// WITHOUT re-querying the driver every frame. `false` ⇒ the platform has no
     /// non-opaque composite here, so a translucent request stays honestly solid.
     post_mult: bool,
+    /// H1 (Windows Mica/Acrylic): whether this surface offers
+    /// `CompositeAlphaMode::PreMultiplied` — the ONLY non-opaque composite a
+    /// DirectComposition visual swapchain accepts (see
+    /// [`GpuRenderer::caps_support_pre_multiplied`]). Captured at attach like
+    /// `post_mult` so the per-frame alpha-mode reconcile never re-queries.
+    pre_mult: bool,
     /// VIDEO introspection: whether the surface caps OFFER `COPY_SRC` (always
     /// true on DX12 flip-model and on wgpu-hal's Metal backend, common on Vulkan).
     /// Gates the `video` frame tap: where false, the verb replies unsupported
@@ -2208,8 +2259,9 @@ pub struct WindowGpu {
     // panels get each panel's own headroom.
     pub(crate) edr_max: f32,
     // M3 (Windows scRGB): the display's reference-white scale, `SDRwhite_nits / 80`
-    // (scRGB 1.0 == 80 nits fixed). Applied to the base grid (blit) + aurora on the
-    // Windows EDR present so content isn't dim. `Default` 0.0 is clamped to 1.0 at
+    // (scRGB 1.0 == 80 nits fixed). Applied to the base grid (blit), the remainder
+    // bands, and the aurora on the Windows EDR present so content isn't dim — the
+    // same transform DWM applies to SDR windows. `Default` 0.0 is clamped to 1.0 at
     // present (never set / macOS / SDR ⇒ no scaling, byte-identical).
     pub(crate) sdr_white_scale: f32,
     // Colour-space tag the platform compositor applies to this window's
@@ -2612,6 +2664,17 @@ pub struct GpuRenderer {
     /// `format_plan::hdr_present_plan` at present. With this false everything
     /// M3-phase-B is inert by the SdrInvariance proof (HdrPresentGate).
     hdr_glow: bool,
+    /// H1 (Windows Mica/Acrylic): config `background_material != none` — the
+    /// frontend's live material knob, mirrored here so the renderer can carry
+    /// per-pixel alpha in the PADDING/CHROME-BLEED regions of the offscreen frame
+    /// and present PreMultiplied. Effective ONLY together with
+    /// `ctx.visual_swapchain` (see [`Self::backdrop_margins_active`]): on the
+    /// default HWND swapchain the composite is Opaque and this flag is inert, so
+    /// the shipped `background_material = "none"` path stays byte-identical.
+    /// Live-updatable BOTH ways on a visual instance (a reload to `none` must
+    /// stop the margins blending over NOTHING — with no DWM backdrop behind the
+    /// visual, translucent pixels would show the windows BEHIND this one).
+    backdrop_margins: bool,
     /// EDR aurora pass resources (pipeline + swapchain-space uniform), built
     /// lazily on the first HDR present (`ensure_hdr_glow_pipeline`) so the
     /// default (hdr off) path allocates nothing. The pipeline targets
@@ -3042,7 +3105,14 @@ struct PresentDest<'a> {
     w: u32,
     h: u32,
     format: wgpu::TextureFormat,
+    /// The destination composites NON-OPAQUE (M5 PostMultiplied on macOS glass, or
+    /// H1 PreMultiplied on the Windows DirectComposition visual swapchain) — the
+    /// blit then emits real alpha instead of forcing 1.0. Always `false` off-glass.
     translucent: bool,
+    /// H1: the destination expects PREMULTIPLIED bytes (the DComp visual
+    /// swapchain; DXGI rejects straight alpha for composition) — the blit
+    /// multiplies rgb by the emitted alpha. Only meaningful with `translucent`.
+    premult: bool,
 }
 
 /// The half-resolution bloom render target + its composite bind group, resident on
@@ -4565,6 +4635,7 @@ impl GpuRenderer {
             bloom_uniform_buf,
             enable_bloom: true,
             hdr_glow: false,
+            backdrop_margins: false,
             hdr_glow_pipeline: None,
             hdr_glow_uniform_buf: None,
             hdr_glow_bg: None,
@@ -5135,6 +5206,33 @@ impl GpuRenderer {
         Ok(())
     }
 
+    /// H1 fail-soft: build a SECOND renderer on a FRESH [`GpuContext`] — new
+    /// instance / adapter / device, the presentation-system latch re-read — plus
+    /// a rebuild of this renderer's sealed font generation at `px`. `self` is
+    /// left untouched, so a failure here costs the caller nothing: the current
+    /// renderer stays live for the next arm (the CPU softbuffer downgrade).
+    ///
+    /// The frontend calls this after [`Self::create_window_surface`] failed on
+    /// a DirectComposition visual instance and the visual latch was withdrawn.
+    /// The presentation system is an INSTANCE-level property, so "fall back to
+    /// the opaque swapchain" means a new instance, and every device-bound
+    /// resource (pipelines, buffers, atlases) with it — which is exactly
+    /// [`Self::from_parts`]. Font discovery does NOT re-run: the face is rebuilt
+    /// from the admitted, sealed sources (`Renderer::rebuild_from_admitted`),
+    /// the same contract the GPU-loss CPU downgrade uses, so no font I/O lands
+    /// on the event-loop thread. Every renderer knob the frontend owns (pad /
+    /// head, bloom, shimmer, backdrop margins, HDR, text shaping, ...) starts
+    /// at its construction default on the returned renderer — exactly as after
+    /// [`Self::new_with_family`] — and the caller re-pins them through the same
+    /// seams it uses after the deferred join. NATIVE ONLY (synchronous
+    /// [`GpuContext::new`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn rebuild_on_fresh_context(&self, px: f32) -> Result<Self, String> {
+        let cpu = self.cpu.rebuild_from_admitted(px, self.theme)?;
+        let ctx = GpuContext::new()?;
+        Self::from_parts(ctx, cpu, self.font_family.clone(), self.theme)
+    }
+
     /// The wrapped CPU face's real BOLD sibling of the primary family for the
     /// GUI chrome. See [`Renderer::chrome_bold_face`].
     #[must_use]
@@ -5307,6 +5405,22 @@ impl GpuRenderer {
     /// transition twice.
     pub fn set_pad_top(&mut self, pad_top: usize) {
         self.cpu.set_pad_top(pad_top);
+    }
+
+    /// Declare the top grid rows that are host chrome and the tone their surface
+    /// extends into the window padding, delegated to the inner CPU renderer — the
+    /// single source of the value, matching the `pad`/`head` delegation.
+    /// `encode_frame` reads `self.cpu.chrome_bleed()` each frame, so this takes
+    /// effect on the next present. See [`aterm_render::ChromeBleed`].
+    pub fn set_chrome_bleed(&mut self, bleed: Option<aterm_render::ChromeBleed>) {
+        self.cpu.set_chrome_bleed(bleed);
+    }
+
+    /// The chrome bleed in force, read from the inner CPU renderer — the value the
+    /// next `encode_frame` will build its gutter quads from.
+    #[must_use]
+    pub fn chrome_bleed(&self) -> Option<aterm_render::ChromeBleed> {
+        self.cpu.chrome_bleed()
     }
 
     /// Padded pixel size of a `rows`×`cols` grid (`cols·cell_w + 2·pad`, etc.) —
@@ -6105,7 +6219,49 @@ impl GpuRenderer {
     /// (grid clamped at reference white). See `format_plan::hdr_present_plan`
     /// for the proven gating.
     pub fn set_hdr_glow(&mut self, on: bool) {
+        // H1 (Windows Mica/Acrylic): the EDR (f16 + scRGB) swapchain and the
+        // DirectComposition visual swapchain are MUTUALLY EXCLUSIVE, decided at
+        // launch: the backdrop engages only when `hdr_glow` is off (the frontend
+        // gate), and once the instance IS visual, a live `hdr_glow` reload cannot
+        // engage — the scRGB tag + premultiplied-over-Mica blend semantics of a
+        // linear-light composition visual are unverified, and the instance's
+        // presentation system cannot be rebuilt without tearing down every
+        // window. Forcing the flag off HERE (the single choke point every config
+        // path funnels through) keeps `format_plan`'s proven gates authoritative
+        // — with `hdr_glow == false` every f16/scRGB arm is inert by proof.
+        if on && self.ctx.visual_swapchain {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "aterm-gpu: hdr_glow is unavailable while background_material is active \
+                     (the DirectComposition backdrop swapchain and the scRGB EDR swapchain \
+                     are mutually exclusive); keeping the backdrop — restart with \
+                     background_material = \"none\" for HDR"
+                );
+            });
+            self.hdr_glow = false;
+            return;
+        }
         self.hdr_glow = on;
+    }
+
+    /// H1 (Windows Mica/Acrylic): mirror the frontend's `background_material`
+    /// knob (`!= none`). See the field doc for the effectiveness rule; a no-op
+    /// unless the context was built on the visual swapchain path.
+    pub fn set_backdrop_margins(&mut self, on: bool) {
+        self.backdrop_margins = on;
+    }
+
+    /// Whether the presented frame carries BACKDROP MARGINS this session: the
+    /// material knob is on AND the instance really is a DirectComposition visual
+    /// swapchain (`ctx.visual_swapchain`). Both conditions are load-bearing —
+    /// the knob without the visual instance is DWM-chrome-only (caption Mica,
+    /// opaque client, today's HWND behaviour), and the visual instance without
+    /// the knob must present fully opaque (no DWM backdrop is installed behind
+    /// it, so alpha would expose the windows behind).
+    #[inline]
+    fn backdrop_margins_active(&self) -> bool {
+        self.backdrop_margins && self.ctx.visual_swapchain
     }
 
     /// Whether the EDR aurora is opted in (config `hdr_glow`).
@@ -6595,6 +6751,7 @@ impl GpuRenderer {
                 let format = wgpu::TextureFormat::Rgba16Float;
                 self.ensure_blit_pipeline(format);
                 let post_mult = Self::caps_support_post_multiplied(&caps);
+                let pre_mult = Self::caps_support_pre_multiplied(&caps);
                 let (usage, copyable) = Self::surface_usage(&caps);
                 let config = wgpu::SurfaceConfiguration {
                     usage,
@@ -6605,7 +6762,10 @@ impl GpuRenderer {
                     present_mode: Self::pick_present_mode(&caps),
                     // M5: translucent glass composites even on the EDR swapchain (the
                     // grid stays reference-white SDR; only the aurora exceeds 1.0).
-                    alpha_mode: Self::present_alpha_mode(self.cpu.background_opacity(), post_mult),
+                    // (H1 note: unreachable on a visual instance — `set_hdr_glow`
+                    // forces the opt-in off there — but routed through the one
+                    // policy anyway so the seams cannot diverge.)
+                    alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
                     view_formats: vec![],
                     // Same latency as the SDR paths below (default 1, honoring the
                     // ATERM_GPU_FRAME_LATENCY override): the 2→1 latency win applies
@@ -6614,7 +6774,7 @@ impl GpuRenderer {
                     // refresh of keypress-to-glass latency for it.
                     desired_maximum_frame_latency: Self::desired_frame_latency(),
                 };
-                surface.configure(&self.ctx.device, &config);
+                self.configure_first_attach(&surface, &config)?;
                 // On DX12 an f16 swapchain is only CORRECT if we can tag it scRGB
                 // (extended-linear) — which succeeds iff Windows HDR is ON for this
                 // output. If not (SDR mode, or a non-DX12 backend) fall through to the
@@ -6636,6 +6796,7 @@ impl GpuRenderer {
                         supports_f16: true,
                         last_hdr_probe: Some(web_time::Instant::now()),
                         post_mult,
+                        pre_mult,
                         copyable,
                     });
                 }
@@ -6683,6 +6844,7 @@ impl GpuRenderer {
         // M5: does this surface offer the non-opaque composite? Captured on the
         // GpuSurface so the per-frame alpha-mode reconcile never re-queries.
         let post_mult = Self::caps_support_post_multiplied(&caps);
+        let pre_mult = Self::caps_support_pre_multiplied(&caps);
         let (usage, copyable) = Self::surface_usage(&caps);
         let config = wgpu::SurfaceConfiguration {
             usage,
@@ -6700,12 +6862,13 @@ impl GpuRenderer {
             present_mode: Self::pick_present_mode(&caps),
             // M5 true vibrancy: PostMultiplied when the window is translucent (blend
             // the STRAIGHT-alpha frame over its NSVisualEffectView), else Opaque —
-            // the byte-identical solid default.
-            alpha_mode: Self::present_alpha_mode(self.cpu.background_opacity(), post_mult),
+            // the byte-identical solid default. H1: PreMultiplied on a visual
+            // instance with the backdrop margins live (the one policy fn).
+            alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
             view_formats: vec![],
             desired_maximum_frame_latency: Self::desired_frame_latency(),
         };
-        surface.configure(&self.ctx.device, &config);
+        self.configure_first_attach(&surface, &config)?;
         if std::env::var_os("ATERM_VERBOSE").is_some() {
             eprintln!("aterm-gpu: present mode = {:?}", config.present_mode);
         }
@@ -6716,8 +6879,74 @@ impl GpuRenderer {
             supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
             last_hdr_probe: Some(web_time::Instant::now()),
             post_mult,
+            pre_mult,
             copyable,
         })
+    }
+
+    /// H1 fail-soft: the FIRST `configure` of a freshly created window surface
+    /// (both attach arms of [`Self::create_window_surface`] route through here).
+    ///
+    /// On a DirectComposition visual instance this call is the one that really
+    /// builds the composition stack: wgpu-hal's DX12 `create_surface` only
+    /// records the HWND, and its `Surface::configure` lazily runs
+    /// `DCompositionCreateDevice2` / `CreateTargetForHwnd` / `CreateVisual` /
+    /// `CreateSwapChainForComposition` / `SetContent` / `Commit`. wgpu's
+    /// `Surface::configure` returns no `Result`: a hal failure becomes
+    /// `ConfigureSurfaceError::InvalidSurface`, delivered to the device's error
+    /// sink, and with no uncaptured-error handler installed (none is, by design
+    /// — see [`Self::clamp_fb_dim`]) the default handler PANICS. "DComp
+    /// unavailable" would therefore be a process abort at the first window
+    /// attach, unseen by the caller's `Err` ⇒ CPU arm. So on a visual instance
+    /// the configure runs inside error scopes for the three classes the sink
+    /// routes (validation — the `InvalidSurface` class — plus internal and
+    /// out-of-memory, so a device-level failure during the configure is caught
+    /// too) and the captured error comes back as `Err`, which
+    /// `create_window_surface` propagates; the frontend then withdraws the
+    /// visual latch and rebuilds on the opaque HWND swapchain
+    /// ([`Self::rebuild_on_fresh_context`]).
+    ///
+    /// On every other instance (the shipped default) NO scope is pushed: the
+    /// configure is the bare call it always was, so that path stays
+    /// byte-identical — including its pre-existing abort-on-validation-error
+    /// behaviour, which `clamp_fb_dim` guards against upstream.
+    fn configure_first_attach(
+        &self,
+        surface: &wgpu::Surface<'static>,
+        config: &wgpu::SurfaceConfiguration,
+    ) -> Result<(), String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.ctx.visual_swapchain {
+            let device = &self.ctx.device;
+            // Error scopes are a per-thread stack on the device's sink and an
+            // error goes to the INNERMOST scope whose filter matches — so one
+            // scope per class, popped in reverse push order (wgpu asserts the
+            // stack discipline). Push and pop stay on this thread.
+            let oom = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            let internal = device.push_error_scope(wgpu::ErrorFilter::Internal);
+            let validation = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            surface.configure(device, config);
+            // The wgpu-core pop future is already resolved; `block_on` just
+            // unwraps it (no GPU round trip, no event-loop dependency). All
+            // three pops ALWAYS run — the stack must be left empty.
+            let validation = pollster::block_on(validation.pop());
+            let internal = pollster::block_on(internal.pop());
+            let oom = pollster::block_on(oom.pop());
+            return match validation.or(internal).or(oom) {
+                None => Ok(()),
+                Some(err) => Err(format!(
+                    "DirectComposition visual swapchain configure failed: {}",
+                    // wgpu's Display is a multi-line cause tree; flatten it so
+                    // the frontend's one-line diagnostic stays one line.
+                    err.to_string()
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )),
+            };
+        }
+        surface.configure(&self.ctx.device, config);
+        Ok(())
     }
 
     /// Configure an ALREADY-CREATED `wgpu::Surface` for presentation at the given
@@ -6737,6 +6966,7 @@ impl GpuRenderer {
         let caps = surface.get_capabilities(&self.ctx.adapter);
         let format = Self::pick_surface_format(&caps)?;
         let post_mult = Self::caps_support_post_multiplied(&caps);
+        let pre_mult = Self::caps_support_pre_multiplied(&caps);
         let (usage, copyable) = Self::surface_usage(&caps);
         let config = wgpu::SurfaceConfiguration {
             usage,
@@ -6750,7 +6980,9 @@ impl GpuRenderer {
             // M5: opacity-aware composite (Opaque at the 1.0 default). The canvas host
             // reaches translucency through its own alpha path, so on the web this
             // stays the solid default unless the surface offers PostMultiplied.
-            alpha_mode: Self::present_alpha_mode(self.cpu.background_opacity(), post_mult),
+            // (`surface_alpha_mode` degenerates to exactly that here: the wasm
+            // context is never a DirectComposition visual.)
+            alpha_mode: self.surface_alpha_mode(post_mult, pre_mult),
             view_formats: vec![],
             desired_maximum_frame_latency: Self::desired_frame_latency(),
         };
@@ -6764,6 +6996,7 @@ impl GpuRenderer {
             supports_f16: false,
             last_hdr_probe: None,
             post_mult,
+            pre_mult,
             copyable,
         })
     }
@@ -6924,6 +7157,20 @@ impl GpuRenderer {
             .contains(&wgpu::CompositeAlphaMode::PostMultiplied)
     }
 
+    /// H1 (Windows Mica/Acrylic): whether this surface offers
+    /// `CompositeAlphaMode::PreMultiplied`. The DirectComposition VISUAL
+    /// swapchain path presents PREMULTIPLIED, never PostMultiplied: wgpu-hal maps
+    /// PostMultiplied to `DXGI_ALPHA_MODE_STRAIGHT`, which
+    /// `CreateSwapChainForComposition` rejects (composition swapchains accept
+    /// only PREMULTIPLIED/IGNORE/UNSPECIFIED), so asking for it would fail the
+    /// configure and kill the present loop. The blit shader multiplies rgb by
+    /// the emitted alpha when the premult flag is set, so the presented bytes
+    /// match the mode.
+    fn caps_support_pre_multiplied(caps: &wgpu::SurfaceCapabilities) -> bool {
+        caps.alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+    }
+
     /// M5: the swapchain composite-alpha mode for a given default-background
     /// `opacity`. `PostMultiplied` (blend the STRAIGHT-alpha frame over the
     /// window's `NSVisualEffectView`) when the window is translucent AND the
@@ -6934,6 +7181,55 @@ impl GpuRenderer {
             wgpu::CompositeAlphaMode::PostMultiplied
         } else {
             wgpu::CompositeAlphaMode::Opaque
+        }
+    }
+
+    /// The swapchain composite-alpha mode for THIS renderer + surface — the one
+    /// policy every attach/reconcile site funnels through.
+    ///
+    /// * DirectComposition visual instance (H1, Windows): `PreMultiplied` iff the
+    ///   backdrop margins are live and the surface offers it (see
+    ///   [`Self::caps_support_pre_multiplied`] for why never PostMultiplied
+    ///   there), else `Opaque` — a visual instance with `background_material`
+    ///   reloaded to `none` MUST go opaque, or its alpha would expose the windows
+    ///   behind (no DWM backdrop is installed to catch it).
+    /// * Everywhere else: the M5 rule, [`Self::present_alpha_mode`] — opacity- and
+    ///   caps-aware PostMultiplied, byte-identical to before H1.
+    fn surface_alpha_mode(&self, post_mult: bool, pre_mult: bool) -> wgpu::CompositeAlphaMode {
+        if self.ctx.visual_swapchain {
+            return if self.backdrop_margins_active() && pre_mult {
+                wgpu::CompositeAlphaMode::PreMultiplied
+            } else {
+                wgpu::CompositeAlphaMode::Opaque
+            };
+        }
+        Self::present_alpha_mode(self.cpu.background_opacity(), post_mult)
+    }
+
+    /// H1: the alpha the PADDING GUTTERS / chrome-bleed fills / letterbox bands
+    /// carry when the backdrop margins are live: mostly-material with a clear
+    /// tint of the colour they would otherwise be. 0.45 was chosen over
+    /// 0.0 (pure material — the gutters then read as a hole cut out of the
+    /// window, and light Mica against a dark grid is a harsh fringe) and over
+    /// ~0.8 (the tint all but hides the material, making the knob look broken).
+    /// The GRID CELLS never carry this — the opaque grid body is the ratified
+    /// design (NATIVE_WINDOWS_DESIGN.md §4) — so the look is the WT-style
+    /// acrylic margin: material gutters, solid text surface.
+    const BACKDROP_MARGIN_ALPHA: f32 = 0.45;
+
+    /// The margin/band alpha for the CURRENT knobs: the H1 margin constant,
+    /// never more opaque than the M5 glass alpha (`bg_quad_alpha`) so a combined
+    /// `background_material` + `background_opacity < 1` config reads as one
+    /// coherent sheet rather than margins MORE solid than the glass they frame.
+    /// `1.0` (fully opaque) whenever the backdrop margins are not live.
+    fn backdrop_margin_alpha(&self) -> f32 {
+        let glass = f32::from(aterm_render::vibrancy::bg_quad_alpha(
+            self.cpu.background_opacity(),
+        )) / 255.0;
+        if self.backdrop_margins_active() {
+            glass.min(Self::BACKDROP_MARGIN_ALPHA)
+        } else {
+            glass
         }
     }
 
@@ -7283,7 +7579,7 @@ impl GpuRenderer {
         // recording armed before the window's very first present configures the
         // copyable swapchain on that same present, and `video_finish` drops back to
         // the compressed default on the next one.
-        let want_alpha = Self::present_alpha_mode(self.cpu.background_opacity(), surf.post_mult);
+        let want_alpha = self.surface_alpha_mode(surf.post_mult, surf.pre_mult);
         // BOTH taps, not just the recording. `presented_snapshot` is deliberately
         // independent of `win.video` (a still taken mid-recording must not perturb
         // the ring), and that independence used to extend to this reconcile — so a
@@ -7350,7 +7646,12 @@ impl GpuRenderer {
                 w: surf.config.width,
                 h: surf.config.height,
                 format: surf.config.format,
-                translucent: want_alpha == wgpu::CompositeAlphaMode::PostMultiplied,
+                translucent: matches!(
+                    want_alpha,
+                    wgpu::CompositeAlphaMode::PostMultiplied
+                        | wgpu::CompositeAlphaMode::PreMultiplied
+                ),
+                premult: want_alpha == wgpu::CompositeAlphaMode::PreMultiplied,
             },
         );
         win.last_present_work_ns =
@@ -7716,10 +8017,15 @@ impl GpuRenderer {
         // arm, always opaque, never emits it). The band alpha is `bg_quad_alpha`
         // normalized, matching the bg quads.
         if dest.translucent {
-            let band_a = f32::from(aterm_render::vibrancy::bg_quad_alpha(
-                self.cpu.background_opacity(),
-            )) / 255.0;
-            want = want.with_translucency(band_a);
+            // The remainder-band alpha: `bg_quad_alpha` (matching the bg quads)
+            // on M5 glass, capped to the H1 margin alpha when the backdrop
+            // margins are live — the letterbox bands read as the same material
+            // gutter as the in-frame padding (`backdrop_margin_alpha` folds both).
+            want = want.with_translucency(self.backdrop_margin_alpha());
+            // H1: a DComp visual destination composites premultiplied.
+            if dest.premult {
+                want = want.with_premultiplied_output();
+            }
         }
         let crown_scissor = visible_source_scissor(&want, dest.w, dest.h);
         // Renderer-level memo (buffer-keyed, not per-window): the blit uniform is
@@ -8073,6 +8379,7 @@ impl GpuRenderer {
                 h,
                 format: VIRTUAL_PRESENT_FORMAT,
                 translucent: false,
+                premult: false,
             },
         );
         win.last_present_work_ns =
@@ -9350,6 +9657,7 @@ impl GpuRenderer {
                 h: h.max(1),
                 format: VIRTUAL_PRESENT_FORMAT,
                 translucent: false,
+                premult: false,
             },
         );
     }
@@ -9620,7 +9928,28 @@ impl GpuRenderer {
         input: &RenderInput,
         boost_pass: bool,
     ) -> (Vec<f32>, u32, u32) {
-        let (w, h) = self.encode_present_frame(win, input);
+        self.present_hdr_sized_for_test(win, input, boost_pass, 0, 0)
+    }
+
+    /// TEST HELPER (W1 bands on the EDR present):
+    /// [`present_hdr_for_test`](Self::present_hdr_for_test) with a destination
+    /// `extra_w`×`extra_h` px LARGER than the grid-fit frame — the raw-window-sized
+    /// f16 swapchain stand-in — so the REAL `fs_blit` band arm (`hdr` +
+    /// `sdr_white_scale`) is exercised alongside the grid arm. The frame lands at
+    /// the centred [`aterm_render::band_offset`]; the remainder bands are painted
+    /// the renderer's theme background, exactly as `blit_to_sized_for_test` does
+    /// for the SDR present. `(0, 0)` is the exact-fit present.
+    #[doc(hidden)]
+    pub fn present_hdr_sized_for_test(
+        &mut self,
+        win: &mut WindowGpu,
+        input: &RenderInput,
+        boost_pass: bool,
+        extra_w: u32,
+        extra_h: u32,
+    ) -> (Vec<f32>, u32, u32) {
+        let (fw, fh) = self.encode_present_frame(win, input);
+        let (w, h) = (fw + extra_w, fh + extra_h);
         let format = wgpu::TextureFormat::Rgba16Float;
 
         // The REAL present gate, with the REAL swapchain format this helper
@@ -9670,8 +9999,10 @@ impl GpuRenderer {
         });
         let dst_view = dst.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // The REAL blit uniform, exact-fit, with the REAL plan-driven hdr flag.
-        let mut want = BlitUniform::bell(false).with_bands(w, h, w, h, self.theme.bg);
+        // The REAL blit uniform (frame placed at the centred band offset of the
+        // destination; exact-fit when `extra == 0`), with the REAL plan-driven
+        // hdr flag + reference-white scale.
+        let mut want = BlitUniform::bell(false).with_bands(fw, fh, w, h, self.theme.bg);
         want.encode_srgb = if self.ctx.srgb_offscreen { 0.0 } else { 1.0 };
         want.hdr = if plan.blit_linear_encode { 1.0 } else { 0.0 };
         want.sdr_white_scale = if plan.blit_linear_encode {
@@ -11166,6 +11497,12 @@ impl GpuRenderer {
         // last), and each cut-out source glyph contributes a SLICE clipped to
         // the cursor rect (bg-coloured, drawn after the fill) — so the
         // complement of the rect is byte-identical to the no-cursor frame.
+        //
+        // H1 (Windows Mica/Acrylic): the backdrop-margin policy reads, hoisted
+        // ABOVE the `self.inst` stream borrows below (they are `&self` method
+        // calls and would otherwise conflict with the live `&mut self.inst.bg`).
+        let backdrop_margins_active = self.backdrop_margins_active();
+        let backdrop_margin_alpha_byte = (self.backdrop_margin_alpha() * 255.0).round() as u8;
         let bg_inst = &mut self.inst.bg;
         let glyph_inst = &mut self.inst.glyph;
         // EMBERFORGE CONTRAST-HALO stream (disjoint `self.inst` field): the dark
@@ -11232,6 +11569,31 @@ impl GpuRenderer {
             c[3] = bg_alpha;
             c
         };
+        // H1 (Windows Mica/Acrylic): whether THIS frame paints its PADDING
+        // regions (gutters, top/bottom strips, chrome bleed) at the backdrop
+        // margin alpha instead of opaque. Requires the DComp visual swapchain +
+        // live material knob (`backdrop_margins_active`), and NOT wallpaper —
+        // the wallpaper stream draws the padding first and a translucent tint
+        // REPLACE'd over it would punch the image out of its own margins (the
+        // wallpaper IS the backdrop there; the material stays honestly hidden).
+        //
+        // Deliberately NOT the frame clear: the clear also owns every EMPTY
+        // (sparse-tail) CELL, and the ratified design keeps the grid body
+        // opaque — so the margins are explicit REPLACE quads over padding-only
+        // geometry, and the clear stays byte-identical.
+        let backdrop_margins_on = backdrop_margins_active && !wallpaper_on;
+        // The margin fill: frame default bg at the H1 margin alpha (see
+        // `BACKDROP_MARGIN_ALPHA` for the tint rationale).
+        let margin_bg = {
+            let mut c = rgb4_u32(frame_bg);
+            c[3] = backdrop_margin_alpha_byte;
+            c
+        };
+        // The top/bottom strip re-establish colour: the margin fill when the
+        // backdrop margins are live (the strips are pure padding — no cells),
+        // else the historical theme_bg (which already carries the M5 glass
+        // alpha where that applies).
+        let strip_bg = if backdrop_margins_on { margin_bg } else { theme_bg };
         // The selection band colour for THIS frame. Terminal-owned OSC 17/21
         // state wins over the static renderer theme; with none in force the CPU
         // face stays the single source of truth (`effective_selection_bg`), so
@@ -11307,9 +11669,12 @@ impl GpuRenderer {
                         .wallpaper
                         .push(wallpaper_quad(0.0, 0.0, w as f32, grid_top as f32));
                 } else {
+                    // H1: `strip_bg` == `theme_bg` except when the backdrop
+                    // margins are live — the strip is pure padding, so it takes
+                    // the margin alpha there (FULL parity: the margin quads).
                     bg_inst.push(BgInstance {
                         rect: [0, 0, w as u16, grid_top as u16],
-                        color: theme_bg,
+                        color: strip_bg,
                     });
                 }
             }
@@ -11325,9 +11690,44 @@ impl GpuRenderer {
                 } else {
                     bg_inst.push(BgInstance {
                         rect: [0, grid_bot as u16, w as u16, (h - grid_bot) as u16],
-                        color: theme_bg,
+                        color: strip_bg,
                     });
                 }
+            }
+        }
+        // H1 (Windows Mica/Acrylic), FULL scope: paint the four PADDING margins —
+        // the `[0, grid_top)` strip, the bottom pad strip, and the left/right
+        // gutters down the grid body — at the margin alpha, over the opaque
+        // clear. REPLACE quads in the bg stream, pushed BEFORE the per-row work
+        // so the chrome bleed (which re-fills the gutters beside chrome rows at
+        // the band colour) and every cell quad land on top in raster order.
+        // The DIRTY twin lives in the row loop (per-row gutter quads) + the
+        // `strip_bg` re-establish above, so both scopes agree pixel for pixel.
+        if backdrop_margins_on && matches!(scope, RepaintScope::Full) {
+            let grid_bot = ((grid_top + rows * ch) as u32).min(h);
+            if grid_top > 0 {
+                bg_inst.push(BgInstance {
+                    rect: [0, 0, w as u16, sat_pos_u16(grid_top)],
+                    color: margin_bg,
+                });
+            }
+            if grid_bot < h {
+                bg_inst.push(BgInstance {
+                    rect: [0, grid_bot as u16, w as u16, (h - grid_bot) as u16],
+                    color: margin_bg,
+                });
+            }
+            if pad > 0 {
+                let gutter_h = grid_bot.saturating_sub(grid_top as u32) as u16;
+                let right = sat_pos_u16((w as usize).saturating_sub(pad));
+                bg_inst.push(BgInstance {
+                    rect: [0, sat_pos_u16(grid_top), sat_pos_u16(pad), gutter_h],
+                    color: margin_bg,
+                });
+                bg_inst.push(BgInstance {
+                    rect: [right, sat_pos_u16(grid_top), sat_pos_u16(pad), gutter_h],
+                    color: margin_bg,
+                });
             }
         }
         for (r, cells) in rendered.iter().enumerate().take(vis_rows) {
@@ -11420,6 +11820,84 @@ impl GpuRenderer {
                     bg_inst.push(BgInstance {
                         rect: [0, y0u, w as u16, ch as u16],
                         color: theme_bg,
+                    });
+                    // H1: re-establish this dirty row's PAD GUTTERS at the
+                    // margin alpha — the full-width theme-bg quad above just
+                    // repainted them opaque, and only the cells' `[pad, w-pad)`
+                    // span gets overwritten below. The DIRTY twin of the FULL
+                    // path's left/right margin quads; a chrome row's bleed
+                    // quads land after these and win (raster order), exactly
+                    // as they win over the full-width reset.
+                    if backdrop_margins_on && pad > 0 {
+                        let right = sat_pos_u16((w as usize).saturating_sub(pad));
+                        bg_inst.push(BgInstance {
+                            rect: [0, y0u, sat_pos_u16(pad), ch as u16],
+                            color: margin_bg,
+                        });
+                        bg_inst.push(BgInstance {
+                            rect: [right, y0u, sat_pos_u16(pad), ch as u16],
+                            color: margin_bg,
+                        });
+                    }
+                }
+            }
+            // CHROME BLEED — the GPU twin of the CPU `fill_chrome_bleed`, in the same
+            // slot (after the row's background is established, before its cells) and
+            // reading the same `Renderer::chrome_bleed`, so the two backends agree
+            // pixel for pixel. A chrome row's SURFACE owns the padding gutters its
+            // cells cannot reach; row 0 also owns the `[0, grid_top)` strip above the
+            // grid. These quads land after the scissored path's own theme-bg resets
+            // just above (bg is REPLACE and instance order is rasterization order, the
+            // same guarantee those resets already rely on) and never overlap the
+            // per-cell quads below, which start at `pad`. No-op with no bleed declared.
+            if let Some(bleed) = self.cpu.chrome_bleed().filter(|b| r < b.rows) {
+                // H1: with the backdrop margins live, the bleed's gutter/strip
+                // fills carry the margin alpha — the strip band's flanks and the
+                // sliver above it become real material, tinted the band colour
+                // (the CPU twin stays opaque: softbuffer has no alpha channel to
+                // present, so mirroring the byte there would be a lie). The SEAM
+                // hairline below stays opaque — it is ink, not surface.
+                let color = {
+                    let mut c = rgb4_u32(bleed.color);
+                    if backdrop_margins_on {
+                        c[3] = margin_bg[3];
+                    }
+                    c
+                };
+                let right = sat_pos_u16((w as usize).saturating_sub(pad));
+                bg_inst.push(BgInstance {
+                    rect: [0, y0u, sat_pos_u16(pad), ch as u16],
+                    color,
+                });
+                bg_inst.push(BgInstance {
+                    rect: [right, y0u, sat_pos_u16(pad), ch as u16],
+                    color,
+                });
+                if r == 0 && grid_top > 0 {
+                    bg_inst.push(BgInstance {
+                        rect: [0, 0, w as u16, grid_top as u16],
+                        color,
+                    });
+                }
+                // The seam's gutter segments, at exactly the underline geometry the
+                // cells of this row draw theirs at, so the rule is continuous to both
+                // window edges. Emitted in the BACKGROUND stream rather than the
+                // decoration stream: nothing else ever paints in the padding, and a
+                // bg-stream rect is the one primitive both backends place identically.
+                if let Some(seam) = bleed.seam.filter(|_| r + 1 == bleed.rows) {
+                    let deco = self.cpu.deco_metrics();
+                    // Both metrics are `usize` (underline_t documented `>= 1`) —
+                    // the only live guards are the band clamps (CPU twin agrees).
+                    let t = deco.underline_t.max(1).min(ch);
+                    let uy = sat_pos_u16(grid_top + r * ch + deco.underline_y.min(ch - t));
+                    let seam = rgb4_u32(seam);
+                    bg_inst.push(BgInstance {
+                        rect: [0, uy, sat_pos_u16(pad), t as u16],
+                        color: seam,
+                    });
+                    bg_inst.push(BgInstance {
+                        rect: [right, uy, sat_pos_u16(pad), t as u16],
+                        color: seam,
                     });
                 }
             }

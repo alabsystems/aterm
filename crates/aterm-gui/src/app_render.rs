@@ -1712,6 +1712,269 @@ mod trail_present_pacing_tests {
         assert_eq!(anchor, Some(frame), "next sample phases from this frame");
     }
 
+    /// THE CHROME-DECORATION LANE (Robi, the typed dog, the reduced-motion sing
+    /// still, the companion's wince follow-up). Every one of them used to buy its
+    /// next frame with `request_redraw()` from inside the redraw handler, which
+    /// winit's Windows backend turns into an immediate re-invalidation of the
+    /// HWND: the armed `WaitUntil` is never reached and the loop free-runs
+    /// (measured at 52k wakes/sec on an idle focused window with Robi walking).
+    ///
+    /// The two properties that make the replacement incapable of either spinning
+    /// or stalling, pinned here because `about_to_wait` needs an event loop and
+    /// this decision must not have to wait for one to be tested:
+    ///
+    /// * A LEVEL, not a one-shot request. It survives parks — which is the whole
+    ///   correction over the first cut of this fix (see
+    ///   `an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick`) —
+    ///   but it EXPIRES, so a decoration that stopped moving stops paying a
+    ///   bounded handful of frames later. Idle still reaches zero.
+    /// * PHASE-LOCKED, never completion-relative. The re-arm continues the
+    ///   deadline train from the slot that FIRED, so an animation paced this way
+    ///   holds the panel cadence instead of sliding by one frame cost per period.
+    #[test]
+    fn a_decoration_latch_is_a_bounded_level_on_the_shared_phase_locked_lane() {
+        let mut app = App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&WindowId(0))
+            .expect("the headless fixture owns window 0");
+        assert!(
+            ws.front_terminal().is_some(),
+            "the fixture must front a terminal, or the arm gate below is vacuous"
+        );
+        let t0 = Instant::now();
+        assert!(
+            !ws.deco_anim_frame_active(t0),
+            "a resting decoration holds the lane open for nothing: the loop parks"
+        );
+
+        // One animating frame. The hold is `DECO_ANIM_LEVEL_FRAMES` panel
+        // refreshes, long enough to cover arm -> fire -> next redraw.
+        let grace = crate::effect_tick_interval(ws.frame_interval) * crate::DECO_ANIM_LEVEL_FRAMES;
+        ws.note_deco_animating(t0);
+        assert!(ws.deco_anim_frame_active(t0));
+        assert!(
+            ws.deco_anim_frame_active(t0 + grace - Duration::from_millis(1)),
+            "the level must outlive one lane period, or a park that redraws \
+             nothing drops the tick the decoration armed"
+        );
+        assert!(
+            !ws.deco_anim_frame_active(t0 + grace),
+            "and it must expire, or a decoration that stopped moving would keep \
+             the loop awake forever — the idle-to-zero law"
+        );
+
+        // Monotonic: a stale/earlier sample never shortens a hold a livelier
+        // decoration already extended (two of them can draw on one frame).
+        ws.note_deco_animating(t0 + grace);
+        ws.note_deco_animating(t0);
+        assert!(
+            ws.deco_anim_frame_active(t0 + grace + grace - Duration::from_millis(1)),
+            "the longer hold wins regardless of the order the arms run in"
+        );
+
+        // The wake it buys: the SAME deadline every other effect takes, phase
+        // locked to the fired slot rather than to when this frame finished.
+        // Negative control on the second assert — `presented + interval` (tick 6)
+        // is exactly the completion-relative slide this lane exists to reject.
+        let interval = Duration::from_millis(4);
+        let base = Instant::now();
+        let fired = base + interval;
+        let presented = fired + Duration::from_millis(2);
+        assert_eq!(
+            phase_locked_effect_deadline(presented, interval, Some(fired), None, true),
+            base + Duration::from_millis(8),
+        );
+        assert_ne!(
+            phase_locked_effect_deadline(presented, interval, Some(fired), None, true),
+            presented + interval,
+        );
+    }
+
+    /// THE STALL THIS PATCH WAS REJECTED FOR THE FIRST TIME, driven through the
+    /// real arm/park decision rather than through its pure helpers.
+    ///
+    /// The first cut made the decoration input EDGE-triggered: `about_to_wait`
+    /// consumed a `deco_anim_wake` flag on the park that armed `next_trail_tick`.
+    /// But the else-arm of that same lane is LEVEL-triggered — it calls
+    /// `park_terminal_effect_scheduler`, which drops `next_trail_tick`. So any
+    /// event-loop turn between the arm and the fire that did NOT redraw this
+    /// window (a `WM_MOUSEMOVE`/`WM_SETCURSOR` `WaitCancelled`, a background
+    /// pane's `Wake::Output`, another window's `ResumeTimeReached`) found the
+    /// flag already spent, fell through to the park, and deleted the pending
+    /// decoration tick. `new_events` only services deadlines under
+    /// `StartCause::ResumeTimeReached`, so nothing re-armed it.
+    ///
+    /// Robi has no safety net underneath: `terminal_effect_frame_active`'s
+    /// cursor-fx term is focus-gated and `WordDecorations::robi` never writes
+    /// `active_until`, so on an unfocused window — or a focused one with a steady
+    /// cursor (`next_blink == None`) — nothing revived him and he froze
+    /// mid-stride, permanently. Two windows made it near-certain: the focused
+    /// one's blink wakes the loop, that turn redraws IT and not the other.
+    ///
+    /// So the sequence, not the predicate, is the property. Park repeatedly with
+    /// nothing else live and no redraw in between; the armed slot must still be
+    /// there, unmoved, and must still be handed to the fold.
+    #[test]
+    fn an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick() {
+        let mut app = App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&WindowId(0))
+            .expect("the headless fixture owns window 0");
+        assert!(
+            ws.front_terminal().is_some(),
+            "the fixture must front a terminal, or the arm gate is vacuous"
+        );
+        let t0 = Instant::now();
+        // `has_glass` stands in for `os_window.is_some()`: a test cannot
+        // fabricate a winit Window, and every arm is vacuous without one.
+        // Baseline: nothing at all is live, so the lane parks and owes no wake.
+        assert_eq!(
+            ws.plan_terminal_effect_lane(t0, false, true),
+            None,
+            "the fixture must be quiescent, or the arm below proves nothing"
+        );
+        assert_eq!(ws.next_trail_tick, None);
+
+        // A redraw draws Robi mid-stride. The next park arms his slot.
+        ws.note_deco_animating(t0);
+        let armed = ws
+            .plan_terminal_effect_lane(t0, false, true)
+            .expect("an in-motion decoration owes the loop a frame");
+        assert!(armed > t0, "the armed slot is strictly in the future");
+        assert_eq!(ws.next_trail_tick, Some(armed));
+
+        // NOW THE BLOCKER. Five event-loop turns before the slot is due, none of
+        // them a redraw of this window and none of them `ResumeTimeReached`, so
+        // nothing refreshes the latch and nothing consumes the tick.
+        let interval = crate::effect_tick_interval(ws.frame_interval);
+        for step in 1..=5_u32 {
+            let woke = t0 + interval / 8 * step;
+            assert!(woke < armed, "the probe must stay inside the armed interval");
+            assert_eq!(
+                ws.plan_terminal_effect_lane(woke, false, true),
+                Some(armed),
+                "an unrelated wake must neither park the decoration's tick nor \
+                 move it — this is the permanent freeze the review caught"
+            );
+            assert_eq!(ws.next_trail_tick, Some(armed));
+        }
+
+        // And it is BOUNDED, not a train: the walk ends, no redraw refreshes the
+        // latch, and the lane parks back to pure `Wait` within the grace.
+        let grace = interval * crate::DECO_ANIM_LEVEL_FRAMES;
+        assert_eq!(
+            ws.plan_terminal_effect_lane(t0 + grace, false, true),
+            None,
+            "a decoration that stopped moving stops paying"
+        );
+        assert_eq!(
+            ws.next_trail_tick, None,
+            "and the park drops the clock, so the loop returns to 0% idle"
+        );
+    }
+
+    /// The other half of the same freeze, reached through the deadline the arm
+    /// INHERITS rather than through the flag it consumed.
+    ///
+    /// The frame-cadence arm keeps an already-armed `next_trail_tick` on purpose
+    /// — that continuity is what makes a park which redrew nothing free. But the
+    /// else-if arm below it can have left a slot there that is bounded only by
+    /// the reduced-motion cat's `discovery_until`: SECONDS out. Inheriting it
+    /// paces the decoration at seconds (visibly wrong on its own), and worse, it
+    /// outlives `deco_anim_until` — so the latch expires with the slot still
+    /// pending, the next unrelated wake takes the park arm, the slot is dropped,
+    /// and nothing is left to re-arm it. Same permanent freeze, one level down.
+    ///
+    /// So the arm clamps: a frame-cadence slot is never later than this lane's
+    /// own cadence, which is exactly what makes "the tick that refreshes the
+    /// latch is always due inside the latch" true rather than hopeful.
+    #[test]
+    fn a_decoration_arm_never_inherits_a_slot_that_outlives_its_own_latch() {
+        let mut app = App::headless_for_test();
+        let ws = app
+            .windows
+            .get_mut(&WindowId(0))
+            .expect("the headless fixture owns window 0");
+        let t0 = Instant::now();
+        let interval = crate::effect_tick_interval(ws.frame_interval);
+
+        // Stand in for the reduced-motion cat's one-shot erase, armed by the
+        // else-if on an earlier park and still pending when a decoration moves.
+        let far = t0 + Duration::from_secs(3);
+        ws.next_trail_tick = Some(far);
+        ws.note_deco_animating(t0);
+        let d = ws
+            .plan_terminal_effect_lane(t0, false, true)
+            .expect("an in-motion decoration owes the loop a frame");
+        assert!(
+            d <= t0 + interval,
+            "a frame-cadence arm may not inherit a coarser slot"
+        );
+        assert!(
+            d < far,
+            "the bounded erase can only land EARLIER than it asked, never later"
+        );
+        assert_eq!(ws.next_trail_tick, Some(d));
+        assert!(
+            ws.deco_anim_frame_active(d),
+            "and the latch must still be live when its own slot fires — that is \
+             the coupling the clamp exists to guarantee"
+        );
+    }
+
+    /// The decoration lane is ARMED BEFORE the RepaintKey early-out and must be,
+    /// which is why it arms a deadline instead of re-requesting a redraw.
+    ///
+    /// Robi's fingerprint legitimately repeats across frames — a walk step whose
+    /// sub-pixel advance bakes to the same sprite is one frame the early-out
+    /// correctly refuses to present. Re-requesting only AFTER a successful
+    /// present (the obvious alternative fix) would drop the wake on exactly those
+    /// frames, and since he carries no focus gate there is nothing else in an
+    /// idle loop to restart him: the park would be permanent and he would freeze
+    /// mid-stride. A deadline has no such coupling — it is armed by the frame
+    /// that DREW him, presented or not, and costs one wake per interval either
+    /// way.
+    ///
+    /// SCOPE, stated because the first version of this patch overclaimed it: this
+    /// test exercises the PURE helpers only (`take_due_trail_tick`,
+    /// `rebase_pending_trail_tick_after_present`, `phase_locked_effect_deadline`).
+    /// It pins exactly one half of the argument above — that a present is not
+    /// required to keep the train phased. It does NOT touch the arm/park branch
+    /// and therefore cannot see a stall that lives there;
+    /// `an_unrelated_wake_between_arm_and_fire_keeps_the_decoration_tick` is the
+    /// one that does.
+    #[test]
+    fn an_early_out_frame_still_owes_the_decoration_its_next_slot() {
+        let interval = Duration::from_millis(4);
+        let base = Instant::now();
+        let fired = base + interval;
+
+        // `new_events` fired the slot and handed ownership to the anchor; the
+        // redraw it requested then early-outed, so no present ever ran and
+        // `rebase_pending_trail_tick_after_present` had nothing to consume.
+        let mut next = Some(fired);
+        let mut anchor = None;
+        assert!(take_due_trail_tick(&mut next, &mut anchor, fired));
+        let early_out_at = fired + Duration::from_millis(1);
+        rebase_pending_trail_tick_after_present(&mut next, &mut anchor, early_out_at);
+        assert_eq!(
+            (next, anchor),
+            (None, Some(fired)),
+            "an early-out leaves the fired anchor exactly as the timer set it"
+        );
+
+        // `about_to_wait` re-arms from the decoration request alone. Same slot,
+        // same cadence a presented frame would have produced — the animation
+        // cannot stall on a repeated fingerprint.
+        let last_fire = anchor.take();
+        assert_eq!(
+            phase_locked_effect_deadline(early_out_at, interval, last_fire, None, true),
+            base + Duration::from_millis(8),
+        );
+    }
+
     #[test]
     fn only_a_due_tick_transfers_ownership_to_the_fired_anchor() {
         let base = Instant::now();
@@ -4727,11 +4990,28 @@ fn scrub_overlay_row_band(input: &mut RenderInput, rows: std::ops::Range<usize>,
     if input.cursor_visible && rows.contains(&input.cursor_row) {
         input.cursor_visible = false;
     }
-    // Selection is folded into the renderer's background/glyph passes rather
-    // than a separate quad stream. A RenderInput carries only one contiguous
-    // selection, so if any selected cell intersects replaced chrome, suppress
-    // that snapshot's selection wholesale; the engine selection is untouched
-    // and returns on the first frame after the chrome disappears.
+    // Selection is folded into the renderer's background/glyph passes rather than a
+    // separate quad stream, and a RenderInput carries only one contiguous selection.
+    //
+    // SELECTION CUSTODY Phase 2: this used to suppress the snapshot's selection
+    // WHOLESALE whenever any selected cell fell under replaced chrome. For an
+    // 8-second config notice that meant the user's entire highlight vanished from
+    // the screen while the ENGINE selection stayed alive — so ⌘-C still copied text
+    // that was no longer shown as selected. The highlight looked destroyed and the
+    // clipboard disagreed.
+    //
+    // Narrow instead of erase: shrink the frame-space `selection_clip` so the band's
+    // rows are excluded and every row OUTSIDE it keeps painting. The clip rectangle
+    // already exists for exactly this kind of masking (split composition uses it to
+    // stop one pane's selection tinting a sibling), so this reuses the renderer's own
+    // mechanism rather than adding a second one.
+    //
+    // The clip is ONE rectangle, so the complement of the band is only expressible
+    // when the band meets an edge of the current clip — which is the real shape: the
+    // config notice and the find bar are edge bands. A band strictly INTERIOR to the
+    // selection cannot be excised by a rectangle, so that case keeps the old
+    // fail-safe of dropping the snapshot selection. Erring toward "not painted" is
+    // right: a highlight shown over chrome would claim the chrome's text is selected.
     let selection_intersects = input.selection.has_selection()
         && rows.clone().any(|frame_row| {
             let row_cells = input.cells.get(frame_row).map(Vec::as_slice).unwrap_or(&[]);
@@ -4742,8 +5022,42 @@ fn scrub_overlay_row_band(input: &mut RenderInput, rows: std::ops::Range<usize>,
             })
         });
     if selection_intersects {
-        input.selection = aterm_core::selection::TextSelection::new();
-        input.selection_clip = None;
+        // Intersect with any clip already present (a split pane's), never overwrite
+        // it — dropping a pane clip here would let this pane's selection tint a
+        // sibling for as long as the chrome is up.
+        let clip = input.selection_clip.unwrap_or_else(|| {
+            aterm_core::render::SelectionClip::new(0, input.rows, 0, input.cols)
+        });
+        let band_covers_top = rows.start <= clip.row_start && rows.end > clip.row_start;
+        let band_covers_bottom = rows.start < clip.row_end && rows.end >= clip.row_end;
+        let narrowed = if band_covers_top && band_covers_bottom {
+            // The band swallows the whole clip: nothing of the selection is visible.
+            None
+        } else if band_covers_top {
+            Some(aterm_core::render::SelectionClip::new(
+                rows.end,
+                clip.row_end,
+                clip.col_start,
+                clip.col_end,
+            ))
+        } else if band_covers_bottom {
+            Some(aterm_core::render::SelectionClip::new(
+                clip.row_start,
+                rows.start,
+                clip.col_start,
+                clip.col_end,
+            ))
+        } else {
+            // Strictly interior — not expressible as one rectangle.
+            None
+        };
+        match narrowed {
+            Some(clip) if clip.row_start < clip.row_end => input.selection_clip = Some(clip),
+            _ => {
+                input.selection = aterm_core::selection::TextSelection::new();
+                input.selection_clip = None;
+            }
+        }
     }
     input
         .cursor_trail
@@ -7551,6 +7865,90 @@ fn paint_prediction_ghosts(
     painted
 }
 
+/// Compose a text FIELD's display string with an in-flight IME composition
+/// spliced at its caret: `(display_text, display_caret_byte, preedit_byte_range
+/// _in_display)`. Shared by the find well and the rename well so the two fields
+/// cannot disagree about where composed text sits relative to the caret.
+///
+/// This is the FIELD twin of the grid's renderer-level overlay
+/// (`RenderInput::overlay_ime_preedit`): both read the SAME
+/// `WindowState::preedit` + `preedit_caret` pair, so a composition draws its
+/// caret at the same byte offset wherever [`crate::app_input::PreeditOwner`]
+/// routes it. `preedit_caret` is winit's caret RANGE already reduced to its
+/// START at the event boundary (`App::on_ime_preedit`); `None` is the platform
+/// giving no range, which parks the visible caret after the whole composition.
+///
+/// The field caret and the composition caret are both floored to char
+/// boundaries defensively; the returned caret places the field's visible caret
+/// INSIDE the composition, exactly where the IME says it is.
+fn field_preedit_display(
+    text: &str,
+    caret: usize,
+    preedit: &str,
+    preedit_caret: Option<usize>,
+) -> (String, usize, std::ops::Range<usize>) {
+    let mut at = caret.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    let mut display = String::with_capacity(text.len() + preedit.len());
+    display.push_str(&text[..at]);
+    display.push_str(preedit);
+    display.push_str(&text[at..]);
+    let in_pre = preedit_caret.map_or(preedit.len(), |a| {
+        let mut b = a.min(preedit.len());
+        while b > 0 && !preedit.is_char_boundary(b) {
+            b -= 1;
+        }
+        b
+    });
+    (display, at + in_pre, at..at + preedit.len())
+}
+
+#[cfg(test)]
+mod ime_preedit_field_tests {
+    //! The FIELD splice shared by the find well and the rename well. The GRID
+    //! arm is upstream's `RenderInput::overlay_ime_preedit` and is covered by
+    //! its own unit tests in aterm-core; this module owns only the field twin.
+    use super::field_preedit_display;
+
+    #[test]
+    fn field_display_splices_at_the_caret() {
+        // Caret mid-field, IME caret mid-composition: the composition lands at
+        // the field caret and the visible caret rides INSIDE it.
+        let (text, caret, span) = field_preedit_display("find", 2, "中文", Some("中".len()));
+        assert_eq!(text, "fi中文nd");
+        assert_eq!(span, 2.."fi中文".len());
+        assert_eq!(caret, 2 + "中".len());
+        // No caret offset ⇒ the field caret sits after the whole composition
+        // (winit's "platform gave no range" contract).
+        let (text, caret, _) = field_preedit_display("ab", 2, "に", None);
+        assert_eq!(text, "abに");
+        assert_eq!(caret, text.len());
+    }
+
+    /// Both offsets are floored to char boundaries: a field caret or a platform
+    /// caret landing mid-UTF-8 must not panic the render path.
+    #[test]
+    fn interior_byte_offsets_are_floored_to_char_boundaries() {
+        // Field caret 1 is inside "中"; the composition caret 2 is inside "日".
+        let (text, caret, span) = field_preedit_display("中", 1, "日", Some(2));
+        assert_eq!(text, "日中", "the field caret floored to 0");
+        assert_eq!(span, 0.."日".len());
+        assert_eq!(caret, 0, "the composition caret floored to 0");
+    }
+
+    /// An empty composition is the identity: the display string, the caret and
+    /// an empty span reproduce the settled field exactly.
+    #[test]
+    fn an_empty_composition_is_the_identity() {
+        let (text, caret, span) = field_preedit_display("query", 3, "", None);
+        assert_eq!(text, "query");
+        assert_eq!(caret, 3);
+        assert!(span.is_empty(), "an empty span authors no underline, no anchor");
+    }
+}
+
 #[allow(
     clippy::items_after_test_module,
     reason = "these unit tests sit next to the ghost painter they cover; the rest of the file is the App render inherent-impl, not stray items"
@@ -8823,6 +9221,40 @@ impl App {
         // eager on every tab.
         let mut targets: Vec<(usize, u64, u16, u16)> = Vec::new();
         for (ti, tab) in ws.tab_set.tabs().iter().enumerate() {
+            // MPT-2: THE FILTER MOVES UPSTREAM OF THE WORK IT PREVENTS. Under
+            // `active_only` the second loop below already discards every
+            // background tab's non-shared pane — but only AFTER this loop has
+            // laid that tab out. `visible_plan` allocates a `Vec<VisibleLeaf>`,
+            // a `Vec<VisibleDivider>`, and an owned heap `SplitPath` per leaf
+            // AND per divider, and `subtree_sizing` re-walks each subtree at
+            // every split node: at 30 tabs x 4 panes that is ~270 allocations
+            // and ~120 leaf-sizing closures per call, of which 7 are used. And
+            // `redraw_window` makes this exact call on EVERY presented frame
+            // while `panes_stale` stands — the whole live drag, which is the
+            // one interaction where main-thread headroom is scarcest.
+            //
+            // The predicate is LITERALLY the one the second loop applies
+            // (`pool.views(id) > 1`), so the surviving target set is unchanged:
+            // a background tab is laid out iff some leaf of it holds a SHARED
+            // session, which is the only eagerness contract that crosses the
+            // tab boundary. `any_leaf` is the allocation-free, short-circuiting
+            // walk that exists for exactly this shape of question — the second
+            // loop's per-pane `continue` STAYS, because a background tab can
+            // hold a shared pane AND non-shared siblings, and only the shared
+            // one may be sized from here.
+            if active_only
+                && ti != active
+                && !tab.root.any_leaf(&mut |view| {
+                    self.view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        .and_then(|session| self.pool.views(session))
+                        .is_some_and(|views| views > 1)
+                })
+            {
+                continue;
+            }
             let plan = tab.visible_plan(
                 crate::tab_model::LogicalRect::new(
                     0.0,
@@ -8934,6 +9366,16 @@ impl App {
                         if let Some((pending, term, proxy)) =
                             job.lock().unwrap_or_else(|p| p.into_inner()).take()
                         {
+                            // CONCURRENCY GAUGE (MPT-1's instrument): this
+                            // worker now owns a real job, so it counts toward
+                            // the live concurrency one settle creates. The
+                            // guard's `Drop` lowers the count AND books the job
+                            // as finished on every exit — success, cancel,
+                            // abort, or an unwind past the inner
+                            // `catch_unwind`s — so the quiescence witness
+                            // (`submitted == finished`) cannot be wedged by a
+                            // failure arm.
+                            let _running = reflow_gauge::enter();
                             // The expensive decompress + rewrap, OFF the lock — STEPPED
                             // (`drive_reflow_job`), not one-shot, so a session teardown
                             // cancels a now-pointless rewrap within ~one step instead of
@@ -8992,14 +9434,25 @@ impl App {
                         }
                     }
                 };
-                if std::thread::Builder::new()
-                    .name("aterm-reflow".into())
-                    .spawn(run)
-                    .is_err()
-                    && let Some((pending, term, proxy)) =
+                // CONCURRENCY GAUGE: book the hand-off on the MAIN thread,
+                // BEFORE any worker can pick it up, so a reader never sees
+                // `finished > submitted` and `submitted == finished` is an
+                // exact quiescence witness for the whole settle.
+                reflow_gauge::submit();
+                // THE BOUNDED MAIN-THREAD FALLBACK, unchanged in body and in
+                // bound — it is now a CLOSURE over the same parking slot rather
+                // than a straight-line `else` arm, because the pool decides
+                // later (and off this stack frame) whether anything is left to
+                // run it. Exactly one of `run` and `inline` finds the job in
+                // the slot; the other's `take()` returns `None`.
+                let inline = move || {
+                    let Some((pending, term, proxy)) =
                         job.lock().unwrap_or_else(|p| p.into_inner()).take()
-                {
-                    // Spawn failed (thread/FD exhaustion). Rewrapping inline preserves
+                    else {
+                        return; // a pooled worker already took this job
+                    };
+                    // NOBODY could drain this job (the pool has no live worker and
+                    // could start none — thread/FD exhaustion). Rewrapping inline preserves
                     // history but runs the O(session-history) reflow on the MAIN thread —
                     // the very L0 freeze this module removes. Bound it: rewrap inline only
                     // when the history is small enough to stay imperceptible; above that,
@@ -9008,9 +9461,9 @@ impl App {
                     const INLINE_REFLOW_MAX_LINES: usize = 20_000;
                     if pending.line_count() > INLINE_REFLOW_MAX_LINES {
                         aterm_log::error!(
-                            "reflow worker spawn failed and session {id} history ({} lines) \
-                             is too large to rewrap inline without a main-thread freeze; \
-                             dropping tiered scrollback (grid recovered to ring-only)",
+                            "no reflow worker could be started and session {id} history \
+                             ({} lines) is too large to rewrap inline without a main-thread \
+                             freeze; dropping tiered scrollback (grid recovered to ring-only)",
                             pending.line_count()
                         );
                         drop(pending);
@@ -9047,26 +9500,48 @@ impl App {
                                     }
                                 }
                                 aterm_log::warn!(
-                                    "reflow worker spawn failed; rewrapped session {id} \
-                                     scrollback synchronously on the main thread \
+                                    "no reflow worker could be started; rewrapped session \
+                                     {id} scrollback synchronously on the main thread \
                                      (history preserved)"
                                 );
                             }
                             Err(_) => {
                                 aterm_log::error!(
-                                    "reflow worker spawn failed AND inline rewrap of session \
-                                     {id} panicked; aborting the offload (grid recovered)"
+                                    "no reflow worker could be started AND the inline rewrap \
+                                     of session {id} panicked; aborting the offload (grid \
+                                     recovered)"
                                 );
                                 term_lock(&term).abort_resize_offload();
                             }
                         }
                     }
+                    // The inline arm handled the hand-off end to end on this
+                    // thread and never minted an `enter` guard, so it books its
+                    // own completion — else the quiescence witness would wait
+                    // forever for a worker that was never created.
+                    reflow_gauge::note_inline();
                     if let Some(proxy) = proxy {
                         let _ = proxy.send_event(crate::Wake::Output {
                             session: id,
                             window: wid,
                         });
                     }
+                };
+                // MPT-1: hand the job to the BOUNDED pool instead of spawning a
+                // thread for it. The old line here was one `Builder::spawn` per
+                // job — the per-session self-throttle bounds one SESSION to one
+                // worker per cycle, but nothing bounded the number of sessions,
+                // and this loop walks every pane of every tab: 120 OS threads
+                // from one 30-tab x 4-pane window drag. The pool runs at most
+                // `reflow_worker_ceiling()` at a time, ACTIVE-tab panes first,
+                // and hands anything it genuinely cannot drain back for the
+                // bounded inline arm above.
+                for stranded in reflow_pool_submit(ReflowHandoff {
+                    run: Box::new(run),
+                    inline: Box::new(inline),
+                    priority: ti == active,
+                }) {
+                    (stranded.inline)();
                 }
             }
             if shared {
@@ -11847,6 +12322,9 @@ impl App {
             && let Some(window) = state.os_window.clone()
         {
             window.set_visible(true);
+            // L1 reveal ledger (first-write-wins): on a handoff boot THIS is the
+            // first window's actual reveal, legitimately after its first present.
+            crate::metrics::mark_first_window_visible();
             self.maybe_signal_handoff_ready();
         } else if self.handoff_ready.is_some() {
             self.maybe_signal_handoff_ready();
@@ -11967,6 +12445,23 @@ impl App {
                 std::thread::Builder::new()
                     .name("aterm-font-warm".into())
                     .spawn(aterm_render::warm_font_coverage_index)
+                    .ok();
+            });
+        }
+        // Register the Windows taskbar jump list on the same off-critical-path
+        // schedule: once per process, only after the first frame reached the
+        // compositor, on its own short-lived thread (the shell round-trips
+        // registry + profile-disk IO under CommitList). Startup (`main_entry`)
+        // was rejected as the call site — it would sit squarely on
+        // time-to-glass for a menu nobody can open before a button exists.
+        // Best-effort throughout: see `jumplist_win` for the failure posture.
+        #[cfg(windows)]
+        {
+            static JUMP_LIST: std::sync::Once = std::sync::Once::new();
+            JUMP_LIST.call_once(|| {
+                std::thread::Builder::new()
+                    .name("aterm-jumplist".into())
+                    .spawn(crate::jumplist_win::install)
                     .ok();
             });
         }
@@ -12283,6 +12778,19 @@ impl App {
             None => return,
             Some(_) => {}
         }
+        // WINDOWS ONLY: confirm the DWM caption still holds the appearance we resolved.
+        // winit re-themes the non-client area from the OS preference on EVERY
+        // `WM_SETTINGCHANGE` (monitor hotplug, accent colour, an Explorer restart, any
+        // `SPIF_SENDCHANGE`) but only REPORTS the ones that move the OS theme, so the
+        // event-driven seams structurally cannot see the silent clobbers — this is the
+        // only path that runs without a change signal. Deliberately observe-only: it
+        // never requests a redraw, and it costs two atomics plus a lock read unless
+        // aterm is actively overriding the desktop; see
+        // `platform_win::verify_chrome_appearance` for the full gate ladder.
+        #[cfg(windows)]
+        if let Some(w) = self.windows.get(&id).and_then(|ws| ws.os_window.as_ref()) {
+            crate::platform_win::verify_chrome_appearance(w);
+        }
         // Frame wall-clock start, read back into the `metrics` verb's
         // `last_frame_render_ms` on an actual present (early-out frames return before
         // `record_present`, so they never count). One `Instant::now()` per redraw.
@@ -12514,6 +13022,20 @@ impl App {
         // lock drops (report_ime_cursor_area needs &mut self). The multi-pane path
         // reports its own caret inside redraw_compose, so this stays None there.
         let mut single_pane_ime_caret: Option<((u16, u16), bool)> = None;
+        // IME-2 ROUTING: which surface owns the in-flight composition this frame
+        // ([`crate::app_input::PreeditOwner`], the render-time twin of
+        // `on_ime_commit`'s dispatch). Resolved ONCE here, before any `&mut`
+        // borrow of `self.windows`, because the grid overlay below runs inside
+        // one — and both it and the candidate-window anchor after the borrow
+        // drops must agree about the owner within a single frame. `None` when no
+        // composition is in flight (one `is_empty()` on a resident `String`).
+        let preedit_owner = self.preedit_owner(id);
+        // The GRID arm only: a composition owned by the find well or the rename
+        // well paints INSIDE that field (their own splices), and one owned by a
+        // frontmost native view is painted by that view's own text pipeline —
+        // in all three cases the grid must stay clean, or the composition would
+        // appear twice.
+        let preedit_on_grid = matches!(preedit_owner, crate::app_input::PreeditOwner::Grid);
         // Sparkle-words: ensure the App-cached resolved state (config + compiled
         // lexicon) is current. Rebuilt ONLY when marked dirty (startup / reload /
         // toggle), never per frame — so the per-frame path does no config
@@ -13166,17 +13688,20 @@ impl App {
             pin_pet_mode_exit(pet_mode, &mut cat_frame);
             // Reduced motion: the STATIC CELEBRATION has no frame cadence of
             // its own (the state machine's 60 fps rearm rides `animate_cat`),
-            // so keep one-present-ahead wakes flowing while any sing drive
+            // so keep frame-paced wakes flowing while any sing drive
             // remains — the discovery-hello wake pattern extended over the
             // drive — or the still would freeze in the app-present artifact past
             // its one-step
             // disappearance and the detector would never settle. Bounded by
             // the celebration itself (hold + ~1 s wind-down).
-            if !animate_cat
-                && sing_drive > 0.0
-                && let Some(window) = ws.os_window.as_ref()
-            {
-                window.request_redraw();
+            // ASK THE SCHEDULER, never the window (`deco_anim_until`): a
+            // `request_redraw()` from inside the redraw handler re-invalidates
+            // the HWND before winit ever enters its wait and free-runs the loop.
+            // The cadence is unchanged from what the coalesced macOS
+            // `request_redraw` delivered — one wake per panel refresh — so the
+            // reduced-motion drain settles in exactly as many frames as before.
+            if !animate_cat && sing_drive > 0.0 && ws.os_window.is_some() {
+                ws.note_deco_animating(frame_started);
             }
             // `sparkle_on`: the cat sprite (and the collection hello) can ONLY be
             // drawn inside the `self.sparkle` branch below — with the master off,
@@ -13601,12 +14126,20 @@ impl App {
                     // suppresses an on-screen wince. The cat frame for this
                     // present was resolved above, so request one follow-up
                     // draw when an active companion accepts the cue.
+                    // The follow-up rides `deco_anim_until` with the rest of the
+                    // family rather than calling `request_redraw()` here. It is
+                    // the mildest member — the cue is DRAINED, so the next frame
+                    // sees zero hits and the request is not renewed — but an
+                    // in-redraw request is still a `WaitCancelled` iteration on
+                    // Windows, and one pacing lane beats a special case. The
+                    // wince lands one frame interval later, which is the soonest
+                    // any panel could have shown it anyway.
                     if ws
                         .cursor_cat
                         .on_curse(frame_started, curse_drain.wince_hits)
-                        && let Some(window) = ws.os_window.as_ref()
+                        && ws.os_window.is_some()
                     {
-                        window.request_redraw();
+                        ws.note_deco_animating(frame_started);
                     }
                     // The rare EARNED cat leading the cursor (gated on
                     // !deco_suspend by living in this branch — an alt-screen /
@@ -13807,11 +14340,15 @@ impl App {
                             fp ^= dog_fp.rotate_left(31);
                         }
                         // The visit animates (bounce + both fades) on its own
-                        // clock; keep one-present-ahead wakes flowing while it
+                        // clock; keep frame-paced wakes flowing while it
                         // is live. Bounded by the ~3.2 s envelope — expiry
                         // zeroes `dog_alpha` and the wakes stop.
-                        if let Some(window) = ws.os_window.as_ref() {
-                            window.request_redraw();
+                        // This one was UNCONDITIONAL for the whole visit, so on
+                        // Windows every typed dog was a ~3 s burn of a full core.
+                        // The deadline (`deco_anim_until`) costs one wake per
+                        // panel refresh for the same visibly identical bounce.
+                        if ws.os_window.is_some() {
+                            ws.note_deco_animating(frame_started);
                         }
                     }
                     fp
@@ -13875,17 +14412,29 @@ impl App {
                 };
                 let ch = i32::from(effect_geom.cell_h).max(1);
                 let cw = i32::from(effect_geom.cell_w).max(1);
-                // The monkey-bar hand line: the in-grid tab strip's mid-height
+                // The monkey-bar hand line: the in-grid tab strip's UNDERSIDE
                 // when a strip exists; otherwise the titlebar band (native
                 // chips are AppKit views above the surface, so he swings in
                 // the band beneath them); or just above row 0 when there is
                 // no headroom at all. All pre-splice grid px (negative = above
                 // row 0 — the strip splice owns the shift).
+                //
+                // He used to grip at the strip's MID-height, which hung his whole
+                // body over the lower half of the band — `FreeZ::OverText`, so he
+                // erased tab labels and the solo band's cwd as he crossed them
+                // (`app_mouse.rs` concedes it: "on the monkey bars he visibly hangs
+                // IN FRONT of the chips"). One pixel inside the band puts his GRIP
+                // on the bar and his body below it, over the grid — exactly where he
+                // hangs when there is no strip at all, and where he is already
+                // welcome. Note this is a Z problem solved with GEOMETRY on purpose:
+                // scrubbing him out of the band would drop sprite slices (hands and
+                // head vanishing mid-hang) and would leave `ws.robi_hit_rect` set to
+                // an invisible body eating strip clicks.
                 let strip_px = i32::from(self.tab_strip_rows) * ch;
                 let head_px = ws.metrics.head as i32;
                 let pad_top_px = ws.metrics.pad_top as i32;
                 let bar_y = if strip_px > 0 {
-                    -strip_px / 2
+                    -1
                 } else if head_px > 0 {
                     -(pad_top_px + head_px * 9 / 20)
                 } else {
@@ -13981,14 +14530,24 @@ impl App {
                             (i32::from(origin_x), i32::from(origin_y)),
                         );
                     }
-                    // One-present-ahead wakes ONLY while a scene is actually
+                    // Frame-paced wakes ONLY while a scene is actually
                     // in motion (the dog's clockless rule): his static idle
                     // stands cost zero wakes — he resumes his rounds on the
                     // next natural redraw.
-                    if frame.animating
-                        && let Some(window) = ws.os_window.as_ref()
-                    {
-                        window.request_redraw();
+                    //
+                    // THIS was the measured offender. `frame.animating` is true
+                    // for ~32% of his 76 s cycle (`robi::CYCLE_MS`), and for
+                    // every one of those seconds the old `request_redraw()` here
+                    // handed winit's Windows backend a fresh invalidation from
+                    // inside WM_PAINT: 52k wakes/sec, 99.8% of a core, a square
+                    // wave with his scene boundaries as its edges. He is
+                    // deliberately un-focus-gated, so nothing else in the loop
+                    // was bounding him — the blink timer only SEEDED the chain.
+                    // Setting the request instead lets `about_to_wait` fold it
+                    // into the shared phase-locked effect deadline: one wake per
+                    // panel refresh, same walk.
+                    if frame.animating && ws.os_window.is_some() {
+                        ws.note_deco_animating(frame_started);
                     }
                 }
                 robi_fp
@@ -14481,7 +15040,12 @@ impl App {
             // Skipped while scrolled back — the cursor cell maps to unrelated
             // history rows there ("never PAINT them over the scrollback
             // view"), and the title indicator still carries the composition.
-            let preedit_drawn = !ws.preedit.is_empty() && display_offset == 0;
+            // Skipped too when a FIELD (find well / rename well) or a native
+            // view owns the composition — `preedit_on_grid` is the routing gate,
+            // resolved before this borrow. The erase arm below is deliberately
+            // NOT gated: a composition that MOVES from the grid into a field
+            // must still repaint the cells the grid run covered.
+            let preedit_drawn = preedit_on_grid && !ws.preedit.is_empty() && display_offset == 0;
             if preedit_drawn {
                 ws.input_scratch.overlay_ime_preedit(
                     &ws.preedit,
@@ -14613,7 +15177,26 @@ impl App {
         // (the default). The term guard is now dropped, so &mut self is free.
         // report_ime_cursor_area's own last_ime_cell gate keeps it cheap, and a steady
         // (skipped) frame can't move the caret, so reporting on rendered frames suffices.
-        if let Some((pos, vis)) = single_pane_ime_caret {
+        //
+        // While a FIELD — the find well or the rename well — owns an in-flight
+        // composition, ITS OWN splice reports the caret instead (the candidate
+        // list must hug the well's caret, not the engine cursor, which sits rows
+        // away); reporting both would flip-flop the rect through winit every
+        // frame. Rename was missing from this gate at first, so composing a tab
+        // name anchored the candidate list at the GRID caret rows below the well
+        // (52601619's review).
+        //
+        // GRID is deliberately NOT in this gate: the grid arm is the renderer's
+        // `overlay_ime_preedit`, which draws the composition starting AT the
+        // engine cursor cell, so this generic report is already the right anchor
+        // — and it is now the only one, since there is no grid splice left to
+        // author a rect of its own.
+        if let Some((pos, vis)) = single_pane_ime_caret
+            && !matches!(
+                preedit_owner,
+                crate::app_input::PreeditOwner::Find | crate::app_input::PreeditOwner::Rename
+            )
+        {
             self.report_ime_cursor_area(id, pos, (0, 0), vis);
         }
         // Predictive local echo: reconcile pending guesses against the now-current
@@ -14925,7 +15508,10 @@ impl App {
     /// composition is either the clean-title fast path (slot kept verbatim) or
     /// a per-session cache hit `clone_from`d into the same slot — a label only
     /// recomposes (and allocates) when its title or description changed.
-    fn redraw_tab_strip_state(&mut self, id: WindowId) -> u64 {
+    // bench-support: priced directly by `benches/workspace_scaling.rs`
+    // (`strip_state/tabs_N`); widened from module-private to crate-visible for
+    // that seam ONLY — no call site or behaviour changes.
+    pub(crate) fn redraw_tab_strip_state(&mut self, id: WindowId) -> u64 {
         let tab_count = self.windows.get(&id).map_or(0, |ws| ws.tab_set.len());
         if self.tab_strip_enabled() && tab_count > 0 {
             // Take the reused buffer out, refill it against the live tab titles, then
@@ -15051,10 +15637,19 @@ impl App {
                         slot.clear();
                         if !t.is_empty() {
                             slot.push_str(t);
-                        } else if let Some(cwd) = term
-                            .current_working_directory()
-                            .filter(|cwd| !cwd.is_empty())
+                        } else if let Some(cwd) =
+                            crate::cwd_native::ReportedCwd::native_working_directory(&*term)
+                                .filter(|cwd| !cwd.is_empty())
                         {
+                            // NATIVE form, not the engine's RFC 8089 URI path:
+                            // a Windows tab labelled `/C:/Users//x` is the
+                            // reported defect. Written as a fully-qualified
+                            // trait call so the scrutinee stays one expression
+                            // (no `use` in the middle of this hot loop), and the
+                            // `Cow` keeps this refill's no-per-frame-allocation
+                            // invariant — every non-Windows path, and an
+                            // already-native `C:\…`, borrows the engine string.
+                            let cwd = cwd.as_ref();
                             // Cwd-as-default-label, `~`-abbreviated IN PLACE (push
                             // into the reused slot — no per-frame `String` alloc,
                             // the invariant this refill exists to keep).
@@ -15200,6 +15795,21 @@ impl App {
         eprintln!(
             "aterm-gui: GPU device lost — downgrading to the CPU renderer so windows keep rendering"
         );
+        // H1 (Windows Mica/Acrylic): a window created for the DirectComposition
+        // visual path carries `WS_EX_NOREDIRECTIONBITMAP`, which strips the GDI
+        // redirection surface the CPU softbuffer fallback blits into — its
+        // content cannot appear until the process restarts (the style is
+        // CreateWindowEx-only). Withdraw the latch so any window created from
+        // here on is a plain HWND, and tell the user why the survivors are blank.
+        #[cfg(windows)]
+        if aterm_gpu::dx12_visual_swapchain_requested() {
+            aterm_gpu::withdraw_dx12_visual_swapchain();
+            eprintln!(
+                "aterm-gui: this session's windows were created for the background_material \
+                 backdrop (no redirection bitmap); the CPU fallback cannot draw into them — \
+                 open a new window or restart aterm"
+            );
+        }
         let cpu = match self
             .backend
             .cpu_renderer_from_admitted(self.font_px, self.theme)
@@ -15240,7 +15850,7 @@ impl App {
                     self.theme.bg,
                 );
                 self.apprt
-                    .window_set_appearance(window, self.window_theme_for_chrome());
+                    .window_set_appearance(window, self.chrome_theme_for_apprt());
             }
             match ensure_target(self, wid) {
                 Ok(()) => {
@@ -15889,62 +16499,109 @@ impl App {
     /// stamps from the presenting window's VISIBLE tab book latency — a TUI
     /// streaming in a background window (or a hidden tab here) used to stamp the
     /// old process-global and get booked against whichever window presented
-    /// next, inflating `present_p99` with spans no human was watching. Hidden
-    /// tabs' stamps are consumed and DISCARDED: their content is not waiting on
-    /// this glass, and letting a stamp age across a later tab switch would book
-    /// the whole hidden interval as render latency.
-    fn present_latency_ns(&self, wid: WindowId) -> u64 {
-        let Some(ws) = self.windows.get(&wid) else {
-            return 0;
-        };
+    /// next, inflating `present_p99` with spans no human was watching.
+    ///
+    /// A hidden pane's stamp is DISCARDED AT THE REVEAL, not swept every
+    /// present (MPT-3): its content was not waiting on this glass, and letting
+    /// it age across a tab switch would book the whole unwatched interval as
+    /// render latency. Doing the discard where the artifact is CREATED — the
+    /// moment the visible leaf set changes — makes it O(panes of the revealed
+    /// tab) once instead of O(tabs x panes) on every present, and closes the
+    /// hole the sweep could not: a stamp armed while hidden and revealed with
+    /// no present in between used to be booked in full.
+    // Crate-visible for the honesty test in `lib.rs` (and the workspace
+    // bench seam): the walk's discard/book contract is asserted from
+    // outside this module. No call site or behaviour changes.
+    pub(crate) fn present_latency_ns(&mut self, wid: WindowId) -> u64 {
         // Honesty bound (mirrors INPUT_SLICE_CAP_NS's rationale): a genuine
         // output→present pipeline wait is milliseconds; SECONDS means the stamp
-        // aged through an interval nobody was watching — a hidden tab revealed
-        // by a switch with no interim present, a miniaturized window, a
-        // sleep/wake gap. Booking those would inflate max/p99 with exactly the
+        // aged through an interval nobody was watching — a miniaturized window,
+        // a sleep/wake gap. Booking those would inflate max/p99 with exactly the
         // artifact the per-window attribution exists to kill.
         const PRESENT_LATENCY_CAP_NS: u64 = 5_000_000_000;
+        // Only the leaves of the ACTIVE tab can ever book a measurement, and
+        // there are 1-4 of them. MPT-3: this used to walk every leaf of every
+        // TAB — O(tabs x panes) per successful present, with two HashMap probes
+        // and a cross-thread `swap` per leaf — purely so a HIDDEN pane's stamp
+        // could be thrown away before a later tab switch could book the hidden
+        // interval as render latency. That discard is now done ONCE, at the
+        // moment a pane is revealed (below), which is where the artifact is
+        // actually created; the per-present walk is therefore exactly the
+        // visible set. At 30 tabs x 4 panes that is ~120 iterations, ~240 map
+        // probes and ~116 read-modify-writes on cache lines other running
+        // threads are writing, collapsed to ~4 / ~8 / ~4.
+        let Some(plan) = self.active_visible_leaf_plan(wid) else {
+            return 0;
+        };
         let now = self.lat_epoch.elapsed().as_nanos() as u64;
-        let mut dt_max = 0u64;
-        // Visible leaves are 1-4, so the plan's own linear `leaf()` lookup beats
-        // collecting a `BTreeSet` outright — and saves the set's allocation.
-        let plan = self.active_visible_leaf_plan(wid);
-        for tab in ws.tab_set.tabs() {
-            // PERF: `visit` instead of `leaves()` — the latter heap-allocates a
-            // `Vec` per TAB (tab_model.rs:299-305 documents the rule), and this
-            // walk runs on every successful present of every route. Same
-            // left-to-right leaf order, so the `swap(0)` stamp consumption is
-            // unchanged; the three `continue`s become `return`s from the
-            // closure, which is the same control flow.
-            tab.root.visit(&mut |view| {
-                let view = *view;
-                let visible = plan.as_ref().is_some_and(|plan| plan.leaf(view).is_some());
-                let Some(sid) = self
+        // REVEAL-CLEAR — the artifact's real seam. A stamp armed while its pane
+        // was OFF this glass measures an interval nobody was watching, so it is
+        // discarded the first time that pane presents. The comparison is
+        // order-sensitive on purpose: `plan.leaves` is built in a stable
+        // left-to-right order, so an unchanged visible set is a <= 4-element
+        // `u64` compare and costs nothing on the overwhelming majority of
+        // presents. Only the panes that are NEWLY here are cleared — a pane
+        // that was already on the glass keeps its stamp, so a resize or divider
+        // drag (which changes geometry, not membership) never drops a real
+        // measurement.
+        let revealed = self.windows.get(&wid).is_some_and(|ws| {
+            ws.last_visible_views.len() != plan.leaves.len()
+                || ws
+                    .last_visible_views
+                    .iter()
+                    .zip(plan.leaves.iter())
+                    .any(|(was, leaf)| *was != leaf.view)
+        });
+        if revealed {
+            for leaf in &plan.leaves {
+                if self
+                    .windows
+                    .get(&wid)
+                    .is_some_and(|ws| ws.last_visible_views.contains(&leaf.view))
+                {
+                    continue; // already on this glass: its stamp is honest
+                }
+                if let Some(sid) = self
                     .view_store
-                    .get(view)
+                    .get(leaf.view)
                     .copied()
                     .and_then(crate::tab_model::View::terminal_session)
-                else {
-                    return;
-                };
-                let Some(sess) = self.pool.get(sid) else {
-                    return;
-                };
-                if !visible && self.is_visible_session(sid) {
-                    // SHARED (Cmd-Shift-O) session hidden HERE but app-rendered in
-                    // another window's active tab: leave the stamp armed for
-                    // THAT window's present to book — a swap here would
-                    // silently destroy the showing window's measurement.
-                    return;
+                    && let Some(sess) = self.pool.get(sid)
+                {
+                    sess.last_output_ns.store(0, Ordering::Relaxed);
                 }
-                let stamp = sess.last_output_ns.swap(0, Ordering::Relaxed);
-                if visible && stamp != 0 {
-                    let dt = now.saturating_sub(stamp);
-                    if dt < PRESENT_LATENCY_CAP_NS {
-                        dt_max = dt_max.max(dt);
-                    }
+            }
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.last_visible_views.clear();
+                ws.last_visible_views
+                    .extend(plan.leaves.iter().map(|leaf| leaf.view));
+            }
+        }
+        let mut dt_max = 0u64;
+        for leaf in &plan.leaves {
+            let Some(sid) = self
+                .view_store
+                .get(leaf.view)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+            else {
+                continue;
+            };
+            let Some(sess) = self.pool.get(sid) else {
+                continue;
+            };
+            // `swap(0)` lets the next burst's leading edge restart the clock.
+            // A session co-viewed by another window is stamped once and booked
+            // by whichever window presents first — unchanged: that race existed
+            // for visible leaves before this change and is the honest answer
+            // (the content did reach a glass).
+            let stamp = sess.last_output_ns.swap(0, Ordering::Relaxed);
+            if stamp != 0 {
+                let dt = now.saturating_sub(stamp);
+                if dt < PRESENT_LATENCY_CAP_NS {
+                    dt_max = dt_max.max(dt);
                 }
-            });
+            }
         }
         if dt_max != 0 && self.trace_latency {
             eprintln!(
@@ -16086,6 +16743,14 @@ impl App {
         // pane's own coherent snapshot.  No `take_damage`, predictor mutation, or
         // present stamp occurs in this pass.
         let theme = self.theme;
+        // IME-2 ROUTING (split form): resolved BEFORE the `&mut` window borrow
+        // below, for the same reason as the single-pane path — the grid overlay
+        // must not paint while the find well, the rename well, or a frontmost
+        // native view owns the composition, or it would appear twice.
+        let preedit_on_grid = matches!(
+            self.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Grid
+        );
         let ws = self.windows.get_mut(&wid)?;
         fill_divider_grid(&mut ws.input_scratch, rows, cols, theme);
         let sole_pane = panes.len() == 1;
@@ -16121,7 +16786,13 @@ impl App {
             // BEFORE the cursor read below, so the composed cursor follows the
             // caret inside the composition. Same scrollback rule: a scrolled
             // pane's cursor cell maps to history, so nothing is painted there.
-            if focused && !ws.preedit.is_empty() && ws.pane_scratch.display_offset == 0 {
+            // `preedit_on_grid` is the routing gate — a field-owned composition
+            // paints in its own well, never in the focused leaf.
+            if preedit_on_grid
+                && focused
+                && !ws.preedit.is_empty()
+                && ws.pane_scratch.display_offset == 0
+            {
                 let ambiguous_cjk = term.modes().ambiguous_width_double;
                 ws.pane_scratch
                     .overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
@@ -16569,10 +17240,15 @@ impl App {
         );
         translate_free_into_pane(&mut ws.pane_free, place);
         ws.free_scratch.extend_from_slice(&ws.pane_free);
-        // Keep one-present-ahead wakes flowing while the visit animates —
+        // Keep frame-paced wakes flowing while the visit animates —
         // bounded by the envelope; expiry zeroes `alpha` and the wakes stop.
-        if let Some(w) = ws.os_window.as_ref() {
-            w.request_redraw();
+        // The split twin of the dog arm in `redraw_window` takes the split twin
+        // of its fix: the latch goes to `deco_anim_until`, never to the window
+        // from inside its own redraw. `cursor_dependents_need_frame_cadence`
+        // could not have covered this one even in a single pane — the visit's
+        // clock is `WindowState::dog_cameo`, not anything `word_decos` reports.
+        if ws.os_window.is_some() {
+            ws.note_deco_animating(ctx.now);
         }
         fp.map_or(0, |f| f.rotate_left(31))
     }
@@ -17747,8 +18423,20 @@ impl App {
             },
         ) ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
         // Keep the IME candidate/compose window anchored at the caret (only re-reports
-        // to winit when the cursor cell actually moves).
-        self.report_ime_cursor_area(wid, focus_cur_pos, focus_off, focus_vis);
+        // to winit when the cursor cell actually moves). While the FIND or RENAME
+        // well owns an in-flight composition, ITS splice in the shared redraw tail
+        // reports the caret instead — same rationale as the single-pane gate
+        // (Rename joined it with 52601619's review: without it, composing a tab
+        // name over a split anchored on the grid caret). GRID is not in the gate
+        // for the same reason it is not in the single-pane one: the renderer's
+        // overlay draws from the focused pane's cursor cell, which is exactly
+        // what this report anchors on.
+        if !matches!(
+            self.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Find | crate::app_input::PreeditOwner::Rename
+        ) {
+            self.report_ime_cursor_area(wid, focus_cur_pos, focus_off, focus_vis);
+        }
         let settings_fp = self.windows.get(&wid).map_or(0, |ws| ws.overlay_fp());
         // Find bar shows in split panes too (its current-match highlight is suppressed,
         // but the bar row + readout still paint) — mirror the single-pane term so an edit
@@ -18181,6 +18869,25 @@ impl App {
     /// rows are painted from: fingerprint = count+active+titles, plus `cols`).
     pub(crate) fn splice_tab_strip_with(&mut self, wid: WindowId, tab_strip: u64) {
         let strip = self.tab_strip_rows as usize;
+        // THE BAND REACHES THE WINDOW EDGES. A strip cell can only paint its own
+        // cell rect (`pad + col·cell_w`), so the band and its seam stop `pad` px short
+        // of the left and right edges and `pad_top + head` px short of the top one —
+        // a floating rectangle with a dark margin, not a band. Hand the renderer the
+        // strip's own tones so it fills that padding with them instead of the theme
+        // background. Set on EVERY call, including when there is no strip at all, so
+        // turning the strip off (or switching to a platform with none) puts the
+        // padding straight back on the theme background. Unconditionally BEFORE the
+        // early-out below for exactly that reason.
+        self.backend.set_chrome_bleed(
+            (strip > 0)
+                .then(|| tab_bar::strip_bleed_tones(self.theme))
+                .flatten()
+                .map(|(color, seam)| aterm_render::ChromeBleed {
+                    rows: strip,
+                    color,
+                    seam,
+                }),
+        );
         if strip == 0 || !self.windows.contains_key(&wid) {
             return;
         }
@@ -18217,7 +18924,48 @@ impl App {
         let rename = self
             .inline_rename_edit(wid)
             .map(|edit| (edit.tab, edit.text.clone(), edit.cursor))
-            .and_then(|(tab, text, cursor)| Some((self.tab_index_for_id(wid, tab)?, text, cursor)));
+            .and_then(|(tab, text, cursor)| Some((self.tab_index_for_id(wid, tab)?, text, cursor)))
+            // IME-2: the rename field OWNS an in-flight composition (the render-
+            // time twin of `on_ime_commit`'s routing — rename outranks find):
+            // splice the preedit into the DISPLAYED text at the caret so composed
+            // CJK is visible in the well while typing a tab name. Display-only —
+            // the edit state itself holds no composition until commit. (The well
+            // paints no per-char underline — its painter has no underline input —
+            // so within this one field the caret riding inside the run is the
+            // composed-text cue.) The preedit bytes are folded into the strip
+            // fingerprint (`tab_strip_fingerprint_from_parts`), so the row cache
+            // rebuilds and the RepaintKey's strip term moves with each keystroke.
+            .map(|(tab, text, cursor)| {
+                match self
+                    .windows
+                    .get(&wid)
+                    .filter(|ws| !ws.preedit.is_empty())
+                    .map(|ws| field_preedit_display(&text, cursor, &ws.preedit, ws.preedit_caret))
+                {
+                    Some((display, caret, _)) => (tab, display, caret),
+                    None => (tab, text, cursor),
+                }
+            });
+        // THE PIXEL BAND's extra key (Windows): the band raster is a function of
+        // this window's own cell box + band lip + scale (mixed-DPI, font size)
+        // and of the asynchronously landing chrome faces — none of which the
+        // cell rows depend on, so none of which `StripCacheKey` carries. Folded
+        // into the hit below as one more equality term: a scale flip, a font-px
+        // change that happens to keep `cols`, or the UI face landing after the
+        // first frames each force ONE rebuild, which re-rasters the band.
+        #[cfg(windows)]
+        let band_key = {
+            let (cell_w, cell_h) = self.win_cell_size(wid);
+            let band_top = self.win_pad_top(wid) + self.win_head(wid);
+            let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale) as f32;
+            (
+                cell_w,
+                cell_h,
+                band_top,
+                scale.to_bits(),
+                crate::tray_raster::strip_band_font_epoch(),
+            )
+        };
         // Field-by-field BORROWED compare instead of building an owned
         // `StripCacheKey` up front: `==` on the tuple compares exactly these five
         // terms in exactly this way, so the hit/miss decision is unchanged — but
@@ -18225,7 +18973,12 @@ impl App {
         // `subtitle.clone()` on every presented frame. The key is materialized
         // below, only on a miss, by MOVING `subtitle` into it.
         let hit = self.windows.get(&wid).is_some_and(|ws| {
-            ws.cached_strip_rows.len() == strip
+            #[cfg(windows)]
+            let band_hit = ws.strip_band_key == band_key;
+            #[cfg(not(windows))]
+            let band_hit = true;
+            band_hit
+                && ws.cached_strip_rows.len() == strip
                 && ws.last_strip_fp.as_ref().is_some_and(|key| {
                     key.0 == tab_strip
                         && key.1 == cols
@@ -18268,6 +19021,7 @@ impl App {
                 Vec::new()
             };
             let mut strip_images = Vec::new();
+            let mut strip_rename_caret = None;
             let mut rows: Vec<Vec<RenderCell>> = Vec::with_capacity(strip);
             for r in 0..strip {
                 let mut row = vec![tab_bar::blank_cell(theme); cols];
@@ -18283,27 +19037,107 @@ impl App {
                             }
                         }),
                     };
-                    strip_images = tab_bar::paint_strip_with_metadata(
-                        &mut row,
-                        &segments,
-                        &titles,
-                        &metadata,
-                        paint,
-                        active,
-                        theme,
-                        self.config.active_tab_color_rgb(),
-                    );
+                    (strip_images, strip_rename_caret) =
+                        tab_bar::paint_strip_with_metadata_and_rename_caret(
+                            &mut row,
+                            &segments,
+                            &titles,
+                            &metadata,
+                            paint,
+                            active,
+                            theme,
+                            self.config.active_tab_color_rgb(),
+                        );
+                }
+                if r + 1 == strip {
+                    // The band's bottom edge, stamped AFTER the paint so it lands on
+                    // whatever the last row ended up being — segments or bare chrome
+                    // (a window with no tabs and no update alert paints no segments
+                    // at all, and that band still has to end somewhere). A no-op on
+                    // macOS, where the strip has no band to close.
+                    tab_bar::seal_strip_bottom(&mut row, theme);
                 }
                 rows.push(row);
             }
+            // T1 — the strip in the UI FONT (Windows): raster the band's text
+            // and marks as ONE pixel image over the freshly painted cells, from
+            // the SAME segments/titles/paint state (geometry converts cols→px
+            // through this window's own `cell_w`, so paint and hit-testing
+            // cannot disagree). `None`/empty ⇒ the legacy cell strip verbatim
+            // (no UI face yet, or nothing qualified) — see
+            // [`tab_bar::pixel_band`] for the fallback and coverage contract.
+            #[cfg(windows)]
+            let strip_band = {
+                let paint = tab_bar::StripPaint {
+                    hovered,
+                    subtitle: subtitle.as_deref(),
+                    rename: rename.as_ref().map(|(tab, text, cursor)| {
+                        tab_bar::StripRenameField {
+                            tab: *tab,
+                            text,
+                            cursor: *cursor,
+                        }
+                    }),
+                };
+                tab_bar::pixel_band::raster_band(
+                    &tab_bar::pixel_band::BandInput {
+                        segments: &segments,
+                        titles: &titles,
+                        metadata: &metadata,
+                        paint,
+                        active,
+                        theme,
+                        active_override: self.config.active_tab_color_rgb(),
+                        geometry: tab_bar::pixel_band::BandGeometry {
+                            cols,
+                            cell_w: band_key.0,
+                            cell_h: band_key.1,
+                            strip_rows: strip,
+                            band_top_px: band_key.2,
+                            scale: f32::from_bits(band_key.3),
+                        },
+                    },
+                    &strip_images,
+                )
+                .unwrap_or_default()
+            };
             if let Some(ws) = self.windows.get_mut(&wid) {
                 ws.tab_segments = segments;
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
+                ws.cached_strip_rename_caret = strip_rename_caret;
                 ws.last_strip_fp = Some((tab_strip, cols, show_update, hovered, subtitle));
+                #[cfg(windows)]
+                {
+                    ws.cached_strip_band = strip_band;
+                    ws.strip_band_key = band_key;
+                }
                 ws.strip_titles_scratch = titles;
                 ws.strip_metadata_scratch = metadata;
             }
+        }
+        // IME-2 (rename): while the RENAME well owns an in-flight composition,
+        // anchor the OS candidate window ON the well's caret cell — the exact
+        // reverse-video cell the paint above placed (cached under the strip
+        // fingerprint, which folds the rename text + preedit bytes, so a cache
+        // HIT means the caret column is unchanged too). The generic per-frame
+        // engine-caret reports are suppressed for `PreeditOwner::Rename` (the
+        // same gate Grid/Find use), so this is the frame's only rect and no
+        // flip-flop through winit is possible. FRAME coordinates: the well sits
+        // in the strip's last row, ABOVE the terminal band, which the
+        // band-coordinate report helper cannot express — hence the `_frame`
+        // core. Re-reported every splice (not only on cache misses) so a DPI or
+        // padding change mid-composition re-resolves the pixel rect; the
+        // helper's own `last_ime_rect` dedupe keeps the steady case free.
+        if matches!(
+            self.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Rename
+        ) && let Some(col) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.cached_strip_rename_caret)
+        {
+            self.report_ime_cursor_area_frame(wid, (strip.saturating_sub(1), col));
         }
         // Shift the composed frame DOWN by `strip` rows, prepending the (cached)
         // strip rows. The cache is passed by reference — disjoint field borrows of
@@ -18326,7 +19160,26 @@ impl App {
             grid_top,
             &mut ws.strip_row_pool,
         );
-        if let Some(image_row) = ws.input_scratch.images.get_mut(strip - 1) {
+        // THE PIXEL BAND (Windows): when the UI-font band rastered, its per-row
+        // `ImageRef` slices replace the icon list wholesale — the band bakes the
+        // icon/status marks itself (vertically centred), and any fallback
+        // segment's shipped rasters were merged back in at build time. An empty
+        // band (no UI face; the raster declined) is the legacy path verbatim.
+        #[cfg(windows)]
+        let band_applied = {
+            let applied = !ws.cached_strip_band.is_empty();
+            for (r, refs) in ws.cached_strip_band.iter().enumerate().take(strip) {
+                if let Some(image_row) = ws.input_scratch.images.get_mut(r) {
+                    image_row.clone_from(refs);
+                }
+            }
+            applied
+        };
+        #[cfg(not(windows))]
+        let band_applied = false;
+        if !band_applied
+            && let Some(image_row) = ws.input_scratch.images.get_mut(strip - 1)
+        {
             image_row.clone_from(&ws.cached_strip_images);
         }
     }
@@ -18446,13 +19299,35 @@ impl App {
         // geometry-dependent use of those cached rows.
         let stale_absolute_rows = frame_absolute_row_revision != match_absolute_row_revision;
         let delta = base_y_now.saturating_sub(match_base_y);
+        // IME-2: while the find field OWNS an in-flight composition
+        // ([`crate::app_input::PreeditOwner::Find`] — the render-time twin of
+        // `on_ime_commit`'s routing), the DISPLAYED query splices the preedit at
+        // the caret so composed CJK text is visible in the well, not invisible
+        // until commit. The SearchState itself is untouched — only the display
+        // string carries the composition, exactly like the grid overlay.
+        // Resolved through `preedit_owner` rather than re-deriving its terms:
+        // the first cut here checked only "preedit non-empty and no rename" and
+        // forgot the active-native-view term `PreeditOwner::Native` encodes, so
+        // a composition belonging to a frontmost native view spliced into a
+        // still-open find bar's well (52601619's review).
+        let owner_is_find = matches!(
+            self.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Find
+        );
+        let field_preedit = owner_is_find
+            .then(|| {
+                self.windows
+                    .get(&wid)
+                    .map(|ws| (ws.preedit.clone(), ws.preedit_caret))
+            })
+            .flatten();
         // Read the find state (bar view + the CURRENT match's terminal-band row + its
         // index + the frame/terminal row counts) before the disjoint-field borrow. The
         // full match set is NOT cloned out here — the highlight loop below borrows
         // `ws.search`'s `matches` in place (a field disjoint from `input_scratch.cells`),
         // avoiding an up-to-~800KB heap copy every presented frame while the bar is open.
         // `None` ⇒ not searching ⇒ no-op.
-        let Some((view, cur_term_row, cur_idx, nrows, term_rows)) =
+        let Some((view, preedit_span, cur_term_row, cur_idx, nrows, term_rows)) =
             self.windows.get(&wid).and_then(|ws| {
                 ws.search.as_ref().map(|s| {
                     // Terminal-band row of the current match: `sel_row + display_offset`,
@@ -18465,10 +19340,21 @@ impl App {
                             .get(s.current)
                             .map(|&(r, _, _)| i64::from(r).saturating_add(offset))
                     };
+                    // Display query + caret: the composition (when the field owns
+                    // one) spliced at the edit position. `preedit_span` is the
+                    // composed run's BYTE range in the display string, for the
+                    // underline + candidate-anchor pass after the rows land.
+                    let (query, cursor, preedit_span) = match &field_preedit {
+                        Some((preedit, pc)) => {
+                            let (q, c, r) = field_preedit_display(&s.query, s.cursor, preedit, *pc);
+                            (q, c, Some(r))
+                        }
+                        None => (s.query.clone(), s.cursor, None),
+                    };
                     (
                         crate::find_bar::FindBarView {
-                            query: s.query.clone(),
-                            cursor: s.cursor,
+                            query,
+                            cursor,
                             idx: s.current + 1,
                             total: s.matches.len(),
                             case_sensitive: s.case_sensitive,
@@ -18476,6 +19362,7 @@ impl App {
                             regex_error: s.regex_error,
                             truncated: s.truncated,
                         },
+                        preedit_span,
                         cur_term_row,
                         s.current,
                         ws.input_scratch.cells.len(),
@@ -18724,6 +19611,72 @@ impl App {
             let bot = ws.input_scratch.grid_bot_row;
             ws.input_scratch.grid_top_row = frame_band.end.min(bot);
         }
+        // IME-2: underline the composed run inside the well + anchor the OS
+        // candidate window on the well's caret. The well paints per CHAR (one
+        // cell each — its own pre-existing layout, CJK included), so this pass
+        // follows that exact layout and the underline cannot drift from the
+        // glyphs. The underline is how users tell composed-but-uncommitted text
+        // from the settled query; `chrome_band::cell` has no underline input, so
+        // it is stamped here on the already-spliced cells.
+        let mut ime_caret: Option<(u16, u16)> = None;
+        if let Some(span) = preedit_span.as_ref().filter(|r| !r.is_empty())
+            && !painted.field_cols.is_empty()
+        {
+            let pre_chars = view.query[..span.start].chars().count();
+            let run_chars = view.query[span.clone()].chars().count();
+            let scroll = painted.field_scroll;
+            let field = painted.field_cols.clone();
+            let frame_field_row = frame_bar_row + painted.field_row;
+            if let Some(rowv) = ws.input_scratch.cells.get_mut(frame_field_row) {
+                for i in pre_chars..pre_chars + run_chars {
+                    let Some(rel) = i.checked_sub(scroll) else {
+                        continue; // scrolled out past the well's left edge
+                    };
+                    let col = field.start + rel;
+                    if col >= field.end {
+                        break;
+                    }
+                    if let Some(cell) = rowv.get_mut(col) {
+                        cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+                    }
+                }
+            }
+            // The candidate list hugs the WELL's caret while the field owns the
+            // composition (terminal-band coords — the report helper adds the
+            // strip inset itself). Defensive boundary floor: both contributions
+            // to `view.cursor` are boundary-maintained, but a slice panic on the
+            // render path is never worth the assumption.
+            let mut cb = view.cursor.min(view.query.len());
+            while cb > 0 && !view.query.is_char_boundary(cb) {
+                cb -= 1;
+            }
+            let caret_chars = view.query[..cb].chars().count();
+            let caret_col = field.start
+                + caret_chars
+                    .saturating_sub(scroll)
+                    .min(field.len().saturating_sub(1));
+            ime_caret = Some((
+                u16::try_from(bar_row + painted.field_row).unwrap_or(u16::MAX),
+                u16::try_from(caret_col).unwrap_or(u16::MAX),
+            ));
+        }
+        // IME-2 fallback (52601619's review): the FIND field owns the
+        // composition, but the underline/anchor pass above painted nothing —
+        // a degraded 1-row panel can drop the well's columns entirely, and an
+        // empty preedit span authors no anchor. The generic engine-caret
+        // reports are suppressed while the field owns the composition, so
+        // without a rect from HERE the OS candidate window keeps whatever
+        // anchor a pre-composition frame left — the grid caret, rows away
+        // from the field. Anchor on the field's first column (the well's own
+        // row) instead: approximate, but ON the surface being composed into.
+        // Read before `painted.field_cols` moves into the hit record below.
+        let fallback_cell = (owner_is_find && ime_caret.is_none()).then(|| {
+            (
+                u16::try_from(bar_row + painted.field_row).unwrap_or(u16::MAX),
+                u16::try_from(painted.field_cols.start.min(cols.saturating_sub(1)))
+                    .unwrap_or(u16::MAX),
+            )
+        });
         // Record where the clickable toggle indicators + the editable well landed (their
         // row + column spans + the well's horizontal scroll), derived from the SAME
         // builder inputs as the paint, so the mouse hit-test reads exact geometry instead
@@ -18737,6 +19690,9 @@ impl App {
             band,
         });
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+        if let Some(cell) = ime_caret.or(fallback_cell) {
+            self.report_ime_cursor_area(wid, cell, (0, 0), true);
+        }
     }
 
     /// The theme an overlay card on window `wid` tints with. Tracks the live
@@ -19661,6 +20617,530 @@ fn preview_damage_from_compiled(
 /// history) — both bounded, so the latency bound holds up to those constants.
 pub(crate) const REFLOW_WORKER_STEP_LINES: usize = 50_000;
 
+/// LIVE GAUGE of the off-thread scrollback rewrap: how many `aterm-reflow`
+/// workers are driving a job RIGHT NOW, process-wide, how high that number has
+/// ever gone, and how many OS threads the hand-off site has created.
+///
+/// WHY A GAUGE, AND WHY IT IS NOT `cfg`-GATED. The all-tabs resize settle
+/// reaches the reflow hand-off ONCE PER PANE whose engine width changed, and
+/// nothing bounds how many panes that is: `resize_panes_scoped` walks every tab
+/// of the window, so a 30-tab x 4-pane workspace hands off 120 jobs inside ONE
+/// settle. What that costs is a property of the PEAK CONCURRENCY and of the
+/// THREAD COUNT — stacks, core oversubscription, resident detached history —
+/// not of the total work, so the numbers a bench has to be able to read are a
+/// high-water mark and a spawn count, not a duration. The counters are
+/// deliberately permanent rather than bench-only: a gauge compiled only into
+/// the bench would measure a code path the product does not run, and this one
+/// costs a handful of `Relaxed` RMWs per JOB, where a job is milliseconds of
+/// decompress + rewrap at its very cheapest.
+///
+/// `submitted` counts hand-offs on the MAIN thread (before any worker exists);
+/// `finished` counts completed jobs, from the worker guard's `Drop` or from the
+/// inline spawn-failure fallback. `submitted == finished` is therefore an exact
+/// QUIESCENCE witness — every job handed off has been re-attached or aborted —
+/// which is what lets a bench wait for a settle to converge instead of sleeping
+/// a guessed interval.
+pub(crate) mod reflow_gauge {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static RUNNING: AtomicU64 = AtomicU64::new(0);
+    static PEAK: AtomicU64 = AtomicU64::new(0);
+    static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+    static FINISHED: AtomicU64 = AtomicU64::new(0);
+    static THREADS: AtomicU64 = AtomicU64::new(0);
+
+    /// One instantaneous read of the gauge. The five fields are sampled by five
+    /// independent `Relaxed` loads, so a snapshot taken while workers are
+    /// churning is a coherent-enough diagnostic, not a linearizable tuple; a
+    /// snapshot taken at quiescence (`submitted == finished`) is exact.
+    #[cfg(any(test, feature = "bench-support"))]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) struct Snapshot {
+        /// Workers driving a job at this instant.
+        pub(crate) running: u64,
+        /// High-water mark of `running` since the last [`reset_peak`].
+        pub(crate) peak: u64,
+        /// Jobs handed off (main thread), since process start.
+        pub(crate) submitted: u64,
+        /// Jobs completed — re-attached, aborted, or cancelled — since process
+        /// start. Equal to `submitted` exactly when nothing is in flight.
+        pub(crate) finished: u64,
+        /// OS threads the hand-off site has CREATED since process start. This
+        /// is the number MPT-1 is about: it used to track `submitted` one for
+        /// one; with the bounded pool it is capped by
+        /// [`reflow_worker_ceiling`] no matter how many panes the settle
+        /// touches.
+        pub(crate) threads: u64,
+    }
+
+    /// Record a hand-off. Called on the MAIN thread, before the job can start,
+    /// so a reader can never observe `finished > submitted`.
+    pub(crate) fn submit() {
+        SUBMITTED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that an OS thread was successfully created to run reflow work.
+    pub(crate) fn note_thread_spawned() {
+        THREADS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A worker is about to drive a job. Raises `running` and folds the
+    /// high-water mark; the returned guard lowers `running` and raises
+    /// `finished` on drop, so an early return — or a panic unwinding out of the
+    /// worker body — can never leak a unit and wedge the gauge high forever.
+    #[must_use = "the returned guard's Drop is what lowers the live count"]
+    pub(crate) fn enter() -> Running {
+        let live = RUNNING.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        PEAK.fetch_max(live, Ordering::Relaxed);
+        Running { _seal: () }
+    }
+
+    /// The live-count guard minted by [`enter`].
+    pub(crate) struct Running {
+        /// Private so only [`enter`] can mint one.
+        _seal: (),
+    }
+
+    impl Drop for Running {
+        fn drop(&mut self) {
+            RUNNING.fetch_sub(1, Ordering::Relaxed);
+            FINISHED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The spawn-failure fallback rewrapped a job INLINE on the main thread. It
+    /// never becomes a worker, so it never takes an [`enter`] guard — but it did
+    /// consume a hand-off, and the quiescence witness must account for it.
+    pub(crate) fn note_inline() {
+        FINISHED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the gauge.
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn snapshot() -> Snapshot {
+        Snapshot {
+            running: RUNNING.load(Ordering::Relaxed),
+            peak: PEAK.load(Ordering::Relaxed),
+            submitted: SUBMITTED.load(Ordering::Relaxed),
+            finished: FINISHED.load(Ordering::Relaxed),
+            threads: THREADS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Re-baseline the high-water mark to the CURRENT live count, so a
+    /// measurement sweep reads the peak of its OWN arm rather than of every arm
+    /// before it. Never to zero: a worker still running is still running.
+    #[cfg(feature = "bench-support")]
+    pub(crate) fn reset_peak() {
+        PEAK.store(RUNNING.load(Ordering::Relaxed), Ordering::Relaxed);
+    }
+}
+
+/// THE SHIPPING CLAIM about reflow concurrency, stated as a function so a bench
+/// can assert against it instead of against a hand-tuned literal: the most
+/// `aterm-reflow` workers that may be driving jobs AT THE SAME INSTANT while a
+/// settle of `jobs` hand-offs converges.
+///
+/// SINCE MPT-1 THIS IS `min(reflow_worker_ceiling(), jobs)`. The hand-off no
+/// longer spawns a thread per job: it enqueues, and at most
+/// [`reflow_worker_ceiling`] pooled workers may be driving jobs at once, so a
+/// settle's concurrency is bounded by the machine and not by the workspace. It
+/// used to be `jobs` exactly — 120 simultaneous threads for a 30-tab x 4-pane
+/// window drag, from one drag of one window edge. Writing the bound down here
+/// rather than leaving it implicit is what lets
+/// `benches/workspace_scaling.rs` pin the number TWO-SIDED against the
+/// SHIPPING claim instead of against a literal.
+///
+/// An INSTANTANEOUS bound is the right shape to assert: it is exact (the gauge
+/// high-water mark either exceeded it or did not), whereas "threads created per
+/// settle" is only a bound in the absence of worker turnover mid-settle.
+#[cfg(feature = "bench-support")]
+pub(crate) fn reflow_thread_ceiling(jobs: usize) -> usize {
+    reflow_worker_ceiling().min(jobs.max(1))
+}
+
+/// The BOUND on concurrent off-thread scrollback rewraps, process-wide.
+///
+/// `min(available_parallelism, REFLOW_WORKER_MAX)`, floored at 1 and resolved
+/// once. WHY A CEILING AT ALL: the jobs are CPU-bound decompress + rewrap, so
+/// more workers than cores buys nothing and costs context switches; and each
+/// in-flight job holds its session's ENTIRE detached off-screen history
+/// resident, so the ceiling is also the bound on how many sessions' histories
+/// can be resident-but-detached at once.
+///
+/// WHY EIGHT, AND NOT THE FOUR THIS STARTED AT — the number was MEASURED, on
+/// `workspace_scaling`'s 30-tab x 4-pane settle, against the two spans a
+/// concurrency bound trades between: the MAIN-THREAD settle
+/// (`resize_settle`, what a live drag actually blocks on) and the
+/// user-facing whole (`settle_to_quiesce`, drag until every pane has its
+/// history back). Unbounded is the baseline:
+///
+/// | ceiling   | main-thread settle | settle→history-back | OS threads |
+/// |-----------|--------------------|---------------------|------------|
+/// | unbounded | 2.12 ms            | 3.72 ms             | 120        |
+/// | 4         | 0.60 ms            | 5.29 ms  (WORSE)    | 4          |
+/// | 8         | 0.71 ms            | 3.19 ms             | 6          |
+/// | 16        | 1.13 ms            | 2.05 ms             | 6          |
+///
+/// Four wins the drag and LOSES the property the user actually waits on — it
+/// throttles the rewrap below what the machine would have delivered, so
+/// scrollback comes back 42% later than before the "fix". Eight is the
+/// smallest ceiling that beats unbounded on BOTH spans at every point of the
+/// sweep (1x1 through 30x4), which is the bar a bound has to clear to be a win
+/// rather than a trade. Sixteen converges faster still, but pays for it on the
+/// span the user is holding the mouse through — and regresses the 8x4
+/// main-thread settle outright — so it is not free either.
+pub(crate) fn reflow_worker_ceiling() -> usize {
+    /// See [`reflow_worker_ceiling`].
+    const REFLOW_WORKER_MAX: usize = 8;
+    static CEILING: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CEILING.get_or_init(|| {
+        // `clamp`, not `min().max()`: the linter rejects the manual form, and
+        // the panic it warns about cannot arise here — `REFLOW_WORKER_MAX` is a
+        // constant well above the floor.
+        std::thread::available_parallelism()
+            .map_or(REFLOW_WORKER_MAX, std::num::NonZeroUsize::get)
+            .clamp(1, REFLOW_WORKER_MAX)
+    })
+}
+
+/// ONE hand-off from the resize path to the bounded reflow pool.
+///
+/// TWO closures, both over the SAME parking slot — which is exactly the shape
+/// the pre-pool code already had, lifted into a value so a queue can hold it:
+///
+/// * `run` — the worker body, byte-identical to the closure the per-job
+///   `Builder::spawn` used to receive (step loop, cancel check, panic guard,
+///   RFL-3 convergence, repaint).
+/// * `inline` — the BOUNDED main-thread fallback, byte-identical to the old
+///   spawn-failure arm (`INLINE_REFLOW_MAX_LINES`, then abort-with-log above
+///   it). It exists because a stranded job must NEVER be run unbounded on the
+///   UI thread — that is the L0 whole-Mac freeze this whole module removes.
+///
+/// Exactly one of them finds the job in the slot; the other's `take()` returns
+/// `None` and it is a no-op. That is the same mutual exclusion the pre-pool
+/// spawn-failure arm relied on, unchanged.
+struct ReflowHandoff {
+    run: Box<dyn FnOnce() + Send + 'static>,
+    inline: Box<dyn FnOnce() + Send + 'static>,
+    /// ACTIVE-tab panes go to the HEAD of the queue: the tab the user is
+    /// looking at gets its history back first, and the background panes
+    /// converge behind it. Purely an ORDER, never an admission decision — every
+    /// queued job is still driven to completion.
+    priority: bool,
+}
+
+/// The process-global reflow queue. See [`reflow_pool_submit`].
+struct ReflowPoolState {
+    queue: std::collections::VecDeque<ReflowHandoff>,
+    /// How many entries at the FRONT of `queue` are priority (active-tab) jobs.
+    /// Keeps FIFO order *within* each class: a new priority job is inserted at
+    /// this index, a background job is pushed to the back.
+    front: usize,
+    /// Workers alive right now (running a job, or between jobs). Mutated ONLY
+    /// under this lock, and a worker retires its own seat in the SAME critical
+    /// section in which it observes the queue empty — so a submitter can never
+    /// see a worker that is about to vanish and decline to start one.
+    workers: usize,
+}
+
+static REFLOW_POOL: std::sync::Mutex<ReflowPoolState> = std::sync::Mutex::new(ReflowPoolState {
+    queue: std::collections::VecDeque::new(),
+    front: 0,
+    workers: 0,
+});
+
+/// Signalled by [`reflow_pool_submit`] after every enqueue; waited on by an idle
+/// worker inside its linger window. See [`REFLOW_WORKER_LINGER`].
+static REFLOW_WORK: std::sync::Condvar = std::sync::Condvar::new();
+
+/// How long an idle pooled worker waits for the NEXT job before retiring.
+///
+/// WITHOUT A LINGER A POOL IS NOT A POOL, it is a rename of the thing it
+/// replaced. `resize_panes_scoped` submits its hand-offs one at a time down a
+/// single loop, and a worker that retires the instant it finds the queue empty
+/// will have retired before the next pane's job is enqueued whenever a job is
+/// shorter than the loop's next iteration. A 30-tab x 1-pane settle then
+/// creates 28 threads for its 30 jobs — the concurrency bound holds (one worker
+/// at a time), but the SPAWN COUNT, which is the number this whole change
+/// exists to collapse, does not move. Measured, on this machine: 30 threads
+/// unbounded, 28 with a retire-immediately pool, 1 with this linger.
+///
+/// 50 ms is chosen against the SUBMIT cadence, not the job length: it only has
+/// to outlast the gap between two panes' hand-offs inside one settle (tens of
+/// microseconds) with enough margin for a descheduled main thread, while being
+/// far too short for an idle process to keep threads parked (a settle is
+/// followed by silence, and the pool is empty ~50 ms later).
+const REFLOW_WORKER_LINGER: Duration = Duration::from_millis(50);
+
+/// Hand a reflow job to the bounded pool.
+///
+/// THE FIX FOR MPT-1. The old hand-off was one `Builder::spawn` per job with no
+/// pool and no semaphore: the per-session self-throttle bounds ONE session to
+/// one worker per cycle, but nothing bounded the number of SESSIONS, and
+/// `resize_panes_scoped` walks every tab of the window — so a 30-tab x 4-pane
+/// settle created 120 OS threads inside one window drag, oversubscribing the
+/// machine by 10-15x during the exact interval the user is still holding the
+/// window edge, and holding 120 detached histories resident at once.
+///
+/// The queue is the right structure because the jobs already are what a queue
+/// wants: independent, stepped, cancellable, and tolerant of supersede. Nothing
+/// about a job's BEHAVIOUR changes — the same closure runs, on a thread, to the
+/// same completion — only how many run at once and in what order.
+///
+/// Returns the hand-offs the caller must run INLINE (empty in every normal
+/// case): the pool could start no worker AND has none running, so nothing would
+/// ever drain the queue. That is the same thread-exhaustion arm the pre-pool
+/// code had, except that it now reclaims EVERY stranded job rather than only
+/// the one whose spawn happened to fail.
+fn reflow_pool_submit(handoff: ReflowHandoff) -> Vec<ReflowHandoff> {
+    let ceiling = reflow_worker_ceiling();
+    let mut state = REFLOW_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    if handoff.priority {
+        let at = state.front;
+        state.queue.insert(at, handoff);
+        state.front += 1;
+    } else {
+        state.queue.push_back(handoff);
+    }
+    // Wake a lingering worker BEFORE deciding to start a new one: an idle
+    // worker inside its linger window is already counted in `workers`, so the
+    // decision below correctly declines to spawn, and this is what makes it
+    // pick the job up instead of timing out.
+    REFLOW_WORK.notify_one();
+    // Start a worker only when one more could actually help: we are under the
+    // ceiling AND there is more queued than the live workers will pick up as
+    // their next job. A worker that is mid-job counts here on purpose — it will
+    // come back for the queue before it retires.
+    if state.workers >= ceiling || state.queue.len() <= state.workers {
+        return Vec::new();
+    }
+    state.workers += 1;
+    drop(state); // never spawn under the pool lock
+    if std::thread::Builder::new()
+        .name("aterm-reflow".into())
+        .spawn(reflow_worker_main)
+        .is_ok()
+    {
+        reflow_gauge::note_thread_spawned();
+        return Vec::new();
+    }
+    // Spawn failed (thread/FD exhaustion). Give the seat back; if that leaves
+    // NOBODY to drain the queue, hand every queued job back for the bounded
+    // inline fallback rather than let those panes' detached history wedge.
+    let mut state = REFLOW_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    state.workers = state.workers.saturating_sub(1);
+    if state.workers == 0 {
+        aterm_log::error!(
+            "reflow worker spawn failed with no live worker; rewrapping {} queued \
+             job(s) inline (bounded)",
+            state.queue.len()
+        );
+        state.front = 0;
+        state.queue.drain(..).collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// A worker's seat in the pool, released even if the worker unwinds.
+///
+/// The per-job `catch_unwind` in [`reflow_worker_main`] already absorbs a
+/// panicking job, so this guard covers only the pathological case — but WITHOUT
+/// it a lost accounting edge would leave the pool sitting at its ceiling with
+/// nothing draining the queue, and every queued pane's tiered history would
+/// stay invisible for the rest of the process. That is the audit-#5 failure
+/// mode, promoted from one session to a whole queue, so it is guarded.
+struct ReflowWorkerSeat {
+    /// `false` once the worker retired its own seat under the pool lock (the
+    /// normal exit); the `Drop` is then a no-op.
+    seated: bool,
+}
+
+impl Drop for ReflowWorkerSeat {
+    fn drop(&mut self) {
+        if !self.seated {
+            return;
+        }
+        // This may run DURING an unwind, where a second panic aborts the
+        // process — so the whole recovery is caught. It captures nothing, so it
+        // is trivially unwind-safe.
+        let _ = std::panic::catch_unwind(release_reflow_seat_and_replace);
+    }
+}
+
+/// The body of [`ReflowWorkerSeat::drop`]'s abnormal path: give the seat back
+/// and, if that left work queued with nobody to drain it, start a replacement.
+fn release_reflow_seat_and_replace() {
+    let mut state = REFLOW_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    state.workers = state.workers.saturating_sub(1);
+    if state.queue.is_empty() || state.workers > 0 {
+        return;
+    }
+    state.workers += 1;
+    drop(state);
+    if std::thread::Builder::new()
+        .name("aterm-reflow".into())
+        .spawn(reflow_worker_main)
+        .is_ok()
+    {
+        reflow_gauge::note_thread_spawned();
+        return;
+    }
+    let mut state = REFLOW_POOL.lock().unwrap_or_else(|p| p.into_inner());
+    state.workers = state.workers.saturating_sub(1);
+    aterm_log::error!("reflow worker died and no replacement could be started");
+}
+
+/// One pooled worker: drain the queue, one job at a time, then retire.
+///
+/// LONG-LIVED WITHIN A SETTLE, NOT FOREVER: a worker that finds the queue empty
+/// gives its seat back and exits, so a process that resizes once does not keep
+/// parked threads (and their stacks) around. The next settle starts fresh
+/// workers — at most `reflow_worker_ceiling()` of them, which is the whole
+/// point.
+fn reflow_worker_main() {
+    let mut seat = ReflowWorkerSeat { seated: true };
+    loop {
+        let handoff = {
+            let mut state = REFLOW_POOL.lock().unwrap_or_else(|p| p.into_inner());
+            let deadline = Instant::now() + REFLOW_WORKER_LINGER;
+            loop {
+                if let Some(handoff) = state.queue.pop_front() {
+                    // Popping index 0 pops a priority job exactly when the
+                    // priority run is non-empty.
+                    state.front = state.front.saturating_sub(1);
+                    break Some(handoff);
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    // RETIRE UNDER THE SAME LOCK that observed the queue empty:
+                    // a submitter holding this lock next therefore sees an
+                    // accurate `workers` and starts a replacement if it needs
+                    // one. Disarming the seat after the decrement cannot panic
+                    // in between.
+                    state.workers = state.workers.saturating_sub(1);
+                    seat.seated = false;
+                    break None;
+                }
+                // LINGER (see `REFLOW_WORKER_LINGER`): a settle enqueues its
+                // panes one at a time, so an empty queue usually means "the
+                // next job is microseconds away", not "the work is done".
+                // Waiting here is what turns one thread per JOB into one thread
+                // per BURST. A spurious wake just re-checks the queue.
+                let (next, _) = REFLOW_WORK
+                    .wait_timeout(state, left)
+                    .unwrap_or_else(|p| p.into_inner());
+                state = next;
+            }
+        };
+        let Some(handoff) = handoff else {
+            return;
+        };
+        // The job body is the SAME closure the pre-pool hand-off spawned, with
+        // its own inner `catch_unwind`s and recovery arms untouched. The outer
+        // guard here keeps a panic that somehow escaped them from taking the
+        // WORKER down — which, unlike a dedicated thread dying, would strand
+        // every other pane still queued behind it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(handoff.run));
+    }
+}
+#[cfg(test)]
+mod reflow_pool_tests {
+    use super::{ReflowHandoff, reflow_pool_submit, reflow_worker_ceiling};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    /// THE POOL'S TWO CONTRACTS, both pinned here because MPT-1's whole claim
+    /// rests on them: every submitted job is driven EXACTLY ONCE (nothing is
+    /// dropped — a dropped job leaves its session's tiered history invisible for
+    /// the rest of the process, the audit-#5 failure), and no more than
+    /// `reflow_worker_ceiling()` jobs are ever in flight at the same instant.
+    ///
+    /// The peak assertion is a GLOBAL invariant of the pool, so it stays valid
+    /// even though libtest runs this alongside other tests that submit their own
+    /// reflow jobs; the per-job counters only ever count this test's own jobs.
+    #[test]
+    fn the_pool_runs_every_job_once_and_never_exceeds_its_ceiling() {
+        const JOBS: usize = 64;
+        let ceiling = reflow_worker_ceiling();
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let stranded_inline = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new((Mutex::new(0usize), Condvar::new()));
+
+        for _ in 0..JOBS {
+            let (live, peak, ran, done) =
+                (live.clone(), peak.clone(), ran.clone(), Arc::clone(&done));
+            let inline_seen = stranded_inline.clone();
+            let run = move || {
+                let now = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // Long enough that jobs genuinely overlap (so a broken bound
+                // would be OBSERVED, not merely unrefuted), short enough that
+                // 64 of them finish well inside the wait below.
+                std::thread::sleep(Duration::from_millis(2));
+                live.fetch_sub(1, Ordering::SeqCst);
+                ran.fetch_add(1, Ordering::SeqCst);
+                let (lock, cv) = &*done;
+                *lock.lock().unwrap_or_else(|p| p.into_inner()) += 1;
+                cv.notify_all();
+            };
+            let inline = move || {
+                inline_seen.fetch_add(1, Ordering::SeqCst);
+            };
+            let stranded = reflow_pool_submit(ReflowHandoff {
+                run: Box::new(run),
+                inline: Box::new(inline),
+                priority: false,
+            });
+            // With threads available the pool never strands anything; if this
+            // machine could not spawn even one worker the fallback ran the job
+            // inline, which is the documented (bounded) degradation.
+            for job in stranded {
+                (job.inline)();
+            }
+        }
+
+        let (lock, cv) = &*done;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen = lock.lock().unwrap_or_else(|p| p.into_inner());
+        while *seen + stranded_inline.load(Ordering::SeqCst) < JOBS {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the pool left {} of {JOBS} jobs undriven — a dropped job wedges \
+                 that session's tiered history forever",
+                JOBS - *seen
+            );
+            let (next, _) = cv
+                .wait_timeout(seen, Duration::from_millis(50))
+                .unwrap_or_else(|p| p.into_inner());
+            seen = next;
+        }
+        drop(seen);
+
+        assert_eq!(
+            ran.load(Ordering::SeqCst) + stranded_inline.load(Ordering::SeqCst),
+            JOBS,
+            "every submitted job must be driven exactly once"
+        );
+        let observed = peak.load(Ordering::SeqCst);
+        assert!(
+            observed <= ceiling,
+            "{observed} jobs were in flight at once, above the pool ceiling \
+             {ceiling} — the bound MPT-1 exists to impose is not being imposed"
+        );
+        assert!(
+            observed >= 1 || stranded_inline.load(Ordering::SeqCst) == JOBS,
+            "no job was ever observed in flight and nothing fell back to the \
+             inline arm, so the ceiling assertion above proved nothing"
+        );
+    }
+}
+
 /// Drive a detached scrollback-reflow job to completion in bounded
 /// [`reflow_step`](aterm_core::grid::PendingScrollbackReflow::reflow_step)
 /// increments of `step_budget` input lines, checking `cancel` BETWEEN steps.
@@ -20275,10 +21755,26 @@ mod config_notice_overlay_tests {
             !input.cursor_visible,
             "the cursor is a later-painted overlay and must not cover the banner"
         );
-        assert!(
-            !input.selection.has_selection(),
-            "selection tint is part of the row renderer and must not recolor the banner"
-        );
+        // Selection tint is part of the row renderer and must not recolor the
+        // banner. Asserted as the PROPERTY — no cell inside the band paints as
+        // selected — rather than as "the snapshot selection was destroyed", which
+        // was the old implementation. SELECTION CUSTODY Phase 2 narrows the
+        // frame-space clip instead of erasing the selection, so rows OUTSIDE the
+        // band keep their highlight; what matters is that rows inside it do not.
+        let banner_rows = app
+            .config_notice
+            .as_ref()
+            .unwrap()
+            .wanted_rows()
+            .min(input.rows);
+        for frame_row in 0..banner_rows {
+            for col in 0..input.cols {
+                assert!(
+                    !input.selection_contains_cell(frame_row, col, false, false),
+                    "banner cell ({frame_row},{col}) must not paint as selected"
+                );
+            }
+        }
         let panel_rows = app
             .config_notice
             .as_ref()
@@ -20352,6 +21848,49 @@ mod config_notice_overlay_tests {
             title.to_ascii_lowercase().contains("config"),
             "native framebuffer includes the diagnostic cell band: {title:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_strip_bleed_tests {
+    use crate::{App, WindowId, tab_bar};
+
+    /// The strip's band must reach the WINDOW edges, not the grid's. A strip cell can
+    /// only paint its own cell rect, so without a declared `ChromeBleed` the band and
+    /// its seam stop `pad` px short of the left and right edges and `pad_top + head`
+    /// px short of the top — a rectangle floating in a margin of terminal background.
+    /// This pins the wiring end to end: composing a frame hands the live renderer the
+    /// strip's own tones for exactly the strip's rows, and turning the strip off hands
+    /// back `None` so the padding returns to the theme background.
+    #[test]
+    fn composing_a_strip_hands_the_renderer_its_band_and_seam_for_the_padding() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.splice_tab_strip_with(wid, 1);
+        let want = tab_bar::strip_bleed_tones(app.theme);
+        match (app.backend.chrome_bleed(), want) {
+            (Some(bleed), Some((color, seam))) => {
+                assert_eq!(bleed.rows, 1, "exactly the strip's rows are chrome");
+                assert_eq!(bleed.color, color, "…in the strip's OWN band tone");
+                assert_eq!(bleed.seam, seam, "…and the seam continues into the gutters");
+                assert_ne!(
+                    bleed.color,
+                    app.theme.bg & 0x00ff_ffff,
+                    "a band that equals the terminal background is not a band"
+                );
+            }
+            // macOS: the strip has no surface of its own, so there is nothing to bleed
+            // and the padding keeps the tone it always had.
+            (got, None) => assert_eq!(got, None, "no band ⇒ no bleed"),
+            (None, Some(_)) => panic!("a chrome band was never handed to the renderer"),
+        }
+
+        // Turning the strip off must put the padding straight back on the theme
+        // background — the reason the setter runs BEFORE the `strip == 0` early-out.
+        app.tab_strip_rows = 0;
+        app.splice_tab_strip_with(wid, 1);
+        assert_eq!(app.backend.chrome_bleed(), None, "no strip ⇒ no bleed");
     }
 }
 
@@ -22063,6 +23602,229 @@ mod find_bar_splice_tests {
                 "no highlight-all tint anywhere in a split (row {r})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod ime_preedit_splice_tests {
+    //! IME-2 (the app half): ROUTING of an in-flight composition between the
+    //! grid, the find field and the rename field ([`crate::app_input::
+    //! PreeditOwner`]), the two FIELD splices that paint it inline, and the
+    //! candidate-window anchor each field authors.
+    //!
+    //! The GRID arm is not exercised here: it is upstream's renderer-level
+    //! `RenderInput::overlay_ime_preedit`, covered by its own unit tests in
+    //! aterm-core (`render.rs`) plus the `preedit_fingerprint` key tests in
+    //! `crate::preedit_fingerprint_tests`. These tests own only what the
+    //! Windows line adds on top of it — the field routing and field anchors.
+    //!
+    //! What a headless test CANNOT witness is a real OS IME driving
+    //! `Ime::Preedit` through winit — that needs a human with an IME installed.
+
+    use crate::{App, WindowId, term_lock};
+    use aterm_core::terminal::UnderlineStyle;
+
+    fn fill_scratch(app: &mut App, wid: WindowId) {
+        let (rows, cols) = {
+            let ws = app.windows.get(&wid).unwrap();
+            (ws.rows as usize, ws.cols as usize)
+        };
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let ws = app.windows.get_mut(&wid).unwrap();
+        let mut term = term_lock(&terminal);
+        term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+    }
+
+    /// Routing (the `on_ime_commit` precedence, render-time): with the find bar
+    /// open the FIELD owns the composition — the grid splice stays out, the well
+    /// shows the composed text underlined at the field caret, and the candidate
+    /// window anchors on the well.
+    #[test]
+    fn find_field_owns_the_preedit() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"$ ");
+        app.search_enter();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .set_query("ab".to_string());
+        app.on_ime_preedit(wid, "中".to_string(), Some((0, "中".len())));
+        assert_eq!(
+            app.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Find,
+            "an open find bar claims the composition"
+        );
+        fill_scratch(&mut app, wid);
+        app.splice_find_bar(wid);
+        let ws = app.windows.get(&wid).unwrap();
+        let hit = ws.find_bar_hit.as_ref().expect("panel geometry");
+        let row = &ws.input_scratch.cells[hit.row];
+        let text: String = row[hit.field_cols.clone()].iter().map(|c| c.ch).collect();
+        assert!(
+            text.starts_with("ab中"),
+            "the well displays the composition inline: {text:?}"
+        );
+        let run_col = hit.field_cols.start + 2 - hit.field_scroll;
+        assert_eq!(
+            row[run_col].underline,
+            UnderlineStyle::Single,
+            "the composed char is underlined in the well"
+        );
+        assert_eq!(
+            row[hit.field_cols.start].underline,
+            UnderlineStyle::None,
+            "settled query text is not underlined"
+        );
+        assert!(
+            ws.last_ime_rect.is_some(),
+            "the candidate window anchored on the well's caret"
+        );
+        // The composition is DISPLAY-only: the search state itself is untouched.
+        assert_eq!(ws.search.as_ref().unwrap().query, "ab");
+    }
+
+    /// 52601619's review #2: a composition owned by a frontmost NATIVE view
+    /// (`PreeditOwner::Native` — its own text pipeline paints the preedit) must
+    /// not splice into a still-open find bar's well. The find splice's guard
+    /// originally re-derived ownership as "preedit non-empty and no rename",
+    /// missing exactly this term; it now asks `preedit_owner` itself.
+    #[test]
+    fn native_view_composition_stays_out_of_the_find_well() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"$ ");
+        app.search_enter();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .set_query("ab".to_string());
+        fill_scratch(&mut app, wid);
+        // A native view comes to the front while the find bar's state survives
+        // behind it. The ids are synthetic — `preedit_owner` only asks whether
+        // a native view is frontmost, not whether it resolves.
+        app.windows.get_mut(&wid).unwrap().front_content =
+            Some(crate::front_content::FrontContent::Native {
+                instance: crate::tab_model::AppInstanceId::from_stored(7),
+                view: crate::tab_model::ViewId::from_stored(44),
+            });
+        app.on_ime_preedit(wid, "中".to_string(), Some((0, "中".len())));
+        assert_eq!(
+            app.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Native,
+            "the frontmost native view claims the composition"
+        );
+        app.splice_find_bar(wid);
+        let ws = app.windows.get(&wid).unwrap();
+        let hit = ws.find_bar_hit.as_ref().expect("panel geometry");
+        let row = &ws.input_scratch.cells[hit.row];
+        let text: String = row[hit.field_cols.clone()].iter().map(|c| c.ch).collect();
+        assert!(
+            !text.contains('中'),
+            "a native view's composition must not splice into the find well: {text:?}"
+        );
+        assert!(
+            text.starts_with("ab"),
+            "the settled query still paints: {text:?}"
+        );
+    }
+
+    /// Routing: the inline tab-rename field outranks find (its key gate sits
+    /// above find's, mirroring `on_ime_commit`), and the grid stays out.
+    #[test]
+    fn rename_field_outranks_find_for_the_preedit() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // The in-grid rename surface only presents while the strip is on screen
+        // (headless defaults it off) — same seeding as the strip's own tests.
+        app.tab_strip_rows = 1;
+        app.begin_active_session_rename(wid);
+        assert!(app.inline_rename_edit(wid).is_some(), "rename field open");
+        app.on_ime_preedit(wid, "に".to_string(), Some((0, 0)));
+        assert_eq!(
+            app.preedit_owner(wid),
+            crate::app_input::PreeditOwner::Rename
+        );
+        fill_scratch(&mut app, wid);
+        // 52601619's review #1: the candidate window anchors ON THE WELL — the
+        // strip's own row, above the terminal band — not on the grid caret.
+        // (Both generic engine-caret reports are gated off for `Rename`; the
+        // strip splice is the frame's one reporter.)
+        app.splice_tab_strip(wid);
+        let (cw, ch) = app.win_cell_size(wid);
+        let (band_x, band_y) = app.frame_origin(wid);
+        let strip_row_y = i64::try_from(app.win_pad_top(wid) + app.win_head(wid))
+            .unwrap()
+            .saturating_add(band_y);
+        let ws = app.windows.get(&wid).unwrap();
+        let caret_col = ws
+            .cached_strip_rename_caret
+            .expect("the rename well painted a caret cell");
+        let rect = ws
+            .last_ime_rect
+            .expect("the strip splice anchored the candidate window");
+        assert_eq!(
+            i64::from(rect.1),
+            strip_row_y,
+            "the anchor sits on the strip row (frame row 0), not on grid row 0 at y+{ch}"
+        );
+        assert_eq!(
+            i64::from(rect.0),
+            i64::try_from(caret_col * cw + app.win_pad(wid))
+                .unwrap()
+                .saturating_add(band_x),
+            "the anchor's column is the well's reverse-video caret cell"
+        );
+    }
+
+    /// An `Ime::Enabled`/`Disabled`/empty preedit clears ownership entirely, so
+    /// EVERY paint surface — the grid overlay and both field splices — sees
+    /// `None` and the common path stays zero-cost (one `is_empty()` on a
+    /// resident `String`: no allocation, no lock, no layout).
+    #[test]
+    fn empty_preedit_owns_nothing() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.on_ime_preedit(wid, String::new(), None);
+        assert_eq!(app.preedit_owner(wid), crate::app_input::PreeditOwner::None);
+        // The idle key is byte-identical to the pre-composition shape, so the
+        // settled-screen early-out still swallows the frame (FL-1).
+        assert_eq!(
+            crate::preedit_fingerprint(
+                &app.windows.get(&wid).unwrap().preedit,
+                app.windows.get(&wid).unwrap().preedit_caret,
+            ),
+            0,
+            "no composition ⇒ zero repaint term (idle invariant)"
+        );
+    }
+
+    /// The find well's composition rides on `preedit_caret` — winit's caret
+    /// RANGE is reduced to its START at the event boundary
+    /// (`App::on_ime_preedit`), and that single offset is what both the grid
+    /// overlay and the field splices draw the caret at.
+    #[test]
+    fn the_caret_range_is_reduced_to_its_start() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.on_ime_preedit(wid, "日本語".to_string(), Some(("日".len(), "日本".len())));
+        assert_eq!(
+            app.windows.get(&wid).unwrap().preedit_caret,
+            Some("日".len()),
+            "the range START is retained; the end is winit's selection extent"
+        );
     }
 }
 

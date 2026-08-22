@@ -103,54 +103,96 @@ pub const FACE_DETAIL_MIN_H: u32 = 56;
 /// carry it as a STROKE rather than a bridge.
 pub const MOUTH_DETAIL_MIN_H: u32 = 40;
 
-/// The vertical size, in DEVICE pixels, a collapsed eye dot grows toward. The
-/// review's fixed ~1.6× was tuned on the chibi rig's balloon eyes; with the
-/// artist's proportions restored the roster's eye subpaths span 3–4.5 px at
-/// ship size, and one multiple cannot serve both ends — 1.6× leaves the
-/// purr's thin happy arc under the 2×2 dark-core bar while anything strong
-/// enough for the arc doubles the open eye. So the growth is size-aware:
-/// each dot scales by `TARGET / authored_height_px`, which converges to 1×
-/// exactly as the canvas grows toward [`FACE_DETAIL_MIN_H`]. At h = 36 an
-/// open eye lands ≈1.6× (the review's number, preserved where it was right)
-/// and the happy arc gets the ≈2.2× it actually needs. Horizontal growth
-/// starts from the same factor and is clamped per neighbouring dot to keep
-/// [`EYE_DOT_GAP_PX`] of daylight.
-pub const EYE_DOT_TARGET_H_PX: f32 = 7.0;
+/// The vertical size, in DEVICE pixels, a collapsed OPEN eye dot grows
+/// toward — the legibility floor, not an aesthetic size.
+///
+/// This constant is where the owner's "the kitty eyes are too big" bug
+/// lived. The first size-aware law aimed every dot at 7 px — the number
+/// that made the purr's thin arc pass the dark-core bar at the 36 px
+/// acceptance bake — and open eyes rode the same target. On a 1× Linux
+/// desktop the default cell (cell_h 14) bakes the pet 24 px tall, where the
+/// authored open eye is 3.0 px — 12.4% of body height — and the 7 px target
+/// drove it to the 2.2× ceiling: a 6.5 px dot, 27% of the body, twice the
+/// artist's proportion. Every Retina mac dodged the bug by geometry (its 2×
+/// device-pixel bake lands at h ≈ 72, above [`FACE_DETAIL_MIN_H`], where no
+/// LOD runs at all), so the inflated face WAS the everyday kitty precisely
+/// and only on 1× displays.
+///
+/// The corrected law grows an open eye only far enough to HOST its
+/// guaranteed dark core: [`EYE_DASH_CORE_PX`] (3.4 px — two full rows and
+/// columns at every raster phase) plus headroom for the authored curve to
+/// peek around the plug. At the Linux default bake the eye lands at 4 px —
+/// 16.7% of body height against the authored 12.4% — and from h ≈ 28 up the
+/// authored eye already clears the target and the growth is IDENTITY: a 36
+/// or 48 px bake now paints the open eyes exactly as drawn. Measured on the
+/// probe sweep (stand/sit/walk rosters, both grounds): before, 27% of body
+/// height at h = 24 and 19.4% at h = 36; after, 16.7% and the authored
+/// 12.3–12.4%.
+pub const EYE_DOT_TARGET_H_PX: f32 = 4.0;
 
-/// Ceiling on the size-aware growth. Uncapped, a 1 px feature at a tiny cell
-/// would grow 7× and paint an eye the size of the muzzle; past ~2.2× a grown
-/// round eye stops reading as the authored shape at all, so the LOD accepts a
-/// sub-bar core at degenerate sizes rather than inventing a new face.
+/// The vertical target for SHALLOW eye subpaths — the happy arcs and closed
+/// lids. Deliberately EQUAL to [`EYE_DASH_CORE_PX`]: an arc is a thin band
+/// whose dark rows the raster grid rations, and the band needs to grow
+/// exactly until the guaranteed core plug fits inside it — any further and
+/// the lid stops reading as a lid. The old 7 px target pushed every arc to
+/// its 2.8× ceiling at every LOD size, painting the purr's 2.0 px squint
+/// 5.7 px tall at a 36 px bake; at this target the same squint carries 3.4 px
+/// — two guaranteed dark rows with the chevron's wings still showing — and
+/// the sleeping faces keep their lids readable as LIDS, clearly shorter than
+/// the 4 px open dot beside a purr's smile.
+pub const EYE_DOT_TARGET_H_PX_ARC: f32 = 3.4;
+
+/// Ceiling on a shallow subpath's HORIZONTAL growth. The old law grew arcs
+/// uniformly, and the width is where the sunglasses came from: at the 2.8×
+/// vertical ceiling the purr's pair painted 9.3 + 8.2 px of dark band across
+/// a 24 px cat — the whole muzzle top fused into one mask, and the sleeper
+/// "wearing sunglasses" was the owner-visible symptom. An arc's WIDTH already
+/// carries its expression at the authored proportion (13.8% of body width,
+/// the widest feature on the face); what rasterization starves is only its
+/// interior rows, which the vertical target and the core plug restore. 1.6×
+/// is enough spare width that the plug plus wings read as one dash while the
+/// dash stays clearly WIDER than the open dot it must never be confused with
+/// (a lid that reads as an open eye is a sleeping cat that reads awake — the
+/// `sleep_0` bug of the first LOD pass).
+pub const EYE_DOT_ARC_KX_MAX: f32 = 1.6;
+
+/// Ceiling on the size-aware growth of an open eye. With the target at
+/// [`EYE_DOT_TARGET_H_PX`] this only binds below h ≈ 15 — cells no live
+/// metric produces — but it stays: uncapped, a degenerate 1 px feature would
+/// grow 4× and paint an eye the size of the muzzle, so the LOD accepts a
+/// sub-bar core at absurd sizes rather than inventing a new face.
 pub const EYE_DOT_SCALE_MAX: f32 = 2.2;
 
-/// The ceiling for SHALLOW eye subpaths — the happy arcs and closed lids,
-/// authored under [`EYE_DOT_SHALLOW_ASPECT`] of height per width. A round eye
-/// is solid ink, so any growth only widens an already-solid core; an arc is a
-/// thin BAND, and what survives rasterization is the band's interior rows.
-/// At 2.2× the artist's 8.4-unit arc carries a ~3.1 px band at a 36 px bake —
-/// about ONE fully-dark interior row, so whether a 2×2 core existed depended
-/// on which side of a pixel boundary the head landed (the purr passed the
-/// bar; the loaf, the same arc four rows lower, failed it). 2.8× makes the
-/// central band ~3.9 px while the whole arc stays 5.7 px tall against the
-/// open eye's 7 — still a fat ^, not a ball. Growth alone cannot finish the
-/// job, though: the chevron's wings SLOPE, so away from the centre column
-/// the fully-covered rows thin out and the 2×2 stays phase-dependent at any
+/// The growth ceiling for SHALLOW eye subpaths. A round eye is solid ink, so
+/// growth only widens an already-solid core; an arc is a thin BAND, and what
+/// survives rasterization is the band's interior rows — the roster's 1.2 px
+/// arcs at the Linux-default 24 px bake need 2.8× to reach the
+/// [`EYE_DOT_TARGET_H_PX_ARC`] band, where a round eye never needs more than
+/// ~1.5×. Growth alone cannot make the band's dark rows a guarantee, though:
+/// the chevron's wings SLOPE, so away from the centre column the
+/// fully-covered rows thin out and a 2×2 core stays phase-dependent at any
 /// sane ceiling — which is what [`EYE_DASH_CORE_PX`] is for.
 pub const EYE_DOT_SCALE_MAX_SHALLOW: f32 = 2.8;
 
-/// Side, in device pixels, of the solid CORE PLUG a shallow eye gets under
-/// the LOD: a small square of the eye ink filled at the subpath's centre,
-/// clamped to the grown arc's own footprint. 3.4 px covers two full pixel
-/// rows and two full columns at every sub-pixel phase (2 px for the bar,
-/// plus one boundary crossing, plus anti-aliasing slack); the grown arc
-/// band at a 36 px bake is ~3.9 px tall and ~4.9 px wide, so the plug
-/// disappears INTO the arc — it thickens the stroke's heart rather than
-/// painting any new feature. This is what makes the ≥2×2-dark-core bar a
-/// GUARANTEE for the happy-arc and lidded faces (the loaf, the purr, the
-/// sleepers) instead of a coin flip against the rasterizer's grid, while
-/// the arc itself keeps carrying the expression. At degenerate sizes the
-/// clamp to the arc footprint wins and the core goes sub-bar with it —
-/// the bar is pinned at ship size, not at every size.
+/// Side, in device pixels, of the solid CORE PLUG every LOD eye gets: a
+/// small square of the eye ink filled at the subpath's centre, clamped to
+/// the grown dot's own footprint. 3.4 px covers two full pixel rows and two
+/// full columns at every sub-pixel phase (2 px for the bar, plus one
+/// boundary crossing, plus anti-aliasing slack).
+///
+/// Originally the plug patched only the shallow arcs and the compressed far
+/// cores, because the open eyes' 7 px growth target made their cores huge by
+/// brute force. With open growth pulled back to the authored proportion
+/// (see [`EYE_DOT_TARGET_H_PX`]) the plug is the guarantee for EVERY eye:
+/// a 4 px solid ellipse's fully-covered pixels are phase-dependent, a 3.4 px
+/// solid square's are not. Inside a 4 px round dot the square's corners poke
+/// ~0.3 px past the curve — under half an anti-aliased pixel, invisible —
+/// and inside anything larger it vanishes entirely. Two clamps keep it
+/// honest: the footprint clamp (the plug may not exceed the grown dot, so a
+/// degenerate size gets a sub-bar core rather than a square eye) and the
+/// pair-daylight clamp (the plug may not close the [`EYE_DOT_GAP_PX`] gap
+/// its own ellipse was throttled to keep — plugs painted at authored centres
+/// would otherwise fuse exactly the close-set pairs the guard exists for).
 pub const EYE_DASH_CORE_PX: f32 = 3.4;
 
 /// Aspect (bbox height ÷ width, measured in DEVICE pixels — the frame where
@@ -209,12 +251,34 @@ pub const EYE_DOT_FAR_CORE_MIN_W_FRAC: f32 = 2.0 / 24.0;
 
 /// Horizontal daylight, in DEVICE pixels, an eye dot must keep from each
 /// sibling dot. The chibi pass authored the pair nearly touching (≈6.5 art
-/// units — barely one device pixel at ship size), so unguarded 1.6× growth
-/// would fuse the eyes into one dark mask: strictly worse than the gray it
+/// units — barely one device pixel at ship size), so unguarded growth would
+/// fuse the eyes into one dark mask: strictly worse than the gray it
 /// replaces, two eyes that read as none. Device pixels rather than a frame
 /// fraction because fusion is a raster phenomenon — the same authored gap is
 /// generous at 96 px and gone at 40.
+///
+/// The guard cuts BELOW authored width when it must. At the Linux-default
+/// 24 px bake the frontal pairs' authored gap is itself sub-pixel (0.9 px),
+/// so even zero growth leaves the pair bridged by each other's anti-aliasing
+/// — daylight outranks authored width there, and each dot narrows a little
+/// (floored at [`EYE_DOT_FAR_CORE_MIN_W_FRAC`], so an eye can thin but never
+/// thin AWAY) until the full gap opens. Two slightly-narrow eyes with a
+/// clear coat column between them read as a face; two authored-width eyes
+/// sharing one smudged bridge pixel read as a mask.
 pub const EYE_DOT_GAP_PX: f32 = 1.3;
+
+/// Ceiling on how far an OPEN eye's painted height may outrun its painted
+/// width — grown h ≤ this × grown w. The daylight guard narrows a close-set
+/// pair while the vertical target still wants its device pixels, and without
+/// a coupling the Linux-default frontal faces painted 2.3 × 4.0 px eyes:
+/// tall bars, the startled-mask look again by another route. An open eye is
+/// authored round (bbox aspects 0.95–1.25); this cap lets rasterization win
+/// a little height (a 2-wide dot may still be 2.8 tall) but keeps the dot
+/// recognizably a DOT, trading guaranteed-core rows for roundness only where
+/// the daylight guard has already judged width the scarcer resource. Arcs
+/// and compressed far cores are exempt: their whole point is a non-round
+/// aspect.
+pub const EYE_DOT_ROUND_ASPECT_MAX: f32 = 1.4;
 
 /// Bounding box of one fixed-point subpath in the glyph's normalized 0..1
 /// frame, `(x0, y0, x1, y1)` — control points included, the same generous
@@ -259,22 +323,29 @@ fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathT
 }
 
 /// The LOD eye pass: each subpath of the `Eye` layer — one authored eye — is
-/// refilled solid as its own dot, grown toward [`EYE_DOT_TARGET_H_PX`] of
-/// device height (capped at [`EYE_DOT_SCALE_MAX`], or
-/// [`EYE_DOT_SCALE_MAX_SHALLOW`] for arc/lid dashes) about its own centre
-/// ([`zoom_about`], so neither eye drifts), with horizontal growth clamped so
-/// the pair keeps [`EYE_DOT_GAP_PX`] of daylight. A foreshortened 3/4 far eye
-/// (see [`EYE_DOT_FAR_COMPRESS_RATIO`]) keeps the full vertical growth but is
+/// refilled solid as its own dot, grown about its own centre ([`zoom_about`],
+/// so neither eye drifts) toward the legibility target for its SHAPE:
+/// [`EYE_DOT_TARGET_H_PX`] of device height for an open round eye (capped at
+/// [`EYE_DOT_SCALE_MAX`]) or [`EYE_DOT_TARGET_H_PX_ARC`] for a shallow
+/// arc/lid dash (capped at [`EYE_DOT_SCALE_MAX_SHALLOW`] vertically and
+/// [`EYE_DOT_ARC_KX_MAX`] horizontally — the dash thickens but never widens
+/// into a mask). Horizontal growth is clamped per neighbouring dot so the
+/// pair keeps [`EYE_DOT_GAP_PX`] of daylight — cutting below authored width
+/// when the authored gap is itself sub-pixel — and an open eye's height is
+/// then held within [`EYE_DOT_ROUND_ASPECT_MAX`] of whatever width survived,
+/// so the dot stays a dot. A foreshortened 3/4 far eye (see
+/// [`EYE_DOT_FAR_COMPRESS_RATIO`]) keeps the full vertical growth but is
 /// painted as a NARROW core — the near-eye horizontal treatment scaled down
 /// by the pose's own foreshortening ratio, floored at
 /// [`EYE_DOT_FAR_CORE_MIN_W_FRAC`] of the tile height, and anchored at its
 /// inner edge so the floor grows the core AWAY from the near eye instead of
-/// into the pair's daylight. A shallow dash — and a compressed far core —
-/// additionally gets a solid [`EYE_DASH_CORE_PX`] plug at its centre, inside
-/// its own footprint, so its dark core is a guarantee instead of a phase
-/// accident. Painted with the layer's own resolved ink: the iris ring, pupil
-/// and catch-light above it were culled, so what remains IS the solid
-/// dot-per-eye the review asked for.
+/// into the pair's daylight. EVERY dot then gets its guaranteed core: a
+/// solid [`EYE_DASH_CORE_PX`] plug at its centre, clamped inside its own
+/// footprint and outside the pair's daylight, so the ≥2×2 dark core is a
+/// guarantee instead of a phase accident. Painted with the layer's own
+/// resolved ink: the iris ring, pupil and catch-light above it were culled,
+/// so what remains IS the solid dot-per-eye the review asked for — at the
+/// artist's proportion, per the owner's eyes-too-big call.
 fn paint_eye_dots(
     tile: &mut Tile,
     layer: &Layer,
@@ -312,34 +383,41 @@ fn paint_eye_dots(
         let compressed = ratio(&bounds[i]) < EYE_DOT_FAR_COMPRESS_RATIO;
         let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
         // Size-aware growth: how far this dot must grow for its authored
-        // height to reach the device-pixel target (scale_y IS the tile
-        // height in the normalized fit). A shallow subpath — an arc or a
-        // lid, a thin BAND rather than solid ink — gets the higher ceiling
-        // (see [`EYE_DOT_SCALE_MAX_SHALLOW`]): its dark core lives in the
-        // band's interior rows, and at the round-eye cap it keeps only one.
-        // Shallowness is judged in DEVICE pixels, deliberately: the glyph's
-        // normalized frame maps each viewbox axis to 0..1 separately, so a
-        // normalized aspect is warped by the viewbox's own shape, while the
-        // aspect-preserving tile restores the artist's proportions — the
-        // arcs measure 0.41 there and the open eyes 0.95+, exactly the
-        // populations [`EYE_DOT_SHALLOW_ASPECT`] was drawn between.
+        // height to reach its shape's device-pixel target (scale_y IS the
+        // tile height in the normalized fit). A shallow subpath — an arc or
+        // a lid, a thin BAND rather than solid ink — aims at the band target
+        // with the higher ceiling: its dark core lives in the band's
+        // interior rows, and it starts from a fraction of the open eye's
+        // height. Shallowness is judged in DEVICE pixels, deliberately: the
+        // glyph's normalized frame maps each viewbox axis to 0..1
+        // separately, so a normalized aspect is warped by the viewbox's own
+        // shape, while the aspect-preserving tile restores the artist's
+        // proportions — the arcs measure 0.41 there and the open eyes
+        // 0.95+, exactly the populations [`EYE_DOT_SHALLOW_ASPECT`] was
+        // drawn between.
         let h_px = (y1 - y0) * xform.scale_y;
         let w_px = (x1 - x0) * xform.scale_x;
         let shallow = w_px > 0.0 && h_px < EYE_DOT_SHALLOW_ASPECT * w_px;
-        let cap = if shallow {
-            EYE_DOT_SCALE_MAX_SHALLOW
+        let (cap, target) = if shallow {
+            (EYE_DOT_SCALE_MAX_SHALLOW, EYE_DOT_TARGET_H_PX_ARC)
         } else {
-            EYE_DOT_SCALE_MAX
+            (EYE_DOT_SCALE_MAX, EYE_DOT_TARGET_H_PX)
         };
         let ky = if h_px > 0.0 {
-            (EYE_DOT_TARGET_H_PX / h_px).clamp(1.0, cap)
+            (target / h_px).clamp(1.0, cap)
         } else {
             1.0
         };
         // The daylight floor, converted from device px into the normalized
-        // frame this bake maps at (scale_x IS the tile width).
+        // frame this bake maps at (scale_x IS the tile width). Horizontal
+        // growth starts from the vertical factor — capped for an arc, whose
+        // width already carries its expression (see [`EYE_DOT_ARC_KX_MAX`]).
         let min_gap = EYE_DOT_GAP_PX / xform.scale_x.max(1.0);
-        let mut kx = ky;
+        let mut kx = if shallow {
+            ky.min(EYE_DOT_ARC_KX_MAX)
+        } else {
+            ky
+        };
         for (j, other) in bounds.iter().enumerate() {
             let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
                 continue;
@@ -363,7 +441,23 @@ fn paint_eye_dots(
                 kx = kx.min(1.0 + (gap - min_gap) / closing);
             }
         }
-        let kx = kx.clamp(1.0, ky);
+        // The guard may cut BELOW authored width: at the Linux-default bake
+        // the frontal pairs' authored gap is itself sub-pixel, and daylight
+        // outranks authored width (see [`EYE_DOT_GAP_PX`]). Floored at the
+        // guaranteed-core width so an eye can thin but never thin away.
+        let kx_floor =
+            (EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y / w_px.max(f32::EPSILON)).min(1.0);
+        let kx = kx.clamp(kx_floor, ky);
+        // A round eye stays round: when the daylight guard has narrowed the
+        // dot, its height follows the width down (see
+        // [`EYE_DOT_ROUND_ASPECT_MAX`]) instead of painting a startled bar.
+        // Never below authored height, and never for the shapes whose whole
+        // point is a non-round aspect.
+        let ky = if shallow || compressed {
+            ky
+        } else {
+            ky.min((EYE_DOT_ROUND_ASPECT_MAX * w_px * kx / h_px.max(f32::EPSILON)).max(1.0))
+        };
         // The compressed far core: the near-eye horizontal treatment scaled
         // DOWN by the authored foreshortening ratio (so the turned head keeps
         // its asymmetry even after `ky` rounds both eyes up), floored at the
@@ -390,12 +484,40 @@ fn paint_eye_dots(
         // floor added for an inner-edge-anchored compressed core. The plug
         // must sit on the PAINTED dot, not the authored one.
         let gx = anchor_x + (cx - anchor_x) * kx;
-        // A shallow dash — and a compressed far core — gets its guaranteed
-        // core (see [`EYE_DASH_CORE_PX`]): a solid square of the same ink at
-        // the dot's centre, clamped inside the grown footprint so it reads as
-        // stroke weight, never as a second feature.
-        if shallow || compressed {
-            let plug_w = EYE_DASH_CORE_PX.min(w_px * kx);
+        // Every dot gets its guaranteed core (see [`EYE_DASH_CORE_PX`]): a
+        // solid square of the same ink at the dot's centre, clamped inside
+        // the grown footprint so it reads as stroke weight, never as a
+        // second feature.
+        {
+            // The pair-daylight clamp: plugs sit at (nearly) authored
+            // centres, so two full-width plugs on a close-set pair would
+            // meet in the middle and fuse exactly the gap the ellipse
+            // growth above was throttled to keep. Both siblings compute the
+            // same centre distance, so both shrink to the same ceiling and
+            // the [`EYE_DOT_GAP_PX`] daylight survives symmetric.
+            let mut allowed_w = f32::MAX;
+            for (j, other) in bounds.iter().enumerate() {
+                let Some(&(ox0, _, ox1, _)) = other.as_ref() else {
+                    continue;
+                };
+                if j == i || occluded(other) {
+                    continue;
+                }
+                let gap = (ox0 - x1).max(x0 - ox1);
+                if gap <= 0.0 {
+                    continue;
+                }
+                let dist = ((ox0 + ox1) * 0.5 - cx).abs() * xform.scale_x;
+                allowed_w = allowed_w.min((dist - EYE_DOT_GAP_PX).max(0.0));
+            }
+            // …floored at the guaranteed-core width, the same precedence the
+            // compressed far core already established: when a pose authors
+            // its pair closer than daylight-plus-two-cores can share (the
+            // land's braced squint), the core outranks the daylight — a
+            // sub-pixel gap on a transient face is recoverable, an invisible
+            // eye is not.
+            let allowed_w = allowed_w.max(EYE_DOT_FAR_CORE_MIN_W_FRAC * xform.scale_y);
+            let plug_w = EYE_DASH_CORE_PX.min(w_px * kx).min(allowed_w);
             let plug_h = EYE_DASH_CORE_PX.min(h_px * ky);
             let hw = plug_w * 0.5 / xform.scale_x.max(f32::EPSILON);
             let hh = plug_h * 0.5 / xform.scale_y.max(f32::EPSILON);
@@ -1259,6 +1381,239 @@ mod tests {
                  above its threshold"
             );
         }
+    }
+
+    /// The eye-SIZE law, pinned at the sizes 1× desktops actually bake — the
+    /// owner's "the kitty eyes are too big" bug, measured. The default Linux
+    /// cell (cell_h 14) bakes the pet 24 px tall, and the old 7 px growth
+    /// target painted the authored 3.0 px open eye 6.5 px — 27% of body
+    /// height against the artist's 12.4%, twice the drawn proportion — while
+    /// the arcs' uniform 2.8× growth painted the purr/sleep pair as one
+    /// 17 px sunglasses band. For EVERY live pose on BOTH grounds, at the
+    /// Linux-default 24 px bake and the 1.5×-HiDPI 36 px bake, each authored
+    /// eye's dark ink component must now stay inside its law-derived box:
+    ///
+    /// * an OPEN eye: no taller than the larger of its authored height and
+    ///   [`EYE_DOT_TARGET_H_PX`], no wider than the larger of its authored
+    ///   width and [`EYE_DASH_CORE_PX`] (the guaranteed-core plug may pad a
+    ///   narrow eye) — plus 1.5 px of anti-aliasing slack each;
+    /// * a SHALLOW arc/lid: height against [`EYE_DOT_TARGET_H_PX_ARC`],
+    ///   width against [`EYE_DOT_ARC_KX_MAX`] × authored — the dash may
+    ///   thicken but never widen into a mask, and a pair fused across its
+    ///   daylight shows up here as one component twice its lawful width;
+    ///
+    /// and must still EXIST — at least a few fully-dark texels per eye, the
+    /// legibility floor the growth exists for. Subpaths whose authored
+    /// x-ranges overlap are one eye drawn in multiple strokes and are
+    /// measured as one. Components are measured by flood fill inside a
+    /// window sized from the bound itself, so an over-grown eye cannot
+    /// escape measurement by outgrowing the probe.
+    #[test]
+    fn lod_eyes_hold_the_artists_proportion_at_desktop_sizes() {
+        // The Linux default, derived, not assumed: ART_ROWS · cell_h 14.
+        let default_h = (crate::kitty_pet::ART_ROWS * 14.0).round() as u32;
+        assert_eq!(default_h, 24, "the Linux-default bake height moved");
+        let mut failures: Vec<String> = Vec::new();
+        for &id in PET_GLYPH_IDS {
+            let needle = PET_GLYPHS[id as usize].id;
+            for h in [default_h, 36] {
+                let w = (h as f32 * PetBaker::aspect(id)).round() as u32;
+                for dark_bg in [false, true] {
+                    let fills = ResolvedFills::from_indices(9, 4, dark_bg);
+                    let tile = bake_pose(id, &fills, w, h);
+                    let px = tile.pixels();
+                    let dark = |x: i32, y: i32| -> bool {
+                        if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
+                            return false;
+                        }
+                        let i = ((y as u32 * w + x as u32) * 4) as usize;
+                        px[i + 3] == 255 && px[i..i + 3].iter().all(|&c| c < 64)
+                    };
+                    for layer in PET_GLYPHS[id as usize].layers {
+                        if layer.role != GlyphRole::Eye {
+                            continue;
+                        }
+                        // Cluster subpaths that share x-range: the baker's
+                        // own daylight guard treats x-overlap as "one eye,
+                        // nothing to guard" (the roll's tilted face stacks
+                        // its two arcs diagonally), so the test measures the
+                        // same union the law paints unguarded.
+                        let mut clusters: Vec<((f32, f32, f32, f32), usize)> = Vec::new();
+                        for b in layer.paths.iter().filter_map(|p| subpath_bounds(p)) {
+                            if let Some((c, n)) =
+                                clusters.iter_mut().find(|(c, _)| b.0 <= c.2 && c.0 <= b.2)
+                            {
+                                c.0 = c.0.min(b.0);
+                                c.1 = c.1.min(b.1);
+                                c.2 = c.2.max(b.2);
+                                c.3 = c.3.max(b.3);
+                                *n += 1;
+                            } else {
+                                clusters.push((b, 1));
+                            }
+                        }
+                        for &((x0, y0, x1, y1), members) in &clusters {
+                            let w_px = (x1 - x0) * w as f32;
+                            let h_px = (y1 - y0) * h as f32;
+                            let shallow = w_px > 0.0 && h_px < EYE_DOT_SHALLOW_ASPECT * w_px;
+                            let (w_bound, h_bound) = if members > 1 {
+                                // A multi-stroke union: each member grows by
+                                // at most the global ceilings about its own
+                                // centre inside the union, so the union is
+                                // bounded loosely — tight pinning belongs to
+                                // the single-stroke eyes every everyday face
+                                // is made of.
+                                (
+                                    (w_px * EYE_DOT_SCALE_MAX).max(EYE_DASH_CORE_PX) + 1.5,
+                                    h_px + EYE_DOT_TARGET_H_PX + 1.5,
+                                )
+                            } else if shallow {
+                                (
+                                    (w_px * EYE_DOT_ARC_KX_MAX).max(EYE_DASH_CORE_PX) + 1.5,
+                                    h_px.max(EYE_DOT_TARGET_H_PX_ARC) + 1.5,
+                                )
+                            } else {
+                                (
+                                    w_px.max(EYE_DASH_CORE_PX) + 1.5,
+                                    h_px.max(EYE_DOT_TARGET_H_PX) + 1.5,
+                                )
+                            };
+                            let cx = ((x0 + x1) * 0.5 * w as f32).round() as i32;
+                            let cy = ((y0 + y1) * 0.5 * h as f32).round() as i32;
+                            // Seed: the dark texel nearest the authored
+                            // centre (the dot may sit a rounded pixel off).
+                            let seed = (0..=3)
+                                .flat_map(|r| {
+                                    ((cx - r)..=(cx + r)).flat_map(move |x| {
+                                        ((cy - r)..=(cy + r)).map(move |y| (x, y))
+                                    })
+                                })
+                                .find(|&(x, y)| dark(x, y));
+                            let Some(seed) = seed else {
+                                failures.push(format!(
+                                    "{needle} h={h} (dark_bg={dark_bg}): the eye \
+                                     at ({cx},{cy}) keeps NO dark ink — the dot \
+                                     grew illegible"
+                                ));
+                                continue;
+                            };
+                            // Flood the component inside a bound-sized
+                            // window: big enough to prove a violation,
+                            // small enough to exclude the silhouette.
+                            let (wx, wy) = (w_bound as i32 / 2 + 3, h_bound as i32 / 2 + 3);
+                            let mut seen = std::collections::HashSet::new();
+                            let mut queue = vec![seed];
+                            seen.insert(seed);
+                            let (mut bx0, mut by0, mut bx1, mut by1) =
+                                (seed.0, seed.1, seed.0, seed.1);
+                            let mut area = 0usize;
+                            while let Some((x, y)) = queue.pop() {
+                                area += 1;
+                                bx0 = bx0.min(x);
+                                by0 = by0.min(y);
+                                bx1 = bx1.max(x);
+                                by1 = by1.max(y);
+                                for dx in -1..=1 {
+                                    for dy in -1..=1 {
+                                        let n = (x + dx, y + dy);
+                                        if (n.0 - cx).abs() <= wx
+                                            && (n.1 - cy).abs() <= wy
+                                            && dark(n.0, n.1)
+                                            && seen.insert(n)
+                                        {
+                                            queue.push(n);
+                                        }
+                                    }
+                                }
+                            }
+                            let (comp_w, comp_h) = (bx1 - bx0 + 1, by1 - by0 + 1);
+                            if comp_w as f32 > w_bound || comp_h as f32 > h_bound {
+                                failures.push(format!(
+                                    "{needle} h={h} (dark_bg={dark_bg}): the \
+                                     {}px-authored eye at ({cx},{cy}) paints a \
+                                     {comp_w}x{comp_h} dark component — over its \
+                                     {w_bound:.1}x{h_bound:.1} lawful box \
+                                     (shallow={shallow})",
+                                    format_args!("{w_px:.1}x{h_px:.1}"),
+                                ));
+                            }
+                            // The legibility floor scales with what the size
+                            // can guarantee: at 36 the full core plug fits
+                            // every pose (≥2×2 fully dark), at the 24 px
+                            // default the land's sub-pixel braced squint
+                            // (0.8 px authored) carries one fully-dark texel
+                            // with its anti-aliased halo doing the visible
+                            // rest (checked on the capture) — a fleck, never
+                            // nothing.
+                            let floor = if h >= 36 { 4 } else { 1 };
+                            if area < floor {
+                                failures.push(format!(
+                                    "{needle} h={h} (dark_bg={dark_bg}): the eye \
+                                     at ({cx},{cy}) keeps only {area} dark texels \
+                                     — under the legibility floor of {floor}"
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the eye-size law regressed:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The Retina identity path, pinned. A 2× mac default (cell_h ≈ 42
+    /// device px ⇒ an ART_ROWS · 42 ≈ 71 px tile) bakes at or above
+    /// [`FACE_DETAIL_MIN_H`], where the LOD never runs and the full authored
+    /// face — charm ink included — is painted verbatim: the eye-size law is
+    /// a 1×/1.5× repair and must not move a single Retina texel. Proven at
+    /// the boundary: the first full-face height keeps the catch-light, one
+    /// pixel below it the LOD culls it.
+    #[test]
+    fn retina_scale_bakes_hit_the_identity_path() {
+        // The 2× mac default lands above the LOD, structurally.
+        let mac_2x_h = (crate::kitty_pet::ART_ROWS * 42.0).round() as u32;
+        assert!(
+            mac_2x_h >= FACE_DETAIL_MIN_H,
+            "a 2x Retina default bake ({mac_2x_h} px) must clear the LOD \
+             threshold ({FACE_DETAIL_MIN_H} px)"
+        );
+        let p = pose("stand");
+        let fills = ResolvedFills::from_indices(9, 4, false);
+        let catch_light = PET_GLYPHS[p as usize]
+            .layers
+            .iter()
+            .find(|l| l.role == GlyphRole::CatchLight)
+            .expect("the standing pose authors a catch-light");
+        let (col, _) = resolve_layer(catch_light, &fills);
+        let byte = |c: f32| (c * 255.0 + 0.5) as u8;
+        let ink = [byte(col.0), byte(col.1), byte(col.2)];
+        let has_ink = |h: u32| {
+            let w = (h as f32 * PetBaker::aspect(p)).round() as u32;
+            bake_pose(p, &fills, w, h)
+                .pixels()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|px| px[3] == 255 && px[..3] == ink)
+        };
+        assert!(
+            has_ink(72),
+            "a 72 px bake (the 2x Retina default) must paint the full \
+             authored face, catch-light included"
+        );
+        assert!(
+            has_ink(FACE_DETAIL_MIN_H),
+            "the first full-face height lost its catch-light — the LOD \
+             leaked above its threshold"
+        );
+        assert!(
+            !has_ink(FACE_DETAIL_MIN_H - 1),
+            "one pixel under the threshold must still bake the LOD face"
+        );
     }
 
     /// Smoke test: a baked standing pose is actually a CAT, not an empty box.

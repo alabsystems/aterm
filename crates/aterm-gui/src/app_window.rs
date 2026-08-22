@@ -16,6 +16,8 @@ use winit::dpi::{LogicalPosition, PhysicalSize};
 use winit::event_loop::ActiveEventLoop;
 use winit::window::Window;
 
+#[cfg(windows)]
+use crate::GpuBackend;
 use crate::app_config::resolve_force_scale;
 use crate::platform::AppRt;
 use crate::spawn::spawn_session;
@@ -113,6 +115,98 @@ fn cascade_top_left_pts(
         x.clamp(area.x, (area.x + area.w - keep_x).max(area.x)),
         y.clamp(area.y, (area.y + area.h - keep_y).max(area.y)),
     ))
+}
+
+/// One live monitor's rectangle in PHYSICAL px — global desktop coordinates, the
+/// space [`Window::outer_position`]/`set_outer_position` and the persisted
+/// `outer_x`/`outer_y` all share — plus its scale factor, so the point-denominated
+/// grab minimum ([`CASCADE_MIN_VISIBLE_PTS`]) can be converted per monitor.
+/// Physical rather than logical on purpose: mixed-DPI logical rectangles overlap
+/// and gap in ways the physical virtual desktop does not.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct MonitorRectPx {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) h: f64,
+    pub(crate) scale: f64,
+}
+
+/// W4: does a PERSISTED window origin still land on a monitor that exists?
+///
+/// The restore path used to apply `outer_x`/`outer_y` verbatim, so undocking a
+/// laptop (or unplugging the external display) brought every window that lived on
+/// the absent monitor back entirely outside the desktop — invisible and, off
+/// macOS (whose AppKit constrains frames onto screens itself), unreachable
+/// without Win+arrow archaeology. This is the same scenario the cascade clamp's
+/// doc above names ("left behind by a display change"); restore deliberately
+/// overrides the cascade, so it must run the same test itself.
+///
+/// The contract mirrors [`cascade_top_left_pts`]'s final clamp: the origin is
+/// acceptable when SOME monitor contains the window's top-left corner with at
+/// least [`CASCADE_MIN_VISIBLE_PTS`] (converted to px at THAT monitor's scale) of
+/// room to its right and below — enough of the titlebar on glass to see and grab.
+/// A window deliberately parked hanging off the desktop's outer edge fails this
+/// and falls back to the cascade: conservative, and exactly what the clamp would
+/// have done to a fresh window at that anchor. CLAMPING the point instead of
+/// rejecting it was considered and rejected — a clamp invents a position on
+/// whichever monitor happens to compare first and lands the window exactly on
+/// top of window 1, which is the eclipse the cascade exists to prevent.
+///
+/// Degenerate rectangles (a monitor winit reports as 0×0, non-finite anything)
+/// are skipped rather than matched, mirroring `cascade_top_left_pts`'s refusal
+/// to reason about nonsense geometry.
+#[must_use]
+fn restored_origin_visible(origin: (f64, f64), monitors: &[MonitorRectPx]) -> bool {
+    if !origin.0.is_finite() || !origin.1.is_finite() {
+        return false;
+    }
+    monitors.iter().any(|m| {
+        let finite = [m.x, m.y, m.w, m.h, m.scale].into_iter().all(f64::is_finite);
+        if !finite || m.w <= 0.0 || m.h <= 0.0 || m.scale <= 0.0 {
+            return false;
+        }
+        let keep = CASCADE_MIN_VISIBLE_PTS * m.scale;
+        // Same shape as the cascade clamp's bounds: corner inside the monitor,
+        // with a grabbable slice of frame guaranteed to its right and below. A
+        // monitor smaller than the grab minimum keeps the whole-frame rule from
+        // `cascade_top_left_pts` (`min` there); here it simply accepts any
+        // corner inside it.
+        let keep_x = keep.min(m.w);
+        let keep_y = keep.min(m.h);
+        origin.0 >= m.x
+            && origin.0 <= m.x + m.w - keep_x
+            && origin.1 >= m.y
+            && origin.1 <= m.y + m.h - keep_y
+    })
+}
+
+/// [`restored_origin_visible`] against the LIVE monitor set, for the restore
+/// paths that are about to `set_outer_position` a persisted coordinate. `true`
+/// means "apply it". An EMPTY monitor enumeration (headless-ish environments,
+/// a driver mid-modeswitch) cannot validate anything, so it answers `true` —
+/// the pre-validation status quo — rather than silently discarding every
+/// persisted position on a machine whose enumeration is merely shy.
+#[must_use]
+pub(crate) fn restored_position_on_screen(window: &Window, x: i32, y: i32) -> bool {
+    let monitors: Vec<MonitorRectPx> = window
+        .available_monitors()
+        .map(|m| {
+            let pos = m.position();
+            let size = m.size();
+            MonitorRectPx {
+                x: f64::from(pos.x),
+                y: f64::from(pos.y),
+                w: f64::from(size.width),
+                h: f64::from(size.height),
+                scale: m.scale_factor(),
+            }
+        })
+        .collect();
+    if monitors.is_empty() {
+        return true;
+    }
+    restored_origin_visible((f64::from(x), f64::from(y)), &monitors)
 }
 
 /// Which existing window a new one cascades off, given the MRU focus stack and the
@@ -247,6 +341,103 @@ impl App {
     /// palette selection is deliberately independent.
     pub(crate) fn window_theme_for_chrome(&self) -> crate::app_config::WindowTheme {
         self.window_theme
+    }
+
+    /// (L1) The cell-GEOMETRY fingerprint the per-scale cell-metrics cache is
+    /// keyed under (`restore::load_cell_metrics` / `store_cell_metrics`): the
+    /// canonicalized font selection (`font_family_request` collapses
+    /// `display_font` and its legacy ids into `font_family`'s space — one string
+    /// for the one face that decides advance/line metrics) plus `line_height`,
+    /// the only other config knob that changes cell geometry. Deliberately NOT
+    /// keyed on: `font_px` (stored per entry — the reader predicts its own
+    /// target and rejects on mismatch), padding/strip-rows (recomputed live at
+    /// lookup, so editing them never needlessly cools the cache), or the
+    /// bold/italic/fallback families (they never set the cell). A font FILE
+    /// swapped under an unchanged name is invisible here by design; the
+    /// post-join mismatch log + re-store in `attach_os_window` is the
+    /// self-healing net for that.
+    fn cell_metrics_font_key(&self) -> String {
+        format!(
+            "{}|lh={}",
+            self.config.font_family_request().unwrap_or_default(),
+            self.config.line_height_or_default(),
+        )
+    }
+
+    /// (L1) The ONE resolved colour the warm-launch early reveal puts on glass
+    /// before the backend joins, and the colour the first presented frame then
+    /// paints over it: the renderer theme background, 24-bit.
+    ///
+    /// Three consumers read it and must never diverge: the Windows class brush
+    /// (`window_set_background_color` — the pre-join erase), every unstyled
+    /// cell of the first frame (`applied_terminal_config_for_with_assets` pins
+    /// the engine default background to the same resolved theme), and the
+    /// remainder bands around the grid (`present_band_bg` falls back to the
+    /// theme until OSC 11 sets a live one, which cannot have happened before
+    /// the first frame). `early_reveal_backdrop_is_the_colour_the_first_frame_paints`
+    /// pins the identity for both OS appearances; the post-join check in
+    /// `attach_os_window` pins it per launch. Deliberately NOT a persisted
+    /// "last presented background" beside the cell-metrics cache: that value
+    /// is stale by construction whenever the previous session ended under
+    /// OSC 11, a live theme edit, or the other half of a `dark:…,light:…`
+    /// split — the resolved theme IS what the first frame paints, so it is
+    /// what the erase paints.
+    ///
+    /// On an HDR desktop the two reach glass through different compositor
+    /// inputs — an 8-bit GDI surface vs the scRGB `Rgba16Float` swapchain —
+    /// and compose to the SAME linear value: DWM decodes the 8-bit surface
+    /// with the sRGB curve and scales it by the SDR-white level
+    /// (`SDRwhite / 80`), which is exactly what the present blit does
+    /// (`hdr_grid_encode3 * sdr_white_scale`). Measured with an FP16
+    /// Windows.Graphics.Capture of the composed desktop (SDR white 240 nits,
+    /// scale 3.0): erase and first present both compose `#111318` to linear
+    /// `(0.01682, 0.01953, 0.02739)`, identical, with no intermediate frame.
+    /// A GDI `BitBlt` / `CopyFromScreen` of that desktop is NOT
+    /// colour-faithful for the float surface: it returns 8-bit surfaces
+    /// verbatim but converts float surfaces at the 80-nit scRGB reference
+    /// (the SDR-white scale un-applied), so the SAME composed pixel reads
+    /// `#111318` during the erase and `#23262E` after the present (and
+    /// `#D0D0D0` text reads `#FFFFFF`). That is a capture artifact, not a
+    /// luminance step: with an 8-bit swapchain (`hdr_glow = false`) the same
+    /// tool reads `#111318` for both. Measure colour on an HDR desktop with
+    /// an FP16 capture, or `aterm-ctl video` (whose `index.json` carries the
+    /// presentation encoding and the SDR-white scale it un-applies).
+    fn early_reveal_backdrop(&self) -> u32 {
+        self.theme.bg & 0x00FF_FFFF
+    }
+
+    /// The chrome appearance actually handed to
+    /// [`crate::platform::AppRt::window_set_appearance`] — the ONE resolution seam
+    /// between the config policy above and the platform seam.
+    ///
+    /// macOS/Windows pass the policy through verbatim: `Auto` stays `Auto` so
+    /// AppKit/DWM keep following the live OS appearance (the system-owned contract
+    /// `automatic_window_chrome_remains_system_owned_independent_of_terminal_palette`
+    /// pins), and the titlebar still MATCHES the terminal because those platforms
+    /// paint it the theme's own bg (`window_set_background_color` + the toolbar's
+    /// `set_strip_dark`).
+    ///
+    /// Linux has neither of those painters: its fallback chrome is winit's
+    /// sctk-adwaita CLIENT-side header on Wayland (the `_GTK_THEME_VARIANT` hint on
+    /// X11), whose only knob is the light/dark variant — and winit's Wayland backend
+    /// never delivers `ThemeChanged`, so `Auto` there does not even track the OS
+    /// live. Under a dark terminal theme that fell back to a mismatched light-grey
+    /// slab bolted onto a black body. So on Linux ONLY, `Auto` resolves to the
+    /// ACTIVE terminal theme's darkness ([`crate::tab_bar::theme_is_dark`]) — the
+    /// header reads as an extension of the terminal, which is what every other
+    /// platform already achieves by painting. An explicit config Light/Dark remains
+    /// the operator's override everywhere. Re-pushed by `apply_theme_live` on Linux
+    /// so a live theme swap moves the header with the body.
+    pub(crate) fn chrome_theme_for_apprt(&self) -> crate::app_config::WindowTheme {
+        #[cfg(target_os = "linux")]
+        if self.window_theme == crate::app_config::WindowTheme::Auto {
+            return if crate::tab_bar::theme_is_dark(self.theme.bg) {
+                crate::app_config::WindowTheme::Dark
+            } else {
+                crate::app_config::WindowTheme::Light
+            };
+        }
+        self.window_theme_for_chrome()
     }
 
     pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
@@ -476,25 +667,7 @@ impl App {
         // GPU cursor-comet BLOOM settings from config (GPU backend only; the
         // CPU/software path has no bloom). Set before the first present so the
         // per-window bloom target is built alongside the offscreen.
-        let gpu_post_fx = self
-            .serious_mode_policy()
-            .allows(crate::motion::SeriousEffect::GpuPostFx);
-        if let Backend::Gpu(g) = self.backend.ready_mut() {
-            g.set_bloom(gpu_post_fx && self.config.cursor_trail_bloom_or_default());
-            g.set_bloom_params(
-                self.config.cursor_trail_bloom_strength_or_default(),
-                self.config.cursor_trail_bloom_radius_or_default(),
-            );
-            // Heat shimmer above burning cells (the bloom's parity class —
-            // GPU only, like the bloom; the CPU path has no shimmer).
-            g.set_shimmer(gpu_post_fx && self.config.cursor_fire_shimmer_or_default());
-            // M3 phase B: the EDR cursor glow opt-in (default off). Set BEFORE any
-            // window surface exists so an opted-in first window gets the
-            // Rgba16Float extended-linear swapchain at attach.
-            g.set_hdr_glow(self.config.hdr_glow_or_default());
-            // SDR twin: the swapchain-side crown budget for non-HDR desktops.
-            g.set_sdr_glow_boost(self.config.cursor_glow_sdr_boost_or_default());
-        }
+        self.pin_gpu_effect_config();
         // The build worker already applied and sealed the complete font
         // generation before publishing this backend. Re-pin only memory-backed
         // shaping/typography/render knobs here; reopening configured font paths
@@ -514,6 +687,120 @@ impl App {
         // only exists after a deliberate user action. So it runs on the
         // first-present hook in `app_render` instead, where it is off time-to-glass
         // and still far earlier than any overlay can be opened.
+    }
+
+    /// Pin the GPU-only effect/swapchain knobs (bloom, shimmer, the H1 backdrop
+    /// margins, the M3 EDR opt-in and its SDR twin) from config onto a freshly
+    /// constructed GPU backend. Extracted verbatim from [`Self::finalize_backend`]
+    /// so the H1 fail-soft rebuild ([`Self::retry_attach_on_opaque_swapchain`])
+    /// re-pins exactly what the deferred join pins — one seam, never two lists.
+    /// No-op on the CPU backend.
+    pub(crate) fn pin_gpu_effect_config(&mut self) {
+        let gpu_post_fx = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::GpuPostFx);
+        if let Backend::Gpu(g) = self.backend.ready_mut() {
+            g.set_bloom(gpu_post_fx && self.config.cursor_trail_bloom_or_default());
+            g.set_bloom_params(
+                self.config.cursor_trail_bloom_strength_or_default(),
+                self.config.cursor_trail_bloom_radius_or_default(),
+            );
+            // Heat shimmer above burning cells (the bloom's parity class —
+            // GPU only, like the bloom; the CPU path has no shimmer).
+            g.set_shimmer(gpu_post_fx && self.config.cursor_fire_shimmer_or_default());
+            // H1 (Windows Mica/Acrylic): mirror the material knob onto the
+            // renderer BEFORE any window surface exists, so a backdrop-config
+            // first window is configured PreMultiplied at attach and its very
+            // first frame carries the margin alpha. Inert unless the GPU
+            // context was actually built on the DComp visual path (the
+            // renderer double-keys on `ctx.visual_swapchain`), so macOS/Linux
+            // and every default Windows run are byte-identical.
+            g.set_backdrop_margins(
+                self.render_knobs.background_material
+                    != crate::app_config::BackgroundMaterial::None,
+            );
+            // M3 phase B: the EDR cursor glow opt-in (default off). Set BEFORE any
+            // window surface exists so an opted-in first window gets the
+            // Rgba16Float extended-linear swapchain at attach. Ordered AFTER the
+            // backdrop mirror above: on a visual instance the renderer forces
+            // the HDR opt-in off (the two swapchains are mutually exclusive)
+            // and prints the diagnostic exactly once.
+            g.set_hdr_glow(self.config.hdr_glow_or_default());
+            // SDR twin: the swapchain-side crown budget for non-HDR desktops.
+            g.set_sdr_glow_boost(self.config.cursor_glow_sdr_boost_or_default());
+        }
+    }
+
+    /// H1 fail-soft (Windows): a window's GPU swapchain attach just failed with
+    /// `first_error`. Consult [`aterm_gpu::surface_attach_fallback`]; unless the
+    /// verdict is `RebuildOpaque` (first/only window on a DirectComposition
+    /// visual instance — "DComp unavailable", which the renderer now reports as
+    /// `Err` instead of wgpu's default-handler panic), hand the error straight
+    /// back so the pre-H1 arms (decline this window / CPU downgrade) run
+    /// byte-identically. Otherwise: withdraw the visual latch, build a second
+    /// GPU renderer on a FRESH instance (the presentation system is
+    /// instance-level, so the opaque HWND swapchain needs a new one), re-pin
+    /// every renderer knob through the same seams the deferred join uses, and
+    /// retry the attach ONCE on the new renderer. The just-created window keeps
+    /// its `WS_EX_NOREDIRECTIONBITMAP` — harmless to a flip-model HWND
+    /// swapchain (Windows Terminal ships it unconditionally). A failed rebuild
+    /// leaves the current backend untouched and returns `first_error`; a failed
+    /// retry returns ITS error with the opaque backend installed — either way
+    /// the caller's CPU arm still works (`cpu_renderer_from_admitted` forks the
+    /// sealed face of whichever GPU renderer is live).
+    #[cfg(windows)]
+    fn retry_attach_on_opaque_swapchain(
+        &mut self,
+        first_error: String,
+        window: &Arc<Window>,
+        (w_px, h_px): (u32, u32),
+        scale: f64,
+        head: usize,
+    ) -> Result<aterm_gpu::GpuSurface, String> {
+        let other_gpu = self
+            .windows
+            .values()
+            .any(|w| matches!(w.present, Some(PresentTarget::Gpu { .. })));
+        if aterm_gpu::surface_attach_fallback(aterm_gpu::dx12_visual_swapchain_active(), other_gpu)
+            != aterm_gpu::SurfaceAttachFallback::RebuildOpaque
+        {
+            return Err(first_error);
+        }
+        eprintln!(
+            "aterm-gui: backdrop requested but DirectComposition is unavailable ({first_error}); \
+             falling back to the opaque swapchain — background_material styles the caption \
+             only this run"
+        );
+        aterm_gpu::withdraw_dx12_visual_swapchain();
+        let rebuilt = match self
+            .backend
+            .gpu_ref()
+            .map(|g| g.rebuild_on_fresh_context(self.font_px))
+        {
+            Some(Ok(g)) => g,
+            Some(Err(err)) => {
+                eprintln!("aterm-gui: opaque swapchain rebuild failed: {err}");
+                return Err(first_error);
+            }
+            None => return Err(first_error),
+        };
+        // Replacing the renderer destroys any virtual tap (none can be live at
+        // a first attach, but the rebuild path's contract is kept whole).
+        let _ = self.video_abort_backend_rebuild();
+        self.backend = BackendSlot::Ready(Backend::Gpu(GpuBackend::new(rebuilt)));
+        // `use_gpu` / the metrics backend tag are unchanged: GPU stays GPU.
+        self.reset_gpu_window_caches();
+        // Mirror the CPU arm's re-pin (pad/head at this window's scale), then
+        // the deferred join's two knob seams, on the fresh renderer.
+        self.backend.set_pad(self.cfg_pad_for_scale(scale));
+        self.backend.set_pad_top(self.cfg_pad_top_for_scale(scale));
+        self.backend.set_head(head);
+        self.pin_gpu_effect_config();
+        self.pin_backend_render_config_core();
+        self.backend
+            .gpu_mut()
+            .expect("the backend was just replaced with a GPU renderer")
+            .create_window_surface(window.clone(), w_px, h_px)
     }
 
     /// The window a NEW window should be offset from: the most recently FOCUSED
@@ -677,11 +964,77 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("aterm")
             .with_inner_size(size);
+        // WINDOWS: point the window at the aterm icon compiled into this exe.
+        //
+        // (Windows arm first, Linux arm below — each shadows `attrs` under its
+        // own `#[cfg]`, so exactly one applies per target and the other target's
+        // bytes are untouched.)
+        //
+        // Embedding the icon is NOT enough on its own. Explorer reads the exe's
+        // icon resource directly, but the *window* chrome does not: DWM asks the
+        // HWND via WM_GETICON, falls back to the window class's GCLP_HICON, and
+        // winit registers its class with no icon — so the caption, Alt-Tab and
+        // Task View all showed the generic exe glyph (measured on the shipped
+        // build: WM_GETICON(SMALL)=0, WM_GETICON(BIG)=0, GCLP_HICON=0). winit
+        // turns these two attributes into the WM_SETICON pair, which is what
+        // actually closes it.
+        //
+        // Sizes: `None` means LR_DEFAULTSIZE, which loads the frame matching
+        // SM_CXICON (32 px at 100%, DPI-scaled) — right for the big/taskbar
+        // icon. The small icon wants SM_CXSMICON, but LoadImage has no
+        // "default SMALL size" spelling, so 16 is asked for explicitly; the .ico
+        // carries a hand-tuned 16 px frame (its ladder is 16/32/48/64/128/256),
+        // which beats letting the shell downscale a 32. The honest cost is that
+        // above 100% DPI Windows scales that 16 up to a 20/24 px caption slot
+        // rather than picking the 32; reading SM_CXSMICON to do better would
+        // mean a GetSystemMetrics FFI declaration in this file for a handful of
+        // caption pixels, which is not worth the surface.
+        //
+        // Failure is silent on purpose: `from_resource` errors only when the exe
+        // has no such resource (a build whose resource compiler was missing —
+        // build.rs already printed a banner about it), and the fallback is
+        // precisely today's behaviour, so there is nothing new to tell the user
+        // at launch time. Do NOT eprintln here: this is a GUI-subsystem binary
+        // and it would either go nowhere or spam a launching console every run.
+        #[cfg(windows)]
+        let attrs = {
+            use winit::platform::windows::{IconExtWindows as _, WindowAttributesExtWindows as _};
+            // Ordinal 1 — the `1 ICON` in the resource script generated by
+            // crates/aterm/build.rs. The two ends are coupled by that number.
+            let big = winit::window::Icon::from_resource(1, None).ok();
+            let small = winit::window::Icon::from_resource(1, Some(PhysicalSize::new(16, 16)))
+                .ok()
+                .or_else(|| big.clone());
+            let attrs = attrs.with_window_icon(small).with_taskbar_icon(big);
+            // H1 (Windows Mica/Acrylic): a window presented through the
+            // DirectComposition VISUAL swapchain must be created WITHOUT the GDI
+            // redirection bitmap (`WS_EX_NOREDIRECTIONBITMAP`) — DWM composites
+            // the redirection surface UNDER the visual tree, filled with the
+            // class background brush, so leaving it in place would paint an
+            // opaque layer exactly where the transparent padding is supposed to
+            // reveal the Mica/Acrylic backdrop (the feature would silently
+            // degrade to today's opaque look). Keyed to the REQUEST latch, not
+            // the (possibly still-building) GPU context: window creation
+            // deliberately overlaps the backend build (#7), so the ground truth
+            // is not yet known here. The build thread's failure arm withdraws
+            // the latch, so only a first window racing a failing GPU init can
+            // end up no-redirection + softbuffer (diagnosed loudly there).
+            // Harmless with a live HWND swapchain too (flip-model present does
+            // not use the redirection surface — Windows Terminal ships this
+            // style unconditionally), but scoped to the backdrop opt-in anyway
+            // so the default window bytes stay untouched.
+            if aterm_gpu::dx12_visual_swapchain_requested() {
+                attrs.with_no_redirection_bitmap(true)
+            } else {
+                attrs
+            }
+        };
         // LINUX WINDOW IDENTITY + FLOOR. `with_name` is the Wayland `app_id`
         // AND the X11 `WM_CLASS` (one shared attribute serves both backends):
         // without it the compositor sees an EMPTY app id — GNOME shows the
         // generic gear icon, refuses to group aterm windows, and can never
-        // match a future `aterm.desktop` (icon/pinning/dock identity all key on
+        // match `aterm.desktop` (which tools/install.sh now ships, with the
+        // hicolor icons; icon/pinning/dock/launcher identity all key on
         // this string equalling the desktop-file basename). Keep it `"aterm"`
         // and lowercase-stable across releases for exactly that reason. The min
         // size is the smallest LEGAL grid — the 20-col × 5-row clamp floor at
@@ -734,12 +1087,23 @@ impl App {
             .proxy
             .clone()
             .map(|proxy| accesskit_winit::Adapter::with_event_loop_proxy(el, &window, proxy));
-        // Deferred-join first window: keep it hidden past the adapter attach; the
-        // post-join size correction below is the single show site (the adapter
-        // still attaches strictly before the first show, as AccessKit requires).
+        // Deferred-join first window: keep it hidden past the adapter attach.
+        // Its show site is either the L1 warm-launch EARLY reveal below (persisted
+        // metrics sized it exactly, pre-join) or the post-join size correction —
+        // both strictly after this point, so the adapter always attaches before
+        // the first show, as AccessKit requires.
         #[cfg(feature = "a11y-accesskit")]
         if !pending_join && !defer_reveal {
             window.set_visible(true);
+        }
+        // L1 reveal ledger: a non-deferred window with a Ready backend is on
+        // glass right here (created visible; under a11y, shown just above).
+        // Offer the process-wide first-reveal stamp — first-write-wins, so only
+        // the FIRST window's reveal ever records and every later Cmd-N attach
+        // is a no-op. (For the non-a11y build the stamp trails the visible
+        // creation by microseconds; honest at the ms grain the metric reports.)
+        if !pending_join && !defer_reveal {
+            crate::metrics::mark_first_window_visible();
         }
         // Native macOS menu bar (menu.rs): build + install NSApp.mainMenu now the
         // FIRST window exists, so aterm presents as a real Mac app. There is ONE
@@ -807,6 +1171,127 @@ impl App {
         // `dark:…,light:…` split `theme` config (a no-op for a single theme, or when
         // the OS appearance equals the engine default already in effect).
         self.sync_app_theme_to_appearance(os_appearance);
+        // (L1) EARLY REVEAL — kill the invisible half-second. Measured on the
+        // shipped Windows build: rust_main→first_present ≈ 440 ms, ~410 ms of it
+        // BEFORE the reveal below (backend_finalize ≈ 274, gui_prepare ≈ 108) —
+        // no window and no taskbar button for most of startup, because a hidden
+        // top-level HWND has neither. The wait exists for a real reason (the
+        // seeded `seed_cell_px` size is a 0.6×/1.2× heuristic — a bare early
+        // show trades blankness for a JUMPING window), so the early path runs
+        // ONLY when it can put the EXACT final frame on glass: a WARM launch
+        // whose per-scale REAL cell metrics were persisted by a previous
+        // backend finish (`restore::load_cell_metrics`). Then the window is
+        // revealed correctly sized, correctly positioned, and correctly themed
+        // BEFORE the ~300 ms join, and content arrives into it with zero
+        // geometry change (asserted against the post-join size below).
+        //
+        // Windows-only, deliberately: this platform is where the cost lives
+        // (no Dock bounce covers the gap), its chrome calls here are all
+        // backend-independent, and its titlebar band is provably 0 (the OS
+        // caption sits outside the client area). macOS measures `head_pts`
+        // from `contentLayoutRect` only after the post-join
+        // fullsize-content + toolbar installs, so an early frame there would
+        // be short one chrome band — adopting this path on macOS means moving
+        // those installs above the join first, a separate change.
+        //
+        // Skips (each keeps today's hidden-until-ready behaviour):
+        //   * cold launch — no persisted metrics for this scale/font;
+        //   * overlap handoff (`defer_reveal`) — the parked parent's frozen
+        //     frame must not be covered by a content-less window;
+        //   * seamless position carry — applied by `resumed` after this
+        //     returns, and a 300 ms visibly-misplaced window then a hop is
+        //     worse than 300 ms hidden;
+        //   * a maximized session restore — the post-join
+        //     `request_inner_size` law below operates on a NORMAL frame, and
+        //     maximizing early would make it fight the OS (the restore
+        //     maximizes after attach, exactly as today).
+        // A restore with a plain persisted position is NOT skipped: that
+        // position is readable right here (`pending_restore` is drained later,
+        // in `about_to_wait`), so it is applied pre-reveal and `resumed`'s
+        // post-attach re-application degenerates to a same-place no-op.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut early_reveal_size: Option<PhysicalSize<u32>> = None;
+        // The colour the early reveal erased to, for the post-join colour check
+        // (the geometry check's twin). `None` on every non-early path.
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut early_reveal_bg: Option<u32> = None;
+        #[cfg(windows)]
+        if pending_join && !defer_reveal && self.seamless_position.is_none() {
+            let bootstrap_restore = self.pending_restore.as_ref().and_then(|m| m.windows.first());
+            let restore_maximized = bootstrap_restore.and_then(|wl| wl.maximized) == Some(true);
+            // The same scale resolution the post-join sizing uses (force-scale
+            // override included), so the two frame derivations cannot diverge.
+            let scale = resolve_force_scale().unwrap_or_else(|| window.scale_factor());
+            // Predict the font px the post-join HiDPI block will settle on:
+            // the auto-scale target, or the explicit/1× size held verbatim.
+            // Pure + deterministic, so a cache hit implies the joined backend
+            // activates exactly the cached metrics' size.
+            let target_font_px =
+                hidpi_target_font_px(self.font_px_explicit, scale).unwrap_or(self.font_px);
+            let cached = (!restore_maximized)
+                .then(|| {
+                    crate::restore::load_cell_metrics(
+                        &self.cell_metrics_font_key(),
+                        scale,
+                        target_font_px,
+                    )
+                })
+                .flatten();
+            if let Some((cell_w, cell_h)) = cached {
+                // The exact-frame twin of `window_frame_px` (`frame_size` +
+                // `visible_frame_height`), computed from the CACHED cell
+                // metrics because the backend that owns the live derivation is
+                // precisely what has not joined yet. Any drift between this
+                // and the post-join truth is caught by the mismatch log below.
+                let pad = self.cfg_pad_for_scale(scale);
+                let pad_top = self.cfg_pad_top_for_scale(scale);
+                // 0 on Windows today — but derived through the same seam the
+                // post-join path measures, not hardcoded, so a future non-zero
+                // band shows up as a logged mismatch rather than silent drift.
+                let head = (self.apprt.titlebar_band_pts(&window) * scale).round().max(0.0)
+                    as usize;
+                let total_rows = rows.saturating_add(self.tab_strip_rows) as usize;
+                let width = cols as usize * cell_w + 2 * pad;
+                let raw_height = total_rows * cell_h + 2 * pad + head;
+                let height = raw_height.saturating_sub(pad.saturating_sub(pad_top));
+                let exact = PhysicalSize::new(width as u32, height as u32);
+                // Still hidden: the correction from the seeded size to the
+                // exact frame is never on glass.
+                let _ = window.request_inner_size(exact);
+                // Bootstrap session-restore position, pre-reveal (W4-validated
+                // against the live monitor set, like every restore apply).
+                // Without this the window would sit ~300 ms at the OS-default
+                // spot before `resumed`'s post-attach move — a visible hop.
+                if let Some((x, y)) =
+                    bootstrap_restore.and_then(|wl| Some((wl.outer_x?, wl.outer_y?)))
+                    && restored_position_on_screen(&window, x, y)
+                {
+                    window.set_outer_position(winit::dpi::PhysicalPosition::new(x, y));
+                }
+                // The two backend-independent chrome calls, hoisted above the
+                // join (their post-join runs become idempotent re-applies): the
+                // themed class brush so the client area erases to EXACTLY the
+                // colour the first frame will paint (`early_reveal_backdrop` —
+                // one resolved value, checked post-join below), and the
+                // caption/immersive-dark resolution so the titlebar is right
+                // from the first composite.
+                let backdrop = self.early_reveal_backdrop();
+                self.apprt.window_set_background_color(&window, backdrop);
+                self.apprt
+                    .window_set_appearance(&window, self.window_theme_for_chrome());
+                // Reveal. The AccessKit adapter attached above, strictly before
+                // this — the invariant holds on every show path.
+                window.set_visible(true);
+                crate::metrics::mark_first_window_visible();
+                // The event-loop thread is about to block in the join and pump
+                // nothing, so force the themed erase onto glass synchronously —
+                // otherwise the "revealed" window is an unpainted rectangle for
+                // the whole join, worse than staying hidden.
+                self.apprt.window_flush_backdrop(&window);
+                early_reveal_size = Some(exact);
+                early_reveal_bg = Some(backdrop);
+            }
+        }
         // (#7 tail) THE join: the OS window now exists (its creation overlapped the
         // build tail); everything below — the HiDPI font derivation, the pad, the
         // corrected window size, the present target — needs the real backend. A
@@ -943,6 +1428,56 @@ impl App {
         }
         size = self.window_frame_px(rows, cols);
         let _ = window.request_inner_size(size);
+        // (L1) The warm-launch contract, verified: the frame revealed BEFORE
+        // the join must equal the frame the joined backend just derived, so the
+        // `request_inner_size` above was a no-op and the user saw ZERO geometry
+        // change after the reveal. A mismatch is not a crash (a font file can
+        // change metrics under an unchanged config fingerprint — the cache is a
+        // prediction, not a proof) but it IS the one visible failure mode of
+        // the early path, so it logs loudly; the store below then re-persists
+        // the corrected metrics and the next launch is exact again.
+        if let Some(early) = early_reveal_size {
+            if early == size {
+                aterm_log::debug!(
+                    "L1 early reveal held: {}x{} confirmed post-join (zero resize on glass)",
+                    size.width,
+                    size.height
+                );
+            } else {
+                aterm_log::warn!(
+                    "L1 early reveal was STALE: revealed {}x{}, backend derived {}x{} — \
+                     one visible resize this launch; re-persisting the real metrics",
+                    early.width,
+                    early.height,
+                    size.width,
+                    size.height
+                );
+            }
+        }
+        // (L1) The colour twin of that contract: the erase the reveal put on
+        // glass must be the colour the first frame paints over it, i.e. the
+        // theme background resolved NOW (the value the post-join brush
+        // re-apply and the engine default background both read) must still
+        // be the one the pre-join brush was seeded from. Nothing between the
+        // two re-resolves the theme today — the OS-appearance sync runs before
+        // the reveal — and a future seam that did would be the one way to put
+        // a real colour step at content arrival, so a mismatch logs at warn.
+        if let Some(early_bg) = early_reveal_bg {
+            let now_bg = self.early_reveal_backdrop();
+            if early_bg == now_bg {
+                aterm_log::debug!(
+                    "L1 early reveal backdrop held: #{:06x} erased pre-join, first frame paints the same",
+                    now_bg
+                );
+            } else {
+                aterm_log::warn!(
+                    "L1 early reveal backdrop DRIFTED: erased #{:06x} pre-join, first frame paints #{:06x} — \
+                     one visible colour step this launch",
+                    early_bg,
+                    now_bg
+                );
+            }
+        }
         // LINUX INITIAL-FRAME SETTLE: the request above is pre-map on Wayland —
         // no CSD frame exists yet and `scale_factor()` may still be the assumed
         // 1.0 — so the compositor's first configure round can hand back a frame
@@ -969,6 +1504,26 @@ impl App {
         {
             let (cw, ch) = self.cell_size();
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
+            // (L1) Persist THIS scale's REAL cell metrics — "written when a
+            // backend finishes": the joined backend is active at this window's
+            // px, so `cell_size()` is the ground truth the next launch's early
+            // reveal sizes from. Guarded to the LAUNCH-DEFAULT font size so a
+            // Cmd-N attach after Cmd-+/− zoom can never poison the cache with
+            // transient metrics (`default_font_px` is what a fresh launch at
+            // this scale settles on; same 0.5 px tolerance as the activate
+            // guard above). All platforms record — the cache is pure file I/O
+            // and lets macOS adopt the early reveal later without a migration —
+            // only the LOOKUP is Windows-gated. Fire-and-forget off-thread;
+            // steady-state (unchanged metrics) writes nothing at all.
+            if (self.font_px - self.default_font_px).abs() < 0.5 {
+                crate::restore::store_cell_metrics(
+                    self.cell_metrics_font_key(),
+                    scale,
+                    self.font_px,
+                    cw,
+                    ch,
+                );
+            }
         }
         // Don't eclipse the window this one was opened from: step the frame down and
         // right so the previous window stays visible behind it. Placed HERE — after
@@ -994,16 +1549,19 @@ impl App {
         // (dropping CoreAnimation's per-frame gamut conversion — see the apprt
         // method's docs).
         self.apprt
-            .window_set_appearance(&window, self.window_theme_for_chrome());
-        // (#7 tail) Reveal the deferred-join first window only NOW: the joined
-        // backend's real metrics resized it above and the themed background is
-        // set, so the seeded size / unthemed chrome are never on glass. (Under
-        // a11y the adapter attached strictly before this first show.)
+            .window_set_appearance(&window, self.chrome_theme_for_apprt());
+        // (#7 tail) Reveal the deferred-join first window NOW — unless the L1
+        // early path already showed it pre-join (warm launch, exact persisted
+        // size; `early_reveal_size` is the receipt). On the remaining COLD path
+        // the joined backend's real metrics resized it above and the themed
+        // background is set, so the seeded size / unthemed chrome are never on
+        // glass. (Under a11y the adapter attached strictly before either show.)
         if pending_join {
             // Handoff boots stay hidden here — the post-present hook is the one
             // reveal site (carried pixels first, never a bg-only frame).
-            if !defer_reveal {
+            if !defer_reveal && early_reveal_size.is_none() {
                 window.set_visible(true);
+                crate::metrics::mark_first_window_visible();
             }
             // First paint must never wait on the OS to volunteer a WM_PAINT: request
             // it explicitly so the just-revealed window presents its first real frame
@@ -1036,6 +1594,23 @@ impl App {
                     .gpu_mut()
                     .unwrap()
                     .create_window_surface(window.clone(), w_px, h_px);
+            // H1 fail-soft (Windows): a first-window attach failure on a
+            // DirectComposition visual instance rebuilds the GPU stack on the
+            // opaque HWND swapchain and retries once, so "DComp unavailable" is
+            // a diagnostic + caption-only material, not a lost launch. Every
+            // other outcome passes through untouched (`Ok`, or an `Err` the
+            // arms below handle exactly as before H1).
+            #[cfg(windows)]
+            let surface_result = match surface_result {
+                Ok(surf) => Ok(surf),
+                Err(first_error) => self.retry_attach_on_opaque_swapchain(
+                    first_error,
+                    &window,
+                    (w_px, h_px),
+                    scale,
+                    head,
+                ),
+            };
             let startup_after_surface_create = Instant::now();
             match surface_result {
                 Ok(surf) => {
@@ -1621,8 +2196,27 @@ impl App {
         if self.headless || self.close_confirm_suppressed {
             return true;
         }
-        let Some(prompt) = crate::quit_safety::confirm_prompt(exits_app, busy) else {
-            // App keeps running and nothing is busy: a plain close needs no confirm.
+        // Windows follows Windows Terminal's convention, not macOS's: prompt when
+        // the gesture closes MULTIPLE tabs or a running job, never for a single
+        // idle tab — see `quit_safety::confirm_prompt_windows`. The tab count is
+        // the gesture's blast radius: every window's tabs for a whole-app quit,
+        // the closing window's for a window close. A last-tab close
+        // (`window_exit_close_allowed`) reaches here with the window already down
+        // to one tab, so it stays instant while idle under both policies.
+        #[cfg(windows)]
+        let prompt = {
+            let tabs_closing: usize = if exits_app {
+                self.windows.values().map(|ws| ws.tab_set.len()).sum()
+            } else {
+                self.windows.get(&wid).map_or(1, |ws| ws.tab_set.len())
+            };
+            crate::quit_safety::confirm_prompt_windows(exits_app, tabs_closing, busy)
+        };
+        #[cfg(not(windows))]
+        let prompt = crate::quit_safety::confirm_prompt(exits_app, busy);
+        let Some(prompt) = prompt else {
+            // Nothing worth interrupting for (macOS: app keeps running and nothing
+            // is busy; Windows: also a single idle tab): the close needs no confirm.
             return true;
         };
         if let Some(proceed) = self
@@ -1927,11 +2521,22 @@ impl App {
             // Same rungs as before, written into the resident slot: reported cwd
             // (`~`-abbreviated), else the last stable tab-title cache value when the
             // parser holds the lock, else the presentation fallback.
+            // Native form (`C:\Users\x`, not the engine's RFC 8089 `/C:/Users//x`)
+            // — this rung is what the user READS in the window title. The `Cow`
+            // is bound to a local so it outlives the `as_deref` borrow handed to
+            // the in-place push, keeping the no-alloc-per-frame property intact
+            // off Windows, where the conversion is a pure borrow.
             let filled = match session.term.try_lock() {
-                Ok(term) => push_home_abbreviated_cwd(slot, term.current_working_directory()),
+                Ok(term) => {
+                    use crate::cwd_native::ReportedCwd as _;
+                    let cwd = term.native_working_directory();
+                    push_home_abbreviated_cwd(slot, cwd.as_deref())
+                }
                 Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    use crate::cwd_native::ReportedCwd as _;
                     let term = poisoned.into_inner();
-                    push_home_abbreviated_cwd(slot, term.current_working_directory())
+                    let cwd = term.native_working_directory();
+                    push_home_abbreviated_cwd(slot, cwd.as_deref())
                 }
                 Err(std::sync::TryLockError::WouldBlock) => match self
                     .windows
@@ -1960,11 +2565,15 @@ impl App {
     /// early-out path, where a title-only change still updates the titlebar
     /// without a pixel repaint.
     ///
-    /// IME-1: while a composition is in flight, the marked preedit text is shown
-    /// as `title [‹preedit›]` — the minimal inline indicator that an
-    /// IME/dead-key composition is active and what it currently holds. Because
-    /// this runs on the early-out path too, the indicator follows the
-    /// composition without forcing a full pixel repaint.
+    /// IME-2: the caption deliberately shows NO composition state. An earlier
+    /// cut appended `title [‹preedit›]` here as the only preedit indicator; the
+    /// composition now paints INLINE where the user is looking (the grid caret
+    /// via `RenderInput::overlay_ime_preedit`, or the find well / rename well
+    /// when one owns it — see `App::preedit_owner`), and the
+    /// caption suffix was DELETED rather than kept as a fallback: it rewrote
+    /// the Alt-Tab/taskbar label on every composing keystroke, it went dark
+    /// whenever a temporary title owner held the caption (find status), and a
+    /// headless window has no OS caption for a "headless fallback" to reach.
     ///
     /// TABS: with more than one in-window tab, a ` — [active/total]` indicator is
     /// appended (e.g. `aterm — [2/3]`) so the (visual-tab-bar-less) tab state is
@@ -2008,7 +2617,6 @@ impl App {
             " — ",
             &mut scratch,
         );
-        let preedit = self.windows.get(&id).map_or("", |ws| ws.preedit.as_str());
         // No "[active/total]" tab counter in the title: the visible tab strip already
         // shows the tabs, so a title-bar counter is redundant clutter (and macOS apps
         // like Ghostty/Terminal don't do it). The title is just the program/cwd title.
@@ -2023,10 +2631,12 @@ impl App {
             )
         });
         let title_authority = window_title_authority(warning_armed, search_active);
-        let title_changed = if preedit.is_empty() {
-            // Common path (no active IME composition): compare the cached title
-            // against the composed scratch directly, avoiding the per-frame
-            // String allocation that an unconditional `format!`/`to_string` paid.
+        let title_changed = {
+            // Compare the cached title against the composed scratch directly,
+            // avoiding the per-frame String allocation that an unconditional
+            // `format!`/`to_string` would pay. (No IME branch here any more —
+            // the composition paints inline, never in the caption; see the
+            // IME-2 note above.)
             let Some(ws) = self.windows.get_mut(&id) else {
                 // Disjoint field, so restoring the slot here is fine even though
                 // `self.windows` was just borrowed.
@@ -2041,25 +2651,6 @@ impl App {
                 }
                 ws.current_title.clear();
                 ws.current_title.push_str(&scratch);
-                true
-            } else {
-                false
-            }
-        } else {
-            // Rare IME-preedit path: only here do we allocate the formatted title.
-            let desired = format!("{scratch} [‹{preedit}›]");
-            let Some(ws) = self.windows.get_mut(&id) else {
-                self.title_compose_scratch = scratch;
-                return;
-            };
-            if desired != ws.current_title
-                && !crate::toolbar::busy_spinner_phase_only_change(&ws.current_title, &desired)
-            {
-                if title_authority == WindowTitleAuthority::Canonical {
-                    window.set_title(&desired);
-                }
-                ws.current_title.clear();
-                ws.current_title.push_str(&desired);
                 true
             } else {
                 false
@@ -2346,6 +2937,141 @@ pub(crate) mod taskbar {
     }
 }
 
+/// W3: the Win32 window-placement read backing maximized-state persistence —
+/// `GetWindowPlacement` on the raw HWND, user32 (already on the tiny-FFI
+/// allowlist; see the vocabulary note on [`taskbar`] above and `lib.rs`'s
+/// `win32` module).
+///
+/// Why not winit: `Window::is_maximized` answers only the CURRENT show state
+/// (and lies for a window minimized FROM maximized, which must restore
+/// maximized), and nothing in winit exposes `rcNormalPosition` — the rect the
+/// OS itself would restore-down to. While maximized, `outer_position()` reports
+/// the maximized frame's origin (the monitor corner, minus the invisible resize
+/// border), which is exactly the coordinate a restore must NOT persist: re-apply
+/// it and then maximize, and the eventual un-maximize plants the window at the
+/// monitor corner instead of where the user had it. One placement call answers
+/// both questions atomically.
+#[cfg(windows)]
+pub(crate) mod placement {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    /// `WINDOWPLACEMENT` — 44 bytes on every Windows ABI aterm builds for
+    /// (4×u32-ish header + two POINTs + one RECT); `length` must be pre-set.
+    #[repr(C)]
+    struct WindowPlacement {
+        length: u32,
+        flags: u32,
+        show_cmd: u32,
+        min_position: Point,
+        max_position: Point,
+        normal_position: Rect,
+    }
+
+    /// `SW_SHOWMAXIMIZED` / `SW_SHOWMINIMIZED` show commands.
+    const SW_SHOWMINIMIZED: u32 = 2;
+    const SW_SHOWMAXIMIZED: u32 = 3;
+    /// `WPF_RESTORETOMAXIMIZED`: the window is minimized NOW but returns to
+    /// maximized — quitting from the taskbar while minimized must still reopen
+    /// maximized, so this counts.
+    const WPF_RESTORETOMAXIMIZED: u32 = 0x2;
+    /// `SPI_GETWORKAREA` (SystemParametersInfoW): the PRIMARY monitor's work
+    /// area in screen coordinates — the origin of the "workspace" coordinate
+    /// space `rcNormalPosition` is denominated in.
+    const SPI_GETWORKAREA: u32 = 0x0030;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowPlacement(hwnd: isize, placement: *mut WindowPlacement) -> i32;
+        // Signature kept byte-identical to `platform_win.rs`'s declaration of
+        // the same import (`*mut c_void`, not a typed out-pointer), or rustc's
+        // `clashing_extern_declarations` fires across the two modules.
+        fn SystemParametersInfoW(
+            action: u32,
+            ui_param: u32,
+            pv_param: *mut std::ffi::c_void,
+            fw_ini: u32,
+        ) -> i32;
+    }
+
+    /// `(maximized, normal-rect top-left in SCREEN physical px)` for `window`,
+    /// or `None` when the HWND is unreachable or the call fails (capture then
+    /// degrades to the winit `outer_position()` read, today's behaviour).
+    ///
+    /// The coordinate conversion is the subtle half: `rcNormalPosition` is in
+    /// WORKSPACE coordinates — screen coordinates shifted by the PRIMARY
+    /// monitor's work-area origin. With the taskbar in its default bottom slot
+    /// the two spaces coincide, which is why code that skips the conversion
+    /// appears correct on most machines and restores every window one
+    /// taskbar-height off on a top- or left-docked one. `SPI_GETWORKAREA`
+    /// supplies the offset; a failed read degrades to (0,0), i.e. the
+    /// no-conversion behaviour.
+    pub(crate) fn read(window: &winit::window::Window) -> Option<(bool, (i32, i32))> {
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let hwnd = match window.window_handle().ok()?.as_raw() {
+            RawWindowHandle::Win32(h) => h.hwnd.get(),
+            _ => return None,
+        };
+        // SAFETY: out-params are stack locals sized per the documented layouts,
+        // `length` pre-set as `GetWindowPlacement` requires; no pointer outlives
+        // the call.
+        unsafe {
+            let mut wp = WindowPlacement {
+                length: std::mem::size_of::<WindowPlacement>() as u32,
+                flags: 0,
+                show_cmd: 0,
+                min_position: Point { x: 0, y: 0 },
+                max_position: Point { x: 0, y: 0 },
+                normal_position: Rect {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+            };
+            if GetWindowPlacement(hwnd, &mut wp) == 0 {
+                return None;
+            }
+            let maximized = wp.show_cmd == SW_SHOWMAXIMIZED
+                || (wp.show_cmd == SW_SHOWMINIMIZED && wp.flags & WPF_RESTORETOMAXIMIZED != 0);
+            let mut work = Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
+            if SystemParametersInfoW(
+                SPI_GETWORKAREA,
+                0,
+                (&raw mut work).cast::<std::ffi::c_void>(),
+                0,
+            ) == 0
+            {
+                work.left = 0;
+                work.top = 0;
+            }
+            Some((
+                maximized,
+                (
+                    wp.normal_position.left + work.left,
+                    wp.normal_position.top + work.top,
+                ),
+            ))
+        }
+    }
+}
+
 /// HiDPI auto-scale target for [`App::attach_os_window`]: the `font_px` the
 /// default font size should render at on a display of `scale`, or `None` when the
 /// auto-scale does not apply (an EXPLICIT `$ATERM_FONT_PX`/`config.font_px` is
@@ -2365,6 +3091,46 @@ fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (L1) The early reveal's class-brush erase and the first presented frame
+    /// are ONE colour: the brush is seeded from `early_reveal_backdrop`, and
+    /// both things the first frame paints — the engine default background of
+    /// every unstyled cell, and the remainder bands around the grid before any
+    /// OSC 11 — resolve to that same byte triple. Pinned under EITHER OS
+    /// appearance after the sync the attach path runs pre-reveal, because a
+    /// `dark:…,light:…` split theme is the one place the two resolutions could
+    /// disagree. A stray alpha byte on the theme never reaches the brush.
+    #[test]
+    fn early_reveal_backdrop_is_the_colour_the_first_frame_paints() {
+        let mut app = crate::App::headless_for_test();
+        for appearance in [
+            aterm_types::Appearance::Light,
+            aterm_types::Appearance::Dark,
+        ] {
+            app.sync_app_theme_to_appearance(appearance);
+            let backdrop = app.early_reveal_backdrop();
+            let tc = app
+                .config
+                .applied_terminal_config_for_with_assets(appearance, &app.config_assets.themes);
+            let cell = tc.default_background;
+            assert_eq!(
+                [cell.r, cell.g, cell.b],
+                crate::settings::u32_rgb(backdrop),
+                "{appearance:?}: an unstyled cell of the first frame must paint the erase colour"
+            );
+            assert_eq!(
+                crate::app_render::present_band_bg(aterm_core::render::COLOR_UNSET, app.theme.bg),
+                backdrop,
+                "{appearance:?}: the bands around the grid must paint the erase colour"
+            );
+        }
+        app.theme.bg = 0xFF11_1318;
+        assert_eq!(
+            app.early_reveal_backdrop(),
+            0x11_1318,
+            "the brush is seeded 24-bit: a stray alpha byte is masked off"
+        );
+    }
 
     /// A 1440×900-point work area whose origin is NOT (0, 0) — the menu-bar band on
     /// the main display, and the general case on a secondary one. Placements that
@@ -2569,6 +3335,39 @@ mod tests {
             app.window_theme_for_chrome(),
             crate::app_config::WindowTheme::Dark,
             "an explicit chrome override remains explicit"
+        );
+    }
+
+    /// The Linux platform-seam resolution (`chrome_theme_for_apprt`): `Auto`
+    /// resolves to the ACTIVE terminal theme's darkness so the sctk-adwaita CSD
+    /// header tracks the terminal body (Linux has no titlebar bg painter, and
+    /// winit's Wayland backend never delivers `ThemeChanged` for `Auto` to
+    /// follow). The CONFIG policy value itself stays system-owned — the test
+    /// above pins that — and an explicit Light/Dark remains the operator's word.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_csd_chrome_resolves_auto_from_terminal_theme_darkness() {
+        let mut app = App::headless_for_test();
+        app.window_theme = crate::app_config::WindowTheme::Auto;
+        app.theme.bg = 0x000000;
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            crate::app_config::WindowTheme::Dark,
+            "a dark terminal theme must not sit under a light-grey CSD slab"
+        );
+        app.theme.bg = 0xffffff;
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            crate::app_config::WindowTheme::Light,
+            "a light terminal theme resolves the light CSD variant"
+        );
+        // An explicit config override outranks the palette on every platform.
+        app.window_theme = crate::app_config::WindowTheme::Light;
+        app.theme.bg = 0x000000;
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            crate::app_config::WindowTheme::Light,
+            "an explicit chrome override remains the operator's word"
         );
     }
 
@@ -2877,6 +3676,82 @@ mod tests {
             Some(1),
             "negative control: the retired views==1 rule would miss this close"
         );
+    }
+
+    /// W4: a synthetic two-monitor desktop — a 1× 1920×1080 primary and a 2×
+    /// 2560×1440 external to its right (the classic docked-laptop shape whose
+    /// undocking is the whole reason the validation exists).
+    fn desk() -> Vec<MonitorRectPx> {
+        vec![
+            MonitorRectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 1920.0,
+                h: 1080.0,
+                scale: 1.0,
+            },
+            MonitorRectPx {
+                x: 1920.0,
+                y: 0.0,
+                w: 2560.0,
+                h: 1440.0,
+                scale: 2.0,
+            },
+        ]
+    }
+
+    #[test]
+    fn restored_positions_on_live_monitors_are_kept() {
+        // Interior points of both monitors, including one only reachable via the
+        // second rect (undock this desk to the primary alone and it must flip).
+        assert!(restored_origin_visible((100.0, 100.0), &desk()));
+        assert!(restored_origin_visible((2400.0, 300.0), &desk()));
+        // Origin exactly at a monitor corner is the cascade's own wrap target.
+        assert!(restored_origin_visible((0.0, 0.0), &desk()));
+        assert!(restored_origin_visible((1920.0, 0.0), &desk()));
+    }
+
+    #[test]
+    fn restored_positions_on_a_departed_monitor_are_refused() {
+        let undocked = vec![MonitorRectPx {
+            x: 0.0,
+            y: 0.0,
+            w: 1920.0,
+            h: 1080.0,
+            scale: 1.0,
+        }];
+        // The window that lived on the (now absent) external: entirely outside
+        // the surviving desktop — the exact "restores off-desktop" defect.
+        assert!(restored_origin_visible((2400.0, 300.0), &desk()));
+        assert!(!restored_origin_visible((2400.0, 300.0), &undocked));
+        // Far off every edge, and the classic minimized-sentinel corner.
+        assert!(!restored_origin_visible((-32000.0, -32000.0), &desk()));
+        assert!(!restored_origin_visible((0.0, 5000.0), &desk()));
+    }
+
+    #[test]
+    fn restored_positions_need_a_grabbable_corner_not_just_intersection() {
+        // Inside the primary's rectangle, but with less than the 160-pt grab
+        // minimum to the right/below — the titlebar would be a sliver in the
+        // corner. Same rule as `cascade_top_left_pts`'s final clamp.
+        assert!(!restored_origin_visible((1920.0 - 10.0, 100.0), &desk()));
+        assert!(!restored_origin_visible((100.0, 1080.0 - 10.0), &desk()));
+        // The 2× monitor's grab minimum is 320 PHYSICAL px: a point 200 px from
+        // its right edge fails there even though 200 > 160.
+        assert!(!restored_origin_visible((1920.0 + 2560.0 - 200.0, 100.0), &desk()));
+        // Nonsense geometry answers false rather than guessing.
+        assert!(!restored_origin_visible((f64::NAN, 10.0), &desk()));
+        assert!(!restored_origin_visible((10.0, 10.0), &[]));
+        assert!(!restored_origin_visible(
+            (10.0, 10.0),
+            &[MonitorRectPx {
+                x: 0.0,
+                y: 0.0,
+                w: 0.0,
+                h: 0.0,
+                scale: 1.0,
+            }]
+        ));
     }
 
     /// Arm window 0's initial-frame settle with a far deadline and `budget`

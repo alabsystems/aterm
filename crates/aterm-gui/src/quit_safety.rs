@@ -85,6 +85,37 @@ pub(crate) fn confirm_prompt(exits_app: bool, busy: bool) -> Option<ConfirmPromp
     }
 }
 
+/// The WINDOWS close-confirm policy — Windows Terminal's convention
+/// (`confirmCloseAllTabs`), NOT macOS's: confirm when the gesture would close
+/// MULTIPLE tabs or end a running job, and NEVER for a single idle tab — an
+/// idle Alt+F4 on a one-tab window closes instantly, even when it is the last
+/// window and thus quits the app. macOS's always-confirm-on-quit rule
+/// ([`confirm_prompt`]'s `exits_app` arm) is deliberately NOT ported: ⌘Q is a
+/// one-key slip next to ⌘W, while a Windows quit is Alt+F4 / the caption ✕ —
+/// gestures no neighbouring key mistypes — and no native Windows app confirms
+/// an idle single-document close.
+///
+/// `tabs_closing` is the gesture's blast radius: every tab the close would take
+/// with it (the closing window's tabs, or all windows' for a whole-app quit).
+/// The busy/quit copy is shared verbatim with [`confirm_prompt`]; only the
+/// idle-multi-tab close of a NON-last window needs copy of its own (macOS never
+/// prompts there at all).
+#[cfg(windows)]
+pub(crate) fn confirm_prompt_windows(
+    exits_app: bool,
+    tabs_closing: usize,
+    busy: bool,
+) -> Option<ConfirmPrompt> {
+    if !busy && tabs_closing <= 1 {
+        return None; // a single idle tab: instant, per the WT convention
+    }
+    confirm_prompt(exits_app, busy).or(Some(ConfirmPrompt {
+        title: "Close all tabs?",
+        body: "This window has several tabs open. Closing it will end all of their sessions.",
+        proceed: "Close",
+    }))
+}
+
 /// Whether a PTY's foreground process group is a JOB rather than the shell itself.
 /// `tcgetpgrp(master)` returns the shell's own pgid (== its pid: the forkpty child
 /// is the session leader) at an idle prompt, the running job's pgid while one runs,
@@ -252,6 +283,48 @@ mod tests {
         );
         let busy = confirm_prompt(false, true).expect("a busy window/tab close confirms");
         assert_eq!(busy.proceed, "Close");
+    }
+
+    /// The Windows policy (WT convention): a single idle tab NEVER prompts —
+    /// including the last-window case that quits the app, which is exactly the
+    /// macOS always-confirm rule this policy refuses to port.
+    #[cfg(windows)]
+    #[test]
+    fn windows_single_idle_tab_closes_without_a_prompt() {
+        assert!(confirm_prompt_windows(false, 1, false).is_none());
+        assert!(
+            confirm_prompt_windows(true, 1, false).is_none(),
+            "an idle one-tab last window must quit instantly on Windows"
+        );
+        assert!(confirm_prompt_windows(false, 0, false).is_none());
+    }
+
+    /// Busy always prompts, with the shared macOS copy: "Quit" for a whole-app
+    /// exit, "Close" otherwise — the REAL verbs the TaskDialog buttons carry.
+    #[cfg(windows)]
+    #[test]
+    fn windows_busy_prompts_with_the_real_verbs() {
+        let busy_close = confirm_prompt_windows(false, 1, true).expect("busy close confirms");
+        assert_eq!(busy_close.proceed, "Close");
+        let busy_quit = confirm_prompt_windows(true, 1, true).expect("busy quit confirms");
+        assert_eq!(busy_quit.proceed, "Quit");
+    }
+
+    /// Closing MULTIPLE tabs prompts even when idle: quit copy when the gesture
+    /// exits the app, the multi-tab close copy when another window survives
+    /// (a case macOS never prompts on, hence the dedicated copy).
+    #[cfg(windows)]
+    #[test]
+    fn windows_multi_tab_close_prompts_when_idle() {
+        let quit = confirm_prompt_windows(true, 4, false).expect("multi-tab quit confirms");
+        assert_eq!(quit.proceed, "Quit");
+        let close = confirm_prompt_windows(false, 4, false).expect("multi-tab close confirms");
+        assert_eq!(close.proceed, "Close");
+        assert!(
+            close.title.contains("all tabs"),
+            "the non-quit multi-tab prompt must say it closes every tab: {}",
+            close.title
+        );
     }
 
     #[test]

@@ -352,11 +352,42 @@ pub fn varied_glyph_raster(
     gid: u16,
     px: f32,
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-    let mut face = ttf_parser::Face::parse(bytes, index).ok()?;
-    for &(tag, value) in coords {
-        let _ = face.set_variation(ttf_parser::Tag(tag), value);
+    VariedFace::parse(bytes, index, coords)?.glyph_raster(gid, px)
+}
+
+/// A face parsed ONCE with its variation coords applied — the amortized form of
+/// [`varied_glyph_raster`] for a caller that rasters MANY glyphs of one instance
+/// (a shaped label, a specimen line): one `Face::parse` + coord replay per run
+/// instead of per glyph, without the caller taking a `ttf_parser` dependency of
+/// its own. Each raster is byte-identical to the byte-slice wrapper's.
+pub struct VariedFace<'a> {
+    face: ttf_parser::Face<'a>,
+}
+
+impl<'a> VariedFace<'a> {
+    /// Parse `bytes` at collection `index` and apply `coords` (unknown tags are
+    /// ignored, exactly as [`varied_glyph_raster`] ignores them). `None` on a
+    /// malformed face.
+    #[must_use]
+    pub fn parse(bytes: &'a [u8], index: u32, coords: &[(u32, f32)]) -> Option<Self> {
+        let mut face = ttf_parser::Face::parse(bytes, index).ok()?;
+        for &(tag, value) in coords {
+            let _ = face.set_variation(ttf_parser::Tag(tag), value);
+        }
+        Some(Self { face })
     }
-    varied_glyph_raster_with_face(&face, gid, px)
+
+    /// [`varied_glyph_raster`] through this instance: the same
+    /// `(width, height, xmin, ymin, advance_width, coverage)` tuple and the same
+    /// `None` cases (missing/oversized glyph, degenerate size).
+    #[must_use]
+    pub fn glyph_raster(
+        &self,
+        gid: u16,
+        px: f32,
+    ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+        varied_glyph_raster_with_face(&self.face, gid, px)
+    }
 }
 
 /// [`varied_glyph_raster`] on an ALREADY-PARSED face — the hot-path form. The

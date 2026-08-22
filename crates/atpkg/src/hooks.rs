@@ -102,6 +102,7 @@ pub fn refresh(layout: &Layout) {
         return;
     }
     let _ = write_hooks(&shell_d, &layout.bin_dir());
+    #[cfg(unix)]
     ensure_command_links(&home);
 }
 
@@ -120,6 +121,11 @@ pub fn refresh(layout: &Layout) {
 /// `tools/install.sh` uses, and NEVER over anything that is not already ours — a
 /// real file there is someone's own build. No dotfile is touched; `atpkg doctor`
 /// still prints the rc line for putting the managed `bin/` itself on PATH.
+///
+/// Unix-only: the whole body is bundle-shaped (`Contents/MacOS`, `~/.local/bin`,
+/// POSIX symlinks), so on Windows it could only ever return early — and
+/// `std::os::unix::fs::symlink` does not exist there to compile against.
+#[cfg(unix)]
 fn ensure_command_links(home: &Path) {
     let Ok(exe) = std::env::current_exe() else {
         return;

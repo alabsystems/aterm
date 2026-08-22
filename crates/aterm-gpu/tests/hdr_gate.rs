@@ -527,6 +527,84 @@ fn gpu_hdr_blit_grid_clamped_and_linear() {
     );
 }
 
+/// REFERENCE-WHITE SCALE on the REAL pipeline, grid AND bands: a Windows-style
+/// scRGB present (`sdr_white_scale = 3.0`, a 240-nit SDR-white desktop) into a
+/// destination 7 px larger than grid fit. Every content pixel equals
+/// `scrgb_present_channel(sdr byte, 3.0)` and every remainder-band pixel equals
+/// the SAME encode of the theme background — the bands are the same sheet as
+/// the grid. Measured on glass before the fix: the band arm skipped the scale,
+/// so the strips composed 1/3 as bright as the grid beside them.
+#[test]
+fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
+    let Some(mut gpu) = gpu(18.0) else { return };
+    gpu.set_hdr_glow(true);
+    let mut win = WindowGpu::new();
+    win.set_edr_max(2.0);
+    win.set_sdr_white_scale(3.0);
+
+    // Real content (bright white text) so the scale has something above 1.0 to
+    // lift — an all-background frame would make the non-vacuity check moot.
+    let (rows, cols) = (4usize, 16usize);
+    let mut t = Terminal::new(rows as u16, cols as u16);
+    t.process(b"band \x1b[97mWHITE\x1b[0m fit");
+    let mut input = t.cell_frame(rows, cols);
+    input.cursor_visible = false;
+
+    let sdr = gpu.render_input(&mut win, &input, None);
+    let (fw, fh) = (sdr.width, sdr.height);
+    let (hdrpix, w, h) = gpu.present_hdr_sized_for_test(&mut win, &input, false, 7, 7);
+    assert_eq!((w as usize, h as usize), (fw + 7, fh + 7));
+    let (ox, oy) = (
+        aterm_render::band_offset(w as usize, fw),
+        aterm_render::band_offset(h as usize, fh),
+    );
+    assert_eq!(
+        (ox, oy),
+        (3, 3),
+        "a 7px remainder splits 3 leading / 4 trailing"
+    );
+
+    let bg = aterm_render::Theme::default().bg & 0x00ff_ffff;
+    let (mut content_px, mut band_px) = (0usize, 0usize);
+    let mut max_dev = 0.0f32;
+    for y in 0..h as usize {
+        for x in 0..w as usize {
+            let (sx, sy) = (x as i64 - ox, y as i64 - oy);
+            let in_frame = sx >= 0 && sy >= 0 && (sx as usize) < fw && (sy as usize) < fh;
+            let src = if in_frame {
+                content_px += 1;
+                sdr.pixels[sy as usize * fw + sx as usize]
+            } else {
+                band_px += 1;
+                bg
+            };
+            for (ch_i, shift) in [(0usize, 16u32), (1, 8), (2, 0)] {
+                let byte = ((src >> shift) & 0xff) as u8;
+                let got = hdrpix[(y * w as usize + x) * 4 + ch_i];
+                assert!(
+                    (0.0..=3.0).contains(&got),
+                    "({x},{y}) ch {ch_i}: escaped [0, scale]: {got}"
+                );
+                let want = hdr::scrgb_present_channel(byte, 3.0);
+                max_dev = max_dev.max((got - want).abs());
+            }
+        }
+    }
+    // NON-VACUITY: both arms genuinely exercised, over the whole surface.
+    assert_eq!(content_px, fw * fh);
+    assert_eq!(band_px, w as usize * h as usize - fw * fh);
+    // f16 quantization in [2, 4) is ~2e-3 per step; GPU pow noise is well below.
+    assert!(
+        max_dev <= 8e-3,
+        "grid + bands must be the SAME scRGB encode of their bytes (max dev {max_dev})"
+    );
+    // NON-VACUITY: the scale genuinely lifts the stream above reference white.
+    assert!(
+        hdrpix.iter().any(|&v| v > 1.0),
+        "a 3.0x present of white text must exceed 1.0 somewhere"
+    );
+}
+
 /// ADDITIVE CLAMP LAW on the REAL pipeline: with the aurora pass on and a
 /// 2.0x panel, no channel exceeds the sanitized EDR max — and (non-vacuity)
 /// the aurora genuinely emits ABOVE reference white, the whole point of M3.

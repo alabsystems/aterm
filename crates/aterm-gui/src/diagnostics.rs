@@ -1177,6 +1177,15 @@ pub(crate) fn config_backend_capability_warnings(
                 .to_string(),
         });
     }
+    // The one security key whose silence would be worst: a user who authored a
+    // PROTECTION must not believe it holds on a platform where it cannot.
+    if config.secure_keyboard_entry.is_some() && platform != ConfigCapabilityPlatform::MacOs {
+        warnings.push(ConfigSemanticWarning {
+            key: crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY,
+            message: "secure_keyboard_entry is parsed and preserved but has no protective                       effect on this platform; Secure Keyboard Entry is a macOS mechanism                       (Carbon secure input)"
+                .to_string(),
+        });
+    }
     if platform != ConfigCapabilityPlatform::MacOs {
         for (key, authored) in [
             (
@@ -1544,14 +1553,32 @@ pub(crate) fn list_themes() -> String {
 }
 
 /// `--list-keybinds`: the keybinding surface. First the BUILT-IN default chords
-/// (the fixed Cmd-* bindings handled in `on_key`), then any user `[keybindings]`
+/// — PER PLATFORM: on macOS the fixed Cmd-* bindings handled in `on_key`, off
+/// macOS the seeded table `Keybindings::platform_defaults` installs. Printing
+/// `BUILTIN_CMD_CHORDS` unconditionally (the old behaviour) documented thirty
+/// `cmd+*` chords on Windows and not one that works: `Chord::from_event` maps
+/// `cmd` from `super_key()`, so "cmd+t" literally means Win+T — a keystroke the
+/// shell steals before aterm ever sees it. Then any user `[keybindings]`
 /// overrides from the effective config (parsed, malformed entries skipped). The
 /// bindable action NAMES come from [`crate::keybinding::ACTION_NAMES`].
 pub(crate) fn list_keybinds() -> String {
     let mut s = String::new();
-    let _ = writeln!(s, "built-in keybindings (in the window):");
-    for (chord, label) in crate::keybinding::BUILTIN_CMD_CHORDS {
-        let _ = writeln!(s, "  {chord:<16} {label}");
+    #[cfg(target_os = "macos")]
+    {
+        let _ = writeln!(s, "built-in keybindings (in the window):");
+        for (chord, label) in crate::keybinding::BUILTIN_CMD_CHORDS {
+            let _ = writeln!(s, "  {chord:<16} {label}");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = writeln!(
+            s,
+            "built-in default keybindings (each rebindable via [keybindings]):"
+        );
+        for (chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
+            let _ = writeln!(s, "  {chord:<18} {action}");
+        }
     }
     let _ = writeln!(s);
     let config = crate::app_config::load_config();
@@ -1847,7 +1874,7 @@ mod tests {
         );
 
         let platform_only = parsed(
-            "font_thicken = true\n[update]\nowner = \"safe-owner\"\nrepo = \"aterm\"\nauto_apply = true\n",
+            "font_thicken = true\nsecure_keyboard_entry = true\n[update]\nowner = \"safe-owner\"\nrepo = \"aterm\"\nauto_apply = true\n",
         );
         let non_macos = config_backend_capability_warnings(
             &platform_only,
@@ -1861,6 +1888,7 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             std::collections::BTreeSet::from([
                 "font_thicken",
+                "secure_keyboard_entry",
                 "update.auto_apply",
                 "update.owner",
                 "update.repo",
@@ -2101,10 +2129,17 @@ expect_nonce = "launch-pin"
 
     #[test]
     fn host_semantics_accept_valid_lexicon_and_report_missing_or_rejected_layers() {
+        // libtest names each test thread after the test's FULL PATH — here
+        // "diagnostics::tests::host_semantics_…" — and `:` is not a legal
+        // character in a Windows path component, so using the name verbatim
+        // made `create_dir_all` fail with os error 123 (InvalidFilename) on
+        // Windows and this test never ran there. Sanitize instead of dropping
+        // the name: it is what keeps the directory unique per test.
+        let thread = std::thread::current();
         let root = std::env::temp_dir().join(format!(
             "aterm-config-lexicon-{}-{}",
             std::process::id(),
-            std::thread::current().name().unwrap_or("test")
+            thread.name().unwrap_or("test").replace(':', "-")
         ));
         std::fs::create_dir_all(&root).unwrap();
         let valid = root.join("valid.toml");
@@ -2593,10 +2628,27 @@ ink = "rainbow"
     #[test]
     fn list_keybinds_covers_builtins_and_action_names() {
         let out = list_keybinds();
-        assert!(out.contains("built-in keybindings"), "builtin header");
-        // A couple of the fixed Cmd-* chords are documented.
-        assert!(out.contains("cmd+c"), "copy chord listed");
-        assert!(out.contains("cmd+t"), "new-tab chord listed");
+        // The built-in section is PER PLATFORM: macOS documents the hardcoded
+        // Cmd-* chords; everywhere else it documents the seeded platform table
+        // (printing "cmd+t" on Windows would teach Win+T, which the shell owns).
+        #[cfg(target_os = "macos")]
+        {
+            assert!(out.contains("built-in keybindings"), "builtin header");
+            // A couple of the fixed Cmd-* chords are documented.
+            assert!(out.contains("cmd+c"), "copy chord listed");
+            assert!(out.contains("cmd+t"), "new-tab chord listed");
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert!(out.contains("built-in default keybindings"), "builtin header");
+            // The section is GENERATED from the seed table, so every seeded
+            // chord and action is documented — drift is structurally impossible,
+            // and this asserts the generation stays wired.
+            for (chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
+                assert!(out.contains(chord), "{chord} listed");
+                assert!(out.contains(action), "{action} listed");
+            }
+        }
         // Every bindable action NAME is offered for [keybindings] values.
         assert!(out.contains("bindable action names"), "actions header");
         assert!(

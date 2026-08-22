@@ -1143,12 +1143,58 @@ mod imp {
             .is_some_and(|(left, right)| (left.volume, left.index) == (right.volume, right.index))
     }
 
+    /// Open the retained READ guard for an artifact.
+    ///
+    /// This share mask used to omit `FILE_SHARE_DELETE`, so a live read guard
+    /// ALSO denied delete/rename of that exact file to every other opener. That
+    /// extra denial is deliberately gone. What it cost to keep, and why nothing
+    /// load-bearing went with it:
+    ///
+    /// Windows evaluates sharing in BOTH directions on every open. The new
+    /// open's desired access must be inside every live handle's share mask, AND
+    /// the new open's share mask must contain every live handle's already
+    /// granted access. A retained write guard from
+    /// `write_private_inner_with_hook` is granted `GENERIC_WRITE |
+    /// DELETE_ACCESS`, and it needs DELETE for its whole retained life:
+    /// `SetFileInformationByHandle(FileRenameInfo)` publishes with it and
+    /// `remove_exact` rolls back with it. The old read mask permitted that
+    /// writer's WRITE but not its DELETE, so reading an artifact this very
+    /// process had written and was still holding failed with
+    /// ERROR_SHARING_VIOLATION (os error 32). That is not a test-only corner:
+    /// the video prune probe reads `index.json` and pins every frame through
+    /// here while `VideoPublication` still retains the write guards for the wire
+    /// reply, so a perfectly complete recording scored `Invalid`.
+    ///
+    /// Re-opening the write handle without DELETE once publication finished was
+    /// tried on paper and rejected. `remove_exact` on a still-retained guard is
+    /// the entire point of handle-anchored rollback (`VideoPublication::abort`
+    /// and the snapshot commit paths depend on it), and re-acquiring DELETE
+    /// afterwards requires the retained handle to have shared DELETE all along —
+    /// which surrenders the WRITE guard's denial, the one
+    /// `windows_guards_deny_delete_until_exact_handles_drop` asserts, instead of
+    /// this one, for strictly more code and an extra open.
+    ///
+    /// The read guard never protected a read by exclusion; it protects it by
+    /// revalidation. `validate_path_identity` re-probes the name and compares
+    /// volume + file index, so a same-uid delete or rename during the read
+    /// becomes a fail-closed verdict instead of a false certification — and the
+    /// bytes already in hand came from this handle, which Windows keeps valid
+    /// even after the name is unlinked. That is precisely the `#[cfg(unix)]`
+    /// backend's contract: an open fd there stops neither `unlink` nor
+    /// `rename`. Two backends of one abstraction were stating different
+    /// contracts, which is itself the defect. The `AnchoredArtifactTransaction`
+    /// machine these functions refine agrees — it has no mutual-exclusion
+    /// concept at all, and `ReadPinned` is enabled whenever the directory is
+    /// pinned. Reader protection that IS specified lives in the refcounted lease
+    /// registry (`ArtifactReaderLease` / `mutate_unleased_artifact`), never in a
+    /// share mask.
+    ///
+    /// Retained WRITE guards and retained DIRECTORY guards keep their denials
+    /// unchanged; only this read path relaxed.
     fn open_regular_file(path: &Path) -> io::Result<std::fs::File> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
-            // Retained read guards also deny delete/rename. Publication and
-            // retention release these before exact cleanup.
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let metadata = file.metadata()?;
@@ -1221,7 +1267,7 @@ mod imp {
                 let _ = self.remove_exact();
                 return Err(error);
             }
-            if let Err(error) = rename_file_handle(&self.file, self.dir.leaf(), name, true) {
+            if let Err(error) = rename_file_handle(&self.file, &self.dir.path, name, true) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -1243,7 +1289,7 @@ mod imp {
                 let _ = self.remove_exact();
                 return Err(error);
             }
-            if let Err(error) = rename_file_handle(&self.file, self.dir.leaf(), name, false) {
+            if let Err(error) = rename_file_handle(&self.file, &self.dir.path, name, false) {
                 let _ = self.remove_exact();
                 return Err(error);
             }
@@ -1433,6 +1479,17 @@ mod imp {
                 // being swapped between validation and truncation/publication.
                 .share_mode(FILE_SHARE_READ)
                 .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+            // REQUIRED even though `access_mode` above is what actually reaches
+            // `CreateFileW`. std validates the PORTABLE flags first, and a creation
+            // disposition without `write`/`append` is rejected there —
+            // "creating or truncating a file requires write or append access" —
+            // before the Windows-specific access mask is ever consulted. Without
+            // this line every private artifact write failed on Windows, which is
+            // how `aterm-ctl window` came to answer with a write error on a
+            // directory it could plainly write to. `get_access_mode` still returns
+            // the explicit mask (an explicit `access_mode` outranks these), so this
+            // changes the validation outcome and nothing about the actual open.
+            options.write(true);
             options.create_new(true);
             let file = options.open(path)?;
             let file = PinnedFile {
@@ -1846,7 +1903,7 @@ mod imp {
             if !self.current_child_matches(from, expected) {
                 return Err(identity_changed());
             }
-            rename_file_handle(expected.leaf(), self.leaf(), to, false)?;
+            rename_file_handle(expected.leaf(), &self.path, to, false)?;
             let current = probe_directory(&self.path.join(to))?;
             if !same_identity(&current, expected.leaf()) {
                 return Err(identity_changed());
@@ -1884,9 +1941,27 @@ mod imp {
         }
     }
 
+    /// Rename the file behind `file`'s HANDLE to `name` inside `parent_path`.
+    ///
+    /// `FILE_RENAME_INFO::RootDirectory` — the natural way to anchor the destination
+    /// to a directory HANDLE this process already retains — is NOT honored by
+    /// `SetFileInformationByHandle`. That field belongs to the NT-native
+    /// `NtSetInformationFile` contract; the Win32 wrapper answers a non-NULL
+    /// `RootDirectory` with `ERROR_INVALID_PARAMETER`, and its contract is
+    /// `RootDirectory = NULL` plus a FULLY-QUALIFIED destination path. Measured
+    /// both ways on Windows 11 (2026-08-20): handle+relative → os error 87,
+    /// NULL+full path → success. Until it was fixed, this made EVERY private
+    /// artifact publication fail on Windows — `aterm-ctl window` reported a write
+    /// error on a directory it could plainly write to.
+    ///
+    /// The SOURCE side keeps its handle anchoring either way: the rename acts on
+    /// `file`'s open handle, never on a path re-lookup that could land on a
+    /// substitute. The destination stays honest through the callers, which bracket
+    /// this with `validate_path_identity()` before and after — and `PinnedDir::path`
+    /// is the canonicalized path of the directory those pinned handles refer to.
     fn rename_file_handle(
         file: &std::fs::File,
-        parent: &std::fs::File,
+        parent_path: &Path,
         name: &OsStr,
         replace: bool,
     ) -> io::Result<()> {
@@ -1897,7 +1972,8 @@ mod imp {
         };
 
         validate_component(name)?;
-        let wide = name.encode_wide().collect::<Vec<_>>();
+        let destination = parent_path.join(name);
+        let wide = destination.as_os_str().encode_wide().collect::<Vec<_>>();
         let header = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let bytes = header
             .checked_add(wide.len().checked_mul(2).ok_or_else(|| {
@@ -1915,7 +1991,8 @@ mod imp {
         unsafe {
             std::ptr::write(information, FILE_RENAME_INFO::default());
             (*information).Anonymous.ReplaceIfExists = replace;
-            (*information).RootDirectory = HANDLE(parent.as_raw_handle());
+            // RootDirectory stays NULL (from `default()`) — see the doc comment:
+            // `SetFileInformationByHandle` rejects any other value.
             (*information).FileNameLength = u32::try_from(wide.len() * 2)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename name too long"))?;
             std::ptr::copy_nonoverlapping(
@@ -1963,13 +2040,28 @@ mod windows_tests {
         pinned.sync().unwrap();
         pinned.validate_path_identity().unwrap();
         index.validate_path_identity().unwrap();
+        // Reading an artifact whose WRITE guard this process still retains must
+        // work. The write guard holds DELETE_ACCESS for its whole life (rename
+        // publication and `remove_exact` both need it), so a read mask without
+        // FILE_SHARE_DELETE answered ERROR_SHARING_VIOLATION here — which is
+        // what the video prune probe hit against a live `VideoPublication`.
         let (bytes, read) = pinned
             .read_private(std::ffi::OsStr::new("index.json"), 32)
             .unwrap();
         assert_eq!(bytes, b"whole");
         read.validate_path_identity().unwrap();
-        drop(read);
+        // The price, stated in code rather than left implicit: a retained READ
+        // guard no longer denies deletion on Windows. Its contract is now the
+        // Unix one — it does not EXCLUDE a same-uid mutation, it DETECTS one and
+        // fails closed. Both halves are asserted so neither can rot silently.
         drop(index);
+        std::fs::remove_file(root.join("index.json"))
+            .expect("a retained read guard permits deletion, as an open Unix fd does");
+        assert!(
+            read.validate_path_identity().is_err(),
+            "a removed artifact must fail the read guard's identity revalidation"
+        );
+        drop(read);
 
         let child = pinned
             .create_child(std::ffi::OsStr::new("recording"))
@@ -1982,8 +2074,17 @@ mod windows_tests {
         pinned
             .remove_child_tree_exact(std::ffi::OsStr::new("recording"), &child)
             .unwrap();
-        assert!(!root.join("recording").exists());
+        // The `unwrap` above is the removal verdict; this `exists` check is only
+        // about WHEN the name stops being enumerable. `dispose_file_handle` is
+        // Windows' handle-anchored removal and it marks delete-on-close, so the
+        // committed entry survives until the last handle to that exact inode
+        // closes — `child` is still holding one right here. (`std`'s `metadata`
+        // falls back to a directory-entry query when the open is refused, so a
+        // delete-pending name still reports as existing.) Unix `unlinkat` drops
+        // the name at once, so the two backends differ in observation point, not
+        // in guarantee. Assert once the handle this call was anchored to is gone.
         drop(child);
+        assert!(!root.join("recording").exists());
         drop(pinned);
         let _ = std::fs::remove_dir_all(root);
     }

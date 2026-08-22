@@ -908,6 +908,27 @@ pub fn wake(_wake_wr: i32) {}
 /// No wake-pipe fds on Windows — nothing to close.
 pub fn close_fd(_fd: i32) {}
 
+/// No `FD_CLOEXEC` on Windows — inheritance is a per-HANDLE property set at creation
+/// (`bInheritHandle` / `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`), not a flag toggled on an
+/// integer fd. Reports success so the shared caller's `?`/`ok()?` chain proceeds; the
+/// only consumer is the POSIX exec-handoff path, which is inert on this platform.
+///
+/// Mirrors [`crate::set_cloexec`]. Both mirrors must grow together — a shared consumer
+/// reads whichever one its target provides.
+#[allow(clippy::unnecessary_wraps)]
+pub fn set_cloexec(_fd: i32, _on: bool) -> io::Result<()> {
+    Ok(())
+}
+
+/// Always `false`: Windows has no inherited PTY-master fd to interrogate. The unix
+/// original is the last-line "and it's still a tty" assertion on a descriptor adopted
+/// across `execve`; there is no such descriptor here, so the honest answer is "no",
+/// which makes every adoption attempt reject rather than proceed on a guess.
+#[must_use]
+pub fn fd_is_tty(_fd: i32) -> bool {
+    false
+}
+
 /// Write all of `bytes` to the child's input, retrying short writes. Stops
 /// silently on any error (matches the Unix Stop-on-error/peer-closed contract;
 /// there is no EINTR on Windows). After the child exits, writes still succeed

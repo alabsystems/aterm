@@ -1,3 +1,5 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+
 #![allow(non_snake_case)]
 
 mod runner;
@@ -44,12 +46,13 @@ use windows_sys::Win32::UI::Input::Touch::{
 use windows_sys::Win32::UI::Input::{RAWINPUT, RIM_TYPEKEYBOARD, RIM_TYPEMOUSE};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect, GetCursorPos,
-    GetMenu, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
-    RegisterClassExW, RegisterWindowMessageA, SetCursor, SetWindowPos, TranslateMessage,
+    GetMenu, KillTimer, LoadCursorW, MsgWaitForMultipleObjectsEx, PeekMessageW, PostMessageW,
+    RegisterClassExW, RegisterWindowMessageA, SetCursor, SetTimer, SetWindowPos, TranslateMessage,
     CREATESTRUCTW, GIDC_ARRIVAL, GIDC_REMOVAL, GWL_STYLE, GWL_USERDATA, HTCAPTION, HTCLIENT,
     MINMAXINFO, MNC_CLOSE, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, PT_PEN,
     PT_TOUCH, QS_ALLINPUT, RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, SC_MINIMIZE, SC_RESTORE,
-    SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WHEEL_DELTA, WINDOWPOS,
+    SIZE_MAXIMIZED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, USER_TIMER_MINIMUM,
+    WHEEL_DELTA, WINDOWPOS,
     WMSZ_BOTTOM, WMSZ_BOTTOMLEFT, WMSZ_BOTTOMRIGHT, WMSZ_LEFT, WMSZ_RIGHT, WMSZ_TOP, WMSZ_TOPLEFT,
     WMSZ_TOPRIGHT, WM_CAPTURECHANGED, WM_CLOSE, WM_CREATE, WM_DESTROY, WM_DPICHANGED,
     WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
@@ -58,7 +61,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_MENUCHAR, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCACTIVATE, WM_NCCALCSIZE,
     WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_PAINT, WM_POINTERDOWN, WM_POINTERUP,
     WM_POINTERUPDATE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SETFOCUS, WM_SETTINGCHANGE,
-    WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TOUCH, WM_WINDOWPOSCHANGED,
+    WM_SIZE, WM_SIZING, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_TOUCH,
+    WM_WINDOWPOSCHANGED,
     WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_OVERLAPPED, WS_POPUP, WS_VISIBLE,
 };
@@ -901,6 +905,17 @@ pub(crate) static DESTROY_MSG_ID: LazyMessageId = LazyMessageId::new("Winit::Des
 // documentation in the `window_state` module for more information.
 pub(crate) static SET_RETAIN_STATE_ON_SIZE_MSG_ID: LazyMessageId =
     LazyMessageId::new("Winit::SetRetainMaximized\0");
+// aterm patch (see the repository NOTICE): id of the per-window `SetTimer` timer
+// that keeps the event-loop runner ticking while Windows holds the thread inside
+// the `WM_ENTERSIZEMOVE` modal loop (caption drag / edge resize). Armed on
+// `WM_ENTERSIZEMOVE`, serviced by the `WM_TIMER` arm below, killed on
+// `WM_EXITSIZEMOVE`. Winit itself never calls `SetTimer` on a window HWND (its
+// `ControlFlow::WaitUntil` timing rides a waitable-timer HANDLE inside
+// `MsgWaitForMultipleObjectsEx`, and gestures are raw pointer messages), so any
+// nonzero id is free today; the ASCII tag just makes a collision with a future
+// in-process `SetTimer` user — control libraries favour small integers —
+// unlikely, and greppable from a stray-timer bug report.
+const SIZE_MOVE_PUMP_TIMER_ID: usize = 0x4154_524d; // "ATRM"
 static THREAD_EVENT_TARGET_WINDOW_CLASS: Lazy<Vec<u16>> =
     Lazy::new(|| util::encode_wide("Winit Thread Event Target"));
 /// When the taskbar is created, it registers a message with the "TaskbarCreated" string and then
@@ -1202,6 +1217,26 @@ unsafe fn public_window_callback_inner(
             userdata
                 .window_state_lock()
                 .set_window_flags_in_place(|f| f.insert(WindowFlags::MARKER_IN_SIZE_MOVE));
+            // aterm patch (see the repository NOTICE): `DefWindowProc` is about to
+            // run a MODAL message loop for the whole caption drag / edge resize.
+            // Our outer pump — `wait_for_messages`'s `prepare_wait()`/`wakeup()`
+            // bracket, and with it every `ControlFlow::WaitUntil` deadline — is
+            // parked under that loop's stack frame until `WM_EXITSIZEMOVE`.
+            // Window events still flow (the modal loop dispatches straight into
+            // this wndproc), but `NewEvents`/`AboutToWait` never fire, so timed
+            // work (cursor blink, decoration animation, the live-resize settle
+            // that repairs PTY winsize) freezes for the drag's duration. macOS
+            // never had this problem: its wakeup is a runloop observer in
+            // `kCFRunLoopCommonModes`, which includes the event-tracking mode.
+            // The classic Win32 remedy is a coarse `WM_TIMER` — timers are
+            // delivered by the modal loop itself — whose arm below re-runs the
+            // same runner bracket the outer pump would have. `USER_TIMER_MINIMUM`
+            // (10ms, quantized to the ~15.6ms system tick) is deliberately not
+            // faster: WM_TIMER only fires when the queue has gone quiet, so an
+            // active drag's WM_MOUSEMOVE flood naturally suppresses it.
+            unsafe {
+                SetTimer(window, SIZE_MOVE_PUMP_TIMER_ID, USER_TIMER_MINIMUM, None);
+            }
             result = ProcResult::Value(0);
         },
 
@@ -1213,6 +1248,59 @@ unsafe fn public_window_callback_inner(
             }
 
             state.set_window_flags_in_place(|f| f.remove(WindowFlags::MARKER_IN_SIZE_MOVE));
+            drop(state);
+            // aterm patch: retire the modal-loop pump armed in WM_ENTERSIZEMOVE.
+            // The outer `wait_for_messages` pump takes over again from here.
+            unsafe {
+                KillTimer(window, SIZE_MOVE_PUMP_TIMER_ID);
+            }
+            result = ProcResult::Value(0);
+        },
+
+        // aterm patch (see the repository NOTICE): the modal size/move pump.
+        // Only our private timer is intercepted; any other WM_TIMER on this
+        // window (none are armed today) falls through to `DefWindowProc`, which
+        // is what dispatches lparam TIMERPROC callbacks.
+        WM_TIMER if wparam == SIZE_MOVE_PUMP_TIMER_ID => {
+            // Re-run the runner bracket the outer pump would have run: Idle →
+            // `AboutToWait` (the app re-folds its deadlines and re-arms
+            // `ControlFlow::WaitUntil`), then HandlingMainEvents →
+            // `NewEvents(cause)` + buffered-event drain. `call_new_events`
+            // computes `cause` from the control flow it just re-read, so a
+            // deadline that lapsed mid-drag yields a GENUINE
+            // `StartCause::ResumeTimeReached` — downstream deadline servicing
+            // gated on that cause (aterm's blink/settle/effect sweep) fires with
+            // no synthetic cause and no app-side allowance. Redraws requested by
+            // the handler post `WM_PAINT` via `RDW_INTERNALPAINT`, which the
+            // modal loop delivers once the queue idles, so painting flows too.
+            //
+            // Guards, both required:
+            //  * MARKER_IN_SIZE_MOVE — a straggler WM_TIMER already posted when
+            //    `KillTimer` ran must not pump outside the modal loop; the outer
+            //    pump owns the bracket there and a second driver would emit
+            //    spurious AboutToWait/NewEvents pairs mid-dispatch.
+            //  * !should_buffer() — if the handler cell is currently taken we are
+            //    re-entrant inside the user's own event handler (a nested pump it
+            //    started: SendMessage, a system menu, a message box). Pumping the
+            //    runner would panic in `call_event_handler`; skip the tick and
+            //    let the next one retry. (The normal drag path never hits this:
+            //    `drag_window()` POSTS its WM_NCLBUTTONDOWN, and a native caption
+            //    hit dispatches from the OS queue, so the modal loop always nests
+            //    under `DefWindowProc`, outside any handler borrow.)
+            //
+            // Rejected alternatives: SetCoalescableTimer with TIMERV_COALESCING
+            // (buys nothing at this coarseness); pumping from a worker thread via
+            // PostMessage (identical delivery constraints, plus a thread); a
+            // WH_MSGFILTER hook on MSGF_SIZE (fires per queue message, i.e. never
+            // while the user holds still — the exact case the settle needs).
+            let in_size_move = userdata
+                .window_state_lock()
+                .window_flags()
+                .contains(WindowFlags::MARKER_IN_SIZE_MOVE);
+            if in_size_move && !userdata.event_loop_runner.should_buffer() {
+                userdata.event_loop_runner.prepare_wait();
+                userdata.event_loop_runner.wakeup();
+            }
             result = ProcResult::Value(0);
         },
 

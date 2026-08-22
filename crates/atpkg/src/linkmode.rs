@@ -283,21 +283,31 @@ pub fn linked_programs(layout: &Layout) -> Vec<String> {
     linked_programs_checked(layout).unwrap_or_default()
 }
 
+// The directory's OS-level identity — the value that must be IDENTICAL before and
+// after an enumeration for that enumeration to describe one directory. `None` means
+// the platform could not determine it, which the caller treats as a failure (never as
+// "unchanged"), so every arm fails CLOSED.
+
 #[cfg(unix)]
-fn directory_identity(metadata: &fs::Metadata) -> (u64, u64) {
+fn directory_identity(_path: &Path, metadata: &fs::Metadata) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
-    (metadata.dev(), metadata.ino())
+    Some((metadata.dev(), metadata.ino()))
 }
 
+// Path-based, not metadata-based: `Metadata` carries the same volume-serial/file-index
+// pair only behind the unstable `windows_by_handle` feature, so this goes through the
+// platform backend's stable `GetFileInformationByHandle` leaf call instead.
 #[cfg(windows)]
-fn directory_identity(metadata: &fs::Metadata) -> (Option<u32>, Option<u64>) {
-    use std::os::windows::fs::MetadataExt as _;
-    (metadata.volume_serial_number(), metadata.file_index())
+fn directory_identity(path: &Path, _metadata: &fs::Metadata) -> Option<(u32, u64)> {
+    crate::platform::directory_identity(path)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn directory_identity(metadata: &fs::Metadata) -> (u64, Option<std::time::SystemTime>) {
-    (metadata.len(), metadata.modified().ok())
+fn directory_identity(
+    _path: &Path,
+    metadata: &fs::Metadata,
+) -> Option<(u64, Option<std::time::SystemTime>)> {
+    Some((metadata.len(), metadata.modified().ok()))
 }
 
 /// Enumerate linked program names with a strict entry/result cap and explicit
@@ -316,7 +326,14 @@ pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> 
             "package links path is not a real directory",
         ));
     }
-    let identity = directory_identity(&before);
+    // Fail CLOSED on an unknowable identity: without it the post-enumeration compare
+    // below would be `None != None` — false — and would wave a swapped directory through.
+    let Some(identity) = directory_identity(&directory, &before) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "could not determine the identity of the package links directory",
+        ));
+    };
     let entries = fs::read_dir(&directory)?;
     for (index, entry) in entries.enumerate() {
         if index >= MAX_LINKED_PROGRAMS {
@@ -335,7 +352,7 @@ pub fn linked_programs_checked(layout: &Layout) -> std::io::Result<Vec<String>> 
     let after = fs::symlink_metadata(&directory)?;
     if !after.file_type().is_dir()
         || crate::platform::is_reparse(&after)
-        || directory_identity(&after) != identity
+        || directory_identity(&directory, &after) != Some(identity)
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

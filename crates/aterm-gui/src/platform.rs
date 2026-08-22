@@ -81,6 +81,24 @@ pub(crate) trait AppRt {
     /// off macOS.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme);
 
+    /// L1 (early reveal): SYNCHRONOUSLY paint the window's themed backdrop onto
+    /// glass, without waiting for the event loop to pump a paint message.
+    ///
+    /// The warm-launch early reveal shows the first window and then BLOCKS the
+    /// event-loop thread joining the backend build (~300 ms). On Windows the
+    /// themed erase that makes the revealed window look like the terminal (the
+    /// class brush `window_set_background_color` installs) only runs when a
+    /// paint/erase message is processed — which the blocked loop will not do,
+    /// so without this the "revealed" window would sit as an unpainted rectangle
+    /// for the whole join, which is worse than staying hidden. The Windows impl
+    /// forces the erase inline via `RedrawWindow(RDW_ERASENOW)`.
+    ///
+    /// Default no-op: macOS/Linux do not take the early-reveal path today, and
+    /// their compositors clear fresh windows to the layer/window background
+    /// without a client-side erase anyway.
+    #[cfg_attr(not(windows), allow(dead_code))] // only the Windows early-reveal path calls it
+    fn window_flush_backdrop(&self, _window: &Window) {}
+
     /// M3 (colour-managed present): tag the window's GPU swapchain layer (the
     /// CAMetalLayer wgpu attached at surface creation) with an EXPLICIT colour
     /// space, so ColorSync INTERPRETS the presented sRGB-encoded bytes instead of

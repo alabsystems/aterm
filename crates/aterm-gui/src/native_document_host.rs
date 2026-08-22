@@ -995,39 +995,67 @@ fn normalize_process_temp_root(path: &Path) -> Result<PathBuf, DocumentHostError
     Ok(root.join(suffix))
 }
 
-fn reject_symlink_components(path: &Path) -> Result<(), DocumentHostError> {
+/// Walk one absolute path component by component and hand every component that
+/// exists to `visit`, together with its `symlink_metadata`. A component that does
+/// not exist ends the walk successfully: callers are allowed to admit a suffix that
+/// Save has not authored yet, but they have still proved every component that does
+/// exist below it.
+///
+/// This walk used to be written out twice — once in `reject_symlink_components` and
+/// once in `logical_symlink_bindings` — and both copies carried the same bug, which
+/// is exactly why it now lives in one place. Two homes for one walk meant a fix
+/// applied to either one alone would have left the other broken, and they are
+/// independently reachable: `normalize_process_temp_root` canonicalizes on its own,
+/// so anything under `std::env::temp_dir()` reached the second copy first.
+///
+/// `Component::Prefix` is accumulated into the path but is never stat-ed on its own,
+/// and that is the whole Windows fix. `fs::canonicalize` always returns a verbatim
+/// path on Windows, so the first component of a canonicalized path is the bare
+/// prefix `\\?\C:` — which names the volume DEVICE, not its root directory.
+/// `symlink_metadata` on it fails with ERROR_INVALID_FUNCTION (raw OS error 1), and
+/// std maps that to `ErrorKind::Uncategorized`, *not* `NotFound`, so the
+/// missing-component arm below never caught it and every canonicalized path fell
+/// straight into the hard-error arm. The user-visible damage was total rather than
+/// cosmetic: `aterm.toml` neither loaded at startup nor saved, and the app silently
+/// fell back to an empty configuration document in which several effects default ON.
+///
+/// Skipping the prefix does not weaken the guard this walk exists to enforce. A
+/// prefix is a volume or UNC designator, not a directory entry: it cannot be a
+/// symlink or a reparse point, and there is nothing about it to validate. Stat-ing
+/// it was never a check in the first place — on a NON-verbatim path the bare `C:`
+/// resolves to the *current directory on drive C:*, so the walk was quietly
+/// symlink-checking an unrelated filesystem object and reporting success on it. Both
+/// the erroring case and the wrong-object case are cured by not stat-ing it at all,
+/// which is why this skips the component rather than merely tolerating its error.
+///
+/// Everything else is stat-ed exactly as strictly as before, the root directory very
+/// much included (`\\?\C:\` stats fine, and `/` always did). Unix has no prefix
+/// component at all, so on macOS and Linux this walk is bit-for-bit the one it
+/// replaces.
+fn walk_path_components<F>(path: &Path, mut visit: F) -> Result<(), DocumentHostError>
+where
+    F: FnMut(&Path, &fs::Metadata) -> Result<(), DocumentHostError>,
+{
     let mut prefix = PathBuf::new();
     for component in path.components() {
         prefix.push(component.as_os_str());
-        match fs::symlink_metadata(&prefix) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(DocumentHostError::SymlinkComponent { path: prefix });
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(DocumentHostError::Io {
-                    stage: AtomicSaveStage::Preflight,
-                    message: format!("could not validate {}: {error}", prefix.display()),
-                });
-            }
+        if matches!(component, std::path::Component::Prefix(_)) {
+            continue;
         }
-    }
-    Ok(())
-}
-
-/// Collect every existing symbolic-link component in the caller's logical
-/// spelling. A missing suffix is allowed so config creation can proceed through a
-/// bound parent-directory alias. A dangling link is not a missing suffix: it must
-/// fail closed rather than being replaced or used as an unbound creation target.
-fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, DocumentHostError> {
-    let mut prefix = PathBuf::new();
-    let mut bindings = Vec::new();
-    for component in path.components() {
-        prefix.push(component.as_os_str());
+        let is_root = matches!(component, std::path::Component::RootDir);
         let metadata = match fs::symlink_metadata(&prefix) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            // A root that cannot be stat-ed is not a capability failure and must not
+            // be reported as one. Windows has pseudo-roots that the metadata call
+            // simply does not accept — a device-namespace prefix such as `\\.\pipe\`
+            // is the reachable example — and std lands their failures in
+            // `Uncategorized`, precisely as it did for the bare verbatim prefix that
+            // caused this bug. Depending on `NotFound` alone to absorb them is the
+            // fragility that shipped here once already, so name the raw codes.
+            // `continue` rather than `break`: an unstattable root is not a missing
+            // root, so every real component underneath it still has to be validated.
+            Err(error) if is_root && root_stat_is_tolerable(&error) => continue,
             Err(error) => {
                 return Err(DocumentHostError::Io {
                     stage: AtomicSaveStage::Preflight,
@@ -1035,16 +1063,57 @@ fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, D
                 });
             }
         };
-        if !metadata.file_type().is_symlink() {
-            continue;
+        visit(&prefix, &metadata)?;
+    }
+    Ok(())
+}
+
+/// Whether a failure to stat a *root* component should be walked past instead of
+/// failing the admission. Windows only; on Unix the root is `/` and any failure to
+/// stat it is a real problem worth surfacing, so this stays closed there.
+#[cfg(windows)]
+fn root_stat_is_tolerable(error: &std::io::Error) -> bool {
+    const ERROR_INVALID_FUNCTION: i32 = 1;
+    const ERROR_INVALID_NAME: i32 = 123;
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_NAME)
+    )
+}
+
+#[cfg(not(windows))]
+fn root_stat_is_tolerable(_error: &std::io::Error) -> bool {
+    false
+}
+
+fn reject_symlink_components(path: &Path) -> Result<(), DocumentHostError> {
+    walk_path_components(path, |prefix, metadata| {
+        if metadata.file_type().is_symlink() {
+            return Err(DocumentHostError::SymlinkComponent {
+                path: prefix.to_path_buf(),
+            });
         }
-        let destination = fs::read_link(&prefix).map_err(|error| DocumentHostError::Io {
+        Ok(())
+    })
+}
+
+/// Collect every existing symbolic-link component in the caller's logical
+/// spelling. A missing suffix is allowed so config creation can proceed through a
+/// bound parent-directory alias. A dangling link is not a missing suffix: it must
+/// fail closed rather than being replaced or used as an unbound creation target.
+fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, DocumentHostError> {
+    let mut bindings = Vec::new();
+    walk_path_components(path, |prefix, metadata| {
+        if !metadata.file_type().is_symlink() {
+            return Ok(());
+        }
+        let destination = fs::read_link(prefix).map_err(|error| DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
             message: format!("could not read symbolic link {}: {error}", prefix.display()),
         })?;
         // Require each admitted link to resolve at admission time. In particular,
         // this distinguishes a missing config suffix from a dangling final link.
-        fs::canonicalize(&prefix).map_err(|error| DocumentHostError::Io {
+        fs::canonicalize(prefix).map_err(|error| DocumentHostError::Io {
             stage: AtomicSaveStage::Preflight,
             message: format!(
                 "could not resolve symbolic link {}: {error}",
@@ -1052,13 +1121,14 @@ fn logical_symlink_bindings(path: &Path) -> Result<Vec<LogicalSymlinkBinding>, D
             ),
         })?;
         bindings.push(LogicalSymlinkBinding {
-            path: prefix.clone(),
+            path: prefix.to_path_buf(),
             destination,
-            identity: file_identity(&metadata),
-            modified_ns: modified_ns(&metadata),
+            identity: file_identity(metadata),
+            modified_ns: modified_ns(metadata),
             len: metadata.len(),
         });
-    }
+        Ok(())
+    })?;
     Ok(bindings)
 }
 
@@ -1824,6 +1894,60 @@ mod tests {
 
     fn file_uri(path: &Path) -> String {
         path_to_file_uri(path).unwrap()
+    }
+
+    /// Regression guard for the Windows defect that silently disabled the entire user
+    /// configuration. The component walk used to push and then stat
+    /// `Component::Prefix` on its own, and on a canonicalized path that first
+    /// component is the bare verbatim prefix `\\?\C:`, which addresses the volume
+    /// device rather than a directory. The resulting ERROR_INVALID_FUNCTION lands in
+    /// `ErrorKind::Uncategorized` rather than `NotFound`, so it slipped past the
+    /// missing-component arm and failed admission outright: `aterm.toml` could neither
+    /// be loaded at startup nor saved. `resolve_atomic_target` canonicalizes and then
+    /// feeds the result to this walk unconditionally, so nothing about the user's
+    /// machine was needed to trigger it — only Windows.
+    ///
+    /// The absence of exactly this test is how the bug shipped: every existing walk
+    /// test used a logical spelling, which on Windows never contains a prefix that
+    /// fails to stat.
+    #[test]
+    fn component_walk_admits_a_canonicalized_path() {
+        let path = unique_file("canonical-walk", b"walk\n");
+        let canonical = fs::canonicalize(&path).unwrap();
+        #[cfg(windows)]
+        {
+            // Assert the shape the fix is about, so this cannot start passing for the
+            // uninteresting reason that it stopped seeing a verbatim path at all.
+            assert!(
+                canonical.as_os_str().to_string_lossy().starts_with(r"\\?\"),
+                "expected fs::canonicalize to produce a verbatim path, got {}",
+                canonical.display()
+            );
+        }
+        reject_symlink_components(&canonical).unwrap();
+        assert!(logical_symlink_bindings(&canonical).unwrap().is_empty());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The same walk is reachable through a second, independent door. Anything under
+    /// `std::env::temp_dir()` is rewritten by `normalize_process_temp_root`, which
+    /// canonicalizes the temporary root itself, so on Windows `logical_symlink_bindings`
+    /// is handed an already-verbatim path and used to die there — before
+    /// `reject_symlink_components` was ever reached. A fix confined to one of the two
+    /// former copies of this walk would have left every temp-rooted document broken,
+    /// this module's own fixtures included, since `unique_file` builds them from the
+    /// process temporary root.
+    #[test]
+    fn component_walk_admits_a_process_temporary_root_path() {
+        let path = unique_file("temporary-walk", b"walk\n");
+        let normalized = normalize_process_temp_root(&path).unwrap();
+        assert!(logical_symlink_bindings(&normalized).unwrap().is_empty());
+        reject_symlink_components(&normalized).unwrap();
+        // And once end to end, through the admission path the application actually
+        // calls, which is the sequence that reported "could not validate \\?\C:".
+        let contents = read_config_atomic_file(&path, 1024, false).unwrap();
+        assert_eq!(contents.bytes, b"walk\n");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

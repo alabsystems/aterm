@@ -529,6 +529,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
          max_frame_gap_ms={:.2} \
          rust_main_to_first_present_ms={:.2} \
+         rust_main_to_first_visible_ms={:.2} \
          startup_phase_schema={} startup_phase_valid={} \
          startup_router_ms={:.2} startup_gui_prepare_ms={:.2} \
          startup_winit_dispatch_ms={:.2} startup_initial_surface_attach_ms={:.2} \
@@ -542,7 +543,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_attach_backend_finalize_ms={:.2} \
          startup_attach_chrome_geometry_ms={:.2} \
          startup_attach_surface_create_ms={:.2} startup_attach_finish_ms={:.2} \
-         first_present_ms={:.2}\n",
+         first_present_ms={:.2} first_visible_ms={:.2}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -591,6 +592,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.past_deadline_arms,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
+        ms(m.rust_main_to_first_visible_ns),
         m.startup_phase_schema,
         u8::from(m.startup_phase_valid),
         ms(m.startup_router_ns),
@@ -612,6 +614,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.startup_attach_surface_create_ns),
         ms(m.startup_attach_finish_ns),
         ms(m.first_present_ns),
+        ms(m.first_visible_ns),
     )
 }
 
@@ -703,6 +706,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
          \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
+         \"rust_main_to_first_visible_ms\":{:.2},\
          \"startup_phase_schema\":{},\"startup_phase_valid\":{},\
          \"startup_router_ms\":{:.2},\"startup_gui_prepare_ms\":{:.2},\
          \"startup_winit_dispatch_ms\":{:.2},\"startup_initial_surface_attach_ms\":{:.2},\
@@ -716,7 +720,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_attach_backend_finalize_ms\":{:.2},\
          \"startup_attach_chrome_geometry_ms\":{:.2},\
          \"startup_attach_surface_create_ms\":{:.2},\"startup_attach_finish_ms\":{:.2},\
-         \"first_present_ms\":{:.2}}}",
+         \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
         ms(m.max_present_latency_ns),
@@ -765,6 +769,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.past_deadline_arms,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
+        ms(m.rust_main_to_first_visible_ns),
         m.startup_phase_schema,
         m.startup_phase_valid,
         ms(m.startup_router_ns),
@@ -786,6 +791,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.startup_attach_surface_create_ns),
         ms(m.startup_attach_finish_ns),
         ms(m.first_present_ns),
+        ms(m.first_visible_ns),
     ))
 }
 
@@ -1973,14 +1979,18 @@ pub(crate) fn cmd_title(term: &Arc<Mutex<Terminal>>) -> String {
 /// OSC 7; empty if never reported). Lets an introspecting client know where
 /// commands will run without scraping the prompt.
 pub(crate) fn cmd_cwd(term: &Arc<Mutex<Terminal>>) -> String {
+    use crate::cwd_native::ReportedCwd as _;
     let t = term_lock(term);
+    // A client asks this verb where to run a command, so it must answer in the
+    // host platform's own path syntax: the engine keeps OSC 7's RFC 8089 URI
+    // path, and `OK /C:/Users//m6-an` is not a Windows directory anyone can pass
+    // to `cd` or to a process spawn. The conversion happens once, in
+    // `cwd_native`, so this verb and `meta` cannot drift apart.
+    let cwd = t.native_working_directory();
     // The cwd is percent-decoded from OSC 7, so it can hold raw newlines / C0 /
     // C1 / BiDi-override bytes. pct_encode it (as sibling verbs do) so it stays a
     // single token and cannot forge extra control-protocol reply lines.
-    format!(
-        "OK {}\n",
-        pct_encode(t.current_working_directory().unwrap_or(""))
-    )
+    format!("OK {}\n", pct_encode(cwd.as_deref().unwrap_or("")))
 }
 
 /// `text --json` -> `{"rows":["<row0>",...],"cursor":{...},"seq":N,"dims":{...}}`.

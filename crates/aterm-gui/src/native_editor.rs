@@ -2356,6 +2356,23 @@ impl Keymap {
             map.bind(sequence, command)
                 .expect("built-in editor key sequence is valid");
         }
+        // Off macOS, C-left/C-right are the PLATFORM word-motion spelling (the
+        // Windows/GTK text convention) — and real emacs binds the very same
+        // commands to them (`right-word`/`left-word`), so no emacs muscle
+        // memory is contradicted. The C-letter arms above are untouched:
+        // C-b/C-f stay by-character, exactly as the audit scoped it (named
+        // keys only). macOS keeps the table as-is: ⌥ is its word modifier and
+        // Ctrl+arrow belongs to Mission Control there. C-Backspace is NOT
+        // seeded — the editor has no word-delete `EditorCommand` to bind it
+        // to, and inventing one is capability growth, not a keymap alias.
+        #[cfg(not(target_os = "macos"))]
+        for (sequence, command) in [
+            (&["C-left"][..], EditorCommand::MoveWordBackward),
+            (&["C-right"][..], EditorCommand::MoveWordForward),
+        ] {
+            map.bind(sequence, command)
+                .expect("built-in editor key sequence is valid");
+        }
         map
     }
 
@@ -2415,6 +2432,49 @@ mod tests {
         Model, native_editor_command_palette_model, native_editor_viewport_model,
     };
     use aterm_spec::interp::{State, admits};
+
+    /// Off macOS, `C-left`/`C-right` are the PLATFORM word-motion spelling and
+    /// resolve to the SAME commands as `M-b`/`M-f` — real emacs binds
+    /// `left-word`/`right-word` there too, so no muscle memory is contradicted —
+    /// while the C-letter arms stay by-character (`C-b` is one column, exactly as
+    /// before).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_arrows_resolve_to_word_motion_off_macos() {
+        let map = Keymap::emacs();
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(
+            map.resolve(&[chord("C-left")]),
+            KeyResolution::Command(EditorCommand::MoveWordBackward)
+        );
+        assert_eq!(
+            map.resolve(&[chord("C-right")]),
+            KeyResolution::Command(EditorCommand::MoveWordForward)
+        );
+        assert_eq!(
+            map.resolve(&[chord("C-b")]),
+            KeyResolution::Command(EditorCommand::MoveBackward),
+            "C-b stays by-character"
+        );
+        // NOTE deliberately not asserted here: the `&["M-b", "M-left"]` row in
+        // `Keymap::emacs` binds a two-key SEQUENCE (M-b is a PREFIX whose child
+        // is M-left), despite its comment reading as two alternate spellings —
+        // a pre-existing, all-platform quirk that predates this change and is
+        // out of its scope. The single-chord `C-left`/`C-right` rows above are
+        // exactly why the cfg'd addition binds each spelling as its OWN row.
+    }
+
+    /// The macOS keymap is byte-identical to what shipped before the cfg'd
+    /// additions: Ctrl+arrow stays unbound there (⌥ owns word motion; Ctrl+arrow
+    /// belongs to Mission Control).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ctrl_arrows_stay_unbound_on_macos() {
+        let map = Keymap::emacs();
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(map.resolve(&[chord("C-left")]), KeyResolution::Unbound);
+        assert_eq!(map.resolve(&[chord("C-right")]), KeyResolution::Unbound);
+    }
 
     /// The indexed line oracle must answer EXACTLY what the scanning one does —
     /// it is the substitution the editor render path makes on every frame, so any

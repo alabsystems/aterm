@@ -70,6 +70,36 @@ pub fn hdr_grid_encode(b: u8) -> f32 {
     srgb_channel_to_linear(f32::from(b) / 255.0).clamp(0.0, 1.0)
 }
 
+/// Sanitize a queried Windows SDR-white scale (`SDR-white nits / 80`, the scRGB
+/// reference): non-finite or `< 1.0` (the unset per-window default `0.0`, macOS,
+/// an SDR desktop) means NO scaling → `1.0`. The GPU side
+/// (`WindowGpu::sdr_white_scale`) applies the same rule, so the float twin and
+/// the uniform the shader reads agree.
+#[must_use]
+pub fn sanitize_sdr_white_scale(v: f32) -> f32 {
+    if v.is_finite() && v >= 1.0 { v } else { 1.0 }
+}
+
+/// scRGB PRESENT of one stored byte — grid and remainder band alike — on the
+/// Windows `Rgba16Float` swapchain: [`hdr_grid_encode`] scaled to the desktop's
+/// SDR-white. The float twin of BOTH `fs_blit` `hdr` arms (content and bands).
+///
+/// # Invariant (measured on glass, pinned below)
+/// On a Windows HDR desktop DWM composes every SDR-drawn pixel (GDI, the
+/// caption tint) as `srgb_piecewise_to_linear(byte) * SDR-white/80` — measured
+/// exactly `3.0 ×` on a 240-nit SDR-white desktop, the sRGB piecewise curve, not
+/// a 2.2 power. This function is therefore the value that makes an aterm byte
+/// compose IDENTICALLY to the same byte drawn by DWM. `scale 1.0` is exactly
+/// [`hdr_grid_encode`]; byte `255` maps to exactly `scale`; every byte lands in
+/// `[0, scale]`. (A GDI screen grab — `BitBlt`/`CopyFromScreen` — reads an f16
+/// swapchain back at 80 nits == white, i.e. `l2s(value)` with NO `/scale`, so it
+/// reports this present `scale×` lifted in linear light while reading SDR
+/// windows byte-exact; verify the EDR present with an FP16 capture instead.)
+#[must_use]
+pub fn scrgb_present_channel(b: u8, sdr_white_scale: f32) -> f32 {
+    hdr_grid_encode(b) * sanitize_sdr_white_scale(sdr_white_scale)
+}
+
 /// Sanitize a queried `NSScreen.maximumExtendedDynamicRangeColorComponentValue`:
 /// non-finite or `< 1.0` (including the unset per-window default `0.0`) means NO
 /// headroom → `1.0`; a corrupt huge value is capped at [`EDR_MAX_CAP`].
@@ -199,6 +229,51 @@ mod tests {
         assert!(
             hdr_grid_encode(255) + hdr_additive_encode(1.0, HDR_GLOW_BOOST, 1.0) > 1.0,
             "an EDR emission over white must exceed 1.0 (else the feature is vacuous)"
+        );
+    }
+
+    /// scRGB PRESENT (grid AND bands): scale 1.0 is the grid encode exactly; white
+    /// maps to exactly the scale; every byte lands in [0, scale]; a poisoned scale
+    /// degrades to 1.0 (no scaling). Anchored on the on-glass measurement: byte
+    /// `0x11` on a 240-nit SDR-white desktop composes at linear 0.01682 — the
+    /// value DWM itself draws for the same byte.
+    #[test]
+    fn scrgb_present_scales_reference_white_exactly() {
+        for b in 0u16..=255 {
+            let b = b as u8;
+            assert_eq!(scrgb_present_channel(b, 1.0), hdr_grid_encode(b));
+            for &s in &[1.0f32, 1.5, 3.0, 12.5] {
+                let v = scrgb_present_channel(b, s);
+                assert!(
+                    (0.0..=s).contains(&v),
+                    "byte {b} scale {s} escaped [0,{s}]: {v}"
+                );
+            }
+        }
+        assert_eq!(
+            scrgb_present_channel(255, 3.0),
+            3.0,
+            "SDR white composes EXACTLY at the SDR-white scale"
+        );
+        assert_eq!(scrgb_present_channel(0, 3.0), 0.0, "black stays black");
+        for &bad in &[
+            0.0f32,
+            0.5,
+            -3.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                sanitize_sdr_white_scale(bad),
+                1.0,
+                "scale {bad} must degrade to 1.0"
+            );
+        }
+        let v = scrgb_present_channel(0x11, 3.0);
+        assert!(
+            (v - 0.016_82).abs() < 1e-4,
+            "byte 0x11 at 3.0x must match DWM's measured 0.01682: {v}"
         );
     }
 

@@ -427,12 +427,22 @@ pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
 /// `[ -x <path> ]` for a file: exists, is not a directory, and carries an
 /// execute bit. Used for every "is the tool present" decision, so a
 /// non-executable script is the same event as a missing one — the script's rule.
+#[cfg(unix)]
 #[must_use]
 pub fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
         .map(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// Windows has no execute bit — a file is runnable by extension (`PATHEXT`), not by
+/// mode — so "exists and is not a directory" is the whole of the test there. Matches
+/// `aterm_containment::allowlist`'s split of the same predicate.
+#[cfg(not(unix))]
+#[must_use]
+pub fn is_executable_file(path: &Path) -> bool {
+    std::fs::metadata(path).map(|m| !m.is_dir()).unwrap_or(false)
 }
 
 /// `command -v <name>` against the PATH the gate hands its children.

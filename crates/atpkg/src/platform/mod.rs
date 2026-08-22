@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn tombstone_content_has_no_forward_target_and_exits_70() {
-        let c = cmd_tombstone_content("atpkg: ay was yanked/revoked — run `atpkg update`");
+        let c = cmd_tombstone_content("atpkg: ay was yanked/revoked — run `aterm pkg update`");
         assert!(c.contains("1>&2"), "notice goes to stderr: {c}");
         assert!(c.contains("exit /b 70"), "exits 70: {c}");
         // A tombstone must NOT parse as an installed shim (mirrors read_link Err on Unix).

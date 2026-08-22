@@ -158,6 +158,33 @@ fn push_row_capped(result: &mut String, row_text: &str, max_bytes: usize) -> boo
     true
 }
 
+/// The row/column span one selection walk needs, computed ONCE by
+/// [`Terminal::selection_to_string_capped`] and threaded to whichever shape walk
+/// runs.
+///
+/// Passed as one value rather than re-derived per shape: the block walk and the
+/// linear walk share only the caps and the output buffer, so a geometry computed
+/// independently in each is exactly the thing that could silently drift.
+#[derive(Clone, Copy)]
+struct SelectionGeometry {
+    /// Oldest terminal-relative row to visit (span-clamped to `-scrollback_lines`).
+    first_row: i32,
+    /// Newest terminal-relative row to visit (span-clamped to `rows - 1`).
+    last_row: i32,
+    /// Side-adjusted selection start row — the row whose text starts at `adj_start_col`.
+    adj_start_row: i32,
+    /// Side-adjusted selection end row — the row whose text stops at `adj_end_col`.
+    adj_end_row: i32,
+    /// Side-adjusted start column, inclusive.
+    adj_start_col: u16,
+    /// Side-adjusted end column, inclusive.
+    adj_end_col: u16,
+    /// `grid.rows()` widened to the row coordinate type.
+    visible_rows: i32,
+    /// `grid.cols()`; the caller has already rejected a zero-column grid.
+    cols: u16,
+}
+
 impl Terminal {
     /// Get the selected text as a string.
     ///
@@ -235,89 +262,30 @@ impl Terminal {
         let first_row = adj_start_row.max(-history);
         let last_row = adj_end_row.min(visible_rows - 1);
 
-        // Iteration runs oldest→newest (first_row→last_row), so a cap truncates the
-        // TAIL: the start row and its adj_start_col are always preserved.
-        let mut rows_emitted = 0usize;
-        let mut truncated = false;
+        // One geometry value, computed once and threaded to whichever shape walk
+        // runs. Deriving it inside the walks instead would let the two copies drift.
+        let geom = SelectionGeometry {
+            first_row,
+            last_row,
+            adj_start_row,
+            adj_end_row,
+            adj_start_col,
+            adj_end_col,
+            visible_rows,
+            cols,
+        };
 
-        match self.text_selection.selection_type() {
+        // Iteration runs oldest→newest (first_row→last_row), so a cap truncates the
+        // TAIL: the start row and its adj_start_col are always preserved. Each shape
+        // walk owns its own counters and hands them back so the cap report below is
+        // identical whichever shape ran.
+        let (rows_emitted, truncated) = match self.text_selection.selection_type() {
             SelectionType::Block => {
-                // Rectangular selection: extract adjusted columns from each row
-                for row in first_row..=last_row {
-                    if rows_emitted >= max_rows || result.len() >= max_bytes {
-                        truncated = true;
-                        break;
-                    }
-                    rows_emitted += 1;
-                    if row > first_row {
-                        result.push('\n');
-                    }
-                    if let Some(line) = self.get_line_text(row, Some((adj_start_col, adj_end_col)))
-                    {
-                        if push_row_capped(&mut result, &line, max_bytes) {
-                            truncated = true;
-                            break;
-                        }
-                    }
-                }
+                self.push_block_selection(&mut result, geom, max_rows, max_bytes)
             }
             // Simple, Semantic, Lines, and future variants all use linear selection
-            _ => {
-                for row in first_row..=last_row {
-                    if rows_emitted >= max_rows || result.len() >= max_bytes {
-                        truncated = true;
-                        break;
-                    }
-                    rows_emitted += 1;
-                    if row > first_row {
-                        // Only insert newline if this row is NOT a soft-wrap continuation.
-                        // Row::is_wrapped() / Line::is_wrapped() means "this row continues
-                        // the previous row's content" (soft wrap, not a hard line break).
-                        #[allow(
-                            clippy::redundant_closure_for_method_calls,
-                            reason = "private row/line types prevent method-reference shorthand"
-                        )]
-                        let is_continuation = if row >= 0 && row < visible_rows {
-                            // LIVE-frame read: selection rows are terminal-relative
-                            // (see get_line_text), so the display-mapped Grid::row
-                            // would test the wrong row's wrap flag while scrolled.
-                            u16::try_from(row)
-                                .ok()
-                                .and_then(|idx| self.grid.row_at_screen(idx))
-                                .is_some_and(|r| r.is_wrapped())
-                        } else if row < 0 {
-                            usize::try_from(-(i64::from(row)) - 1)
-                                .ok()
-                                .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
-                                .is_some_and(|l| l.is_wrapped())
-                        } else {
-                            false
-                        };
-                        if !is_continuation {
-                            result.push('\n');
-                        }
-                    }
-
-                    let start_col = if row == adj_start_row {
-                        adj_start_col
-                    } else {
-                        0
-                    };
-                    let end_col = if row == adj_end_row {
-                        adj_end_col
-                    } else {
-                        cols - 1
-                    };
-
-                    if let Some(line) = self.get_line_text(row, Some((start_col, end_col))) {
-                        if push_row_capped(&mut result, &line, max_bytes) {
-                            truncated = true;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+            _ => self.push_linear_selection(&mut result, geom, max_rows, max_bytes),
+        };
 
         if truncated {
             // Honest report at the edge (data-layer bound fired). The `truncated`
@@ -335,6 +303,173 @@ impl Terminal {
         } else {
             (Some(result), truncated)
         }
+    }
+
+    /// Walk a BLOCK (rectangular) selection into `result`, returning
+    /// `(rows_emitted, truncated)`.
+    ///
+    /// Split out of [`Self::selection_to_string_capped`] purely so each selection
+    /// shape is its own function; the walk is unchanged. `geom` carries the row/col
+    /// span the caller already computed — the two shape walks share only the caps
+    /// and the output buffer, so nothing here re-derives geometry.
+    ///
+    /// The walk body moved verbatim except for one forced token: `&mut result`
+    /// became `result`, the same reborrow now that the buffer arrives as a
+    /// reference (`clippy::needless_borrow`).
+    fn push_block_selection(
+        &self,
+        result: &mut String,
+        geom: SelectionGeometry,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> (usize, bool) {
+        let SelectionGeometry {
+            first_row,
+            last_row,
+            adj_start_col,
+            adj_end_col,
+            ..
+        } = geom;
+        let mut rows_emitted = 0usize;
+        let mut truncated = false;
+
+            // Rectangular selection: extract adjusted columns from each row
+            for row in first_row..=last_row {
+                if rows_emitted >= max_rows || result.len() >= max_bytes {
+                    truncated = true;
+                    break;
+                }
+                rows_emitted += 1;
+                if row > first_row {
+                    result.push('\n');
+                }
+                if let Some(line) = self.get_line_text(row, Some((adj_start_col, adj_end_col)))
+                {
+                    if push_row_capped(result, &line, max_bytes) {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+
+        (rows_emitted, truncated)
+    }
+
+    /// Walk a LINEAR (Simple/Semantic/Lines) selection into `result`, returning
+    /// `(rows_emitted, truncated)`.
+    ///
+    /// Split out of [`Self::selection_to_string_capped`] alongside
+    /// [`Self::push_block_selection`]; the walk — including the SCR-4
+    /// one-fetch-per-history-row hoist described inside — is unchanged, save the
+    /// same `&mut result` -> `result` reborrow noted there.
+    fn push_linear_selection(
+        &self,
+        result: &mut String,
+        geom: SelectionGeometry,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> (usize, bool) {
+        let SelectionGeometry {
+            first_row,
+            last_row,
+            adj_start_row,
+            adj_end_row,
+            adj_start_col,
+            adj_end_col,
+            visible_rows,
+            cols,
+        } = geom;
+        let mut rows_emitted = 0usize;
+        let mut truncated = false;
+
+            for row in first_row..=last_row {
+                if rows_emitted >= max_rows || result.len() >= max_bytes {
+                    truncated = true;
+                    break;
+                }
+                rows_emitted += 1;
+                // ONE tier fetch per HISTORY row (SCR-4). This loop used to
+                // resolve every scrollback row TWICE — once below for the
+                // soft-wrap bit and once inside `get_line_text` for the text
+                // — i.e. 2N-1 tier reads for an N-row selection, where each
+                // read is a full `Line` construction on the ring path
+                // (Row -> String + RLE attrs + hyperlink clone) or a `Line`
+                // CLONE out of the decompressed block on warm/cold. The two
+                // uses are hoisted onto one `Cow<Line>` here; both leaves
+                // below read it instead of re-entering the tiers.
+                //
+                // Behaviour is identical by construction: the wrap flag is
+                // the same `Line::is_wrapped()` off the same line, and the
+                // text branch inlines exactly what `get_line_text`'s
+                // negative-row arm does with the same column range and the
+                // same `MAX_SCROLLBACK_LINE_SCAN_BYTES` ceiling. Live rows
+                // (`row >= 0`) keep going through `get_line_text` unchanged
+                // — they never touched the tiers to begin with.
+                let history_line = if row < 0 {
+                    usize::try_from(-(i64::from(row)) - 1)
+                        .ok()
+                        .and_then(|rev_idx| self.grid.history_line_rev(rev_idx))
+                } else {
+                    None
+                };
+                if row > first_row {
+                    // Only insert newline if this row is NOT a soft-wrap continuation.
+                    // Row::is_wrapped() / Line::is_wrapped() means "this row continues
+                    // the previous row's content" (soft wrap, not a hard line break).
+                    #[allow(
+                        clippy::redundant_closure_for_method_calls,
+                        reason = "private row/line types prevent method-reference shorthand"
+                    )]
+                    let is_continuation = if row >= 0 && row < visible_rows {
+                        // LIVE-frame read: selection rows are terminal-relative
+                        // (see get_line_text), so the display-mapped Grid::row
+                        // would test the wrong row's wrap flag while scrolled.
+                        u16::try_from(row)
+                            .ok()
+                            .and_then(|idx| self.grid.row_at_screen(idx))
+                            .is_some_and(|r| r.is_wrapped())
+                    } else if row < 0 {
+                        history_line.as_ref().is_some_and(|l| l.is_wrapped())
+                    } else {
+                        false
+                    };
+                    if !is_continuation {
+                        result.push('\n');
+                    }
+                }
+
+                let start_col = if row == adj_start_row {
+                    adj_start_col
+                } else {
+                    0
+                };
+                let end_col = if row == adj_end_row {
+                    adj_end_col
+                } else {
+                    cols - 1
+                };
+
+                let line = if row < 0 {
+                    history_line.as_ref().map(|stored| {
+                        scrollback_line_range_text(
+                            stored.as_bytes(),
+                            start_col,
+                            end_col,
+                            MAX_SCROLLBACK_LINE_SCAN_BYTES,
+                        )
+                    })
+                } else {
+                    self.get_line_text(row, Some((start_col, end_col)))
+                };
+                if let Some(line) = line {
+                    if push_row_capped(result, &line, max_bytes) {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+
+        (rows_emitted, truncated)
     }
 
     /// Get text from a line (visible or scrollback).
@@ -393,6 +528,80 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::column_range_to_byte_offsets;
+
+    /// SCR-4, pinned two ways: the copy is byte-identical to what the
+    /// double-fetch loop produced, AND every selected history row is resolved
+    /// from the tier EXACTLY ONCE.
+    ///
+    /// The count is the load-bearing half. The linear branch used to fetch each
+    /// scrollback row twice — once for the soft-wrap bit, once for the text —
+    /// so an N-row selection cost 2N-1 tier reads, each a full `Line`
+    /// construction on the ring path. `take_row_to_line_ops` counts exactly
+    /// those constructions (`row_to_line_with_stored_extras`), so this asserts
+    /// N, not 2N-1, and fails loudly if the second fetch ever comes back.
+    #[test]
+    fn scrollback_selection_reads_each_history_line_once() {
+        use crate::selection::{SelectionSide, SelectionType};
+        use crate::terminal::Terminal;
+
+        const ROWS: u16 = 4;
+        const COLS: u16 = 16;
+        const FILL: usize = 60;
+        const SELECTED: usize = 40;
+
+        let mut term = Terminal::new(ROWS, COLS);
+        let mut corpus = String::new();
+        for i in 0..FILL {
+            corpus.push_str(&format!("row{i:03}\r\n"));
+        }
+        term.process(corpus.as_bytes());
+        // Ring reads/writes the FIXTURE performed are not what is being counted.
+        let _ = aterm_grid::test_counters::take_row_to_line_ops();
+
+        let selected_rows = i32::try_from(SELECTED).expect("SELECTED fits i32");
+        let sel = term.text_selection_mut();
+        sel.start_selection(
+            -selected_rows,
+            0,
+            SelectionSide::Left,
+            SelectionType::Simple,
+        );
+        sel.update_selection(-1, COLS - 1, SelectionSide::Right);
+        sel.complete_selection();
+
+        let text = term
+            .selection_to_string()
+            .expect("a 40-row scrollback selection copies text");
+        let reads = aterm_grid::test_counters::take_row_to_line_ops();
+
+        // IDENTITY FIRST: the hoist must not move one byte of the copy. History
+        // holds fill lines 0..=(FILL - ROWS), so row -1 is fill line
+        // FILL - ROWS and row -SELECTED is SELECTED-1 lines above it.
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            SELECTED,
+            "a {SELECTED}-row hard-broken selection must copy {SELECTED} lines"
+        );
+        let newest = FILL - usize::from(ROWS);
+        assert_eq!(
+            lines[SELECTED - 1].trim_end(),
+            format!("row{newest:03}"),
+            "the last copied line is not the newest selected history row"
+        );
+        assert_eq!(
+            lines[0].trim_end(),
+            format!("row{:03}", newest + 1 - SELECTED),
+            "the first copied line is not the oldest selected history row"
+        );
+
+        assert_eq!(
+            reads, SELECTED,
+            "a {SELECTED}-row scrollback selection performed {reads} tier line \
+             constructions; one per selected row is the whole point of the hoist \
+             (the double fetch cost 2N-1)"
+        );
+    }
 
     #[test]
     fn ascii_full_range() {

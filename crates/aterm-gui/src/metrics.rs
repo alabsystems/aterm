@@ -520,6 +520,24 @@ pub(crate) fn mark_initial_surface_ready() {
     let _ = INITIAL_SURFACE_READY.set(Instant::now());
 }
 
+/// L1 (early reveal): the instant the FIRST OS window actually became visible —
+/// a `set_visible(true)` on the first window's reveal path, or (for a window
+/// created visible) the moment right after its creation. This is the number the
+/// user's eye measures at launch: "when did a window exist AT ALL", as opposed
+/// to `first_present` ("when did real content land"). The warm-launch early
+/// reveal moves it BEFORE the backend join, so it must be its own stamp — it is
+/// not derivable from any phase of the exclusive present partition, and unlike
+/// that partition it can also legally land AFTER the first present (an overlap
+/// handoff reveals only once the carried pixels are on). First-write-wins:
+/// every window's reveal path offers the stamp; only the first records, so
+/// later Cmd-N windows can never replace it.
+static FIRST_WINDOW_VISIBLE: OnceLock<Instant> = OnceLock::new();
+
+/// Offer the first-window-reveal stamp (see [`FIRST_WINDOW_VISIBLE`]).
+pub(crate) fn mark_first_window_visible() {
+    let _ = FIRST_WINDOW_VISIBLE.set(Instant::now());
+}
+
 /// Wire schema for the exclusive Rust-main → first-present phase partition.
 pub(crate) const STARTUP_PHASE_SCHEMA: u64 = 1;
 
@@ -671,6 +689,18 @@ struct StartupMilestones {
 
 fn duration_ns(start: Instant, end: Instant) -> Option<u64> {
     u64::try_from(end.checked_duration_since(start)?.as_nanos()).ok()
+}
+
+/// `anchor` → the first-window reveal, or 0 while either stamp is missing.
+/// Unlike the present-anchored startup sample this is read LIVE from the
+/// stamps at snapshot time: the reveal (early-reveal path) legitimately exists
+/// long before any present publishes `STARTUP_PRESENT`, and time-to-visible
+/// must be reportable in exactly that window.
+fn first_visible_since(anchor: Option<Instant>) -> u64 {
+    anchor
+        .zip(FIRST_WINDOW_VISIBLE.get().copied())
+        .and_then(|(start, end)| duration_ns(start, end))
+        .unwrap_or(0)
 }
 
 fn derive_startup_phases(
@@ -1644,6 +1674,19 @@ pub struct Snapshot {
     /// first present, and unavailable in the thin GUI binary); see
     /// [`mark_rust_main_start`]. Survives `reset`.
     pub rust_main_to_first_present_ns: u64,
+    /// GUI entry → the FIRST window's actual reveal (0 until a window is on
+    /// glass) — L1's time-to-VISIBLE, the number the eye measures at launch.
+    /// On a warm Windows launch the reveal precedes the backend join, so this
+    /// runs well under `first_present_ns`; on an overlap-handoff boot it can
+    /// legally EXCEED it (carried pixels present first, reveal after). Read
+    /// live from its own stamp, so it needs no present to publish. Survives
+    /// `reset`.
+    pub first_visible_ns: u64,
+    /// Shipped one-binary Rust entry → the same reveal instant (0 until
+    /// revealed, and unavailable in the thin GUI binary). THE L1 acceptance
+    /// number: warm-launch target well under 150 ms against a
+    /// `rust_main_to_first_present_ms` of ~440. Survives `reset`.
+    pub rust_main_to_first_visible_ns: u64,
     /// Exclusive startup-phase schema. `startup_phase_valid` is false until a
     /// complete, ordered one-binary timeline reaches its first successful
     /// present. The immutable phase fact survives `reset`.
@@ -1737,6 +1780,8 @@ pub fn snapshot() -> Snapshot {
         max_frame_gap_ns: MAX_FRAME_GAP_NS.load(Ordering::Relaxed),
         first_present_ns: startup.gui_entry_ns,
         rust_main_to_first_present_ns: startup.rust_main_ns,
+        first_visible_ns: first_visible_since(PROCESS_START.get().copied()),
+        rust_main_to_first_visible_ns: first_visible_since(RUST_MAIN_START.get().copied()),
         startup_phase_schema: STARTUP_PHASE_SCHEMA,
         startup_phase_valid: startup.phases.valid,
         startup_router_ns: startup.phases.router_ns,

@@ -647,6 +647,28 @@ pub(crate) struct StatusObserver {
     /// this module reads it.
     badge: bool,
     sessions: std::collections::HashMap<u64, SessionSlot>,
+    /// MIN OVER `sessions`' deadlines — a LOWER BOUND on it, never an upper
+    /// one. This is the whole of MPT-4's fix: "which sessions are past their
+    /// per-session deadline" is a min-over-deadlines question, and it was
+    /// answered by a full `pool.iter()` scan with a `HashMap` probe per session
+    /// at the TOP of every `Wake::Output` arm — i.e. thousands of times a
+    /// second under a flood, to usually find zero. `None` means "no slot is
+    /// known to be rate-limited", which for a fresh observer is exactly right:
+    /// the gate stays open.
+    ///
+    /// LOWER BOUND, DELIBERATELY: [`StatusObserver::observe`] only folds the
+    /// new deadline in (an O(1) `min`), which can leave this EARLIER than the
+    /// true minimum after a slot is pushed forward; the exact value is restored
+    /// by [`StatusObserver::note_swept`] at the end of each sweep. Too-early
+    /// means one extra scan; too-late would mean a missed classification, and
+    /// no path here can produce it.
+    next_due_any: Option<Instant>,
+    /// The `SessionPool::insert_epoch` observed at the last COMPLETED sweep.
+    /// While it still matches, every live session is one this observer has been
+    /// offered, so `next_due_any` covers the whole pool; a mismatch means a
+    /// brand-new session may be waiting for its first classification and the
+    /// gate must open regardless of the deadlines. See `SessionPool::insert_epoch`.
+    swept_pool_epoch: u64,
 }
 
 #[derive(Debug)]
@@ -674,7 +696,54 @@ impl StatusObserver {
             // after startup does not report a phantom flip.
             badge: true,
             sessions: std::collections::HashMap::new(),
+            // No slots yet: the gate is open until the first sweep records one.
+            next_due_any: None,
+            swept_pool_epoch: 0,
         }
+    }
+
+    /// Could ANY known session be past its deadline right now? The O(1) half of
+    /// the sweep's gate (the other half is the pool epoch — see
+    /// `swept_pool_epoch`). `None` (nothing known) answers YES, so an observer
+    /// that has never seen a session never gates anything out.
+    pub(crate) fn any_due(&self, now: Instant) -> bool {
+        self.next_due_any.is_none_or(|due| now >= due)
+    }
+
+    /// A sweep just walked the whole pool: make `next_due_any` EXACT again, and
+    /// bank `pool_epoch` IF the sweep left every pooled session with a slot.
+    /// O(slots), on the classification path only — which is 4/s at the default
+    /// interval, not the burst rate the gate spares.
+    ///
+    /// `None` MEANS "DO NOT BANK", and that is the load-bearing case. A sweep
+    /// can leave a session unclassified: the classify path takes the session's
+    /// terminal with `try_lock` and SKIPS the session when the PTY reader holds
+    /// it — which, under exactly the output flood this gate exists to survive,
+    /// is not rare. A session skipped that way still has no slot, so `due()`
+    /// would report it due and the whole-pool scan WOULD classify it, while
+    /// `next_due_any` (a min over slots that do not include it) would not. If
+    /// this banked the epoch anyway, the gate would close over a session it has
+    /// never seen and that session's first status could wait out another
+    /// session's whole interval. Leaving the epoch stale keeps the gate open
+    /// until the newcomer really is classified, which costs one scan per wake
+    /// in a rare case and makes the gate EXACTLY equivalent to the scan it
+    /// replaces — the only property that makes it safe to ship.
+    pub(crate) fn note_swept(&mut self, pool_epoch: Option<u64>) {
+        if let Some(epoch) = pool_epoch {
+            self.swept_pool_epoch = epoch;
+        }
+        self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
+    }
+
+    /// Whether this observer holds a slot for `session` — i.e. whether it has
+    /// ever successfully classified it. See [`StatusObserver::note_swept`].
+    pub(crate) fn knows(&self, session: u64) -> bool {
+        self.sessions.contains_key(&session)
+    }
+
+    /// See [`StatusObserver::note_swept`].
+    pub(crate) fn swept_pool_epoch(&self) -> u64 {
+        self.swept_pool_epoch
     }
 
     /// Whether this session is allowed a classification now. Callers check this
@@ -710,6 +779,13 @@ impl StatusObserver {
         if changed {
             slot.revision = slot.revision.saturating_add(1);
         }
+        // FOLD, never recompute. Keeping `next_due_any` a LOWER bound on the
+        // true minimum is what makes the O(1) gate safe without an O(slots)
+        // pass per observation; `note_swept` restores exactness once per sweep.
+        // Folded here, after the slot borrow has ended, rather than beside the
+        // assignment above.
+        let due = now + self.min_interval;
+        self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
         changed
     }
 
@@ -772,7 +848,12 @@ impl StatusObserver {
     /// Drop a retired session's state. Without this the map would grow for the
     /// process lifetime as tabs open and close.
     pub(crate) fn retire(&mut self, session: u64) {
-        self.sessions.remove(&session);
+        if self.sessions.remove(&session).is_some() {
+            // The removed slot may have BEEN the minimum, and a stale-early
+            // bound would only cost a scan — but the exact value is one cheap
+            // pass over a map that just shrank, and retirement is rare.
+            self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
+        }
     }
 
     /// Adopt a new policy at runtime. Returns whether anything actually moved,
@@ -803,6 +884,10 @@ impl StatusObserver {
             slot.fsm.policy = policy;
             slot.next_due = slot.next_due.min(now + min_interval);
         }
+        // Every deadline just moved DOWN, so the gate's bound must follow it
+        // down too — otherwise a shortened interval would still "do nothing"
+        // until the old one expired, the exact bug the clamp above fixes.
+        self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
         true
     }
 
@@ -812,6 +897,9 @@ impl StatusObserver {
     pub(crate) fn clear(&mut self) -> bool {
         let had = !self.sessions.is_empty();
         self.sessions.clear();
+        // No slots ⇒ no known deadline ⇒ the gate is open again, which is what
+        // a re-enabled subsystem needs (every session is unclassified).
+        self.next_due_any = None;
         had
     }
 }
@@ -833,6 +921,25 @@ impl crate::App {
     /// `tcgetpgrp`, and no map lookup for it.
     pub(crate) fn observe_session_statuses(&mut self, now: std::time::Instant) -> Vec<u64> {
         if !self.config.tab_status_or_default() {
+            return Vec::new();
+        }
+        // THE O(1) DEADLINE GATE (MPT-4). "Which sessions are past their
+        // 250 ms deadline" is a min-over-deadlines question, and it used to be
+        // answered by folding the whole pool through a `HashMap` probe per
+        // session — at the PTY reader's batch rate, thousands of times a
+        // second, to usually find zero. At 120 sessions and a 3000-wake/s
+        // flood that is ~360k probes/s of UI-thread time inside exactly the
+        // workload the wake-coalescing design exists to survive.
+        //
+        // Both halves are needed and neither is sufficient: `any_due` covers
+        // every session this observer KNOWS, and the pool epoch covers the one
+        // it cannot — a brand-new session has no slot, `due()` reports an
+        // unknown id as due immediately, and gating on deadlines alone would
+        // make a fresh tab wait a whole interval for its first classification.
+        let pool_epoch = self.pool.insert_epoch();
+        let gated = pool_epoch == self.session_status.swept_pool_epoch()
+            && !self.session_status.any_due(now);
+        if gated {
             return Vec::new();
         }
         let due: Vec<(u64, i32, i32)> = self
@@ -889,6 +996,23 @@ impl crate::App {
                 changed.push(id);
             }
         }
+        // This pass walked the whole pool, so the gate's bound can be made
+        // exact. O(slots), once per sweep — and a sweep only happens when
+        // something WAS due, i.e. at the classification rate (~4/s at the
+        // default interval), never at the burst rate.
+        //
+        // The EPOCH is banked only if every pooled session now has a slot. A
+        // `try_lock` that lost to the PTY reader leaves a session unclassified
+        // and slot-less, and the scan this gate replaces would have retried it
+        // on the very next wake; banking the epoch over it would instead defer
+        // its first status by another session's interval. See
+        // `StatusObserver::note_swept`.
+        let fully_classified = self
+            .pool
+            .iter()
+            .all(|session| self.session_status.knows(session.id));
+        self.session_status
+            .note_swept(fully_classified.then_some(pool_epoch));
         changed
     }
 
@@ -1076,11 +1200,14 @@ impl crate::App {
             // terminal answers `-`/`unavailable` instead of inventing one.
             _ => {
                 let rungs = |t: &aterm_core::terminal::Terminal| {
+                    use crate::cwd_native::ReportedCwd as _;
                     let osc = t.title().to_string();
                     if osc.is_empty() {
                         (
-                            t.current_working_directory()
-                                .map(crate::app_tabs::home_abbreviated),
+                            // The cwd rung is user-facing text, so it takes the
+                            // native path, not the engine's RFC 8089 URI path.
+                            t.native_working_directory()
+                                .map(|cwd| crate::app_tabs::home_abbreviated(&cwd)),
                             "cwd",
                         )
                     } else {

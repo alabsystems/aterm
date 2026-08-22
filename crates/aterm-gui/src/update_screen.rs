@@ -320,13 +320,13 @@ impl UpdateState {
             // failing_persistent arm below can never catch it. Before this arm the
             // headline was "You're up to date." over an outcome that says "will
             // NEVER receive an update until it is fixed" (round-11 audit).
-            "aterm can\u{2019}t check for updates on this Mac.".to_string()
+            "aterm can\u{2019}t check for updates on this machine.".to_string()
         } else if self.failing_persistent {
             // NEVER "up to date" while the ledger says otherwise: for eight hours on
             // 2026-08-18 every check was rejected publisher-side and this line said
             // "You're up to date." The cause rides in `outcome` (the same sentence
             // `aterm ctl update status` prints), shown as the detail below.
-            "Updates are failing on this Mac.".to_string()
+            "Updates are failing on this machine.".to_string()
         } else {
             "You\u{2019}re up to date.".to_string()
         }

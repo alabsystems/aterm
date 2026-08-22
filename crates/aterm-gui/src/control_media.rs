@@ -47,7 +47,15 @@ pub(crate) fn call_main<T>(
     match rx.recv_timeout(MAIN_THREAD_REPLY_TIMEOUT) {
         Ok(v) => Ok(v),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            Err("main thread did not answer within 30s (event loop wedged?)")
+            // State only what expiring this deadline actually proves: no reply
+            // arrived in time. The former text guessed "(event loop wedged?)",
+            // and that guess was WRONG for the first real report it produced --
+            // a request abandoned in the config queue by a loop that was turning
+            // tens of thousands of times a second and answering every other verb
+            // instantly -- while costing an hour of hunting for a stall that did
+            // not exist. A timeout cannot distinguish a wedged loop from a slow
+            // turn from a request nobody ever settles, so it must not name one.
+            Err("main-thread reply did not arrive within 30s")
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err("main-thread reply dropped"),
     }

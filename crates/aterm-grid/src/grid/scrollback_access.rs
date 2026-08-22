@@ -194,6 +194,48 @@ impl Grid {
         self.storage.mark_content_full();
     }
 
+    /// The RING-tier row behind reverse history index `rev_idx`, with its
+    /// preserved extras — or `None` when that index lands in the lazy buffer or
+    /// the tiered store instead (SCR-2).
+    ///
+    /// The tier test is [`Self::try_get_history_line`]'s ring arm, arrived at
+    /// from the OTHER end. That one walks forward from the OLDEST line, so it
+    /// needs the tiered line count and the lazy length to find where the ring
+    /// starts. `rev_idx` already counts back from the NEWEST line, and the ring
+    /// holds exactly the newest `ring_buffer_scrollback()` lines
+    /// (`scrollback_lines() == tiered + lazy + ring`), so the same question —
+    /// "is this a ring line, and which one?" — is answered by the ring count
+    /// ALONE: `rev_idx < ring`, at `ring - 1 - rev_idx`.
+    ///
+    /// That is not merely tidier; it is the cheapest possible form of the
+    /// question for the rows this DECLINES. It runs per visible row on every
+    /// history read, including every read that lands in the warm/cold tiers,
+    /// where anything it does is pure overhead on a path it cannot speed up —
+    /// and asking the tiered store for `line_count()` is a `dyn` call.
+    ///
+    /// MEASURED, `scroll_scrub_harness`, this form vs the tiered+lazy form vs
+    /// the pre-SCR-2 baseline (medians of 3+ alternating runs, both orders):
+    /// `scrub_median_rps` 2.75M / 2.67M / 1.96M, `pageup_median_rps` 1.94M /
+    /// 1.92M / 1.96M, `jump_top_median_jps` 55.9k / 55.7k / 59.1k. So this form
+    /// buys ~3% more scrub and gives pageup back; the ~5% `jump_top` cost is
+    /// NOT this arithmetic (it survives `#[inline(never)]` on the fast
+    /// materializer too) but the price the deep-tier path pays for the ring
+    /// path existing at all — a fence with a 0.45 pass ratio and 1.4x of
+    /// headroom over its floor, bought with a ~40% gain on the scrub phase the
+    /// same fence measures.
+    fn ring_history_row_at_rev(
+        &self,
+        rev_idx: usize,
+    ) -> Option<(&super::Row, Option<&scroll_convert::ScrolledRowExtras>)> {
+        let ring = self.storage.ring_buffer_scrollback();
+        // `checked_*`: a `rev_idx` past the ring (a tiered or deferred line, or
+        // past history entirely) underflows here, and the underflow IS the
+        // decline — the caller then reads it as a `Line`, exactly as before.
+        let ring_idx = ring.checked_sub(rev_idx.checked_add(1)?)?;
+        let row = self.storage.ring_history_row(ring_idx)?;
+        Some((row, self.storage.ring_history_extras(ring_idx)))
+    }
+
     /// Materialize a scrollback line with full fidelity (#4216).
     ///
     /// Returns a [`MaterializedRow`](scroll_materialize::MaterializedRow)
@@ -204,12 +246,28 @@ impl Grid {
     ///
     /// For hot-tier lines, the `Cow` from `history_line_rev` avoids cloning —
     /// `materialize_from_line` only needs `&Line` via `Deref`. (#5950)
+    ///
+    /// RING TIER FIRST (SCR-2). For the newest ~10_000 lines the source row is
+    /// still in RAM as real `Cell`s, so going through `history_line_rev` means
+    /// serializing those cells to text + RLE attrs and immediately parsing them
+    /// back — two O(cols) passes and ~4 allocations to move data between two
+    /// in-memory representations of the same row.
+    /// [`materialize_from_row_extras`](scroll_materialize::materialize_from_row_extras)
+    /// reads the row directly, and returns `None` whenever it cannot PROVE it
+    /// would produce what the round trip produces — so this is a speed decision
+    /// only, and the line below stays the answer for every case it declines and
+    /// for every line that has left the ring.
     #[must_use]
     pub fn materialize_scrollback_row_full(
         &self,
         rev_idx: usize,
         cols: u16,
     ) -> Option<scroll_materialize::MaterializedRow> {
+        if let Some((row, extras)) = self.ring_history_row_at_rev(rev_idx)
+            && let Some(mat) = scroll_materialize::materialize_from_row_extras(row, extras, cols)
+        {
+            return Some(mat);
+        }
         let line = self.history_line_rev(rev_idx)?;
         Some(scroll_materialize::materialize_from_line(&line, cols))
     }

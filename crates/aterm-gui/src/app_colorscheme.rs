@@ -94,6 +94,48 @@ impl App {
     /// re-applies the engine palette + rebuilds the backend exactly as a live
     /// `reload_config` does, so the switch is seamless.
     pub(crate) fn sync_app_theme_to_appearance(&mut self, appearance: aterm_types::Appearance) {
+        // WINDOWS ONLY: re-assert the resolved title-bar appearance after the OS flip.
+        // With config `window_theme = "auto"` the window's winit `preferred_theme` is
+        // `None`, so winit's own `WM_SETTINGCHANGE` handler has just re-themed the
+        // non-client area straight from the new OS preference — which is precisely the
+        // decision the Windows arm overrides (it resolves the caption from the TERMINAL
+        // background instead, so a dark grid never wears a white caption bar). That
+        // clobber lands while the event is being produced, i.e. strictly before this
+        // handler runs, so re-applying here is the last word.
+        //
+        // ABOVE the dedupe below, and that placement is load-bearing. Windows broadcasts
+        // `WM_SETTINGCHANGE` to EVERY top-level window and winit's handler is PER-HWND,
+        // dispatching `ThemeChanged` inline from inside each window's `WndProc`. With two
+        // windows open across one OS flip the order is: W1's proc re-themes W1 and emits
+        // `ThemeChanged(W1)` → we land here and re-assert both → THEN W2's proc runs,
+        // re-themes W2, and emits `ThemeChanged(W2)` → we land here again with the
+        // appearance already recorded, so an early return would leave W2 wearing the OS
+        // caption for good. Hoisting costs one idempotent re-apply per window per event
+        // and removes the hole entirely.
+        //
+        // Not folded into the `theme_changed` branch below either: a plain, non-split
+        // `theme` keeps the SAME background across an OS flip, so `apply_theme_live` (and
+        // with it `window_set_background_color`, the other re-resolution seam) never runs
+        // — yet winit repainted the caption anyway. When it DOES run it re-publishes the
+        // new background to every window afterwards, so the final word still carries the
+        // freshly resolved colour.
+        //
+        // This is only the CHANGE-SIGNALLED half. winit re-themes on every
+        // `WM_SETTINGCHANGE` but reports only the ones that move the OS theme, so the
+        // silent broadcasts are caught on the frame path by
+        // `platform_win::verify_chrome_appearance`.
+        //
+        // macOS/Linux are untouched: `window_theme_for_chrome` still passes `Auto`
+        // through to AppKit/winit unchanged there, and this block does not compile.
+        #[cfg(windows)]
+        {
+            for wid in self.appearance_redraw_targets() {
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    crate::platform_win::resync_chrome_appearance(w);
+                }
+            }
+        }
+
         if self.os_appearance == appearance {
             return; // unchanged — nothing to re-resolve
         }

@@ -218,10 +218,15 @@ struct Snapshot {
 
 impl Snapshot {
     fn metadata(term: &Terminal) -> (Self, SemanticStamp) {
+        use crate::cwd_native::ReportedCwd as _;
         let stamp = semantic_stamp(term);
         let title = bounded_text(term.title(), MAX_COMMAND_CHARS);
+        // This snapshot feeds the summarizer's prompt and the description shown
+        // to the user, so it carries the native path rather than the engine's
+        // RFC 8089 URI path — a model told the cwd is `/C:/Users//x` will happily
+        // repeat that non-path back into a tab description.
         let cwd = bounded_text(
-            term.current_working_directory().unwrap_or_default(),
+            term.native_working_directory().unwrap_or_default().as_ref(),
             MAX_COMMAND_CHARS,
         );
         let block = term.current_block().or_else(|| term.all_blocks().last());
@@ -1749,6 +1754,11 @@ fn semantic_stamp(term: &Terminal) -> SemanticStamp {
     let command = block
         .and_then(|block| block.commandline.as_deref())
         .unwrap_or_default();
+    // Deliberately the RAW engine cwd, NOT the native-converted one: this is a
+    // change-detection hash, never displayed, and `native_path` is a pure
+    // deterministic function — the native form changes exactly when the raw form
+    // does, so hashing the raw bytes is equivalent and skips the only allocation
+    // the conversion can cost on this per-Output-wake path.
     let cwd = term
         .current_working_directory()
         .or_else(|| block.and_then(|block| block.working_directory.as_deref()))

@@ -10,6 +10,7 @@
 
 use aterm_scrollback::ScrollbackStorage;
 
+use super::ViewportRowCache;
 use super::scroll_convert::LazyBuffer;
 use super::state::{GridCursorState, GridPresentationState, GridStorage};
 use super::{Cell, Grid, HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
@@ -73,6 +74,9 @@ impl Grid {
         }
 
         Self {
+            // A fresh grid has no history, so the memo starts empty and sizes
+            // itself on first use from the epoch it is asked about.
+            viewport_cache: ViewportRowCache::default(),
             storage: GridStorage {
                 pages,
                 rows: row_storage,
@@ -162,6 +166,8 @@ impl Grid {
         }
 
         Self {
+            // See `with_scrollback`: derived state, starts empty.
+            viewport_cache: ViewportRowCache::default(),
             storage: GridStorage {
                 pages,
                 rows: row_storage,

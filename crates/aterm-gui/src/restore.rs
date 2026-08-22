@@ -612,6 +612,20 @@ pub(crate) struct WindowLayout {
     pub outer_x: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outer_y: Option<i32>,
+    /// Whether the window was MAXIMIZED at capture time, so quitting maximized
+    /// reopens maximized instead of as a floating default-size frame. When this is
+    /// `Some(true)` the Windows capture stores `rcNormalPosition` — the OS's own
+    /// restore-down rect — in `outer_x`/`outer_y` rather than the maximized frame's
+    /// origin (see `capture_restore_manifest`), so un-maximizing after a restore
+    /// lands where un-maximizing before the quit would have. Additive/optional
+    /// (`Option`, not `bool`): older manifests parse as `None` = "unknown", which
+    /// restore treats exactly like `Some(false)` — never force a state change off
+    /// a manifest that predates the field. Currently written on Windows only; the
+    /// macOS strip keeps its zoom semantics untouched and the Unix seamless
+    /// commit's topology equality never sees a `Some` (belt-and-braces normalized
+    /// there anyway, next to `outer_x`/`outer_y`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximized: Option<bool>,
     /// Terminal-only compatibility projection. Kept byte-compatible with RESTORE-1.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tabs: Vec<PaneLayout>,
@@ -1217,6 +1231,214 @@ pub(crate) fn take() -> Option<RestoreManifest> {
     take_from(&manifest_path()?)
 }
 
+// ---------------------------------------------------------------------------
+// L1 (show the window early): the per-scale REAL cell-metrics cache.
+//
+// A windowed cold launch sizes its first — hidden — OS window from
+// `seed_cell_px`, a 0.6×/1.2× em heuristic, and keeps it hidden until the
+// backend build joins (~300 ms) because revealing the heuristic size would
+// trade blankness for a visibly JUMPING window. This cache removes the
+// heuristic on every launch after the first: `attach_os_window` persists the
+// REAL cell metrics the finished backend derived, keyed by display scale
+// factor, so the NEXT launch can size the pre-backend window exactly and
+// reveal it before the join.
+//
+// Deliberately NOT part of [`RestoreManifest`]: the manifest is single-use
+// (deleted on read) and written only on graceful quit, so folding the metrics
+// in would lose them to every crash and every restore-less boot. This is a
+// durable many-use sibling in the same data dir, sharing the manifest's lock +
+// unique-temp publication machinery so the two persistence lanes cannot round
+// atomicity differently.
+//
+// Staleness is SAFE, not correct-by-construction: a font-file update that
+// changes advance widths without touching any config key yields a wrong entry.
+// The consumer (`attach_os_window`) treats the cache as a size *prediction*,
+// re-derives the truth after the backend joins, logs when they disagree, and
+// re-persists — one launch with a one-off post-reveal resize, then converged.
+
+/// On-disk schema for [`CellMetricsCache`]. Bumped on incompatible layout
+/// change; a mismatched file is ignored wholesale (cold-launch behaviour),
+/// never mis-parsed.
+const CELL_METRICS_SCHEMA: u32 = 1;
+
+/// Scales worth remembering. A desktop has a handful of distinct DPI factors;
+/// dropping the OLDEST entry beyond this bounds the file against a pathological
+/// `$ATERM_FORCE_SCALE` sweep writing unbounded rows.
+const MAX_CELL_METRICS_ENTRIES: usize = 16;
+
+/// Sanity bound for one persisted cell edge in device px. A corrupted or
+/// hand-edited file must never size a window to absurdity; out-of-band entries
+/// read as absent (cold launch), and degenerate measurements are never written.
+const MAX_CELL_EDGE_PX: usize = 4096;
+
+/// One scale factor's measured cell geometry.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub(crate) struct CellMetricsEntry {
+    /// The display scale factor × 1000, rounded — an integer key so lookup is
+    /// exact equality, immune to f64 formatting drift through TOML.
+    pub scale_milli: u32,
+    /// The font size (physical px) the cells were measured at — the launch
+    /// default for this scale at write time. A reader predicts its own target
+    /// px and rejects the entry on mismatch, so an explicit `font_px` config
+    /// change invalidates without a schema bump.
+    pub font_px: f32,
+    pub cell_w: u32,
+    pub cell_h: u32,
+}
+
+/// The whole cache: one font-selection fingerprint, then per-scale entries.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub(crate) struct CellMetricsCache {
+    pub schema: u32,
+    /// The cell-GEOMETRY fingerprint (font selection + line height) every entry
+    /// was measured under. One key for the whole file, not per entry: a font
+    /// change invalidates every scale's metrics at once, which is exactly true.
+    pub font_key: String,
+    #[serde(default)]
+    pub entries: Vec<CellMetricsEntry>,
+}
+
+/// The cache path: `<data_dir>/aterm/cell-metrics.toml`, beside `session.toml`.
+fn cell_metrics_path() -> Option<PathBuf> {
+    aterm_types::dirs::data_dir().map(|d| d.join("aterm").join("cell-metrics.toml"))
+}
+
+/// `scale` → the integer entry key. Clamped positive so a hostile/broken scale
+/// can neither alias 0 nor overflow.
+fn cell_metrics_scale_milli(scale: f64) -> u32 {
+    (scale * 1000.0).round().clamp(1.0, 1_000_000.0) as u32
+}
+
+/// Fail-safe read: any I/O error, malformed TOML, or schema mismatch is `None`
+/// (the caller cold-launches), mirroring the manifest's parse contract.
+fn read_cell_metrics(path: &Path) -> Option<CellMetricsCache> {
+    let text = fs::read_to_string(path).ok()?;
+    let cache: CellMetricsCache = toml::from_str(&text).ok()?;
+    (cache.schema == CELL_METRICS_SCHEMA).then_some(cache)
+}
+
+/// The persisted cell size for `scale`, iff it was measured under the same
+/// font fingerprint at (within rounding) the same font px the caller predicts
+/// for this launch. `None` = cold launch (keep the hidden-until-ready path).
+/// Unlocked read on the launch critical path: publication is whole-file
+/// atomic (unique temp + rename), so a torn read cannot be observed.
+#[cfg_attr(not(windows), allow(dead_code))] // consumed by the Windows early-reveal path (macOS adoption is future work — its head_pts measure needs the attach-time chrome calls first)
+pub(crate) fn load_cell_metrics(
+    font_key: &str,
+    scale: f64,
+    expected_font_px: f32,
+) -> Option<(usize, usize)> {
+    load_cell_metrics_from(&cell_metrics_path()?, font_key, scale, expected_font_px)
+}
+
+fn load_cell_metrics_from(
+    path: &Path,
+    font_key: &str,
+    scale: f64,
+    expected_font_px: f32,
+) -> Option<(usize, usize)> {
+    let cache = read_cell_metrics(path)?;
+    if cache.font_key != font_key {
+        return None;
+    }
+    let key = cell_metrics_scale_milli(scale);
+    let entry = cache.entries.iter().find(|e| e.scale_milli == key)?;
+    // Same tolerance class as the attach path's own "backend already at the
+    // target size" comparison (0.5 px): a real font-px change always exceeds
+    // it, while a bit-identical re-derivation always passes.
+    if (entry.font_px - expected_font_px).abs() >= 0.5 {
+        return None;
+    }
+    let (cell_w, cell_h) = (entry.cell_w as usize, entry.cell_h as usize);
+    ((1..=MAX_CELL_EDGE_PX).contains(&cell_w) && (1..=MAX_CELL_EDGE_PX).contains(&cell_h))
+        .then_some((cell_w, cell_h))
+}
+
+/// Persist one scale's measured cell metrics. Fire-and-forget on a spawned
+/// thread: the caller sits inside the window-attach bracket (squarely between
+/// launch and first paint), and a lost write costs exactly one future cold
+/// launch — self-healing, so neither the write nor its fsync belongs on the
+/// critical path. Owned arguments because the thread outlives the borrow.
+pub(crate) fn store_cell_metrics(
+    font_key: String,
+    scale: f64,
+    font_px: f32,
+    cell_w: usize,
+    cell_h: usize,
+) {
+    let Some(path) = cell_metrics_path() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        if let Err(error) =
+            store_cell_metrics_to(&path, &font_key, scale, font_px, cell_w, cell_h)
+        {
+            eprintln!("aterm-gui: cell-metrics cache not written: {error}");
+        }
+    });
+}
+
+fn store_cell_metrics_to(
+    path: &Path,
+    font_key: &str,
+    scale: f64,
+    font_px: f32,
+    cell_w: usize,
+    cell_h: usize,
+) -> Result<(), String> {
+    // Never persist a degenerate measurement: a 0-px or absurd cell would make
+    // the NEXT launch reveal a broken frame. Skipping is correct — the cache
+    // simply stays cold for this scale.
+    if !(1..=MAX_CELL_EDGE_PX).contains(&cell_w) || !(1..=MAX_CELL_EDGE_PX).contains(&cell_h) {
+        return Ok(());
+    }
+    let (Ok(cell_w), Ok(cell_h)) = (u32::try_from(cell_w), u32::try_from(cell_h)) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("cell-metrics cache {} has no parent", path.display()))?;
+    fs::create_dir_all(parent).map_err(|error| format!("mkdir {}: {error}", parent.display()))?;
+    // Read-modify-write UNDER the shared restore lock (keyed per file name, so
+    // this never contends with `session.toml` traffic): two live aterm
+    // instances finishing backends concurrently must not lose each other's
+    // scale entries by racing the whole-file rewrite.
+    with_restore_lock(path, || {
+        let mut cache = read_cell_metrics(path)
+            .filter(|c| c.font_key == font_key)
+            .unwrap_or_else(|| CellMetricsCache {
+                schema: CELL_METRICS_SCHEMA,
+                font_key: font_key.to_string(),
+                entries: Vec::new(),
+            });
+        let entry = CellMetricsEntry {
+            scale_milli: cell_metrics_scale_milli(scale),
+            font_px,
+            cell_w,
+            cell_h,
+        };
+        match cache
+            .entries
+            .iter_mut()
+            .find(|e| e.scale_milli == entry.scale_milli)
+        {
+            // Steady state (every attach on an already-cached scale): byte-equal
+            // entry, no disk write at all.
+            Some(existing) if *existing == entry => return Ok(()),
+            Some(existing) => *existing = entry,
+            None => {
+                if cache.entries.len() >= MAX_CELL_METRICS_ENTRIES {
+                    cache.entries.remove(0);
+                }
+                cache.entries.push(entry);
+            }
+        }
+        let toml =
+            toml::to_string(&cache).map_err(|e| format!("serialize cell metrics: {e}"))?;
+        write_restore_locked(path, toml.as_bytes())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1231,6 +1453,7 @@ mod tests {
                 active_tab: 1,
                 outer_x: Some(120),
                 outer_y: Some(64),
+                maximized: Some(true),
                 tabs: vec![
                     PaneLayout::leaf(Some("/home/a".into()), "zsh".into(), true),
                     PaneLayout::Split {
@@ -1251,6 +1474,7 @@ mod tests {
                 active_tab: 0,
                 outer_x: None,
                 outer_y: None,
+                maximized: None,
                 tabs: vec![PaneLayout::leaf(Some("/".into()), "sh".into(), true)],
                 native_tabs: Vec::new(),
                 tab_order: Vec::new(),
@@ -1267,6 +1491,7 @@ mod tests {
             active_tab: 0,
             outer_x: None,
             outer_y: None,
+            maximized: None,
             tabs: vec![PaneLayout::leaf(Some("/tmp".into()), "shell".into(), true)],
             native_tabs: vec![
                 NativeTabRestore::Settings {
@@ -1304,6 +1529,37 @@ mod tests {
             }
         ));
         assert!(!m.is_empty());
+    }
+
+    /// W3 schema compatibility both ways. FORWARD: a pre-`maximized` manifest (the
+    /// key simply absent — byte-for-byte what an older build wrote, thanks to
+    /// `skip_serializing_if`) parses with `maximized: None`, so an upgrade never
+    /// rejects the user's saved session. BACKWARD: a `None` never emits the key,
+    /// so a manifest written by this build and read by an older one carries
+    /// nothing new unless a window really was maximized (and serde's default
+    /// unknown-field tolerance absorbs it there).
+    #[test]
+    fn manifest_maximized_is_schema_compatible() {
+        // sample() has window 0 maximized: the flag must survive the round trip
+        // (covered structurally by `manifest_round_trips_through_toml`, asserted
+        // by name here so a serde-attr regression fails with a legible message).
+        let toml = sample().to_toml().expect("serialize");
+        assert!(toml.contains("maximized = true"));
+        let back = RestoreManifest::from_toml(&toml).expect("parse");
+        assert_eq!(back.windows[0].maximized, Some(true));
+        assert_eq!(back.windows[1].maximized, None);
+
+        // The legacy shape: strip the flag and re-serialize — the key vanishes
+        // entirely (an old manifest, byte-for-byte in this respect) and parsing
+        // yields "unknown", never a forced state.
+        let mut legacy = sample();
+        for window in &mut legacy.windows {
+            window.maximized = None;
+        }
+        let legacy_toml = legacy.to_toml().expect("serialize legacy");
+        assert!(!legacy_toml.contains("maximized"));
+        let back = RestoreManifest::from_toml(&legacy_toml).expect("parse legacy");
+        assert!(back.windows.iter().all(|w| w.maximized.is_none()));
     }
 
     #[test]
@@ -1705,6 +1961,117 @@ metadata = "opaque=copy-me"
         assert_eq!(absent["returned"], 1);
         assert!(model.check_invariant("AtMostOneConsumer", &absent));
         assert!(model.check_invariant("ReturnOnlyAfterDurableClaim", &absent));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L1 cell-metrics cache: store→load round-trips per scale, a second scale
+    /// coexists with the first, and re-storing the identical entry is the
+    /// steady-state no-op (file bytes untouched).
+    #[test]
+    fn cell_metrics_round_trip_per_scale() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-cell-metrics-roundtrip-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cell-metrics.toml");
+
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 7, 15).unwrap();
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.5, 18.0, 11, 22).unwrap();
+        assert_eq!(
+            load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.0, 12.0),
+            Some((7, 15))
+        );
+        assert_eq!(
+            load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.5, 18.0),
+            Some((11, 22))
+        );
+        // An uncached scale misses without disturbing the cached ones.
+        assert_eq!(
+            load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 2.0, 24.0),
+            None
+        );
+
+        // Steady state: the identical re-store leaves the published file's
+        // mtime-bearing BYTES untouched (compare content — mtimes are too
+        // coarse on some filesystems to prove a skipped write).
+        let before = std::fs::read_to_string(&path).unwrap();
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 7, 15).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        // A REAL change on one scale updates that entry and keeps the other.
+        store_cell_metrics_to(&path, "JetBrains Mono|lh=1", 1.0, 12.0, 8, 16).unwrap();
+        assert_eq!(
+            load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.0, 12.0),
+            Some((8, 16))
+        );
+        assert_eq!(
+            load_cell_metrics_from(&path, "JetBrains Mono|lh=1", 1.5, 18.0),
+            Some((11, 22))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L1 cell-metrics cache: every staleness gate fails CLOSED (a miss, never a
+    /// wrong hit) — font-key change, font-px change, degenerate persisted cells,
+    /// schema mismatch, and absent/corrupt files.
+    #[test]
+    fn cell_metrics_staleness_gates_fail_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-cell-metrics-staleness-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cell-metrics.toml");
+
+        // Absent + corrupt files read as cold launches.
+        assert_eq!(load_cell_metrics_from(&path, "k", 1.0, 12.0), None);
+        std::fs::write(&path, "not toml [").unwrap();
+        assert_eq!(load_cell_metrics_from(&path, "k", 1.0, 12.0), None);
+        let _ = std::fs::remove_file(&path);
+
+        store_cell_metrics_to(&path, "Cascadia|lh=1", 1.0, 12.0, 7, 15).unwrap();
+        // A font change (new fingerprint) misses...
+        assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 1.0, 12.0), None);
+        // ...and the next STORE under the new key drops the stale entries
+        // wholesale rather than mixing fingerprints.
+        store_cell_metrics_to(&path, "Fira|lh=1", 2.0, 24.0, 13, 29).unwrap();
+        assert_eq!(
+            load_cell_metrics_from(&path, "Cascadia|lh=1", 1.0, 12.0),
+            None
+        );
+        assert_eq!(
+            load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.0),
+            Some((13, 29))
+        );
+        // A predicted-font-px drift ≥ the tolerance misses (an explicit
+        // `font_px` config change), a sub-tolerance one hits (f32 noise).
+        assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 25.0), None);
+        assert_eq!(
+            load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.2),
+            Some((13, 29))
+        );
+
+        // Degenerate measurements are never persisted...
+        store_cell_metrics_to(&path, "Fira|lh=1", 3.0, 36.0, 0, 15).unwrap();
+        assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 3.0, 36.0), None);
+        // ...and a hand-corrupted absurd entry is rejected at load.
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("cell_w = 13", "cell_w = 99999");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 2.0, 24.0), None);
+
+        // A future schema is ignored wholesale, never mis-parsed.
+        let _ = std::fs::remove_file(&path);
+        store_cell_metrics_to(&path, "Fira|lh=1", 1.0, 12.0, 7, 15).unwrap();
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("schema = 1", "schema = 999");
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 1.0, 12.0), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

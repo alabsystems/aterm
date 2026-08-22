@@ -1177,8 +1177,7 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
                     libc::close(rd);
                     libc::close(wr);
                 }
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
+                Err(io::Error::other(
                     "pipe2(O_CLOEXEC) produced a descriptor without FD_CLOEXEC",
                 ))
             }

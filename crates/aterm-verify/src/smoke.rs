@@ -132,6 +132,7 @@ pub fn signal(pid: u32, sig: &str) -> (bool, String) {
 /// launched being the process it measured.
 ///
 /// Returns `(ok, stderr_from_kill)`.
+#[cfg(unix)]
 pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -164,6 +165,45 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
             (_, Some(9)) => kill_sent,
             _ => false,
         },
+        Err(_) => false,
+    };
+    (ok, noise)
+}
+
+/// Windows analogue of the above. There is no signal to ask politely with and no
+/// `signal()` on `ExitStatus` to classify the death by, so the sequence is: give the
+/// child two seconds to leave on its own, then `TerminateProcess` via [`Child::kill`].
+///
+/// The Unix contract — only a death WE caused counts as a clean retirement — is kept:
+/// a self-exit is judged by its code, and a terminated child is a success only when
+/// this function is the one that terminated it.
+#[cfg(not(unix))]
+pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
+    let mut noise = String::new();
+
+    let mut exited = false;
+    for _ in 0..40 {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            Err(_) => break,
+        }
+    }
+    let mut kill_sent = false;
+    if !exited && matches!(child.try_wait(), Ok(None)) {
+        match child.kill() {
+            Ok(()) => kill_sent = true,
+            Err(e) => noise.push_str(&e.to_string()),
+        }
+    }
+    let ok = match child.wait() {
+        // Left on its own terms, cleanly.
+        Ok(st) if st.code() == Some(0) => true,
+        // Any other exit is clean only if this function is what ended it.
+        Ok(_) => kill_sent,
         Err(_) => false,
     };
     (ok, noise)
@@ -233,11 +273,38 @@ pub fn smoke_log_tail(label: &str, path: &Path) -> String {
 
 /// Is this path a bound unix socket (or a symlink to one)? The script's
 /// `[ -S "$sock" ] || [ -L "$sock" ]`.
+#[cfg(unix)]
 #[must_use]
 pub fn is_socket_or_symlink(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
     std::fs::symlink_metadata(path)
         .map(|m| m.file_type().is_symlink() || m.file_type().is_socket())
+        .unwrap_or(false)
+}
+
+/// Windows has no `S_IFSOCK`: a bound `AF_UNIX` socket lands on disk as a REPARSE
+/// POINT, which `FileType::is_socket` (absent there) could not report anyway. So the
+/// honest analogue tests the reparse attribute alongside the symlink case — still
+/// specific, and still false for the plain file the selftest asserts against.
+#[cfg(not(unix))]
+#[must_use]
+pub fn is_socket_or_symlink(path: &Path) -> bool {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    #[cfg(windows)]
+    use std::os::windows::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path)
+        .map(|m| {
+            #[cfg(windows)]
+            {
+                m.file_type().is_symlink()
+                    || (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = FILE_ATTRIBUTE_REPARSE_POINT;
+                m.file_type().is_symlink()
+            }
+        })
         .unwrap_or(false)
 }
 

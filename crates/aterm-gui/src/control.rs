@@ -134,13 +134,18 @@ mod clipboard;
 // Re-export `pbcopy`/`pbpaste` (GUI OSC-52 path, `main.rs`, menu Paste), which
 // reach through the stable `crate::control::NAME` path, so those paths keep resolving.
 pub(crate) use clipboard::{pbcopy, pbpaste};
-// The X11 non-blocking own-selection read, for the OSC-52 query arm (which must
-// never block inside the terminal lock on a foreign-owned selection).
-#[cfg(target_os = "linux")]
-pub(crate) use clipboard::pbpaste_owned;
-// `primary_get`/`primary_set` (PRIMARY-selection paste/own) are wired ONLY to Linux
-// middle-click / selection-release in `app_mouse`, so their re-exports are
-// Linux-only — on macOS they would be unused imports.
+// The test-only clipboard stub (see its doc): reached as
+// `crate::control::PBPASTE_STUB` by tests that must make "the clipboard says X"
+// deterministic without touching the real system clipboard.
+#[cfg(test)]
+pub(crate) use clipboard::PBPASTE_STUB;
+// `pbpaste_owned` (the X11 non-blocking own-selection read, for the OSC-52
+// query arm — which must never block inside the terminal lock on a
+// foreign-owned selection) and `primary_get`/`primary_set` (PRIMARY-selection
+// paste/own, wired ONLY to Linux middle-click / selection-release in
+// `app_mouse`). ONE grouped re-export: a second standalone `pbpaste_owned`
+// line is E0252 (duplicate import) on the Linux build. Linux-only — on macOS
+// all three would be unused imports.
 #[cfg(target_os = "linux")]
 pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_set};
 
@@ -7036,7 +7041,10 @@ mod tests {
         std::fs::write(&path, "base\n").unwrap();
         app.open_document_tab(
             crate::native_app::AppKind::Editor,
-            &format!("file://{}", path.to_string_lossy()),
+            // The shipping encoder, not a hand-rolled `format!` — the latter is
+            // malformed on Windows (drive letter + backslashes after the
+            // authority slot), so this test could not even open its document there.
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
         )
         .unwrap();
         let (instance, view) = app.active_native_view(wid).unwrap();
@@ -10971,7 +10979,10 @@ mod tests {
         std::fs::write(&path, "base\n").unwrap();
         app.open_document_tab(
             crate::native_app::AppKind::Editor,
-            &format!("file://{}", path.to_string_lossy()),
+            // The shipping encoder, not a hand-rolled `format!` — the latter is
+            // malformed on Windows (drive letter + backslashes after the
+            // authority slot), so this test could not even open its document there.
+            &crate::native_document_host::path_to_file_uri(&path).unwrap(),
         )
         .unwrap();
         let (instance, view) = app.active_native_view(wid).unwrap();

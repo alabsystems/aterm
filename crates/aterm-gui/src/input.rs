@@ -394,6 +394,147 @@ fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffset) -> (u16,
     }
 }
 
+/// Ceiling on the number of times ONE wheel event may write its encoded bytes.
+/// Both bursts the seam can produce are bounded by it: the per-line mouse reports
+/// under a tracking app (via the `mouse` verb's `lines=N` clamp, which IS this
+/// constant — `control_input::MAX_WHEEL_LINES`), and the DEC-1007 alt-scroll arrow
+/// presses, whose count is `lines` times the platform's lines-per-detent and so can
+/// exceed `lines` on its own (Windows' "One screen at a time" multiplies by the
+/// viewport height). 512 covers a large flick of many screens; past that a single
+/// event is flooding the PTY, not scrolling.
+pub(crate) const MAX_WHEEL_BURST: i32 = 512;
+
+/// How far a wheel gesture of `notch_lines` DETENTS travels, in lines, once the
+/// platform's lines-per-detent is applied. `page_rows` is the viewport height, used
+/// only for the "One screen at a time" setting.
+///
+/// WINDOWS ONLY (identity elsewhere). winit's Win32 backend reports exactly ±1.0
+/// `LineDelta` per detent, but on Windows a detent is not one line: it is
+/// `SPI_GETWHEELSCROLLLINES` lines — default **3**, the Mouse-settings slider, the
+/// distance every other window on the desktop travels. macOS and X11 need no such
+/// term: AppKit folds the user's scroll speed into `scrollingDeltaY` before winit
+/// sees it, and X11's button-4/5 ARE one line by convention.
+///
+/// THE TWO CALLERS ARE THE TWO SURFACES THE USER SCROLLS WITHOUT AN APP'S HELP:
+/// the local scrollback viewport (`App::input_wheel`), and the alternate-scroll
+/// (DEC 1007) arrow synthesis in `seam_egress`, which is how `less`, `man` and
+/// `git log` scroll. The mouse-TRACKING path deliberately does NOT call this: there
+/// the app receives real wheel reports and applies its own notch->lines conversion
+/// (vim's `mousescroll`, default 3), so scaling would compound to nine lines a
+/// notch.
+#[cfg(windows)]
+pub(crate) fn wheel_platform_lines(notch_lines: i32, page_rows: u16) -> i32 {
+    wheel_scaled_lines(
+        notch_lines,
+        crate::platform_win::wheel_notch_scroll(),
+        page_rows,
+    )
+}
+
+/// The non-Windows twin of [`wheel_platform_lines`]: the platform already delivered
+/// the user's scroll speed in the delta, so the gesture's line count is final.
+#[cfg(not(windows))]
+pub(crate) fn wheel_platform_lines(notch_lines: i32, _page_rows: u16) -> i32 {
+    notch_lines
+}
+
+/// Where ONE wheel event goes — the seam's routing decision, factored out of
+/// `seam_egress` so the precedence is a pure, cross-platform-testable truth
+/// table (the byte production stays in the seam, under its single term-lock).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WheelRoute {
+    /// An app is tracking the mouse: encode wheel reports for it.
+    Report,
+    /// Alt screen + DEC 1007, tracking off: synthesize arrow-key presses.
+    AltScroll,
+    /// aterm's own scrollback viewport (`Egress::TrackingOff`).
+    Viewport,
+}
+
+/// Resolve a wheel's [`WheelRoute`] from the three facts the seam reads under
+/// its term lock. THE ORDER IS THE CONTRACT:
+///
+/// 1. `shift_held` wins over EVERYTHING (audit I12). Shift+wheel is the user's
+///    explicit "scroll ATERM, not the app" gesture — the xterm convention whose
+///    KEYBOARD half aterm already ships (`scrollback_chord`, Shift+PgUp/PgDn,
+///    citing "the xterm / Terminal.app convention"). Without it there is NO
+///    wheel gesture that moves the viewport over fzf / a mouse-enabled REPL.
+///    Checked BEFORE the tracking test so the shifted event can never reach
+///    `encode_mouse_wheel` (which would fold SHIFT_MASK into the report byte —
+///    the bypass must not leak a shifted report to the app), and before the
+///    DEC-1007 arm for the same reason xterm's is: Shift reserves the wheel for
+///    the terminal, full stop. The fallback path never reads the modifier, so
+///    nothing downstream needs to "strip" Shift, and the platform
+///    lines-per-detent multiplier still applies (`wheel_viewport_lines` runs on
+///    every `TrackingOff` wheel).
+/// 2. `alt_local` — Option/Alt held on the MAIN screen (SELECTION CUSTODY
+///    Phase 2): the wheel scrolls THIS terminal's scrollback even while an app
+///    tracks the mouse. Option is aterm's OWN established override modifier
+///    under tracking, not an import: `press_starts_selection` (`app_mouse.rs`,
+///    audit M6) already lets Option-click start a local selection "so a PID can
+///    be copied out of htop" — one modifier, one meaning; this is the wheel
+///    half of the same gesture. The CALLER computes the main-screen scoping
+///    (`ALT_MASK` held AND not alt screen): the alt screen is built with zero
+///    scrollback, so a bypass there buys nothing while costing the DEC-1007
+///    arrows that less/man/git-log scroll by — with Alt on the alt screen the
+///    wheel behaves exactly as it always has.
+/// 3. Mouse tracking: the app grabbed the mouse, it gets real reports.
+/// 4. Alternate scroll (DEC 1007, alt screen): arrows for less/man/git-log.
+/// 5. Otherwise: the local scrollback viewport.
+///
+/// REJECTED — stripping Shift in `on_mouse_wheel` (the GUI handler) instead:
+/// that would bypass for the Human path only, silently diverging the controller
+/// `mouse` verb (the seam is deliberately source-blind; a policy split keyed on
+/// the builder is exactly the divergence the A.7 invariant forbids). Also
+/// REJECTED — a platform-conditional bypass modifier (the `link_modifier_held`
+/// shape): the convention is xterm's own and holds on every platform aterm
+/// ships; a per-platform split would buy nothing but a third behaviour matrix.
+/// (macOS trackpads convert a Shift+swipe to a HORIZONTAL delta before winit
+/// sees it, so this arm is naturally rare there — but a Shift+notch on a real
+/// mouse wheel behaves identically everywhere.)
+pub(crate) fn wheel_route(
+    shift_held: bool,
+    alt_local: bool,
+    tracking: bool,
+    alt_scroll: bool,
+) -> WheelRoute {
+    if shift_held {
+        return WheelRoute::Viewport;
+    }
+    if alt_local {
+        return WheelRoute::Viewport;
+    }
+    if tracking {
+        return WheelRoute::Report;
+    }
+    if alt_scroll {
+        return WheelRoute::AltScroll;
+    }
+    WheelRoute::Viewport
+}
+
+/// The pure arithmetic of [`wheel_platform_lines`], split out so the multiply can be
+/// tested without a live `SystemParametersInfoW` (whose answer belongs to whoever's
+/// machine runs the suite, and so can never be asserted).
+///
+/// [`WheelNotch::Page`] is the slider's "One screen at a time" position: a detent is
+/// then a PAGE, sized as the viewport so a wheel and PgUp/PgDn cannot disagree about
+/// what a page is. `Lines(0)` — "wheel scrolling off" in Mouse settings — is
+/// honoured as zero rather than clamped up to one: a user who turned the wheel off
+/// means it.
+#[cfg(windows)]
+fn wheel_scaled_lines(
+    notch_lines: i32,
+    notch: crate::platform_win::WheelNotch,
+    page_rows: u16,
+) -> i32 {
+    let per_notch = match notch {
+        crate::platform_win::WheelNotch::Lines(n) => i32::try_from(n).unwrap_or(i32::MAX),
+        crate::platform_win::WheelNotch::Page => i32::from(page_rows).max(1),
+    };
+    notch_lines.saturating_mul(per_notch)
+}
+
 /// How [`seam_egress`] hands the encoded bytes to the [`SinkWriter`] — a TRANSPORT
 /// knob keyed on the CALLING THREAD, never on who produced the event (cf.
 /// `echo_to_window` and the `resize` arm, which key on WHERE the event came from,
@@ -584,34 +725,68 @@ pub fn seam_egress(
             let lines = (*lines).max(1);
             // Decide the wheel's egress under the SINGLE term_lock window. Three
             // source-blind outcomes (Human and Controller converge):
-            //   Write(b)  — emit `b` once per line: a mouse-wheel report when an app
-            //               is tracking, OR (alt screen + DEC 1007, audit M5) a
-            //               synthesized arrow key so a wheel scrolls less/man/vim;
+            //   Write     — emit the bytes `repeat` times: a mouse-wheel report ONCE
+            //               PER LINE when an app is tracking, OR (alt screen + DEC
+            //               1007, audit M5) a synthesized arrow key so a wheel scrolls
+            //               less/man/vim — that one scaled by the platform's
+            //               lines-per-detent, see the arm below;
             //   Swallow   — Reported with nothing to write (X10 mode-9 press-only, or
             //               an empty key encoding): the wheel is CONSUMED, the local
             //               viewport must NOT move;
-            //   Fallback  — tracking off and not alt-scroll: `App::input` scrolls the
-            //               local scrollback viewport (`Egress::TrackingOff`).
+            //   Fallback  — tracking off and not alt-scroll, OR Shift held (the
+            //               I12 bypass — see `wheel_route`): `App::input` scrolls
+            //               the local scrollback viewport (`Egress::TrackingOff`).
             enum WheelPlan {
-                Write(Vec<u8>),
+                Write { bytes: Vec<u8>, repeat: i32 },
                 Swallow,
                 Fallback,
             }
             let plan = {
                 let t = term_lock(term);
-                if t.mouse_tracking_enabled() {
+                // The precedence (Shift bypass > Alt local-override > tracking >
+                // alt-scroll > viewport) lives in `wheel_route` — pure, so the
+                // table is pinned by tests on every platform. The facts are read
+                // HERE, under this lock; the Alt override's main-screen scoping
+                // (no scrollback on the alt screen — see the contract) is one of
+                // those facts, not policy.
+                let route = wheel_route(
+                    *mods & aterm_types::mouse::SHIFT_MASK != 0,
+                    *mods & aterm_types::mouse::ALT_MASK != 0 && !t.is_alternate_screen(),
+                    t.mouse_tracking_enabled(),
+                    t.is_alternate_screen() && t.modes().alternate_scroll,
+                );
+                if route == WheelRoute::Report {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     match t.encode_mouse_wheel(*dir_up, rx, ry, *mods) {
-                        Some(b) => WheelPlan::Write(b),
+                        // EXACTLY one report per line, NEVER scaled by the platform's
+                        // lines-per-detent: the app grabbed the mouse and does its own
+                        // notch->lines conversion (vim's `mousescroll`, default 3).
+                        // Multiplying here would hand vim three notches to multiply,
+                        // i.e. nine lines a detent on Windows.
+                        Some(b) => WheelPlan::Write {
+                            bytes: b,
+                            repeat: lines,
+                        },
                         None => WheelPlan::Swallow, // X10 (mode 9) is press-only
                     }
-                } else if t.is_alternate_screen() && t.modes().alternate_scroll {
+                } else if route == WheelRoute::AltScroll {
                     // Alternate scroll (DEC mode 1007, audit M5): the alt screen has no
                     // scrollback, so when the app did NOT grab the mouse the wheel
-                    // becomes arrow-key PRESSES (one per line) — how less/man/git-log
-                    // scroll under a wheel. Encoded through the engine's LIVE keyboard
-                    // mode so DECCKM (SS3 arrows) and the kitty forms stay exact (never
-                    // a hardcoded ESC[A).
+                    // becomes arrow-key PRESSES — how less/man/git-log scroll under a
+                    // wheel. Encoded through the engine's LIVE keyboard mode so DECCKM
+                    // (SS3 arrows) and the kitty forms stay exact (never a hardcoded
+                    // ESC[A).
+                    //
+                    // The COUNT is the platform's lines-per-detent, not one: this is a
+                    // pager with no wheel of its own, so aterm owes it the same
+                    // distance the local viewport gets (`SPI_GETWHEELSCROLLLINES`,
+                    // default 3, on Windows — identity elsewhere). xterm and Windows
+                    // Terminal both send N arrows here. Unlike the tracking arm above
+                    // there is nothing downstream to multiply again: `less` moves one
+                    // line per ArrowDown, full stop. Bounded by [`MAX_WHEEL_BURST`] for
+                    // the reason the `mouse` verb is: "One screen at a time"
+                    // (WHEEL_PAGESCROLL) times a large flick would otherwise let one
+                    // event flood the PTY.
                     let arrow = if *dir_up {
                         NamedKey::ArrowUp
                     } else {
@@ -626,17 +801,22 @@ pub fn seam_egress(
                     if bytes.is_empty() {
                         WheelPlan::Swallow
                     } else {
-                        WheelPlan::Write(bytes)
+                        WheelPlan::Write {
+                            bytes,
+                            repeat: wheel_platform_lines(lines, t.rows()).clamp(0, MAX_WHEEL_BURST),
+                        }
                     }
                 } else {
                     WheelPlan::Fallback
                 }
             };
             match plan {
-                WheelPlan::Write(b) => {
-                    // One report / keypress PER line (kills divergence e).
+                WheelPlan::Write { bytes: b, repeat } => {
+                    // One report / keypress PER unit of `repeat` (kills divergence e —
+                    // `repeat` is computed source-blind, from the terminal's modes and
+                    // the platform's setting, never from `_audit`).
                     let mut d = Delivery::Full;
-                    for _ in 0..lines {
+                    for _ in 0..repeat {
                         if delivered(emit(sink, mode, &b), b.len()) == Delivery::Failed {
                             d = Delivery::Failed; // any short/failed write fails the lot
                         }
@@ -779,6 +959,31 @@ pub(crate) fn shell_escape_path_posix(path: &str) -> String {
             out.push('\\');
         }
         out.push(c);
+    }
+    out
+}
+
+/// Build the terminal INSERTION for a list of file paths — the clipboard
+/// CF_HDROP paste (audit S9: Ctrl+C a file in Explorer, Ctrl+V in aterm) —
+/// reusing the drag-and-drop contract EXACTLY (`App::drop_file`): each path
+/// shell-escaped ([`shell_escape_path`]) and given ONE trailing space, so a
+/// multi-file copy reproduces iTerm's space-joined `p1 p2 p3 ` and the
+/// insertion ends in a space, NOT a newline — nothing is executed. Empty paths
+/// contribute nothing (mirroring `drop_file`'s empty-path early return).
+/// Winit/fs-free so the join contract is unit-tested on every target; the
+/// escaping itself is pinned by the `shell_escape_path_*` suites above it.
+/// Its one production caller is the Windows `CF_HDROP` arm of
+/// `App::paste_clipboard_into`, hence the off-Windows dead-code allowance
+/// (the `shell_escape_path_posix` shape).
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn paths_paste_insertion(paths: &[String]) -> String {
+    let mut out = String::new();
+    for p in paths {
+        if p.is_empty() {
+            continue;
+        }
+        out.push_str(&shell_escape_path(p));
+        out.push(' ');
     }
     out
 }
@@ -961,6 +1166,19 @@ mod tests {
         }
     }
 
+    /// A wheel event carrying mouse modifier bits (see `App::mouse_modifiers`).
+    #[cfg(unix)]
+    fn wheel_mods(dir_up: bool, lines: i32, mods: u8) -> InputEvent {
+        InputEvent::Wheel {
+            dir_up,
+            lines,
+            row: 0,
+            col: 0,
+            mods,
+            px_off: PixelOffset::CELL_ORIGIN,
+        }
+    }
+
     /// Drive ONE event through [`seam_egress`] and return the [`Egress`] verdict
     /// (the variant the viewport side-effects key off), discarding any PTY bytes.
     #[cfg(unix)]
@@ -974,6 +1192,58 @@ mod tests {
             libc::close(fds[0]);
         }
         e
+    }
+
+    /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE.
+    ///
+    /// A program that grabs the mouse takes the wheel absolutely, so while it runs
+    /// the user cannot reach their own scrollback at all. With Option held the wheel
+    /// scrolls this terminal instead — the wheel half of the gesture
+    /// `press_starts_selection` already gives selection under tracking.
+    #[cfg(unix)]
+    #[test]
+    fn option_wheel_scrolls_locally_under_mouse_tracking() {
+        use aterm_types::mouse::ALT_MASK;
+        // Main screen, app grabbing the mouse (SGR tracking).
+        let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+        // Control: without the override the app owns the wheel.
+        assert!(
+            matches!(egress_of(&term, &wheel(true, 1)), Egress::Reported(_)),
+            "a tracking app still gets the plain wheel"
+        );
+        // With Option held the local viewport scrolls instead.
+        assert!(
+            matches!(
+                egress_of(&term, &wheel_mods(true, 1, ALT_MASK)),
+                Egress::TrackingOff { .. }
+            ),
+            "Option+wheel must reach the local scrollback"
+        );
+    }
+
+    /// …and it is scoped to the MAIN screen. The alt screen is built with zero
+    /// scrollback, so an override there would reach nothing WHILE costing the
+    /// alternate-scroll arrows that are how `less`/`man`/`git log` scroll.
+    #[cfg(unix)]
+    #[test]
+    fn the_local_scroll_override_leaves_the_alt_screen_alone() {
+        use aterm_types::mouse::ALT_MASK;
+        // Alt screen + DEC 1007: Option must NOT steal the arrows.
+        let alt_scroll = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
+        assert_eq!(
+            egress_bytes(&alt_scroll, &wheel_mods(true, 1, ALT_MASK)),
+            b"\x1b[A",
+            "alternate scroll still converts the wheel to an arrow"
+        );
+        // Alt screen + a tracking app: Option must NOT steal the report either.
+        let tracking = term_with(&[b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"]);
+        assert!(
+            matches!(
+                egress_of(&tracking, &wheel_mods(true, 1, ALT_MASK)),
+                Egress::Reported(_)
+            ),
+            "a mouse-owning alt-screen app keeps the wheel"
+        );
     }
 
     /// Audit M5 — alternate scroll (DEC 1007): on the ALT screen with 1007 set and
@@ -1011,6 +1281,39 @@ mod tests {
         assert_eq!(egress_bytes(&term, &wheel(true, 1)), b"\x1b[<64;1;1M");
     }
 
+    /// I12 at the byte level: the SAME tracking + alt-scroll terminal as above,
+    /// but with SHIFT on the event — the seam falls back to the local viewport
+    /// (`TrackingOff` carrying the gesture's lines) and writes NOTHING, so a
+    /// shifted report byte (`64|SHIFT_MASK`) can never leak to the app.
+    #[cfg(unix)]
+    #[test]
+    fn shift_wheel_bypasses_a_tracking_app_with_no_report_bytes() {
+        let term = term_with(&[
+            b"\x1b[?1049h",
+            b"\x1b[?1007h",
+            b"\x1b[?1000h",
+            b"\x1b[?1006h",
+        ]);
+        let shifted = InputEvent::Wheel {
+            dir_up: true,
+            lines: 2,
+            row: 0,
+            col: 0,
+            mods: aterm_types::mouse::SHIFT_MASK,
+            px_off: PixelOffset::CELL_ORIGIN,
+        };
+        assert!(matches!(
+            egress_of(&term, &shifted),
+            Egress::TrackingOff {
+                wheel_lines: 2,
+                wheel_up: true
+            }
+        ));
+        assert!(egress_bytes(&term, &shifted).is_empty());
+        // Control: the unshifted twin still reports (the bypass is the ONLY change).
+        assert_eq!(egress_bytes(&term, &wheel(true, 1)), b"\x1b[<64;1;1M");
+    }
+
     /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
     /// falls back to local scrollback (`Egress::TrackingOff`), no arrows synthesized.
     #[cfg(unix)]
@@ -1040,12 +1343,46 @@ mod tests {
         assert!(egress_bytes(&term, &wheel(true, 1)).is_empty());
     }
 
-    /// One arrow press is emitted PER accumulated wheel line.
+    /// One arrow press is emitted PER accumulated wheel line — on a platform whose
+    /// lines-per-detent is the identity ([`wheel_platform_lines`]). On Windows the
+    /// same gesture is worth `SPI_GETWHEELSCROLLLINES` arrows; see
+    /// `wheel_scale_is_the_platform_distance_not_one_line`.
     #[cfg(unix)]
     #[test]
     fn alternate_scroll_emits_one_arrow_per_line() {
         let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
         assert_eq!(egress_bytes(&term, &wheel(true, 3)), b"\x1b[A\x1b[A\x1b[A");
+    }
+
+    /// THE WHEEL MULTIPLY ITSELF (Windows). The live
+    /// `SPI_GETWHEELSCROLLLINES` read cannot be asserted — its answer belongs to
+    /// whoever's machine runs the suite — so the arithmetic every wheel gesture
+    /// goes through is pinned here instead, on all three of the setting's shapes.
+    /// Both surfaces that scroll without an app's help route through this: the
+    /// scrollback viewport (`App::input_wheel`) and the DEC-1007 alt-scroll arrows.
+    #[cfg(windows)]
+    #[test]
+    fn wheel_scale_is_the_platform_distance_not_one_line() {
+        use crate::platform_win::WheelNotch;
+        // The Windows default, and the whole point: one detent is THREE lines, not
+        // the one that winit's `LineDelta` literally reports.
+        assert_eq!(wheel_scaled_lines(1, WheelNotch::Lines(3), 24), 3);
+        assert_eq!(wheel_scaled_lines(4, WheelNotch::Lines(3), 24), 12);
+        // A user who set the slider to 1 keeps the old behaviour exactly.
+        assert_eq!(wheel_scaled_lines(2, WheelNotch::Lines(1), 24), 2);
+        // "One screen at a time" is a PAGE, sized as the viewport so a wheel and
+        // PgUp/PgDn cannot disagree; a degenerate zero-row grid still moves.
+        assert_eq!(wheel_scaled_lines(1, WheelNotch::Page, 24), 24);
+        assert_eq!(wheel_scaled_lines(2, WheelNotch::Page, 50), 100);
+        assert_eq!(wheel_scaled_lines(1, WheelNotch::Page, 0), 1);
+        // "Wheel scrolling off" (a literal 0) is honoured as NO motion rather than
+        // clamped up to one line: a user who turned the wheel off meant it.
+        assert_eq!(wheel_scaled_lines(9, WheelNotch::Lines(0), 24), 0);
+        // Absurd values saturate instead of wrapping into a negative scroll.
+        assert_eq!(
+            wheel_scaled_lines(i32::MAX, WheelNotch::Lines(u32::MAX), 24),
+            i32::MAX
+        );
     }
 
     /// THE Tier-1 indistinguishability invariant (A.7), part 1 — BYTE EQUALITY.
@@ -1665,5 +2002,70 @@ mod tests {
         assert_eq!(shell_escape_path(spaced), shell_escape_path_windows(spaced));
         #[cfg(not(windows))]
         assert_eq!(shell_escape_path(spaced), shell_escape_path_posix(spaced));
+    }
+
+    /// The CF_HDROP paste insertion (S9) is the drop_file contract verbatim:
+    /// per-path `shell_escape_path` + ONE trailing space, space-joined for a
+    /// multi-file copy, ending in a space — never a newline, so nothing runs.
+    #[test]
+    fn paths_paste_insertion_matches_the_drop_contract() {
+        let one = vec!["C:\\Users\\me\\a.txt".to_string()];
+        assert_eq!(
+            paths_paste_insertion(&one),
+            format!("{} ", shell_escape_path("C:\\Users\\me\\a.txt"))
+        );
+        // Multi-file: iTerm's `p1 p2 p3 ` shape — each escaped, each with its
+        // own trailing space (so the join IS the separator).
+        let many = vec![
+            "C:\\Program Files\\a.txt".to_string(),
+            "C:\\b (1).png".to_string(),
+        ];
+        let expect = format!(
+            "{} {} ",
+            shell_escape_path("C:\\Program Files\\a.txt"),
+            shell_escape_path("C:\\b (1).png")
+        );
+        assert_eq!(paths_paste_insertion(&many), expect);
+        assert!(expect.ends_with(' ') && !expect.contains('\n'));
+        // Degenerate inputs insert nothing rather than a stray quoted "".
+        assert_eq!(paths_paste_insertion(&[]), "");
+        assert_eq!(paths_paste_insertion(&[String::new()]), "");
+    }
+
+    /// THE I12 DECISION TABLE: Shift bypasses tracking AND alt-scroll — before
+    /// either test, so a shifted wheel can never reach `encode_mouse_wheel`
+    /// (whose SHIFT_MASK fold would leak a shifted report) — while the unshifted
+    /// rows keep the pre-I12 precedence exactly. Pure, so it runs (and pins the
+    /// contract) on every platform, unlike the pipe-backed `#[cfg(unix)]` seam
+    /// byte tests around it.
+    #[test]
+    fn wheel_route_shift_bypasses_tracking_before_every_other_test() {
+        use super::{WheelRoute, wheel_route};
+        // Shift held: the viewport wins over EVERY terminal-mode combination.
+        for tracking in [false, true] {
+            for alt_scroll in [false, true] {
+                assert_eq!(
+                    wheel_route(true, false, tracking, alt_scroll),
+                    WheelRoute::Viewport,
+                    "shift must bypass (tracking={tracking}, alt_scroll={alt_scroll})"
+                );
+            }
+        }
+        // Unshifted: the pre-I12 ladder, unchanged — tracking first, then
+        // DEC-1007 alt-scroll, then the local viewport.
+        assert_eq!(wheel_route(false, false, true, false), WheelRoute::Report);
+        assert_eq!(wheel_route(false, false, true, true), WheelRoute::Report);
+        assert_eq!(wheel_route(false, false, false, true), WheelRoute::AltScroll);
+        assert_eq!(wheel_route(false, false, false, false), WheelRoute::Viewport);
+        // SELECTION CUSTODY Phase 2: Alt on the main screen reaches local
+        // history over a tracking app — and over nothing else, because the
+        // caller only sets `alt_local` off the alt screen, where `alt_scroll`
+        // can never be true at the same time in practice; the table still
+        // answers every combination.
+        assert_eq!(wheel_route(false, true, true, false), WheelRoute::Viewport);
+        assert_eq!(wheel_route(false, true, false, false), WheelRoute::Viewport);
+        assert_eq!(wheel_route(false, true, true, true), WheelRoute::Viewport);
+        // Shift and Alt agree on the destination; either alone suffices.
+        assert_eq!(wheel_route(true, true, true, true), WheelRoute::Viewport);
     }
 }

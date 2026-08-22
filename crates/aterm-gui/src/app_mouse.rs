@@ -58,6 +58,61 @@ pub(crate) fn press_starts_selection(tracking: bool, option_held: bool) -> bool 
     !tracking || option_held
 }
 
+/// What a RIGHT press does at its pre-dispatch point in `on_mouse_input`
+/// (audit I6). Pure so the decision table is unit-pinned; the side-effects
+/// (copy/paste/report) stay in the handler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RightPressPlan {
+    /// The press landed on CHROME (the tab strip band): swallow it entirely —
+    /// no copy, no paste, and crucially NO seam report. Before this arm the
+    /// strip's gates were all Left-only, so a right press on a CHIP fell
+    /// through to the seam and a tracking TUI received a press at whatever
+    /// grid cell the clamp put under the strip — a bogus report for a click
+    /// the user aimed at chrome (the audit's "reported at a bogus cell").
+    Chrome,
+    /// Tracking OFF, a selection exists: copy it to the system clipboard and
+    /// clear it (conhost's QuickEdit half of the convention).
+    Copy,
+    /// Tracking OFF, no selection: paste the clipboard (the WT/conhost other
+    /// half) — via `App::paste_clipboard_into`, NEVER a raw
+    /// `self.input(…Paste…)`: the paste MUST pass `deliver_paste`'s
+    /// pastejacking guard. (The Linux middle-click arm in `on_mouse_input`
+    /// predates the guard and bypasses it — audited as a defect; do not copy
+    /// that shape.)
+    Paste,
+    /// Fall through to the seam untouched: tracking is ON (the app owns the
+    /// button — press/release report exactly as before this gesture existed),
+    /// or the gesture is configured `off`.
+    Seam,
+}
+
+/// Resolve a RIGHT press against the conhost/Windows-Terminal convention
+/// (`right_click = "copy_paste"`): copy-if-selection-else-paste, tracking-OFF
+/// only, never on chrome. THE ORDER IS THE CONTRACT: chrome wins first (the
+/// bogus-cell fix applies even with the gesture `off` — a right press on the
+/// strip is a press on chrome no matter what the grid gesture is configured
+/// to); then a tracking app keeps the button (parity with the pre-gesture
+/// behaviour, and the M6 Option-bypass already covers "select over a tracking
+/// app" for the LEFT button); only then does the copy/paste split apply.
+pub(crate) fn right_press_plan(
+    gesture_on: bool,
+    over_strip: bool,
+    tracking: bool,
+    has_selection: bool,
+) -> RightPressPlan {
+    if over_strip {
+        return RightPressPlan::Chrome;
+    }
+    if !gesture_on || tracking {
+        return RightPressPlan::Seam;
+    }
+    if has_selection {
+        RightPressPlan::Copy
+    } else {
+        RightPressPlan::Paste
+    }
+}
+
 /// How far outside the pet's drawn body (frame px, each side) a click still
 /// counts as petting. A cat is not a checkbox: the target moves, so a few
 /// pixels of grace keeps an honest aim from sliding off a paw mid-walk.
@@ -1483,16 +1538,35 @@ impl App {
         true
     }
 
-    /// `CursorMoved` -> remember the cell under the pointer; mid-drag, grow the
-    /// text selection to that cell (and, when motion tracking is on, report the
-    /// move to the app instead).
-    /// Show the "pointer" cursor while Cmd-hovering a link, else the default. Only
-    /// touches the OS cursor on a state CHANGE (not every mouse move). Updated on
-    /// both pointer motion and Cmd press/release so the affordance tracks the key.
+    /// Resolve the OS cursor for the pointer's CURRENT location. Called on every
+    /// `CursorMoved` (via the `_with` twin, which reuses the motion path's derived
+    /// geometry) AND on every modifier change, so the link hand tracks a bare
+    /// Cmd/Ctrl press. The modifier caller has no pointer event, which is why this
+    /// must resolve BY LOCATION (`last_cursor_px` / `last_mouse_window_cell`): the
+    /// old "link-or-default" swap was location-blind, and that was safe only while
+    /// Default was the answer everywhere else — with the grid I-beam below it
+    /// would paint an I-beam over the tab strip on a bare Ctrl tap.
+    ///
+    /// Resolution order: chrome (strip → the plain arrow) → split divider (the
+    /// axis resize cursor, so the seam finally SAYS it is draggable before a drag
+    /// begins) → link (the pointer hand, modifier held) → the grid itself: an
+    /// I-beam, because the surface's primary gesture is text selection — reverted
+    /// to the arrow while a VT mouse-tracking app owns the pointer (presses are
+    /// REPORTED then, not selecting; the terminal is a control surface, not a
+    /// text one, and the I-beam would promise the wrong gesture).
     pub(crate) fn update_hover_cursor(&mut self, wid: WindowId) {
-        // While a modal overlay is open the pointer is ITS (the About dialog runs its
-        // own link/I-beam cursor): a Cmd press must not resolve a terminal link
-        // hidden UNDER the card and flip the cursor out from under the modal.
+        // Zero-argument wrapper for the cold caller (modifier changes); the
+        // per-motion path threads its already-derived geometry instead, keeping
+        // the one-derivation-per-event rule (`PointerGeometry`'s contract).
+        self.update_hover_cursor_with(wid, self.pointer_geometry(wid));
+    }
+
+    /// [`Self::update_hover_cursor`] against geometry the caller already derived.
+    fn update_hover_cursor_with(&mut self, wid: WindowId, geom: PointerGeometry) {
+        // While a modal overlay is open the pointer is ITS (the About dialog runs
+        // its own link/I-beam cursor, the palette its row hand): a Cmd press must
+        // not resolve a terminal link hidden UNDER the card and flip the cursor
+        // out from under the modal.
         if self
             .windows
             .get(&wid)
@@ -1500,25 +1574,118 @@ impl App {
         {
             return;
         }
+        // A native view owns its cursor through the motion path's native branch
+        // (I-beam over text bodies, hand over controls): a modifier tap must not
+        // stomp what that branch resolved — the old blind swap did exactly that,
+        // clearing `native_text_cursor` on a Ctrl tap over an editor body.
+        if self.active_native_view(wid).is_some() {
+            return;
+        }
+        // A held divider drag owns the resize cursor until release
+        // (`begin_divider_drag` set it, `finish_divider_drag` restores): mid-drag
+        // the pointer routinely leaves the seam, and re-resolving would flicker
+        // the icon against the very gesture it advertises.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.divider_drag.is_some())
+        {
+            return;
+        }
+        let Some((px, py)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
+            return;
+        };
+        // Chrome: over the tab strip the pointer is a button pointer, never an
+        // I-beam (the strip is not selectable text) — the same answer the motion
+        // path's own strip branch gives, repeated here for the pointer-eventless
+        // caller. Same stale-first-event caveat as the pet seam: before the first
+        // `CursorMoved`, `last_cursor_px` is the window origin.
+        if self.strip_col_at_with(wid, geom, px, py).is_some() {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+            return;
+        }
+        // Split dividers (hover half): the 1-cell seam is drawn, but until this
+        // probe nothing SAID it was draggable — the resize cursor appeared only
+        // once `begin_divider_drag` had already armed, i.e. you had to be
+        // dragging to learn you could drag.
+        if let Some(icon) = self.divider_cursor_under_pointer(wid) {
+            self.set_hover_cursor(wid, icon, true, true);
+            return;
+        }
         let mod_held = self
             .windows
             .get(&wid)
             .is_some_and(|ws| link_modifier_held(ws.mods));
-        let over_link = mod_held && self.link_under_pointer(wid).is_some();
+        if mod_held && self.link_under_pointer(wid).is_some() {
+            self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+            return;
+        }
+        // The grid. The tracking probe takes the terminal lock once per resolved
+        // motion — the same cost shape as the wheel seam's per-event read, and
+        // cheaper than the selection paths this event class already funds.
+        let tracking = self
+            .front_terminal(wid)
+            .map(|terminal| terminal.term.clone())
+            .is_some_and(|t| term_lock(&t).mouse_tracking_enabled());
+        if tracking {
+            self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+        } else {
+            self.set_hover_cursor(wid, CursorIcon::Text, false, true);
+        }
+    }
+
+    /// Write one resolved hover-cursor state, touching the OS cursor only on a
+    /// CHANGE. The two existing `WindowState` bools double as the change
+    /// detector, with one borrowed encoding: `(pointer, text) = (true, true)` —
+    /// impossible for the plain states, which are mutually exclusive — means "a
+    /// divider's resize cursor", and always re-issues `set_cursor`, because the
+    /// pair cannot tell Col from Row and a hover sliding across a splits
+    /// junction must not keep the wrong axis. Every existing reset site
+    /// (`finish_divider_drag`, focus loss, the About boundary) clears both
+    /// bools, so the encoding degrades to exactly the old semantics there.
+    fn set_hover_cursor(&mut self, wid: WindowId, icon: CursorIcon, pointer: bool, text: bool) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if over_link != ws.hover_pointer || ws.native_text_cursor {
-            ws.hover_pointer = over_link;
-            ws.native_text_cursor = false;
-            if let Some(w) = &ws.os_window {
-                w.set_cursor(if over_link {
-                    CursorIcon::Pointer
-                } else {
-                    CursorIcon::Default
-                });
-            }
+        let divider = pointer && text;
+        if !divider && ws.hover_pointer == pointer && ws.native_text_cursor == text {
+            return;
         }
+        ws.hover_pointer = pointer;
+        ws.native_text_cursor = text;
+        if let Some(w) = &ws.os_window {
+            w.set_cursor(icon);
+        }
+    }
+
+    /// The resize cursor for the pane divider under the pointer, if any — the
+    /// HOVER half of the divider affordance: the same two probes
+    /// [`Self::begin_divider_drag`] arms with (`pane::PaneTree::divider_at` for
+    /// the terminal projection, the canonical plan's `divider_at` otherwise),
+    /// minus the arming. `DividerHit.dir` exists for exactly this — its own doc
+    /// says "Lets the GUI pick the resize cursor".
+    fn divider_cursor_under_pointer(&self, wid: WindowId) -> Option<CursorIcon> {
+        let ws = self.windows.get(&wid)?;
+        let (wr, wc) = ws.last_mouse_window_cell;
+        if let Some(tree) = self.active_tree(wid) {
+            if tree.len() == 1 {
+                return None;
+            }
+            let hit = tree.divider_at(wr, wc, ws.rows, ws.cols)?;
+            return Some(match hit.dir {
+                pane::SplitDir::Vertical => CursorIcon::ColResize,
+                pane::SplitDir::Horizontal => CursorIcon::RowResize,
+            });
+        }
+        let plan = self.active_visible_leaf_plan(wid)?;
+        let divider = plan.divider_at(crate::tab_model::LogicalPoint {
+            x: f32::from(wc),
+            y: f32::from(wr),
+        })?;
+        Some(match divider.axis {
+            crate::tab_model::SplitAxis::Horizontal => CursorIcon::ColResize,
+            crate::tab_model::SplitAxis::Vertical => CursorIcon::RowResize,
+        })
     }
 
     /// Resolve a native editor source-body hit through the exact compiled node
@@ -1797,7 +1964,7 @@ impl App {
             self.drag_divider(wid);
             return;
         }
-        self.update_hover_cursor(wid);
+        self.update_hover_cursor_with(wid, geom);
         // Which half of the cell the pointer is in: the right half includes
         // the hovered cell, the left half stops before it. Remembered so a
         // shift-click press (which has no pixel position of its own) can
@@ -1898,6 +2065,32 @@ impl App {
         let sel_row = {
             let mut term = term_lock(&term);
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
+            // SELECTION CUSTODY Phase 2: re-derive the gesture ORIGIN from the LIVE
+            // selection each move, instead of trusting `GestureOrigin.row`.
+            //
+            // A word/line drag rebuilds the whole selection from its origin on every
+            // pointer move. `GestureOrigin.row` is a plain `i32` captured in
+            // selection space at press time and stored in `WindowState` — nothing
+            // ever compensates it. The ENGINE's anchors are compensated (`post_process`
+            // runs `adjust_for_scroll` on every parser batch), so as soon as output
+            // scrolls the grid mid-drag the two disagree and each move re-anchors the
+            // selection at a row the origin word no longer occupies.
+            //
+            // This was masked before: the `i32::MAX` damage sentinel usually cleared
+            // the selection out from under the drag first, so the mis-anchor rarely
+            // survived long enough to be seen. Phase 4 removes that sentinel and
+            // selections start surviving output — which would turn a hidden bug into a
+            // live WRONG-COPY path. Fixing it is therefore a prerequisite, not polish.
+            //
+            // `start()` is the origin anchor: every arm below re-anchors with
+            // `start_selection(origin)` and then `update_selection(moving end)`, so the
+            // selection's start IS the origin, and it rides `adjust_for_scroll`. Only
+            // fall back to the captured row when there is no live selection to read
+            // (the first move after a press that the engine has since cleared).
+            let origin_row = match term.text_selection().state() {
+                aterm_core::selection::SelectionState::None => None,
+                _ => Some(term.text_selection().start().row),
+            };
             match fws.gesture {
                 None => {
                     term.text_selection_mut()
@@ -1907,18 +2100,19 @@ impl App {
                 // hovered line. Rebuilt from the origin each move so the
                 // anchor sides stay inclusive in either drag direction.
                 Some(g) if g.kind == SelectionType::Lines => {
+                    let g_row = origin_row.unwrap_or(g.row);
                     let max_col = term.cols().saturating_sub(1);
                     let sel = term.text_selection_mut();
-                    if sel_row < g.row {
+                    if sel_row < g_row {
                         sel.start_selection(
-                            g.row,
+                            g_row,
                             max_col,
                             SelectionSide::Right,
                             SelectionType::Lines,
                         );
                         sel.update_selection(sel_row, 0, SelectionSide::Left);
                     } else {
-                        sel.start_selection(g.row, 0, SelectionSide::Left, SelectionType::Lines);
+                        sel.start_selection(g_row, 0, SelectionSide::Left, SelectionType::Lines);
                         sel.update_selection(sel_row, max_col, SelectionSide::Right);
                     }
                 }
@@ -1926,11 +2120,12 @@ impl App {
                 // (or bare cell on whitespace); the origin word stays fully
                 // selected by anchoring at its far boundary.
                 Some(g) => {
+                    let g_row = origin_row.unwrap_or(g.row);
                     let (ws, we) = control::word_cols(&term, sel_row, col).unwrap_or((col, col));
                     let sel = term.text_selection_mut();
-                    if (sel_row, col) < (g.row, g.start_col) {
+                    if (sel_row, col) < (g_row, g.start_col) {
                         sel.start_selection(
-                            g.row,
+                            g_row,
                             g.end_col,
                             SelectionSide::Right,
                             SelectionType::Semantic,
@@ -1938,7 +2133,7 @@ impl App {
                         sel.update_selection(sel_row, ws, SelectionSide::Left);
                     } else {
                         sel.start_selection(
-                            g.row,
+                            g_row,
                             g.start_col,
                             SelectionSide::Left,
                             SelectionType::Semantic,
@@ -2709,17 +2904,88 @@ impl App {
                 return;
             }
         }
+        // RIGHT-CLICK COPY/PASTE (audit I6 — the conhost/Windows Terminal
+        // convention, `right_click = "copy_paste"`, the Windows default): a
+        // right PRESS over the grid with VT mouse tracking OFF copies the
+        // selection if one exists (and clears it, QuickEdit-style) — else
+        // pastes. Tracking ON leaves the button to the seam so a TUI keeps its
+        // press/release reports exactly as before. The decision table is
+        // [`right_press_plan`]; two shapes here are deliberate:
+        //   * only the PRESS is examined — the release falls through, where a
+        //     REPORTED press's release still reports (pairing preserved) and a
+        //     consumed/chrome press's release dies at the `was_reported` guard
+        //     below (no orphan release, the config-banner pattern);
+        //   * the paste goes through `paste_clipboard_into` -> `deliver_paste`
+        //     (the pastejacking guard + the S9 CF_HDROP file fallback), NEVER
+        //     `self.input(…Paste…)` directly — the middle-click arm above
+        //     bypasses the guard and is audited as a defect, not a precedent.
+        // Cross-platform by config (macOS/Linux default `off` — their hands
+        // expect a context menu / middle-click paste), so no cfg here: the
+        // platform split lives in `RightClickGesture::PLATFORM_DEFAULT`.
+        if pressed && button == WinitMouseButton::Right {
+            let (px, py) = self
+                .windows
+                .get(&wid)
+                .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
+            let over_strip = self.strip_col_at(wid, px, py).is_some();
+            let gesture_on = self.config.right_click_or_default()
+                == crate::app_config::RightClickGesture::CopyPaste;
+            let term = self
+                .front_terminal(wid)
+                .map(|terminal| terminal.term.clone());
+            // One lock window for both facts AND the selection text: deciding
+            // on a cheap "is there a selection" probe and re-extracting later
+            // would materialize the selection twice (multi-ms on a huge
+            // scrollback sweep, see `finish_selection`'s PRIMARY note).
+            let (tracking, selection) = term.as_ref().map_or((false, None), |t| {
+                let tl = term_lock(t);
+                (
+                    tl.mouse_tracking_enabled(),
+                    tl.selection_to_string().filter(|s| !s.is_empty()),
+                )
+            });
+            match right_press_plan(gesture_on, over_strip, tracking, selection.is_some()) {
+                RightPressPlan::Chrome => return,
+                RightPressPlan::Copy => {
+                    if let (Some(text), Some(t)) = (selection, term.as_ref()) {
+                        // Copy, then clear-and-repaint even if the clipboard is
+                        // momentarily held by another process (conhost clears
+                        // its QuickEdit selection unconditionally too): the
+                        // gesture's visible promise is "the selection is taken",
+                        // and leaving a stale highlight would read as a no-op.
+                        let _ = control::pbcopy(&text);
+                        term_lock(t).text_selection_mut().clear();
+                        if let Some(w) =
+                            self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                        {
+                            w.request_redraw();
+                        }
+                    }
+                    return;
+                }
+                RightPressPlan::Paste => {
+                    self.paste_clipboard_into(wid);
+                    return;
+                }
+                // Tracking ON or gesture off: fall through — the seam reports
+                // (or, tracking OFF + `off`, returns TrackingOff whose consumer
+                // is Left-gated: today's inert behaviour, by explicit choice).
+                RightPressPlan::Seam => {}
+            }
+        }
         // DISMISSING ROBI: a left press on the robot's drawn body queues the
         // `robi = false` write and stops HERE (see [`Self::robi_press_at`]
         // for the persist policy and the latch). Chrome-wins like the petting
         // seam below, but ABOVE the tab strip and the find bar: both of those
         // are spliced CELLS, and Robi is stamped `FreeZ::OverText` across the
-        // whole composed frame — spliced strip rows included — so on the
-        // monkey bars he visibly hangs IN FRONT of the chips, and a press on
-        // his head must dismiss him, not switch (or close!) the tab his body
-        // is covering. Still below the modals and the notice card, which
-        // composite over the finished frame at present time — and his own
-        // tip bubble IS that notice card, consumed by `notice_click` above.
+        // whole composed frame — spliced strip rows included. He now HANGS FROM
+        // the strip rather than through it (`app_render`'s `bar_y`), so his body
+        // is over the grid and only his grip touches the band's last pixel row —
+        // but a press there is still a press on him, and it must dismiss him
+        // rather than switch (or close!) the tab underneath. Still below the
+        // modals and the notice card, which composite over the finished frame
+        // at present time — and his own tip bubble IS that notice card,
+        // consumed by `notice_click` above.
         if pressed && button == WinitMouseButton::Left && self.robi_press_at(wid) {
             return;
         }
@@ -3093,10 +3359,6 @@ impl App {
     /// works on the whole screen exactly as on a mouse selection.
     pub(crate) fn select_all(&mut self) {
         // A window-level command (menu Select All): targets the frontmost window.
-        let Some(wid) = self.frontmost_window else {
-            return;
-        };
-        self.snap_to_bottom(wid);
         let Some(ws) = self.front() else { return };
         let Some(terminal) = ws.front_terminal() else {
             return;
@@ -3105,9 +3367,24 @@ impl App {
         let max_col = ws.cols.saturating_sub(1);
         {
             let mut term = term_lock(&terminal.term);
+            // SELECTION CUSTODY Phase 2: no snap-to-bottom first.
+            //
+            // This used to jump the viewport to live "so 0..rows are stable
+            // selection coordinates", and then select those rows — which meant
+            // ⌘-A while reading history selected the screen the user had just been
+            // moved AWAY from, and silently destroyed their place to do it. Select
+            // All should select what you are looking at.
+            //
+            // The coordinates are made stable the honest way instead: read the live
+            // `display_offset` inside the lock this function already takes and map
+            // the visible rows through it, exactly as the mouse path does
+            // (`sel_row = row - display_offset`). Visible rows `0..=last` are
+            // selection rows `-off..=last-off`; negative rows are scrollback, which
+            // is precisely where the user is reading.
+            let off = term.grid().display_offset() as i32;
             let sel = term.text_selection_mut();
-            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Lines);
-            sel.update_selection(last, max_col, SelectionSide::Right);
+            sel.start_selection(-off, 0, SelectionSide::Left, SelectionType::Lines);
+            sel.update_selection(last - off, max_col, SelectionSide::Right);
             sel.expand_lines(max_col);
             sel.complete_selection();
         }
@@ -3501,8 +3778,21 @@ mod tests {
         settings.search_input = TextInputState::new("foreground".to_string());
         settings.set_search("foreground".to_string());
         // A short compact search gives its contextual live preview the first
-        // bounded slice and the matching native field the next one.
-        settings.page_scroll = 1;
+        // bounded slice and the matching native field the next one — at the 12 px
+        // `FONT_PX` of the macOS/Linux arm. On Windows `FONT_PX` is 16 (the
+        // logical-unit split documented at the constant: a Windows logical px is
+        // 1/96 in, so 16 is the same 12 pt that 12 is on macOS), which makes the
+        // headless window ~1/3 taller in device px, and the compact page then fits
+        // the preview AND the field in ONE bounded slice — the field is on slice 0
+        // and slice 1 paints nothing. Staging only: the properties under test
+        // (leading-pad caret, swatch-edge caret, pad→swatch drag selection) are
+        // asserted identically on both, and the slice the field lands on is a
+        // function of viewport height, not of the behaviour being pinned.
+        #[cfg(not(windows))]
+        let field_slice = 1;
+        #[cfg(windows)]
+        let field_slice = 0;
+        settings.page_scroll = field_slice;
         settings
             .legacy
             .fields
@@ -3744,7 +4034,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pointer.txt");
         std::fs::write(&path, "alpha βeta\nsecond\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy());
+        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
+        // letter + backslashes after the authority slot), so these tests never ran
+        // there. Build the URI the way the shipping path does.
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
         app.open_document_tab(AppKind::Editor, &uri).unwrap();
         let (_, editor_view) = app.active_native_view(wid).expect("Editor active");
         let compiled = presented_native_ui(&mut app, wid);
@@ -4029,7 +4322,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("pointer.md");
         std::fs::write(&path, "alpha\nβeta\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy());
+        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
+        // letter + backslashes after the authority slot), so these tests never ran
+        // there. Build the URI the way the shipping path does.
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -4190,7 +4486,10 @@ mod tests {
         let path = dir.join("pointer.md");
         let source = "# **Heading**\n\nBody [link](https://example.com).\n";
         std::fs::write(&path, source).unwrap();
-        let uri = format!("file://{}", path.to_string_lossy());
+        // A hand-rolled `format!("file://{}")` URI is MALFORMED on Windows (drive
+        // letter + backslashes after the authority slot), so these tests never ran
+        // there. Build the URI the way the shipping path does.
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         app.open_document_tab(AppKind::Markdown, &uri).unwrap();
@@ -4533,6 +4832,58 @@ mod tests {
         );
         assert_eq!(press_selection_kind(false, false), SelectionType::Simple);
         assert_eq!(press_selection_kind(false, true), SelectionType::Simple);
+    }
+
+    /// Audit I6 — THE RIGHT-CLICK DECISION TABLE (the conhost/WT convention):
+    /// chrome swallows first (even with the gesture off — the bogus-cell fix is
+    /// unconditional), a tracking app keeps the button, and only then does
+    /// copy-if-selection-else-paste split. All 16 rows, so the precedence can
+    /// never silently reorder.
+    #[test]
+    fn right_press_plan_matches_the_windows_convention() {
+        use super::{RightPressPlan, right_press_plan};
+        for gesture_on in [false, true] {
+            for has_selection in [false, true] {
+                for tracking in [false, true] {
+                    // Chrome (the strip band) wins over EVERYTHING: no paste on
+                    // a chip, and no report at the clamped cell under the band.
+                    assert_eq!(
+                        right_press_plan(gesture_on, true, tracking, has_selection),
+                        RightPressPlan::Chrome,
+                        "chrome must swallow (gesture_on={gesture_on}, tracking={tracking})"
+                    );
+                }
+                // Tracking ON over the grid: the app owns the button — the press
+                // reports exactly as it did before the gesture existed,
+                // selection or not, config on or off.
+                assert_eq!(
+                    right_press_plan(gesture_on, false, true, has_selection),
+                    RightPressPlan::Seam,
+                    "tracking keeps the button (gesture_on={gesture_on})"
+                );
+            }
+        }
+        // The gesture itself, tracking OFF over the grid.
+        assert_eq!(
+            right_press_plan(true, false, false, true),
+            RightPressPlan::Copy,
+            "selection exists: copy (and clear) it"
+        );
+        assert_eq!(
+            right_press_plan(true, false, false, false),
+            RightPressPlan::Paste,
+            "no selection: paste"
+        );
+        // `right_click = "off"`: the seam keeps the press — today's inert
+        // tracking-OFF behaviour, by explicit config choice.
+        assert_eq!(
+            right_press_plan(false, false, false, true),
+            RightPressPlan::Seam
+        );
+        assert_eq!(
+            right_press_plan(false, false, false, false),
+            RightPressPlan::Seam
+        );
     }
 
     /// W1 regression (kill the compositor stretch): the pointer geometry mirrors
@@ -5030,5 +5381,91 @@ mod tests {
         );
         assert!(!ws.selecting, "and no selection started");
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// I10/I11: the hover cursor resolves BY LOCATION. Over plain grid cells the
+    /// window advertises the I-BEAM state (`native_text_cursor`, the surface's
+    /// primary gesture being text selection); while a VT mouse-tracking app owns
+    /// the pointer it reverts to the arrow (both bools clear — presses are
+    /// REPORTED then, not selecting); over a split divider it advertises the
+    /// RESIZE state (the borrowed `(pointer, text) = (true, true)` encoding); and
+    /// the modifier-change caller has no pointer event, so a bare Ctrl tap with
+    /// the pointer parked over the TAB STRIP must paint no I-beam. Headless
+    /// windows have no OS cursor, so the assertions read the two `WindowState`
+    /// bools the `set_cursor` write is keyed from.
+    #[test]
+    fn hover_cursor_resolves_grid_tracking_divider_and_strip_by_location() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let strip_px = app.tab_strip_rows as f64 * ch as f64;
+        // A fixture point WELL inside the grid: below any strip band, ~10 cols in.
+        let grid = (pad + cw as f64 * 10.5, pad + strip_px + ch as f64 * 5.5);
+        assert!(
+            app.strip_col_at(wid, grid.0, grid.1).is_none(),
+            "fixture point must be off the strip"
+        );
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.last_cursor_px = grid;
+            ws.last_mouse_window_cell = (5, 10);
+        }
+
+        // Plain grid, tracking off: the I-beam state.
+        app.update_hover_cursor(wid);
+        let state = |app: &crate::App| {
+            let ws = &app.windows[&wid];
+            (ws.hover_pointer, ws.native_text_cursor)
+        };
+        assert_eq!(state(&app), (false, true), "grid = I-beam");
+
+        // A VT mouse-tracking app owns the pointer: revert to the arrow.
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        crate::term_lock(&term).process(b"\x1b[?1000h");
+        app.update_hover_cursor(wid);
+        assert_eq!(state(&app), (false, false), "tracking = arrow");
+        crate::term_lock(&term).process(b"\x1b[?1000l");
+        app.update_hover_cursor(wid);
+        assert_eq!(state(&app), (false, true), "tracking off = I-beam again");
+
+        // Split 1|2 (divider at window col 40): hovering the seam advertises the
+        // resize cursor BEFORE any drag — the whole point of I11.
+        let _sid = app.split_active_stub_tab(wid);
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.last_mouse_window_cell = (5, 40);
+        }
+        app.update_hover_cursor(wid);
+        assert_eq!(state(&app), (true, true), "divider = resize encoding");
+        // Back off the seam: the grid I-beam returns.
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.last_mouse_window_cell = (5, 10);
+        }
+        app.update_hover_cursor(wid);
+        assert_eq!(state(&app), (false, true), "off the seam = I-beam");
+
+        // THE TRAP the audit named: `on_modifiers_changed` calls the resolver
+        // with no pointer event. With the pointer parked over the tab strip, a
+        // bare Ctrl tap must resolve the STRIP (arrow), not paint an I-beam over
+        // chrome. `headless_for_test` seeds `tab_strip_rows: 0` (the macOS
+        // default), so enable the one-row strip the Windows/Linux default ships.
+        {
+            app.tab_strip_rows = 1;
+            let strip_px = ch as f64;
+            let strip_pt = (pad + cw as f64 * 2.5, pad + strip_px * 0.5);
+            assert!(
+                app.strip_col_at(wid, strip_pt.0, strip_pt.1).is_some(),
+                "fixture point must be ON the strip"
+            );
+            if let Some(ws) = app.windows.get_mut(&wid) {
+                ws.last_cursor_px = strip_pt;
+            }
+            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::CONTROL);
+            assert_eq!(
+                state(&app),
+                (false, false),
+                "a Ctrl tap over the strip paints chrome's arrow, not an I-beam"
+            );
+            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
+        }
     }
 }

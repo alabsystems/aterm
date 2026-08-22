@@ -12,6 +12,22 @@
 //! name that actually describes them. Reached through the stable
 //! `crate::control::NAME` path.
 
+// Test-only clipboard STUB for `pbpaste` (and its Linux `pbpaste_owned`
+// twin): a test sets it to make "the clipboard says X" deterministic without
+// touching the REAL system clipboard — which is machine-global state, so a
+// genuine write would clobber the developer's own copy buffer and race every
+// concurrently running clipboard test. Thread-local, not static, because
+// libtest runs tests on separate threads and the paste paths under test
+// (`search_paste_in`'s non-Linux arm, `pbpaste_owned` on Linux) read the
+// clipboard SYNCHRONOUSLY on the calling thread — the override is visible to
+// exactly the test that set it. Compiled out of every shipping binary.
+// (A plain comment: rustc discards doc comments on macro invocations.)
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PBPASTE_STUB: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Place `text` on the system CLIPBOARD. macOS writes the general `NSPasteboard`
 /// IN-PROCESS (a subprocess `pbcopy` would cost a fork/exec + wait — tens of ms —
 /// on every Cmd-C / copy-on-select on the winit event-loop thread); Linux/X11
@@ -71,6 +87,10 @@ pub(crate) fn pbcopy(text: &str) -> bool {
 /// shortcut and the menu Paste. An empty pasteboard string maps to `None` so no
 /// Paste event fires on an empty clipboard.
 pub(crate) fn pbpaste() -> Option<String> {
+    #[cfg(test)]
+    if let Some(stub) = PBPASTE_STUB.with(|s| s.borrow().clone()) {
+        return (!stub.is_empty()).then_some(stub);
+    }
     #[cfg(target_os = "macos")]
     {
         use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
@@ -106,6 +126,12 @@ pub(crate) fn pbpaste() -> Option<String> {
 /// [`pbpaste`] directly and never need this fast-path (an unused import off Linux).
 #[cfg(target_os = "linux")]
 pub(crate) fn pbpaste_owned() -> Option<String> {
+    // The same test stub as `pbpaste`: it must answer HERE too, or a Linux test
+    // run would fall to the foreign-owner worker thread and lose the override.
+    #[cfg(test)]
+    if let Some(stub) = PBPASTE_STUB.with(|s| s.borrow().clone()) {
+        return (!stub.is_empty()).then_some(stub);
+    }
     crate::clipboard_x11::X11Clipboard::get_handle()
         .and_then(|c| c.get_owned(crate::clipboard_x11::Sel::Clipboard))
 }

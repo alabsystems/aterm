@@ -672,7 +672,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("draft.md");
         std::fs::write(&path, "draft\n").unwrap();
-        let uri = format!("file://{}", path.to_string_lossy().replace(' ', "%20"));
+        // The shipping encoder, not a hand-rolled `format!` — the latter is
+        // malformed on Windows (drive letter + backslashes after the authority
+        // slot), so this test could not even open its document there.
+        let uri = crate::native_document_host::path_to_file_uri(&path).unwrap();
 
         let mut app = App::headless_for_test();
         app.open_document_tab(crate::native_app::AppKind::Editor, &uri)

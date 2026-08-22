@@ -3181,6 +3181,13 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
     if key == prefs::EDIT_ALLOW_NOTIFICATIONS && !crate::notify::delivery_available() {
         return None;
     }
+    // Secure Keyboard Entry actuates only on macOS (Carbon secure input);
+    // elsewhere the saved value is preserved but no ordinary switch claims it
+    // works — the FONT_THICKEN pattern, checked BEFORE the security
+    // short-circuit below would claim it unconditionally.
+    if key == prefs::EDIT_SECURE_KEYBOARD_ENTRY {
+        return cfg!(target_os = "macos").then_some(Effect::SecurityPolicy);
+    }
     if prefs::SECURITY_BOOL_KEYS.contains(&key) {
         return Some(Effect::SecurityPolicy);
     }
@@ -3756,6 +3763,7 @@ fn raw_bool_value(config: &Config, key: &str) -> Option<bool> {
         "allow_notifications" => config.allow_notifications,
         "allow_palette_reconfigure" => config.allow_palette_reconfigure,
         "allow_kitty_file_transfer" => config.allow_kitty_file_transfer,
+        "secure_keyboard_entry" => config.secure_keyboard_entry,
         _ => None,
     }
 }
@@ -6375,9 +6383,14 @@ fn page(
             SettingsRoute::Modified => settings_fields_page(state, true, cx, width),
             SettingsRoute::TabColor => tab_color_page(state, width),
             SettingsRoute::Wallpaper => wallpaper_page(state, width),
-            SettingsRoute::SoftwareUpdate => {
-                update_page(state, update, width, cx.viewport.width, cx.viewport.height)
-            }
+            SettingsRoute::SoftwareUpdate => update_page(
+                state,
+                update,
+                SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
+                width,
+                cx.viewport.width,
+                cx.viewport.height,
+            ),
             SettingsRoute::Packages => packages_page(
                 state,
                 packages,
@@ -11241,6 +11254,11 @@ fn platform_unavailability(
             "Windows only · No effect here",
             "Windows only; no effect on this platform",
         )),
+        prefs::EDIT_SECURE_KEYBOARD_ENTRY if !availability.macos => Some(unavailable(
+            "Secure Keyboard Entry is a macOS mechanism (Carbon secure input); Wayland is secure by default and X11 cannot be secured. The saved value is preserved for portability",
+            "Unavailable · macOS only",
+            "Unavailable on this platform; saved for portability",
+        )),
         prefs::EDIT_FONT_THICKEN if !availability.macos => Some(unavailable(
             "CoreText font thickening is implemented only on macOS. This saved value has no effect on the current platform",
             "macOS only · No effect here",
@@ -14381,7 +14399,7 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         // NEVER "is the latest build" on the same page whose headline says this Mac
         // cannot update: with nothing staged this branch was unconditional, so the
         // card contradicted the card above it every time (2026-08-19 round-5 audit).
-        "Release notes appear here once a newer build is staged. This Mac is not \
+        "Release notes appear here once a newer build is staged. This machine is not \
          completing update checks — the cause is above."
             .to_string()
     } else if !update.installable {
@@ -14627,9 +14645,39 @@ fn update_outcome_line(update: &UpdateProjection) -> Option<String> {
     ))
 }
 
+/// The one platform-true sentence for a build whose in-app updater lane does
+/// not exist: how updates ACTUALLY arrive here. Windows gets the concrete lane
+/// (the package/installer scripts under `apps/aterm-win` — reinstalling the
+/// newer build over this copy IS the update); the remaining platforms get the
+/// package-manager phrasing. Shown as the status card's detail line under the
+/// "macOS-only" headline, so the pair reads as one honest statement. ONE LINE
+/// by contract: the detail slot is a single fixed-height row (its siblings are
+/// ~50 characters — "Update checks are unavailable for this installation."),
+/// and the overflow audit measures it at every width down to the Medium
+/// workbench, where the card's text measure is ~320pt.
+fn platform_update_lane_sentence(availability: SettingsAvailability) -> &'static str {
+    if availability.windows {
+        "Reinstall from the Windows package lane to update."
+    } else {
+        "Reinstall through your package manager to update."
+    }
+}
+
 /// What the automatic-updates card explains, beyond the switch's own label.
-fn update_automatic_caption(width: SettingsWidth) -> String {
-    if width == SettingsWidth::Compact {
+/// `macos_updater` is [`SettingsAvailability::macos`]: with the in-app updater
+/// lane absent, the caption must not describe the switch as doing anything —
+/// this is the SAME honest copy `setting_effect_projection` authors for
+/// `update.auto_apply` ("macOS updater only · No effect here"), which the
+/// page's direct visual labels otherwise strip.
+fn update_automatic_caption(width: SettingsWidth, macos_updater: bool) -> String {
+    if !macos_updater {
+        if width == SettingsWidth::Compact {
+            "macOS updater only \u{b7} no effect here."
+        } else {
+            "This switch drives the macOS in-app updater only \u{2014} it has no effect on \
+             this platform. The saved value is kept for portability."
+        }
+    } else if width == SettingsWidth::Compact {
         "aterm installs new builds itself and keeps your sessions."
     } else {
         "aterm installs new builds on its own and hands your live sessions to the new one. \
@@ -14645,6 +14693,7 @@ fn update_automatic_caption(width: SettingsWidth) -> String {
 /// for free, and cannot drift from the value the updater actually reads.
 fn update_automatic_card(
     state: &SettingsViewState,
+    availability: SettingsAvailability,
     width: SettingsWidth,
     text_width: f32,
     height_budget: Option<f32>,
@@ -14668,11 +14717,35 @@ fn update_automatic_card(
         }
         .to_string();
     }
+    // A LANE THAT DOES NOT EXIST CANNOT LOOK OPERABLE. Off macOS the in-app
+    // updater never runs (`aterm_update::enabled()` is macOS-only), so the
+    // switch is DISABLED — not hidden: the config leaf is real, portable, and
+    // the greyed control plus its caption say exactly why it does nothing here.
+    // Hiding it would make the page shape diverge per platform and turn "where
+    // did my setting go" into a support question; a live switch was worse — it
+    // flipped a value nothing reads and looked like a working feature (the
+    // 2026-08 Windows audit's L4). The row's semantic label already carries the
+    // registry's "In-app updater unavailable off macOS; saved for portability"
+    // disclosure, so assistive tech hears the same truth the caption paints.
+    if !availability.macos {
+        // Desktop rows hold the switch directly at children[1]; compact rows
+        // wrap it in a controls group (spacer first, switch LAST). Rather than
+        // mirror that layout knowledge here, find the row's one Switch.
+        fn disable_switch(node: &mut UiNode) -> bool {
+            if let UiContent::Switch(switch) = &mut node.content {
+                switch.state.enabled = false;
+                return true;
+            }
+            node.children.iter_mut().any(disable_switch)
+        }
+        let disabled = disable_switch(&mut row);
+        debug_assert!(disabled, "the auto_apply row carries exactly one switch");
+    }
     let text_scale = settings_text_scale();
     let caption_line_height = 24.0_f32.max(20.0 * text_scale);
     let row_height = width.row_height();
     let mut caption = wrap_native_lines(
-        std::slice::from_ref(&update_automatic_caption(width)),
+        std::slice::from_ref(&update_automatic_caption(width, availability.macos)),
         text_width,
         13.0 * crate::native_appearance::text_scale(),
     );
@@ -14695,7 +14768,7 @@ fn update_automatic_card(
             UiNode::new(
                 "updates/automatic/caption",
                 UiContent::Group(GroupSpec {
-                    label: Some(update_automatic_caption(width)),
+                    label: Some(update_automatic_caption(width, availability.macos)),
                     role: SemanticRole::Text,
                     style: StyleRef::Quiet,
                 }),
@@ -14750,10 +14823,44 @@ fn update_automatic_card(
 fn update_page(
     state: &SettingsViewState,
     update: &UpdateProjection,
+    availability: SettingsAvailability,
     width: SettingsWidth,
     viewport_width: f32,
     viewport_height: f32,
 ) -> Vec<UiNode> {
+    // PLATFORM TRUTH (Windows/Linux audit, 2026-08): `aterm_update::enabled()`
+    // is macOS-only, so off macOS this page's `!enabled` arm used to headline
+    // "Automatic updates are off." over a live-looking switch — describing a
+    // lane that does not exist here as if it were merely switched off. The
+    // honest disclosure already exists (`setting_effect_projection`'s
+    // "macOS updater only · No effect here" — it reaches Settings ▸ Terminal
+    // and assistive tech), but this page's direct-label retitles strip it. So
+    // the page itself owns the sentence: rewrite the headline/detail with the
+    // platform-true copy and let the subtitle/caption/switch gates below match.
+    // Gated on `!update.enabled` as well as the platform so the projection
+    // fixtures the layout tests drive (which fake `enabled: true` to exercise
+    // the staged/checking arms) keep their shapes; on a real off-macOS build
+    // `enabled` is always false. NOT done in `UpdateState::headline()` — that
+    // model is shared with macOS surfaces and must stay byte-identical there.
+    let honest;
+    let update = if availability.macos || update.enabled {
+        update
+    } else {
+        honest = UpdateProjection {
+            // Hero-sized and one line: the Medium workbench gives the headline
+            // ~320pt, which "Automatic updates are off." (26 chars) fit and a
+            // 33-char sentence did not. The "macOS-only" half of the statement
+            // rides in the page subtitle and the switch caption instead.
+            headline: "No in-app updater here.".to_string(),
+            // The platform sentence REPLACES any authored detail: with the
+            // updater lane absent, every macOS-shaped detail ("Move aterm.app
+            // to your Applications folder…") is a worse lie than the vague
+            // line it decorates.
+            detail: Some(platform_update_lane_sentence(availability).to_string()),
+            ..update.clone()
+        };
+        &honest
+    };
     let text_scale = settings_text_scale();
     let compact = width == SettingsWidth::Compact;
     let compact_large_type = compact && text_scale > 1.25;
@@ -14822,6 +14929,7 @@ fn update_page(
     );
     let automatic = update_automatic_card(
         state,
+        availability,
         width,
         automatic_text_width,
         compact.then_some(compact_section_height),
@@ -15017,7 +15125,7 @@ fn update_page(
         state.record_result_page_limit(total.saturating_sub(1));
         let section = state.page_scroll.min(total.saturating_sub(1));
         let section_node = sections.swap_remove(section);
-        let mut out = page_heading("Software Update", update_page_subtitle(width));
+        let mut out = page_heading("Software Update", update_page_subtitle(width, availability.macos));
         out.extend([
             page_navigation_node_pages(
                 "updates/pagination",
@@ -15033,7 +15141,7 @@ fn update_page(
     }
 
     state.record_result_page_limit(0);
-    let mut out = page_heading("Software Update", update_page_subtitle(width));
+    let mut out = page_heading("Software Update", update_page_subtitle(width, availability.macos));
     out.extend(sections);
     out
 }
@@ -15923,8 +16031,18 @@ fn is_subsequence(needle: &str, haystack: &str) -> bool {
     wanted.is_none()
 }
 
-fn update_page_subtitle(width: SettingsWidth) -> &'static str {
-    if width == SettingsWidth::Compact {
+/// `macos_updater` is [`SettingsAvailability::macos`]: off macOS the page must
+/// not invite "update now / leave automatic updates on" — neither verb exists
+/// there (the 2026-08 Windows audit's L4). The platform-true subtitle names how
+/// updates actually arrive instead.
+fn update_page_subtitle(width: SettingsWidth, macos_updater: bool) -> &'static str {
+    if !macos_updater {
+        if width == SettingsWidth::Compact {
+            "Updates arrive by reinstalling."
+        } else {
+            "Updates arrive by reinstalling; the in-app updater is macOS-only."
+        }
+    } else if width == SettingsWidth::Compact {
         "Update now, or let aterm do it."
     } else {
         "Update to the latest build now, or leave automatic updates on."
@@ -20538,7 +20656,8 @@ mod tests {
                 false,
             ),
             settings_fields_subtitle(SettingsRoute::Modified, SettingsWidth::Compact, false, true),
-            update_page_subtitle(SettingsWidth::Compact),
+            update_page_subtitle(SettingsWidth::Compact, true),
+            update_page_subtitle(SettingsWidth::Compact, false),
             packages_page_subtitle(SettingsWidth::Compact),
         ]);
         for copy in copies {
@@ -20563,7 +20682,8 @@ mod tests {
                 false,
             ),
             settings_fields_subtitle(SettingsRoute::Modified, SettingsWidth::Medium, false, true),
-            update_page_subtitle(SettingsWidth::Medium),
+            update_page_subtitle(SettingsWidth::Medium, true),
+            update_page_subtitle(SettingsWidth::Medium, false),
             packages_page_subtitle(SettingsWidth::Medium),
         ]);
         for copy in medium_copies {
@@ -21887,6 +22007,99 @@ mod tests {
             .find(|hit| hit.key.as_str() == "about/pagination/previous")
             .expect("second About section exports semantic Previous");
         assert_eq!(previous.action.as_str(), "settings/page-up");
+    }
+
+    /// L4 (2026-08 Windows audit): off macOS the in-app updater lane does not
+    /// exist, so the page must not headline "Automatic updates are off." over a
+    /// live switch. `enabled == false` — the only value a real off-macOS build
+    /// ever projects — flips the page to the platform-true copy and DISABLES,
+    /// never hides, the switch. Not asserted on macOS, whose copy is unchanged.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn off_macos_update_page_names_the_real_lane_and_disables_the_switch() {
+        let mut status = update_status(false);
+        status.enabled = false;
+        let (mut runtime, instance, view) =
+            setup_with_update(UpdateState::from_status(1, "0.1.0", Some(&status), false));
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::SoftwareUpdate),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        for (variant, cx) in [
+            ("wide", view_cx_at(1_200.0, 820.0)),
+            // The genuine Medium workbench — the narrowest status card, where
+            // the one-line detail has ~320pt to fit in.
+            ("medium", view_cx_at(849.0, 513.0)),
+            ("compact", view_cx_at(600.0, 820.0)),
+        ] {
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            let headline = compiled
+                .semantic(&UiKey::new("updates/headline"))
+                .unwrap_or_else(|| panic!("{variant}: the status headline is on the first page"));
+            assert_eq!(
+                headline.label, "No in-app updater here.",
+                "{variant}: the headline names the platform truth"
+            );
+            let switch = compiled
+                .semantic(&UiKey::new("settings/control/update.auto_apply"))
+                .unwrap_or_else(|| panic!("{variant}: the switch stays on the page"));
+            assert!(
+                !switch.state.expect("a control carries state").enabled,
+                "{variant}: the switch is disabled, not hidden"
+            );
+            if let Some(subtitle) =
+                compiled.semantic(&UiKey::new("settings/page-subtitle/software-update"))
+            {
+                assert!(
+                    subtitle.label.contains("reinstalling"),
+                    "{variant}: the subtitle names the real lane: {:?}",
+                    subtitle.label
+                );
+            }
+            if variant == "wide" {
+                let detail = compiled
+                    .semantic(&UiKey::new("updates/detail"))
+                    .expect("the detail line is on the desktop page");
+                assert!(
+                    detail.label.to_lowercase().contains("reinstall"),
+                    "the detail names the real lane: {:?}",
+                    detail.label
+                );
+                let caption = compiled
+                    .semantic(&UiKey::new("updates/automatic/caption"))
+                    .expect("the desktop card keeps its caption");
+                assert!(
+                    caption.label.contains("macOS in-app updater only"),
+                    "the caption says why the switch is inert: {:?}",
+                    caption.label
+                );
+            }
+            // The page's own copy must fit its slots at every width. The
+            // Medium workbench is audited for the `updates/` nodes only: the
+            // retitled "Automatic updates" row label overflows its 0.38-fraction
+            // column there on every platform and predates this page's copy —
+            // a separate fix, not one this honesty pass should hide behind.
+            let overflowing = compiled
+                .paint_audit_lines()
+                .into_iter()
+                .filter(|line| line.contains("overflow=true") || line.contains("clip-truncated=true"))
+                .filter(|line| line.contains("paint-text key=\"updates/"))
+                .collect::<Vec<_>>();
+            assert!(
+                overflowing.is_empty(),
+                "{variant}: off-macOS Update copy overflows its slot:\n{}",
+                overflowing.join("\n")
+            );
+            if variant != "medium" {
+                assert_zero_top_paint(&compiled, &format!("{variant} off-macOS Update page"));
+            }
+        }
     }
 
     #[test]
@@ -29788,7 +30001,11 @@ enabled = true
         assert!(settings_field_is_visible(SPARKLE_WORDS_KEY, true, false));
         assert!(!settings_field_is_visible(prefs::EDIT_THEME, false, false));
         assert!(settings_field_is_visible(prefs::EDIT_THEME, true, false));
-        for macos_only in [prefs::EDIT_FONT_THICKEN, prefs::EDIT_BACKGROUND_OPACITY] {
+        for macos_only in [
+            prefs::EDIT_FONT_THICKEN,
+            prefs::EDIT_BACKGROUND_OPACITY,
+            prefs::EDIT_SECURE_KEYBOARD_ENTRY,
+        ] {
             assert_eq!(
                 settings_field_is_visible(macos_only, false, false),
                 cfg!(target_os = "macos"),
@@ -29926,7 +30143,7 @@ enabled = true
         assert_eq!(
             ordinary_count,
             if cfg!(target_os = "macos") {
-                53
+                54
             } else if cfg!(windows) {
                 51
             } else {
@@ -30658,6 +30875,11 @@ enabled = true
         // allow_osc52_query is a LIVE policy now (the GUI answers authorized
         // queries), so it must NOT read as unavailable anywhere.
         assert!(!unavailable(prefs::EDIT_ALLOW_OSC52_QUERY));
+        assert_eq!(
+            !unavailable(prefs::EDIT_SECURE_KEYBOARD_ENTRY),
+            cfg!(target_os = "macos"),
+            "Secure Keyboard Entry actuates on macOS only"
+        );
         assert_eq!(
             !unavailable(prefs::EDIT_ALLOW_NOTIFICATIONS),
             crate::notify::delivery_available()

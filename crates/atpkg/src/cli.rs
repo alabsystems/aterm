@@ -54,6 +54,103 @@ const VERBS: &[&str] = &[
     "relocate",
 ];
 
+/// The advertised roster, grouped the way a person meets it. PRESENTATION ONLY:
+/// dispatch order stays [`VERBS`] (pinned by [`tests::verb_hint_matches_dispatch`]);
+/// these tiers are pinned as an EXACT partition of it by
+/// [`tests::verb_tiers_partition_the_roster`], so a verb added to dispatch without
+/// a tier fails loudly instead of silently vanishing from every human surface —
+/// the drift that killed `sync` and `seed`.
+///
+/// Three tiers, because that is the question a first hour actually has: what do I
+/// type today (daily), what do I type when something needs undoing or holding
+/// (occasional), and what exists but is not for me yet (plumbing). A flat 21-name
+/// comma list buried `install` between `verify-pkg` and `seed`, which is how a new
+/// user ends up reading the whole roster to find the one verb the docs call "the
+/// usual first command".
+const VERB_TIERS: &[(&str, &[&str])] = &[
+    (
+        "daily",
+        &["install", "list", "update", "doctor", "status", "which", "run"],
+    ),
+    (
+        "occasional",
+        &["uninstall", "rollback", "pin", "unpin", "verify", "gc"],
+    ),
+    (
+        "plumbing",
+        &[
+            "seed",
+            "link",
+            "unlink",
+            "refresh",
+            "tree-root",
+            "verify-index",
+            "verify-pkg",
+            "relocate",
+        ],
+    ),
+];
+
+/// The tier block, rendered — ONE function so bare `atpkg`, `--help`, and the
+/// unknown-verb error can never fork the roster the way the old two hand-written
+/// copies (bare vs `--help`) already had.
+///
+/// `status` is real in [`VERB_TIERS`] (the partition test needs every dispatched
+/// verb placed) but renders attached to `doctor` as `doctor (or: status)`: the two
+/// are one report, and listing them as siblings would imply a difference for the
+/// reader to go hunting for.
+fn verb_tier_lines() -> Vec<String> {
+    VERB_TIERS
+        .iter()
+        .map(|(tier, verbs)| {
+            let shown: Vec<&str> = verbs
+                .iter()
+                .filter(|v| **v != "status")
+                .map(|v| if *v == "doctor" { "doctor (or: status)" } else { *v })
+                .collect();
+            format!("atpkg:   {tier:<12} {}", shown.join(", "))
+        })
+        .collect()
+}
+
+/// Print [`verb_tier_lines`] to `out` — the one shared renderer (stdout for the
+/// posture/help surfaces, stderr beside the unknown-verb error).
+fn print_verb_tiers(out: &mut impl std::io::Write) {
+    for line in verb_tier_lines() {
+        let _ = writeln!(out, "{line}");
+    }
+}
+
+/// The advertised verb closest to `input` (Levenshtein distance ≤ 2), or `None` when
+/// nothing is close enough to suggest — a far-fetched guess ("frobnicate → refresh"?)
+/// erodes trust in the near ones. Ties resolve to the first in [`VERBS`] order.
+fn did_you_mean(input: &str) -> Option<&'static str> {
+    let mut best: Option<(usize, &'static str)> = None;
+    for verb in VERBS {
+        let d = levenshtein(input, verb);
+        if best.is_none_or(|(b, _)| d < b) {
+            best = Some((d, verb));
+        }
+    }
+    best.filter(|(d, _)| *d <= 2).map(|(_, v)| v)
+}
+
+/// Plain O(len_a * len_b) edit distance over chars — the roster is 21 short names,
+/// so clarity beats cleverness here.
+fn levenshtein(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut row = vec![i + 1];
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            row.push((prev[j] + cost).min(prev[j + 1] + 1).min(row[j] + 1));
+        }
+        prev = row;
+    }
+    prev[b_chars.len()]
+}
+
 /// The whole package-manager CLI as a callable: `argv[1..]` in, exit code
 /// out. Served in-process by the ONE `aterm` binary (`aterm pkg …` / the
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
@@ -99,7 +196,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             return cmd_help();
         }
         eprintln!("atpkg {v}: {operand:?} is not a program name — it is a flag");
-        eprintln!("atpkg:   `atpkg {v} --help` shows what {v} accepts");
+        eprintln!("atpkg:   `aterm pkg {v} --help` shows what {v} accepts");
         return ExitCode::from(2);
     }
     let _store_lock = if verb.is_some_and(verb_mutates_store) {
@@ -114,10 +211,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         // `status` is the name people reach for first — it is what every other package
         // manager calls this — and it answered "unknown verb" while `doctor` sat two lines
         // away. An alias costs nothing and removes a guess from the first minute of use.
-        Some("doctor") => return doctor(),
-        Some("status") => return doctor(),
+        Some("doctor") => return doctor("doctor"),
+        // Same report, and the report SIGNS ITSELF with the verb the user typed: every
+        // line answered "doctor:" regardless, so a `status` user could not tell which
+        // verb they had run and a script keying on the prefix keyed on the wrong verb.
+        Some("status") => return doctor("status"),
         Some("which") => return cmd_which(args.get(1)),
-        Some("list") => cmd_list(),
+        Some("list") => return cmd_list(args.get(1..).unwrap_or(&[])),
         Some("uninstall") => return cmd_uninstall(args.get(1)),
         Some("tree-root") => return cmd_tree_root(args.get(1)),
         Some("verify-index") => return cmd_verify_index(args.get(1..).unwrap_or(&[])),
@@ -136,23 +236,70 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         Some("run") => return cmd_run(&args[1..]),
         Some("relocate") => return cmd_relocate(&args[1..]),
         Some(other) => {
-            eprintln!("atpkg: unknown verb '{other}' (try: {})", VERBS.join(", "));
+            // The head `atpkg: unknown verb '<x>'` is byte-stable for scripts; the
+            // suggestion rides after an em dash so a typo's fix is the FIRST thing on
+            // screen, and the full tiered roster still prints below — arrangement, not
+            // deletion: hiding plumbing verbs from the error would strand the operator
+            // who misspells one.
+            match did_you_mean(other) {
+                Some(verb) => {
+                    eprintln!("atpkg: unknown verb '{other}' — did you mean `{verb}`?");
+                }
+                None => eprintln!("atpkg: unknown verb '{other}'"),
+            }
+            print_verb_tiers(&mut std::io::stderr());
+            eprintln!("atpkg: full manual: aterm help pkg");
             return ExitCode::from(2);
         }
-        None => status(),
+        None => cmd_bare(),
     }
     ExitCode::SUCCESS
 }
 
 /// `atpkg help` / `-h` / `--help` — the conventional help surface: usage plus the ONE
-/// advertised verb roster ([`VERBS`]), exit 0. The full manual is `aterm help pkg`;
-/// this stays a summary so the two never fork.
+/// advertised verb roster (tiered — the same [`print_verb_tiers`] block every other
+/// surface prints, so they can never fork), exit 0. The full manual is `aterm help pkg`;
+/// this stays a summary so the two never fork. Static — no store reads — so it answers
+/// even with HOME unset.
 fn cmd_help() -> ExitCode {
     println!("atpkg — the aterm toolchain package manager");
-    println!("usage: atpkg <verb> [args…]");
-    println!("verbs: {}", VERBS.join(", "));
+    // The usage line keeps its `atpkg` spelling (that IS this program's name, and the
+    // argv0 alias makes it runnable), but a first-hour user arrived via `aterm pkg` —
+    // name the spelling they can actually paste.
+    println!("usage: atpkg <verb> [args…]   (you type: aterm pkg <verb>)");
+    print_verb_tiers(&mut std::io::stdout());
+    println!("atpkg: new machine: aterm pkg install --default-set installs the whole ALab toolset");
     println!("full manual: aterm help pkg");
     ExitCode::SUCCESS
+}
+
+/// The one-line answer for a program/tool the store does not hold — fact first, then
+/// the fix, because a bare "ty is not installed" is a dead end: the user's very next
+/// question is ALWAYS "then how do I get it", and the first hour should never need a
+/// second guess. `fix:` is the house word for the attached remedy (one spelling
+/// everywhere, greppable).
+fn not_installed_fix(name: &str) -> String {
+    format!("atpkg: {name} is not installed (fix: aterm pkg install {name})")
+}
+
+/// After an [`crate::FlowError::Unreachable`] failure line, name the ONE act that
+/// resumes the flow — because the Display used to end "…the toolchain retries
+/// automatically", which is true only inside the windowed app's 6-hour loop and a
+/// plain lie at this CLI edge (nothing retries a foreground verb). The re-run is
+/// per-verb, so the edge that knows the verb appends it; and when the reason is the
+/// anonymous GitHub budget, waiting is not the only fix, so that one case names the
+/// token that lifts it.
+fn print_unreachable_followup(e: &crate::FlowError, rerun: &str) {
+    let crate::FlowError::Unreachable(why) = e else {
+        return;
+    };
+    eprintln!("atpkg:   when the connection is back, re-run: {rerun}");
+    if why.contains("403") || why.to_ascii_lowercase().contains("rate limit") {
+        eprintln!(
+            "atpkg:   the anonymous GitHub limit resets within the hour; gh auth login \
+             provisions a token that lifts it"
+        );
+    }
 }
 
 /// The chain-validated `[packages].prefix` override, or `None` for the default.
@@ -251,25 +398,72 @@ fn mutator_store_lock() -> Result<Option<crate::lock::StoreLock>, ExitCode> {
     }
 }
 
-/// `atpkg` (no verb) — the inert/enabled posture, observable from the shell.
-fn status() {
-    if manager_enabled() {
-        let anchor = "root key pinned";
-        println!("atpkg: enabled ({anchor}). Verbs: {}.", VERBS.join(", "));
-    } else {
+/// `atpkg` (no verb) — the inert/enabled posture, observable from the shell, answering
+/// a first hour's four questions in order: what is this (the head), what do I have (the
+/// counts), what can I type (the tiers), and the ONE next command. Read-only and
+/// lock-free — `list_installed`/`active_builds` read the store without the writer lock,
+/// so the bare invocation's classification in `store_lock_verb_roster_is_exact` holds.
+///
+/// The stable head `atpkg: enabled (root key pinned)` and the byte-exact disabled line
+/// are the script-facing contract; the counts ride after an em dash on the same line so
+/// nothing keying on the head moves. (The old `. Verbs: …` tail is gone — the roster
+/// now prints tiered below, on lines a script was never keying on.)
+fn cmd_bare() {
+    if !manager_enabled() {
         println!("atpkg: disabled (no root key pinned) -- inert");
+        return;
     }
+    // HOME unset: the head still answers (posture is a fact about the BINARY), with no
+    // counts to claim and no next act to name — a next command would fail in the same
+    // broken environment that emptied the tail.
+    let counts = crate::store::resolve(configured_prefix().as_deref()).map(|layout| {
+        let programs: std::collections::BTreeSet<String> = crate::list_installed(&layout)
+            .into_iter()
+            .map(|(program, _)| program)
+            .collect();
+        (programs.len(), crate::active_builds(&layout).len())
+    });
+    for line in bare_lines(counts) {
+        println!("{line}");
+    }
+}
+
+/// The bare posture's lines for an ENABLED manager — pure, so the head's stability and
+/// the one-next-command rule are testable without a process.
+fn bare_lines(counts: Option<(usize, usize)>) -> Vec<String> {
+    let mut lines = vec![match counts {
+        Some((0, _)) => "atpkg: enabled (root key pinned) — nothing installed yet".to_string(),
+        Some((programs, live)) => format!(
+            "atpkg: enabled (root key pinned) — {programs} program(s) installed, {live} live"
+        ),
+        None => "atpkg: enabled (root key pinned)".to_string(),
+    }];
+    lines.extend(verb_tier_lines());
+    match counts {
+        // Empty store: the one next act is the install, and it says what it does.
+        Some((0, _)) => lines.push(
+            "atpkg: next: aterm pkg install --default-set — installs the whole ALab \
+             toolset · manual: aterm help pkg"
+                .to_string(),
+        ),
+        Some(_) => lines.push(
+            "atpkg: next: aterm pkg list — what you have · full manual: aterm help pkg"
+                .to_string(),
+        ),
+        None => {}
+    }
+    lines
 }
 
 /// `atpkg doctor` — the full health surface (§15): trust root, PATH wiring, broken-symlink
 /// scan, active-build store integrity, shell.d hooks + fish-safety, disk headroom, index
 /// freshness, and rustup state. No network, no mutation. Structural breakage exits
 /// nonzero; advisory warnings stay exit-0.
-fn doctor() -> ExitCode {
+fn doctor(prefix: &str) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1); // HOME unset is itself structural
     };
-    if crate::doctor::run(&layout) {
+    if crate::doctor::run(&layout, prefix) {
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
@@ -291,7 +485,7 @@ fn cmd_which(tool: Option<&String>) -> ExitCode {
             ExitCode::SUCCESS
         }
         None => {
-            eprintln!("atpkg: {tool} is not installed");
+            eprintln!("{}", not_installed_fix(tool));
             ExitCode::from(1)
         }
     }
@@ -319,7 +513,7 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     let Some(target) = crate::which(&layout, tool) else {
-        eprintln!("atpkg: {tool} is not installed (try: atpkg install {tool})");
+        eprintln!("{}", not_installed_fix(tool));
         return ExitCode::from(127);
     };
     let child_path =
@@ -398,53 +592,230 @@ fn cmd_relocate(rest: &[String]) -> ExitCode {
 }
 
 /// `atpkg list` — the installed `(program, build)` pairs.
-fn cmd_list() {
-    let Some(layout) = layout() else {
-        return;
+///
+/// TWO AUDIENCES, TWO SHAPES, ONE SET OF FACTS. A terminal gets the human report:
+/// verdict first (`atpkg: N program(s) — L live`), then one row per PROGRAM with its
+/// live build, because the most common question here — "what am I running, is it
+/// healthy?" — used to take twenty rows of raw TSV printed superseded-first. A pipe
+/// (or `--porcelain`, for a script that runs on a TTY) gets the original headerless
+/// `program\tbuild\tnotes` rows BYTE-IDENTICAL to what every existing parser keys on:
+/// ascending builds, superseded before live, `atpkg: no programs installed` when empty.
+///
+/// The only accepted flag is `--porcelain`; anything else is a usage error (extra args
+/// used to be silently ignored, which is a meaning nobody asked for).
+fn cmd_list(args: &[String]) -> ExitCode {
+    use std::io::IsTerminal as _;
+    let mut porcelain = false;
+    for a in args {
+        match a.as_str() {
+            "--porcelain" => porcelain = true,
+            _ => {
+                eprintln!("usage: atpkg list [--porcelain]");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let human = !porcelain && std::io::stdout().is_terminal();
+    run_list(layout(), human)
+}
+
+/// [`cmd_list`] under an already-resolved layout — split so the exit codes and both
+/// renderings are exercisable against a temp store without a process (and without a TTY).
+fn run_list(layout: Option<crate::store::Layout>, human: bool) -> ExitCode {
+    // Exit 1, like every sibling read verb (`which`, `doctor`, `verify`): `layout()`
+    // already printed why. This used to return success with an error on stderr — a
+    // silent green in exactly the environments that are already broken.
+    let Some(layout) = layout else {
+        return ExitCode::from(1);
     };
     let installed = crate::list_installed(&layout);
     if installed.is_empty() {
-        println!("atpkg: no programs installed");
-        return;
+        if human {
+            println!("{EMPTY_LIST_HUMAN}");
+        } else {
+            // The stable piped form — byte-identical to every earlier release.
+            println!("atpkg: no programs installed");
+        }
+        return ExitCode::SUCCESS;
     }
-    // WHAT AM I ACTUALLY RUNNING. `list` used to print `<program>\t<build>` and nothing
-    // else, which cannot answer that — the store legitimately holds MORE THAN ONE build per
-    // program (retention is live + 1 rollback), so the output showed e.g. `ay 7987` and
-    // `ay 8174` with no way to tell which one `ay` on PATH resolves to. Worse, a dev-linked
-    // program looked completely ordinary: the store rows were still there while the shims
-    // pointed at a checkout, so `list` positively implied the registry build was in use.
-    //
-    // The three facts a user needs are the three that change what runs: which build is LIVE,
-    // whether a dev link has taken the program over, and whether a pin is holding it back.
-    // Each comes from the authority that owns it — `active_builds` reads the shims,
-    // `is_linked`/`linked_checkout` read the marker, `is_pinned` reads the pin state — so
-    // this reports the store's real posture rather than a second opinion about it.
     let live = crate::active_builds(&layout);
+    let mut linked: std::collections::BTreeMap<String, Option<std::path::PathBuf>> =
+        std::collections::BTreeMap::new();
+    let mut pinned: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (program, _) in &installed {
+        if !linked.contains_key(program) && crate::linkmode::is_linked(&layout, program) {
+            linked.insert(program.clone(), crate::linkmode::linked_checkout(&layout, program));
+        }
+        if crate::pin::is_pinned(&layout, program) {
+            pinned.insert(program.clone());
+        }
+    }
+    let lines = if human {
+        list_human_lines(&installed, &live, &linked, &pinned)
+    } else {
+        list_porcelain_lines(&installed, &live, &linked, &pinned)
+    };
+    for line in lines {
+        println!("{line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// The empty store's human answer — the fact and, on the same line, the one command
+/// that changes it (the no-dead-ends rule).
+const EMPTY_LIST_HUMAN: &str =
+    "atpkg: no programs installed — aterm pkg install --default-set installs the ALab toolset";
+
+/// `update` on an empty, unadopted store — the fact keeps its stable head
+/// (`atpkg: nothing installed to update`), the remedy rides after the em dash.
+const EMPTY_UPDATE: &str = "atpkg: nothing installed to update — aterm pkg install \
+                            --default-set installs the ALab toolset";
+
+/// `verify` over an empty store — nothing was attested because nothing is installed,
+/// and saying only that is a dead end; the order of acts matters (install, THEN verify).
+const EMPTY_VERIFY: &str = "atpkg: nothing installed to verify — install first (aterm pkg \
+                            install --default-set), then verify re-attests every program \
+                            against the signed root";
+
+/// The STABLE script form: one row per installed BUILD, `program\tbuild\tnotes`,
+/// headerless, ascending builds (superseded rows before the live one) — byte-identical
+/// to what `atpkg list` always printed, because pipes elsewhere key on it.
+///
+/// WHAT AM I ACTUALLY RUNNING. `list` used to print `<program>\t<build>` and nothing
+/// else, which cannot answer that — the store legitimately holds MORE THAN ONE build per
+/// program (retention is live + 1 rollback). The three facts that change what runs are
+/// which build is LIVE, whether a dev link has taken the program over, and whether a pin
+/// is holding it back; each comes from the authority that owns it (`active_builds` reads
+/// the shims, the link marker, the pin state).
+fn list_porcelain_lines(
+    installed: &[(String, u64)],
+    live: &std::collections::BTreeMap<String, u64>,
+    linked: &std::collections::BTreeMap<String, Option<std::path::PathBuf>>,
+    pinned: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
     let mut shown_link = std::collections::BTreeSet::new();
+    let mut lines = Vec::new();
     for (program, build) in installed {
         let mut notes: Vec<String> = Vec::new();
-        if crate::linkmode::is_linked(&layout, &program) {
+        if let Some(checkout) = linked.get(program) {
             // A dev link supersedes EVERY store build, so the note belongs on the program,
             // not on one row; print it once and never call a store build "live" while it is
             // shadowed — that was the misleading part.
             if shown_link.insert(program.clone()) {
-                match crate::linkmode::linked_checkout(&layout, &program) {
+                match checkout {
                     Some(path) => notes.push(format!("DEV-LINKED -> {}", path.display())),
                     None => notes.push("DEV-LINKED".to_string()),
                 }
             } else {
                 notes.push("(shadowed by the dev link)".to_string());
             }
-        } else if live.get(&program) == Some(&build) {
+        } else if live.get(program) == Some(build) {
             notes.push("live".to_string());
         } else {
             notes.push("superseded (kept for rollback)".to_string());
         }
-        if crate::pin::is_pinned(&layout, &program) {
+        if pinned.contains(program) {
             notes.push("pinned".to_string());
         }
-        println!("{program}\t{build}\t{}", notes.join("  "));
+        lines.push(format!("{program}\t{build}\t{}", notes.join("  ")));
     }
+    lines
+}
+
+/// The human report: a count summary FIRST (verdict before detail — the grid rule),
+/// then one aligned row per PROGRAM in its live state, with superseded builds folded
+/// into a trailing "(N older build(s) kept for rollback)" — the fact survives, the
+/// twenty-row scan does not. No health adjective anywhere: counts are what the shims
+/// prove; "healthy" is doctor's word, earned by running checks.
+fn list_human_lines(
+    installed: &[(String, u64)],
+    live: &std::collections::BTreeMap<String, u64>,
+    linked: &std::collections::BTreeMap<String, Option<std::path::PathBuf>>,
+    pinned: &std::collections::BTreeSet<String>,
+) -> Vec<String> {
+    // Group the per-build rows per program, preserving list order (ascending builds).
+    let mut builds: std::collections::BTreeMap<&str, Vec<u64>> = std::collections::BTreeMap::new();
+    for (program, build) in installed {
+        builds.entry(program).or_default().push(*build);
+    }
+    let name_width = builds.keys().map(|p| p.len()).max().unwrap_or(0);
+    let build_width = installed
+        .iter()
+        .map(|(_, b)| b.to_string().len())
+        .max()
+        .unwrap_or(0);
+    let mut live_count = 0usize;
+    let mut no_live = 0usize;
+    let mut rows = Vec::new();
+    for (program, program_builds) in &builds {
+        let is_pinned = pinned.contains(*program);
+        let state = if let Some(checkout) = linked.get(*program) {
+            let mut s = match checkout {
+                Some(path) => format!("DEV-LINKED -> {}", path.display()),
+                None => "DEV-LINKED".to_string(),
+            };
+            s.push_str(&format!(
+                "  ({} store build(s) shadowed)",
+                program_builds.len()
+            ));
+            if is_pinned {
+                s.push_str(", pinned (updates held)");
+            }
+            s
+        } else if let Some(live_build) = live.get(*program) {
+            live_count += 1;
+            let mut s = String::from("live");
+            if is_pinned {
+                s.push_str(", pinned (updates held)");
+            }
+            let older = program_builds.iter().filter(|b| *b != live_build).count();
+            if older > 0 {
+                s.push_str(&format!("   ({older} older build(s) kept for rollback)"));
+            }
+            s
+        } else {
+            // Loud and uppercase, like the porcelain DEV-LINKED marker: a program with
+            // builds on disk and nothing on PATH is the one row that needs doctor.
+            no_live += 1;
+            format!("NO LIVE BUILD ({} build(s) on disk)", program_builds.len())
+        };
+        let shown_build = if linked.contains_key(*program) {
+            // Shadowed: the store build number would imply it is what runs.
+            "-".to_string()
+        } else {
+            live.get(*program)
+                .or_else(|| program_builds.last())
+                .map(u64::to_string)
+                .unwrap_or_default()
+        };
+        rows.push(format!(
+            "  {program:<name_width$}  {shown_build:>build_width$}  {state}"
+        ));
+    }
+    // The summary, zero-count categories omitted — "10 program(s) — 10 live" is the
+    // whole story on a healthy machine, and every extra clause would dilute the one
+    // that matters on an unhealthy one.
+    let mut clauses = vec![format!("{live_count} live")];
+    if !pinned.is_empty() {
+        clauses.push(format!("{} pinned", pinned.len()));
+    }
+    if !linked.is_empty() {
+        clauses.push(format!("{} dev-linked", linked.len()));
+    }
+    if no_live > 0 {
+        clauses.push(format!("{no_live} without a live build"));
+    }
+    let mut lines = vec![format!(
+        "atpkg: {} program(s) — {}",
+        builds.len(),
+        clauses.join(", ")
+    )];
+    lines.extend(rows);
+    if no_live > 0 {
+        // The one next act, only when a row needs explaining — doctor names the why.
+        lines.push("atpkg: next — aterm pkg doctor".to_string());
+    }
+    lines
 }
 
 /// `atpkg uninstall <program>` — remove its shims + store builds (fail-closed inside the prefix).
@@ -490,7 +861,45 @@ fn cmd_uninstall(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    match uninstall_and_retire(&layout, program) {
+    uninstall_one(&layout, program)
+}
+
+/// Whether anything on this machine still bears `program`'s name: a store tree (even a
+/// partial one an interrupted install left) or a bin shim resolving into it — the same
+/// two places `ops::uninstall` cleans. The record row is deliberately NOT consulted:
+/// a row is a claim about the store, not the store.
+fn program_present(layout: &crate::store::Layout, program: &str) -> bool {
+    let prog_store = layout.prefix.join("store").join(program);
+    if prog_store.exists() {
+        return true;
+    }
+    if let Ok(entries) = std::fs::read_dir(layout.bin_dir()) {
+        for e in entries.flatten() {
+            if let Some(target) = crate::platform::resolve_shim(&e.path())
+                && target.starts_with(&prog_store)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// [`cmd_uninstall`]'s single-program body, split from the layout resolution so the
+/// refusal below is exercisable against a temp store.
+fn uninstall_one(layout: &crate::store::Layout, program: &str) -> ExitCode {
+    // REFUSE TO "UNINSTALL" WHAT WAS NEVER THERE. This used to print "uninstalled ty",
+    // exit 0, and mint a durable removed-marker — a fabricated success whose hidden
+    // state change silently suppressed future set-completion for a program the user
+    // never had. Only program-shaped names take this path: a sentinel/flag name still
+    // reaches the retirement gate's own refusal, which owns those words.
+    if !((program.starts_with('*') && program.ends_with('*')) || program.starts_with('-'))
+        && !program_present(layout, program)
+    {
+        eprintln!("atpkg: {program} is not installed — nothing to uninstall");
+        return ExitCode::from(1);
+    }
+    match uninstall_and_retire(layout, program) {
         Ok(()) => {
             println!("atpkg: uninstalled {program}");
             // Removing a managed program is an EXPLICIT act, so this machine stops being
@@ -499,8 +908,8 @@ fn cmd_uninstall(program: Option<&String>) -> ExitCode {
             // its owner. Adoption is re-established by the deliberate whole-set act
             // (Settings ▸ Packages ▸ Install ALab toolset), and the way to drop ONE
             // program while staying adopted is `[packages].exclude`.
-            if adopted(&layout) {
-                clear_adoption(&layout);
+            if adopted(layout) {
+                clear_adoption(layout);
                 println!(
                     "atpkg: this machine no longer auto-completes the ALab toolset (removing \
                      a program opts out). Re-adopt with `aterm pkg install --default-set`, or \
@@ -560,9 +969,10 @@ fn cmd_uninstall_all() -> ExitCode {
         clear_adoption(&layout);
         record_decline(&layout);
         println!(
-            "atpkg: nothing was installed — recorded that this machine does not want the \
-             ALab toolset, so no later pass installs it. \
-             `aterm pkg install --default-set` opts back in."
+            "atpkg: removed nothing (nothing installed) — noted that this machine declines \
+             the ALab toolset: no later pass installs it (not the first-run seed, not the \
+             unattended update, not set auto-completion); aterm pkg install --default-set \
+             opts back in"
         );
         return ExitCode::SUCCESS;
     }
@@ -634,7 +1044,7 @@ fn print_gc_abstentions(verb: &str, report: &crate::gc::GcReport) {
     let names: Vec<&str> = report.diverged.iter().map(|d| d.program.as_str()).collect();
     println!(
         "atpkg {verb}: skipped {} program(s) with no proven live build ({}) — \
-         run `atpkg doctor` for the reason",
+         run `aterm pkg doctor` for the reason",
         names.len(),
         names.join(", ")
     );
@@ -901,7 +1311,7 @@ fn failed_install_state(e: &crate::FlowError) -> Option<String> {
         // A dev-linked program is a benign HARD-SKIP (§13), not an error state.
         crate::FlowError::Linked(_) => Some(String::from("dev-linked (skipped)")),
         // Verdicts about the REQUEST or the NETWORK — never about this program.
-        crate::FlowError::NotReachable(_)
+        crate::FlowError::NotReachable(..)
         | crate::FlowError::NoIndex
         | crate::FlowError::Unreachable(_)
         | crate::FlowError::Stale => None,
@@ -1457,6 +1867,12 @@ pub const SEED_PARTIAL_MARKER: &str = "seed-partial: ";
 /// adopted machine, which used to happen with no user-visible trace at all.
 pub const NET_INSTALLED_MARKER: &str = "net-installed: ";
 
+/// The human line printed on its own row AFTER an install marker (`seed-installed:` /
+/// `net-installed:`) — never appended to the marker itself, which the GUI parses
+/// byte-for-byte. Answers the first question a fresh install raises: how do I run one?
+const SEED_FOLLOW_ON: &str = "atpkg: these tools are on PATH in every aterm shell — \
+                              aterm pkg list shows them; aterm <tool> runs one anywhere";
+
 /// WHETHER THE 6-HOUR PASS MAY COMPLETE THE SET — the whole consent policy, as one
 /// pure function so it can be tested.
 ///
@@ -1639,7 +2055,7 @@ fn cmd_install(program: Option<&String>) -> ExitCode {
         // line that leaves them to guess which of the two forms they wanted.
         eprintln!("usage: atpkg install <program> | atpkg install --default-set");
         eprintln!(
-            "atpkg:   for the whole ALab toolset (the usual answer): atpkg install --default-set"
+            "atpkg:   for the whole ALab toolset (the usual answer): aterm pkg install --default-set"
         );
         return ExitCode::from(2);
     };
@@ -1712,12 +2128,13 @@ fn cmd_install_with(
         Err(crate::FlowError::Linked(p)) => {
             // A dev-linked program is managed from its checkout — a hard skip, not a failure.
             println!(
-                "atpkg: {p} is dev-linked; run `atpkg unlink {p}` to install from the registry"
+                "atpkg: {p} is dev-linked; run `aterm pkg unlink {p}` to install from the registry"
             );
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("atpkg: install {program} failed: {e}");
+            print_unreachable_followup(&e, &format!("aterm pkg install {program}"));
             ExitCode::from(1)
         }
     }
@@ -1779,17 +2196,18 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
             if let Some(g) = &r.coherence_group {
                 eprintln!(
                     "atpkg: warning — {program} is in coherence group '{g}'; rolling back one \
-                     member alone splits the locked tuple. Consider `atpkg update` to re-cohere."
+                     member alone splits the locked tuple. Consider `aterm pkg update` to re-cohere."
                 );
             }
             println!(
-                "atpkg: rolled back {program} from build {} to {}; `atpkg pin {program}` to hold it there",
+                "atpkg: rolled back {program} from build {} to {}; `aterm pkg pin {program}` to hold it there",
                 r.from_build, r.to_build
             );
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("atpkg: rollback {program} failed: {e}");
+            print_unreachable_followup(&e, &format!("aterm pkg rollback {program}"));
             ExitCode::from(1)
         }
     }
@@ -1810,7 +2228,10 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
     };
     // Pinning something not installed is meaningless.
     if !crate::active_builds(&layout).contains_key(program) {
-        eprintln!("atpkg: {program} is not installed — nothing to {verb}");
+        eprintln!(
+            "atpkg: {program} is not installed — nothing to {verb} (aterm pkg list shows \
+             what is)"
+        );
         return ExitCode::from(1);
     }
     match crate::pin::set_pinned(&layout, program, pinned) {
@@ -1891,7 +2312,7 @@ fn cmd_update_all() -> ExitCode {
     let complete_the_set =
         should_complete_set(cfg.auto_install(), adopted(&layout), declined(&layout));
     if installed.is_empty() && !complete_the_set {
-        println!("atpkg: nothing installed to update");
+        println!("{EMPTY_UPDATE}");
         return ExitCode::SUCCESS;
     }
     let fetcher = resolve_fetcher(&layout);
@@ -1918,6 +2339,11 @@ fn cmd_update_all() -> ExitCode {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("atpkg: update failed: {e}");
+                // Same follow-up the single-program lane prints: the old Display
+                // carried a false "retries automatically" tail, and dropping it
+                // without a replacement left this lane stating a network failure
+                // with no next act.
+                print_unreachable_followup(&e, "aterm pkg update");
                 record_status(
                     &layout,
                     "*index*",
@@ -1988,6 +2414,7 @@ fn cmd_update_all() -> ExitCode {
         if !arrived.is_empty() {
             arrived.sort();
             println!("atpkg: {NET_INSTALLED_MARKER}{}", arrived.join(", "));
+            println!("{SEED_FOLLOW_ON}");
         }
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
@@ -2046,7 +2473,7 @@ fn cmd_update_all() -> ExitCode {
                     format!(
                         "nothing is installed and nothing was installable — the index \
                          publishes builds for {} but every one was refused (revoked, \
-                         below the floor, or filtered out); see `atpkg doctor`",
+                         below the floor, or filtered out); see `aterm pkg doctor`",
                         current_triple()
                     ),
                     "unavailable: every published build was refused",
@@ -2055,7 +2482,7 @@ fn cmd_update_all() -> ExitCode {
                 (
                     format!(
                         "nothing is installed and nothing was installable — no published \
-                         build was found for this Mac's architecture ({})",
+                         build was found for this machine's architecture ({})",
                         current_triple()
                     ),
                     "unavailable: no build for this architecture",
@@ -2116,6 +2543,7 @@ fn install_default_set(
         Ok(i) => i,
         Err(e) => {
             eprintln!("atpkg: default-set bootstrap: cannot resolve the signed index: {e}");
+            print_unreachable_followup(&e, "aterm pkg install --default-set");
             return 1;
         }
     };
@@ -2565,7 +2993,8 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         // lane installs whatever the store lacks, so without this check it would
         // undo that on the very next launch.
         println!(
-            "atpkg: the ALab toolset was removed on this machine — not re-installing it.              `aterm pkg install --default-set` brings it back."
+            "atpkg: the ALab toolset was removed on this machine — not re-installing it. \
+             `aterm pkg install --default-set` brings it back."
         );
         return ExitCode::SUCCESS;
     }
@@ -2756,6 +3185,9 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         // The stable marker the GUI parses — change it and the first-run
         // notice goes blind (crates/aterm-gui, spawn_pkg_update_check).
         println!("atpkg: seed-installed: {}", new.join(", "));
+        // The marker above is the GUI's (byte-stable, parsed); this line is the human's:
+        // an install that lands 10 commands and never says how to run one is a dead end.
+        println!("{SEED_FOLLOW_ON}");
     }
     // RECLAIM only on a CLEAN pass. The payload is dead weight once extracted —
     // ~600 MB on top of the gigabytes it expanded into — but "extracted" has to
@@ -3023,7 +3455,7 @@ fn finish_unusable_seed(
             // The only permanent one in this arm: the CPU will not change.
             permanent = true;
             println!(
-                "atpkg: seed-unusable: the bundled toolchain has no build for this Mac's \
+                "atpkg: seed-unusable: the bundled toolchain has no build for this machine's \
                  architecture ({}) — no ALab programs were installed from it",
                 current_triple()
             );
@@ -3142,7 +3574,7 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
     if serves_us == Some(false) {
         println!(
             "atpkg: {SEED_UNUSABLE_MARKER}the signed index publishes no artifact for this \
-             Mac's architecture ({triple}) — nothing was installed, and nothing arrives \
+             machine's architecture ({triple}) — nothing was installed, and nothing arrives \
              until one is published"
         );
         record_status(
@@ -3157,8 +3589,9 @@ fn report_seedless_posture(layout: &crate::store::Layout) {
         );
     } else {
         println!(
-            "atpkg: no bundled toolchain in this app — atpkg installs the ALab toolset from \
-             the signed index instead, and keeps it current from here on"
+            "atpkg: no bundled toolchain in this app — the ALab toolset installs from the \
+             signed index instead: aterm pkg install --default-set (the windowed app also \
+             runs this pass on its 6-hour loop)"
         );
     }
 }
@@ -3210,7 +3643,7 @@ fn reclaim_bundled_seed(seed_dir: &std::path::Path) {
         if !ours {
             println!(
                 "atpkg: leaving the bundled seed in place — {} is not owned by this user, and \
-                 other accounts on this Mac may still need it to install offline",
+                 other accounts on this machine may still need it to install offline",
                 seed_dir.display()
             );
             return;
@@ -3459,8 +3892,8 @@ fn reconcile_links(layout: &crate::store::Layout, cfg: &crate::config::PackagesC
                     Some(existing) => {
                         eprintln!(
                             "atpkg: [packages.links] {program}: REFUSING to touch the \
-                             existing dev-link at {} (config wants {}); run `atpkg unlink \
-                             {program}` first if the config target is right",
+                             existing dev-link at {} (config wants {}); run `aterm pkg \
+                             unlink {program}` first if the config target is right",
                             existing.display(),
                             want.display()
                         );
@@ -3588,6 +4021,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         Ok(x) => x,
         Err(e) => {
             eprintln!("atpkg: update {program} failed: {e}");
+            print_unreachable_followup(&e, &format!("aterm pkg update {program}"));
             return ExitCode::from(1);
         }
     };
@@ -3612,6 +4046,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("atpkg: update {program} failed: {e}");
+                print_unreachable_followup(&e, &format!("aterm pkg update {program}"));
                 return ExitCode::from(1);
             }
         };
@@ -3645,7 +4080,7 @@ fn cmd_update_one(program: &String) -> ExitCode {
         && crate::pin::is_pinned(&layout, program)
     {
         println!(
-            "atpkg: {program} held by local pin (build {c}); `atpkg unpin {program}` to allow updates"
+            "atpkg: {program} held by local pin (build {c}); `aterm pkg unpin {program}` to allow updates"
         );
         return ExitCode::SUCCESS;
     }
@@ -3895,7 +4330,7 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
         None => crate::verify::verify_all(&layout),
     };
     if outcomes.is_empty() {
-        println!("atpkg: nothing installed to verify");
+        println!("{EMPTY_VERIFY}");
         return ExitCode::SUCCESS;
     }
     let mut bad = 0u32;
@@ -3921,12 +4356,13 @@ fn cmd_verify(program: Option<&String>) -> ExitCode {
             NoSignedRoot { .. } => {
                 bad += 1;
                 eprintln!(
-                    "atpkg: {name} — no signed tree_root recorded; reinstall to enable verification"
+                    "atpkg: {name} — no signed tree_root recorded; aterm pkg install {name} \
+                     reinstalls it and records one"
                 );
             }
             NotInstalled => {
                 bad += 1;
-                eprintln!("atpkg: {name} is not installed");
+                eprintln!("{}", not_installed_fix(name));
             }
             Unreadable { build, error } => {
                 bad += 1;
@@ -4002,7 +4438,7 @@ fn cmd_link(rest: &[String]) -> ExitCode {
     match crate::link(&layout, program, checkout_path, &bins) {
         Ok(out) => {
             println!(
-                "atpkg: dev-linked {program} ({}); `atpkg unlink {program}` to release it",
+                "atpkg: dev-linked {program} ({}); `aterm pkg unlink {program}` to release it",
                 if out.linked.is_empty() {
                     "no bins".into()
                 } else {
@@ -4056,12 +4492,12 @@ fn cmd_unlink(program: Option<&String>) -> ExitCode {
             match restore_installed_shims(&layout, program, owned.as_deref()) {
                 Ok(0) => println!(
                     "atpkg:   no installed build to restore — {program} is off PATH until \
-                     `atpkg install {program}`"
+                     `aterm pkg install {program}`"
                 ),
                 Ok(n) => println!("atpkg:   restored {n} command(s) from the installed build"),
                 Err(e) => eprintln!(
                     "atpkg:   WARNING: could not restore the installed build's shims ({e}); \
-                     run `atpkg install {program}` to put it back on PATH"
+                     run `aterm pkg install {program}` to put it back on PATH"
                 ),
             }
             ExitCode::SUCCESS
@@ -4181,7 +4617,7 @@ mod tests {
         // `permanent`, or the reclaim is keyed on a compile-time constant.
         let src = include_str!("cli.rs");
         let arm = src
-            .find("the bundled toolchain has no build for this Mac's")
+            .find("the bundled toolchain has no build for this machine's")
             .expect("the architecture verdict");
         let guard = src[..arm]
             .rfind("running_translated()")
@@ -4292,6 +4728,247 @@ mod tests {
         );
     }
 
+    /// [`VERB_TIERS`] must be an EXACT partition of [`VERBS`]: every dispatched verb
+    /// placed in exactly one tier, and no tier naming a verb that does not dispatch.
+    /// Without this, a verb added to the match with no tier would still parse but
+    /// silently vanish from bare `atpkg`, `--help`, and the unknown-verb hint at once —
+    /// the same drift that killed `sync` and `seed` when the roster was hand-kept.
+    #[test]
+    fn verb_tiers_partition_the_roster() {
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for (tier, verbs) in VERB_TIERS {
+            for v in *verbs {
+                assert!(
+                    seen.insert(v),
+                    "{v} appears in more than one tier (second: {tier}) — a verb has ONE home"
+                );
+                assert!(
+                    VERBS.contains(v),
+                    "{v} is tiered ({tier}) but not dispatched — the tiers advertise it \
+                     while the match rejects it"
+                );
+            }
+        }
+        for v in VERBS {
+            assert!(
+                seen.contains(v),
+                "{v} dispatches but has no tier — it would vanish from every human surface"
+            );
+        }
+    }
+
+    /// The shared tier block renders each advertised verb exactly once as a word —
+    /// `status` folded into `doctor (or: status)` rather than dropped.
+    #[test]
+    fn tier_block_renders_every_verb_once() {
+        let block = verb_tier_lines().join("\n");
+        for v in VERBS {
+            let count = block
+                .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+                .filter(|w| w == v)
+                .count();
+            assert_eq!(count, 1, "{v} must appear exactly once in the tier block:\n{block}");
+        }
+        assert!(
+            block.contains("doctor (or: status)"),
+            "status renders attached to doctor, not as a sibling:\n{block}"
+        );
+    }
+
+    /// The suggestion engine: a one-slip typo gets the fix, gibberish gets silence —
+    /// a far-fetched guess erodes trust in the near ones.
+    #[test]
+    fn did_you_mean_suggests_and_gives_up() {
+        assert_eq!(did_you_mean("instal"), Some("install"));
+        assert_eq!(did_you_mean("udpate"), Some("update"));
+        assert_eq!(did_you_mean("frobnicate"), None);
+    }
+
+    /// The bare posture's script contract: the enabled HEAD never moves (counts ride
+    /// after the em dash), the disabled line is byte-exact, and the tail names exactly
+    /// one `next:` act.
+    #[test]
+    fn bare_posture_head_is_stable() {
+        for counts in [None, Some((0, 0)), Some((10, 10))] {
+            let lines = bare_lines(counts);
+            assert!(
+                lines[0].starts_with("atpkg: enabled (root key pinned)"),
+                "the stable head leads: {:?}",
+                lines[0]
+            );
+            let nexts = lines.iter().filter(|l| l.starts_with("atpkg: next:")).count();
+            assert_eq!(
+                nexts,
+                usize::from(counts.is_some()),
+                "one next act with a store, none without: {lines:?}"
+            );
+        }
+        // Fresh machine: the one act is the install, and it says what it does.
+        assert!(
+            bare_lines(Some((0, 0)))
+                .last()
+                .unwrap()
+                .contains("aterm pkg install --default-set"),
+            "an empty store's next act is the whole-set install"
+        );
+    }
+
+    /// NO DEAD ENDS: every empty/negative answer carries a `aterm pkg …` act the user
+    /// can paste — the fact alone ("ty is not installed") always raises exactly one
+    /// follow-up question, and the first hour should never need a second guess.
+    #[test]
+    fn empty_answers_name_a_next_command() {
+        let family: Vec<String> = vec![
+            EMPTY_LIST_HUMAN.to_string(),
+            EMPTY_UPDATE.to_string(),
+            EMPTY_VERIFY.to_string(),
+            SEED_FOLLOW_ON.to_string(),
+            not_installed_fix("ty"),
+        ];
+        for answer in &family {
+            assert!(
+                answer.contains("aterm pkg "),
+                "an empty/negative answer must name its next command: {answer}"
+            );
+        }
+    }
+
+    /// The piped `list` form is a SCRIPT CONTRACT: `program\tbuild\tnotes`, headerless,
+    /// ascending builds with superseded rows before the live one — byte-identical to
+    /// every earlier release, dev-link and pin notes included.
+    #[test]
+    fn list_porcelain_is_stable() {
+        let installed = vec![
+            ("ay".to_string(), 7987),
+            ("ay".to_string(), 8256),
+            ("clean".to_string(), 7345),
+        ];
+        let live: std::collections::BTreeMap<String, u64> =
+            [("ay".to_string(), 8256), ("clean".to_string(), 7345)].into();
+        let linked = std::collections::BTreeMap::new();
+        let mut pinned = std::collections::BTreeSet::new();
+        pinned.insert("clean".to_string());
+        assert_eq!(
+            list_porcelain_lines(&installed, &live, &linked, &pinned),
+            vec![
+                "ay\t7987\tsuperseded (kept for rollback)".to_string(),
+                "ay\t8256\tlive".to_string(),
+                "clean\t7345\tlive  pinned".to_string(),
+            ],
+        );
+    }
+
+    /// The human report leads with the verdict-shaped summary, folds superseded rows
+    /// into a per-program count, and appends its one `next` act only when some program
+    /// has no live build (counts only, no health adjective — "healthy" is doctor's word).
+    #[test]
+    fn list_human_report_summarizes_and_names_doctor_only_when_needed() {
+        let installed = vec![
+            ("ay".to_string(), 7987),
+            ("ay".to_string(), 8256),
+            ("clean".to_string(), 7345),
+        ];
+        let live: std::collections::BTreeMap<String, u64> =
+            [("ay".to_string(), 8256), ("clean".to_string(), 7345)].into();
+        let none_linked = std::collections::BTreeMap::new();
+        let none_pinned = std::collections::BTreeSet::new();
+        let lines = list_human_lines(&installed, &live, &none_linked, &none_pinned);
+        assert_eq!(lines[0], "atpkg: 2 program(s) — 2 live");
+        assert!(
+            lines.iter().any(|l| l.contains("(1 older build(s) kept for rollback)")),
+            "the superseded build survives as a count: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("next")),
+            "a healthy listing names no next act: {lines:?}"
+        );
+        // A program with builds on disk and nothing live is the row that needs doctor.
+        let dead_live: std::collections::BTreeMap<String, u64> =
+            [("ay".to_string(), 8256)].into();
+        let lines = list_human_lines(&installed, &dead_live, &none_linked, &none_pinned);
+        assert_eq!(lines[0], "atpkg: 2 program(s) — 1 live, 1 without a live build");
+        assert!(
+            lines.iter().any(|l| l.contains("NO LIVE BUILD")),
+            "the dead program is loud: {lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap(),
+            "atpkg: next — aterm pkg doctor",
+            "exactly one next act, at the end: {lines:?}"
+        );
+    }
+
+    /// `list` with no resolvable prefix exits 1 like every sibling read verb — it used
+    /// to print the error and exit 0, a silent green in an already-broken environment.
+    #[test]
+    fn list_exit_codes() {
+        assert_eq!(
+            format!("{:?}", run_list(None, true)),
+            format!("{:?}", ExitCode::from(1)),
+            "no layout is a structural failure, not a success"
+        );
+    }
+
+    /// UNINSTALLING WHAT IS NOT THERE IS A REFUSAL, NOT A SUCCESS. This used to print
+    /// "uninstalled ty", exit 0, and mint a durable removed-marker that silently
+    /// suppressed future set-completion — a fabricated success with a hidden state
+    /// change. Partial-install debris (a store tree with no shims) must still clean.
+    #[test]
+    fn uninstall_not_installed_refuses() {
+        let layout = temp_layout("uninstall-absent");
+        assert_eq!(
+            format!("{:?}", uninstall_one(&layout, "ty")),
+            format!("{:?}", ExitCode::from(1)),
+            "nothing bears the name, so nothing was uninstalled"
+        );
+        assert!(
+            !removed_programs(&layout).contains("ty"),
+            "no removed-marker is minted for a program that was never here"
+        );
+        // Partial debris: a store tree with no shims is still this verb's to clean.
+        std::fs::create_dir_all(layout.build_dir("ty", 7)).unwrap();
+        assert_eq!(
+            format!("{:?}", uninstall_one(&layout, "ty")),
+            format!("{:?}", ExitCode::SUCCESS),
+            "debris cleans as before"
+        );
+        assert!(
+            !layout.prefix.join("store").join("ty").exists(),
+            "the debris really came off"
+        );
+        assert!(
+            removed_programs(&layout).contains("ty"),
+            "a real removal still records itself for the seed lane"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// THE SPELLING RULE CANNOT REGRESS AT THE SHAPES THAT ALREADY SLIPPED. Anything a
+    /// user is invited to TYPE is spelled `aterm pkg …`; the bare `atpkg` spelling in a
+    /// remedy only works because of the argv0 alias, which a first-hour user has no way
+    /// to know about. Source-level, because these strings are scattered across four
+    /// files and every one of them drifted at least once.
+    #[test]
+    fn remedies_are_spelled_as_typed() {
+        for (file, source) in [
+            ("cli.rs", include_str!("cli.rs")),
+            ("doctor.rs", include_str!("doctor.rs")),
+            ("flow.rs", include_str!("flow.rs")),
+            ("activate.rs", include_str!("activate.rs")),
+        ] {
+            // Needles assembled at runtime so this test's own source (inside
+            // cli.rs's include_str!) never contains them.
+            for head in ["try: ", "run `", ": "] {
+                let needle = format!("{head}atpkg {}", if head == ": " { "install --default-set" } else { "" });
+                assert!(
+                    !source.contains(&needle),
+                    "{file} still spells a remedy as `atpkg` ({needle:?}) — remedies say \
+                     `aterm pkg`, the spelling a user can paste"
+                );
+            }
+        }
+    }
+
     fn temp_layout(label: &str) -> crate::store::Layout {
         let p = std::env::temp_dir().join(format!("atpkg-main-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -4309,7 +4986,7 @@ mod tests {
     #[test]
     fn a_name_the_index_does_not_name_is_never_recorded() {
         assert_eq!(
-            failed_install_state(&crate::FlowError::NotReachable("--help".into())),
+            failed_install_state(&crate::FlowError::NotReachable("--help".into(), vec![])),
             None,
             "the index does not name it, so there is no program to remember"
         );

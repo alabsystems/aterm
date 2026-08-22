@@ -103,7 +103,7 @@ fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
 /// problems (`main` maps `false` → exit 1). Reads the real environment (home + PATH + clock
 /// + the `[packages]` config account + the token chain's SOURCE label — never the token).
 #[must_use]
-pub fn run(layout: &Layout) -> bool {
+pub fn run(layout: &Layout, prefix: &str) -> bool {
     let home = aterm_types::dirs::home_dir();
     let path = std::env::var_os("PATH");
     let cfg_account = crate::config::cached().account().map(str::to_string);
@@ -117,6 +117,9 @@ pub fn run(layout: &Layout) -> bool {
         crate::flow::now_unix(),
         cfg_account.as_deref(),
         token_source.as_deref(),
+        prefix,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
     )
 }
 
@@ -125,6 +128,7 @@ pub fn run(layout: &Layout) -> bool {
 /// can be exercised against a synthetic environment without mutating the process env
 /// (or spawning the keychain/`gh` probes).
 #[must_use]
+#[allow(clippy::too_many_arguments)] // the injected environment, plus the speaker and its streams
 pub fn run_with(
     layout: &Layout,
     home: Option<&Path>,
@@ -132,7 +136,15 @@ pub fn run_with(
     now: i64,
     cfg_account: Option<&str>,
     token_source: Option<&str>,
+    prefix: &str,
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
 ) -> bool {
+    // THE SPEAKER IS THE VERB THE USER TYPED. `status` is an alias for this same report,
+    // and it used to answer every line as "doctor:" — so a user could not tell which verb
+    // they had run, and a script keying on the prefix keyed on the wrong verb. Same
+    // checks, same exit codes; only the signature matches the invocation.
+    let p = prefix;
     let mut fails = 0usize;
 
     // (0) WHICH atpkg IS SPEAKING. Every line below is only as good as the binary printing
@@ -147,32 +159,32 @@ pub fn run_with(
     // own store is the most expensive kind of wrong, because the natural next step is to
     // reinstall something that was never broken. Naming the speaker makes that verifiable
     // in one line instead of an afternoon.
-    println!(
-        "doctor: this atpkg is {} at {}",
+    let _ = writeln!(out,
+        "{p}: this atpkg is {} at {}",
         env!("CARGO_PKG_VERSION"),
         std::env::current_exe()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown path>".to_string())
     );
-    report_aterm_posture(layout);
+    report_aterm_posture(layout, p, out);
 
     // (1) TRUST ROOT + INDEX SOURCE + TOKEN SOURCE.
-    println!(
-        "doctor: index source github.com/{}",
+    let _ = writeln!(out,
+        "{p}: index source github.com/{}",
         crate::resolve_account(cfg_account).slug()
     );
     if crate::manager_enabled() {
         // The root is the PAPER MASTER — the same anchor the app updater uses, not a
         // package-specific key. Naming it here is what lets an operator answer "which
         // trust root is this build on?" without reading source.
-        println!(
-            "doctor: ok — paper master pinned (fingerprint {}, {} key(s))",
+        let _ = writeln!(out,
+            "{p}: ok — paper master pinned (fingerprint {}, {} key(s))",
             crate::root_key_fingerprint(),
             crate::PKG_TRUST_ANCHORS.len()
         );
     } else {
-        println!(
-            "doctor: warn — disabled/inert (no paper master compiled in \
+        let _ = writeln!(out,
+            "{p}: warn — disabled/inert (no paper master compiled in \
              (pins::PAPER_MASTER_PUBKEYS is empty), or ATPKG_DISABLE set) — this build \
              installs nothing"
         );
@@ -181,21 +193,22 @@ pub fn run_with(
     // `$ATPKG_TOKEN` → aterm-update-core chain (env → keychain → 0600 file →
     // `$GITHUB_TOKEN`/`$GH_TOKEN` → `gh auth token`) supplied a credential.
     match token_source {
-        Some(src) => println!(
-            "doctor: ok — GitHub token from {src} (used for index/pkg fetches; never printed)"
-        ),
-        None => println!(
-            "doctor: ok — no GitHub token provisioned (anonymous API: fine for public \
-             repos, rate-limited; private fetch overrides need one)"
-        ),
+        Some(src) => { let _ = writeln!(out, 
+            "{p}: ok — GitHub token from {src} (used for index/pkg fetches; never printed)"
+        ); },
+        None => { let _ = writeln!(out, 
+            "{p}: ok — no GitHub token provisioned (anonymous API: fine for public \
+             repos, rate-limited; `gh auth login` provisions one; private fetch overrides \
+             need one)"
+        ); },
     }
 
     // (2) PREFIX / STORE.
     if layout.prefix.is_dir() {
-        println!("doctor: ok — prefix {}", layout.prefix.display());
+        let _ = writeln!(out, "{p}: ok — prefix {}", layout.prefix.display());
     } else {
-        println!(
-            "doctor: warn — prefix {} does not exist yet (nothing installed)",
+        let _ = writeln!(out,
+            "{p}: warn — prefix {} does not exist yet (nothing installed)",
             layout.prefix.display()
         );
     }
@@ -206,12 +219,16 @@ pub fn run_with(
         .map(|p| std::env::split_paths(p).any(|d| d == bin_dir))
         .unwrap_or(false);
     if on_path {
-        println!("doctor: ok — managed bin/ is on PATH");
+        let _ = writeln!(out, "{p}: ok — managed bin/ is on PATH");
     } else {
-        println!(
-            "doctor: warn — {} is not on PATH; an aterm shell auto-sources ~/.aterm/shell.d \
-             (which APPENDS it), or add: {}",
-            bin_dir.display(),
+        // The bin path used to appear TWICE on this line — once as the subject, once
+        // inside the export — doubling the longest token in the whole report. The
+        // copy-pasteable export is the copy that earns its bytes; "managed bin/" matches
+        // the ok-branch's name for the same thing.
+        let _ = writeln!(
+            out,
+            "{p}: warn — managed bin/ is not on PATH; an aterm shell auto-sources \
+             ~/.aterm/shell.d (which APPENDS it), or add: {}",
             manual_path_hint(&bin_dir)
         );
     }
@@ -222,26 +239,32 @@ pub fn run_with(
     // (deliberately target-less) yields `None` and is never flagged.
     if let Ok(entries) = std::fs::read_dir(&bin_dir) {
         for e in entries.flatten() {
-            let p = e.path();
-            if let Some(target) = crate::platform::resolve_shim(&p)
+            let shim = e.path();
+            if let Some(target) = crate::platform::resolve_shim(&shim)
                 && !target.exists()
             {
                 fails += 1;
-                eprintln!("doctor: FAIL — broken bin shim {}", p.display());
+                let _ = writeln!(err, "{p}: FAIL — broken bin shim {}", shim.display());
             }
         }
     }
 
     // (5) ACTIVE-BUILD STORE INTEGRITY.
     let active = crate::ops::active_builds(layout);
+    // The first program whose store tree is missing/incomplete — remembered so the
+    // verdict tail can name ONE structural repair (`install <program>`) instead of a menu.
+    let mut next_install_program: Option<String> = None;
     for (program, build) in &active {
         let bd = layout.build_dir(program, *build);
         if !bd.is_dir() || !crate::store::build_is_complete(&bd) {
             fails += 1;
-            eprintln!("doctor: FAIL — active {program} build {build} store missing/incomplete");
+            let _ = writeln!(err, "{p}: FAIL — active {program} build {build} store missing/incomplete");
+            if next_install_program.is_none() {
+                next_install_program = Some(program.clone());
+            }
         }
     }
-    println!("doctor: ok — {} program(s) active", active.len());
+    let _ = writeln!(out, "{p}: ok — {} program(s) active", active.len());
 
     // (5c) SOLVERS THE `trust` BUNDLE PINS PRIVATELY.
     //
@@ -289,8 +312,8 @@ pub fn run_with(
                 continue;
             }
             let override_hint = if program.as_str() == "ay" { " (override: AY_PATH)" } else { "" };
-            println!(
-                "doctor: note — Trust builds use the {program} pinned inside the trust bundle \
+            let _ = writeln!(out,
+                "{p}: note — Trust builds use the {program} pinned inside the trust bundle \
                  ({pinned_version}), not the managed {program} {managed_version} \
                  (build {managed_build}){override_hint}"
             );
@@ -305,6 +328,9 @@ pub fn run_with(
     // is STRUCTURAL: whichever view is stale, some tool on PATH is running a build activation
     // does not select. A merely-absent witness is not breakage, so it warns.
     let live = crate::gc::live_builds(layout);
+    // A shim/channel divergence's repair is a re-run of `update` — remembered for the
+    // verdict tail's single `next` act.
+    let mut next_update_divergence = false;
     for d in live.diverged() {
         match &d.reason {
             crate::gc::Diverged::ChannelShimMismatch {
@@ -312,17 +338,19 @@ pub fn run_with(
                 shims_say,
             } => {
                 fails += 1;
-                eprintln!(
-                    "doctor: FAIL — {}: the channel selects build {channel_says} but its bin/ \
-                     shims run build {shims_say} (re-run `atpkg update {}`)",
+                next_update_divergence = true;
+                let _ = writeln!(err,
+                    "{p}: FAIL — {}: the channel selects build {channel_says} but its bin/ \
+                     shims run build {shims_say} (re-run `aterm pkg update {}`)",
                     d.program, d.program
                 );
             }
             crate::gc::Diverged::ShimsDisagree { builds } => {
                 fails += 1;
-                eprintln!(
-                    "doctor: FAIL — {}: its bin/ shims are split across builds {} — one \
-                     program's tools must all point into one build (re-run `atpkg update {}`)",
+                next_update_divergence = true;
+                let _ = writeln!(err,
+                    "{p}: FAIL — {}: its bin/ shims are split across builds {} — one \
+                     program's tools must all point into one build (re-run `aterm pkg update {}`)",
                     d.program,
                     build_list(builds),
                     d.program
@@ -330,10 +358,11 @@ pub fn run_with(
             }
             crate::gc::Diverged::ChannelsDisagree { builds } => {
                 fails += 1;
-                eprintln!(
-                    "doctor: FAIL — {}: two channel `current` links select different builds \
+                next_update_divergence = true;
+                let _ = writeln!(err,
+                    "{p}: FAIL — {}: two channel `current` links select different builds \
                      {} and it has no `store/{}/current` of its own to break the tie — run \
-                     `atpkg update {}` to write one",
+                     `aterm pkg update {}` to write one",
                     d.program,
                     build_list(builds),
                     d.program,
@@ -341,17 +370,17 @@ pub fn run_with(
                 );
             }
             crate::gc::Diverged::NoLiveWitness { shims_say } => {
-                println!(
-                    "doctor: warn — {}: build {shims_say} is on PATH but no `current` link \
+                let _ = writeln!(out,
+                    "{p}: warn — {}: build {shims_say} is on PATH but no `current` link \
                      selects it, so gc keeps every superseded {} build. Run \
-                     `atpkg update {}` to re-activate it and clear this.",
+                     `aterm pkg update {}` to re-activate it and clear this.",
                     d.program, d.program, d.program
                 );
             }
         }
     }
-    println!(
-        "doctor: ok — {} program(s) with a proven live build",
+    let _ = writeln!(out,
+        "{p}: ok — {} program(s) with a proven live build",
         live.len()
     );
 
@@ -364,16 +393,16 @@ pub fn run_with(
         // present platform-native hook means PATH wiring is in place.
         let native_hook = format!("{}.{}", crate::hooks::HOOK_BASENAME, native_hook_ext());
         if shell_d.join(&native_hook).is_file() {
-            println!("doctor: ok — shell.d hooks present");
+            let _ = writeln!(out, "{p}: ok — shell.d hooks present");
         } else {
-            println!("doctor: warn — shell.d hooks not generated yet (an install writes them)");
+            let _ = writeln!(out, "{p}: warn — shell.d hooks not generated yet (an install writes them)");
         }
         if let Ok(entries) = std::fs::read_dir(&shell_d) {
             for e in entries.flatten() {
                 if e.file_name().to_string_lossy().ends_with(".sh") {
                     fails += 1;
-                    eprintln!(
-                        "doctor: FAIL — shell.d/{}: a POSIX .sh breaks fish — remove it",
+                    let _ = writeln!(err,
+                        "{p}: FAIL — shell.d/{}: a POSIX .sh breaks fish — remove it",
                         e.file_name().to_string_lossy()
                     );
                 }
@@ -386,8 +415,8 @@ pub fn run_with(
                 && !crate::platform::dir_meta_is_private(&m)
             {
                 fails += 1;
-                eprintln!(
-                    "doctor: FAIL — {} is group/other-writable (login shells source it)",
+                let _ = writeln!(err,
+                    "{p}: FAIL — {} is group/other-writable (login shells source it)",
                     dir.display()
                 );
             }
@@ -396,27 +425,27 @@ pub fn run_with(
 
     // (7) DISK HEADROOM.
     match crate::freespace::available_bytes(&layout.prefix) {
-        Some(free) if free < 5 * GIB => println!(
-            "doctor: warn — only {} free (a toolchain update needs ~2.5x its artifact size)",
+        Some(free) if free < 5 * GIB => { let _ = writeln!(out, 
+            "{p}: warn — only {} free (a toolchain update needs ~2.5x its artifact size)",
             crate::cost::human_bytes(free)
-        ),
-        Some(free) => println!("doctor: ok — {} free", crate::cost::human_bytes(free)),
-        None => println!("doctor: warn — could not query free space"),
+        ); },
+        Some(free) => { let _ = writeln!(out, "{p}: ok — {} free", crate::cost::human_bytes(free)); },
+        None => { let _ = writeln!(out, "{p}: warn — could not query free space"); },
     }
 
     // (8) INDEX FREEZE / AGE (no unverified parse — atpkg's OWN diagnostics only).
     if let Some(status) = crate::status::read(layout) {
         match index_age_days(&status.updated_at, now) {
-            Some(days) if days > 30 => println!(
-                "doctor: warn — {days} day(s) since the last successful update ({}) — publishing \
+            Some(days) if days > 30 => { let _ = writeln!(out, 
+                "{p}: warn — {days} day(s) since the last successful update ({}) — publishing \
                  looks frozen or this machine has been offline",
                 status.updated_at
-            ),
-            Some(days) => println!("doctor: ok — {days} day(s) since the last successful update"),
-            None => println!("doctor: warn — could not parse the last-update time"),
+            ); },
+            Some(days) => { let _ = writeln!(out, "{p}: ok — {days} day(s) since the last successful update"); },
+            None => { let _ = writeln!(out, "{p}: warn — could not parse the last-update time"); },
         }
     } else {
-        println!("doctor: warn — no status.toml yet (no update has run)");
+        let _ = writeln!(out, "{p}: warn — no status.toml yet (no update has run)");
     }
     // The build floor is printed WITH the generation that recorded it, because that pair
     // is the actual gate: a floor stamped with an older generation is re-based by the next
@@ -426,8 +455,8 @@ pub fn run_with(
         index_build: crate::sig::Floor::new(layout.floor()).current(),
         roster_seq: crate::sig::Floor::new(layout.floor_generation()).current(),
     };
-    println!(
-        "doctor: last-trusted index_build {} (recorded under roster_seq {})",
+    let _ = writeln!(out,
+        "{p}: last-trusted index_build {} (recorded under roster_seq {})",
         build_floor.index_build, build_floor.roster_seq
     );
     // The SECOND durable ratchet, shown beside the first because they answer different
@@ -435,14 +464,14 @@ pub fn run_with(
     // advanced, `roster_seq` is which generation of the machine roster this store has
     // accepted. A roster floor that is stuck while machines have been minted or revoked
     // means this store has not seen a publish since, which is worth being able to see.
-    println!(
-        "doctor: last-trusted roster_seq {}",
+    let _ = writeln!(out,
+        "{p}: last-trusted roster_seq {}",
         crate::sig::Floor::new(layout.roster_floor()).current()
     );
 
     // (9) RUSTUP + RELOCATABILITY.
     if !rustup_present() {
-        println!("doctor: warn — rustup not found (self-contained bundles are portable)");
+        let _ = writeln!(out, "{p}: warn — rustup not found (self-contained bundles are portable)");
     }
 
     // (10) THE QUESTION A USER ACTUALLY CAME HERE WITH: do I have the toolchain?
@@ -467,8 +496,8 @@ pub fn run_with(
         .map(|s| s.programs.keys().filter(|k| k.starts_with('-')).collect())
         .unwrap_or_default();
     for stray in &strays {
-        println!(
-            "doctor: warn — the record holds a stray row for {stray:?}, which cannot be a \
+        let _ = writeln!(out,
+            "{p}: warn — the record holds a stray row for {stray:?}, which cannot be a \
              program name (it is a command-line flag, left by a mistyped `atpkg install`). \
              No program is missing because of it; the next successful `aterm pkg update` \
              clears it"
@@ -483,27 +512,27 @@ pub fn run_with(
     let mut toolset_problem = false;
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
-        println!(
-            "doctor: the ALab toolset was removed on this machine (`aterm pkg install \
+        let _ = writeln!(out,
+            "{p}: the ALab toolset was removed on this machine (`aterm pkg install \
              --default-set` reinstalls it)"
         );
     } else if installed.is_empty() {
         toolset_problem = true;
         match recorded_problems.first() {
-            Some(why) => println!("doctor: PROBLEM — no ALab programs are installed ({why})"),
+            Some(why) => { let _ = writeln!(out, "{p}: PROBLEM — no ALab programs are installed ({why})"); },
             // No per-program row survives an ENVIRONMENTAL failure any more — an
             // unreachable index says nothing about any particular program — so the
             // aggregate sentence is now the only place the reason lives. Preferring it to
             // the generic hint is what keeps "why did nothing arrive?" answerable offline.
             None => match status.as_ref().map(|s| s.outcome.as_str()).filter(|o| !o.is_empty()) {
-                Some(outcome) => println!(
-                    "doctor: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
-                ),
-                None => println!(
-                    "doctor: PROBLEM — no ALab programs are installed. Run \
-                     `aterm pkg install --default-set` to see why (it names the reason and \
-                     exits 2 when no build is published for this Mac)"
-                ),
+                Some(outcome) => { let _ = writeln!(out, 
+                    "{p}: PROBLEM — no ALab programs are installed (last attempt: {outcome})"
+                ); },
+                None => { let _ = writeln!(out,
+                    "{p}: PROBLEM — no ALab programs are installed. Fix: aterm pkg install \
+                     --default-set (installs the whole ALab toolset; if no build is \
+                     published for this machine it names the reason and exits 2)"
+                ); },
             },
         }
     } else if !recorded_problems.is_empty() {
@@ -516,26 +545,43 @@ pub fn run_with(
         // a different N would contradict it in the same report — the tail is the line a
         // human reads last and a script would grep. The problems are listed immediately
         // below, so the number is there to be read.
-        println!(
-            "doctor: PROBLEM — the toolset is incomplete; {} program(s) active",
+        let _ = writeln!(out,
+            "{p}: PROBLEM — the toolset is incomplete; {} program(s) active",
             installed.len()
         );
     } else {
-        println!("doctor: {} ALab program(s) active", installed.len());
+        let _ = writeln!(out, "{p}: {} ALab program(s) active", installed.len());
     }
     if let Some(start) = problem_listing_start(declined, installed.is_empty(), recorded_problems.len())
     {
         for why in recorded_problems.iter().skip(start) {
-            println!("doctor:   {why}");
+            let _ = writeln!(out, "{p}:   {why}");
         }
     }
 
     if fails == 0 && !toolset_problem {
-        println!("doctor: healthy");
+        let _ = writeln!(out, "{p}: healthy");
         true
     } else {
         let total = fails + usize::from(toolset_problem);
-        println!("doctor: found {total} problem(s)");
+        let _ = writeln!(out, "{p}: found {total} problem(s)");
+        // THE ONE NEXT ACT — a single command, never a menu: a report that ends in a pile
+        // of problems and three suggestions teaches a first-hour user to close the
+        // terminal. Priority: install the missing SET (an empty store has exactly one
+        // fix), then `update` (a successful pass rewrites every recorded fault row and
+        // re-flips diverged shims), then the structural repair of one named program.
+        // Failures with their remedy already inline (a stray .sh — "remove it") add no
+        // line here rather than a second, vaguer act.
+        let next = if toolset_problem && installed.is_empty() {
+            Some(String::from("aterm pkg install --default-set"))
+        } else if (!recorded_problems.is_empty() && !declined) || next_update_divergence {
+            Some(String::from("aterm pkg update"))
+        } else {
+            next_install_program.map(|program| format!("aterm pkg install {program}"))
+        };
+        if let Some(act) = next {
+            let _ = writeln!(out, "{p}: next — {act}");
+        }
         false
     }
 }
@@ -634,7 +680,7 @@ fn native_hook_ext() -> &'static str {
 ///
 /// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
 /// fault.
-fn report_aterm_posture(layout: &crate::store::Layout) {
+fn report_aterm_posture(layout: &crate::store::Layout, p: &str, out: &mut dyn std::io::Write) {
     let Some(support) = layout.prefix.parent() else {
         return;
     };
@@ -649,15 +695,15 @@ fn report_aterm_posture(layout: &crate::store::Layout) {
         return;
     };
     match (field("status.toml", "current_build"), field("status.toml", "staged_build")) {
-        (Some(current), Some(staged)) if current != staged => println!(
-            "doctor: note — aterm is RUNNING build {current}, installed {installed}, with \
+        (Some(current), Some(staged)) if current != staged => { let _ = writeln!(out, 
+            "{p}: note — aterm is RUNNING build {current}, installed {installed}, with \
              build {staged} staged and waiting for a restart"
-        ),
-        (Some(current), _) if current != installed => println!(
-            "doctor: note — aterm is RUNNING build {current} but build {installed} is \
+        ); },
+        (Some(current), _) if current != installed => { let _ = writeln!(out, 
+            "{p}: note — aterm is RUNNING build {current} but build {installed} is \
              installed; the running process predates it"
-        ),
-        _ => println!("doctor: ok — aterm build {installed} installed"),
+        ); },
+        _ => { let _ = writeln!(out, "{p}: ok — aterm build {installed} installed"); },
     }
 }
 
@@ -735,7 +781,7 @@ mod tests {
         // PATH contains the managed bin/ so even the advisory check is clean.
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a clean install is healthy"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -753,7 +799,7 @@ mod tests {
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         // Structurally spotless — and still not healthy, because there is no toolchain.
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a store with no ALab programs must report a problem, not health"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -802,7 +848,7 @@ mod tests {
         let home = synthetic_home("stray-help");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a mistyped flag left in the record is a stray row, not a missing program"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -814,7 +860,7 @@ mod tests {
         let home = synthetic_home("stray-real");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a real program name in an error state is still a problem doctor must report"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -921,7 +967,7 @@ mod tests {
         let home = synthetic_home("multi-problem");
         let path = std::env::join_paths([l.bin_dir()]).unwrap();
         assert!(
-            !run_with(&l, Some(&home), Some(&path), 0, None, None),
+            !run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "three recorded faults must fail the health verdict"
         );
 
@@ -959,7 +1005,7 @@ mod tests {
         std::fs::create_dir_all(&l.prefix).unwrap();
         std::fs::write(l.declined(), b"# removed on purpose\n").unwrap();
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a deliberate removal is a healthy state, not a fault"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -977,7 +1023,7 @@ mod tests {
             .unwrap();
         let home = synthetic_home("broken");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None),
+            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a dangling bin symlink is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1002,7 +1048,7 @@ mod tests {
         assert!(!crate::store::build_is_complete(&l.build_dir("ay", 18)));
         let home = synthetic_home("missing-store");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None),
+            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "an incomplete active build is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1018,7 +1064,7 @@ mod tests {
         std::fs::create_dir_all(&shell_d).unwrap();
         std::fs::write(shell_d.join("00-atpkg.sh"), b"echo stray\n").unwrap();
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None),
+            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a fish-breaking stray .sh is structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1039,7 +1085,7 @@ mod tests {
         crate::platform::install_shim(&older.join("bin"), &ay, &l.shim(&ay)).unwrap();
         let home = synthetic_home("witness-mismatch");
         assert!(
-            !run_with(&l, Some(&home), None, 0, None, None),
+            !run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "channel says 19, shims say 18 — structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1058,7 +1104,7 @@ mod tests {
         crate::store::mark_build_ready(&dir).unwrap();
         let home = synthetic_home("witness-absent");
         assert!(
-            run_with(&l, Some(&home), None, 0, None, None),
+            run_with(&l, Some(&home), None, 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "an un-witnessed program is advisory, not structural"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -1073,8 +1119,77 @@ mod tests {
         // PATH without the managed bin/ → a warning, not a structural fail.
         let path = std::ffi::OsString::from("/usr/bin:/bin");
         assert!(
-            run_with(&l, Some(&home), Some(&path), 0, None, None),
+            run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut std::io::sink(), &mut std::io::sink()),
             "a PATH warning stays exit-0"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// TWO NAMES, ONE REPORT, AND THE SPEAKER IS THE NAME YOU TYPED. `status` used to
+    /// answer every line as "doctor:" — a user could not tell which verb they had run,
+    /// and a script keying on the prefix keyed on the wrong verb.
+    #[test]
+    fn status_never_speaks_as_doctor() {
+        let l = layout("speaker");
+        install(&l, "ay", 18);
+        let home = synthetic_home("speaker");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        for (invoked, other) in [("status", "doctor:"), ("doctor", "status:")] {
+            let mut out: Vec<u8> = Vec::new();
+            let mut err: Vec<u8> = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                None,
+                invoked,
+                &mut out,
+                &mut err,
+            );
+            for stream in [&out, &err] {
+                let text = String::from_utf8_lossy(stream);
+                assert!(
+                    !text.lines().any(|line| line.starts_with(other)),
+                    "invoked as {invoked}, no line may speak as {other}:\n{text}"
+                );
+                assert!(
+                    text.lines().all(|line| line.is_empty() || line.starts_with(invoked)),
+                    "every line is signed by the verb the user typed ({invoked}):\n{text}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// AN UNHEALTHY REPORT ENDS IN ONE ACT. A fresh machine's only story is "nothing
+    /// installed yet"; the tail must name the one command that fixes it — and exactly
+    /// one, after the byte-stable "found N problem(s)" line, never instead of it.
+    #[test]
+    fn an_unhealthy_report_names_one_next_act() {
+        let l = layout("next-act");
+        let home = synthetic_home("next-act");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        assert!(!run_with(&l, Some(&home), Some(&path), 0, None, None, "doctor", &mut out, &mut err));
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains("doctor: found 1 problem(s)"),
+            "the verdict line keeps its bytes:\n{text}"
+        );
+        let next: Vec<&str> = text.lines().filter(|l| l.starts_with("doctor: next — ")).collect();
+        assert_eq!(
+            next,
+            vec!["doctor: next — aterm pkg install --default-set"],
+            "exactly one next act, and it is the whole-set install:\n{text}"
+        );
+        assert!(
+            text.contains("Fix: aterm pkg install"),
+            "the PROBLEM line states the remedy as what it is:\n{text}"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
         let _ = std::fs::remove_dir_all(&home);

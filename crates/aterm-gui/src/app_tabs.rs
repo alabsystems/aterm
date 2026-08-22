@@ -1121,7 +1121,12 @@ impl App {
                     );
                 }
                 let term_label = |t: &aterm_core::terminal::Terminal| {
-                    resolved_terminal_title_rung(None, t.title(), t.current_working_directory())
+                    use crate::cwd_native::ReportedCwd as _;
+                    // The cwd rung is a LABEL: it must read as a path on this
+                    // platform, so it goes through the native conversion rather
+                    // than showing the engine's RFC 8089 `/C:/…` URI path.
+                    let cwd = t.native_working_directory();
+                    resolved_terminal_title_rung(None, t.title(), cwd.as_deref())
                         .unwrap_or_default()
                 };
                 let fresh = match s.term.try_lock() {
@@ -1410,18 +1415,19 @@ impl App {
             return c.ext.clone();
         }
         let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let cwd = match term.try_lock() {
-            Ok(term) => term
-                .current_working_directory()
+        // The tab TOOLTIP's `cwd: …` line, so it takes the native form — the
+        // reported defect showed `cwd: /C:/Users//m6-an` here.
+        let native_cwd = |t: &aterm_core::terminal::Terminal| {
+            use crate::cwd_native::ReportedCwd as _;
+            t.native_working_directory()
                 .filter(|c| !c.is_empty())
-                .map(str::to_string),
+                .map(|c| c.into_owned())
+        };
+        let cwd = match term.try_lock() {
+            Ok(term) => native_cwd(&term),
             // Recover poison exactly like `term_lock`; poison does not imply
             // another thread currently owns the mutex.
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned
-                .into_inner()
-                .current_working_directory()
-                .filter(|c| !c.is_empty())
-                .map(str::to_string),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => native_cwd(&poisoned.into_inner()),
             Err(std::sync::TryLockError::WouldBlock) => {
                 let stale = self
                     .session_chrome
@@ -1554,6 +1560,21 @@ impl App {
             edit.tab.hash(&mut h);
             edit.text.hash(&mut h);
             edit.cursor.hash(&mut h);
+            // IME-2: while the rename field owns an in-flight composition, the
+            // strip's rename well paints the preedit spliced into the display
+            // text (`splice_tab_strip_with`) — its bytes + caret are part of
+            // what the rows show, so they must move this fingerprint or the
+            // strip row cache (and the RepaintKey's strip term) would keep
+            // serving pre-composition rows while a CJK user types a tab name.
+            // Hashed only under a live rename edit: with no rename field the
+            // preedit never reaches the strip, and the fingerprint stays
+            // byte-identical to the pre-IME value.
+            if let Some(ws) = self.windows.get(&wid)
+                && !ws.preedit.is_empty()
+            {
+                ws.preedit.hash(&mut h);
+                ws.preedit_caret.hash(&mut h);
+            }
         }
         // Never collide with the disabled-strip sentinel (0): a real strip always
         // sets at least bit 0, so a zero-hash strip still forces the first repaint.
@@ -3649,10 +3670,51 @@ impl App {
             return;
         };
         let Some(hit) = tab_bar::hit_test(&segs, col) else {
-            // Bare strip background is not a chip, so it breaks the streak — and it
-            // is still "away" from the field.
+            // Bare strip background is not a chip, so it breaks the chip streak —
+            // and it is still "away" from the field, so it commits an open rename.
+            // Both must happen whatever else the press becomes below.
+            let now = std::time::Instant::now();
+            let band_repeat = self.windows.get(&wid).is_some_and(|ws| {
+                ws.strip_band_press
+                    .is_some_and(|at| now.duration_since(at).as_millis() <= crate::MULTI_CLICK_MS)
+            });
+            // `clear_strip_press` also clears the BAND streak (any other press
+            // breaks a band double-click), so the repeat test above runs first
+            // and the first-press re-arm below runs after.
             self.clear_strip_press(wid);
             self.settle_rename_edit(wid);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.strip_band_press = (!band_repeat).then_some(now);
+            }
+            // W2: the strip's background IS caption space, so give it the two
+            // caption reflexes — press-drag moves the window, double-click
+            // toggles maximize — the Windows Terminal feel, with ZERO non-client
+            // surgery. The window stays plainly decorated (`WM_NCCALCSIZE` at
+            // DefWindowProc), which is what keeps Snap Layouts / Alt+Space /
+            // Win+arrow correct today; `drag_window` just posts
+            // `WM_NCLBUTTONDOWN(HTCAPTION)`, entering the SAME modal move loop a
+            // real caption press would, so snap-while-dragging works too. The
+            // double-click is our own tiny FSM (`strip_band_press`) rather than
+            // the OS's because a client-area press never becomes
+            // `WM_NCLBUTTONDBLCLK`. Gated to Windows: the macOS strip rows are 0
+            // by default (its strip lives in the real titlebar, which already
+            // drags/zooms natively), and the Linux daily-driver lane has not
+            // ratified winit's per-WM drag behaviour — the band press there
+            // stays the pre-W2 no-op. Ordering trap the FSM avoids: the FIRST
+            // press starts a drag; a click-release-click lands here as a repeat
+            // and must NOT also start a drag (the maximize toggle would fight
+            // the modal loop), which is why the repeat arm never calls
+            // `drag_window`. Headless / pre-attach (`os_window: None`) is a
+            // natural no-op, so the strip unit tests exercise the streak
+            // bookkeeping without an OS window.
+            #[cfg(windows)]
+            if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                if band_repeat {
+                    w.set_maximized(!w.is_maximized());
+                } else {
+                    let _ = w.drag_window();
+                }
+            }
             return;
         };
         match hit {
@@ -3676,6 +3738,8 @@ impl App {
                 });
                 if let Some(ws) = self.windows.get_mut(&wid) {
                     ws.strip_press = tab.map(|tab| (now, tab));
+                    // A chip press is not part of a BAND double-click either.
+                    ws.strip_band_press = None;
                 }
                 // A click on a DIFFERENT chip is a click away and COMMITS, matching
                 // the macOS `Wake::SelectTab` arm and every other exit. A click on
@@ -3730,12 +3794,18 @@ impl App {
         }
     }
 
-    /// Break the strip's double-click streak. Any hit that is not "the same chip
-    /// again" ends it, so a Close/`+`/`↻`/background click between two chip presses
-    /// cannot be counted as a double-click on the chip.
+    /// Break the strip's double-click streaks — the chip one AND the bare-band
+    /// one. Any hit that is not "the same chip again" ends the chip streak, so a
+    /// Close/`+`/`↻`/background click between two chip presses cannot be counted
+    /// as a double-click on the chip; symmetrically, any press that is not bare
+    /// band ends the band streak (W2's double-click-maximize), so
+    /// chip-then-band cannot read as a band double-click. The band arm in
+    /// `handle_tab_strip_click` samples its streak BEFORE calling this and
+    /// re-arms after.
     pub(crate) fn clear_strip_press(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_press = None;
+            ws.strip_band_press = None;
         }
     }
 
@@ -6034,6 +6104,52 @@ mod rename_strip_click_tests {
         assert_eq!(app.rename_edit_session(wid), None);
         assert_eq!(pin(&app, 0).as_deref(), Some("kept"));
         assert!(app.windows[&wid].strip_press.is_none(), "streak broken");
+    }
+
+    /// W2: the BARE band keeps its own double-click streak — the FSM behind the
+    /// Windows caption reflexes (press-drag, double-click-maximize) on the
+    /// strip's background. Headless has no OS window, so the drag/maximize
+    /// calls themselves are natural no-ops here; the FSM is the half with rules
+    /// worth pinning: a first band press ARMS, a repeat within the interval
+    /// CONSUMES (so a triple-click starts over instead of re-toggling), a chip
+    /// press in between DISARMS, and a stale press re-arms as a fresh first.
+    #[test]
+    fn bare_band_presses_keep_their_own_double_click_streak() {
+        let (mut app, wid) = app_with_two_tabs();
+        // Far beyond every laid-out segment: genuinely bare band.
+        let band = 999u16;
+        assert!(tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none());
+
+        app.handle_tab_strip_click(wid, band);
+        assert!(
+            app.windows[&wid].strip_band_press.is_some(),
+            "the first band press arms"
+        );
+        app.handle_tab_strip_click(wid, band);
+        assert!(
+            app.windows[&wid].strip_band_press.is_none(),
+            "the repeat is consumed — a third press is a fresh gesture"
+        );
+
+        // A chip press between two band presses breaks the pair (and the
+        // symmetric case — band between chips — is what keeps the rename
+        // double-click honest; `clear_strip_press` covers both).
+        app.handle_tab_strip_click(wid, band);
+        assert!(app.windows[&wid].strip_band_press.is_some());
+        app.handle_tab_strip_click(wid, chip_col(&app, wid, 0));
+        assert!(
+            app.windows[&wid].strip_band_press.is_none(),
+            "a chip press disarms the band streak"
+        );
+
+        // A slow second press is a new first press, not a double-click.
+        app.windows.get_mut(&wid).unwrap().strip_band_press =
+            Some(Instant::now() - Duration::from_millis(crate::MULTI_CLICK_MS as u64 + 50));
+        app.handle_tab_strip_click(wid, band);
+        assert!(
+            app.windows[&wid].strip_band_press.is_some(),
+            "a stale press re-arms instead of consuming"
+        );
     }
 
     /// A TAB THAT VANISHES mid-edit cancels — never a commit, because the user was

@@ -32,6 +32,7 @@ pub mod scrollback_budget;
 mod search_content;
 pub mod state;
 mod tab_ops;
+mod viewport_row_cache;
 mod visible_row_view;
 mod write;
 mod write_split;
@@ -83,8 +84,8 @@ pub(in crate::grid) use crate::{KANI_MAX_COLS, KANI_MAX_ROWS};
 // Test counter re-exports so grid submodules can use `super::count_*`.
 #[cfg(any(test, feature = "testing"))]
 pub(in crate::grid) use crate::test_counters::{
-    count_reflow_passthrough_lines, count_reflow_row_op, count_row_to_line_cell,
-    count_row_to_line_op, count_scrollback_reflow_sync_lines,
+    count_reflow_passthrough_lines, count_reflow_row_op, count_ring_fast_materialize,
+    count_row_to_line_cell, count_row_to_line_op, count_scrollback_reflow_sync_lines,
 };
 
 // Scrollback re-exports for test files migrated from aterm-core (#6556).
@@ -115,6 +116,7 @@ fn clamp_u16(val: i32) -> u16 {
 }
 
 use state::GridStorage;
+pub(in crate::grid) use viewport_row_cache::{HistoryEpoch, ViewportRowCache};
 
 /// Terminal grid.
 ///
@@ -126,6 +128,13 @@ pub struct Grid {
     ///
     /// Accessed explicitly as `self.storage` — no `Deref` chain (#6917).
     pub(crate) storage: GridStorage,
+    /// DERIVED state, not grid state: the memo of materialized history rows a
+    /// scrolled-back viewport reads (SCR-1). Deliberately a sibling of
+    /// `storage` rather than a field inside it — nothing in it is authoritative
+    /// and every entry can be rebuilt from `storage` alone, which is exactly
+    /// why it is safe for it to be filled through `&self`. See the
+    /// `viewport_row_cache` module for the key and its invalidation.
+    pub(in crate::grid) viewport_cache: ViewportRowCache,
 }
 
 impl Grid {

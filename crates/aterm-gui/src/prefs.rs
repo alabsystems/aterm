@@ -341,6 +341,9 @@ pub(crate) const EDIT_TAB_STATUS_DWELL_MS: &str = "tab_status_dwell_ms";
 pub(crate) const EDIT_TAB_STATUS_BADGE: &str = "tab_status_badge";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
+/// macOS Secure Keyboard Entry (`Config::secure_keyboard_entry`, default OFF):
+/// the OS keystroke-snooping guard, actuated by `crate::secure_input`.
+pub(crate) const EDIT_SECURE_KEYBOARD_ENTRY: &str = "secure_keyboard_entry";
 pub(crate) const EDIT_ALLOW_WINDOW_OPS: &str = "allow_window_ops";
 pub(crate) const EDIT_ALLOW_NOTIFICATIONS: &str = "allow_notifications";
 pub(crate) const EDIT_ALLOW_PALETTE_RECONFIGURE: &str = "allow_palette_reconfigure";
@@ -388,6 +391,10 @@ pub(crate) const SECURITY_BOOL_KEYS: &[&str] = &[
     EDIT_ALLOW_NOTIFICATIONS,
     EDIT_ALLOW_PALETTE_RECONFIGURE,
     EDIT_ALLOW_KITTY_FILE_TRANSFER,
+    // Not an allow_* PTY power — the one PROTECTION in the set (the five
+    // above grant programs abilities; this one takes an ability away from
+    // every OTHER process). Same fail-closed default-off contract.
+    EDIT_SECURE_KEYBOARD_ENTRY,
 ];
 
 pub(crate) const EDIT_WINDOW_THEME: &str = "window_theme";
@@ -901,6 +908,14 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
         "key_sequences",
         "a chord→raw-bytes TABLE whose values carry escape sequences that require TOML \
          literal-string quoting; the same no-lossy-encoding rationale as keybindings",
+    ),
+    (
+        "right_click",
+        "the grid right-button gesture (copy_paste|off, platform-defaulted: the conhost/WT \
+         copy-if-selection-else-paste convention on Windows, off elsewhere); Settings has no \
+         Mouse section yet, and seeding this one key as an orphan enum row would misfile a \
+         platform-semantics choice under an unrelated page — it joins the registry with the \
+         Mouse section (wheel bypass, link modifier, middle-click) as one coherent block",
     ),
 ];
 
@@ -2659,7 +2674,8 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
         }
         "Permissions" => {
-            "Off by default. Terminal programs can request access. Notifications work only on macOS and Windows."
+            "Off by default. Programs request access; Secure Keyboard Entry stops \
+             snooping. Notifications: macOS and Windows."
         }
         "Window padding" => {
             "Top padding cannot exceed all-edge padding; constrained values show their effective size."
@@ -2770,6 +2786,7 @@ pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
 fn security_label(key: &str) -> &'static str {
     match key {
         EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard (OSC 52)",
+        EDIT_SECURE_KEYBOARD_ENTRY => "Secure Keyboard Entry (block keystroke snooping)",
         EDIT_ALLOW_WINDOW_OPS => "Allow title / text-grid-size queries (XTWINOPS)",
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
         EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
@@ -3126,6 +3143,15 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "rainbow",
             "confetti",
             "badge",
+        ],
+        EDIT_SECURE_KEYBOARD_ENTRY => &[
+            "secure",
+            "keyboard",
+            "keylogger",
+            "snooping",
+            "password",
+            "privacy",
+            "security",
         ],
         EDIT_SERIOUS_MODE => &[
             "serious",
@@ -4612,6 +4638,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             EDIT_ALLOW_NOTIFICATIONS => cfg.allow_notifications,
             EDIT_ALLOW_PALETTE_RECONFIGURE => cfg.allow_palette_reconfigure,
             EDIT_ALLOW_KITTY_FILE_TRANSFER => cfg.allow_kitty_file_transfer,
+            EDIT_SECURE_KEYBOARD_ENTRY => cfg.secure_keyboard_entry,
             _ => None,
         }
         .unwrap_or(false);

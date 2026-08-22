@@ -66,7 +66,9 @@ pub use imp::{
 // module) and the handoff rendezvous DIALER (`handoff_rendezvous::dial_and_claim`
 // proves the listener is same-uid before it writes the claim secret); the
 // socketpair unit test below calls it directly.
-#[cfg(unix)]
+// Off macOS the rendezvous dialer does not exist and only the unit test
+// below calls it — the re-export rides exactly its consumers.
+#[cfg(all(unix, any(target_os = "macos", test)))]
 pub(crate) use imp::peer_uid;
 // Test-only import: `random_token_hex`'s production callers live inside the
 // per-platform `imp` modules (`provision_token`); only the unit tests below

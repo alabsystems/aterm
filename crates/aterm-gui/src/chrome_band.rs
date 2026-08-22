@@ -39,16 +39,36 @@ fn blend(a: u32, b: u32, t: f32) -> [u8; 3] {
     mix3(rgb(a), rgb(b), t)
 }
 
-fn mix3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
+/// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ [0,1].
+///
+/// `pub(crate)` because the tab strip derives its band, its raised card and its
+/// seam with exactly this blend. It had a byte-identical private copy; two copies
+/// of a colour blend is how two chrome surfaces drift apart by a rounding step.
+pub(crate) fn mix3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     let mix = |x: u8, y: u8| (f32::from(x).mul_add(1.0 - t, f32::from(y) * t)).round() as u8;
     [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
 }
 
-fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
+/// WCAG relative-contrast ratio between two RGB triples.
+///
+/// `pub(crate)` because [`ensure_contrast`] is a one-way ratchet — it can only push
+/// ink AWAY from its surface — and the tab strip needs to know when that ratchet has
+/// overshot (a DIMMED label the floor dragged past full strength is no longer a dim).
+/// Answering that needs the ratio itself, not just the floor.
+pub(crate) fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     aterm_types::Rgb::new(a[0], a[1], a[2]).contrast(aterm_types::Rgb::new(b[0], b[1], b[2]))
 }
 
-fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
+/// Nudge ink `c` toward black/white (whichever the background is not) until it
+/// clears `target`:1 against `bg`, in ten steps, returning the best it reached when
+/// the target is unreachable. A no-op when `c` already clears the target, so it is
+/// safe to wrap an ink that is normally fine and only needs a floor on an
+/// exotic user theme.
+///
+/// `pub(crate)` because the tab strip's inks moved OFF the terminal background and
+/// onto the chrome band, where a theme's own fg/bg contrast no longer describes
+/// what the reader sees.
+pub(crate) fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
     if contrast(c, bg) >= target {
         return c;
     }

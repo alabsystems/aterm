@@ -5,7 +5,10 @@
 //! `CF_UNICODETEXT` get/set over direct `unsafe extern "system"` user32 +
 //! kernel32 FFI — user32 is the unavoidable clipboard surface (there is no
 //! kernel32-only or std alternative), and it is on the approved tiny-FFI list
-//! for exactly this use. UTF-8 <-> UTF-16 conversion is std.
+//! for exactly this use. UTF-8 <-> UTF-16 conversion is std. A separate
+//! `CF_HDROP` reader ([`get_paths`], shell32 `DragQueryFileW`) serves ONLY the
+//! terminal paste path, so an Explorer file-copy pastes as quoted paths (S9)
+//! without ever reaching the text consumers that share [`get`].
 //!
 //! The Win32 clipboard is a contended GLOBAL: `OpenClipboard` fails spuriously
 //! while any other process (a clipboard manager, another copy) holds it, so
@@ -34,9 +37,23 @@ unsafe extern "system" {
     fn GlobalSize(mem: isize) -> usize;
 }
 
+// The documented reader for a CF_HDROP file list (audit S9). shell32 is on the
+// approved tiny-FFI allowlist (see `app_mouse`'s ShellExecuteW); there is no
+// user32/kernel32/std alternative — parsing the DROPFILES block by hand would
+// re-implement exactly this API against an undocumented-layout temptation.
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn DragQueryFileW(hdrop: isize, ifile: u32, file: *mut u16, cch: u32) -> u32;
+}
+
 /// UTF-16 text with a trailing NUL — the one format aterm reads/writes; the
 /// system synthesizes `CF_TEXT`/`CF_OEMTEXT` from it for legacy consumers.
 const CF_UNICODETEXT: u32 = 13;
+/// An Explorer file-copy: a global DROPFILES block listing the copied paths.
+/// Read by [`get_paths`] ONLY — never by [`get`], see its doc for why.
+const CF_HDROP: u32 = 15;
+/// `DragQueryFileW`'s "give me the file COUNT" index sentinel.
+const DRAG_QUERY_COUNT: u32 = 0xFFFF_FFFF;
 /// Movable global memory, the documented allocation kind for clipboard data.
 const GMEM_MOVEABLE: u32 = 0x0002;
 
@@ -111,6 +128,60 @@ pub(crate) fn get() -> Option<String> {
         return None;
     }
     Some(text.replace("\r\n", "\n"))
+}
+
+/// Read the system CLIPBOARD as a FILE LIST (`CF_HDROP` — what Explorer's
+/// Ctrl+C on a file puts up), or `None` when the clipboard holds no file list.
+/// Returns each file's full path, in clipboard order.
+///
+/// DELIBERATELY NOT folded into [`get`] (audit S9): `get`/`pbpaste` is shared
+/// with the find bar and the rename editor, which must never receive quoted
+/// path spam when the user last copied a file in Explorer. The ONE consumer is
+/// the terminal paste path (`App::paste_clipboard_into`), which formats the
+/// paths through the drag-and-drop contract (`input::paths_paste_insertion`)
+/// and only after `CF_UNICODETEXT` came up empty — text always wins, matching
+/// how Explorer itself offers "Copy as path" text alongside the HDROP.
+///
+/// The `GetClipboardData(CF_HDROP)` handle IS the `HDROP` that `DragQueryFileW`
+/// takes (an HGLOBAL over a `DROPFILES` block; the API does its own lock), so
+/// no `GlobalLock` appears here. Per-file, the first call sizes the buffer
+/// (null buffer → required length in UTF-16 units, excluding the NUL) and the
+/// second fills it — the documented two-step. A zero count / all-empty list is
+/// `None`, mirroring `get`'s empty-text contract.
+pub(crate) fn get_paths() -> Option<Vec<String>> {
+    // Cheap pre-check without opening: no file list, no contention.
+    // SAFETY: plain format query, callable anywhere.
+    if unsafe { IsClipboardFormatAvailable(CF_HDROP) } == 0 {
+        return None;
+    }
+    let _guard = open_clipboard()?;
+    // SAFETY: the clipboard is open (guard live). The HDROP handle is owned by
+    // the clipboard — DragQueryFileW only reads it. Buffers are sized by the
+    // API's own length query (+1 for the NUL it always appends) before the fill.
+    let paths = unsafe {
+        let drop = GetClipboardData(CF_HDROP);
+        if drop == 0 {
+            return None;
+        }
+        let count = DragQueryFileW(drop, DRAG_QUERY_COUNT, std::ptr::null_mut(), 0);
+        let mut out = Vec::with_capacity(count as usize);
+        for i in 0..count {
+            let len = DragQueryFileW(drop, i, std::ptr::null_mut(), 0);
+            if len == 0 {
+                continue; // a malformed entry: skip it, keep the rest
+            }
+            let mut buf = vec![0u16; len as usize + 1];
+            let copied = DragQueryFileW(drop, i, buf.as_mut_ptr(), buf.len() as u32);
+            if copied == 0 {
+                continue;
+            }
+            // `copied` excludes the terminating NUL; decode lossily like `get`
+            // so an unpaired surrogate in a hostile path cannot drop the paste.
+            out.push(String::from_utf16_lossy(&buf[..copied as usize]));
+        }
+        out
+    };
+    (!paths.is_empty()).then_some(paths)
 }
 
 /// Outbound line-ending normalization: `CF_UNICODETEXT` convention is CRLF,
@@ -189,6 +260,72 @@ mod tests {
         if set("line1\nline2") {
             assert_eq!(get().as_deref(), Some("line1\nline2"));
         }
+
+        // A text-only clipboard has NO file list (the caller's text-first
+        // precedence never needs get_paths on an ordinary copy)…
+        assert_eq!(get_paths(), None);
+
+        // …and a genuine CF_HDROP (a hand-built DROPFILES block, exactly what
+        // Explorer's Ctrl+C places) round-trips through DragQueryFileW — count,
+        // order, spaces and multibyte intact — while get() correctly reports no
+        // TEXT is available. Same serialized test fn, same global-clipboard
+        // caveat as above.
+        let files = ["C:\\Program Files\\aterm\\例 ✓.txt", "C:\\tmp\\b.txt"];
+        if set_hdrop_for_test(&files) {
+            assert_eq!(
+                get_paths().as_deref(),
+                Some(&files.map(String::from)[..]),
+                "CF_HDROP paths round-trip in order"
+            );
+            assert_eq!(get(), None, "a file-list clipboard is not text");
+        }
+
+        // Leave TEXT on the clipboard, not a phantom file list whose paths do
+        // not exist (pasting that in Explorer raises an error dialog).
+        let _ = set(&marker);
+    }
+
+    /// Test-only CF_HDROP writer: a DROPFILES header (pFiles=20, wide=1) plus a
+    /// double-NUL-terminated UTF-16 path list — the block Explorer itself puts
+    /// up. Built as u16 words (the header's five little-endian DWORDs are word
+    /// pairs), which is sound on the x86/ARM little-endian targets Windows
+    /// ships on. Production code never WRITES CF_HDROP; this exists so the
+    /// reader is proven against the real clipboard, not a mock.
+    fn set_hdrop_for_test(paths: &[&str]) -> bool {
+        // DROPFILES { pFiles: 20, pt: (0,0), fNC: 0, fWide: 1 } as ten u16s.
+        let mut block: Vec<u16> = vec![20, 0, 0, 0, 0, 0, 0, 0, 1, 0];
+        for p in paths {
+            block.extend(p.encode_utf16());
+            block.push(0);
+        }
+        block.push(0); // list terminator (double NUL)
+        let bytes = block.len() * 2;
+        let Some(_guard) = open_clipboard() else {
+            return false;
+        };
+        // SAFETY: mirrors `set` exactly — open clipboard, movable global,
+        // in-bounds copy; ownership passes to the system on success.
+        unsafe {
+            if EmptyClipboard() == 0 {
+                return false;
+            }
+            let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+            if mem == 0 {
+                return false;
+            }
+            let ptr = GlobalLock(mem);
+            if ptr.is_null() {
+                GlobalFree(mem);
+                return false;
+            }
+            std::ptr::copy_nonoverlapping(block.as_ptr(), ptr, block.len());
+            GlobalUnlock(mem);
+            if SetClipboardData(CF_HDROP, mem) == 0 {
+                GlobalFree(mem);
+                return false;
+            }
+        }
+        true
     }
 
     /// Outbound normalization is pure and testable without the clipboard.

@@ -359,5 +359,16 @@ name = "frame_latency"
 harness = false
 required-features = ["bench-support"]
 
+# The WORKSPACE axis (multi-pane/tab/window scaling). `frame_latency`'s
+# `many_tabs_idle/N` prices `redraw_compose`, which sits BELOW `redraw_window`'s
+# wrapper and takes the strip fingerprint as a parameter — so its (true, good)
+# flat result says nothing about the four whole-workspace passes that live in
+# the wrapper, nor the two on the `Wake::Output` arm. This target prices those,
+# at 30 tabs x 4 panes. Same `bench-support` seam, same no-shipping-build law.
+[[bench]]
+name = "workspace_scaling"
+harness = false
+required-features = ["bench-support"]
+
 [lints]
 workspace = true

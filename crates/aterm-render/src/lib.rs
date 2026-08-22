@@ -47,6 +47,11 @@ pub mod font_catalog;
 pub mod font_chain;
 pub mod font_file;
 pub mod hdr;
+/// LINUX CRISPNESS (W13): grid-fitted (hinted) glyph outlines for the native
+/// non-macOS raster path — fontdue has no hinting, so 1.0-scale desktop text
+/// read fuzzy there. The Linux twin of the `ct_glyph` seam; see its docs.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod hinted;
 pub mod ligature_shaping;
 pub mod procedural;
 pub mod scroll_translate;
@@ -841,6 +846,42 @@ pub struct AdmittedFontSources {
     emoji: Option<AdmittedFaceSource>,
 }
 
+/// The top rows of the grid are host CHROME, not terminal content, and their
+/// surface owns the window's padding as well as its own cells.
+///
+/// A cell background can only ever paint a CELL: `render_row_bg` fills rects at
+/// `pad + col·cell_w`, so a chrome row spliced into the grid (the in-grid tab
+/// strip) stops `pad` px short of both window edges, and the `pad_top + head`
+/// strip above row 0 keeps the theme background too. That is invisible while
+/// chrome recedes into the terminal background — it is what every chrome-band
+/// surface in this app did until now — but the moment chrome takes a SURFACE of
+/// its own it ships as a rectangle floating in a dark margin instead of a band,
+/// and any hairline it draws stops short of the edges and reads as an unfinished
+/// rule. This is the renderer-side half of the fix: the host declares which top
+/// rows are chrome and what tone they are, and the padding under them is filled
+/// with that tone instead of the theme background, on BOTH backends.
+///
+/// `None` (the default) is the historical layout, byte-identical in every pixel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChromeBleed {
+    /// How many grid rows from the TOP are chrome. `0` is inert. Row 0 additionally
+    /// owns the whole `[0, grid_top)` strip above the grid (the `head` band plus the
+    /// top pad), because that strip has no row of its own and would otherwise be a
+    /// dark lip above the band.
+    pub rows: usize,
+    /// The chrome surface tone, `0x00RRGGBB`. Painted OPAQUE, exactly like the chrome
+    /// cells themselves: their background is not the frame default, so the
+    /// background-opacity transmittance never applied to them, and a translucent
+    /// gutter beside an opaque band would be the same seam in a different form.
+    pub color: u32,
+    /// The hairline that closes the LAST chrome row against the content below,
+    /// `0x00RRGGBB`, or `None` for a chrome band with no seam. Drawn only in the
+    /// padding — the cells carry their own per-cell underline — at exactly the
+    /// underline geometry [`Renderer::deco_metrics`] gives those cells, so the
+    /// gutter segment and the cell segments are one continuous rule.
+    pub seam: Option<u32>,
+}
+
 /// Monospace CPU rasterizer.
 ///
 /// `font` is the primary monospace face used for Latin/box-drawing. `fallback`
@@ -1058,6 +1099,17 @@ pub struct Renderer {
     /// (byte-identical to before); `false` renders such cells with the regular
     /// face. Real styled faces are unaffected (they are not synthesis).
     synthetic_styles: bool,
+    /// LINUX CRISPNESS (W13): how the native raster path grid-fits outlines
+    /// (`ATERM_FONT_HINTING`, resolved once at construction; `Off` under
+    /// `ATERM_RASTERIZER=fontdue`, so the portable/deterministic path the
+    /// golden/parity tests export stays bit-stable). See [`hinted`].
+    #[cfg(all(unix, not(target_os = "macos")))]
+    hint_mode: hinted::HintMode,
+    /// Per-(face, px) skrifa `HintingInstance` memo — the [`hinted`] twin of
+    /// `ct_cache` (building one replays `fpgm`/`prep`, so never per glyph).
+    /// CLEARED on `set_px` (instances are size-specific), like `ct_cache`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    hint_bank: hinted::HintBank,
     /// The active glyph rasterizer (macOS: CoreText by default, fontdue when forced).
     #[cfg(target_os = "macos")]
     rasterizer: RasterKind,
@@ -1192,6 +1244,10 @@ pub struct Renderer {
     /// `band_offset`, and the frame dimensions are all unaffected — only
     /// [`Self::grid_top`] moves.
     pad_top: Option<usize>,
+    /// The host chrome occupying the TOP grid rows, whose surface tone claims the
+    /// padding gutters as well as its cells — see [`ChromeBleed`]. `None` (default)
+    /// is byte-identical to the historical layout.
+    chrome_bleed: Option<ChromeBleed>,
     baseline: i32,
     theme: Theme,
     /// Per-renderer stem-weight LUT — the identity (no-op) table by DEFAULT. True
@@ -5182,6 +5238,10 @@ impl Renderer {
             runtime_discovery: true,
             styled_faces: [None, None, None],
             synthetic_styles: true,
+            #[cfg(all(unix, not(target_os = "macos")))]
+            hint_mode: hinted::HintMode::from_env(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            hint_bank: hinted::HintBank::default(),
             #[cfg(target_os = "macos")]
             rasterizer: select_rasterizer(),
             #[cfg(target_os = "macos")]
@@ -5221,6 +5281,7 @@ impl Renderer {
             pad: 0,
             head: 0,
             pad_top: None,
+            chrome_bleed: None,
             baseline,
             theme,
             stem_lut: build_stem_lut(env_stem_gamma()),
@@ -5455,6 +5516,9 @@ impl Renderer {
         // the stale CtFont. Same discipline as `set_primary_font`.
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
+        // The hint bank shares the pointer-keying and the aliasing hazard.
+        #[cfg(target_os = "linux")]
+        self.hint_bank.clear();
         Ok(())
     }
 
@@ -5490,6 +5554,9 @@ impl Renderer {
         self.shaped_runs.clear();
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
+        // Pointer-keyed like the CT cache — same swap, same aliasing hazard.
+        #[cfg(target_os = "linux")]
+        self.hint_bank.clear();
         Ok(())
     }
 
@@ -5728,6 +5795,9 @@ impl Renderer {
         // drop them so the new face's CtFonts build fresh.
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
+        // The hint bank keys by the same dropped pointer — clear it with them.
+        #[cfg(target_os = "linux")]
+        self.hint_bank.clear();
         // W9: instantiate the NEW face (config requests + nudge carry over);
         // re-derives the geometry again only when it is actually variable.
         self.refresh_variations();
@@ -6569,6 +6639,12 @@ impl Renderer {
         {
             rebuilt.rasterizer = self.rasterizer;
         }
+        // The Linux twin of the forced-backend handoff: a debug-forced fontdue
+        // parent must not resurrect env-resolved hinting in its rebuild.
+        #[cfg(target_os = "linux")]
+        {
+            rebuilt.hint_mode = self.hint_mode;
+        }
         Ok(rebuilt)
     }
 
@@ -6675,6 +6751,12 @@ impl Renderer {
         {
             fork.rasterizer = self.rasterizer;
         }
+        // W13: a debug-forced fontdue parent (hinting Off) must fork
+        // faithfully — same portable bytes on both sides of the handoff.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            fork.hint_mode = self.hint_mode;
+        }
         Some(fork)
     }
 
@@ -6687,10 +6769,23 @@ impl Renderer {
     }
 
     /// TEST/DEBUG: force the deterministic fontdue rasterizer on this renderer
-    /// (no process-global env var, so it can't race other tests). No-op off macOS,
+    /// (no process-global env var, so it can't race other tests). On macOS it
+    /// switches off the CoreText backend; on Linux it switches off the
+    /// grid-fitted [`hinted`] path (W13) — either way the portable fontdue
+    /// bytes are what rasterize afterwards. No-op on the remaining targets,
     /// where fontdue is already the only backend.
     #[doc(hidden)]
     pub fn debug_force_fontdue(&mut self) {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.hint_mode = hinted::HintMode::Off;
+            self.hint_bank.clear();
+            // Cached coverage is backend-specific (grid-fitted vs fontdue
+            // bytes) — re-rasterize on the forced backend, same discipline as
+            // the macOS arm below.
+            self.glyphs.clear();
+            self.keys.clear();
+        }
         #[cfg(target_os = "macos")]
         {
             self.rasterizer = RasterKind::Fontdue;
@@ -6746,12 +6841,28 @@ impl Renderer {
     }
 
     /// W9: rasterize a BOLD-styled PRIMARY glyph from the REAL bold
-    /// INSTANCE of a variable primary (`vf_bold_coords`, CoreText only) —
-    /// the true-weight replacement for synthetic `embolden` when the `wght`
-    /// axis exists. Applies only to a Primary-source key that asked for
-    /// BOLD; a real bold FILE outranks it (the caller's styled-slot branch
-    /// runs first), and `None` (non-variable primary, fontdue backend, CT
-    /// failure, uncovered char) falls back to the pre-W9 synthetic path.
+    /// INSTANCE of a variable primary (`vf_bold_coords`) — the true-weight
+    /// replacement for synthetic `embolden` when the `wght` axis exists.
+    /// Applies only to a Primary-source key that asked for BOLD; a real bold
+    /// FILE outranks it (the caller's styled-slot branch runs first), and
+    /// `None` (non-variable primary, a `wght` axis too narrow to reach a
+    /// weight class above the resolved base, uncovered char, declined
+    /// raster) falls back to the pre-W9 synthetic path.
+    ///
+    /// Two backends draw the instance, chosen by platform, never by taste:
+    /// CoreText on macOS (hinted + system antialiasing, the same descriptor
+    /// machinery the regular instance uses), and the portable
+    /// [`variation::varied_glyph_raster`] everywhere else — ttf-parser applies
+    /// the coords to the OUTLINE, so the fontdue-only platforms get the real
+    /// weight too. The portable arm used to be a `None` stub justified by
+    /// "fontdue cannot instantiate an axis"; that was true of fontdue and
+    /// irrelevant, because the sibling [`Self::vf_primary_gid_raster`] has
+    /// been drawing the REGULAR instance off macOS through ttf-parser since
+    /// FONT-2 — only bold was left behind. It mattered: `embolden` dilates
+    /// horizontally by `max(1, px/18)` px and leaves the ADVANCE alone, so on
+    /// a 7px Windows cell a 1px stem became a 2px stem bleeding into the next
+    /// column ("command" reading as "commmand"). Nothing clips it — the only
+    /// coverage clamp, [`clamp_to_row_band`], is vertical.
     fn vf_bold_mono_raster(
         &mut self,
         ch: char,
@@ -6769,10 +6880,70 @@ impl Renderer {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            // fontdue cannot instantiate an axis: keep the synthetic path.
-            let _ = (ch, coords);
-            None
+            // The gid is resolved on the primary's own UNICODE cmap for the same
+            // reason the regular path does it (`primary_unicode_gid`) — and the
+            // coords do not disturb it, since ttf-parser's cmap never consults
+            // variation coordinates. Deliberately NOT sharing
+            // `vf_bold_gid_raster` below: `coords` is already in hand here, and
+            // re-entering the helper would only re-unwrap the same field.
+            let gid = self.primary_unicode_gid(ch)?;
+            let bytes = self.rb_primary_bytes.as_deref()?;
+            variation::varied_glyph_raster(bytes, 0, &coords, gid, self.px)
         }
+    }
+
+    /// LINUX CRISPNESS (W13): rasterize glyph `gid` of a PRIMARY-FAMILY face
+    /// (primary / injected bold / styled sibling — the faces that draw at the
+    /// renderer's own px) through the grid-fitted skrifa path ([`hinted`]) —
+    /// the Linux twin of [`Self::ct_glyph`], in the same fontdue-convention
+    /// tuple. `None` (hinting `Off`, unparseable face, missing glyph, draw
+    /// failure) always falls back to the untouched fontdue raster, so this is
+    /// a safe enhancement exactly like the CoreText seam.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn hinted_glyph(
+        &mut self,
+        key_ptr: usize,
+        bytes: &[u8],
+        index: u32,
+        gid: u16,
+    ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+        let inst = self
+            .hint_bank
+            .instance(key_ptr, bytes, index, self.px, self.hint_mode)?;
+        hinted::hinted_glyph_raster(bytes, index, gid, self.px, &inst)
+    }
+
+    /// LINUX CRISPNESS (W13): the by-CHAR hinted raster for a PRIMARY-source
+    /// Mono key — glyph id resolved through the primary's own Unicode cmap
+    /// ([`Self::primary_unicode_gid`], memoized; NOT fontdue's Mac-Roman-prone
+    /// lookup, the same discipline as the styled/fallback paths). A VARIABLE
+    /// primary with resolved coords is excluded: the FONT-2 instantiated
+    /// raster owns those cells, and hinting the `fvar` default would silently
+    /// reset the configured instance.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn hinted_primary_char(
+        &mut self,
+        key: GlyphKey,
+        ch: char,
+    ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+        if key.source != FaceId::Primary || self.var_coords.is_some() {
+            return None;
+        }
+        let gid = self.primary_unicode_gid(ch)?;
+        let bytes = self.rb_primary_bytes.clone()?;
+        self.hinted_glyph(bytes.as_ptr() as usize, &bytes, 0, gid)
+    }
+
+    /// Inert twin (macOS: CoreText owns the native path; Windows/wasm: fontdue
+    /// is the only backend) so the raster chain reads identically everywhere.
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    #[allow(clippy::unused_self)]
+    fn hinted_primary_char(
+        &mut self,
+        _key: GlyphKey,
+        _ch: char,
+    ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+        None
     }
 
     /// W8: rasterize a FALLBACK-face Mono glyph (`Fallback` / `SymbolFallback`
@@ -7286,10 +7457,66 @@ impl Renderer {
     /// rasterizer kind: on macOS the CoreText path draws the instance FIRST, so this is
     /// only ever reached (for a variable primary) on the fontdue backend, where it closes
     /// the "draws only the fvar default instance" gap. Bold cells pass through the
-    /// resolved (regular) instance here and keep their synthetic embolden on top — the
-    /// real-bold-instance path stays CoreText-only.
+    /// resolved (regular) instance here only when the real bold instance was already
+    /// offered and declined — `vf_bold_gid_raster` off macOS, the CoreText block on
+    /// macOS, both of which run first — i.e. when the face has no `wght` axis
+    /// reaching a heavier cut, where synthetic dilation is the honest bold. That
+    /// sibling is named in plain backticks rather than as an intra-doc link on
+    /// purpose: it is `cfg`'d out on macOS (see its own doc), so a `[Self::…]` link
+    /// would resolve to nothing on exactly the platform this doc is compiled for
+    /// there, and `rustdoc::broken_intra_doc_links` would move the `-D warnings`
+    /// failure into the doc lane instead of fixing it.
     fn vf_primary_gid_raster(&self, gid: u16) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         let coords = self.var_coords.as_deref()?;
+        let bytes = self.rb_primary_bytes.as_deref()?;
+        variation::varied_glyph_raster(bytes, 0, coords, gid, self.px)
+    }
+
+    /// The BOLD-instance twin of [`Self::vf_primary_gid_raster`]: rasterize PRIMARY
+    /// glyph `gid` at the resolved REAL bold instance (`vf_bold_coords` — `wght`
+    /// pulled to 700, clamped to the axis) on the portable path. `None` — so the
+    /// caller keeps the regular instance plus synthetic dilation, byte-identical to
+    /// before — when the primary is not variable, when its `wght` axis cannot reach
+    /// a full weight class above the resolved base (`compute_variations` refuses to
+    /// fabricate a "bold" barely heavier than regular, so Consolas and every static
+    /// face still take the synthetic path), when there are no primary bytes, or when
+    /// the outline raster declines.
+    ///
+    /// GRID SAFETY: this returns the bold instance's OWN advance, exactly as the
+    /// regular-instance twin returns the regular one's — and that is safe because
+    /// the per-glyph advance is not what lays out the grid. The cell advance comes
+    /// from `cell_w`, derived once from [`Self::primary_m_advance_px`] at the
+    /// REGULAR coords, and `GlyphImage::advance` is read by nothing on the paint
+    /// path (only by tests), so a 700-weight glyph that measured wider than its 400
+    /// is still placed on the cell advance, never on its own. A monospaced variable
+    /// face holds advances constant across `wght` in any case — the same invariance
+    /// the dark-nudge gate in `compute_variations` checks explicitly — but the
+    /// layout deliberately does not depend on that here.
+    ///
+    /// The grid stays monospaced, but the INK is still the designer's, and a couple
+    /// of glyphs are drawn past the cell by design. Measured on Cascadia Mono at
+    /// px 12 / `cell_w` 7, over the 94 printable-ASCII glyphs: the synthetic
+    /// dilation put 76 of them over the cell edge, the real instance puts 2 — `&`
+    /// (right edge 9 → 8) and `W` (8 → 8, i.e. exactly as far over as the dilation
+    /// already was). So the residue is a property of the face rather than of this
+    /// change, and a stray pixel on bold `W` is expected, not a sign the instance
+    /// path failed. No glyph got LIGHTER (all 94 out-ink their regular cut).
+    ///
+    /// `cfg`'d to the platforms that can reach it. Its only caller is the by-glyph-id
+    /// `#[cfg(not(target_os = "macos"))]` arm; on macOS that arm is stripped, the
+    /// by-char twin's macOS arm calls `ct_glyph` instead, and both tests are likewise
+    /// non-macOS — so without this gate the method would have ZERO macOS callers and
+    /// `dead_code` (warn-by-default, and this workspace lints `--all-targets -- -D
+    /// warnings`) would fail the macOS build. Gated rather than given an artificial
+    /// macOS caller because the gate states the truth: this is the non-CoreText path,
+    /// the same way `ct_glyph` one screen up carries `#[cfg(target_os = "macos")]`.
+    /// Removing it from the macOS compilation cannot change macOS behaviour, since
+    /// nothing there called it. Linux left too when the hinted arm took over the
+    /// unix by-ID path — its VF-bold picks now ride `vf_primary_gid_raster` plus
+    /// the embolden fail-safe — so the one caller left is the Windows arm.
+    #[cfg(not(unix))]
+    fn vf_bold_gid_raster(&self, gid: u16) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
+        let coords = self.vf_bold_coords.as_deref()?;
         let bytes = self.rb_primary_bytes.as_deref()?;
         variation::varied_glyph_raster(bytes, 0, coords, gid, self.px)
     }
@@ -7705,6 +7932,9 @@ impl Renderer {
         // CoreText fonts are built at a fixed px — drop them so they rebuild at `px`.
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
+        // Hinting instances likewise (W13): size-specific, rebuild at `px`.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        self.hint_bank.clear();
     }
 
     /// LIGHT per-window size switch (W12 mixed-DPI): re-target the active
@@ -8189,6 +8419,30 @@ impl Renderer {
     )]
     pub fn set_pad_top(&mut self, pad_top: usize) {
         self.pad_top = Some(pad_top.min(self.pad));
+    }
+
+    /// The host chrome band currently claiming the padding gutters, if any.
+    /// The GPU mirror reads this so the two backends agree pixel for pixel.
+    #[must_use]
+    pub fn chrome_bleed(&self) -> Option<ChromeBleed> {
+        self.chrome_bleed
+    }
+
+    /// Declare (or clear, with `None`) the top rows that are host chrome and the tone
+    /// their surface extends into the window's padding — see [`ChromeBleed`].
+    ///
+    /// NO CACHE INVALIDATION, deliberately, and this is the load-bearing reason it is
+    /// safe: the gutters are only ever repainted for a row the damage tracker already
+    /// decided to repaint, and every input that can change this value (the chrome's
+    /// row count, the theme its tone is derived from) necessarily changes those rows'
+    /// CELLS too — the tone IS those cells' background. So a bleed change can never
+    /// arrive without its rows being dirty, and the damaged path re-establishes each
+    /// dirty band across its FULL width from the theme background
+    /// ([`Self::fill_band_bg`]) before the bleed repaints it, so a stale gutter cannot
+    /// survive either. A value that could change independently of its rows' content
+    /// would need a cache epoch; this one cannot.
+    pub fn set_chrome_bleed(&mut self, bleed: Option<ChromeBleed>) {
+        self.chrome_bleed = bleed.filter(|b| b.rows > 0);
     }
 
     /// The grid content's Y-origin in window px: `pad_top + head` (X stays
@@ -9197,7 +9451,20 @@ impl Renderer {
                             self.ct_glyph(kp, &b, idx, g, self.px, &[], 0)
                         })
                     };
-                    #[cfg(not(target_os = "macos"))]
+                    // LINUX CRISPNESS (W13): the grid-fitted raster is this
+                    // arm's CoreText twin — same face bytes, same by-id
+                    // addressing, same fail-safe to fontdue below.
+                    #[cfg(all(unix, not(target_os = "macos")))]
+                    let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
+                        let src = match (gid, self.styled_faces[slot].as_ref()) {
+                            (Some(g), Some(sf)) => {
+                                Some((sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index, g))
+                            }
+                            _ => None,
+                        };
+                        src.and_then(|(kp, b, idx, g)| self.hinted_glyph(kp, &b, idx, g))
+                    };
+                    #[cfg(not(unix))]
                     let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
                     if let Some(t) = ct {
                         t
@@ -9213,11 +9480,12 @@ impl Renderer {
                     }
                 } else if let Some(t) = self.vf_bold_mono_raster(ch, key) {
                     // W9: a BOLD cell on a variable primary with NO real bold
-                    // file — rasterize the REAL wght≈700 instance via CoreText
-                    // instead of dilating coverage. The face IS bold now, so
-                    // drop BOLD from the synthetic residue (ITALIC, if any,
-                    // stays synthetic). Fontdue fail-safes below keep the
-                    // pre-W9 synthetic path when CT declines.
+                    // file — rasterize the REAL wght≈700 instance (CoreText on
+                    // macOS, the portable outline rasterizer elsewhere) instead
+                    // of dilating coverage. The face IS bold now, so drop BOLD
+                    // from the synthetic residue (ITALIC, if any, stays
+                    // synthetic). Fontdue fail-safes below keep the pre-W9
+                    // synthetic path when the instance raster declines.
                     synth_style = StyleBits(synth_style.0 & !StyleBits::BOLD.0);
                     t
                 } else if matches!(
@@ -9237,6 +9505,12 @@ impl Renderer {
                 {
                     // FONT-2: portable path — the primary char's RESOLVED variable
                     // instance (fontdue below would draw only the fvar default).
+                    t
+                } else if let Some(t) = self.hinted_primary_char(key, ch) {
+                    // LINUX CRISPNESS (W13): grid-fitted primary raster —
+                    // crisp stems/crossbars where unhinted fontdue smears
+                    // across fractional pixel phases. Fontdue below stays the
+                    // fail-safe (and the byte-stable test backend).
                     t
                 } else {
                     let face = match key.source {
@@ -9411,12 +9685,60 @@ impl Renderer {
                     let drawn = vf_bold && ct.is_some();
                     (ct, drawn)
                 };
-                #[cfg(not(target_os = "macos"))]
+                // LINUX CRISPNESS (W13): the grid-fitted raster for the by-ID
+                // (ligature / styled-run / injected-bold) path — the CoreText
+                // block's Linux twin, face picked identically. A variable
+                // primary is EXCLUDED (`var_coords` set): the FONT-2
+                // resolved-instance raster below must keep drawing the
+                // instantiated outline (hinting the fvar default would
+                // silently reset the configured weight). Real bold instances
+                // (W9) are macOS + WINDOWS here (see the `not(unix)` arm just
+                // below), never this one, so `vf_bold_drawn` is always false.
+                #[cfg(all(unix, not(target_os = "macos")))]
+                let (ct, vf_bold_drawn) = {
+                    let src: Option<(usize, std::sync::Arc<[u8]>, u32)> = match &pick {
+                        FacePick::Primary if self.var_coords.is_none() => self
+                            .rb_primary_bytes
+                            .clone()
+                            .map(|b| (b.as_ptr() as usize, b, 0)),
+                        FacePick::Primary => None,
+                        FacePick::InjectedBold { .. } => self
+                            .bold_font_bytes
+                            .clone()
+                            .map(|b| (b.as_ptr() as usize, b, 0)),
+                        FacePick::Styled { slot, .. } => self.styled_faces[*slot]
+                            .as_ref()
+                            .map(|sf| (sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index)),
+                    };
+                    let hinted = src.and_then(|(kp, b, idx)| self.hinted_glyph(kp, &b, idx, gid));
+                    (hinted, false)
+                };
+                // WINDOWS (the `not(unix)` third of the split): the portable twin of
+                // the CoreText block above, and the arm that actually decides how BOLD
+                // looks here — this is the by-ID path plain primary text takes, so a
+                // bold cell that never reaches the per-char Mono arm is drawn from the
+                // real `wght` instance here or synthesized nowhere. Same precondition
+                // as the CT block — a BOLD-styled PRIMARY pick on a face whose `wght`
+                // axis yields a usable bold instance — and the same discipline: only a
+                // SUCCESSFUL raster sets `drawn`, so a declined one keeps the fontdue +
+                // `embolden` fail-safe. An `InjectedBold`/`Styled` pick is excluded
+                // because it already draws from a real bold FILE, which outranks an
+                // instantiated axis. `ct` is the shared name for "a native/instanced
+                // raster the fail-safes below should not override"; there is no
+                // CoreText here.
+                #[cfg(not(unix))]
                 #[allow(clippy::type_complexity)]
                 let (ct, vf_bold_drawn): (
                     Option<(usize, usize, i32, i32, f32, Vec<u8>)>,
                     bool,
-                ) = (None, false);
+                ) = {
+                    let ct = (matches!(pick, FacePick::Primary)
+                        && key.style.contains(StyleBits::BOLD))
+                    .then(|| self.vf_bold_gid_raster(gid))
+                    .flatten();
+                    let drawn = ct.is_some();
+                    (ct, drawn)
+                };
                 let (gw, gh, gxmin, gymin, gadv, mut bytes) = if let Some(t) = ct {
                     t
                 } else if let Some(t) = matches!(pick, FacePick::Primary)
@@ -10338,6 +10660,62 @@ impl Renderer {
         base_span(pixels, y0 * w, y1 * w, bg, base);
     }
 
+    /// Extend a CHROME row's surface into the padding the grid columns cannot reach:
+    /// the left/right gutters beside row `r`, the `[0, grid_top)` strip above row 0,
+    /// and — on the last chrome row — the seam hairline across both gutters. A no-op
+    /// with no [`ChromeBleed`] declared, or for a row below the chrome. See
+    /// [`ChromeBleed`] for why this exists at all.
+    ///
+    /// Runs in `composite_free`'s phase A, immediately after [`Self::render_row_bg`]
+    /// laid the row's cells — so it is the SAME pass on both the full and the damaged
+    /// path, and every later pass (glyph ink, glow, decorations, free sprites) draws
+    /// over it exactly as it draws over a cell background. It is deliberately NOT
+    /// merged into `render_row_bg`: that function is the per-cell background contract
+    /// (and is called per pane on composed rows), while this is one window-space
+    /// border fill per chrome row.
+    fn fill_chrome_bleed(&self, pixels: &mut [u32], w: usize, h: usize, r: usize) {
+        let Some(bleed) = self.chrome_bleed.filter(|b| r < b.rows) else {
+            return;
+        };
+        let (y0, y1) = self.row_band_px(r, h);
+        if y0 >= y1 {
+            return;
+        }
+        // Opaque: the chrome cells beside these gutters are opaque too (their bg is
+        // not the frame default, so `render_row_bg` never gave them the
+        // background-opacity transmittance), and a see-through gutter next to a solid
+        // band is the same broken edge this whole helper exists to close.
+        let color = bleed.color & 0x00ff_ffff;
+        // The grid occupies `[pad, w - pad)` horizontally by construction
+        // (`frame_size` = `cols·cell_w + 2·pad`); derive the right gutter from the
+        // FRAME rather than from `cols·cell_w` so a clamped/oversized frame still
+        // yields a gutter inside the buffer rather than an off-screen one.
+        let right = w.saturating_sub(self.pad);
+        let band_h = y1 - y0;
+        self.fill_rect(pixels, w, h, 0, y0, self.pad, band_h, color);
+        self.fill_rect(pixels, w, h, right, y0, self.pad, band_h, color);
+        // The strip above the grid belongs to no row, so the FIRST chrome row adopts
+        // it — otherwise the band ships with a dark lip along the window's top edge,
+        // which is the same defect as the side margins turned ninety degrees.
+        if r == 0 {
+            self.fill_rect(pixels, w, h, 0, 0, w, self.grid_top(), color);
+        }
+        // The seam, in the gutters only: the cells of this row carry their own
+        // per-cell underline (the host stamps it), and these two segments continue it
+        // to the window edges at the same y and the same thickness, so the finished
+        // rule is one line rather than one line plus two stubs.
+        if let Some(seam) = bleed.seam.filter(|_| r + 1 == bleed.rows) {
+            let deco = self.deco_metrics();
+            // Both metrics are `usize` (underline_t documented `>= 1`), so the
+            // only live guards are the band clamps.
+            let t = deco.underline_t.max(1).min(band_h);
+            let uy = y0 + deco.underline_y.min(band_h - t);
+            let seam = seam & 0x00ff_ffff;
+            self.fill_rect(pixels, w, h, 0, uy, self.pad, t, seam);
+            self.fill_rect(pixels, w, h, right, uy, self.pad, t, seam);
+        }
+    }
+
     /// The `[y0, y1)` device-pixel span of grid row `r`'s band (`grid_top +
     /// r·cell_h` down, one cell tall), clamped to the frame height `h`.
     fn row_band_px(&self, r: usize, h: usize) -> (usize, usize) {
@@ -10536,6 +10914,10 @@ impl Renderer {
             }
             let ctx = self.row_ctx(input, r);
             self.render_row_bg(pixels, w, h, input, &ctx);
+            // A CHROME row's surface continues into the padding the cells cannot
+            // reach (and, on row 0, into the strip above the grid). No-op unless the
+            // host declared a `ChromeBleed`.
+            self.fill_chrome_bleed(pixels, w, h, r);
             self.render_row_images_below_bg(ic, pixels, w, h, input, r, &ctx);
         }
         // Phase B1 — legacy per-row sprites (single-band, byte-identical slot).
@@ -22794,6 +23176,119 @@ mod tests {
             back.pixels, base.pixels,
             "head 0 restores the byte-identical render"
         );
+    }
+
+    /// A declared [`ChromeBleed`] makes the top rows' SURFACE reach the window edges:
+    /// the left/right pad gutters and the whole `[0, grid_top)` strip above the grid
+    /// carry the chrome tone instead of the theme background, and the seam hairline
+    /// continues across both gutters at the cells' own underline geometry. Without
+    /// this, in-grid chrome ships as a rectangle floating in a dark margin with a rule
+    /// that stops short of both edges — see [`ChromeBleed`].
+    ///
+    /// Also the three properties the design leans on: the GRID columns are untouched
+    /// (this is a border fill, not a background policy), rows past the chrome are
+    /// untouched, and `None` restores the byte-identical historical frame.
+    #[test]
+    fn a_chrome_bleed_carries_the_band_and_its_seam_into_the_padding() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const H: usize = 6;
+        const BAND: u32 = 0x0030_3135;
+        const SEAM: u32 = 0x0060_6164;
+        let (_, ch) = r.cell_size();
+        let (rows, cols) = (3usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(b"chrome band");
+        let input = term.cell_frame(rows, cols);
+        r.set_pad(P);
+        r.set_head(H);
+        let base = r.render_input(&input);
+        let bg = Theme::default().bg;
+        let top = r.grid_top();
+        let (w, hgt) = (base.width, base.height);
+
+        assert_eq!(r.chrome_bleed(), None, "no bleed by default");
+        r.set_chrome_bleed(Some(ChromeBleed {
+            rows: 1,
+            color: BAND,
+            seam: Some(SEAM),
+        }));
+        let bled = r.render_input(&input);
+        assert_eq!(
+            (bled.width, bled.height),
+            (w, hgt),
+            "a bleed is pixels only"
+        );
+        let at = |px: &[u32], x: usize, y: usize| px[y * w + x];
+
+        // 1. The whole strip ABOVE the grid (head + top pad) is the band: row 0 adopts
+        //    it, because it belongs to no row and would otherwise be a dark lip.
+        for y in 0..top {
+            for x in 0..w {
+                assert_eq!(at(&bled.pixels, x, y), BAND, "top strip ({x},{y})");
+                assert_eq!(at(&base.pixels, x, y), bg, "…and was bg before");
+            }
+        }
+        // 2. Row 0's left/right gutters are the band, except on the seam scanline.
+        let deco = r.deco_metrics();
+        let t = deco.underline_t.max(1).min(ch);
+        let seam_y0 = top + deco.underline_y.min(ch - t);
+        for y in top..top + ch {
+            let want = if (seam_y0..seam_y0 + t).contains(&y) {
+                SEAM
+            } else {
+                BAND
+            };
+            for x in (0..P).chain(w - P..w) {
+                assert_eq!(at(&bled.pixels, x, y), want, "row-0 gutter ({x},{y})");
+                assert_eq!(at(&base.pixels, x, y), bg, "…and was bg before");
+            }
+        }
+        // 3. The GRID columns are byte-identical — a bleed fills border, never cells.
+        for y in top..hgt {
+            for x in P..w - P {
+                assert_eq!(
+                    at(&bled.pixels, x, y),
+                    at(&base.pixels, x, y),
+                    "grid pixel ({x},{y}) must not move"
+                );
+            }
+        }
+        // 4. Rows past the chrome keep their padding on the theme background.
+        for y in top + ch..hgt {
+            for x in (0..P).chain(w - P..w) {
+                assert_eq!(at(&bled.pixels, x, y), bg, "row-1+ gutter ({x},{y})");
+            }
+        }
+
+        // 5. The DAMAGED path reproduces the fresh render. This is the whole basis for
+        //    `set_chrome_bleed` needing no cache epoch: the gutters repaint with the
+        //    row, and a dirty band is re-established full-width from bg first, so the
+        //    incremental frame cannot drift from the full one.
+        let mut wc = WindowCpu::default();
+        assert_eq!(r.render_input_cached(&mut wc, &input).pixels(), bled.pixels);
+        let mut term2 = Terminal::new(rows as u16, cols as u16);
+        term2.process(b"chrome band\r\nsecond");
+        let moved = term2.cell_frame(rows, cols);
+        let fresh = r.render_input(&moved);
+        assert_eq!(
+            r.render_input_cached(&mut wc, &moved).pixels(),
+            fresh.pixels,
+            "incremental frame must match a fresh one with a bleed in force"
+        );
+
+        // 6. Clearing restores the byte-identical historical frame, and `rows: 0` is
+        //    normalized to no bleed at all rather than an inert one.
+        r.set_chrome_bleed(Some(ChromeBleed {
+            rows: 0,
+            color: BAND,
+            seam: None,
+        }));
+        assert_eq!(r.chrome_bleed(), None, "a zero-row bleed is no bleed");
+        assert_eq!(r.render_input(&input).pixels, base.pixels);
     }
 
     /// `row_pixel_band` extends BOTH grid-edge bands over the chrome strips,

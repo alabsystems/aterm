@@ -188,24 +188,48 @@ const KEYS_HELP: &str = concat!(
     "                      Tab state shows in the title as [active/total].\n\n",
 );
 
-/// See [`KEYS_HELP`] (macOS) — the Linux / non-macOS shortcut set.
+/// See [`KEYS_HELP`] (macOS) — the non-macOS KEYS section, GENERATED from
+/// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`], the same const
+/// `platform_defaults()` seeds, so this help can never drift from what the
+/// window actually does. (It used to: the hand-written list it replaces had
+/// fallen behind the table — no palette, no splits, no prompt jumps, none of
+/// the plain-Ctrl paste trio — and was headed "Linux has no menu bar" on
+/// Windows.) Chords are grouped per action in table order, so paste's three
+/// spellings read as one row; the chord strings are printed VERBATIM because
+/// they are exactly what a `[keybindings]` override key must say.
 #[cfg(not(target_os = "macos"))]
-const KEYS_HELP: &str = concat!(
-    "KEYS (in the window — Linux has no menu bar, so these chords ARE the app menu):\n",
-    "    Ctrl+Shift+C / +V    Copy selection / paste (control-stripped, bracketed).\n",
-    "    Ctrl+= / Ctrl+-      Zoom the font in / out.   Ctrl+0  Reset zoom.\n",
-    "    Ctrl+click           Open a hyperlink / detected URL (http/https/mailto).\n",
-    "    Ctrl+Shift+F         Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
-    "    Ctrl+Shift+S         Open the native Settings tab on Top Settings.\n",
-    "                         Use Manual there for assisted aterm.toml editing.\n",
-    "    Ctrl+Shift+A         About: name / version / build in a simple info dialog\n",
-    "                         (OK, the close dot, or Esc closes). This IS the \"About\" menu.\n",
-    "    Ctrl+Shift+N         Open a new window (same process, same sessions).\n",
-    "    Ctrl+Shift+T         Open a new tab (new shell, same window).\n",
-    "    Ctrl+Shift+W         Close the active tab; closing the last tab quits.\n",
-    "    Ctrl+Shift+Right/Left  Next / previous tab (or Ctrl+PgUp / Ctrl+PgDn).\n",
-    "                         Open tabs show in the strip at the top of the window.\n\n",
-);
+fn keys_help() -> String {
+    let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
+    for &(chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
+        match groups.iter_mut().find(|(a, _)| *a == action) {
+            Some((_, chords)) => chords.push(chord),
+            None => groups.push((action, vec![chord])),
+        }
+    }
+    let rows: Vec<(String, &str)> = groups
+        .into_iter()
+        .map(|(action, chords)| (chords.join(", "), action))
+        .collect();
+    let width = rows.iter().map(|(chords, _)| chords.len()).max().unwrap_or(0);
+    let mut s = String::from(
+        "KEYS (in the window; no menu bar off macOS, so these chords ARE the app menu —\n",
+    );
+    s.push_str("each row is a DEFAULT, rebindable via [keybindings]; see --list-keybinds):\n");
+    for (chords, action) in rows {
+        s.push_str(&format!("    {chords:<width$}  {action}\n"));
+    }
+    // Not a chord, so not in the table: the pointer half of the keymap.
+    s.push_str("    ctrl+click  Open a hyperlink / detected URL (http/https/mailto).\n\n");
+    s
+}
+
+/// The macOS KEYS section: the hardcoded Cmd-* chords, hand-written above —
+/// there is no seed table to generate from (macOS ships an empty
+/// `platform_defaults()`; the menu bar owns these chords).
+#[cfg(target_os = "macos")]
+fn keys_help() -> String {
+    KEYS_HELP.to_string()
+}
 
 const HELP_TAIL: &str = concat!(
     "ENVIRONMENT (each has a flag above; precedence is flag > env > config > default):\n",
@@ -276,7 +300,8 @@ const HELP_TAIL: &str = concat!(
     "              option_as_meta, search_history_lines, focus_boost (Windows:\n",
     "              shell priority follows window focus; default on).\n",
     "  Security    allow_window_ops, allow_notifications, allow_palette_reconfigure,\n",
-    "              allow_kitty_file_transfer  (all opt-in, default off).\n",
+    "              allow_kitty_file_transfer, allow_osc52_query,\n",
+    "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
 );
 
@@ -426,6 +451,8 @@ const STARTER_CONFIG: &str = "\
 # allow_notifications = false
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false
+# allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on
+# secure_keyboard_entry = false    # macOS: block other processes from observing keystrokes (held while aterm is frontmost)
 
 # --- sparkle words (purely visual; NEVER affects copied text, logs, or recordings)
 # Decorate matched words: a randomized SPARKLE over profanity (the \"fuck\" family in
@@ -610,7 +637,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{HELP_HEAD}{KEYS_HELP}{HELP_TAIL}");
+                print!("{HELP_HEAD}{}{HELP_TAIL}", keys_help());
                 std::process::exit(0);
             }
             "-V" | "--version" => {
@@ -699,7 +726,8 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 match crate::explorer_win::install() {
                     Ok(()) => println!(
                         "aterm-gui: installed the 'Open aterm here' Explorer context menu (per-user). \
-                         Right-click a folder, its empty background, or a drive."
+                         Right-click a folder, its empty background, or a drive \
+                         (on Windows 11 the entry appears under 'Show more options' / Shift+F10)."
                     ),
                     Err(e) => {
                         eprintln!("aterm-gui: context-menu install failed: {e}");
@@ -883,6 +911,26 @@ mod tests {
                 "{flag} must be advertised in the help text"
             );
         }
+    }
+
+    /// Off macOS the KEYS section is generated from the platform seed table, so
+    /// EVERY seeded chord and action is documented (the hand-written list it
+    /// replaced had drifted to omit five actions and the plain-Ctrl paste trio)
+    /// and no macOS `cmd+*` chord — which off macOS would mean the shell-owned
+    /// Win/Super key — can leak in.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn keys_help_documents_every_seeded_default_and_no_cmd_chords() {
+        let keys = super::keys_help();
+        for &(chord, action) in crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS {
+            assert!(keys.contains(chord), "{chord} must be documented");
+            assert!(keys.contains(action), "{action} must be documented");
+        }
+        assert!(!keys.contains("cmd+"), "no Cmd chords off macOS:\n{keys}");
+        assert!(
+            keys.contains("ctrl+click"),
+            "the pointer half of the keymap stays documented"
+        );
     }
 
     /// `--headless` and `$ATERM_HEADLESS` are ONE mechanism with two spellings.
@@ -1188,6 +1236,8 @@ mod tests {
             "allow_notifications",
             "allow_palette_reconfigure",
             "allow_kitty_file_transfer",
+            "allow_osc52_query",
+            "secure_keyboard_entry",
         ] {
             assert!(
                 checked.iter().any(|k| k == must),

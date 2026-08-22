@@ -125,8 +125,15 @@ pub(crate) fn count_row_to_line_cell() {
 }
 
 /// Take (read and reset) the row-to-line operation count.
-#[cfg(test)]
-pub(crate) fn take_row_to_line_ops() -> usize {
+///
+/// `pub` under the `testing` feature (unlike its siblings, which are
+/// `cfg(test)`-only) because a DOWNSTREAM crate's tests need it: `Line`
+/// construction from a ring row is what a scrollback COPY pays per selected
+/// line, and the pin that each selected row is resolved exactly ONCE
+/// (aterm-core `selection.rs`, SCR-4) can only be written where
+/// `selection_to_string` lives. Exactly the use the module header describes.
+#[cfg(any(test, feature = "testing"))]
+pub fn take_row_to_line_ops() -> usize {
     ROW_TO_LINE_OPS.with(|c| {
         let v = c.get();
         c.set(0);
@@ -200,6 +207,42 @@ pub(crate) fn count_scrollback_reflow_sync_lines(n: usize) {
 #[cfg(test)]
 pub(crate) fn take_scrollback_reflow_sync_lines() -> usize {
     SCROLLBACK_REFLOW_SYNC_LINES.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+// Counter for RING-tier history rows materialized DIRECTLY from their stored
+// `Row` + `ScrolledRowExtras` (SCR-2's fast path) instead of through the
+// Row -> Line -> cells round trip. Reach is asserted in BOTH directions by the
+// parity test: a realistic corpus must drive it above zero (the fast path
+// really fires, so the parity assertions are not vacuous), and a read that
+// lands in the warm/cold tiers must leave it at zero (it never over-fires onto
+// a tier whose bytes it cannot see).
+thread_local! {
+    static RING_FAST_MATERIALIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the ring fast-materialize counter.
+pub(crate) fn count_ring_fast_materialize() {
+    RING_FAST_MATERIALIZE.with(|c| c.set(c.get() + 1));
+}
+
+/// Take (read and reset) the ring fast-materialize count.
+///
+/// `pub` under the `testing` feature (unlike its `cfg(test)`-only siblings)
+/// because the parity test that needs it lives DOWNSTREAM, in aterm-core: only
+/// there can a corpus of OSC 8 / SGR 58 / emoji / CJK be fed through the real
+/// parser into real scrollback, which is the only way to prove the fast path
+/// agrees with the round trip on the data that actually reaches it.
+///
+/// Gated on the FEATURE alone, not `any(test, feature)`: without the feature
+/// this module is `pub(crate)`, so a `pub fn` no aterm-grid test calls would
+/// read as dead code.
+#[cfg(feature = "testing")]
+pub fn take_ring_fast_materialize() -> usize {
+    RING_FAST_MATERIALIZE.with(|c| {
         let v = c.get();
         c.set(0);
         v

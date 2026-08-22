@@ -109,6 +109,10 @@ impl Terminal {
         // through process().
         let pinned_offset = self.grid.display_offset();
         let lines_before = self.grid.absolute_row_counter();
+        // SELECTION CUSTODY Phase 3: remember which screen this batch STARTED on.
+        // If it ends on the other one, `self.grid` at the epilogue is no longer the
+        // grid whose offset was pinned here — see the re-pin below.
+        let was_alt = self.modes.alternate_screen;
         if pinned_offset > 0 {
             self.grid.scroll_to_bottom();
         }
@@ -181,14 +185,43 @@ impl Terminal {
         // absolute row counter). Clamped to scrollback_lines() so the invariant
         // display_offset <= scrollback_lines() holds even if eviction discarded
         // some of those lines. If no new lines scrolled in, the offset is simply
-        // restored unchanged. The alt screen has no scrollback, so on alt the
-        // counter does not rise and the offset stays 0 — correct.
+        // restored unchanged.
+        //
+        // SELECTION CUSTODY Phase 3 — THE RE-PIN MUST TARGET THE GRID IT PINNED.
+        //
+        // The old code always repinned `self.grid`, with the note "the alt screen
+        // has no scrollback, so on alt the counter does not rise and the offset
+        // stays 0 — correct." That reasoning holds for a batch that was ALREADY on
+        // alt. It is wrong for the batch that ENTERS alt, and that batch is the
+        // whole bug: `enter_alternate_screen_raw` does
+        // `mem::replace(self.grid, new_grid)` (`handler_dec.rs`), so by the time we
+        // get here `self.grid` is the fresh ALT grid — whose `scrollback_lines()` is
+        // 0, so the repin clamps to 0 and does nothing — while the user's MAIN grid
+        // is sitting in `alt_grid` carrying the zero the prologue forced on it.
+        //
+        // Net effect before this fix: running `less`, `man`, `vim`, `fzf` or
+        // `git log` while scrolled back into history destroyed the reading position
+        // PERMANENTLY. Exit restored the main grid wholesale — including its
+        // display_offset of 0.
+        //
+        // So repin the grid that was actually pinned. `lines_added` is 0 for it by
+        // construction: a grid that has been swapped out stopped receiving output,
+        // so no lines entered ITS scrollback during this batch. `repin_display_offset`
+        // clamps to that grid's own `scrollback_lines()`, so `DisplayOffsetValid`
+        // still holds for whichever grid we touch.
         if pinned_offset > 0 {
-            let lines_added = self
-                .grid
-                .absolute_row_counter()
-                .saturating_sub(lines_before);
-            self.grid.repin_display_offset(pinned_offset, lines_added);
+            let entered_alt = !was_alt && self.modes.alternate_screen;
+            if entered_alt {
+                if let Some(main_grid) = self.alt_grid.as_mut() {
+                    main_grid.repin_display_offset(pinned_offset, 0);
+                }
+            } else {
+                let lines_added = self
+                    .grid
+                    .absolute_row_counter()
+                    .saturating_sub(lines_before);
+                self.grid.repin_display_offset(pinned_offset, lines_added);
+            }
         }
 
         // Note: tmux DCS passthrough (`ESC P tmux; ... ST`) works via natural

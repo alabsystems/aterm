@@ -33,6 +33,164 @@ pub mod video_tap;
 // the Tier-1 conformance test can drive the genuine decision headlessly.
 pub use renderer::should_slice;
 
+// H1 (Windows Mica/Acrylic): the DirectComposition VISUAL swapchain opt-in.
+//
+// The default DX12 surface is an HWND swapchain (`CreateSwapChainForHwnd`) whose
+// ONLY composite mode is Opaque — DWM's Mica/Acrylic backdrop
+// (`DWMWA_SYSTEMBACKDROP_TYPE`) is painted strictly BEHIND the window's visual
+// tree, so an opaque client area covers it completely and `background_material`
+// could never reach the client pixels. wgpu 29 ships the alternative wholesale:
+// `Dx12SwapchainKind::DxgiFromVisual` builds an `IDCompositionVisual` +
+// `CreateSwapChainForComposition` swapchain itself, whose caps DO advertise the
+// non-opaque composite modes — a frame presented with per-pixel alpha then blends
+// over the DWM backdrop.
+//
+// The presentation system is an INSTANCE-descriptor property (it decides how
+// `create_surface` interprets a Win32 handle), and the instance is created before
+// any window/config-reload can be consulted — so the opt-in is a process-global
+// latch the frontend sets from config BEFORE building the [`GpuContext`].
+// Rejected alternatives:
+//   * `WGPU_DX12_PRESENTATION_SYSTEM=visual` (wgpu's own env knob): works, but
+//     mutating our own environment as an IPC channel to a library is exactly the
+//     kind of spooky action the explicit `InstanceDescriptor` field exists to
+//     replace — and the env would leak to child shells the terminal spawns.
+//   * Always-visual: the HWND swapchain is the RenderDoc-debuggable, most-mature
+//     path and the shipped default is `background_material = "none"`; the visual
+//     path engages ONLY on explicit config, keeping the default byte-identical.
+//
+// FAIL-SOFT ("DirectComposition unavailable"). On a visual instance
+// `create_surface` only records the HWND: the DComp device / target / visual and
+// the composition swapchain are all built LAZILY by the FIRST `Surface::configure`
+// (wgpu-hal dx12 `DCompositionCreateDevice2` → `CreateTargetForHwnd` →
+// `CreateVisual` → `CreateSwapChainForComposition` → `SetContent` → `Commit`),
+// and wgpu's `Surface::configure` returns no `Result` — a hal failure becomes
+// `ConfigureSurfaceError::InvalidSurface`, delivered to the DEVICE's error sink,
+// whose default handler PANICS (aterm installs no uncaptured-error handler, by
+// design — see `GpuRenderer::clamp_fb_dim`). Left alone, "DComp unavailable"
+// would therefore be a process abort at the first window attach, not a soft
+// error, and the `create_window_surface` Err ⇒ CPU arm would never see it. So
+// `GpuRenderer::create_window_surface` runs the visual path's first configure
+// inside wgpu error scopes and returns `Err`; the frontend's attach arm then
+// consults [`surface_attach_fallback`], withdraws this latch, rebuilds the GPU
+// stack on the plain HWND swapchain (`GpuRenderer::rebuild_on_fresh_context` —
+// the presentation system is instance-level, so a new instance it is), and
+// retries the attach once. The material then styles the caption only, with one
+// diagnostic; the default (non-visual) configure is never scoped.
+#[cfg(windows)]
+static DX12_VISUAL_SWAPCHAIN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Whether a made request was later WITHDRAWN this run (GPU init failed, the
+/// first composition-swapchain configure failed, or the device was lost), so a
+/// later "caption only" diagnostic can say so instead of suggesting a restart
+/// that would only repeat the failure.
+#[cfg(windows)]
+static DX12_VISUAL_SWAPCHAIN_WITHDRAWN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// What [`GpuContext::new`] actually BUILT (requested AND the DX12 backend won
+/// adapter selection), distinct from the request so introspection never reports
+/// an engaged visual path on a `ATERM_GPU_BACKEND=vulkan` escape-hatch run.
+#[cfg(windows)]
+static DX12_VISUAL_SWAPCHAIN_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Request that the NEXT [`GpuContext::new`] build its DX12 instance on the
+/// DirectComposition VISUAL swapchain path (see the latch comment above). Must be
+/// called before the context exists; a GPU-loss recovery rebuild re-reads the
+/// latch, so the choice survives device loss. Windows-only by construction —
+/// every other backend ignores the DX12 options.
+#[cfg(windows)]
+pub fn request_dx12_visual_swapchain() {
+    DX12_VISUAL_SWAPCHAIN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Withdraw the visual-swapchain request. Three frontend arms call this:
+///   * the GPU-init-failure arm — windows created after a failed GPU init go
+///     back to plain HWND attributes (a softbuffer present into a
+///     `WS_EX_NOREDIRECTIONBITMAP` window has no redirection surface to blit
+///     into and would show nothing);
+///   * the GPU-loss downgrade (same softbuffer reasoning for later windows);
+///   * the H1 fail-soft arm — the first composition-swapchain configure failed
+///     (see the latch comment above), so the GPU stack is rebuilt on the HWND
+///     path: [`GpuContext::new`] re-reads the latch, which must be `false` by
+///     then.
+///
+/// Records the withdrawal ([`dx12_visual_swapchain_withdrawn`]) when a request
+/// was actually standing; a withdraw with no request outstanding is a no-op.
+#[cfg(windows)]
+pub fn withdraw_dx12_visual_swapchain() {
+    if DX12_VISUAL_SWAPCHAIN_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        DX12_VISUAL_SWAPCHAIN_WITHDRAWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether a visual-swapchain request was made and then withdrawn this run
+/// (see [`withdraw_dx12_visual_swapchain`]). Diagnostics only: the "material
+/// styles the caption only" once-warning uses it to name the real cause rather
+/// than advise a restart.
+#[cfg(windows)]
+pub fn dx12_visual_swapchain_withdrawn() -> bool {
+    DX12_VISUAL_SWAPCHAIN_WITHDRAWN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// H1 fail-soft: what the frontend does when a window's GPU swapchain attach
+/// ([`GpuRenderer::create_window_surface`]) returns `Err`. The decision is pure
+/// and platform-independent so the latch-withdrawal policy is unit-tested on
+/// every CI runner, even though only Windows can build a visual instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceAttachFallback {
+    /// Another window already presents on this GPU instance, so the instance
+    /// itself works (on a visual instance, its composition swapchain has
+    /// already succeeded once): decline THIS window only. Downgrading or
+    /// rebuilding the shared backend would orphan the live surfaces.
+    DeclineWindow,
+    /// First/only window on a DirectComposition visual instance: the failure is
+    /// the lazily built composition stack (or something the opaque path does
+    /// not need) — withdraw the visual latch, rebuild the GPU stack on the
+    /// opaque HWND swapchain, and retry the attach ONCE. The window's
+    /// `WS_EX_NOREDIRECTIONBITMAP` is harmless to a flip-model HWND swapchain.
+    RebuildOpaque,
+    /// First/only window on a plain instance (or the opaque retry failed too):
+    /// downgrade the whole app to the CPU softbuffer renderer — the pre-H1 arm.
+    CpuRenderer,
+}
+
+/// The [`SurfaceAttachFallback`] for a failed attach, given whether the live
+/// context was built on the visual path (`visual_swapchain_active`) and whether
+/// any other window already presents on it (`other_gpu_windows`). Total over
+/// both inputs; `RebuildOpaque` is chosen iff the instance is visual AND no
+/// other GPU window exists — the one situation where "DComp unavailable" is
+/// the plausible cause and a rebuild orphans nothing.
+#[must_use]
+pub fn surface_attach_fallback(
+    visual_swapchain_active: bool,
+    other_gpu_windows: bool,
+) -> SurfaceAttachFallback {
+    if other_gpu_windows {
+        SurfaceAttachFallback::DeclineWindow
+    } else if visual_swapchain_active {
+        SurfaceAttachFallback::RebuildOpaque
+    } else {
+        SurfaceAttachFallback::CpuRenderer
+    }
+}
+
+/// Whether the visual swapchain has been REQUESTED (config asked for a client-area
+/// backdrop and the frontend latched it). Window creation keys
+/// `with_no_redirection_bitmap` off this — the request is made before any window
+/// exists, while [`dx12_visual_swapchain_active`] is only known after the (possibly
+/// concurrent) GPU init finishes.
+#[cfg(windows)]
+pub fn dx12_visual_swapchain_requested() -> bool {
+    DX12_VISUAL_SWAPCHAIN_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether the live [`GpuContext`] was actually built on the DirectComposition
+/// visual path (ground truth for `aterm-ctl chrome`'s `client=` field).
+#[cfg(windows)]
+pub fn dx12_visual_swapchain_active() -> bool {
+    DX12_VISUAL_SWAPCHAIN_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// wgpu device + queue, plus what we learned about the adapter.
 ///
 /// The `instance` and `adapter` are KEPT (not dropped after device creation) so a
@@ -66,6 +224,14 @@ pub struct GpuContext {
     /// set, rebuilds the whole GPU stack (new instance/adapter/device + per-window
     /// surfaces) or downgrades to the CPU softbuffer backend, instead of freezing.
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// H1 (Windows Mica/Acrylic): whether THIS instance was built on the DX12
+    /// DirectComposition VISUAL swapchain path (`Dx12SwapchainKind::DxgiFromVisual`)
+    /// — i.e. the request latch was set at build time AND the DX12 backend won
+    /// adapter selection. Window surfaces created from a visual instance offer the
+    /// non-opaque composite modes; the renderer keys its backdrop-margin alpha and
+    /// the PreMultiplied present off this, never off the request alone. Always
+    /// `false` off Windows / on wasm / on the Vulkan escape hatch.
+    pub(crate) visual_swapchain: bool,
 }
 
 /// Row alignment required by `copy_texture_to_buffer`.
@@ -192,11 +358,33 @@ impl GpuContext {
         // surface-capable on Metal — the platform doesn't use the display handle
         // (it's only required for GLES/Wayland presentation), so the headless
         // adapter request below can keep `compatible_surface: None`.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        #[cfg_attr(not(windows), allow(unused_mut))] // only the DX12 latch below mutates
+        let mut desc = wgpu::InstanceDescriptor {
             backends: backends_from_env(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-        pollster::block_on(Self::from_instance(instance))
+        };
+        // H1 (Windows Mica/Acrylic): honour the visual-swapchain latch via the
+        // EXPLICIT descriptor field (not wgpu's `WGPU_DX12_PRESENTATION_SYSTEM`
+        // env knob — see the latch comment at the top of this file). Ignored by
+        // every non-DX12 backend, so the `ATERM_GPU_BACKEND=vulkan` escape hatch
+        // still works; `visual_swapchain` below records the ground truth.
+        #[cfg(windows)]
+        if dx12_visual_swapchain_requested() {
+            desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
+        }
+        let instance = wgpu::Instance::new(desc);
+        #[allow(unused_mut, reason = "mutated only on the Windows visual-swapchain arm")]
+        let mut ctx = pollster::block_on(Self::from_instance(instance))?;
+        // The visual path is ACTIVE only if the DX12 backend actually won adapter
+        // selection (the descriptor option is inert elsewhere). Recorded on the
+        // context (renderer decisions) AND the process-global (introspection).
+        #[cfg(windows)]
+        {
+            ctx.visual_swapchain = dx12_visual_swapchain_requested() && ctx.backend == "Dx12";
+            DX12_VISUAL_SWAPCHAIN_ACTIVE
+                .store(ctx.visual_swapchain, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(ctx)
     }
 
     /// ASYNC adapter+device acquisition on an existing `wgpu::Instance`. Shared by
@@ -289,6 +477,9 @@ impl GpuContext {
             instance,
             adapter,
             device_lost,
+            // Seeded false; ONLY the native `new()` (which owns the descriptor
+            // decision) upgrades it — the wasm/web path never has a DComp visual.
+            visual_swapchain: false,
         })
     }
 
@@ -574,5 +765,55 @@ mod env_override_tests {
             Some(wgpu::PowerPreference::LowPower)
         );
         assert_eq!(parse_gpu_power("medium"), None);
+    }
+}
+
+/// H1 fail-soft: the latch-withdrawal decision a failed window-surface attach
+/// drives (`surface_attach_fallback`). Pure, so it runs on every platform.
+#[cfg(test)]
+mod surface_attach_fallback_tests {
+    use super::{SurfaceAttachFallback as F, surface_attach_fallback};
+
+    /// The review's scenario: `background_material` set, DX12 won, DComp is
+    /// unavailable, first window — the ONLY case that withdraws the latch and
+    /// rebuilds on the opaque HWND swapchain (instead of aborting the process).
+    #[test]
+    fn visual_first_window_rebuilds_on_the_opaque_swapchain() {
+        assert_eq!(surface_attach_fallback(true, false), F::RebuildOpaque);
+    }
+
+    /// A later window failing on a WORKING visual instance is not a DComp
+    /// outage (the first window's composition swapchain succeeded): keep the
+    /// pre-H1 hard rollback for that one window, never rebuild under the
+    /// survivors.
+    #[test]
+    fn visual_instance_with_live_gpu_windows_declines_only_this_window() {
+        assert_eq!(surface_attach_fallback(true, true), F::DeclineWindow);
+    }
+
+    /// The shipped default (`background_material = "none"`, HWND swapchain)
+    /// keeps its byte-identical arms: decline when others present, else the
+    /// CPU softbuffer downgrade. No latch to withdraw, no rebuild.
+    #[test]
+    fn plain_instance_keeps_the_pre_h1_arms() {
+        assert_eq!(surface_attach_fallback(false, true), F::DeclineWindow);
+        assert_eq!(surface_attach_fallback(false, false), F::CpuRenderer);
+    }
+
+    /// Totality + the one-liner invariant: `RebuildOpaque` iff visual AND no
+    /// other GPU window; `other_gpu_windows` dominates regardless of the path.
+    #[test]
+    fn rebuild_iff_visual_and_alone() {
+        for visual in [false, true] {
+            for others in [false, true] {
+                let plan = surface_attach_fallback(visual, others);
+                assert_eq!(
+                    plan == F::RebuildOpaque,
+                    visual && !others,
+                    "visual={visual} others={others} -> {plan:?}"
+                );
+                assert_eq!(plan == F::DeclineWindow, others, "others must dominate");
+            }
+        }
     }
 }

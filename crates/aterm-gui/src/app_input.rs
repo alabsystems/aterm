@@ -55,6 +55,28 @@ const INPUT_HOT_WINDOW: std::time::Duration = std::time::Duration::from_millis(5
 /// queued keystroke stays licensed for at most ~2.25 s after the keypress.
 const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::from_millis(1_500);
 
+/// The surface that OWNS the in-flight IME composition of one window — resolved
+/// per frame by [`App::preedit_owner`], mirroring [`App::on_ime_commit`]'s
+/// routing precedence, so where the composition PAINTS and where its commit
+/// LANDS can never disagree. The renderer consults this to pick which splice
+/// draws the marked text and which caret rect anchors the OS candidate window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PreeditOwner {
+    /// No composition in flight — every splice is a zero-cost no-op.
+    None,
+    /// A frontmost NATIVE view (Settings, editor): its own text-input pipeline
+    /// paints the preedit (see `App::native_preedit_active`); the grid splices
+    /// must stay out.
+    Native,
+    /// The inline tab-RENAME field: the composition belongs in its well (it is
+    /// the more deeply focused field — its key gate sits above find's).
+    Rename,
+    /// The open find field: the composition belongs in the find bar's well.
+    Find,
+    /// No field has focus: the composition splices into the GRID at the caret.
+    Grid,
+}
+
 /// A predictor mutation needs a paint when it either removes pixels that were
 /// already on glass or creates/extends a visible overlay. Keeping this decision
 /// in one pure seam prevents conservative flush paths from accidentally keying
@@ -514,6 +536,37 @@ pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
     }
 }
 
+/// How many VIEWPORT lines a wheel gesture of `notch_lines` detents should move:
+/// [`input::wheel_platform_lines`] against this window's viewport height (which is
+/// what a "One screen at a time" detent means, sized like PgUp/PgDn in
+/// `input_scroll_view` so the two gestures cannot disagree about what a page is).
+///
+/// WHY AT THE CONSUMER and not where the delta is banked in `on_mouse_wheel`:
+/// `input::seam_egress` emits ONE mouse report per line while an app is tracking
+/// the mouse. Multiplying before the seam would therefore send three reports per
+/// detent to vim, which applies its OWN three-line `mousescroll` to each — nine
+/// lines a notch. Every terminal on Windows sends one report per detent; the
+/// surfaces that scroll WITHOUT an app's help are the ones that owe the user the
+/// platform's distance, and they are exactly the two callers of
+/// `wheel_platform_lines`: this one, and the DEC-1007 alt-scroll arrow synthesis
+/// inside the seam (the pager — `less`, `man`, `git log`).
+///
+/// ACCEPTED COST: a precision touchpad's sub-detent `LineDelta` fractions are still
+/// banked into whole detents upstream, so touchpad scrolling now moves in 3-line
+/// steps instead of 1-line ones. Scaling the banked FRACTION instead would restore
+/// that granularity, but only by moving the multiplier back before the seam — the
+/// nine-lines-in-vim trap above. A sub-row wheel path is the real fix and belongs
+/// with the render-side sub-row translate the glide already wants.
+fn wheel_viewport_lines(notch_lines: i32, term: &Arc<Mutex<Terminal>>) -> i32 {
+    // `rows()` is read unconditionally even though it only MATTERS for the page
+    // sentinel: branching on the setting first would mean two cache probes for the
+    // common case. Safe to lock here — the only caller (`input_wheel`) holds no
+    // `term_lock` at the call site: `seam_egress` released its own on return, and
+    // the rain gate above it locked only for the length of its own `if let`.
+    let rows = term_lock(term).rows();
+    input::wheel_platform_lines(notch_lines, rows)
+}
+
 /// The modifier-INDEPENDENT logical key of a winit event (the unshifted base
 /// key), used for the keybinding chord lookup so a binding written as the base
 /// key (`cmd+shift+]`, not `cmd+}`) matches regardless of how Shift composes the
@@ -546,7 +599,9 @@ pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
 /// end, `^B`/`^F` and `←`/`→` by character, `⌥←`/`⌥→` by word, `^K`/`^U`/`^W`/
 /// `⌥⌫`/`⌘⌫` to kill, `^D`/`⌦` forward-delete — cannot mean two different things
 /// in two aterm fields. Every one of them repeats on a held key through this
-/// classification.
+/// classification. Off macOS, `Ctrl+←`/`Ctrl+→` and `Ctrl+⌫`/`Ctrl+⌦` are the
+/// SAME word motions (the Windows/GTK text-box convention; see the cfg'd
+/// `by_word` term below) — Alt stays accepted as an alias on every platform.
 ///
 /// Two deliberate exclusions: `↑`/`↓` are NOT claimed (a one-line field has no
 /// vertical motion, and the find bar spends them on match navigation), and plain
@@ -564,6 +619,16 @@ fn field_edit_action(mods: ModifiersState, ev: &KeyEvent) -> Option<crate::app_s
     let ctrl = mods.control_key() && !mods.super_key() && !mods.alt_key();
     // macOS text-field convention: ⌥ = by word, ⌘ = to the end of the line.
     let by_word = mods.alt_key() && !mods.control_key() && !mods.super_key();
+    // Off macOS, CTRL is the native word modifier — Ctrl+←/→ walks words and
+    // Ctrl+⌫/⌦ eats them in every Windows/GTK text box — so it joins `by_word`
+    // for the NAMED-key arms below. Alt stays accepted as an alias (it is also
+    // what the seeded Alt+←/→ pane-nav suspension in `find_suspends_action`
+    // preserves for this field). The ctrl-Character emacs arms are untouched:
+    // they match `Key::Character` bases, which no `by_word` arm does, so ^B/^F
+    // still move by ONE character. macOS keeps ⌥ alone — Ctrl+arrow is not the
+    // word idiom there, and ⌥ composing é/ß is why plain ⌥+letter stays free.
+    #[cfg(not(target_os = "macos"))]
+    let by_word = by_word || ctrl;
     let to_edge = mods.super_key() && !mods.control_key() && !mods.alt_key();
     match &ev.logical_key {
         Key::Named(NamedKey::ArrowLeft) if to_edge => Some(SearchEdit::MoveStart),
@@ -629,6 +694,28 @@ fn is_bare_modifier_key(key: &Key) -> bool {
 /// is the xterm / Terminal.app convention: the Shift+ forms scroll the view, plain
 /// PageUp/Home/End reach the application.
 fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent> {
+    // SELECTION CUSTODY Phase 2 — the DELIBERATE return.
+    //
+    // ⌘↓ jumps to the live bottom, ⌘↑ to the oldest retained line. Both were dead
+    // keys: bare ⌘+arrow is claimed by nothing (`on_key_pane_focus` requires Alt as
+    // well, `on_key_super_chord` matches only `Key::Character`), so they fell into
+    // the Cmd swallow and did nothing at all.
+    //
+    // They exist because Phase 1 removed the accidental ways back to live. Before,
+    // a user who was scrolled up got returned by touching almost any key — which
+    // was the bug. The honest replacement is a chord that MEANS it, and ⇧End was
+    // not it: it needs Fn on every MacBook and is advertised nowhere.
+    //
+    // Routed as a `ScrollIntent` like every other scrollback chord, so it moves the
+    // viewport WITHOUT snapping and WITHOUT clearing — you come back to live with
+    // your selection intact, which a keystroke that reached the seam could not do.
+    if mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key() {
+        return match ev.logical_key {
+            Key::Named(NamedKey::ArrowDown) => Some(ScrollIntent::Bottom),
+            Key::Named(NamedKey::ArrowUp) => Some(ScrollIntent::Top),
+            _ => None,
+        };
+    }
     if !mods.shift_key() || mods.control_key() || mods.alt_key() || mods.super_key() {
         return None;
     }
@@ -646,6 +733,15 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
 /// actions (typing, copying, scrolling — the ones a focused text field owns or would be
 /// desynced by); false for app-level ones (windows, tabs, panes, font, settings, and
 /// find itself), which keep working with the panel open.
+///
+/// The two HORIZONTAL pane-focus actions are the exception to that split, and not
+/// because they are text-level: their default chord off macOS is Alt+←/→
+/// (`Keybindings::platform_defaults`), which is also the ONLY word-motion chord the
+/// shared field keymap has (`field_edit_action`'s `by_word`). Since this block runs
+/// ABOVE the find gate in `on_key`, seeding pane focus without this arm would leave
+/// the find field with no word motion at all on Windows and Linux — a capability
+/// going to zero, not an idiom being shadowed. Alt+↑/↓ mean nothing to a
+/// single-line field, so vertical pane focus stays live with the panel open.
 fn find_suspends_action(action: keybinding::Action) -> bool {
     use keybinding::Action as A;
     matches!(
@@ -661,6 +757,8 @@ fn find_suspends_action(action: keybinding::Action) -> bool {
             | A::JumpPrevPrompt
             | A::JumpNextPrompt
             | A::ToggleViMode
+            | A::FocusPaneLeft
+            | A::FocusPaneRight
     )
 }
 
@@ -2821,7 +2919,8 @@ impl App {
 
     /// `InputEvent::Wheel` arm of [`App::input`]: tracking ON emitted the per-line
     /// reports inside `seam_egress`; tracking OFF scrolls the LOCAL viewport by the
-    /// wheel's lines (>0, guaranteed by the handler/verb) — through the M1 smooth
+    /// wheel's lines (>0, guaranteed by the handler/verb) scaled by the platform's
+    /// lines-per-detent ([`wheel_viewport_lines`]) — through the M1 smooth
     /// glide when the motion policy permits — and repaints. Positive
     /// `display_offset` = older content, so wheel up -> history. `ev` must be
     /// `InputEvent::Wheel { .. }`.
@@ -2853,8 +2952,16 @@ impl App {
             wheel_up,
         } = egress
         {
-            let delta = if wheel_up { wheel_lines } else { -wheel_lines };
-            self.scroll_wheel_animated(wid, term, delta);
+            // The seam counted DETENTS (one report per line while tracking); the
+            // local viewport owes the user the platform's lines-per-detent. Zero is
+            // reachable and meaningful — Windows' "lines to scroll" of 0 means the
+            // wheel does not scroll — so it is honoured as no motion rather than
+            // waking the glide and the scroll pill for a zero-row target.
+            let lines = wheel_viewport_lines(wheel_lines, term);
+            if lines != 0 {
+                let delta = if wheel_up { lines } else { -lines };
+                self.scroll_wheel_animated(wid, term, delta);
+            }
         }
         egress_to_outcome(egress)
     }
@@ -4579,7 +4686,27 @@ impl App {
                 // still fires: those are app-level, not text-level.
                 keybinding::ChordResolution::Action(action)
                     if find_suspends_action(action)
-                        && self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) => {}
+                        && self.windows.get(&wid).is_some_and(|ws| ws.search.is_some()) =>
+                {
+                    // Paste is the ONE suspended action the field itself can honour.
+                    // Suspension alone parked the chord so the field "can own it" —
+                    // and the field never claimed it: `field_edit_action` has no `v`
+                    // arm and its printable tail refuses control chords, so every
+                    // seeded paste spelling (`ctrl+v`, `ctrl+shift+v`, `shift+insert`)
+                    // fell through to `on_key_search_mode`'s `_ => {}` and did
+                    // NOTHING, while the hardcoded ⌘V arm there is Win+V off macOS —
+                    // a chord the shell's clipboard history swallows first. Routing
+                    // the resolved action into the field here makes every spelling —
+                    // including a user rebind — paste into the QUERY, never the PTY
+                    // (`search_paste_in` strips control bytes and stays single-line).
+                    // The other suspended actions stay parked: the empty fall-through
+                    // lets the keystroke drive the field/match navigation below.
+                    if action == keybinding::Action::Paste {
+                        self.search_paste_in(wid);
+                        self.note_press_disposition(wid, &ev, None);
+                        return;
+                    }
+                }
                 keybinding::ChordResolution::Action(action) => {
                     let repeat_action = match action {
                         keybinding::Action::ScrollPageUp => Some(ScrollIntent::Up),
@@ -5247,7 +5374,9 @@ impl App {
     /// swallow-all, because those are the same policy reached by two routes and
     /// they must not disagree:
     ///
-    /// * field edits, `⌘V`, ⎋ and ⏎/⇥ belong to the editor — handled, `true`;
+    /// * field edits, PASTE (`⌘V` and whatever chord `[keybindings]` binds to
+    ///   it — `ctrl+v` & co. off macOS), ⎋ and ⏎/⇥ belong to the editor —
+    ///   handled, `true`;
     /// * a bare modifier is neither content nor an exit — swallowed, `true`;
     /// * EVERYTHING ELSE settles the edit (keeping what was typed, the
     ///   "clicking away" rule) and returns `false`, so the command it was
@@ -5255,9 +5384,18 @@ impl App {
     ///   focused field.
     ///
     /// Placed EARLY in `on_key` — above the rebindable `[keybindings]` and
-    /// `[key_sequences]` block — so ⎋ can never reach the PTY and a configured
-    /// raw-byte rule can never fire from under the field. That is the modal-focus
-    /// leak the find bar, which sits much lower, has to patch case by case.
+    /// `[key_sequences]` block — so ⎋ can never reach the PTY, and so an ACTION
+    /// this gate claims (a field edit, or Paste on whatever chord it is bound to)
+    /// cannot also fire from under the field. That is the modal-focus leak the find
+    /// bar, which sits much lower, has to patch case by case.
+    ///
+    /// NOT yet closed, and the earlier wording here overstated it: a
+    /// `[key_sequences]` RAW-BYTE rule still reaches the PTY. Anything this gate
+    /// does not claim settles the edit and returns `false` by design, and the block
+    /// below then resolves the chord to `ChordResolution::Sequence` →
+    /// `forward_literal_press`, whose only field guard is `ws.search`. Pre-existing
+    /// and separable (it wants the same treatment `ws.search` gets there, not
+    /// another arm here), but it is not the "never" this doc used to claim.
     ///
     /// A NATIVE (macOS) edit is not touched here: AppKit's field editor is the
     /// first responder and already owns those keys.
@@ -5286,6 +5424,13 @@ impl App {
         let base = base_logical_key(ev);
         let bare_cmd =
             mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key();
+        // Whether this keystroke is whatever chord PASTE is currently bound to.
+        // Resolved BEFORE the match because a match guard may not hold a borrow of
+        // `self` that the arm body then needs mutably. `[keybindings]` alone is the
+        // right map to consult: it wins over `[key_sequences]` in `resolve_chord`,
+        // so a chord bound to Paste there resolves to Paste no matter what else
+        // claims it — and asking the map directly avoids `resolve_chord`'s Vec.
+        let paste_chord = self.keybindings.lookup(&base, mods) == Some(keybinding::Action::Paste);
         match &ev.logical_key {
             // ⎋ is the ONE cancel, exactly as in the macOS field editor.
             Key::Named(NamedKey::Escape) => {
@@ -5304,6 +5449,30 @@ impl App {
             }
             // ⌘V pastes into the FIELD, never the PTY behind it.
             _ if bare_cmd && matches!(&base, Key::Character(c) if c.eq_ignore_ascii_case("v")) => {
+                self.rename_paste_in(wid);
+                return true;
+            }
+            // …and so does the CONFIGURED paste chord, which off macOS is the only
+            // one that exists: ⌘V above is the hardcoded macOS chord, while the
+            // Windows/Linux defaults (`ctrl+v`, `ctrl+shift+v`, `shift+insert` —
+            // `Keybindings::platform_defaults`) reach Paste through the keybinding
+            // map. Without this arm all three fell to `_ => {}` below, which
+            // SETTLES the edit — committing the half-typed pin — and returns
+            // `false`; `on_key`'s keybinding block, which sits BELOW this gate,
+            // then resolved the very same chord to `Action::Paste` and wrote the
+            // clipboard to the PTY out from under what the user still believed was
+            // a focused text field. Resolving against the same map that block
+            // consults keeps the two routes agreeing by construction: whatever
+            // chord Paste is bound to is the chord the field claims.
+            //
+            // NOT fixed by teaching `find_suspends_action` about the rename edit
+            // (the other obvious place): that helper's job is to SUSPEND an action
+            // so the find field can own the keystroke, and the rename field's rule
+            // is the opposite one — everything it does not own settles the edit and
+            // falls through ("clicking away"). Suspending Paste there would swallow
+            // the key while leaving the edit open, which is neither policy, and it
+            // would have to run after the settle has already happened.
+            _ if paste_chord => {
                 self.rename_paste_in(wid);
                 return true;
             }
@@ -5400,12 +5569,17 @@ impl App {
     /// staying at the match, highlight kept), `⎋`/`^G` CANCEL (exit, restoring the
     /// pre-find viewport), `↓`/`↑` mirror `^S`/`^R` for non-emacs muscle memory. The
     /// case/regex toggles live on `⌥⌘C`/`⌥⌘R` — NOT plain ⌥ chords, which must stay
-    /// free for Option-composed query characters (é, ß, …) on macOS.
+    /// free for Option-composed query characters (é, ß, …) on macOS. Off macOS they
+    /// ALSO answer to plain `Alt+C`/`Alt+R` (the VS Code find-widget chords): an Alt
+    /// key composes nothing there, and the ⌥⌘ spelling degenerates to Win+Alt —
+    /// Win+Alt+R is the Xbox Game Bar's.
     ///
     /// Everything else about the query is TEXT-FIELD editing, classified (and made
     /// key-repeatable) by [`Self::search_repeat_action`]: caret motion, word/line kills,
     /// and printable insertion. `⌘V` pastes the clipboard into the FIELD (never the
-    /// PTY). ⎋ and ⏎ are commands here, so they must not survive as inserted text —
+    /// PTY) — and so does any chord bound to `Action::Paste`, which the suspension arm
+    /// in `on_key` routes here via [`Self::search_paste_in`] before this handler runs.
+    /// ⎋ and ⏎ are commands here, so they must not survive as inserted text —
     /// see the control-character filter on that classifier's text arm.
     fn on_key_search_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         if self.windows.get(&wid).is_none_or(|ws| ws.search.is_none()) {
@@ -5436,6 +5610,28 @@ impl App {
         // through to the terminal's copy so the match can be copied WITHOUT closing find.
         if bare_cmd && base_is("c") {
             return false;
+        }
+        // Alt+C / Alt+R: the case/regex toggles, off macOS only (the VS Code
+        // find-widget chords, and the ones `find_bar::hint_text` teaches there).
+        // The macOS objection to plain ⌥+letter — Option COMPOSES query
+        // characters (é, ß, …) — does not apply to an Alt key, and the ⌥⌘
+        // spelling below is useless off macOS: ⌘ is the Win/Super key, and
+        // Win+Alt+R belongs to the Xbox Game Bar. Checked BEFORE the field
+        // classifier so a layout whose Alt+letter still yields `ev.text` cannot
+        // type a literal `c` into the query instead of toggling. AltGr stays
+        // safe: winit strips the synthetic Ctrl+Alt while RightAlt composes, and
+        // a LeftCtrl+LeftAlt spelling fails the `!control_key` test here.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let bare_alt = mods.alt_key() && !mods.control_key() && !mods.super_key();
+            if bare_alt && base_is("c") {
+                self.search_toggle_case_in(wid);
+                return true;
+            }
+            if bare_alt && base_is("r") {
+                self.search_toggle_regex_in(wid);
+                return true;
+            }
         }
         if let Some(action) = self.search_repeat_action(wid, mods, ev) {
             self.apply_search_repeat_action(wid, action);
@@ -6310,10 +6506,19 @@ impl App {
         }
     }
 
-    /// IME-1: a composition update (`Ime::Preedit`) — track the marked text so a
-    /// preedit indicator can render and direct key sends stay suppressed while
-    /// composing. An empty preedit ends the composition. Requests a repaint so
-    /// the (minimal) on-screen indicator follows the composition.
+    /// IME-1: a composition update (`Ime::Preedit`) — track the marked text (and
+    /// the platform's caret START within it) so the inline composition can render
+    /// and direct key sends stay suppressed while composing. An empty preedit
+    /// ends the composition. Requests a repaint so the on-screen composition
+    /// follows every keystroke; the paint itself happens at render time, routed
+    /// by [`Self::preedit_owner`]: the GRID arm is
+    /// `RenderInput::overlay_ime_preedit` (frame compositing on the per-frame
+    /// snapshot), while the find and rename wells splice the composition into
+    /// their own field text.
+    ///
+    /// winit reports the caret as a BYTE RANGE; only its START is retained
+    /// (`preedit_caret`) — that is the offset both the overlay and the field
+    /// splices draw the cursor at.
     pub(crate) fn on_ime_preedit(
         &mut self,
         wid: WindowId,
@@ -6365,12 +6570,28 @@ impl App {
         if !vis {
             return;
         }
-        let win_cell = (cur.0.saturating_add(off.0), cur.1.saturating_add(off.1));
+        // Terminal-band cell → FRAME cell: the strip rows sit above the band, so
+        // the frame row is the band row plus the strip height (the same shift the
+        // strip prepend applies to the cells themselves).
+        let frame_cell = (
+            (cur.0.saturating_add(off.0)) as usize + self.tab_strip_rows as usize,
+            (cur.1.saturating_add(off.1)) as usize,
+        );
+        self.report_ime_cursor_area_frame(wid, frame_cell);
+    }
+
+    /// [`Self::report_ime_cursor_area`]'s core, in FRAME cells (row 0 = the top
+    /// strip row when a strip is on; terminal-band callers go through the public
+    /// wrapper, which adds the strip inset). Split out so a caret INSIDE the
+    /// strip — the inline tab-rename well while it owns an IME composition
+    /// ([`PreeditOwner::Rename`]) — can anchor the candidate window on its own
+    /// cell, which the band-coordinate wrapper cannot express (it would need a
+    /// negative band row).
+    pub(crate) fn report_ime_cursor_area_frame(&mut self, wid: WindowId, frame_cell: (usize, usize)) {
         // Read geometry off `&self` BEFORE the `&mut self.windows` borrow below.
         // W12: THIS window's own metrics (mixed-DPI) — the caret rect must track the
         // window's cell box even while the shared renderer is activated to another.
         let (cw, ch) = self.win_cell_size(wid);
-        let strip_px = self.tab_strip_rows as usize * ch.max(1);
         let pad = self.win_pad(wid);
         // The caret Y is the inverse of `pixel_to_term_cell`'s vertical inset, so
         // it uses the tighter top pad (`pad_top + head`) to keep the IME candidate
@@ -6386,10 +6607,10 @@ impl App {
         // Inverse of `app_render::pixel_to_term_cell`: cell → caret top-left px.
         // Resolve BEFORE consulting the cache so same-cell DPI/padding/remainder
         // changes are observable instead of being suppressed as false duplicates.
-        let x = i64::try_from((win_cell.1 as usize) * cw.max(1) + pad)
+        let x = i64::try_from(frame_cell.1 * cw.max(1) + pad)
             .unwrap_or(i64::MAX)
             .saturating_add(band_x);
-        let y = i64::try_from((win_cell.0 as usize) * ch.max(1) + strip_px + pad_top + head)
+        let y = i64::try_from(frame_cell.0 * ch.max(1) + pad_top + head)
             .unwrap_or(i64::MAX)
             .saturating_add(band_y);
         let rect = (
@@ -6422,6 +6643,7 @@ impl App {
         // committed text — the same stale-preedit hazard as `on_ime_preedit`.
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.preedit.clear();
+            ws.preedit_caret = None;
         }
         if self.active_native_view(wid).is_some() {
             if !text.is_empty() {
@@ -6466,6 +6688,34 @@ impl App {
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.request_redraw();
         }
+    }
+
+    /// Which surface OWNS the in-flight IME composition on window `wid` — the
+    /// render-time routing twin of [`Self::on_ime_commit`]'s dispatch, in the
+    /// SAME precedence order (native view, then the inline rename field, then
+    /// the find field, then the grid), so the composition always paints exactly
+    /// where its commit would land. Consulted by the redraw path to decide which
+    /// splice paints the preedit and which one anchors the IME candidate window
+    /// (`set_ime_cursor_area`). [`PreeditOwner::None`] with no composition in
+    /// flight keeps the common path zero-cost: one `is_empty()` on a resident
+    /// `String`, no allocation, no lock.
+    pub(crate) fn preedit_owner(&self, wid: WindowId) -> PreeditOwner {
+        let Some(ws) = self.windows.get(&wid) else {
+            return PreeditOwner::None;
+        };
+        if ws.preedit.is_empty() {
+            return PreeditOwner::None;
+        }
+        if self.active_native_view(wid).is_some() {
+            return PreeditOwner::Native;
+        }
+        if self.inline_rename_edit(wid).is_some() {
+            return PreeditOwner::Rename;
+        }
+        if ws.search.is_some() {
+            return PreeditOwner::Find;
+        }
+        PreeditOwner::Grid
     }
 
     /// Current keyboard modifiers as a mouse-report modifier mask (shift/alt/ctrl
@@ -6886,12 +7136,15 @@ impl App {
     /// of `window` (never `~`-abbreviated — a pasted path must be real), or
     /// `None` when absent — the `Copy CWD` payload. One brief term lock.
     pub(crate) fn tab_session_cwd(&self, window: WindowId, index: usize) -> Option<String> {
+        use crate::cwd_native::ReportedCwd as _;
         let session = self.tab_terminal_session(window, index)?;
         let s = self.pool.get(session)?;
         let term = crate::term_lock(&s.term);
-        term.current_working_directory()
+        // "Real" means real ON THIS PLATFORM: the engine keeps OSC 7's RFC 8089
+        // URI path, so a Windows pasted path must be the native `C:\…` form.
+        term.native_working_directory()
             .filter(|c| !c.is_empty())
-            .map(str::to_string)
+            .map(|c| c.into_owned())
     }
 
     /// The CURRENT position of the canonical tab with stable id `tab` in
@@ -7227,7 +7480,11 @@ mod native_keyboard_boundary_tests {
     }
 
     fn file_uri(path: &std::path::Path) -> String {
-        format!("file://{}", path.to_string_lossy().replace(' ', "%20"))
+        // Built by the SHIPPING encoder, not a hand-rolled `format!` — the
+        // latter is malformed on Windows (drive letter + backslashes after the
+        // authority slot), so every test funnelling through here failed to even
+        // open its document there.
+        crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 
     #[test]
@@ -10194,6 +10451,89 @@ mod press_path_lock_elision_tests {
         term
     }
 
+    /// SELECTION CUSTODY Phase 2 — ⌘-A selects WHAT YOU ARE LOOKING AT.
+    ///
+    /// `select_all` used to snap the viewport to live first, "so 0..rows are stable
+    /// selection coordinates" — which meant Select All while reading history
+    /// selected the screen it had just moved you away from, and destroyed your
+    /// place to do it. The coordinates are made stable the honest way instead: the
+    /// visible rows are mapped through the live `display_offset`, exactly as the
+    /// mouse path maps a click.
+    #[test]
+    fn select_all_selects_the_visible_screen_without_snapping() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        let off = {
+            let mut t = term_lock(&term);
+            t.process("line\r\n".repeat(64).as_bytes());
+            t.scroll_to_top();
+            let off = t.grid().display_offset() as i32;
+            assert_ne!(off, 0, "viewport is in history");
+            off
+        };
+        let rows = i32::from(app.windows[&wid].rows);
+
+        app.select_all();
+
+        let t = term_lock(&term);
+        assert_eq!(
+            t.grid().display_offset() as i32,
+            off,
+            "Select All must not move the viewport"
+        );
+        let sel = t.text_selection();
+        assert!(sel.has_selection(), "a selection was made");
+        assert_eq!(
+            sel.start().row,
+            -off,
+            "the selection starts at the TOP VISIBLE row, not the live top"
+        );
+        assert_eq!(
+            sel.end().row,
+            rows - 1 - off,
+            "…and ends at the bottom visible row"
+        );
+    }
+
+    /// SELECTION CUSTODY Phase 2 — ⌘↓ / ⌘↑, the DELIBERATE return.
+    ///
+    /// Phase 1 removed the accidental ways back to live (touching any key), so the
+    /// honest replacement is a chord that means it. Both were dead keys before:
+    /// bare ⌘+arrow is claimed by nothing, so it fell into the Cmd swallow.
+    ///
+    /// Routed as a `ScrollIntent`, which moves the viewport WITHOUT snapping and
+    /// WITHOUT clearing — so you return to live with your selection intact.
+    #[test]
+    fn cmd_arrows_are_the_deliberate_return_to_live() {
+        use crate::input::ScrollIntent;
+        use winit::keyboard::NamedKey as WNamed;
+        let down = modifier_event(WNamed::ArrowDown, KeyCode::ArrowDown, ElementState::Pressed);
+        let up = modifier_event(WNamed::ArrowUp, KeyCode::ArrowUp, ElementState::Pressed);
+
+        assert!(matches!(
+            super::scrollback_chord(ModifiersState::SUPER, &down),
+            Some(ScrollIntent::Bottom)
+        ));
+        assert!(matches!(
+            super::scrollback_chord(ModifiersState::SUPER, &up),
+            Some(ScrollIntent::Top)
+        ));
+        // ⌘⌥arrow stays PANE FOCUS — the new chord must not shadow it.
+        assert!(
+            super::scrollback_chord(ModifiersState::SUPER | ModifiersState::ALT, &down).is_none(),
+            "cmd+alt+arrow belongs to pane focus"
+        );
+        // …and the existing Shift forms are untouched.
+        let end = modifier_event(WNamed::End, KeyCode::End, ElementState::Pressed);
+        assert!(matches!(
+            super::scrollback_chord(ModifiersState::SHIFT, &end),
+            Some(ScrollIntent::Bottom)
+        ));
+        // A bare arrow still belongs to the PTY.
+        assert!(super::scrollback_chord(ModifiersState::empty(), &down).is_none());
+    }
+
     /// SELECTION CUSTODY (R1) for the modifier keys the ENGINE has no `NamedKey`
     /// for — AltGr on every European layout, and laptop/macOS `Fn`.
     ///
@@ -12464,6 +12804,10 @@ mod find_field_key_tests {
             Action::ScrollPageUp,
             Action::JumpPrevPrompt,
             Action::ToggleViMode,
+            // Not text-level, but its default chord IS the field's only word-motion
+            // chord off macOS (Alt+←/→), and this block runs above the find gate.
+            Action::FocusPaneLeft,
+            Action::FocusPaneRight,
         ] {
             assert!(super::find_suspends_action(action), "{action:?}");
         }
@@ -12474,6 +12818,10 @@ mod find_field_key_tests {
             Action::FontIncrease,
             Action::SplitVertical,
             Action::ToggleSettings,
+            // Alt+↑/↓ mean nothing to a single-line field, so vertical pane focus
+            // keeps working with the panel open.
+            Action::FocusPaneUp,
+            Action::FocusPaneDown,
         ] {
             assert!(!super::find_suspends_action(action), "{action:?}");
         }
@@ -12507,6 +12855,150 @@ mod find_field_key_tests {
             term_lock(&term).content_seq(),
             before,
             "no find-field keystroke reached the shell"
+        );
+    }
+
+    /// A chord BOUND to `Action::Paste` pastes into the QUERY, through the real
+    /// `on_key` routing: the find gate's suspension arm routes the resolved action
+    /// into the field instead of merely parking it. Parking alone left every paste
+    /// chord doing NOTHING — `field_edit_action` has no `v` arm and its text tail
+    /// refuses control chords — while `Paste` still had to be suspended or the
+    /// clipboard would go to the PTY from under the focused field. The clipboard is
+    /// STUBBED (`PBPASTE_STUB`), so the machine's real clipboard is neither read
+    /// nor raced.
+    #[test]
+    fn a_bound_paste_chord_pastes_into_the_query_never_the_pty() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // A rebind only a user could write, overlaid exactly as App::new overlays
+        // it. On macOS the platform table is empty, so this ALSO pins that the
+        // suspension arm works from a bare user table there.
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(
+            &[("ctrl+y".to_string(), "paste".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"needle here\r\n");
+        let before = term_lock(&term).content_seq();
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = Some("needle".to_string()));
+
+        app.search_enter();
+        app.on_key(wid, character("n"));
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("y"));
+        assert_eq!(
+            query(&app, wid),
+            Some(("nneedle".to_string(), 7)),
+            "the bound chord pasted the (stubbed) clipboard at the caret"
+        );
+        assert!(app.windows[&wid].search.is_some(), "find stays open");
+        assert_eq!(
+            term_lock(&term).content_seq(),
+            before,
+            "nothing reached the shell"
+        );
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
+    }
+
+    /// The three SEEDED paste spellings — ctrl+v, ctrl+shift+v, shift+insert
+    /// (`Keybindings::PLATFORM_DEFAULT_PAIRS`) — all paste into the query. This is
+    /// the shipping Windows/Linux configuration: platform defaults installed, no
+    /// user table. Off-macOS only because macOS deliberately seeds no table (⌘V is
+    /// its hardcoded find-field paste, covered above).
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn every_seeded_paste_spelling_pastes_into_the_query() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.keybindings = crate::keybinding::Keybindings::platform_defaults();
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = Some("x".to_string()));
+
+        app.search_enter();
+        set_mods(&mut app, wid, ModifiersState::CONTROL);
+        app.on_key(wid, character("v"));
+        assert_eq!(query(&app, wid), Some(("x".to_string(), 1)), "ctrl+v");
+        set_mods(&mut app, wid, ModifiersState::CONTROL | ModifiersState::SHIFT);
+        app.on_key(wid, character("v"));
+        assert_eq!(query(&app, wid), Some(("xx".to_string(), 2)), "ctrl+shift+v");
+        set_mods(&mut app, wid, ModifiersState::SHIFT);
+        app.on_key(wid, named(NamedKey::Insert));
+        assert_eq!(query(&app, wid), Some(("xxx".to_string(), 3)), "shift+insert");
+        assert!(app.windows[&wid].search.is_some(), "find stays open");
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
+    }
+
+    /// Off macOS, CTRL is the platform word modifier in the shared field keymap
+    /// (`field_edit_action`'s cfg'd `by_word` term): Ctrl+←/→ walk words and
+    /// Ctrl+⌫/⌦ eat them — while Alt stays accepted as an alias, the ctrl-letter
+    /// emacs arms stay by-CHARACTER, and a Ctrl+Alt chord (the LCtrl+LAlt AltGr
+    /// spelling) is NEITHER, so composed input can never word-jump.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_named_keys_are_word_motions_in_the_field_off_macos() {
+        use crate::app_search::SearchEdit;
+        let classify = |mods, ev: &winit::event::KeyEvent| super::field_edit_action(mods, ev);
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::ArrowLeft)),
+            Some(SearchEdit::MoveWordLeft),
+            "Ctrl+← walks a word"
+        );
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::ArrowRight)),
+            Some(SearchEdit::MoveWordRight),
+            "Ctrl+→ walks a word"
+        );
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::Backspace)),
+            Some(SearchEdit::DeleteWordBack),
+            "Ctrl+⌫ eats the previous word"
+        );
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::Delete)),
+            Some(SearchEdit::DeleteWordForward),
+            "Ctrl+⌦ eats the next word"
+        );
+        // Alt stays an alias — the pane-nav suspension preserves it for the field.
+        assert_eq!(
+            classify(ModifiersState::ALT, &named(NamedKey::ArrowLeft)),
+            Some(SearchEdit::MoveWordLeft),
+            "⌥← still walks a word"
+        );
+        // The ctrl-letter emacs arms are untouched: ^B is by ONE character.
+        assert_eq!(
+            classify(ctrl, &character("b")),
+            Some(SearchEdit::MoveCharLeft),
+            "^B stays by-character"
+        );
+        // Ctrl+Alt together qualifies for NEITHER word term (AltGr safety).
+        assert_eq!(
+            classify(ctrl | ModifiersState::ALT, &named(NamedKey::ArrowLeft)),
+            Some(SearchEdit::MoveCharLeft),
+            "Ctrl+Alt+← is not a word motion"
+        );
+    }
+
+    /// The macOS side of the same classifier, byte-identical to what shipped
+    /// before the cfg'd term: CTRL+named-key is NOT a word motion there — ⌥ alone
+    /// owns words (Ctrl+arrow belongs to Mission Control / Spaces on a Mac).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ctrl_named_keys_stay_character_motions_on_macos() {
+        use crate::app_search::SearchEdit;
+        let classify = |mods, ev: &winit::event::KeyEvent| super::field_edit_action(mods, ev);
+        let ctrl = ModifiersState::CONTROL;
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::ArrowLeft)),
+            Some(SearchEdit::MoveCharLeft)
+        );
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::Backspace)),
+            Some(SearchEdit::DeleteBack)
+        );
+        assert_eq!(
+            classify(ctrl, &named(NamedKey::Delete)),
+            Some(SearchEdit::DeleteForward)
         );
     }
 }
@@ -12802,6 +13294,47 @@ mod rename_field_key_tests {
             Some("kept"),
             "keeping what you typed"
         );
+    }
+
+    /// THE BOUND PASTE CHORD STAYS IN THE FIELD — the safety case. ⌘V was the only
+    /// paste this gate claimed, so `ctrl+v` (the seeded Windows/Linux chord, and
+    /// the one Win+V cannot be because the shell owns it for clipboard history)
+    /// fell to "everything else settles": it COMMITTED the half-typed pin, returned
+    /// `false`, and `on_key`'s keybinding block — which sits below this gate and
+    /// consults only `ws.search` for a focused field — then resolved the very same
+    /// keystroke to `Action::Paste` and wrote the clipboard to the PTY.
+    ///
+    /// The clipboard's CONTENT is deliberately not asserted (this reads the real
+    /// system pasteboard); what must hold for any clipboard is that the key was
+    /// claimed and the edit is still open.
+    #[test]
+    fn a_bound_paste_chord_pastes_into_the_field_instead_of_the_pty() {
+        let (mut app, wid) = app_editing();
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+v".to_string(), "paste".to_string());
+        table.insert("ctrl+t".to_string(), "new_tab".to_string());
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
+        type_str(&mut app, wid, "half");
+
+        assert!(
+            app.on_key_rename_mode(wid, ModifiersState::CONTROL, &character("v")),
+            "the field claims the bound paste chord, so on_key returns before its \
+             keybinding block can deliver Paste to the PTY"
+        );
+        assert!(
+            app.rename_edit_session(wid).is_some(),
+            "a paste is an edit, not an exit — the field is still open"
+        );
+        assert_eq!(pin(&app, 0), None, "and nothing was committed");
+
+        // ONLY Paste is claimed: an app-level bound action still settles the edit
+        // and falls through, exactly as an unbound key does.
+        assert!(
+            !app.on_key_rename_mode(wid, ModifiersState::CONTROL, &character("t")),
+            "ctrl+t is New Tab, not a field edit"
+        );
+        assert!(app.rename_edit_session(wid).is_none(), "the edit settled");
+        assert!(pin(&app, 0).is_some(), "keeping what was typed");
     }
 
     /// A HELD key repeats against the SESSION captured at press time, and a repeat

@@ -137,9 +137,18 @@ impl Sandbox {
     }
 }
 
+#[cfg(unix)]
 fn chmod_700(path: &Path) -> Option<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).ok()
+}
+
+/// No POSIX permission bits on Windows (privacy there is the per-user ACL a
+/// `%LOCALAPPDATA%`-rooted directory already inherits), so this is a no-op that
+/// reports success — the same contract `atpkg::platform::windows::set_mode` uses.
+#[cfg(not(unix))]
+fn chmod_700(_path: &Path) -> Option<()> {
+    Some(())
 }
 
 /// Outcome of the shared "build, launch, wait for the socket" preamble.
