@@ -495,23 +495,25 @@ release_asset_records() {
 	case "$name" in
 	aterm-appcast.toml | aterm-appcast.toml.sig) ;;
 	*)
-		# Two canonical container names, both anchored and version-shaped. The zip
-		# is admitted because Intel Macs install FROM it: the sealed payload's bulk
-		# is the Trust compiler bundles, and that group publishes aarch64 only, so
-		# those machines take the lean container instead of ~1.0 GB they mostly
-		# cannot run — the ALab programs that DO carry an x86_64-apple-darwin row
-		# arrive over the network instead. Without this arm the whole lean lane was
-		# dead on arrival — every Intel install aborted here with "noncanonical
-		# name" before downloading a byte.
+		# Three canonical container names, all anchored and version-shaped. The
+		# zip is admitted because lean installs come FROM it (Intel on releases
+		# without an Intel DMG, and any --no-toolchain install); without that arm
+		# the whole lean lane was dead on arrival — every Intel install aborted
+		# here with "noncanonical name" before downloading a byte. The
+		# `-x86_64.dmg` row is the Intel batteries-included DMG (per-arch pair,
+		# 2026-08): releases whose seed covers x86_64-apple-darwin name it in
+		# the manifest (`dmg_x86_64`), and an Intel + toolchain install elects
+		# it — the same signed universal app with that architecture's seed.
 		#
 		# Kept as an explicit allowlist rather than a loosened pattern: the point of
 		# this gate is that a manifest cannot name an arbitrary asset in the
-		# release, and `-mac.zip` is exactly as constrained as `.dmg`.
+		# release, and each suffix is exactly as constrained as `.dmg`.
 		#
 		# The Linux rows are the same shape: the released ONE binary's tarball
 		# and its sha256 sidecar — that sidecar is the Linux lane's integrity
 		# anchor while the signed appcast carries no linux keys.
 		[[ "$name" =~ ^aterm-[0-9]+(\.[0-9]+)+\.dmg$ ||
+			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-x86_64\.dmg$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-mac\.zip$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-linux-x86_64\.tar\.gz(\.sha256)?$ ]] || {
 			echo "install.sh: refusing asset lookup for noncanonical name $name" >&2
@@ -1603,7 +1605,9 @@ install_app() {
 		! TEAM_MANIFEST="$(toml_single_str "$TMP/aterm-appcast.toml" team_id 0)" ||
 		! MIN_OS="$(toml_single_str "$TMP/aterm-appcast.toml" min_os 0)" ||
 		! ZIP_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" zip 0)" ||
-		! ZIP_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" zip_sha256 0)"; then
+		! ZIP_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" zip_sha256 0)" ||
+		! DMG_X86_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" dmg_x86_64 0)" ||
+		! DMG_X86_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" dmg_x86_64_sha256 0)"; then
 		echo "install.sh: release $TAG has a malformed or duplicate manifest identity field" >&2
 		exit 1
 	fi
@@ -1615,32 +1619,32 @@ install_app() {
 	# semantics; see required_team_for.
 	TEAM_WANT="$(required_team_for "$REPO_SLUG" "${ATERM_TEAM_ID:-}" "$TEAM_MANIFEST")" || exit 1
 
-	# --- pick the container: fat DMG, or the LEAN zip -------------------------
-	# The DMG carries the batteries-included toolchain seal (~1.0 GB of signed
-	# tarballs — measured 2026-08-19, docs/GOLDEN-INSTALL-PATH.md) so a first
-	# launch provisions the whole ALab toolset with no network. The zip is the
-	# SAME signed, notarized bundle with that payload stripped (~1/40 the
-	# bytes) — it already exists, is already published every cut, and is what
-	# self-updates download.
+	# --- pick the container: per-arch DMG, or the LEAN zip --------------------
+	# The DMG carries the batteries-included toolchain seal (signed tarballs +
+	# manifests — docs/GOLDEN-INSTALL-PATH.md) so a first launch provisions the
+	# whole ALab toolset with no network. Since the per-arch DMG pair (2026-08)
+	# a release can carry TWO batteries-included DMGs: the canonical
+	# `aterm-<v>.dmg` (arm64 seed) and the additive `aterm-<v>-x86_64.dmg`
+	# (Intel seed), named by the manifest's optional dmg_x86_64/dmg_x86_64_sha256
+	# pair. The zip is the SAME signed, notarized bundle with the seal stripped
+	# (~1/40 the bytes) — it already exists, is already published every cut, and
+	# is what self-updates download.
 	#
-	# TWO cases take the lean container; the DMG stays the default, because the
-	# toolset is the product (docs/GOLDEN-INSTALL-PATH.md §1.3):
-	#   ARCHITECTURE — not a preference, correctness: the seal's bulk is the
-	#   Trust compiler coherence group (trust / trust-ir / trust-cg / trust-vc),
-	#   which publishes aarch64-apple-darwin ONLY and moves all-or-nothing, so on
-	#   an x86_64 Mac most of the fat DMG's extra ~1.0 GB is bytes the first
-	#   launch deletes. The programs that DO carry an x86_64-apple-darwin row
-	#   (ay, clean, nn, ny, ty, trust-mc) reach that Mac over the network — the
-	#   lane the lean container already relies on. Not sending the seal is not
-	#   "opting out of batteries"; it is not shipping a gigabyte of aarch64
-	#   tarballs to a CPU that cannot run them.
-	#   --no-toolchain — the flag already excludes the toolset, so the sealed
-	#   payload would ride down only to be deleted unopened. The lean container
-	#   is the SAME signed bundle without the dead weight, and the toolset
-	#   installs later, over the network, with `aterm pkg seed` or
-	#   `aterm pkg install --default-set`. This adds NO new knob: batteries
-	#   stay the default, and only an exclusion already made stops paying for
-	#   what it excluded.
+	# Election order, because the toolset is the product
+	# (docs/GOLDEN-INSTALL-PATH.md §1.3):
+	#   APPLE SILICON + toolchain — the canonical DMG. Default, unchanged.
+	#   INTEL + toolchain, manifest names an Intel DMG — that DMG: batteries
+	#   included on Intel, for the first time, with this architecture's own
+	#   binaries in the seed (since atpkg index 14 every ALab program publishes
+	#   x86_64-apple-darwin). Keyed on the MANIFEST fields, never on the release
+	#   listing: an older release without the pair takes the next arm.
+	#   INTEL + toolchain, no Intel DMG in this release — the lean zip, and the
+	#   published x86_64 programs arrive over the network
+	#   (`aterm pkg install --default-set`). This was the only Intel lane before
+	#   the pair existed, and stays the fallback so every older release keeps
+	#   installing.
+	#   --no-toolchain — the lean zip on any CPU: the flag already excludes the
+	#   toolset, so a sealed payload would ride down only to be deleted unopened.
 	# ZIP_NAME/ZIP_SHA were parsed WITH the identity fields above: absence is
 	# the only silent case (empty under required=0), while a duplicated key or
 	# a malformed value took the same loud abort as every other manifest field.
@@ -1660,10 +1664,45 @@ install_app() {
 	IS_APPLE_SILICON=0
 	[[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == 1 ]] && IS_APPLE_SILICON=1
 	LEAN_REASON=""
-	if [[ "$IS_APPLE_SILICON" == 0 ]]; then
-		LEAN_REASON=intel
-	elif [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
+	# The EXPLICIT flag outranks the architecture: a user who said
+	# --no-toolchain must be told "toolset skipped (--no-toolchain)", never a
+	# sentence about which DMGs this release carries — with the arms the other
+	# way around, an Intel Mac passing the flag got the pair/predates-the-pair
+	# explanation for a decision they had already made themselves.
+	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
 		LEAN_REASON=no-toolchain
+	elif [[ "$IS_APPLE_SILICON" == 0 ]]; then
+		LEAN_REASON=intel
+	fi
+	# INTEL + toolchain + the release names an Intel DMG: batteries included via
+	# the per-arch pair. The pair travels together or not at all — a name
+	# without a digest is a malformed release this cutter never produces, and
+	# proceeding on half a pair would be the one download whose digest check
+	# quietly degraded. Fail loud, not lean.
+	if [[ "$LEAN_REASON" == intel && "$DO_TOOLCHAIN" -eq 1 && ( -n "$DMG_X86_NAME" || -n "$DMG_X86_SHA" ) ]]; then
+		if [[ -z "$DMG_X86_NAME" || -z "$DMG_X86_SHA" ]]; then
+			echo "install.sh: manifest carries half an Intel DMG pair (dmg_x86_64/dmg_x86_64_sha256) — refusing" >&2
+			exit 1
+		fi
+		# The SAME identity binds the canonical DMG and zip lanes enforce: the
+		# canonical-name bind stops a manifest naming some other asset in the
+		# release, and the 64-hex bind stops an empty or malformed field from
+		# turning the later digest comparison into a no-op.
+		if [[ "$DMG_X86_NAME" != "aterm-$VERSION-x86_64.dmg" ]]; then
+			echo "install.sh: manifest dmg_x86_64 $DMG_X86_NAME is not canonical aterm-$VERSION-x86_64.dmg" >&2
+			exit 1
+		fi
+		if [[ ! "$DMG_X86_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
+			echo "install.sh: manifest dmg_x86_64_sha256 is not exactly 64 hexadecimal digits" >&2
+			exit 1
+		fi
+		CONTAINER_KIND=dmg
+		ASSET_NAME="$DMG_X86_NAME"
+		ASSET_SHA="$DMG_X86_SHA"
+		LEAN_REASON=""
+		echo "install.sh: Intel Mac — using the Intel batteries-included DMG ($ASSET_NAME)."
+		echo "install.sh:   Same signed, notarized universal app; the sealed toolchain carries"
+		echo "install.sh:   x86_64 builds of every ALab program, so first launch needs no network."
 	fi
 	if [[ -n "$ZIP_NAME" && -n "$ZIP_SHA" && -n "$LEAN_REASON" ]]; then
 		# The SAME identity binds the DMG lane enforces, applied to the zip. Skipping
@@ -1686,11 +1725,12 @@ install_app() {
 		ASSET_SHA="$ZIP_SHA"
 		if [[ "$LEAN_REASON" == intel ]]; then
 			echo "install.sh: Intel Mac — using the lean container ($ASSET_NAME)."
-			echo "install.sh:   Identical signed app. The sealed toolchain is omitted because its"
-			echo "install.sh:   bulk — the Trust compiler bundles — is published for Apple silicon"
-			echo "install.sh:   only. The ALab programs that do publish x86_64 builds come from the"
-			echo "install.sh:   network instead (\`aterm pkg install --default-set\`); the compiler"
-			echo "install.sh:   follows as soon as it ships for this architecture."
+			echo "install.sh:   Identical signed app. This release predates the Intel"
+			echo "install.sh:   batteries-included DMG (aterm-<version>-x86_64.dmg), so the sealed"
+			echo "install.sh:   toolchain — packed per-architecture — is omitted rather than shipping"
+			echo "install.sh:   a gigabyte of arm64 binaries this CPU cannot run. The ALab toolset"
+			echo "install.sh:   installs over the network instead: \`aterm pkg install --default-set\`"
+			echo "install.sh:   (every program publishes x86_64-apple-darwin since atpkg index 14)."
 		else
 			echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME)."
 			echo "install.sh:   Identical signed app, without the ~1 GB sealed toolchain payload it"
@@ -1779,7 +1819,12 @@ install_app() {
 	else
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
 		if [[ "$LEAN_REASON" == intel ]]; then
-			echo "  then: aterm.app -> $DEST. The sealed toolset is Apple-silicon-only; the ALab programs published for x86_64 install from the network."
+			# This branch is only reached when the release names NO Intel DMG
+			# (the pair election above wins otherwise) — i.e. a pre-pair
+			# release. Say that, not the pre-index-14 claim that the toolset
+			# itself is Apple-silicon-only, which stopped being true when the
+			# registry went dual-arch.
+			echo "  then: aterm.app -> $DEST. This release predates the Intel batteries DMG; the ALab programs install from the network (published dual-arch since index 14)."
 		else
 			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain); \`aterm pkg seed\` or \`aterm pkg install --default-set\` installs it later."
 		fi
