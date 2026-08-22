@@ -22,6 +22,19 @@ doctest = false
 name = "atpkg"
 path = "src/main.rs"
 
+# The index-resolve pricing instrument. atpkg shipped with NO benchmark, so the cost of
+# resolving the signed index (1 listing + 4 asset downloads per candidate x 4 candidates,
+# every pass, in a fresh process) was argued from the source instead of measured.
+#
+# `harness = false` and deliberately NO dev-dependency on criterion: this crate's whole
+# subject is supply chain — every dependency edge in the block below is argued, `ring` is
+# promoted to a direct edge on purpose and floor-banned in deny.toml — so widening the
+# surface to render a histogram of injected sleeps is a bad trade. The bench reports the
+# two numbers that matter (round-trips, wall time) from a plain `main`.
+[[bench]]
+name = "index_resolve"
+harness = false
+
 [dependencies]
 # THE load-bearing crypto root. atpkg's two-tier signature anchor
 # (docs/TOOLCHAIN-PACKAGE-MANAGER.md S8/S13) verifies every manifest with
@@ -85,6 +98,19 @@ zstd = { workspace = true }
 # (`cargo build -p atpkg`) still uses the default-features=false edge above and so
 # proves the no-alloc verify path compiles on its own.
 ring = { version = "0.17.14" }
+
+# The shim pricing instrument. `bin/<tool>` is the only route from a typed command to a
+# managed tool, and it is a /bin/sh script — on macOS a whole bash — created and torn down
+# to issue one execve. Nothing in the crate could say what that costs, so the shim's
+# latency was argued rather than measured; this target measures it, and sniffs the shim
+# dialect so it keeps reporting truthfully if the stub is ever replaced by a native one.
+#
+# `harness = false` and NO new dependency, for the same reason as the crate's other bench:
+# atpkg's subject is supply chain, and a process-spawn benchmark is not a workload a
+# sampling harness measures better than an explicit loop.
+[[bench]]
+name = "shim_exec"
+harness = false
 
 [lints]
 workspace = true

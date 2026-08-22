@@ -242,6 +242,11 @@ impl Grid {
         // reflow compensate here; `resize_viewport_state` already clamped, so
         // the shift re-clamps against the SAME bound.
         if revealed > 0 && !(new_cols != old_cols && reflow) {
+            // Publish the same shift for the SELECTION, which is compensated by
+            // `Terminal::finalize_resize` rather than here — it lives on the
+            // Terminal, not the Grid. Same guard as the cursor's for the same
+            // reason: the column-reflow path owns its own tracking.
+            self.storage.last_resize_row_shift = row_u16(revealed);
             let bound = new_rows.saturating_sub(1);
             let row = self
                 .storage

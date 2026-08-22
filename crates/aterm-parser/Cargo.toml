@@ -15,6 +15,14 @@ aterm-provenance = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }
+criterion = "0.5"
+
+# The only target in the tree that RE-ENTERS the OSC accumulation buffer's
+# grow/shrink cycle. aterm-gpu/benches/gpu_frame.rs issues its OSC 1337 escape
+# once during setup, outside `b.iter`, so nothing measured the retention policy.
+[[bench]]
+name = "osc_buffer"
+harness = false
 
 [lints]
 workspace = true

@@ -71,8 +71,8 @@ pub(crate) fn cmd_scroll(
 /// `strip_suffix('\n')` arm below is therefore defensive normalization for any
 /// in-process caller, not the socket submit path. Only the trailing newline is
 /// converted; embedded newlines in the body are passed through unchanged.
-pub(crate) fn cmd_send(sink: &SinkWriter, rest: &str) -> String {
-    let bytes: Vec<u8> = if let Some(head) = rest.strip_suffix("\\n") {
+pub(crate) fn send_bytes(rest: &str) -> Vec<u8> {
+    if let Some(head) = rest.strip_suffix("\\n") {
         let mut b = head.as_bytes().to_vec();
         b.push(0x0d);
         b
@@ -84,7 +84,11 @@ pub(crate) fn cmd_send(sink: &SinkWriter, rest: &str) -> String {
         b
     } else {
         rest.as_bytes().to_vec()
-    };
+    }
+}
+
+pub(crate) fn cmd_send(sink: &SinkWriter, rest: &str) -> String {
+    let bytes = send_bytes(rest);
     write_pty(sink, &bytes);
     "OK\n".to_string()
 }
@@ -432,10 +436,10 @@ pub(crate) fn cmd_ctrl(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// allowed) straight to the PTY. The escape hatch for control/binary bytes the
 /// line-delimited `send` verb can't carry: `feed 03` = Ctrl-C, `feed 1b5b41` =
 /// ESC[A, `feed 0a` = a real newline. Replies `OK <n> bytes\n` or `ERR bad hex`.
-pub(crate) fn cmd_feed(sink: &SinkWriter, rest: &str) -> String {
+pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
     let hex: String = rest.chars().filter(|c| !c.is_whitespace()).collect();
     if !hex.len().is_multiple_of(2) {
-        return "ERR bad hex (odd length)\n".to_string();
+        return Err("ERR bad hex (odd length)\n");
     }
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let h = hex.as_bytes();
@@ -444,11 +448,19 @@ pub(crate) fn cmd_feed(sink: &SinkWriter, rest: &str) -> String {
         let hi = (h[i] as char).to_digit(16);
         let lo = (h[i + 1] as char).to_digit(16);
         let (Some(hi), Some(lo)) = (hi, lo) else {
-            return "ERR bad hex\n".to_string();
+            return Err("ERR bad hex\n");
         };
         bytes.push((hi * 16 + lo) as u8);
         i += 2;
     }
+    Ok(bytes)
+}
+
+pub(crate) fn cmd_feed(sink: &SinkWriter, rest: &str) -> String {
+    let bytes = match feed_bytes(rest) {
+        Ok(bytes) => bytes,
+        Err(error) => return error.to_string(),
+    };
     let n = bytes.len();
     write_pty(sink, &bytes);
     format!("OK {n} bytes\n")
@@ -495,7 +507,7 @@ pub(crate) fn cmd_signal(master: i32, rest: &str) -> String {
     "ERR signal unsupported on this platform\n".to_string()
 }
 
-const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown> <left|middle|right> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
+const MOUSE_USAGE: &str = "ERR usage: mouse <press|release|move|wheelup|wheeldown|wheelleft|wheelright> <left|middle|right|back|forward> <row> <col> [mods=..] [count=N] [side=left|right] [block=0|1] [lines=N]\n";
 
 /// Upper bound on a single `mouse wheelup|wheeldown` verb's `lines=N`. The seam
 /// emits ONE wheel report per line under a tracking app, so an unbounded count
@@ -515,19 +527,25 @@ const MAX_WHEEL_LINES: i32 = crate::input::MAX_WHEEL_BURST;
 ///
 /// Grammar: `mouse <action> <button> <row> <col> [mods=..] [count=N]
 /// [side=left|right] [block=0|1] [lines=N]`. `action` is `press|release|move|
-/// wheelup|wheeldown`; `button` is `left|middle|right` (ignored for the wheel
-/// actions); `row`/`col` are 0-based. The additive tokens carry the data that
-/// closes the human/controller divergences: `mods=` the real modifier mask
-/// (kills a), `count=` the click depth 1..=3 (kills b), `side=` the cell-half
-/// (kills i), `block=1` the rectangular-selection intent for a single-click press
-/// (the same intent a human encodes from a held Alt, carried as DATA so the seam
-/// never reads ambient modifier state), `lines=N` the wheel-notch count for the
-/// wheel actions (default 1, clamped to `1..=MAX_WHEEL_LINES`) so one verb line
-/// scrolls N lines the way a human's single trackpad flick banks N — instead of
-/// one socket round trip per notch. `lines=` is ignored by the non-wheel actions.
+/// wheelup|wheeldown|wheelleft|wheelright`; `button` is
+/// `left|middle|right|back|forward` (ignored for the wheel actions); `row`/`col`
+/// are 0-based. The horizontal wheel pair and the thumb buttons (audits I7/I8)
+/// exist here for the same reason the rest do: a controller must be able to
+/// drive every gesture a hand can, or the seam's source-blindness is only a
+/// claim.
+///
+/// The additive tokens carry the data that closes the human/controller
+/// divergences: `mods=` the real modifier mask (kills a), `count=` the click
+/// depth 1..=3 (kills b), `side=` the cell-half (kills i), `block=1` the
+/// rectangular-selection intent for a single-click press (the same intent a human
+/// encodes from a held Alt, carried as DATA so the seam never reads ambient
+/// modifier state), `lines=N` the wheel-notch count for the wheel actions
+/// (default 1, clamped to `1..=MAX_WHEEL_LINES`) so one verb line scrolls N lines
+/// the way a human's single trackpad flick banks N — instead of one socket round
+/// trip per notch. `lines=` is ignored by the non-wheel actions.
 pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
     use aterm_core::selection::SelectionSide;
-    use aterm_types::mouse::{ALT_MASK, CTRL_MASK, MouseButton, SHIFT_MASK};
+    use aterm_types::mouse::{ALT_MASK, CTRL_MASK, MouseButton, SHIFT_MASK, WheelDir};
     let mut action = "";
     let mut mods: u8 = 0;
     let mut click_count: u8 = 1;
@@ -575,6 +593,8 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
             "left" => Ok(MouseButton::Left),
             "middle" => Ok(MouseButton::Middle),
             "right" => Ok(MouseButton::Right),
+            "back" => Ok(MouseButton::Back),
+            "forward" => Ok(MouseButton::Forward),
             _ => Err("ERR bad button\n".to_string()),
         }
     };
@@ -613,7 +633,7 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
             }
             _ => return Err(MOUSE_USAGE.to_string()),
         },
-        "press" | "release" | "wheelup" | "wheeldown" => {
+        "press" | "release" | "wheelup" | "wheeldown" | "wheelleft" | "wheelright" => {
             let [b, r, c] = positional.as_slice() else {
                 return Err(MOUSE_USAGE.to_string());
             };
@@ -650,16 +670,16 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
                     suppress_copy_on_select: false,
                     px_off: crate::input::PixelOffset::CELL_ORIGIN,
                 },
-                "wheelup" => InputEvent::Wheel {
-                    dir_up: true,
-                    lines: wheel_lines,
-                    row,
-                    col,
-                    mods,
-                    px_off: crate::input::PixelOffset::CELL_ORIGIN,
-                },
-                _ => InputEvent::Wheel {
-                    dir_up: false,
+                // The wheel's four directions share one arm: only `dir` differs,
+                // and the `_` catch-all is `wheeldown` (the outer match already
+                // fenced the action set, so no other string can reach here).
+                wheel => InputEvent::Wheel {
+                    dir: match wheel {
+                        "wheelup" => WheelDir::Up,
+                        "wheelleft" => WheelDir::Left,
+                        "wheelright" => WheelDir::Right,
+                        _ => WheelDir::Down,
+                    },
                     lines: wheel_lines,
                     row,
                     col,
@@ -1009,12 +1029,12 @@ mod tests {
     /// non-positive / non-numeric value falling back to 1.
     #[test]
     fn parse_mouse_wheel_lines() {
-        let Ok(InputEvent::Wheel { lines, dir_up, .. }) = parse_mouse("wheeldown left 2 4 lines=8")
+        let Ok(InputEvent::Wheel { lines, dir, .. }) = parse_mouse("wheeldown left 2 4 lines=8")
         else {
             panic!("wheeldown lines=8 parses");
         };
         assert_eq!(lines, 8);
-        assert!(!dir_up);
+        assert_eq!(dir, aterm_types::mouse::WheelDir::Down);
         // No token: the default stays 1 (byte-compatible with the old grammar).
         let Ok(InputEvent::Wheel { lines, .. }) = parse_mouse("wheelup left 2 4") else {
             panic!("bare wheelup parses");
@@ -1033,5 +1053,35 @@ mod tests {
             };
             assert_eq!(lines, 1, "{line}");
         }
+    }
+
+    /// The four wheel actions each parse to their own [`WheelDir`], and the thumb
+    /// buttons name themselves (audits I7/I8). Without the horizontal pair a
+    /// controller could not drive — or regression-test — buttons 66/67 at all.
+    #[test]
+    fn parse_mouse_covers_every_wheel_direction_and_button() {
+        use aterm_types::mouse::{MouseButton, WheelDir};
+        for (line, want) in [
+            ("wheelup left 2 4", WheelDir::Up),
+            ("wheeldown left 2 4", WheelDir::Down),
+            ("wheelleft left 2 4", WheelDir::Left),
+            ("wheelright left 2 4", WheelDir::Right),
+        ] {
+            let Ok(InputEvent::Wheel { dir, .. }) = parse_mouse(line) else {
+                panic!("{line} parses");
+            };
+            assert_eq!(dir, want, "{line}");
+        }
+        for (line, want) in [
+            ("press back 2 4", MouseButton::Back),
+            ("press forward 2 4", MouseButton::Forward),
+        ] {
+            let Ok(InputEvent::MouseButton { button, .. }) = parse_mouse(line) else {
+                panic!("{line} parses");
+            };
+            assert_eq!(button, want, "{line}");
+        }
+        // An unnamed device button is still rejected — no bogus report.
+        assert!(parse_mouse("press thumb3 2 4").is_err());
     }
 }

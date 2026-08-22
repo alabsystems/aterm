@@ -94,10 +94,27 @@ impl TurnLedger {
     /// Records with `id > after`, oldest-first (the events digest's scan, and the
     /// `turns since=<id>` verb). Records only ever append with strictly increasing
     /// ids, so this is a suffix. `None` = all retained records.
+    ///
+    /// SEEK, DON'T FILTER. The doc above has always said "this is a suffix" and
+    /// the body then walked all [`LEDGER_CAP`] retained records and threw away
+    /// the prefix — which the subscribe `events` digest paid on EVERY 250 ms
+    /// liveness tick per watched target, whether or not a turn had landed.
+    /// `id <= after` is a MONOTONE predicate over the ring precisely because the
+    /// ids are strictly increasing, so `partition_point` lands on the first
+    /// record past the watermark in O(log n) and `range` yields the suffix
+    /// itself. Same elements, same order, same borrow — the drain is now
+    /// O(log n + matched) instead of O(retained).
+    ///
+    /// A watermark BELOW the retained low-water still yields EVERY retained
+    /// record (`partition_point` returns 0), which is the behaviour the
+    /// events-resume `GAP … events-resync=` frame is built on: `low_id()`
+    /// reports the drop-oldest eviction, `since` does not silently swallow it.
     pub(crate) fn since(&self, after: Option<u64>) -> impl Iterator<Item = &TurnRecord> {
-        self.records
-            .iter()
-            .filter(move |r| after.is_none_or(|a| r.id > a))
+        let start = match after {
+            None => 0,
+            Some(a) => self.records.partition_point(|r| r.id <= a),
+        };
+        self.records.range(start..)
     }
 }
 
@@ -166,6 +183,72 @@ mod tests {
             got,
             vec![hi - 1, hi],
             "only ids strictly greater than `after`"
+        );
+    }
+
+    /// DIFFERENTIAL: the `partition_point` seek must agree with the linear
+    /// filter it replaced, for EVERY watermark — including the two that the
+    /// events digest and its GAP frame actually depend on (a watermark below
+    /// the retained low-water must still yield everything; a watermark at or
+    /// above the high must yield nothing). Ids are deliberately GAPPY here:
+    /// turn ids come from a process-global counter, so a single session's
+    /// ledger is sparse, and a seek that assumed contiguity would pass a dense
+    /// fixture and be wrong in production.
+    #[test]
+    fn since_seek_matches_the_linear_filter_for_every_watermark() {
+        let mut l = TurnLedger::default();
+        // Sparse ids (7, 14, 21, …) past the cap, so the ring has evicted and the
+        // retained low-water is well above 0.
+        for i in 1..=(LEDGER_CAP as u64 + 5) {
+            l.push(rec(i * 7));
+        }
+        let low = l.low_id().expect("non-empty");
+        let high = l.high_id().expect("non-empty");
+        assert!(
+            low > 1,
+            "the fixture must have evicted, or the below-low arm is vacuous"
+        );
+
+        let reference = |after: Option<u64>| -> Vec<u64> {
+            l.records
+                .iter()
+                .filter(|r| after.is_none_or(|a| r.id > a))
+                .map(|r| r.id)
+                .collect()
+        };
+        let observed = |after: Option<u64>| -> Vec<u64> { l.since(after).map(|r| r.id).collect() };
+
+        // The whole neighbourhood: below the low-water, exactly on retained ids,
+        // in the GAPS between them, at the high, and past it.
+        let mut probes: Vec<Option<u64>> = vec![None, Some(0), Some(1), Some(low - 1)];
+        for id in [
+            low,
+            low + 1,
+            low + 3,
+            high - 7,
+            high - 1,
+            high,
+            high + 1,
+            high + 100,
+        ] {
+            probes.push(Some(id));
+        }
+        for after in probes {
+            assert_eq!(
+                observed(after),
+                reference(after),
+                "since({after:?}) diverged"
+            );
+        }
+        // The two arms the digest and the GAP frame stand on, named explicitly.
+        assert_eq!(
+            observed(Some(low - 1)).len(),
+            LEDGER_CAP,
+            "below low-water = all retained"
+        );
+        assert!(
+            observed(Some(high)).is_empty(),
+            "at the high-water = nothing new"
         );
     }
 

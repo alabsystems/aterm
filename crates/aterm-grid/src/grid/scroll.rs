@@ -853,9 +853,13 @@ impl Grid {
         // Fill BCE RGB in vacated bottom rows after shift (#7685).
         self.fill_bce_rgb_rows(row_u16(bottom + 1 - n)..bottom_u16.saturating_add(1));
 
-        // Partial-region scroll invalidates selection coordinates in complex ways.
-        // Use saturating_add with large value to force selection clear via adjust_for_scroll.
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this moved the REGION's rows and nothing else.
+        // Record that band; a selection is cleared iff it overlaps it. (Was
+        // `content_scroll_delta = i32::MAX`, which cleared every selection anywhere
+        // — including one anchored far up in scrollback that this scroll never
+        // touched.) History and `absolute_row_counter` are untouched here, so the
+        // batch's row-advance accounting is unaffected by dropping the sentinel.
+        self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1011,9 +1015,9 @@ impl Grid {
         // Fill BCE RGB in vacated top rows after shift (#7685).
         self.fill_bce_rgb_rows(top_u16..row_u16(top + n));
 
-        // Force selection clear: partial-region coordinate mapping is non-trivial,
-        // and full-screen scroll_down() also delegates here.
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: the region's rows are the damage. A reverse
+        // region scroll adds nothing to history, so the counter is untouched.
+        self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         // Mark only the scroll region rows as dirty, not the full screen.
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
@@ -1109,7 +1113,11 @@ impl Grid {
             left..right.saturating_add(1),
         );
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: a MARGINED region scroll moves a rectangle, but
+        // the lattice is row-granular, so the band is the region's rows — the same
+        // rows marked dirty below. Wider than the rectangle in the column direction,
+        // which fails SAFE (over-clear, never a stale highlight).
+        self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }
@@ -1200,7 +1208,11 @@ impl Grid {
         // Fill BCE RGB in vacated top-left rect after shift (#7685).
         self.fill_bce_rgb_rect(top_u16..row_u16(top + n), left..right.saturating_add(1));
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: a MARGINED region scroll moves a rectangle, but
+        // the lattice is row-granular, so the band is the region's rows — the same
+        // rows marked dirty below. Wider than the rectangle in the column direction,
+        // which fails SAFE (over-clear, never a stale highlight).
+        self.damage_selection_visible_rows_ext(top_u16, bottom_u16, true);
         self.storage
             .mark_content_rows(top_u16, bottom_u16.saturating_add(1));
     }

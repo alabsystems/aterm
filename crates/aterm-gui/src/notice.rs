@@ -148,6 +148,34 @@ impl TransientNotice {
         }
     }
 
+    /// A FAILED USER GESTURE's answer — Cmd-T that opened nothing, a restore
+    /// that dropped tabs, an adoption that lost a shell. Rides the same
+    /// free-text card as `update_status` (the kind's name is historical; the
+    /// renderer treats it as one line of text): the user pressed a key and
+    /// nothing visibly happened, which is the one outcome a GUI must never
+    /// leave unexplained — stderr, where these failures used to go alone, is
+    /// invisible from a windowed session. The text is TRUNCATED here so a
+    /// multi-line io::Error can never stretch the card: the first line of the
+    /// reason is what a person acts on, and the full error still goes to the
+    /// log at every call site.
+    pub(crate) fn gesture_failure(text: impl Into<String>, now: Instant) -> Self {
+        let mut text: String = text.into();
+        if let Some(nl) = text.find('\n') {
+            text.truncate(nl);
+        }
+        if text.chars().count() > 160 {
+            let cut = text.char_indices().nth(159).map_or(text.len(), |(i, _)| i);
+            text.truncate(cut);
+            text.push('…');
+        }
+        Self {
+            kind: NoticeKind::UpdateStatus { text },
+            spawned: now,
+            anchor: None,
+            ttl: TTL,
+        }
+    }
+
     pub(crate) fn robi_tip(text: &'static str, anchor: Option<(f32, f32)>, now: Instant) -> Self {
         Self {
             kind: NoticeKind::RobiTip { text },
@@ -1026,6 +1054,24 @@ pub(crate) fn notice_tray(
 
 #[cfg(test)]
 mod tests {
+
+    /// The gesture-failure card's text contract: one line, elided at 160
+    /// chars — a raw io::Error must never stretch or wrap the card; the full
+    /// error belongs to the paired stderr line.
+    #[test]
+    fn gesture_failure_text_is_one_bounded_line() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let short = super::TransientNotice::gesture_failure("✕ New tab failed: EMFILE", now);
+        assert_eq!(short.text(), "✕ New tab failed: EMFILE");
+        let multiline =
+            super::TransientNotice::gesture_failure("first line\nsecond line", now);
+        assert_eq!(multiline.text(), "first line");
+        let long = super::TransientNotice::gesture_failure("x".repeat(300), now);
+        let text = long.text();
+        assert!(text.chars().count() <= 161, "159 kept + ellipsis");
+        assert!(text.ends_with('…'));
+    }
     use super::*;
 
     /// The shadow must stay inside [`SHADOW_MARGIN`], because the compositor grows the

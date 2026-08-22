@@ -1058,6 +1058,77 @@ fn bench_count(g: &mut BenchmarkGroup<'_, WallTime>, id: &str, count: usize) {
     });
 }
 
+/// PROVE the redundant-BACKGROUND state every CPU-raster arm in this group
+/// renders in — TWO-SIDED, on real presented frames, and on a counter that
+/// reads the same on either side of the background elision it exists to gate
+/// (`Renderer::last_bg_runs` counts the runs `render_row_bg` RESOLVED, not the
+/// fills it emitted).
+///
+/// TARGET — the echo fixture's own content: ordinary text on the DEFAULT
+/// background. Every background run such a row resolves carries exactly the
+/// colour the band's base already holds, so `at_base > 0` on a presented frame.
+///
+/// CONTROL — the same fixture with every column of every row wrapped in an SGR
+/// background colour. Those runs resolve to a colour the base does NOT hold, so
+/// `at_base == 0` while `total` stays positive. Without this half the target's
+/// half is an assertion an EMPTY frame would also satisfy: a frame that
+/// rastered no row resolves no runs at all, and "no run disagreed with the
+/// base" would read as reach where there was none.
+fn verify_bg_runs() {
+    let (mut tgt, t0) = f_echo();
+    // A frame with REAL damage: an idle re-present has an empty dirty set, so
+    // its row background pass never runs and the probe would read 0/0 — which
+    // is exactly the vacuous reading the control half exists to catch.
+    tgt.feed(0, b"echo hello");
+    tgt.present_frame(t0 + FRAME_DT);
+    let (total, at_base) = tgt.bg_run_probe();
+    report(
+        "bg_runs_target",
+        &format!("{at_base}/{total} resolved bg runs carry the band base colour"),
+    );
+    assert!(
+        total > 0,
+        "bg_runs_target: the presented frame resolved NO background run — the \
+         fixture never reached the row background pass"
+    );
+    assert!(
+        at_base > 0,
+        "bg_runs_target: {at_base}/{total} runs carry the band base colour — the \
+         plain-text fixture does not reach the redundant-background state at all"
+    );
+
+    let mut ctl = BenchApp::headless();
+    let (rows, cols) = ctl.grid();
+    // Home, then an SGR BACKGROUND colour, then a glyph in EVERY column of
+    // every row: no column anywhere resolves to the frame default, so a run
+    // that matched the band base would be a bug in the counter, not content.
+    let mut paint: Vec<u8> = b"\x1b[H\x1b[44m".to_vec();
+    for r in 0..rows {
+        paint.extend(std::iter::repeat_n(b'x', cols as usize));
+        if r + 1 < rows {
+            paint.extend_from_slice(b"\r\n");
+        }
+    }
+    let c0 = Instant::now();
+    ctl.present_frame(c0);
+    ctl.feed(0, &paint);
+    ctl.present_frame(c0 + FRAME_DT);
+    let (ctl_total, ctl_at_base) = ctl.bg_run_probe();
+    report(
+        "bg_runs_control",
+        &format!("{ctl_at_base}/{ctl_total} resolved bg runs carry the band base colour"),
+    );
+    assert!(
+        ctl_total > 0,
+        "bg_runs_control: the presented frame resolved NO background run"
+    );
+    assert_eq!(
+        ctl_at_base, 0,
+        "bg_runs_control: {ctl_at_base}/{ctl_total} runs still carry the band base \
+         colour on an all-SGR-background grid — the counter is not reading content"
+    );
+}
+
 // -------------------------------------------------------------- the groups --
 
 #[allow(
@@ -1068,6 +1139,7 @@ fn frame_latency(c: &mut Criterion) {
     // PROVE FIRST, TIME SECOND: every fixture is built, warmed and verified
     // before a nanosecond is measured; the timed run continues from the
     // verified state with the same arm sustaining it.
+    verify_bg_runs();
     let (mut fx_off, mut off_now) = verify_effects_off();
     let (mut pet, mut pet_now, pet_map_rows, pet_inked) = verify_pet_invisible();
     let (mut flood, flood_sid, mut flood_now) = verify_flood();

@@ -6,7 +6,7 @@
 //!
 //! The 19 existing proofs in `proofs.rs` exercise compact indirectly through
 //! set/set_range, but 10/19 fail (killed/timeout/OOM) because CBMC struggles
-//! with the combined splice + compact + rebuild_prefix_sums paths.
+//! with the combined splice + compact paths.
 //!
 //! These proofs verify compact and compact_around in ISOLATION by constructing
 //! Rle instances with deliberately uncompacted runs (adjacent duplicates) and
@@ -29,7 +29,6 @@ fn rle_from_raw_runs(runs: Vec<Run<u8>>, total_length: u32) -> Rle<u8> {
     Rle {
         runs,
         total_length,
-        prefix_sums: Vec::new(),
     }
 }
 

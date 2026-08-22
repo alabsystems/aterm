@@ -22,7 +22,7 @@
 // EXCLUDED (host bindings, re-bound here):
 //   - the five callbacks (bell, cursor_style, buffer_activation, window,
 //     text_sizing)
-//   - policy_engine (Option<PolicyEngine>)
+//   - policy (PolicyState: the installed PolicyEngine + its compiled gate table)
 //   - live auth nonces / capabilities (clipboard_auth, shell_integration_auth,
 //     hyperlink_auth, dcs_auth)
 // These are HOST effects, not buffer state. They are re-bound by the host on
@@ -508,6 +508,12 @@ impl Terminal {
         self.style = c.style.into_style();
         let (_parser, mut handler) = self.split_for_process();
         handler.sgr_style().apply_style_change();
+        // In-place hydration swaps the entire coordinate lineage underneath
+        // existing host consumers. Preserve the cumulative clocks but publish
+        // one fail-closed epoch edge so cursor effects/search-adjacent caches
+        // cannot remain attached to pre-restore cells. A freshly constructed
+        // `from_checkpoint` terminal needs no edge: consumers baseline it.
+        self.content_scroll_state.invalidate();
     }
 }
 
@@ -1175,6 +1181,32 @@ mod tests {
             t.checkpoint(),
             h.checkpoint(),
             "restored alt screen stays in lockstep with the live engine after scrolling"
+        );
+    }
+
+    #[test]
+    fn in_place_restore_advances_content_scroll_epoch_once() {
+        let mut source = Terminal::new(3, 12);
+        source.process(b"restored");
+        let checkpoint = source.checkpoint();
+
+        let mut live = Terminal::new(3, 12);
+        live.process(b"\x1b[3;1H\n");
+        let before = live.content_scroll_state();
+        live.restore_checkpoint(&checkpoint);
+        let after = live.content_scroll_state();
+        assert_eq!(after.uniform_up_rows, before.uniform_up_rows);
+        assert_eq!(
+            after.invalidation_epoch,
+            before.invalidation_epoch + 1,
+            "wholesale in-place grid replacement invalidates existing host coordinates"
+        );
+
+        live.process(b"");
+        assert_eq!(
+            live.content_scroll_state(),
+            after,
+            "the restored grid carries no latent scroll sentinel to double-report"
         );
     }
 }

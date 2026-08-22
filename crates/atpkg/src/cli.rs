@@ -1866,6 +1866,17 @@ pub const SEED_PARTIAL_MARKER: &str = "seed-partial: ";
 /// The NETWORK completion lane's answer — programs that arrived over the wire on an
 /// adopted machine, which used to happen with no user-visible trace at all.
 pub const NET_INSTALLED_MARKER: &str = "net-installed: ";
+/// The network lane's ANNOUNCEMENT, printed BEFORE any bytes move — the
+/// seed-starting twin for the wire. The comment above `complete_the_set`
+/// already argued for it ("ANNOUNCE BEFORE ACTING, exactly as the local seed
+/// lane does") while the code announced nothing: gigabytes could stream with
+/// the first user-visible line being the completion.
+pub const NET_STARTING_MARKER: &str = "net-starting: ";
+/// The network lane's failure TERMINAL: an announced provisioning that then
+/// installs nothing must retire its own held card with the truth — the seed
+/// lane shipped exactly this bug once (a card held for its full 20 minutes),
+/// and the marker contract is what prevents the rerun.
+pub const NET_FAILED_MARKER: &str = "net-failed: ";
 
 /// The human line printed on its own row AFTER an install marker (`seed-installed:` /
 /// `net-installed:`) — never appended to the marker itself, which the GUI parses
@@ -2399,13 +2410,15 @@ fn cmd_update_all() -> ExitCode {
         // contract exists to prevent, on the lane that is MORE surprising because
         // nothing local prompted it.
         let before_net = crate::active_builds(&layout);
-        failures += install_default_set(
+        let net = install_default_set(
             &layout,
             &*fetcher,
             &effective_anchor(&layout),
             cfg,
             now_unix(),
         );
+        failures += net.failures;
+        let announced = net.announced;
         let mut arrived: Vec<String> = crate::active_builds(&layout)
             .keys()
             .filter(|k| !before_net.contains_key(k.as_str()))
@@ -2415,6 +2428,13 @@ fn cmd_update_all() -> ExitCode {
             arrived.sort();
             println!("atpkg: {NET_INSTALLED_MARKER}{}", arrived.join(", "));
             println!("{SEED_FOLLOW_ON}");
+        } else if announced {
+            // ALWAYS ANSWER THE ANNOUNCEMENT (the seed lane's law): a pass that
+            // said "installing over the network" and then installed nothing
+            // must say so, or the held notice outlives its own truth.
+            println!(
+                "atpkg: {NET_FAILED_MARKER}network provisioning installed nothing —                  see the lines above for each program's reason"
+            );
         }
     }
     // Reclaim superseded builds once after the whole channel apply (all group activations
@@ -2531,20 +2551,29 @@ fn cmd_update_all() -> ExitCode {
 /// scream every 6h about states that are correct. GC + the shell-hook refresh run
 /// once at the caller's CLI edge (the `cmd_update_all` precedent), keeping this
 /// hermetically testable.
+/// What a default-set pass did, for the caller's marker bookkeeping: how many
+/// members failed, and whether the `net-starting:` announcement was printed
+/// (an announcement DEMANDS a terminal answer — `net-installed:` or
+/// `net-failed:` — so the caller must know one was opened).
+struct DefaultSetOutcome {
+    failures: u32,
+    announced: bool,
+}
+
 fn install_default_set(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
     now: i64,
-) -> u32 {
+) -> DefaultSetOutcome {
     let floor = build_floor(layout);
     let index = match crate::resolve_verified_index(fetcher, layout, anchor, floor, now) {
         Ok(i) => i,
         Err(e) => {
             eprintln!("atpkg: default-set bootstrap: cannot resolve the signed index: {e}");
             print_unreachable_followup(&e, "aterm pkg install --default-set");
-            return 1;
+            return DefaultSetOutcome { failures: 1, announced: false };
         }
     };
     // Fail-closed diagnostics for `[packages.links]` fetch overrides: a program the
@@ -2568,7 +2597,7 @@ fn install_default_set(
     let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
         let e = crate::FlowError::NoChannel(cfg.channel().to_string());
         eprintln!("atpkg: default-set bootstrap failed: {e}");
-        return 1;
+        return DefaultSetOutcome { failures: 1, announced: false };
     };
     let installed = crate::active_builds(layout);
     let mut wanted = index.installable(cfg.include(), cfg.exclude());
@@ -2579,6 +2608,38 @@ fn install_default_set(
     // the set the user has, not overruling their removals.
     for p in removed_programs(layout) {
         wanted.remove(&p);
+    }
+    // ANNOUNCE BEFORE ACTING — the seed lane's law, now kept on the wire lane
+    // too (the block comment at the caller had argued for it while nothing
+    // announced). The set named is exactly what the loop below will attempt:
+    // wanted ∧ absent, minus dev-linked groups (announcing a member the loop
+    // then skips for a dev link would be a lie). Printed only when non-empty,
+    // so the ordinary every-6-hours no-op tick stays silent.
+    let mut will_install: Vec<String> = Vec::new();
+    for group in crate::plan_groups(&index, ch) {
+        if group
+            .members
+            .iter()
+            .any(|m| crate::linkmode::is_linked(layout, m))
+        {
+            continue;
+        }
+        will_install.extend(
+            group
+                .members
+                .iter()
+                .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+                .cloned(),
+        );
+    }
+    let announced = !will_install.is_empty();
+    if announced {
+        will_install.sort();
+        println!(
+            "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {}",
+            will_install.len(),
+            will_install.join(", ")
+        );
     }
     let mut failures = 0u32;
     // Every channel-pinned program some group covers (grouped tuple or singleton);
@@ -2642,7 +2703,7 @@ fn install_default_set(
         eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
         record_bootstrap_error(layout, program, &e);
     }
-    failures
+    DefaultSetOutcome { failures, announced }
 }
 
 /// The grouped (coherence-tuple) arm of [`install_default_set`]: refuse a config-narrowed
@@ -2880,13 +2941,14 @@ fn cmd_install_default_set() -> ExitCode {
     reconcile_links(&layout, cfg);
     let fetcher = resolve_fetcher(&layout);
     let before = crate::active_builds(&layout);
-    let failures = install_default_set(
+    let failures_outcome = install_default_set(
         &layout,
         &*fetcher,
         &effective_anchor(&layout),
         cfg,
         now_unix(),
     );
+    let failures = failures_outcome.failures;
     let activated = crate::active_builds(&layout)
         .keys()
         .filter(|k| !before.contains_key(k.as_str()))
@@ -3156,7 +3218,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         }
     );
     let before = crate::active_builds(&layout);
-    let failures = install_default_set(&layout, &fetcher, &anchor, cfg, now_unix());
+    let failures = install_default_set(&layout, &fetcher, &anchor, cfg, now_unix()).failures;
     // New shims must reach interactive shells without a relaunch.
     crate::hooks::refresh(&layout);
     let after = crate::active_builds(&layout);
@@ -6112,7 +6174,7 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(failures, 0, "skips are never failures");
         let active = crate::active_builds(&layout);
         assert_eq!(
@@ -6128,7 +6190,7 @@ mod tests {
             "the dev link survives untouched"
         );
         // Idempotence: a second pass finds ay installed and re-installs nothing.
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(failures, 0);
         assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
         // The durable floor advanced to the trusted index (§8 gate 3).
@@ -6149,14 +6211,14 @@ mod tests {
         // channel is one loud pass-level failure, nothing installs.
         let layout = temp_layout("channel-default");
         let cfg = crate::config::PackagesConfig::default();
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert!(failures > 0, "a missing channel is loud, not silent");
         assert!(crate::active_builds(&layout).is_empty());
         let _ = std::fs::remove_dir_all(&layout.prefix);
         // channel = "nightly" threads through and installs.
         let layout = temp_layout("channel-nightly");
         let cfg = crate::config::parse_packages("[packages]\nchannel = \"nightly\"\n");
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(failures, 0);
         assert_eq!(
             crate::active_builds(&layout).get("ay").copied(),
@@ -6208,7 +6270,7 @@ mod tests {
         let layout = temp_layout("group-ok");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(failures, 0);
         let active = crate::active_builds(&layout);
         assert_eq!(active.get("ta").copied(), Some(4), "tuple member installed");
@@ -6230,7 +6292,7 @@ mod tests {
         let layout = temp_layout("group-abort");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(failures, 1, "one failure for the aborted group");
         let active = crate::active_builds(&layout);
         assert!(
@@ -6267,7 +6329,7 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(
             failures, 0,
             "a config-narrowed tuple is a diagnostic, not a failure"
@@ -6298,7 +6360,7 @@ mod tests {
         let cfg =
             crate::config::parse_packages("[packages.links]\nghost = \"alabsystems/ghost\"\n");
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
         assert_eq!(
             failures, 0,
             "the refusal is a loud diagnostic, not a loop failure"

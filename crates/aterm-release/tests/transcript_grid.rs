@@ -347,15 +347,18 @@ fn the_x86_warning_keeps_its_facts_its_order_and_its_space() {
         "the ACK must be described as the mute it is — the old text's \"Acknowledge\" \
          read as a gate the code does not have: {block}"
     );
-    // The FACTS, as of atpkg index 12 (which superseded the original three: the
-    // registry now publishes six programs dual-arch, and the blocker was never
-    // \"no std\" — it is rustc_private, absent cross-host).
+    // The FACTS, as of atpkg index 14 (which superseded the index-12 set: the
+    // registry now publishes EVERY pinned program dual-arch — the rustc
+    // coherence group included, pkg-trust-6808.toml carries the
+    // x86_64-apple-darwin row — so the old "six programs / rustc_private"
+    // story is history, and an x86-less seal now also means no Intel DMG
+    // variant).
     for fact in [
         "seed-unusable: no build for this Mac's architecture",
         "STALE STAGE",
-        "ay, clean, nn, ny, ty, trust-mc",
-        "rustc_private",
-        "the group moves together",
+        "pinned program since index 14",
+        "pkg-trust-6808.toml carries the row",
+        "dmg_x86_64",
     ] {
         assert!(block.contains(fact), "the warning dropped {fact:?}: {block}");
     }

@@ -342,8 +342,8 @@ pub fn extract_cell_slice(
 /// Whether `cell` is eligible to join a ligature shaping run.
 ///
 /// A run is contiguous cells that are: drawable (not wide-continuation, not a
-/// space, not a control char), NOT an emoji-presentation cell, NOT part of a
-/// shaped emoji cluster, and NOT image-covered. Spaces and controls BREAK the
+/// space, not a control char), NOT an explicit emoji/text-presentation cell,
+/// NOT part of a shaped emoji cluster, and NOT image-covered. Spaces and controls BREAK the
 /// run (so `a => b` shapes `=>` but not across the spaces); wide/emoji/image
 /// cells route to their existing colour/wide paths untouched. The caller also
 /// breaks on a STYLE change (bold/italic) and per-frame on the cursor/selection
@@ -354,6 +354,7 @@ pub fn cell_is_shapeable(cell: &RenderCell, has_cluster: bool, image_covered: bo
         && cell.ch != ' '
         && !cell.ch.is_control()
         && !cell.emoji_presentation
+        && !cell.text_presentation
         && !has_cluster
         && !image_covered
 }
@@ -834,6 +835,7 @@ mod tests {
             bg: [0, 0, 0],
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,
@@ -858,6 +860,22 @@ mod tests {
         assert!(
             !cell_is_shapeable(&c, false, true),
             "an image-covered cell must NOT be shapeable (the run breaks on it)"
+        );
+    }
+
+    #[test]
+    fn explicit_presentation_cells_are_not_shapeable() {
+        let mut c = cell('\u{1F600}');
+        c.text_presentation = true;
+        assert!(
+            !cell_is_shapeable(&c, false, false),
+            "VS15 must stay on the presentation-aware per-cell resolver"
+        );
+        c.text_presentation = false;
+        c.emoji_presentation = true;
+        assert!(
+            !cell_is_shapeable(&c, false, false),
+            "VS16 must stay on the presentation-aware per-cell resolver"
         );
     }
 

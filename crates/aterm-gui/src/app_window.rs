@@ -489,6 +489,7 @@ impl App {
                 // Spawn failed: do NOT mint a broken (session-less) window. The id is
                 // burned (never reused), which is fine — ids are monotonic, not dense.
                 eprintln!("aterm-gui: could not open a new window: {e}");
+                self.surface_gesture_failure(&format!("✕ New window failed: {e}"));
                 return None;
             }
         };
@@ -770,6 +771,19 @@ impl App {
             "aterm-gui: backdrop requested but DirectComposition is unavailable ({first_error}); \
              falling back to the opaque swapchain — background_material styles the caption \
              only this run"
+        );
+        // The honesty half: this runs during the FIRST attach, before any window is
+        // on glass, on a process whose stderr a Start-Menu launch discarded. Queue
+        // the sentence for the notice banner and latch the cause so `aterm-ctl
+        // chrome` reads `client=opaque(dcomp_unavailable)` rather than a bare
+        // `opaque` that could mean five different things.
+        crate::config_notice::queue_deferred(
+            "background_material is styling the title bar only: this display stack refused \
+             the DirectComposition backdrop swapchain, so the terminal body stays opaque."
+                .to_string(),
+        );
+        crate::platform_win::note_client_backdrop_declined(
+            crate::platform_win::ClientBackdropDecline::DcompUnavailable,
         );
         aterm_gpu::withdraw_dx12_visual_swapchain();
         let rebuilt = match self
@@ -1245,15 +1259,33 @@ impl App {
                 // and the post-join truth is caught by the mismatch log below.
                 let pad = self.cfg_pad_for_scale(scale);
                 let pad_top = self.cfg_pad_top_for_scale(scale);
-                // 0 on Windows today — but derived through the same seam the
-                // post-join path measures, not hardcoded, so a future non-zero
-                // band shows up as a logged mismatch rather than silent drift.
+                // The measured OS band (0 on Windows — no AppKit titlebar) PLUS the
+                // C3 synthetic tab band, which is emphatically NOT 0 here: it is
+                // reserved out of the frame the post-join path derives, so predicting
+                // it wrong would make every warm launch log "early reveal was STALE"
+                // and put one visible resize on glass. The cached `(cell_w, cell_h)`
+                // this branch is already gated on is exactly the input the law wants,
+                // so the prediction is the same arithmetic, not a second heuristic.
                 let head = (self.apprt.titlebar_band_pts(&window) * scale).round().max(0.0)
-                    as usize;
+                    as usize
+                    + self.synthetic_strip_head_px(scale, cell_h);
                 let total_rows = rows.saturating_add(self.tab_strip_rows) as usize;
-                let width = cols as usize * cell_w + 2 * pad;
-                let raw_height = total_rows * cell_h + 2 * pad + head;
-                let height = raw_height.saturating_sub(pad.saturating_sub(pad_top));
+                // THE SHARED LAW, not a second copy of it. `frame_size_px` is what
+                // `Renderer::frame_size` itself is, and `visible_frame_height` is the
+                // same top-pad crop `Backend::frame_size` applies over it — so this
+                // prediction and the post-join `window_frame_px` below differ ONLY in
+                // where the cell box came from (cached here, live there). Open-coding
+                // the arithmetic is what would let the two drift, and the `head` term
+                // is exactly the one a synthetic tab band makes non-zero.
+                let (width, raw_height) = aterm_render::frame_size_px(
+                    total_rows,
+                    cols as usize,
+                    cell_w,
+                    cell_h,
+                    pad,
+                    head,
+                );
+                let height = crate::visible_frame_height(raw_height, pad, pad_top);
                 let exact = PhysicalSize::new(width as u32, height as u32);
                 // Still hidden: the correction from the seeded size to the
                 // exact frame is never on glass.
@@ -1415,6 +1447,22 @@ impl App {
         // regime, while a redundant same-value `set_pad` is a complete no-op.
         let pad_top = self.cfg_pad_top_for_scale(scale);
         self.backend.set_pad_top(pad_top);
+        // C3 (Windows): overwrite the measured band (0 — there is no AppKit
+        // titlebar to sample) with the SYNTHETIC tab band. Derived HERE, not up at
+        // the `titlebar_band_pts` measure, because the law's residue is
+        // `target − pad_top − strip_rows·cell_h` and `cell_h` is only knowable once
+        // the block above has settled `self.font_px` and activated the backend at
+        // it. `ws.metrics` is written from `head` immediately below, so this is the
+        // one write the whole attach needs. A no-op off Windows and whenever the
+        // strip is off / the band is `compact`.
+        #[cfg(windows)]
+        {
+            let cell_h = self.backend.cell_geometry(self.font_px).1;
+            let synthetic = self.synthetic_strip_head_px(scale, cell_h);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.head_pts = synthetic as f64 / if scale > 0.0 { scale } else { 1.0 };
+            }
+        }
         // FIRE-INTO-CHROME: the titlebar band in device px.
         let head_pts = self.windows.get(&wid).map_or(0.0, |ws| ws.head_pts);
         let head = (head_pts * scale).round() as usize;

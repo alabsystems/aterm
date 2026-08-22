@@ -2165,24 +2165,115 @@ pub(crate) fn cmd_session_status(proxy: &EventLoopProxy<Wake>, session: u64, res
     }
 }
 
-/// `spawn [cwd=<path>]` -> mint ONE new tab session in the frontmost window and
-/// reply `OK <sid>` — birth as a socket primitive. The sid is live in the registry
-/// before the reply is sent, so `@<sid> …` works immediately: an orchestrator
-/// stands up a fleet with a loop of spawn calls and drives each newborn with
-/// `turn`/`send`/`subscribe`, no process management. `cwd=<path>` sets the
-/// newborn's working directory (default: inherit the focused pane's cwd, like
-/// Cmd-T). The newborn runs the default shell; give it a command with
-/// `@<sid> turn '<cmd>'`. Main-thread hop like `open`/`controls`.
-pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    let mut cwd: Option<String> = None;
-    for tok in rest.split_whitespace() {
-        if let Some(v) = tok.strip_prefix("cwd=") {
-            cwd = Some(v.to_string());
+/// Split `rest` into `key=value` tokens, honouring a DOUBLE-QUOTED value.
+///
+/// The control protocol is newline-delimited and otherwise whitespace-split,
+/// which was fine while the only value anyone passed was a POSIX path. It is not
+/// fine on Windows: `cwd=C:\Program Files\Git` arrives as two tokens and is
+/// rejected as a usage error, and that is the majority of the paths a Windows
+/// operator actually has. So a value may be wrapped in `"…"`, and only the
+/// wrapping quotes are consumed — there is deliberately NO escape vocabulary
+/// (`\"`, doubling, percent-encoding): a Windows path cannot contain `"` at all,
+/// and inventing an escape grammar for a protocol whose framing is "one line"
+/// buys a corner case at the cost of a second parser everyone has to agree on.
+/// The front door refuses to forward such a path instead
+/// (`aterm_cli::WindowRequest::control_request`).
+///
+/// Backward compatible in both directions: an UNQUOTED value parses exactly as
+/// it always did, so every existing `aterm-ctl spawn cwd=/tmp/x` caller is
+/// untouched, and an older server simply never sees a quoted one (the front door
+/// only quotes when it must).
+///
+/// WHERE A `"` OPENS A QUOTE is therefore narrow on purpose: only at the start of
+/// a token, or immediately after the `=` of a `key=` prefix — the one place the
+/// wire format ever puts one. Anywhere else it is an ORDINARY CHARACTER. This
+/// module is cross-platform while its justification ("a Windows path cannot
+/// contain `\"`") is not: `/tmp/a"b` is a perfectly legal POSIX directory, it
+/// used to arrive as one whitespace-delimited token and work, and a state
+/// machine that toggled on every `"` would leave the line unterminated and
+/// answer `ERR usage`. Treating a mid-value quote as data costs nothing — the
+/// front door refuses to FORWARD such a path anyway
+/// (`aterm_cli::WindowRequest::control_request`), so the only way one arrives is
+/// a direct `aterm-ctl spawn` that used to be served.
+///
+/// Returns `None` for an unterminated quote — a malformed request, answered with
+/// the verb's usage line rather than a half-path.
+fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut started = false;
+    let mut in_quotes = false;
+    for ch in rest.chars() {
+        if ch == '"' && in_quotes {
+            in_quotes = false;
+        } else if ch == '"' && (current.is_empty() || current.ends_with('=')) {
+            in_quotes = true;
+            started = true;
+        } else if ch.is_whitespace() && !in_quotes {
+            if started {
+                out.push(std::mem::take(&mut current));
+                started = false;
+            }
         } else {
-            return "ERR usage: spawn [cwd=<path>]\n".to_string();
+            current.push(ch);
+            started = true;
         }
     }
-    match call_main(proxy, |tx| Wake::SpawnSession { cwd, reply: tx }) {
+    if in_quotes {
+        return None;
+    }
+    if started {
+        out.push(current);
+    }
+    Some(out)
+}
+
+/// `spawn [cwd=<path>] [split=<v|h>]` -> mint ONE new session in the frontmost
+/// window and reply `OK <sid>` — birth as a socket primitive. The sid is live in
+/// the registry before the reply is sent, so `@<sid> …` works immediately: an
+/// orchestrator stands up a fleet with a loop of spawn calls and drives each
+/// newborn with `turn`/`send`/`subscribe`, no process management.
+///
+/// `cwd=<path>` sets the newborn's working directory (default: inherit the
+/// focused pane's cwd, like Cmd-T); a path containing spaces is quoted
+/// (`cwd="C:\Program Files\Git"`, see [`split_quoted_tokens`]).
+///
+/// `split=v` / `split=h` divides the FOCUSED PANE instead of opening a tab —
+/// side-by-side and stacked respectively, the same two directions Cmd-D and
+/// Cmd-Shift-D take. This is the wire half of the front door's `aterm
+/// split-pane [-d <dir>]` (S12): a split is the one "new terminal" shape that
+/// could not be requested from outside the process, so the verb that opens a
+/// terminal grew an option rather than the protocol growing a second verb (a new
+/// verb would need its own op-class entry, roster line, and completion, for a
+/// variation on the same act).
+///
+/// The newborn runs the default shell; give it a command with
+/// `@<sid> turn '<cmd>'`. Main-thread hop like `open`/`controls`.
+pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    const USAGE: &str = "ERR usage: spawn [cwd=<path>] [split=<v|h>]\n";
+    let mut cwd: Option<String> = None;
+    let mut split: Option<crate::pane::SplitDir> = None;
+    let Some(tokens) = split_quoted_tokens(rest) else {
+        return USAGE.to_string();
+    };
+    for tok in tokens {
+        if let Some(v) = tok.strip_prefix("cwd=") {
+            cwd = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("split=") {
+            split = match v {
+                "v" | "vertical" => Some(crate::pane::SplitDir::Vertical),
+                "h" | "horizontal" => Some(crate::pane::SplitDir::Horizontal),
+                _ => return USAGE.to_string(),
+            };
+        } else {
+            return USAGE.to_string();
+        }
+    }
+    match call_main(proxy, |tx| Wake::SpawnSession {
+        cwd,
+        split,
+        reply: tx,
+    }) {
         Ok(Ok(sid)) => format!("OK {sid}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -2251,6 +2342,68 @@ pub(crate) fn cmd_panes(proxy: &EventLoopProxy<Wake>, session: Option<u64>) -> S
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod spawn_parse_tests {
+    use super::split_quoted_tokens;
+
+    /// The BACKWARD-COMPATIBILITY leg: every `spawn` request that worked before
+    /// quoting existed must tokenize byte-identically, or a quiet regression
+    /// lands in every existing `aterm-ctl spawn` caller and every orchestrator
+    /// script.
+    #[test]
+    fn unquoted_requests_tokenize_exactly_as_whitespace_splitting_did() {
+        for rest in [
+            "",
+            "   ",
+            "cwd=/tmp/x",
+            "  cwd=/tmp/x  ",
+            "cwd=/tmp/x split=v",
+            // A `"` INSIDE a value: legal on macOS/Linux, and the whole point of
+            // the "byte-identical for every unquoted shape" claim. Before the
+            // quote rule was narrowed these toggled the state machine, left the
+            // line unterminated, and turned a working `aterm-ctl spawn` into
+            // `ERR usage`.
+            r#"cwd=/tmp/a"b"#,
+            r#"cwd=/tmp/a"b"c"#,
+            r#"cwd=/tmp/say"hi split=h"#,
+        ] {
+            let expected: Vec<String> = rest.split_whitespace().map(str::to_string).collect();
+            assert_eq!(split_quoted_tokens(rest), Some(expected), "{rest:?}");
+        }
+    }
+
+    /// The reason quoting exists at all: an ordinary Windows path. Before this,
+    /// `cwd=C:\Program Files\Git` split into three tokens and the verb answered
+    /// with a usage error.
+    #[test]
+    fn a_quoted_value_keeps_its_spaces_as_one_token() {
+        assert_eq!(
+            split_quoted_tokens(r#"cwd="C:\Program Files\Git""#),
+            Some(vec![r"cwd=C:\Program Files\Git".to_string()])
+        );
+        assert_eq!(
+            split_quoted_tokens(r#"split=h cwd="C:\Users\a b\c""#),
+            Some(vec![
+                "split=h".to_string(),
+                r"cwd=C:\Users\a b\c".to_string()
+            ])
+        );
+        // An EMPTY quoted value is a token, not nothing: `cwd=""` must not
+        // silently become "no cwd given".
+        assert_eq!(
+            split_quoted_tokens(r#"cwd="""#),
+            Some(vec!["cwd=".to_string()])
+        );
+    }
+
+    /// An unterminated quote is malformed, not "everything to end of line": the
+    /// caller gets the usage line instead of a truncated directory it never named.
+    #[test]
+    fn an_unterminated_quote_is_rejected() {
+        assert_eq!(split_quoted_tokens(r#"cwd="C:\Program Files"#), None);
+    }
 }
 
 #[cfg(test)]

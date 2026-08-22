@@ -449,6 +449,18 @@ fn paint_well(
     if last < chars.len() && cursor != last {
         row[field.end - 1] = chrome_band::cell(SCROLL_RIGHT, c.label, c.field_bg, false, false);
     }
+    // BORDER, when the fill cannot carry the boundary. Stamped LAST so it covers every
+    // cell the passes above wrote — text, caret, placeholder and edge markers alike —
+    // and applied only where `band_colors` says the well and the band share a tone
+    // (every Windows High-Contrast scheme; no theme-derived one). Without it an HC
+    // user sees an editable field with no edge at all: the fill is the only thing this
+    // well ever drew to say "you can type here". See [`BandColors::well_rule`].
+    if let Some(rule) = c.well_rule {
+        for cell in &mut row[field] {
+            cell.underline = aterm_core::terminal::UnderlineStyle::Single;
+            cell.underline_color = Some(rule);
+        }
+    }
     scroll
 }
 
@@ -867,6 +879,50 @@ mod tests {
             top.rows.iter().flatten().all(|c| !c.overline),
             "top panel → no overline"
         );
+    }
+
+    /// THE QUERY FIELD ALWAYS HAS AN EDGE. The well is drawn as a FILL — the only
+    /// thing that says "you can type here" — and under every stock Windows
+    /// High-Contrast scheme `COLOR_WINDOW == COLOR_BTNFACE`, so that fill is the same
+    /// tone as the band and the field disappears. HC separates surfaces with borders,
+    /// so a border is stamped instead: unbroken across the whole well, over the text,
+    /// the caret and the edge markers alike.
+    #[test]
+    fn the_query_well_keeps_a_boundary_under_a_forced_palette() {
+        use aterm_core::terminal::UnderlineStyle;
+        let cols = 90;
+        // Off an OS palette the fill carries the edge and nothing is stamped.
+        let plain = paint(&view("abc"), cols);
+        assert!(
+            plain.rows[plain.field_row][plain.field_cols.clone()]
+                .iter()
+                .all(|c| c.underline == UnderlineStyle::None),
+            "a theme-derived well is an inset already: no border"
+        );
+
+        for (name, palette) in chrome_band::hc_fixtures::STOCK {
+            chrome_band::hc_fixtures::with_forced(palette, || {
+                let c = chrome_band::band_colors(Theme::default());
+                assert_eq!(
+                    c.field_bg, c.bar_bg,
+                    "{name}: the fixture is only interesting because the tones collapse"
+                );
+                let p = paint(&view("abc"), cols);
+                let well = &p.rows[p.field_row][p.field_cols.clone()];
+                assert!(
+                    well.iter()
+                        .all(|cell| cell.underline == UnderlineStyle::Single
+                            && cell.underline_color == c.well_rule),
+                    "{name}: the well must carry an unbroken border, caret cell included"
+                );
+                // And it must stop AT the well: the band around it is not a field.
+                assert_eq!(
+                    p.rows[p.field_row][p.field_cols.start - 1].underline,
+                    UnderlineStyle::None,
+                    "{name}: the border marks the field, not the whole row"
+                );
+            });
+        }
     }
 
     /// The hints row teaches the emacs-isearch keymap in words that actually RENDER:

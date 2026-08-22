@@ -153,6 +153,7 @@ fn main() {
     for i in 0..typed.len() as u16 {
         t += Duration::from_millis(45);
         col = 3 + i;
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((row, col)), t, &cfg, geom, &mut quads);
         // Mid-typing captures at a third and at the end of the line.
         if i == typed.len() as u16 / 2 || i == typed.len() as u16 - 1 {
@@ -179,6 +180,9 @@ fn main() {
         ("enter_400ms", 400),
     ] {
         t += Duration::from_millis(wait_ms);
+        if wait_ms == 0 {
+            glow.note_synthetic_move(t);
+        }
         glow.tick(Some(landing), t, &cfg, geom, &mut quads);
         let f = ball.tick(Some(landing), t, glow.blaze(), geom, &fb_cfg, &mut quads);
         composite(

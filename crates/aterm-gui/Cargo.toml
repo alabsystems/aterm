@@ -370,5 +370,17 @@ name = "workspace_scaling"
 harness = false
 required-features = ["bench-support"]
 
+# The SUBSCRIBE (fleet observation) axis. Nothing priced it before: `frame_latency`
+# measures the render path and `workspace_scaling` the wrapper passes, while the
+# control socket's push loop — the thing a fleet orchestrator actually leans on —
+# had no bench target at all. This one prices the `events` DIGEST against the
+# variable its cost was found to track: RETAINED HISTORY DEPTH (completed blocks,
+# turn records, timeline events), not the live window. Same `bench-support` seam,
+# same no-shipping-build law.
+[[bench]]
+name = "subscribe_digest"
+harness = false
+required-features = ["bench-support"]
+
 [lints]
 workspace = true

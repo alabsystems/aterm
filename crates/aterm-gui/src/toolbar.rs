@@ -2642,6 +2642,15 @@ mod macos {
         /// because enabledness is the COMPOSER's decision (e.g. `Copy CWD` greys
         /// when no cwd is reported), not AppKit's responder-chain guess.
         fn show_context_menu(&self, event: &NSEvent) {
+            // This custom NSView consumes right/ctrl-click without a winit
+            // pointer event. Fence at OPEN, before the synchronous nested menu
+            // loop: dismissing the menu produces no TabMenuAction wake at all.
+            let _ = self
+                .ivars()
+                .proxy
+                .send_event(Wake::TabContextMenuOpening {
+                    window: self.ivars().window,
+                });
             let mtm = MainThreadMarker::from(self);
             // CLONE the model out of the RefCell (dropping the borrow) BEFORE the
             // tracking session: menu tracking runs a nested run loop that can

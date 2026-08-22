@@ -8,4 +8,4 @@ mod cursor;
 mod presentation;
 
 pub use cursor::GridCursorState;
-pub use presentation::{AbsoluteRowUpdate, GridPresentationState};
+pub use presentation::{AbsoluteRowUpdate, GridPresentationState, SelectionDamage};

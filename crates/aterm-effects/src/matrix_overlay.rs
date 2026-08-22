@@ -778,6 +778,7 @@ fn to_render_cell(cell: ExternalRainCell, default_bg: [u8; 3]) -> RenderCell {
         bg,
         wide: cell.flags & EXTERNAL_CELL_WIDE_CONTINUATION != 0,
         emoji_presentation: false,
+        text_presentation: false,
         bold: false,
         italic: false,
         underline: if cell.flags & EXTERNAL_CELL_UNDERLINE != 0 {

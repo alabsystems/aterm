@@ -1196,6 +1196,95 @@ fn vs16_emoji_gpu_matches_cpu() {
     );
 }
 
+/// VS15 text-presentation parity and containment end-to-end. The default-emoji
+/// scalar 😀 is narrowed to one materialized cell and X is explicitly placed in
+/// the immediately-adjacent column. Both backends must draw a non-vacuous text
+/// glyph while leaving that X cell byte-identical to an independently-rendered
+/// blank+X control. VS16 and CJK remain wide controls.
+#[test]
+fn vs15_text_emoji_is_one_cell_on_cpu_and_gpu_without_adjacent_overpaint() {
+    let theme = Theme::default();
+    let px = 18.0;
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+
+    let grin = '\u{1F600}';
+    let default_key = cpu.glyph_key(grin);
+    if default_key.source != aterm_render::FaceId::ColorEmoji
+        || default_key.glyph_class != aterm_render::GlyphClass::Rgba
+    {
+        eprintln!("SKIP: no ordinary colour 😀 path on this host: {default_key:?}");
+        return;
+    }
+
+    let (rows, cols) = (1usize, 5usize);
+    let (cw, ch) = cpu.cell_size();
+    let mut vs15_term = Terminal::new(rows as u16, cols as u16);
+    vs15_term.process("\x1b[?25l😀\u{FE0E}\x1b[2GX".as_bytes());
+    let vs15 = vs15_term.cell_frame(rows, cols);
+    assert!(vs15.cells[0][0].text_presentation);
+    assert!(!vs15.cells[0][0].emoji_presentation);
+    assert_eq!(aterm_render::materialized_cell_span(&vs15.cells[0], 0), 1);
+    assert_eq!(vs15.cells[0][1].ch, 'X');
+
+    let mut win = aterm_gpu::WindowGpu::new();
+    let cpu_vs15 = cpu.render_input(&vs15);
+    let gpu_vs15 = gpu.render_input(&mut win, &vs15, None);
+    let delta = max_channel_delta(&cpu_vs15, &gpu_vs15);
+    assert!(delta <= 8, "GPU/CPU VS15 pixels diverge: {delta}");
+
+    let mut control_term = Terminal::new(rows as u16, cols as u16);
+    control_term.process(b"\x1b[?25l X");
+    let control = control_term.cell_frame(rows, cols);
+    let cpu_control = cpu.render_input(&control);
+    let gpu_control = gpu.render_input(&mut win, &control, None);
+    assert!(
+        max_channel_delta(&cpu_control, &gpu_control) <= 8,
+        "blank+X control lost CPU/GPU parity"
+    );
+
+    assert!(
+        non_bg_count(&cell_pixels(&cpu_vs15, cw, ch, 0, 0)) > 12,
+        "CPU VS15 glyph is vacuously blank"
+    );
+    assert!(
+        non_bg_count(&cell_pixels(&gpu_vs15, cw, ch, 0, 0)) > 12,
+        "GPU VS15 glyph is vacuously blank"
+    );
+    assert_eq!(
+        cell_pixels(&cpu_vs15, cw, ch, 0, 1),
+        cell_pixels(&cpu_control, cw, ch, 0, 1),
+        "CPU VS15 glyph overpainted adjacent X"
+    );
+    assert_eq!(
+        cell_pixels(&gpu_vs15, cw, ch, 0, 1),
+        cell_pixels(&gpu_control, cw, ch, 0, 1),
+        "GPU VS15 glyph/quad overpainted adjacent X"
+    );
+
+    // Negative controls against over-correcting all wide characters: VS16 stays
+    // an emoji-presentation 2-cell unit and CJK stays a non-presentation 2-cell
+    // unit. Their following X begins at column 2, not the adjacent column 1 above.
+    let mut vs16_term = Terminal::new(rows as u16, cols as u16);
+    vs16_term.process("\x1b[?25l\u{2764}\u{FE0F}X".as_bytes());
+    let vs16 = vs16_term.cell_frame(rows, cols);
+    assert!(vs16.cells[0][0].emoji_presentation);
+    assert!(!vs16.cells[0][0].text_presentation);
+    assert_eq!(aterm_render::materialized_cell_span(&vs16.cells[0], 0), 2);
+    assert_eq!(vs16.cells[0][2].ch, 'X');
+
+    let mut cjk_term = Terminal::new(rows as u16, cols as u16);
+    cjk_term.process("\x1b[?25l中X".as_bytes());
+    let cjk = cjk_term.cell_frame(rows, cols);
+    assert!(!cjk.cells[0][0].emoji_presentation);
+    assert!(!cjk.cells[0][0].text_presentation);
+    assert_eq!(aterm_render::materialized_cell_span(&cjk.cells[0], 0), 2);
+    assert_eq!(cjk.cells[0][2].ch, 'X');
+}
+
 /// Emoji grapheme-CLUSTER parity end-to-end: a ZWJ family (👨‍👩‍👧), a skin-tone
 /// thumbs-up (👍🏽), and a keycap (1️⃣) are multi-codepoint clusters the renderer
 /// SHAPES (rustybuzz) to a single colour glyph. Both paths must draw that glyph,

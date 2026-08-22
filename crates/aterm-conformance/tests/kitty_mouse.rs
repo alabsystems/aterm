@@ -19,6 +19,7 @@
 use aterm_conformance::{Screen, run};
 use aterm_core::terminal::Terminal;
 use aterm_types::keyboard::{Key, KeyboardMode, Modifiers, NamedKey, encode_key};
+use aterm_types::mouse::WheelDir;
 
 /// Feed bytes to a raw 24x80 engine `Terminal` (Screen lacks encoder access).
 fn term_24x80(input: &[u8]) -> Terminal {
@@ -208,7 +209,7 @@ fn mouse_1000_default_encoding_press_release_exact_bytes() {
 fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
     let t = term_24x80(b"\x1b[?1000h");
     assert_eq!(
-        t.encode_mouse_wheel(true, 10, 5, 0),
+        t.encode_mouse_wheel(WheelDir::Up, 10, 5, 0),
         Some(vec![0x1b, b'[', b'M', 96, 43, 38]),
         "wheel up: Cb = 32 + 64"
     );
@@ -217,6 +218,47 @@ fn mouse_1000_wheel_up_is_button_64_and_shift_adds_4() {
         t.encode_mouse_press(0, 10, 5, 4),
         Some(vec![0x1b, b'[', b'M', 36, 43, 38]),
         "shift+left press: Cb = 32 + (0|4)"
+    );
+}
+
+/// xterm ctlseqs, Mouse Tracking: the wheel block continues past 4/5 —
+/// "buttons 6 and 7" are the horizontal (tilt) wheel, event codes 66 and 67.
+/// SGR (1006) so the code is readable; a tilt-left is `CSI < 66 ; x ; y M`.
+/// This pair was UNREACHABLE before the encoder took a 4-way direction: the
+/// GUI dropped horizontal gestures and the encoder had no code to give them.
+#[test]
+fn mouse_1006_horizontal_wheel_is_buttons_66_and_67() {
+    let t = term_24x80(b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(
+        t.encode_mouse_wheel(WheelDir::Left, 10, 5, 0).as_deref(),
+        Some(b"\x1b[<66;11;6M".as_slice()),
+        "tilt left: button 6"
+    );
+    assert_eq!(
+        t.encode_mouse_wheel(WheelDir::Right, 10, 5, 0).as_deref(),
+        Some(b"\x1b[<67;11;6M".as_slice()),
+        "tilt right: button 7"
+    );
+}
+
+/// xterm ctlseqs, Mouse Tracking: the second extension block — "buttons 8-11"
+/// — starts at Cb 128, so the thumb (back/forward) pair reports 128 and 129.
+/// Under SGR the release keeps the button identity and flips the final byte.
+#[test]
+fn mouse_1006_thumb_buttons_are_128_and_129() {
+    use aterm_types::mouse::MouseButton;
+    let t = term_24x80(b"\x1b[?1000h\x1b[?1006h");
+    assert_eq!(
+        t.encode_mouse_press(MouseButton::Back.code(), 10, 5, 0)
+            .as_deref(),
+        Some(b"\x1b[<128;11;6M".as_slice()),
+        "thumb back press: xterm button 8"
+    );
+    assert_eq!(
+        t.encode_mouse_release(MouseButton::Forward.code(), 10, 5, 0)
+            .as_deref(),
+        Some(b"\x1b[<129;11;6m".as_slice()),
+        "thumb forward release keeps its identity under SGR"
     );
 }
 
@@ -387,11 +429,11 @@ fn mouse_no_tracking_mode_all_encoders_return_none() {
     assert_eq!(t.encode_mouse_press(0, 10, 5, 0), None);
     assert_eq!(t.encode_mouse_release(0, 10, 5, 0), None);
     assert_eq!(t.encode_mouse_motion(0, 10, 5, 0), None);
-    assert_eq!(t.encode_mouse_wheel(true, 10, 5, 0), None);
+    assert_eq!(t.encode_mouse_wheel(WheelDir::Up, 10, 5, 0), None);
 
     let t = term_24x80(b"\x1b[?1000h\x1b[?1000l");
     assert_eq!(t.encode_mouse_press(0, 10, 5, 0), None, "after DECRST 1000");
-    assert_eq!(t.encode_mouse_wheel(true, 10, 5, 0), None);
+    assert_eq!(t.encode_mouse_wheel(WheelDir::Up, 10, 5, 0), None);
 }
 
 /// xterm ctlseqs, "X10 compatibility mode" (DECSET 9): reports button
@@ -405,5 +447,5 @@ fn mouse_mode_9_x10_compat_is_press_only() {
     );
     assert_eq!(t.encode_mouse_release(0, 10, 5, 0), None);
     assert_eq!(t.encode_mouse_motion(0, 10, 5, 0), None);
-    assert_eq!(t.encode_mouse_wheel(true, 10, 5, 0), None);
+    assert_eq!(t.encode_mouse_wheel(WheelDir::Up, 10, 5, 0), None);
 }

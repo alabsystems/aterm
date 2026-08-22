@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::time::Instant;
 
 use aterm_core::selection::{SelectionSide, SelectionType};
+use aterm_types::mouse::WheelDir;
 use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta};
 use winit::window::CursorIcon;
 
@@ -21,15 +22,28 @@ use crate::{
 };
 
 /// Map a winit mouse button to the engine's [`aterm_types::mouse::MouseButton`]
-/// for an [`InputEvent::MouseButton`]. `None` for buttons the GUI does not report
-/// (Back/Forward/Other), so the handler can early-return.
+/// for an [`InputEvent::MouseButton`].
+///
+/// The THUMB pair (audit I8) maps too: `Back`/`Forward` are XButton1/XButton2 on
+/// Windows and `BTN_SIDE`/`BTN_EXTRA` on Linux, and they are xterm's buttons 8/9,
+/// so a TUI that asked for mouse tracking can finally see them. They flow through
+/// the SAME seam as the other three — every pre-dispatch consumer in
+/// `on_mouse_input` (strip, dividers, selection, right-click, modals) is gated on
+/// a specific button, so nothing local claims them and, with tracking OFF, the
+/// `TrackingOff` consumer is Left-gated and they stay inert.
+///
+/// `Other(_)` stays `None` and the handler early-returns: an unmapped device
+/// button has NO xterm code, and inventing one (or folding it onto button 8)
+/// would send a TUI a report for a press it cannot name.
 pub(crate) fn winit_mouse_button(b: WinitMouseButton) -> Option<aterm_types::mouse::MouseButton> {
     use aterm_types::mouse::MouseButton;
     match b {
         WinitMouseButton::Left => Some(MouseButton::Left),
         WinitMouseButton::Middle => Some(MouseButton::Middle),
         WinitMouseButton::Right => Some(MouseButton::Right),
-        _ => None,
+        WinitMouseButton::Back => Some(MouseButton::Back),
+        WinitMouseButton::Forward => Some(MouseButton::Forward),
+        WinitMouseButton::Other(_) => None,
     }
 }
 
@@ -953,6 +967,95 @@ impl App {
         )
     }
 
+    /// C5 — window pixel `(x, y)` as a FRAME cell `(row, col)`: the coordinate
+    /// system the tab-strip splice (and therefore [`crate::tab_menu::MenuRect`])
+    /// works in, where row 0 is the strip's first row.
+    ///
+    /// Deliberately UNCLAMPED, for exactly the reason
+    /// [`Self::find_bar_pixel_hit`] is: `pixel_to_cell` snaps a point in the
+    /// surrounding pad onto the nearest real cell, so a press in the top border
+    /// or past the right edge would resolve to a menu row it never touched. A
+    /// point outside the grid interior returns `None` and the caller treats it
+    /// as "off the card".
+    fn frame_cell_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(usize, usize)> {
+        let (cw, ch) = self.win_cell_size(wid);
+        let (cw, ch) = (cw.max(1), ch.max(1));
+        let pad = self.win_pad(wid);
+        let top = self.win_pad_top(wid) + self.win_head(wid);
+        let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols) as usize;
+        let (ox, oy) = self.frame_origin(wid);
+        let (fx, fy) = (x - ox as f64, y - oy as f64);
+        if fy < top as f64 || fx < pad as f64 {
+            return None;
+        }
+        let row = ((fy as usize).saturating_sub(top)) / ch;
+        let col = ((fx as usize).saturating_sub(pad)) / cw;
+        (col < cols).then_some((row, col))
+    }
+
+    /// C5 — the open menu's recorded rect plus the frame cell under `(x, y)`,
+    /// when this window has a menu that has actually been PAINTED. The rect is
+    /// the one the painter recorded, never a re-derivation, so a click can never
+    /// resolve against a placement the glass does not show.
+    fn tab_menu_probe(
+        &self,
+        wid: WindowId,
+        x: f64,
+        y: f64,
+    ) -> Option<(crate::tab_menu::MenuRect, usize, usize)> {
+        let rect = self.windows.get(&wid)?.tab_menu_rect?;
+        let (row, col) = self.frame_cell_at(wid, x, y)?;
+        Some((rect, row, col))
+    }
+
+    /// C5 — the LIVE action row under `(x, y)`, or `None` on a header, a
+    /// separator, a disabled row, a border, or anywhere off the card.
+    fn tab_menu_action_at(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
+        let (rect, row, col) = self.tab_menu_probe(wid, x, y)?;
+        let ws = self.windows.get(&wid)?;
+        let menu = ws.tab_menu.as_ref()?;
+        crate::tab_menu::action_at(rect, &menu.entries, row, col)
+    }
+
+    /// C5 — whether `(x, y)` is anywhere ON the open card, border included. A
+    /// press there is swallowed even when it activates nothing: the card is a
+    /// surface, and a click on its frame must not reach the terminal beneath.
+    fn tab_menu_contains(&self, wid: WindowId, x: f64, y: f64) -> bool {
+        self.tab_menu_probe(wid, x, y)
+            .is_some_and(|(rect, row, col)| rect.contains(row, col))
+    }
+
+    /// C5 — move the open menu's highlight to the row under the pointer (or
+    /// clear it off the card). Change-gated: only a row CHANGE requests a
+    /// repaint, so sweeping within one row costs nothing, exactly like
+    /// [`Self::track_strip_hover`].
+    fn track_tab_menu_hover(&mut self, wid: WindowId, x: f64, y: f64) {
+        let hovered = self.tab_menu_action_at(wid, x, y);
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let Some(menu) = ws.tab_menu.as_mut() else {
+            return;
+        };
+        // A KEYBOARD-opened menu keeps the row its opener lit until the pointer
+        // actually enters the card: a hand brushing the mouse must not silently
+        // unselect the row a ⇧F10 user is about to press ↵ on. The first hover
+        // ON a row hands ownership of the highlight to the pointer for good.
+        if hovered.is_none() && menu.keyboard {
+            return;
+        }
+        if hovered.is_some() {
+            menu.keyboard = false;
+        }
+        if menu.highlight == hovered {
+            return;
+        }
+        menu.highlight = hovered;
+        if let Some(w) = &ws.os_window {
+            w.request_redraw();
+        }
+    }
+
     /// PETTING THE PET (wave 1): if the last pointer position lands on the
     /// pet's drawn body (the rect the redraw stashed post-tick, padded by
     /// [`PET_HIT_SLOP_PX`]), stroke the cat and CONSUME the press. Returns
@@ -1769,6 +1872,10 @@ impl App {
     }
 
     pub(crate) fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
+        // Pointer input has no causally provable terminal landing. It remains
+        // dark, but as a newer user boundary it must retire an older swallowed
+        // key candidate even when chrome/modal handling returns locally.
+        self.cancel_cursor_move_candidate(wid);
         // Remember the raw pixel position so a follow-up button press can tell
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1801,6 +1908,21 @@ impl App {
         self.track_strip_hover(wid, geom, x, y);
         if self.palette_claims_pointer(wid) {
             self.palette_pointer_motion(wid, x, y);
+            return;
+        }
+        // C5 TAB CONTEXT MENU: while the card is up it owns the pointer, so
+        // motion only moves its HIGHLIGHT and stops — no grid hover, no
+        // selection drag, no PTY motion report under an open menu. Change-gated
+        // (a sweep within one row costs nothing) and it clears the highlight
+        // when the pointer leaves the card, which is what a real menu does.
+        // Placed after the palette for the same reason `on_mouse_input`'s gate
+        // is: the palette is the more modal of the two.
+        if self.windows.get(&wid).is_some_and(|ws| ws.tab_menu.is_some()) {
+            // …but the cell caches still refresh, exactly as the About modal
+            // does: the first click after a KEYBOARD dismiss (Esc/↵, no
+            // intervening motion) must not act on the pre-open cell.
+            self.refresh_mouse_cell(wid, geom, x, y);
+            self.track_tab_menu_hover(wid, x, y);
             return;
         }
         // SETTINGS COLOUR-WHEEL DRAG: while the popover's disk or value slider is
@@ -2549,6 +2671,7 @@ impl App {
         state: ElementState,
         button: WinitMouseButton,
     ) {
+        self.cancel_cursor_move_candidate(wid);
         // GUI-ONLY prefix (gesture-state owner = App; a controller can't trigger
         // these): Cmd-click link-open, shift-extend, and the MULTI_CLICK_MS streak
         // FSM that yields the authoritative `click_count`. These stay in the
@@ -2567,6 +2690,43 @@ impl App {
                 }
             }
             if !pressed {
+                self.settle_pointer_drags(wid);
+            }
+            return;
+        }
+        // C5 TAB CONTEXT MENU: while the card is up it is MODAL over the
+        // pointer — every button, press and release, dies here. The three
+        // outcomes are the ones every menu on this platform has:
+        //   * a press on a LIVE action row runs it and dismisses;
+        //   * a press anywhere else ON the card (border, header, separator,
+        //     greyed row) is swallowed and the card stays — a real menu ignores
+        //     its own inert rows rather than closing on them;
+        //   * a press OFF the card dismisses it and is CONSUMED. Click-away
+        //     costs a click, which is the Windows/AppKit rule: the gesture that
+        //     closes a menu never also acts on what is underneath, or a hasty
+        //     dismiss would switch a tab / start a selection / land in a TUI.
+        // Only the PRESS is examined; the matching RELEASE is swallowed by the
+        // same gate having never set a `reported_buttons` bit, so a tracking app
+        // sees neither half and its press/release stream stays balanced (the
+        // config-banner pattern, restated in `RightPressPlan::Chrome`).
+        if self.windows.get(&wid).is_some_and(|ws| ws.tab_menu.is_some()) {
+            if pressed {
+                let (px, py) = self
+                    .windows
+                    .get(&wid)
+                    .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
+                if button == WinitMouseButton::Left
+                    && let Some(i) = self.tab_menu_action_at(wid, px, py)
+                {
+                    self.activate_tab_menu_entry(wid, i);
+                } else if !self.tab_menu_contains(wid, px, py) {
+                    self.close_tab_menu(wid);
+                }
+            } else {
+                // A swallowed RELEASE still settles any drag that was in flight
+                // when the menu popped — the same belt the Settings/About modals
+                // wear, or a divider/selection drag would keep tracking motion
+                // the gate above is no longer delivering.
                 self.settle_pointer_drags(wid);
             }
             return;
@@ -2945,7 +3105,51 @@ impl App {
                 )
             });
             match right_press_plan(gesture_on, over_strip, tracking, selection.is_some()) {
-                RightPressPlan::Chrome => return,
+                RightPressPlan::Chrome => {
+                    // C5: the press is on the strip band. If it landed on a
+                    // CHIP, pop that tab's context menu — the first Windows
+                    // reflex on a tab, and the only way the long-composed
+                    // `session_chrome::compose_tab_menu` model reaches a human
+                    // off macOS. On the bare band, the `+` or the `↻` there is
+                    // nothing to pop, so the arm keeps its wave-3 behaviour: a
+                    // pure swallow, which is still the fix for the bogus-cell
+                    // fall-through this whole plan exists for.
+                    //
+                    // WINDOWS ONLY, and the narrowing is deliberate.
+                    //
+                    // macOS: its chips carry a REAL `NSMenu` on the native strip
+                    // (`toolbar.rs`), popped by AppKit on the same model. The
+                    // in-grid strip is a non-default fallback there, and giving
+                    // it a second, differently-drawn menu would mean two answers
+                    // to one gesture on one platform.
+                    //
+                    // LINUX: this is a Windows-lane bundle, and on Linux it
+                    // would change three things at once that no Linux lane has
+                    // ratified — a chip right-press going from a pure swallow to
+                    // a popup (and note `RightClickGesture::PLATFORM_DEFAULT` is
+                    // `off` there, yet `right_press_plan` returns `Chrome` for
+                    // the strip regardless of the gesture setting, so it would
+                    // fire even for a user who turned the gesture off), Menu /
+                    // Shift+F10 becoming app-owned, and a new keyboard mode that
+                    // swallows every key while the card is up. The in-grid strip
+                    // IS Linux's tab chrome, so the card is a natural fit there
+                    // and this is a scope decision rather than a technical one:
+                    // it needs its own lane's review, not a Windows commit's.
+                    #[cfg(windows)]
+                    if let Some(col) = self.strip_col_at(wid, px, py) {
+                        let segs = self
+                            .windows
+                            .get(&wid)
+                            .map(|ws| ws.tab_segments.clone())
+                            .unwrap_or_default();
+                        if let Some(crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Close(index)) =
+                            crate::tab_bar::hit_test(&segs, col)
+                        {
+                            self.open_tab_context_menu(wid, index, col, false);
+                        }
+                    }
+                    return;
+                }
                 RightPressPlan::Copy => {
                     if let (Some(text), Some(t)) = (selection, term.as_ref()) {
                         // Copy, then clear-and-repaint even if the clipboard is
@@ -3146,9 +3350,12 @@ impl App {
         // when tracking is OFF (the motion then takes the local selection path and
         // never reads this).
         // Per-button "press was reported" bit, so a release pairs with its OWN press
-        // (a two-button chord under mouse tracking keeps both releases). `&7` keeps the
-        // shift in range; terminal mouse buttons are codes 0..=2.
-        let bit = 1u8 << (button.code() & 7);
+        // (a two-button chord under mouse tracking keeps both releases). Keyed on the
+        // DENSE `slot()`, never on `code()`: the thumb buttons' wire codes are 128/129,
+        // so the old `1 << (code & 7)` would alias Back onto Left's bit and Forward
+        // onto Middle's — a thumb release would clear a live drag's press bit and
+        // orphan its release.
+        let bit = 1u8 << (button.slot() & 7);
         let was_reported = self
             .windows
             .get(&wid)
@@ -3218,77 +3425,147 @@ impl App {
         );
     }
 
+    /// Normalize ONE winit wheel delta into whole notches: the axis, its
+    /// [`WheelDir`], and how many reports/lines it is worth. `None` while the
+    /// gesture is still sub-notch (banked) or carries no axis at all.
+    ///
+    /// Lines to move per event: whole lines drained from the per-window
+    /// residual — one per classic ±1 LineDelta notch, banked fractions for
+    /// precision-touchpad LineDelta and trackpad PixelDelta.
+    ///
+    /// AXIS FIRST (audit I7). The dominant component picks the axis; the
+    /// horizontal one is then banked in its OWN residual and travels as a
+    /// `WheelDir::Left/Right`. It used to be dropped in `on_mouse_wheel` with an
+    /// early return, which was the correct LOCAL answer (a grid has no
+    /// horizontal viewport, and the guard fixed a phantom scroll-down) but also
+    /// silently ate the gesture for a mouse-TRACKING app: Neovim, tmux and every
+    /// other SGR consumer never saw buttons 66/67 from aterm. Not a Windows
+    /// quirk — the `PixelDelta` twin dropped macOS trackpad swipes identically.
+    ///
+    /// Split out of `on_mouse_wheel` so the SIGN convention (which winit sign
+    /// becomes which xterm button) is provable against the REAL per-window
+    /// residual fields rather than against locals: a test that banks into its own
+    /// `f64` cannot fail no matter what this code does.
+    pub(crate) fn wheel_notches(
+        &mut self,
+        wid: WindowId,
+        delta: MouseScrollDelta,
+    ) -> Option<(WheelDir, i32)> {
+        match delta {
+            MouseScrollDelta::LineDelta(x, y) => {
+                // STRICT dominance on both axes, so the accepted VERTICAL set is
+                // bit-for-bit the old guard's (`y != 0 && |y| > |x|`) and a tie —
+                // including the all-zero event, which used to fall through to
+                // dir_up=false + `.max(1)` and scroll DOWN one line — still
+                // carries no axis and dies here.
+                let axis = wheel_axis(f64::from(x), f64::from(y), 0.0)?;
+                let ws = self.windows.get_mut(&wid)?;
+                match axis {
+                    // Positive x means "the content moves right", i.e. the reader
+                    // is walking LEFT (winit's documented sign, and the reason its
+                    // Windows backend negates WM_MOUSEHWHEEL's tilt-right).
+                    WheelAxis::Horizontal => {
+                        // sub-notch motion banks and emits nothing yet
+                        let (positive, n) =
+                            bank_scroll_lines(&mut ws.scroll_residual_x, f64::from(x))?;
+                        Some((horizontal_dir(positive), n))
+                    }
+                    // Fractional deltas (Windows precision touchpads / free-spinning
+                    // wheels emit many |y| << 1 events) bank into the residual and
+                    // emit only WHOLE lines — the old `.round().max(1)` forced a full
+                    // line per micro-event, scrolling several times too fast. A
+                    // classic ±1-per-notch wheel still moves exactly one line/notch.
+                    WheelAxis::Vertical => {
+                        let (up, n) = bank_scroll_lines(&mut ws.scroll_residual, f64::from(y))?;
+                        Some((vertical_dir(up), n))
+                    }
+                }
+            }
+            MouseScrollDelta::PixelDelta(p) => {
+                // Same axis split for trackpad pixel deltas, with the same EPSILON
+                // floor the old vertical guard carried. The horizontal half is
+                // measured in CELL WIDTHS so a swipe's notch count is the same unit
+                // the vertical half uses (cell heights) — a REPORT count, not a
+                // pixel count; the app does its own per-notch conversion.
+                //
+                // A cell is roughly twice as tall as it is wide, so the SAME pixel
+                // distance is worth about 2x the reports sideways. That is the
+                // intended unit, not an oversight: a column is the horizontal
+                // quantum exactly as a row is the vertical one, and measuring a
+                // sideways swipe in row HEIGHTS would be arbitrary. The volume it
+                // permits is bounded where every source converges, by
+                // `MAX_WHEEL_BURST` at the seam.
+                let axis = wheel_axis(p.x, p.y, f64::EPSILON)?;
+                let (cw, ch) = self.win_cell_size(wid);
+                let (cw, ch) = (cw.max(1) as f64, ch.max(1) as f64);
+                let ws = self.windows.get_mut(&wid)?;
+                match axis {
+                    WheelAxis::Horizontal => {
+                        let (positive, n) = bank_scroll_lines(&mut ws.scroll_residual_x, p.x / cw)?;
+                        Some((horizontal_dir(positive), n))
+                    }
+                    // Accumulate the signed sub-line delta in the per-window residual
+                    // and emit only WHOLE lines, carrying the fraction forward — so
+                    // slow, precise trackpad scrolling moves pixel-by-pixel instead of
+                    // snapping ≥1 line per event and dropping the remainder.
+                    WheelAxis::Vertical => {
+                        let (up, n) = bank_scroll_lines(&mut ws.scroll_residual, p.y / ch)?;
+                        Some((vertical_dir(up), n))
+                    }
+                }
+            }
+        }
+    }
+
     /// `MouseWheel` -> when an app is tracking the mouse, report wheel up/down at
     /// the cell under the pointer; otherwise scroll the scrollback viewport (the
     /// everyday "scroll up to see history" gesture).
     pub(crate) fn on_mouse_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
-        // The modal claim is decided before normalization. Horizontal/sub-line gestures
-        // still return below without ever reaching native/terminal scroll consumers.
+        self.cancel_cursor_move_candidate(wid);
+        // The modal claim is decided before normalization. Sub-line gestures still
+        // return below without ever reaching native/terminal scroll consumers, and
+        // so do HORIZONTAL ones over the palette / a native view — the terminal
+        // seam is the only consumer with an answer for that axis (audit I7).
         let palette = self.palette_claims_pointer(wid);
-        // Lines to move per event: whole lines drained from the per-window
-        // residual — one per classic ±1 LineDelta notch, banked fractions for
-        // precision-touchpad LineDelta and trackpad PixelDelta.
-        let (dir_up, lines) = match delta {
-            MouseScrollDelta::LineDelta(x, y) => {
-                // Ignore a predominantly-horizontal notch (a horizontal wheel or a
-                // tilt-wheel): a horizontal gesture must NOT scroll the viewport
-                // vertically. Without this, `y == 0.0` fell through to dir_up=false
-                // + `.max(1)` and scrolled DOWN one line on every horizontal swipe.
-                if y == 0.0 || y.abs() <= x.abs() {
-                    return;
-                }
-                // Fractional deltas (Windows precision touchpads / free-spinning
-                // wheels emit many |y| << 1 events) bank into the residual and
-                // emit only WHOLE lines — the old `.round().max(1)` forced a full
-                // line per micro-event, scrolling several times too fast. A
-                // classic ±1-per-notch wheel still moves exactly one line/notch.
-                let Some(ws) = self.windows.get_mut(&wid) else {
-                    return;
-                };
-                match bank_scroll_lines(&mut ws.scroll_residual, f64::from(y)) {
-                    Some(r) => r,
-                    None => return, // sub-line motion banked; nothing to emit yet
-                }
-            }
-            MouseScrollDelta::PixelDelta(p) => {
-                // Same guard for trackpad pixel deltas: bail when the vertical
-                // component is negligible or dominated by the horizontal one, so a
-                // horizontal two-finger swipe is a no-op instead of a phantom
-                // scroll-down. Vertical-dominant events keep the prior `.max(1)`
-                // one-line-minimum behavior unchanged.
-                if p.y.abs() < f64::EPSILON || p.y.abs() <= p.x.abs() {
-                    return;
-                }
-                let ch = self.win_cell_size(wid).1.max(1) as f64;
-                // Accumulate the signed sub-line delta in the per-window residual
-                // and emit only WHOLE lines, carrying the fraction forward — so
-                // slow, precise trackpad scrolling moves pixel-by-pixel instead of
-                // snapping ≥1 line per event and dropping the remainder.
-                let Some(ws) = self.windows.get_mut(&wid) else {
-                    return;
-                };
-                match bank_scroll_lines(&mut ws.scroll_residual, p.y / ch) {
-                    Some(r) => r,
-                    None => return, // sub-line motion banked; nothing to emit yet
-                }
-            }
+        let Some((dir, lines)) = self.wheel_notches(wid, delta) else {
+            return;
         };
-        if palette {
-            self.palette_pointer_wheel(
-                wid,
-                if dir_up {
-                    -(lines as isize)
-                } else {
-                    lines as isize
-                },
-            );
+        // CHROME AND NATIVE VIEWS ARE VERTICAL SURFACES. The palette card and a
+        // Settings/editor/reader tab each scroll ONE list on ONE axis, so a
+        // horizontal flick over them is nothing — and it must not fall through to
+        // the terminal seam either, because the PTY under a native tab is PARKED
+        // (the whole point of the native pointer boundary in `on_mouse_input`).
+        // Over the GRID a horizontal flick DOES continue to the seam, which
+        // reports it to a tracking app and yields zero local motion otherwise.
+        //
+        // HONEST SCOPE of "tracking-off is unchanged": byte-identical and
+        // motion-identical, not side-effect-identical. A horizontal flick over
+        // the grid now traverses `App::input` -> `input_to_session`, where the
+        // old early-return stopped it — so it now also trips
+        // `note_update_handoff_activity` (which revokes a pending automatic-update
+        // handoff overlap a dropped gesture used to leave intact), the
+        // `is_present_recovery_stimulus` retry rearm, and `note_alt_scroll` on the
+        // alt screen. All three are "the user is active" signals and are the
+        // RIGHT answer for a gesture the user really made — but they are new
+        // observable effects, so they are named here rather than implied away.
+        let vertical_up = dir.vertical_up();
+        if vertical_up.is_none() && (palette || self.active_native_view(wid).is_some()) {
             return;
         }
-        if self.active_native_view(wid).is_some() {
-            let signed = if dir_up { -lines } else { lines };
-            let _ =
-                self.dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(signed));
-            return;
+        if let Some(up) = vertical_up {
+            if palette {
+                self.palette_pointer_wheel(
+                    wid,
+                    if up { -(lines as isize) } else { lines as isize },
+                );
+                return;
+            }
+            if self.active_native_view(wid).is_some() {
+                let signed = if up { -lines } else { lines };
+                let _ = self
+                    .dispatch_native_event(wid, crate::native_app::AppEvent::ScrollLines(signed));
+                return;
+            }
         }
         let (row, col) = self
             .windows
@@ -3302,11 +3579,16 @@ impl App {
                 ws.last_mouse_px_off
             });
         // Phase 0.5: the seam decides tracking-ON (N reports / N lines — kills e)
-        // vs tracking-OFF (scroll the viewport `lines`) under one mode read.
+        // vs tracking-OFF (scroll the viewport `lines`) under one mode read. That
+        // is also where the horizontal axis is resolved: REPORTED while an app
+        // tracks the mouse, zero local motion otherwise. Reading the mode HERE
+        // instead would split the decision across two lock windows and hand the
+        // control `mouse` verb a different answer than a human hand — exactly the
+        // source-blindness the seam exists to guarantee.
         self.input(
             wid,
             InputEvent::Wheel {
-                dir_up,
+                dir,
                 lines,
                 row,
                 col,
@@ -3453,6 +3735,51 @@ fn open_url_windows(url: &str) {
     };
 }
 
+/// Which axis ONE wheel event belongs to, or `None` when it carries no axis at
+/// all (audit I7). Pure, so the classification table is unit-pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WheelAxis {
+    Horizontal,
+    Vertical,
+}
+
+/// Classify a raw `(x, y)` wheel delta. `floor` is the magnitude below which a
+/// component counts as no motion at all (0 for `LineDelta`, `f64::EPSILON` for
+/// `PixelDelta`, matching the guards each arm carried before the axis existed).
+///
+/// STRICT dominance both ways, and that is deliberate: it makes the accepted
+/// VERTICAL set bit-for-bit identical to the old `y == 0.0 || y.abs() <= x.abs()`
+/// early-return, so nothing about tracking-off scrolling moved. A diagonal TIE
+/// (|x| == |y|, the all-zero event included) still belongs to NEITHER axis and is
+/// dropped — a 45° trackpad drift has no defensible answer, and the old code's
+/// answer to the 0/0 case was a phantom scroll-DOWN.
+pub(crate) fn wheel_axis(x: f64, y: f64, floor: f64) -> Option<WheelAxis> {
+    let (ax, ay) = (x.abs(), y.abs());
+    if ax > ay && ax >= floor && ax > 0.0 {
+        return Some(WheelAxis::Horizontal);
+    }
+    if ay > ax && ay >= floor && ay > 0.0 {
+        return Some(WheelAxis::Vertical);
+    }
+    None
+}
+
+/// A banked HORIZONTAL notch's [`WheelDir`]. `positive` is winit's sign, where
+/// "+x" means the content moves right — i.e. the reader walks LEFT (xterm's
+/// button 6). Named rather than inlined so the sign convention is stated once.
+fn horizontal_dir(positive: bool) -> WheelDir {
+    if positive {
+        WheelDir::Left
+    } else {
+        WheelDir::Right
+    }
+}
+
+/// A banked VERTICAL notch's [`WheelDir`] (+y = wheel up = older content).
+fn vertical_dir(up: bool) -> WheelDir {
+    if up { WheelDir::Up } else { WheelDir::Down }
+}
+
 /// Bank a signed scroll delta (in LINES) into the per-window residual and drain
 /// the whole lines: `Some((dir_up, n))` with `n >= 1`, or `None` while the
 /// accumulated motion is still sub-line. A direction flip forfeits the old
@@ -3471,7 +3798,7 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bank_scroll_lines, press_selection_kind, press_starts_selection};
+    use super::{WheelDir, bank_scroll_lines, press_selection_kind, press_starts_selection};
     use aterm_core::selection::SelectionType;
 
     fn native_palette_row_center(
@@ -3779,18 +4106,18 @@ mod tests {
         settings.set_search("foreground".to_string());
         // A short compact search gives its contextual live preview the first
         // bounded slice and the matching native field the next one — at the 12 px
-        // `FONT_PX` of the macOS/Linux arm. On Windows `FONT_PX` is 16 (the
-        // logical-unit split documented at the constant: a Windows logical px is
-        // 1/96 in, so 16 is the same 12 pt that 12 is on macOS), which makes the
-        // headless window ~1/3 taller in device px, and the compact page then fits
-        // the preview AND the field in ONE bounded slice — the field is on slice 0
-        // and slice 1 paints nothing. Staging only: the properties under test
+        // `FONT_PX` of the macOS arm. On Windows `FONT_PX` is 16 and on Linux 15
+        // (the logical-unit split documented at the constant: a 1/96-in logical
+        // px there, so those are 12 pt / 11.25 pt), which makes the headless
+        // window taller in device px, and the compact page then fits the preview
+        // AND the field in ONE bounded slice — the field is on slice 0 and the
+        // next slice paints nothing. Staging only: the properties under test
         // (leading-pad caret, swatch-edge caret, pad→swatch drag selection) are
-        // asserted identically on both, and the slice the field lands on is a
-        // function of viewport height, not of the behaviour being pinned.
-        #[cfg(not(windows))]
+        // asserted identically on all three, and the slice the field lands on is
+        // a function of viewport height, not of the behaviour being pinned.
+        #[cfg(target_os = "macos")]
         let field_slice = 1;
-        #[cfg(windows)]
+        #[cfg(not(target_os = "macos"))]
         let field_slice = 0;
         settings.page_scroll = field_slice;
         settings
@@ -4747,6 +5074,262 @@ mod tests {
         assert!((wheel.s - expected.1).abs() < 1.0e-6);
     }
 
+    /// Audit I7 — the axis table. The VERTICAL column is the regression fence:
+    /// it must accept exactly what the old `y == 0.0 || y.abs() <= x.abs()`
+    /// early-return accepted, no more, so tracking-off scrolling is untouched.
+    /// The horizontal column is the new capability, and the tie/zero rows are
+    /// the phantom-scroll-down cases that must stay dropped.
+    #[test]
+    fn wheel_axis_matches_the_old_vertical_guard_and_adds_the_horizontal_one() {
+        use super::{WheelAxis, wheel_axis};
+        // Vertical dominance (either sign) — accepted before and now.
+        assert_eq!(wheel_axis(0.0, 1.0, 0.0), Some(WheelAxis::Vertical));
+        assert_eq!(wheel_axis(0.0, -1.0, 0.0), Some(WheelAxis::Vertical));
+        assert_eq!(wheel_axis(0.4, -1.0, 0.0), Some(WheelAxis::Vertical));
+        // Horizontal dominance — dropped before, reported now.
+        assert_eq!(wheel_axis(1.0, 0.0, 0.0), Some(WheelAxis::Horizontal));
+        assert_eq!(wheel_axis(-1.0, 0.4, 0.0), Some(WheelAxis::Horizontal));
+        // No axis: the all-zero event (which used to scroll DOWN one line) and
+        // a perfect diagonal, which has no defensible answer either way.
+        assert_eq!(wheel_axis(0.0, 0.0, 0.0), None);
+        assert_eq!(wheel_axis(1.0, 1.0, 0.0), None);
+        assert_eq!(wheel_axis(-2.0, 2.0, 0.0), None);
+        // The PixelDelta floor rejects sub-EPSILON motion on BOTH axes, matching
+        // the `p.y.abs() < f64::EPSILON` guard the vertical arm always had.
+        assert_eq!(wheel_axis(0.0, f64::EPSILON / 2.0, f64::EPSILON), None);
+        assert_eq!(wheel_axis(f64::EPSILON / 2.0, 0.0, f64::EPSILON), None);
+    }
+
+    /// Audit I7, on the REAL handler. `App::wheel_notches` (the normalizer
+    /// `on_mouse_wheel` runs before anything else) must bank the two axes into
+    /// the two SEPARATE per-window fields — `scroll_residual_x` for horizontal,
+    /// `scroll_residual` for vertical — so a sideways flick can never pay off,
+    /// or cancel, pending vertical motion.
+    ///
+    /// The previous version of this test banked into two LOCAL `f64`s and so
+    /// could not fail whatever the handler did; it proved a property of
+    /// `bank_scroll_lines` under a name that claimed a property of the handler.
+    #[test]
+    fn the_two_wheel_axes_bank_into_separate_window_fields() {
+        use crate::{App, WindowId};
+        use winit::event::MouseScrollDelta;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // `LineDelta` is f32, so the banked f64 carries the f32 rounding of 0.6.
+        let near = |got: f64, want: f64, what: &str| {
+            assert!((got - want).abs() < 1e-6, "{what}: got {got}, want ~{want}");
+        };
+        let residuals = |app: &App| {
+            let ws = &app.windows[&wid];
+            (ws.scroll_residual_x, ws.scroll_residual)
+        };
+        assert_eq!(residuals(&app), (0.0, 0.0), "both banks start empty");
+
+        // A sub-notch flick on each axis: neither emits, and each lands in its
+        // OWN field. If the handler shared one residual these two 0.6s would
+        // already have made a whole notch.
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(0.6, 0.0)),
+            None
+        );
+        near(residuals(&app).0, 0.6, "x banked in the x field");
+        assert_eq!(residuals(&app).1, 0.0, "the y field is untouched by x");
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(0.0, 0.6)),
+            None
+        );
+        near(residuals(&app).0, 0.6, "the x bank survived a y event");
+        near(residuals(&app).1, 0.6, "y banked in the y field");
+
+        // Each axis needs its OWN second half to emit; neither borrows the other.
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(0.0, 0.6)),
+            Some((WheelDir::Up, 1)),
+            "the vertical bank pays off from vertical motion alone"
+        );
+        near(
+            residuals(&app).0,
+            0.6,
+            "the vertical payoff must not drain the horizontal bank",
+        );
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(-0.6, 0.0)),
+            None,
+            "a horizontal reversal forfeits only the horizontal bank"
+        );
+        near(
+            residuals(&app).0,
+            -0.6,
+            "the reversal restarted the x bank in its own direction",
+        );
+    }
+
+    /// Audit I7 — the horizontal axis END TO END, in BOTH directions, through
+    /// the real `App` handler, with the exact xterm bytes each direction emits.
+    ///
+    /// This is the sign convention the whole widening rests on: winit documents
+    /// "+x = the content moves right", i.e. the reader walks LEFT, which is
+    /// xterm button 66; -x is button 67. Getting it backwards would silently
+    /// invert every horizontal scroll in Neovim/tmux, and nothing else in the
+    /// suite drives the handler off the vertical axis.
+    #[test]
+    fn horizontal_flicks_report_both_xterm_buttons_in_the_right_direction() {
+        use aterm_core::terminal::Terminal;
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        // Classic tilt-wheel notches, both signs.
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(1.0, 0.0)),
+            Some((WheelDir::Left, 1)),
+            "+x (content moves right) = the reader walks LEFT"
+        );
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(-1.0, 0.0)),
+            Some((WheelDir::Right, 1)),
+            "-x = the reader walks RIGHT (winit's Windows backend negates WM_MOUSEHWHEEL)"
+        );
+        // A multi-notch flick carries its count.
+        assert_eq!(
+            app.wheel_notches(wid, MouseScrollDelta::LineDelta(-3.0, 0.0)),
+            Some((WheelDir::Right, 3))
+        );
+
+        // Trackpad pixel deltas take the same signs, measured in CELL WIDTHS.
+        let cw = app.win_cell_size(wid).0.max(1) as f64;
+        assert_eq!(
+            app.wheel_notches(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(cw, 0.0))
+            ),
+            Some((WheelDir::Left, 1)),
+            "+x pixels agree with +x lines"
+        );
+        assert_eq!(
+            app.wheel_notches(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(-cw, 0.0))
+            ),
+            Some((WheelDir::Right, 1))
+        );
+
+        // THE BYTES. `Terminal::encode_mouse_wheel` is the seam's SOLE wheel
+        // byte producer, so pinning it for the two dirs above pins what a
+        // tracking app actually receives from a left/right flick.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?1000h");
+        term.process(b"\x1b[?1006h");
+        // Coordinates are 0-based going in and 1-based on the wire.
+        assert_eq!(
+            term.encode_mouse_wheel(WheelDir::Left, 0, 0, 0).as_deref(),
+            Some(b"\x1b[<66;1;1M".as_slice()),
+            "walking left is xterm button 6"
+        );
+        assert_eq!(
+            term.encode_mouse_wheel(WheelDir::Right, 0, 0, 0).as_deref(),
+            Some(b"\x1b[<67;1;1M".as_slice()),
+            "walking right is xterm button 7"
+        );
+        // …and the vertical pair keeps its codes, so the four are distinct.
+        assert_eq!(
+            term.encode_mouse_wheel(WheelDir::Up, 0, 0, 0).as_deref(),
+            Some(b"\x1b[<64;1;1M".as_slice())
+        );
+        assert_eq!(
+            term.encode_mouse_wheel(WheelDir::Down, 0, 0, 0).as_deref(),
+            Some(b"\x1b[<65;1;1M".as_slice())
+        );
+    }
+
+    /// The horizontal axis has NO local viewport, on the grid or over chrome.
+    /// With tracking off a sideways flick over the grid must move nothing (the
+    /// old early-return's behaviour, preserved by `WheelPlan::Fallback`'s
+    /// `wheel_lines: 0`), and over the palette / a native tab it must be
+    /// swallowed before it can reach the parked PTY at all.
+    #[test]
+    fn horizontal_flicks_move_no_local_viewport_anywhere() {
+        use winit::event::MouseScrollDelta;
+
+        use crate::native_app::AppViewState;
+        use crate::{App, WindowId};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            let mut terminal = crate::term_lock(&term);
+            for line in 0..100 {
+                terminal.process(format!("history {line}\r\n").as_bytes());
+            }
+            assert!(terminal.grid().scrollback_lines() > 0);
+        }
+
+        // Over the GRID, tracking off: the flick reaches the seam and yields
+        // zero rows of motion and no glide.
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(3.0, 0.0));
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(-3.0, 0.0));
+        assert_eq!(crate::term_lock(&term).grid().display_offset(), 0);
+        assert!(
+            app.windows[&wid].scroll_glide.is_none(),
+            "a horizontal flick never arms the vertical smooth scroll"
+        );
+        // Negative control: the VERTICAL twin of the same gesture does move.
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 3.0));
+        assert!(
+            app.windows[&wid].scroll_glide.is_some()
+                || crate::term_lock(&term).grid().display_offset() > 0,
+            "negative control: the vertical axis still scrolls"
+        );
+
+        // Over a NATIVE tab: swallowed before `dispatch_native_event`. The About
+        // route carries a page-scroll limit without needing a render pass
+        // (`special_page_scroll_limit`), so the vertical negative control below
+        // really can move.
+        let mut app = App::headless_for_test();
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_, view) = app.active_native_view(wid).expect("Settings active");
+        let page_scroll = |app: &App| match app.native_runtime.view_state(view).unwrap() {
+            AppViewState::Settings(settings) => settings.page_scroll,
+            _ => panic!("Settings state"),
+        };
+        let before = page_scroll(&app);
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(5.0, 0.0));
+        assert_eq!(
+            page_scroll(&app),
+            before,
+            "a horizontal flick never scrolls a native view"
+        );
+        // Negative control: the vertical twin does reach the native scroller.
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, -5.0));
+        assert_ne!(
+            page_scroll(&app),
+            before,
+            "negative control: the vertical axis still reaches the native scroller"
+        );
+
+        // Over the PALETTE: swallowed before `palette_pointer_wheel`.
+        let mut app = App::headless_for_test();
+        app.palette_enter();
+        let scroll_of = |app: &App| app.windows[&wid].palette().unwrap().scroll_extent().0;
+        let before = scroll_of(&app);
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(5.0, 0.0));
+        assert_eq!(
+            scroll_of(&app),
+            before,
+            "a horizontal flick never scrolls the palette card"
+        );
+    }
+
     /// Classic wheel notches (±1 or ±3 lines per event) pass through whole and
     /// leave no residual — behavior identical to the pre-banking code.
     #[test]
@@ -5019,6 +5602,92 @@ mod tests {
             0,
             "the Left (selection) reported bit is cleared on settle"
         );
+    }
+
+    /// Audit I8, on the REAL handler. A THUMB button must get its own
+    /// `reported_buttons` slot, so pressing it mid-drag cannot clear the Left
+    /// button's bit and orphan that drag's release.
+    ///
+    /// This is the exact aliasing the `slot()` fix exists to kill: `Back.code()`
+    /// is 128 and `128 & 7 == 0 == Left.code() & 7`, so the old
+    /// `1 << (code & 7)` bookkeeping folded Back onto Left and Forward onto
+    /// Middle. Nothing drove `on_mouse_input` with a thumb button before, so the
+    /// whole `winit_mouse_button(Back)` -> bitset -> press/release pairing chain
+    /// was unexercised end to end.
+    #[test]
+    fn a_thumb_press_never_clears_a_live_drags_reported_bit() {
+        use aterm_types::mouse::MouseButton;
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        // A foreground app is tracking, so every button press reports and sets
+        // its bit (no local selection gesture claims the Left press).
+        term_lock(&term).process(b"\x1b[?1000h");
+        assert!(term_lock(&term).mouse_tracking_enabled());
+        let bits = |app: &App| app.windows[&wid].reported_buttons;
+        let bit = |b: MouseButton| 1u8 << (b.slot() & 7);
+        // The aliasing this test fences: the OLD `1 << (code & 7)` gave Back and
+        // Left the same bit.
+        assert_eq!(
+            MouseButton::Back.code() & 7,
+            MouseButton::Left.code() & 7,
+            "the wire codes really do alias under `& 7` — that is why slot() exists"
+        );
+        assert_ne!(bit(MouseButton::Back), bit(MouseButton::Left));
+        assert_ne!(bit(MouseButton::Forward), bit(MouseButton::Middle));
+
+        // Left goes down and stays down (a live drag).
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_ne!(
+            bits(&app) & bit(MouseButton::Left),
+            0,
+            "Left press reported"
+        );
+        // A thumb click lands and lifts entirely inside that drag.
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Back);
+        assert_ne!(
+            bits(&app) & bit(MouseButton::Back),
+            0,
+            "Back press reported"
+        );
+        assert_ne!(
+            bits(&app) & bit(MouseButton::Left),
+            0,
+            "the thumb press must not disturb the live Left drag"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Back);
+        assert_eq!(bits(&app) & bit(MouseButton::Back), 0, "Back bit cleared");
+        assert_ne!(
+            bits(&app) & bit(MouseButton::Left),
+            0,
+            "the thumb RELEASE must not clear the live drag's press bit — the \
+             orphaned-release bug"
+        );
+        // The drag's own release still pairs.
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(bits(&app), 0, "every bit paired off");
+
+        // Forward gets a third distinct slot, and `Other(_)` is dropped outright
+        // (no bogus report for a device button aterm has no xterm code for).
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Forward);
+        assert_eq!(bits(&app), bit(MouseButton::Forward));
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Other(9));
+        assert_eq!(
+            bits(&app),
+            bit(MouseButton::Forward),
+            "an unmapped device button touches no bit"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Forward);
+        assert_eq!(bits(&app), 0);
+        assert_eq!(super::winit_mouse_button(WinitMouseButton::Other(9)), None);
     }
 
     /// PETTING (wave 1): the hit test is pure and pads by the slop on every
@@ -5381,6 +6050,95 @@ mod tests {
         );
         assert!(!ws.selecting, "and no selection started");
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// C5 — the RIGHT-press gesture, end to end through the real handler.
+    ///
+    /// Three things are pinned here and nowhere else: a right press on a chip
+    /// POPS the composed menu; that press never reaches the grid (the
+    /// bogus-cell fall-through the plan's `Chrome` arm exists to stop, now with
+    /// something behind it); and a left press AWAY from the card dismisses it
+    /// without also acting on whatever was underneath.
+    ///
+    /// WINDOWS ONLY, mirroring the opener's own gate: macOS chips carry a real
+    /// `NSMenu`, and the card is not offered on Linux (see the `Chrome` arm).
+    #[cfg(windows)]
+    #[test]
+    fn a_right_press_on_a_chip_pops_the_menu_and_never_reaches_the_grid() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        // Lay the strip out so `tab_segments` is real (the hit-test reads it).
+        app.splice_tab_strip_with(wid, 1);
+        let chip = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find_map(|seg| match seg.kind {
+                crate::tab_bar::TabHit::Select(0) => Some(seg.start_col + 1),
+                _ => None,
+            })
+            .expect("the lone tab has a chip");
+        let chip_pt = (
+            pad + f64::from(chip) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        assert!(
+            app.strip_col_at(wid, chip_pt.0, chip_pt.1).is_some(),
+            "fixture point must be ON the strip"
+        );
+
+        app.on_cursor_moved(wid, chip_pt.0, chip_pt.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Right);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Right);
+        let menu = app.windows[&wid]
+            .tab_menu
+            .as_ref()
+            .expect("the right press popped the tab's menu");
+        assert!(
+            menu.entries
+                .iter()
+                .any(|e| matches!(e, crate::session_chrome::TabMenuEntry::Action { .. })),
+            "…carrying the composed model's action rows"
+        );
+        // THE bogus-cell witness: `reported_buttons` is set by (and only by)
+        // the seam, at the end of `on_mouse_input`. A zero here is the proof
+        // that the press never reached the grid — the audit's "reported into
+        // the terminal at a bogus cell under a tracking TUI".
+        assert_eq!(
+            app.windows[&wid].reported_buttons, 0,
+            "a press on chrome is never reported to the terminal"
+        );
+
+        // A left press on the `+` dismisses the card and is CONSUMED: the
+        // dismissing gesture must not also do what it was pointing at (here,
+        // open a tab) — the click-away rule.
+        let plus = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find_map(|seg| (seg.kind == crate::tab_bar::TabHit::NewTab).then_some(seg.start_col))
+            .expect("a one-tab strip still offers the + segment");
+        let tabs_before = app.windows[&wid].tab_set.len();
+        let plus_pt = (
+            pad + f64::from(plus) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        app.on_cursor_moved(wid, plus_pt.0, plus_pt.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "click-away dismissed the card"
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            tabs_before,
+            "…and the dismissing press did NOT also open a tab"
+        );
+        assert_eq!(app.windows[&wid].reported_buttons, 0);
     }
 
     /// I10/I11: the hover cursor resolves BY LOCATION. Over plain grid cells the

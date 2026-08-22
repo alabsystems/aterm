@@ -13,4 +13,4 @@ mod encode;
 mod types;
 
 pub use encode::{encode_mouse, encode_sgr, encode_urxvt, encode_utf8, encode_x10};
-pub use types::{ALT_MASK, CTRL_MASK, MouseButton, MouseEncoding, MouseMode, SHIFT_MASK};
+pub use types::{ALT_MASK, CTRL_MASK, MouseButton, MouseEncoding, MouseMode, SHIFT_MASK, WheelDir};

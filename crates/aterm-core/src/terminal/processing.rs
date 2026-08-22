@@ -282,6 +282,31 @@ impl Terminal {
         // have drained `take_absolute_row_update()` above.
         let selection_row_update = self.grid.take_selection_row_update();
         let scroll_delta = self.grid.take_content_scroll_delta();
+        // Preserve the grid's precise, per-batch coordinate-motion verdict in
+        // a cumulative read-only projection before selection handling consumes
+        // it. A positive finite delta is composable only on the PRIMARY screen:
+        // alt-screen applications own/repaint their buffer and must invalidate
+        // cached host coordinates. Splices, region/down/erase sentinels, and
+        // any future negative delta are likewise non-uniform or ambiguous.
+        // SELECTION CUSTODY Phase 4: `scroll_delta == i32::MAX` used to carry this.
+        // That sentinel had TWO jobs — invalidate host coordinate caches, and clear
+        // the selection — and Phase 4 split them, because they are different
+        // questions (see `coordinates_invalidated` in the grid state). The selection
+        // half moved to the damage lattice; this half is now an explicit flag the
+        // row-MOVING ops set. Without it, removing the sentinel would have silently
+        // broken the documented `ContentScrollState::invalidation_epoch` contract for
+        // every host caching grid coordinates.
+        let invalidates_coordinates = selection_row_update.is_some()
+            || self.grid.take_coordinates_invalidated()
+            || scroll_delta == i32::MAX
+            || scroll_delta < 0
+            || (self.modes.alternate_screen && scroll_delta > 0);
+        if invalidates_coordinates {
+            self.content_scroll_state.invalidate();
+        } else if scroll_delta > 0 {
+            self.content_scroll_state
+                .record_uniform_up(u64::try_from(scroll_delta).unwrap_or(u64::MAX));
+        }
         let max_rows = i32::from(self.grid.rows());
         // Lower clear bound is the retained-history floor, not the visible
         // height: a scrollback selection has rows down to -scrollback_lines
@@ -334,6 +359,36 @@ impl Terminal {
             // scroll/edit in one parser batch, cannot be represented by one
             // piecewise boundary. Preserve the historical fail-closed behavior.
             (Some(_), _) => self.text_selection.clear(),
+        }
+
+        // SELECTION CUSTODY Phase 4 — the DAMAGE TEST, after the geometric
+        // transform above and before eviction below.
+        //
+        // The transform moves the selection with the content. This asks the separate
+        // question the old `i32::MAX` sentinel could not: did anything this batch
+        // actually REPLACE the rows the selection is sitting on? Only then is the
+        // highlight meaningless and only then must it go.
+        //
+        // Tested in ABSOLUTE rows because that is the one space both sides agree on
+        // regardless of where the viewport is. `live_top_abs` is
+        // `absolute_row_counter - rows`, the same base `Grid::visible_to_absolute`
+        // uses when recording, so a band recorded mid-batch and an anchor tested
+        // post-transform are directly comparable.
+        match self.grid.take_selection_damage() {
+            aterm_grid::SelectionDamage::None => {}
+            aterm_grid::SelectionDamage::All => self.text_selection.clear(),
+            aterm_grid::SelectionDamage::Band { lo_abs, hi_abs } => {
+                let live_top_abs = self
+                    .grid
+                    .absolute_row_counter()
+                    .saturating_sub(u64::from(self.grid.rows()));
+                if self
+                    .text_selection
+                    .intersects_absolute_band(live_top_abs, lo_abs, hi_abs)
+                {
+                    self.text_selection.clear();
+                }
+            }
         }
 
         // Sync BiDi cache invalidation from grid damage
@@ -462,6 +517,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         repaint_blink_epoch: _,
         absolute_row_revision: _,
         // --- Session-only (not forwarded to handler) ---
+        content_scroll_state: _,
         parser: _,
         font: _,
         text_selection: _,
@@ -471,7 +527,7 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         shell_integration_auth: _,
         hyperlink_auth: _,
         dcs_auth: _,
-        policy_engine: _,
+        policy: _,
         damage_epoch: _,
         damage_epoch_counted: _,
         // DMG-1 damage carrier: extraction-continuity tokens (engine identity
@@ -529,6 +585,185 @@ mod tests {
             !splice_accounts_for_batch_row_advance(before, before - 1, inserted),
             "the monotonic counter moving backward must also reject recovery",
         );
+    }
+
+    #[test]
+    fn content_scroll_state_tracks_uniform_scroll_with_zero_history_capacity() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(0)
+            .build();
+        let before = term.content_scroll_state();
+
+        term.process(b"\x1b[3;1H\n");
+
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            0,
+            "zero-capacity history cannot expose a count delta"
+        );
+        assert_eq!(
+            term.content_scroll_state().uniform_up_rows,
+            before.uniform_up_rows + 1,
+            "the content-motion signal is independent of retained history"
+        );
+        assert_eq!(
+            term.content_scroll_state().invalidation_epoch,
+            before.invalidation_epoch
+        );
+    }
+
+    #[test]
+    fn content_scroll_state_tracks_uniform_scroll_at_saturated_history_capacity() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(1)
+            .build();
+        term.process(b"\x1b[3;1H\n");
+        assert_eq!(term.grid().scrollback_lines(), 1, "history is at its cap");
+        let before = term.content_scroll_state();
+
+        term.process(b"\x1b[3;1H\n");
+
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            1,
+            "eviction keeps the observable history count saturated"
+        );
+        assert_eq!(
+            term.content_scroll_state().uniform_up_rows,
+            before.uniform_up_rows + 1
+        );
+        assert_eq!(
+            term.content_scroll_state().invalidation_epoch,
+            before.invalidation_epoch
+        );
+    }
+
+    #[test]
+    fn content_scroll_state_invalidates_interior_and_top_anchored_regions() {
+        let mut term = TerminalBuilder::new()
+            .size(4, 12)
+            .ring_buffer_size(8)
+            .build();
+
+        let before_interior = term.content_scroll_state();
+        // Interior DECSTBM region: rows 2..=3 move, rows 1 and 4 stay fixed.
+        term.process(b"\x1b[2;3r\x1b[3;1H\n");
+        let after_interior = term.content_scroll_state();
+        assert_eq!(
+            after_interior.uniform_up_rows, before_interior.uniform_up_rows,
+            "a partial-region shift is not a whole-screen translation"
+        );
+        assert_eq!(
+            after_interior.invalidation_epoch,
+            before_interior.invalidation_epoch + 1
+        );
+
+        let before_top_anchored = after_interior;
+        // Top-anchored archival region: the upper band enters history while
+        // the bottom row remains a protected footer. This is a row splice, not
+        // a uniform viewport translation even though scrollback grows.
+        term.process(b"\x1b[r\x1b[1;1HX\x1b[1;3r\x1b[3;1H\n");
+        let after_top_anchored = term.content_scroll_state();
+        assert_eq!(
+            after_top_anchored.uniform_up_rows,
+            before_top_anchored.uniform_up_rows
+        );
+        assert_eq!(
+            after_top_anchored.invalidation_epoch,
+            before_top_anchored.invalidation_epoch + 1
+        );
+        assert!(
+            term.grid().scrollback_lines() > 0,
+            "the top-anchored case closes the scrollback-growth false positive"
+        );
+    }
+
+    #[test]
+    fn content_scroll_state_invalidates_alt_screen_scrolls() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(8)
+            .build();
+        term.process(b"\x1b[?1049h");
+        assert!(term.is_alternate_screen());
+        let before = term.content_scroll_state();
+
+        term.process(b"\x1b[3;1H\n");
+
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            0,
+            "alt screen has no history"
+        );
+        assert_eq!(
+            term.content_scroll_state().uniform_up_rows,
+            before.uniform_up_rows,
+            "an app-owned alt buffer is never translated by the host"
+        );
+        assert_eq!(
+            term.content_scroll_state().invalidation_epoch,
+            before.invalidation_epoch + 1
+        );
+    }
+
+    #[test]
+    fn content_scroll_state_survives_direct_and_ris_reset_without_double_counting() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(0)
+            .build();
+        term.process(b"\x1b[3;1H\n");
+        let before_direct = term.content_scroll_state();
+
+        term.reset();
+
+        let after_direct = term.content_scroll_state();
+        assert_eq!(after_direct.uniform_up_rows, before_direct.uniform_up_rows);
+        assert_eq!(
+            after_direct.invalidation_epoch,
+            before_direct.invalidation_epoch + 1
+        );
+        term.process(b"");
+        assert_eq!(
+            term.content_scroll_state(),
+            after_direct,
+            "direct reset drains its grid sentinel instead of reporting twice"
+        );
+
+        term.process(b"\x1bc");
+        let after_ris = term.content_scroll_state();
+        assert_eq!(after_ris.uniform_up_rows, after_direct.uniform_up_rows);
+        assert_eq!(
+            after_ris.invalidation_epoch,
+            after_direct.invalidation_epoch + 1,
+            "byte-stream RIS reports one coordinate invalidation"
+        );
+    }
+
+    #[test]
+    fn content_scroll_state_coalesces_uniform_rows_and_invalidates_mixed_batches() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(0)
+            .build();
+        let initial = term.content_scroll_state();
+
+        // Once parked on the bottom row, every LF is another full-screen scroll;
+        // the grid coalesces their finite deltas within this parser batch.
+        term.process(b"\x1b[3;1H\n\n\n");
+        let uniform = term.content_scroll_state();
+        assert_eq!(uniform.uniform_up_rows, initial.uniform_up_rows + 3);
+        assert_eq!(uniform.invalidation_epoch, initial.invalidation_epoch);
+
+        // A later partial-region shift in the SAME batch turns the grid verdict
+        // into the fail-closed sentinel. Do not publish the earlier scroll as a
+        // composable translation: one invalidation covers the whole batch.
+        term.process(b"\x1b[3;1H\n\x1b[2;3r\x1b[3;1H\n");
+        let mixed = term.content_scroll_state();
+        assert_eq!(mixed.uniform_up_rows, uniform.uniform_up_rows);
+        assert_eq!(mixed.invalidation_epoch, uniform.invalidation_epoch + 1);
     }
 
     /// SCR-1: while the user is scrolled back into history, live output (e.g.

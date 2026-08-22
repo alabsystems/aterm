@@ -116,8 +116,24 @@ impl<T: Default> Default for Run<T> {
 /// Run-Length Encoded sequence of attributes.
 ///
 /// Stores a sequence of attributes as runs of consecutive identical values.
-/// Provides O(log runs) random access via binary search on cached prefix sums,
-/// and efficient range operations.
+/// Provides O(runs) random access by a linear walk of the run lengths, and
+/// efficient range operations.
+///
+/// # Why no prefix-sum index
+///
+/// This type used to carry a second `Vec<u32>` of run start offsets so that
+/// [`get`](Self::get) / [`set`](Self::set) / [`set_range`](Self::set_range) /
+/// [`Index`] could binary-search it. That index cost one extra allocation on
+/// every constructed `Rle` — paid by the scrollback materialization path for
+/// EVERY line it builds, including the all-default lines whose `Rle` is
+/// discarded unread — and 24 of the struct's 56 bytes. It bought nothing: the
+/// four random-access readers are the only readers of the index, and no
+/// production caller reaches them (scrollback's `Line::get_attr` deliberately
+/// walks the `runs` slice instead). [`with_value`](Self::with_value) already
+/// left the index empty and never resynced it, so those `Rle`s permanently ran
+/// on the linear path with no observable consequence — the tell that the index
+/// was decoration. Runs per scrollback line are 1-6, so a linear walk is also
+/// the faster shape at the sizes that exist.
 ///
 /// # Type Parameters
 ///
@@ -128,10 +144,6 @@ pub struct Rle<T> {
     runs: Vec<Run<T>>,
     /// Total length (sum of all run lengths).
     total_length: u32,
-    /// Cached prefix sums for O(log n) binary search in `find_run`.
-    /// `prefix_sums[i]` = sum of `runs[0..i].length` (start offset of run `i`).
-    /// Empty when invalidated; rebuilt lazily on the next `find_run` call.
-    prefix_sums: Vec<u32>,
 }
 
 impl<T: Copy + PartialEq + Default> Default for Rle<T> {
@@ -147,7 +159,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         Self {
             runs: Vec::new(),
             total_length: 0,
-            prefix_sums: Vec::new(),
         }
     }
 
@@ -173,7 +184,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         Self {
             runs,
             total_length: length,
-            prefix_sums: Vec::new(),
         }
     }
 
@@ -250,7 +260,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
     pub fn clear(&mut self) {
         self.runs.clear();
         self.total_length = 0;
-        self.prefix_sums.clear();
     }
 
     /// Push a single value onto the end.
@@ -309,23 +318,13 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
         {
             last.length = Self::checked_run_length_sum(last.length, count);
             self.total_length = Self::checked_run_length_sum(self.total_length, count);
-            // Prefix sums still valid — no new run boundaries.
             return;
         }
-        let offset = self.total_length;
-        // Capture the pre-push run count: `runs.len() - 1` after the push is
-        // exactly this value (`Vec::push` adds one element), and the pre-push
-        // spelling has no `- 1` underflow obligation for the verifier to
-        // refute (it cannot see `push`'s length postcondition).
-        let runs_before = self.runs.len();
         self.runs.push(Run {
             value,
             length: count,
         });
         self.total_length = Self::checked_run_length_sum(self.total_length, count);
-        if self.prefix_sums.len() == runs_before {
-            self.prefix_sums.push(offset);
-        }
     }
 
     /// Get the value at a specific index (safe alternative to `Index`).
@@ -361,7 +360,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
         // Need to split the run
         self.split_and_set(run_idx, offset_in_run, value);
-        self.rebuild_prefix_sums();
         true
     }
 
@@ -381,7 +379,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
                 value,
                 length: self.total_length,
             });
-            self.rebuild_prefix_sums();
             return;
         }
 
@@ -414,7 +411,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
                 end_offset.saturating_add(1),
                 value,
             );
-            self.rebuild_prefix_sums();
             return;
         }
 
@@ -427,7 +423,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
             end_offset.saturating_add(1),
             value,
         );
-        self.rebuild_prefix_sums();
     }
 
     /// Resize the sequence, extending with default value or truncating.

@@ -10,20 +10,6 @@
 use super::{Rle, Run, count_run_iteration};
 
 impl<T: Copy + PartialEq + Default> Rle<T> {
-    /// Rebuild prefix sums from current runs.
-    pub(super) fn rebuild_prefix_sums(&mut self) {
-        // No up-front `reserve(self.runs.len())`: a reserve of a symbolic
-        // length is refutable under the verifier's per-allocation ceiling.
-        // The pushes below grow the vector geometrically to the same final
-        // capacity class; results are identical.
-        self.prefix_sums.clear();
-        let mut acc = 0u32;
-        for run in &self.runs {
-            self.prefix_sums.push(acc);
-            acc = Self::checked_run_length_sum(acc, run.length);
-        }
-    }
-
     /// Truncate to a specific length.
     pub(super) fn truncate(&mut self, new_length: u32) {
         if new_length >= self.total_length {
@@ -50,7 +36,6 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
                 // saturates; this just discharges the no-overflow obligation.
                 self.runs.truncate(i.saturating_add(1));
                 self.total_length = new_length;
-                self.rebuild_prefix_sums();
                 return;
             }
             accumulated = next_accumulated;
@@ -59,56 +44,22 @@ impl<T: Copy + PartialEq + Default> Rle<T> {
 
     /// Find the run containing an index.
     ///
-    /// Uses O(log n) binary search when prefix sums are cached,
-    /// falls back to O(n) linear scan otherwise.
-    /// Returns `(run_index, offset_within_run)`.
+    /// O(runs) linear walk of the run lengths. Returns
+    /// `(run_index, offset_within_run)`.
+    ///
+    /// This used to prefer a binary search over a cached prefix-sum index. The
+    /// index was deleted (see the `Rle` type docs): it cost an allocation on
+    /// every constructed `Rle` on the scrollback materialization path, no
+    /// production caller reaches any of the four readers that consulted it, and
+    /// `with_value` already produced `Rle`s that ran here permanently. Runs per
+    /// line are 1-6, so the walk is short by construction — and it is the shape
+    /// the Kani harnesses already prove (`proofs_saturation.rs` drove exactly
+    /// this path).
     pub(super) fn find_run(&self, index: u32) -> Option<(usize, u32)> {
-        if self.prefix_sums.len() == self.runs.len() && !self.runs.is_empty() {
-            return self.find_run_binary(index);
-        }
         self.find_run_linear(index)
     }
 
-    /// Binary search on cached prefix sums.
-    fn find_run_binary(&self, index: u32) -> Option<(usize, u32)> {
-        // prefix_sums[i] = start offset of run i (nondecreasing by
-        // construction). Find the largest i where prefix_sums[i] <= index,
-        // i.e. the partition point of `start <= index`. Spelled as an
-        // explicit binary search — identical result to `partition_point` on
-        // the sorted-by-invariant array — because the closure-taking
-        // `partition_point` call is a construct the Level-0 verifier cannot
-        // model. The loop guard `lo < hi` bounds every step (`hi - lo` and
-        // `mid + 1 <= hi` stay in range), so the saturating ops never
-        // actually saturate; they just discharge the obligations.
-        let mut lo = 0usize;
-        let mut hi = self.prefix_sums.len();
-        while lo < hi {
-            let mid = lo.saturating_add(hi.saturating_sub(lo) / 2);
-            if self.prefix_sums[mid] <= index {
-                lo = mid.saturating_add(1);
-            } else {
-                hi = mid;
-            }
-        }
-        let pos = lo;
-        if pos == 0 {
-            return None;
-        }
-        let run_idx = pos - 1;
-        // Count a single "iteration" for tests; no-op in non-test builds.
-        count_run_iteration();
-        // `prefix_sums[pos - 1] <= index` by partition_point's contract, but
-        // that postcondition is opaque to the verifier — saturating_sub is
-        // identical when it holds.
-        let offset = index.saturating_sub(self.prefix_sums[run_idx]);
-        if offset < self.runs[run_idx].length {
-            Some((run_idx, offset))
-        } else {
-            None
-        }
-    }
-
-    /// Linear scan fallback when prefix sums are not cached.
+    /// Linear scan over the run lengths.
     fn find_run_linear(&self, index: u32) -> Option<(usize, u32)> {
         let mut accumulated = 0u32;
         for (i, run) in self.runs.iter().enumerate() {

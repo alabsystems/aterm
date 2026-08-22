@@ -343,6 +343,18 @@ impl App {
         self.request_redraw_all_windows();
     }
 
+    /// The transient card for a FAILED USER GESTURE (see
+    /// [`crate::notice::TransientNotice::gesture_failure`]): every call site
+    /// pairs this with the stderr line that carries the full error — the card
+    /// answers the person, the log answers the investigator.
+    pub(crate) fn surface_gesture_failure(&mut self, text: &str) {
+        self.notice = Some(crate::notice::TransientNotice::gesture_failure(
+            text,
+            std::time::Instant::now(),
+        ));
+        self.request_redraw_all_windows();
+    }
+
     /// Whether the celebration card's pixels are actually MOVING right now — sparkles
     /// enabled and motion live. The notice cannot know either: one is config, the
     /// other is the reduced-motion amplitude. Both must be true before the card earns

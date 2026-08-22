@@ -291,6 +291,8 @@ const HELP_TAIL: &str = concat!(
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
     "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
+    "              font_hinting (Linux: full | light | native | off;\n",
+    "              aliases $ATERM_FONT_HINTING),\n",
     "              font_variation [\"wght=450\", ...], font_weight,\n",
     "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
     "              font_family_bold/_italic/_bold_italic, font_synthetic_style,\n",
@@ -303,6 +305,25 @@ const HELP_TAIL: &str = concat!(
     "              allow_kitty_file_transfer, allow_osc52_query,\n",
     "              secure_keyboard_entry (macOS)  (all opt-in, default off).\n",
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
+);
+
+/// Windows-only verbs, appended to `--help` on Windows alone.
+///
+/// `--unset-default-terminal` is here because it is the ESCAPE HATCH: a machine
+/// whose `HKCU\Console\%%Startup` delegation points at a class nothing can
+/// create stops opening consoles entirely, and the way out has to be findable
+/// from the binary — not only from a README the user may not have.
+#[cfg(windows)]
+const WINDOWS_HELP_TAIL: &str = concat!(
+    "\nWINDOWS:\n",
+    "    --install-context-menu     Add 'Open aterm here' to the Explorer right-click menu\n",
+    "                               (per-user HKCU; --uninstall-context-menu removes it).\n",
+    "    --set-default-terminal     Register aterm as the Windows 11 default terminal.\n",
+    "                               REFUSES in this build (no COM handoff server yet) and\n",
+    "                               says why; nothing is written.\n",
+    "    --unset-default-terminal   Clear aterm's default-terminal registration — the way\n",
+    "                               back out. Works in every build; leaves another\n",
+    "                               terminal's registration alone and tells you whose it is.\n",
 );
 
 /// A documented starter config written by `--write-config`. Linux-tuned (real
@@ -434,6 +455,9 @@ const STARTER_CONFIG: &str = "\
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
 # stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner);
 #                                  # aliases $ATERM_STEM_GAMMA (env wins)
+# font_hinting = \"full\"           # Linux grid fitting: full (crispest, default) | light
+#                                  # (hintslight look) | native (font bytecode) | off;
+#                                  # aliases $ATERM_FONT_HINTING (env wins)
 # font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default = Regular / wght=400)
 # font_weight = 450                # wght shorthand; wins over a font_variation wght entry
 # font_weight_dark_nudge = 0       # extra wght on DARK themes (applied only when grid-safe)
@@ -638,6 +662,15 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
         match arg.as_str() {
             "-h" | "--help" => {
                 print!("{HELP_HEAD}{}{HELP_TAIL}", keys_help());
+                // Windows-only verbs, printed here rather than folded into the
+                // cross-platform HELP_TAIL so no Unix build advertises a flag it
+                // does not have. `--unset-default-terminal` in particular is the
+                // ESCAPE HATCH from a delegation that stops consoles opening;
+                // leaving it discoverable only through the README strands anyone
+                // who reaches that state on a stripped machine. `--set-...`
+                // refuses today and says why, which is more useful than silence.
+                #[cfg(windows)]
+                print!("{WINDOWS_HELP_TAIL}");
                 std::process::exit(0);
             }
             "-V" | "--version" => {
@@ -740,6 +773,91 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
             "--uninstall-context-menu" => {
                 let _ = crate::explorer_win::uninstall();
                 println!("aterm-gui: removed the 'Open aterm here' Explorer context menu.");
+                std::process::exit(0);
+            }
+            // Windows 11 default-terminal (DefTerm) handoff. Opt-in only, and
+            // currently REFUSED — see `defterm_win::handoff_server_available`.
+            // The refusal is deliberately loud and specific: silently doing
+            // nothing would leave the user believing their consoles had been
+            // redirected, and "it didn't take" is the one DefTerm failure that
+            // looks identical to a wrong registry key.
+            #[cfg(windows)]
+            "--set-default-terminal" => {
+                match crate::defterm_win::set_default_terminal() {
+                    Ok(()) => println!(
+                        "aterm-gui: registered aterm as the Windows default terminal. \
+                         New consoles (a double-clicked .bat, `Win+R cmd`, an installer's \
+                         console) will open in aterm. Undo with --unset-default-terminal."
+                    ),
+                    Err(e) => {
+                        eprintln!("aterm-gui: cannot become the default terminal: {e}");
+                        let (console, terminal) =
+                            crate::defterm_win::current_delegation().unwrap_or((None, None));
+                        eprintln!(
+                            "  current HKCU\\{}: {}={} {}={}{}",
+                            crate::defterm_win::STARTUP_KEY,
+                            crate::defterm_win::VALUE_CONSOLE,
+                            console.as_deref().unwrap_or("(unset)"),
+                            crate::defterm_win::VALUE_TERMINAL,
+                            terminal.as_deref().unwrap_or("(unset)"),
+                            if crate::defterm_win::is_aterm_default(terminal.as_deref()) {
+                                "  <- already aterm"
+                            } else {
+                                ""
+                            },
+                        );
+                        eprintln!(
+                            "  nothing was written; your console setup is unchanged. \
+                             Set the default terminal in Settings > System > For developers \
+                             until this ships."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                std::process::exit(0);
+            }
+            // Never GATED on the handoff server: removal is the escape hatch
+            // from a broken delegation and must work in every build, including
+            // on a machine whose registering exe is already gone. But it is
+            // guarded on OWNERSHIP — `HKCU\Console\%%Startup` is a shared,
+            // machine-wide console setting, so a registration aterm did not
+            // write is left alone and said so, never deleted and then reported
+            // as ours.
+            #[cfg(windows)]
+            "--unset-default-terminal" => {
+                use crate::defterm_win::UnsetOutcome;
+                match crate::defterm_win::unset_default_terminal() {
+                    Ok(UnsetOutcome::Removed) => println!(
+                        "aterm-gui: removed aterm's default-terminal registration \
+                         (consoles go back to the Windows default)."
+                    ),
+                    Ok(UnsetOutcome::NothingRegistered) => println!(
+                        "aterm-gui: no default-terminal registration to remove \
+                         (consoles already use the Windows default)."
+                    ),
+                    Ok(UnsetOutcome::NotOurs { console, terminal }) => {
+                        println!(
+                            "aterm-gui: nothing changed — the default terminal is registered to \
+                             another app, and aterm only removes its own registration."
+                        );
+                        println!(
+                            "  current HKCU\\{}: {}={} {}={}",
+                            crate::defterm_win::STARTUP_KEY,
+                            crate::defterm_win::VALUE_CONSOLE,
+                            console.as_deref().unwrap_or("(unset)"),
+                            crate::defterm_win::VALUE_TERMINAL,
+                            terminal.as_deref().unwrap_or("(unset)"),
+                        );
+                        println!(
+                            "  change it in Settings > System > For developers > Terminal, \
+                             or with that app's own uninstaller."
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("aterm-gui: could not clear the default-terminal keys: {e}");
+                        std::process::exit(1);
+                    }
+                }
                 std::process::exit(0);
             }
             "-d" | "--working-directory" => {
@@ -1080,6 +1198,89 @@ mod tests {
                 "{flag} is advertised but has no dispatch arm ({arm})"
             );
         }
+    }
+
+    /// The DefTerm pair must both dispatch. (Behaviour is asserted below and in
+    /// `defterm_win`'s own tests — this one only proves the flags are wired.)
+    #[cfg(windows)]
+    #[test]
+    fn default_terminal_pair_dispatches() {
+        let src = include_str!("cli.rs");
+        for flag in ["--set-default-terminal", "--unset-default-terminal"] {
+            let arm = format!("\"{flag}\" =>");
+            assert!(
+                src.contains(&arm),
+                "{flag} must have a dispatch arm ({arm})"
+            );
+        }
+    }
+
+    /// An escape hatch nobody can find is not an escape hatch. Every Windows
+    /// verb must be advertised in the Windows help block, that block must
+    /// actually reach `--help`, and each verb must have a dispatch arm.
+    #[cfg(windows)]
+    #[test]
+    fn windows_help_advertises_every_windows_verb() {
+        let src = include_str!("cli.rs");
+        for flag in [
+            "--install-context-menu",
+            "--uninstall-context-menu",
+            "--set-default-terminal",
+            "--unset-default-terminal",
+        ] {
+            assert!(
+                super::WINDOWS_HELP_TAIL.contains(flag),
+                "{flag} must be documented in the Windows --help block"
+            );
+            let arm = format!("\"{flag}\" =>");
+            assert!(
+                src.contains(&arm),
+                "{flag} is advertised but has no dispatch arm ({arm})"
+            );
+        }
+        // ...and the block is actually printed by the -h/--help arm.
+        let help_arm = src
+            .split_once("\"-h\" | \"--help\" => {")
+            .expect("the help arm exists")
+            .1;
+        let help_arm = &help_arm[..help_arm.len().min(1200)];
+        assert!(
+            help_arm.contains("WINDOWS_HELP_TAIL"),
+            "--help must print the Windows verb block, not just define it"
+        );
+    }
+
+    /// THE INVARIANT THAT MATTERS on the unset side: it must never be gated on
+    /// the handoff server being available. Clearing `HKCU\Console\%%Startup` is
+    /// the escape hatch from a delegation that points at a class nothing can
+    /// create — a state where every new console fails to open — so a user in
+    /// that hole must be able to dig out with the binary they already have.
+    ///
+    /// Behavioural, not source-text: `set` really does refuse with `Unsupported`
+    /// while the gate is false, and `unset` really does return an outcome rather
+    /// than that refusal, on the live machine, without writing anything.
+    #[cfg(windows)]
+    #[test]
+    fn unset_default_terminal_is_never_gated_while_set_refuses() {
+        assert!(
+            !crate::defterm_win::handoff_server_available(),
+            "no COM handoff server ships in this build yet"
+        );
+        let set_err = crate::defterm_win::set_default_terminal()
+            .expect_err("set must refuse while nothing can answer the handoff");
+        assert_eq!(set_err.kind(), std::io::ErrorKind::Unsupported);
+
+        let before = crate::defterm_win::current_delegation().expect("read");
+        crate::defterm_win::unset_default_terminal()
+            .expect("unset must not fail on the live machine, gated or not");
+        let after = crate::defterm_win::current_delegation().expect("read");
+        // On a machine where aterm is not the default (every machine today) the
+        // unset must also have been INERT — see `defterm_win`'s scratch-key test
+        // for the foreign-registration case driven end to end.
+        assert_eq!(
+            before, after,
+            "unset must not touch a delegation aterm does not own"
+        );
     }
 
     #[test]

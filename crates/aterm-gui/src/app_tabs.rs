@@ -2039,7 +2039,20 @@ impl App {
     /// concurrently exiting session, and the sid is registered (addressable)
     /// before the caller's reply is written. Headless-safe: the logical window
     /// hosts tabs exactly like a real one.
-    pub(crate) fn spawn_tab_session(&mut self, cwd: Option<String>) -> Result<String, String> {
+    ///
+    /// `split` (`spawn split=<v|h>`, the wire half of the front door's
+    /// `aterm split-pane`) divides the FOCUSED PANE instead of opening a tab.
+    /// The registry diff is what makes one function serve both: a split spawns
+    /// exactly one new session too, so the newborn is found the same way and the
+    /// same sid contract holds. It rides the identical `App::split_focused_pane`
+    /// path a Cmd-D chord takes — including its refusal to split a SHARED
+    /// session, which surfaces here as "session did not spawn" rather than as a
+    /// corrupted co-viewing window.
+    pub(crate) fn spawn_tab_session(
+        &mut self,
+        cwd: Option<String>,
+        split: Option<crate::pane::SplitDir>,
+    ) -> Result<String, String> {
         let Some(front) = self.frontmost_window else {
             return Err("no window to host the session".to_string());
         };
@@ -2047,7 +2060,10 @@ impl App {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             g.snapshot().iter().map(|h| h.sid.clone()).collect()
         };
-        self.open_tab_in_cwd(front, cwd.as_deref());
+        match split {
+            Some(dir) => self.split_focused_pane_in(dir, cwd),
+            None => self.open_tab_in_cwd(front, cwd.as_deref()),
+        }
         let after = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             g.snapshot()
@@ -2168,7 +2184,9 @@ impl App {
                     self.refresh_operator_status_item();
                     return;
                 }
-                match self.spawn_tab_session(None) {
+                // A TAB, never a split: the operator row stands up its own
+                // terminal, not a division of whatever pane happens to be focused.
+                match self.spawn_tab_session(None, None) {
                     Ok(sid) => {
                         // Stamp identity via user meta BEFORE the agent renames
                         // itself, then type the launch line through the sink —
@@ -2421,7 +2439,10 @@ impl App {
                     self.sync_window(owner);
                 }
             }
-            Err(e) => eprintln!("aterm-gui: could not open a new tab: {e}"),
+            Err(e) => {
+                eprintln!("aterm-gui: could not open a new tab: {e}");
+                self.surface_gesture_failure(&format!("✕ New tab failed: {e}"));
+            }
         }
     }
 
@@ -3806,6 +3827,217 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_press = None;
             ws.strip_band_press = None;
+        }
+    }
+
+    /// C5 — the composed CONTEXT-MENU model for tab `index` of `wid`, or an
+    /// empty vec when that tab has no menu (a native app tab; an out-of-range
+    /// index). One call into the SAME epoch-gated
+    /// [`Self::composed_session_chrome`] the strip's tooltips and the `chrome`
+    /// verb's `tab-menu` lines already read, so the popup can never show an item
+    /// the introspection mirror does not — the whole point of a single composer.
+    ///
+    /// It resolves the label through [`Self::tab_titles`] rather than reading
+    /// the presentation directly because the composer's first identity line IS
+    /// the chip label, and `tab_titles` is the one place that chain (user title
+    /// ▸ OSC title ▸ `~`-relative cwd) is resolved.
+    pub(crate) fn tab_context_menu_model(
+        &mut self,
+        wid: WindowId,
+        index: usize,
+    ) -> Vec<crate::session_chrome::TabMenuEntry> {
+        let Some(session) = self.windows.get(&wid).and_then(|ws| {
+            let tab = ws.tab_set.tabs().get(index)?;
+            self.view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session)
+        }) else {
+            return Vec::new();
+        };
+        let titles = self.tab_titles(wid);
+        let label = titles.get(index).map_or("", String::as_str);
+        self.composed_session_chrome(wid, session, label).menu
+    }
+
+    /// C5 — pop the tab context menu over tab `index` of `wid`, anchored at
+    /// strip column `anchor_col`.
+    ///
+    /// Windows' first reflex on a tab is a right-click, and its first rule is
+    /// that right-clicking a background tab SELECTS it: the menu's subject must
+    /// be the thing the user is looking at, and every one of its actions
+    /// (rename, copy, close) reads as being about the front tab. So the switch
+    /// happens first, and only then the card pops. (macOS's `NSMenu` on a
+    /// background chip does NOT select — AppKit's convention — which is exactly
+    /// why this behaviour lives here and not in the shared composer.)
+    ///
+    /// Returns whether a menu actually opened: a native app tab composes an
+    /// EMPTY model (native surfaces own richer affordances of their own), and a
+    /// caller that gets `false` must let the gesture fall through to whatever it
+    /// would have done before.
+    ///
+    /// Both real callers (the strip's right press, Shift+F10 / the Menu key)
+    /// are `#[cfg(windows)]` — macOS pops a real `NSMenu` off the native strip
+    /// instead, and the card is not offered on Linux (see the `Chrome` arm in
+    /// `app_mouse`) — so off Windows this is reachable only from tests.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn open_tab_context_menu(
+        &mut self,
+        wid: WindowId,
+        index: usize,
+        anchor_col: u16,
+        keyboard: bool,
+    ) -> bool {
+        // No strip, no menu. The card hangs BELOW the band, so with
+        // `tab_strip_rows = 0` it would float at the top of the terminal grid
+        // attached to nothing — and there is no chip to have aimed at either.
+        // (The mouse path cannot reach here with the strip off, since
+        // `strip_col_at` already declines; the keyboard path can.)
+        if !self.tab_strip_enabled() {
+            return false;
+        }
+        let Some(tab) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.tabs().get(index))
+            .map(|tab| tab.id)
+        else {
+            return false;
+        };
+        let entries = self.tab_context_menu_model(wid, index);
+        if entries.is_empty() {
+            return false;
+        }
+        // A chip press is a press AWAY from an open rename field, and it breaks
+        // both strip double-click streaks — the same bookkeeping the LEFT chip
+        // path does, for the same reasons (a right press between two left
+        // presses must not complete a double-click, and a name typed into the
+        // field you then right-click is kept, not dropped).
+        self.clear_strip_press(wid);
+        self.settle_rename_edit(wid);
+        if self.windows.get(&wid).and_then(|ws| ws.tab_set.active_index()) != Some(index) {
+            self.switch_tab_in(wid, index);
+        }
+        // Seeded to the first enabled action only for a KEYBOARD open: a card
+        // that pops with a row already lit under a pointer that has not moved is
+        // an invitation to activate the wrong thing on the next click.
+        let highlight = keyboard
+            .then(|| crate::tab_menu::first_selectable(&entries, entries.len()))
+            .flatten();
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.tab_menu = Some(crate::tab_menu::TabMenu {
+                tab,
+                index,
+                entries,
+                anchor_col,
+                highlight,
+                keyboard,
+            });
+            // Stale from a previous pop; the next splice records the real one.
+            ws.tab_menu_rect = None;
+            if let Some(w) = &ws.os_window {
+                w.request_redraw();
+            }
+        }
+        true
+    }
+
+    /// C5 — the KEYBOARD entry point (Shift+F10 / the Menu key): pop the
+    /// context menu for the window's ACTIVE tab, anchored at that chip's own
+    /// left edge rather than at a pointer that was never involved.
+    ///
+    /// This is what makes the popup usable without a mouse, and on Windows it
+    /// is not a nicety: Shift+F10 is the OS-wide "show the context menu for the
+    /// focused thing" chord, and a surface that has a right-click menu but no
+    /// keyboard route to it is unreachable for anyone driving by keyboard.
+    /// Returns whether a menu opened, so the caller can let the chord fall
+    /// through when it did not (a native app tab, no strip, no tabs).
+    ///
+    /// Its real callers are the two `#[cfg(windows)]` chord arms — `on_key`'s
+    /// and the convergence seam's `tab_menu_input_event` — which is what makes
+    /// `aterm ctl key menu` exercise the same path the physical key does. ⇧F10
+    /// is not a menu chord on macOS, and Linux does not offer the card.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn open_active_tab_context_menu(&mut self, wid: WindowId) -> bool {
+        let Some(index) = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active_index())
+        else {
+            return false;
+        };
+        // The chip's own start column, read off the SAME laid-out segments the
+        // strip painted, so the card lines up with the tab it belongs to. A
+        // window whose segments have not been laid out yet (no frame drawn)
+        // falls back to column 0 — flush left, still under the band.
+        let anchor = self
+            .windows
+            .get(&wid)
+            .and_then(|ws| {
+                ws.tab_segments
+                    .iter()
+                    .find(|seg| seg.kind == tab_bar::TabHit::Select(index))
+                    .map(|seg| seg.start_col)
+            })
+            .unwrap_or(0);
+        self.open_tab_context_menu(wid, index, anchor, true)
+    }
+
+    /// C5 — dismiss any open tab context menu on `wid`. Returns whether one was
+    /// actually open (callers use it to decide whether the dismissing gesture
+    /// was consumed). Requests the repaint that ERASES the card; the
+    /// `RepaintKey`'s `tab_menu_fp` term is what keeps that frame from being
+    /// swallowed by the settled-screen early-out.
+    pub(crate) fn close_tab_menu(&mut self, wid: WindowId) -> bool {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        if ws.tab_menu.take().is_none() {
+            ws.tab_menu_rect = None;
+            return false;
+        }
+        ws.tab_menu_rect = None;
+        if let Some(w) = &ws.os_window {
+            w.request_redraw();
+        }
+        true
+    }
+
+    /// C5 — activate entry `i` of the open menu on `wid` and dismiss the card.
+    ///
+    /// The chosen action is POSTED as [`crate::Wake::TabMenuAction`] rather than
+    /// dispatched inline, for two reasons that both matter:
+    ///   * `App::dispatch_tab_menu_action` needs an `&ActiveEventLoop` (the
+    ///     `Close Tab` arm escalates a last-tab close into a window teardown),
+    ///     and neither the mouse nor the key handler has one;
+    ///   * it puts this popup on the byte-same path the macOS `NSMenu` relay
+    ///     already uses, carrying the STABLE `TabId` captured at pop time — so
+    ///     the two platforms share one dispatcher, one targeting rule, and one
+    ///     "the tab went away, log it and drop the action" fallback.
+    ///
+    /// A no-op (beyond the dismiss) when `i` is not a live action row; the
+    /// caller has already hit-tested, this is the belt.
+    pub(crate) fn activate_tab_menu_entry(&mut self, wid: WindowId, i: usize) {
+        let chosen = self.windows.get(&wid).and_then(|ws| {
+            let menu = ws.tab_menu.as_ref()?;
+            match menu.entries.get(i)? {
+                crate::session_chrome::TabMenuEntry::Action {
+                    action,
+                    enabled: true,
+                    ..
+                } => Some((menu.tab, *action)),
+                _ => None,
+            }
+        });
+        self.close_tab_menu(wid);
+        if let Some((tab, action)) = chosen
+            && let Some(proxy) = self.proxy.clone()
+        {
+            let _ = proxy.send_event(crate::Wake::TabMenuAction {
+                window: wid,
+                tab,
+                action,
+            });
         }
     }
 
@@ -5977,6 +6209,60 @@ mod session_chrome_app_tests {
             "still the session the menu was popped on"
         );
     }
+
+    /// REGRESSION (orphan controller release): a `mouse press` arriving off the
+    /// card DISMISSES it and is consumed — and because the dismiss CLOSES the
+    /// card, the matching RELEASE finds no menu open and would fall through to
+    /// a tracking TUI as half a press pair, the same defect the consumed-press
+    /// key sets exist to prevent. The dismissing button is latched so its
+    /// release is swallowed with it; a button that was never eaten is not.
+    #[cfg(windows)]
+    #[test]
+    fn a_controller_press_that_dismisses_the_card_swallows_its_own_release() {
+        use crate::input::InputEvent;
+        use aterm_types::mouse::MouseButton;
+
+        let ev = |button, pressed| InputEvent::MouseButton {
+            button,
+            pressed,
+            row: 8,
+            col: 8,
+            mods: 0,
+            click_count: 1,
+            side: Default::default(),
+            block: false,
+            suppress_copy_on_select: false,
+            px_off: Default::default(),
+        };
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        assert!(app.open_active_tab_context_menu(wid), "the card is up");
+        assert!(
+            app.tab_menu_input_event(wid, &ev(MouseButton::Left, true)),
+            "a press off the card dismisses it AND is consumed"
+        );
+        assert!(app.windows[&wid].tab_menu.is_none(), "the card is down");
+        assert!(
+            app.tab_menu_input_event(wid, &ev(MouseButton::Left, false)),
+            "and its RELEASE is swallowed too — never handed on alone"
+        );
+        assert!(
+            !app.tab_menu_input_event(wid, &ev(MouseButton::Left, false)),
+            "the latch is spent: a later release is ordinary input"
+        );
+
+        // Only the latched button is eaten. A different button's release was
+        // never half of a pair the modal ate, so it stays ordinary input.
+        assert!(app.open_active_tab_context_menu(wid));
+        assert!(app.tab_menu_input_event(wid, &ev(MouseButton::Left, true)));
+        assert!(
+            !app.tab_menu_input_event(wid, &ev(MouseButton::Right, false)),
+            "a button the card never consumed passes through"
+        );
+    }
 }
 
 /// THE IN-GRID STRIP'S CLICK STREAK — the service AppKit provides on macOS
@@ -6265,6 +6551,127 @@ mod operator_glance_tests {
         let mut app = App::headless_for_test();
         assert!(app.focus_session_window(0));
         assert!(!app.focus_session_window(777));
+    }
+}
+
+/// C5 — the in-grid tab CONTEXT MENU's App-level wiring: the popup carries the
+/// SAME model `compose_tab_menu` composes (so the `chrome` verb's `tab-menu`
+/// mirror and the glass can never disagree), right-clicking a background tab
+/// SELECTS it first, and the entries a user could not otherwise reach — `Copy
+/// Session ID` and `Copy CWD` — are present and live.
+///
+/// Headless: no OS window, so `request_redraw` is a no-op and no `Wake` proxy
+/// is installed. The dispatch itself (`dispatch_tab_menu_action`) is proved by
+/// `session_chrome_app_tests`; what these pin is that the popup resolves a
+/// pointer to exactly one of the model's own [`MenuAction`]s.
+#[cfg(test)]
+mod tab_context_menu_tests {
+    use super::*;
+    use crate::menu::MenuAction;
+    use crate::session_chrome::TabMenuEntry;
+
+    fn actions(entries: &[TabMenuEntry]) -> Vec<(MenuAction, bool)> {
+        entries
+            .iter()
+            .filter_map(|e| match e {
+                TabMenuEntry::Action {
+                    action, enabled, ..
+                } => Some((*action, *enabled)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opening_pops_the_composed_model_with_the_unreachable_copies_live() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        assert!(
+            app.open_tab_context_menu(wid, 0, 5, false),
+            "a terminal tab always has a menu"
+        );
+        let menu = app.windows[&wid].tab_menu.as_ref().expect("menu is open");
+        assert_eq!(menu.anchor_col, 5, "anchored where the press landed");
+        assert_eq!(menu.highlight, None, "a mouse open lights no row");
+        // The popup IS the composed model — same items, same order, same
+        // enabled bits as the `chrome` verb's mirror reads.
+        let titles = app.tab_titles(wid);
+        let composed = app.tab_chrome_ext(wid, &titles);
+        assert_eq!(
+            app.windows[&wid].tab_menu.as_ref().unwrap().entries,
+            composed[0].menu,
+            "the card renders the one composed model, never a parallel list"
+        );
+        let acts = actions(&composed[0].menu);
+        assert!(
+            acts.contains(&(MenuAction::CopySessionId, true)),
+            "the GUI-unreachable session-id copy is live: {acts:?}"
+        );
+        assert!(
+            acts.iter().any(|(a, _)| *a == MenuAction::CopyCwd),
+            "…and Copy CWD is present (greyed on a stub with no cwd): {acts:?}"
+        );
+        assert!(acts.contains(&(MenuAction::CloseTab, true)));
+        assert!(app.close_tab_menu(wid), "close reports it dismissed one");
+        assert!(!app.close_tab_menu(wid), "…and is idempotent");
+        assert!(app.windows[&wid].tab_menu_rect.is_none());
+    }
+
+    #[test]
+    fn a_keyboard_open_lights_the_first_enabled_action() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        assert!(app.open_active_tab_context_menu(wid));
+        let menu = app.windows[&wid].tab_menu.as_ref().expect("open");
+        let lit = menu.highlight.expect("⇧F10 enters with a row selected");
+        assert!(
+            crate::tab_menu::is_selectable(&menu.entries[lit]),
+            "and it is an ENABLED action, never a header or a greyed row"
+        );
+        assert!(menu.keyboard);
+    }
+
+    /// With `tab_strip_rows = 0` there is no band to hang a card under and no
+    /// chip to have aimed at — the keyboard chord must fall through untouched
+    /// rather than float a menu over the terminal's first row.
+    #[test]
+    fn no_strip_means_no_menu() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 0;
+        assert!(!app.open_active_tab_context_menu(wid));
+        assert!(!app.open_tab_context_menu(wid, 0, 0, false));
+        assert!(app.windows[&wid].tab_menu.is_none());
+    }
+
+    /// Windows' rule: right-clicking a BACKGROUND tab selects it, because every
+    /// action on the card reads as being about the tab you are looking at.
+    #[test]
+    fn right_clicking_a_background_tab_selects_it_first() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        assert!(
+            app.windows[&wid].tab_set.len() >= 2,
+            "two tabs to switch between"
+        );
+        let active = app.windows[&wid].tab_set.active_index().unwrap();
+        let other = usize::from(active == 0);
+        assert!(app.open_tab_context_menu(wid, other, 0, false));
+        assert_eq!(
+            app.windows[&wid].tab_set.active_index(),
+            Some(other),
+            "the menu's subject became the front tab"
+        );
+        let menu = app.windows[&wid].tab_menu.as_ref().expect("open");
+        assert_eq!(
+            menu.tab,
+            app.windows[&wid].tab_set.tabs()[other].id,
+            "…and the card captured that tab's STABLE id, not its slot"
+        );
     }
 }
 

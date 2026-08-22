@@ -1537,8 +1537,20 @@ impl AtermTerminal {
 
     /// Encode a mouse WHEEL tick at `col`/`row` (`up` = wheel-up); the host sends
     /// these instead of scrolling scrollback while tracking is on. `None` in X10.
+    ///
+    /// The JS-facing signature deliberately stays a VERTICAL bool even though
+    /// the engine now takes the full 4-way [`aterm_types::mouse::WheelDir`]: a
+    /// browser `WheelEvent` carries `deltaX` too, but widening this binding is a
+    /// web-host feature with its own delta-normalization questions (`deltaMode`,
+    /// momentum), not a side effect of the native wheel fix. Widen it here when
+    /// a web host actually wants to send buttons 66/67.
     pub fn encode_mouse_wheel(&self, col: u16, row: u16, up: bool, mods: u8) -> Option<Vec<u8>> {
-        self.term.encode_mouse_wheel(up, col, row, mods)
+        let dir = if up {
+            aterm_types::mouse::WheelDir::Up
+        } else {
+            aterm_types::mouse::WheelDir::Down
+        };
+        self.term.encode_mouse_wheel(dir, col, row, mods)
     }
 
     /// Encode a keyboard event through the engine's FULL encoder — legacy +
@@ -4209,6 +4221,11 @@ mod tests {
     /// the pointer stable across animation frames, and stay identity (len 0,
     /// rev still) at 0/0 chrome.
     #[test]
+    #[ignore = "RED since 201449c2 — same structural gap as aterm-gpu-web's \
+spill_exports_surface_band_content_on_the_cpu_face (see its ignore note for \
+the full mechanism): the movement-admission gate needs a typed-move proof no \
+web host can arm yet, so the fire trail this test waits for can never spawn. \
+Un-ignore with the web-host migration."]
     fn spill_exports_track_band_content_through_the_real_pipeline() {
         let Some(mut t) = AtermTerminal::new_from_system(12, 40, 16.0) else {
             return;

@@ -917,6 +917,46 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          platform-semantics choice under an unrelated page — it joins the registry with the \
          Mouse section (wheel bypass, link modifier, middle-click) as one coherent block",
     ),
+    (
+        "tab_menu_chord",
+        "the Windows-only keyboard spelling of the tab context menu (on|menu_key|off): a \
+         key-OWNERSHIP escape hatch, not a preference — its whole purpose is to hand \
+         Menu / Shift+F10 back to a terminal application, which is a Keyboard-section \
+         concern the registry has no page for yet; it joins the registry with that section \
+         rather than sitting as an orphan enum row on an unrelated page",
+    ),
+    (
+        "font_hinting",
+        "the Linux glyph grid-fitting mode (full|light|native|off, R2) — inert on \
+         macOS/Windows, and this registry has no platform-gated-row precedent yet: a knob \
+         that visibly does nothing on two of three platforms would read as broken. It is a \
+         full config key (aterm.toml, $ATERM_FONT_HINTING alias, hot-reload); it joins the \
+         Typography section when per-platform row visibility exists",
+    ),
+    (
+        "tab_band_height",
+        "the in-grid tab band's height policy (compact|standard, platform-defaulted: standard \
+         on Windows, compact elsewhere). It is INERT on macOS — the platform this Settings \
+         surface is authored and screenshotted on puts tabs in the native toolbar and never \
+         paints the band — so a live row here would read as a control that does nothing, the \
+         exact dishonesty the Updates page is already criticised for; it joins the registry \
+         with the Windows chrome block (caption tint, band height, strip focus dim) once \
+         Settings has a page whose rows are all live on the reader's platform",
+    ),
+    (
+        "windowing_behavior",
+        "where a NEW terminal opens when one is already running (new_window|attach); this is \
+         the only Config key no running window ever reads — the FRONT DOOR \
+         (crates/aterm/src/main.rs) consults it before a window exists, and the Windows jump \
+         list reads it to decide whether a 'New Tab' taskbar row would tell the truth. \
+         Settings' whole contract is live, previewable, this-window state (uncommitted values \
+         project into the workbench scene), and a launch-routing choice has neither a preview \
+         nor any effect on the window you changed it in; Settings has no Launch section to \
+         file it under, so seeding it as an orphan enum row on the Window page would promise \
+         an in-window effect it cannot have. It joins the registry with a Launch/Startup \
+         section. Reachable meanwhile from Manual (it is in native_config_language's \
+         MANUAL_SCHEMA), from aterm.toml, and from $ATERM_WINDOWING_BEHAVIOR",
+    ),
 ];
 
 /// Every setting whose uncommitted value must have a renderer-native visual

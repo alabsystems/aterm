@@ -94,7 +94,46 @@ impl BenchApp {
             .get_mut(&wid)
             .expect("headless fixture window 0")
             .focused = true;
-        BenchApp { app, wid }
+        let mut b = BenchApp { app, wid };
+        b.pin_theme_defaults();
+        b
+    }
+
+    /// Pin every resident session's ENGINE default fg/bg to the render theme —
+    /// the pinning the SHIPPING launch does unconditionally and
+    /// `App::headless_for_test` omits.
+    ///
+    /// The product builds its session factory with
+    /// `terminal_config: Some(config.applied_terminal_config_for_with_assets(..))`
+    /// — "Always Some: pins the engine default fg/bg to the theme so unstyled
+    /// cells paint the themed background, not spec-black" — and
+    /// `applied_terminal_config_for_with_assets` unconditionally writes
+    /// `tc.default_background = rgb(theme.bg)`.
+    ///
+    /// WITHOUT IT this fixture is a pristine `Terminal::new`: `cell_frame`
+    /// takes the "standalone-renderer compatibility" arm and publishes
+    /// `default_bg = COLOR_UNSET` while every unstyled cell carries VT-spec
+    /// black — so the raster paints a BLACK grid over a THEME-BG clear. That is
+    /// the "black-backed text" state the product deliberately does not ship
+    /// (two visual judges flagged it; see `applied_terminal_config`), and it
+    /// makes the fixture's base-clear/cell-colour relationship the opposite of
+    /// every shipping frame's. Pricing a background pass against it prices a
+    /// colour arrangement the product never renders.
+    pub fn pin_theme_defaults(&mut self) {
+        let theme = aterm_render::Theme::default();
+        let rgb = |c: u32| {
+            aterm_core::terminal::Rgb::new(
+                ((c >> 16) & 0xff) as u8,
+                ((c >> 8) & 0xff) as u8,
+                (c & 0xff) as u8,
+            )
+        };
+        let terms: Vec<_> = self.app.pool.iter().map(|s| s.term.clone()).collect();
+        for t in terms {
+            let mut guard = term_lock(&t);
+            guard.set_default_background(rgb(theme.bg));
+            guard.set_default_foreground(rgb(theme.fg));
+        }
     }
 
     // ------------------------------------------------------------- config --
@@ -157,7 +196,9 @@ impl BenchApp {
     /// Split the active tab into the unit suite's 2-pane vertical split with a
     /// fresh stub session; returns the new pane's session id.
     pub fn split_stub(&mut self) -> u64 {
-        self.app.split_active_stub_tab(self.wid)
+        let sid = self.app.split_active_stub_tab(self.wid);
+        self.pin_theme_defaults();
+        sid
     }
 
     /// Append `n` stub tabs (each a fresh no-PTY session) to the window — the
@@ -168,6 +209,7 @@ impl BenchApp {
             let session = stub_session(sid);
             self.app.push_stub_tab(self.wid, session);
         }
+        self.pin_theme_defaults();
     }
 
     /// Tabs resident in the window (layout trees), for the fixture guard.
@@ -453,6 +495,18 @@ impl BenchApp {
 
     // -------------------------------------------------------------- probes --
 
+    /// `(total, at_base)` background runs the LAST rastered frame resolved —
+    /// [`aterm_render::Renderer::last_bg_runs`] lifted to the fixture, so a
+    /// bench can prove two-sided that its content reaches the
+    /// redundant-background state (and that a control does not).
+    #[must_use]
+    pub fn bg_run_probe(&self) -> (u32, u32) {
+        let BackendSlot::Ready(Backend::Cpu(renderer)) = &self.app.backend else {
+            unreachable!("headless_for_test always builds a ready CPU backend");
+        };
+        renderer.last_bg_runs()
+    }
+
     /// The scanner's per-row pet-ink map, from the SAME `pet_ink()` call the
     /// unconditional per-frame feed makes: `(rows_in_map, inked_rows,
     /// live_edge)`. The PET-03 guard's "the map is real" proof — a workload
@@ -623,6 +677,7 @@ impl BenchApp {
                 self.split_stub();
             }
         }
+        self.pin_theme_defaults();
     }
 
     /// Panes resident across EVERY tab of the window — the count the
@@ -990,5 +1045,84 @@ impl BenchApp {
             .windows
             .get_mut(&self.wid)
             .expect("bench fixture window 0 is never closed")
+    }
+}
+
+// ------------------------------------------------------- subscribe digest --
+
+/// The public face of the `events`-digest driver for
+/// `benches/subscribe_digest.rs`.
+///
+/// Same shape, and same law, as [`BenchApp`]: a thin forward to a crate-private
+/// seam ([`crate::subscribe::bench_seam`]) with no logic of its own. It exists
+/// because the thing being timed — the push loop's per-target per-wake body —
+/// is module-private and must STAY module-private; a bench is an external
+/// target and would otherwise have to be given a copy of it, which is how a
+/// bench comes to measure something the product does not run.
+pub struct DigestBench {
+    inner: crate::subscribe::bench_seam::DigestFixture,
+}
+
+impl DigestBench {
+    /// `targets` watched sessions, each with `blocks` shell blocks, `turns` turn
+    /// records and `timeline` timeline events retained. Depths past the shipping
+    /// ring caps saturate; [`Self::retained`] reports what was really reached.
+    #[must_use]
+    pub fn new(targets: usize, blocks: usize, turns: usize, timeline: usize) -> Self {
+        DigestBench {
+            inner: crate::subscribe::bench_seam::DigestFixture::build(
+                targets, blocks, turns, timeline,
+            ),
+        }
+    }
+
+    /// One wake of the shipping digest across every target. Returns the frame
+    /// bytes produced: `0` on a coalesced idle wake.
+    pub fn wake(&mut self, woke: bool) -> usize {
+        self.inner.wake(woke)
+    }
+
+    /// `(blocks, turns, timeline events)` actually retained on target 0.
+    #[must_use]
+    pub fn retained(&self) -> (usize, usize, usize) {
+        self.inner.retained()
+    }
+
+    /// Append one real turn record to every target's ledger.
+    pub fn land_turn(&mut self) {
+        self.inner.land_turn();
+    }
+}
+
+/// The public face of the INSTANCE ROSTER tick (see
+/// [`crate::subscribe::bench_seam::RosterRebuild`] for exactly what is real and
+/// what is modelled).
+pub struct RosterBench {
+    inner: crate::subscribe::bench_seam::RosterRebuild,
+}
+
+impl RosterBench {
+    /// An instance with `sessions` live sessions and a caught-up subscriber.
+    #[must_use]
+    pub fn new(sessions: usize) -> Self {
+        RosterBench {
+            inner: crate::subscribe::bench_seam::RosterRebuild::new(sessions),
+        }
+    }
+
+    /// One roster wake: rebuild, diff, adopt. Returns emitted bytes.
+    pub fn tick(&mut self) -> usize {
+        self.inner.tick()
+    }
+
+    /// Retire one session and open another, so the next tick has real work.
+    pub fn churn(&mut self) {
+        self.inner.churn();
+    }
+
+    /// Live session count.
+    #[must_use]
+    pub fn sessions(&self) -> usize {
+        self.inner.sessions()
     }
 }

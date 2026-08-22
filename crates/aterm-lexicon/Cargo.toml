@@ -15,7 +15,13 @@ toml = { workspace = true }
 aterm-hash = { workspace = true }
 
 [dev-dependencies]
-# Tests use only std + the crate itself.
+# Tests use only std + the crate itself; `benches/cjk_scan.rs` prices the
+# no-space-script scan arm (nothing else in the tree reaches it).
+criterion = "0.5"
+
+[[bench]]
+name = "cjk_scan"
+harness = false
 
 [lints]
 workspace = true

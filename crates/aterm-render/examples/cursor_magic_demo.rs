@@ -83,6 +83,10 @@ fn hot_run(style: GlowStyle, theme: Theme, cw: usize, ch: usize) -> (CursorGlow,
     glow.tick(Some((row, 8)), now, &cfg, geom, &mut quads);
     for col in 9..=54 {
         now += Duration::from_millis(22);
+        // This is a synthetic TYPING run, so give the engine the same positive
+        // input witness the real host supplies. In particular, Rainbow Kitty's
+        // anti-stray gate must not be bypassed just to make a review PNG light.
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((row, col)), now, &cfg, geom, &mut quads);
     }
     (glow, now, 54)
@@ -112,6 +116,7 @@ fn render_phases(
     let (mut glow, now, head_col) = hot_run(style, theme, cw, ch);
     let mut term = terminal_at(head_col);
     let mut phases = Vec::new();
+    let mut nyan_body_emitted = false;
     for (index, dt_ms) in [0_u64, 72, 144].into_iter().enumerate() {
         let mut quads = Vec::new();
         glow.tick(
@@ -123,11 +128,27 @@ fn render_phases(
         );
         let mut input = term.cell_frame(ROWS, COLS);
         input.cursor_glow_add = quads;
+        // Rainbow Kitty's ribbon body is deliberately under-ink; copying only
+        // the additive channel makes this review panel look cold even when the
+        // witnessed synthetic typing run produced a healthy wake. Mirror the
+        // shipping host's complete cursor-effect splice.
+        input.glow_halo = glow.halos().to_vec();
+        input.fire_patch = glow.patches().to_vec();
+        input.glow_under = glow.under_quads().to_vec();
+        input.char_fg = glow.charred().to_vec();
+        input.fire_halo = glow.halo_cells().to_vec();
+        nyan_body_emitted |= !input.glow_under.is_empty();
         let frame = renderer.render_input(&input);
         let path = dir.join(format!("cursor_{name}_{index}.png"));
         fs::write(&path, frame.to_png()).expect("write cursor review PNG");
         println!("wrote {}", path.display());
         phases.push(frame);
+    }
+    if matches!(style, GlowStyle::RainbowKitty) {
+        assert!(
+            nyan_body_emitted,
+            "the witnessed Rainbow Kitty review run must publish its under-ink ribbon"
+        );
     }
     phases
 }
@@ -234,6 +255,7 @@ fn render_fire_band(renderer: &mut Renderer, theme: Theme, dir: &Path) -> Vec<Fr
     glow.tick(Some((0, 8)), now, &cfg, geom, &mut quads);
     for col in 9..=52 {
         now += Duration::from_millis(22);
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((0, col)), now, &cfg, geom, &mut quads);
     }
     let mut phases = Vec::new();
@@ -310,14 +332,17 @@ fn render_band(
     glow.tick(Some((0, 8)), now, &cfg, geom, &mut quads);
     for col in 9..=44 {
         now += Duration::from_millis(22);
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((0, col)), now, &cfg, geom, &mut quads);
     }
     // Establish the cursor on a lower row mid-run, then JUMP >=2 cells back UP
     // onto row 0 — the splash-ring / jump-beam arming move (dist >= 2), landing
     // against the head band.
     now += Duration::from_millis(22);
+    glow.note_synthetic_move(now);
     glow.tick(Some((4, 48)), now, &cfg, geom, &mut quads);
     now += Duration::from_millis(22);
+    glow.note_synthetic_move(now);
     glow.tick(Some((0, 52)), now, &cfg, geom, &mut quads);
     let mut phases = Vec::new();
     for (index, dt_ms) in [0_u64, 72, 144].into_iter().enumerate() {

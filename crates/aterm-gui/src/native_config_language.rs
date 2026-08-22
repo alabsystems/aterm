@@ -120,6 +120,20 @@ const CUSTOM_INK_COLORWAYS: &[&str] = &["rainbow", "twotone:#RRGGBB,#RRGGBB"];
 const CUSTOM_BURST_KINDS: &[&str] = &["sparkle", "nova", "supernova", "starburst", "glow"];
 const CUSTOM_BURST_KIND_ALIASES: &[&str] = &["super_nova", "super-nova"];
 const CUSTOM_GRAPHIC_COLLECTIONS: &[&str] = &["cats"];
+/// `windowing_behavior` — the two canonical spellings. Windows Terminal's own
+/// `useNew`/`useExisting` also parse (`aterm_cli::WindowingBehavior::parse`) and
+/// are offered as aliases so a ported `settings.json` habit validates.
+const WINDOWING_BEHAVIORS: &[&str] = &["new_window", "attach"];
+const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
+    "new-window",
+    "newwindow",
+    "new",
+    "usenew",
+    "use_existing",
+    "use-existing",
+    "useexisting",
+    "existing",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigDiagnosticSeverity {
@@ -591,6 +605,21 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Keyboard shortcut map",
         ConfigSchemaKind::DynamicStringMap,
         &["shortcut", "chord", "action", "keyboard"],
+        true,
+    ),
+    // A FRONT-DOOR key: read by `crates/aterm/src/main.rs` before a window
+    // exists (and by the Windows jump list), never by a running window. It is
+    // deliberately off `prefs::editable_fields` — see its `DEFERRED_CONFIG_KEYS`
+    // rationale — but it is a first-class scalar an operator writes by hand, so
+    // Manual must complete it, hover it, and flag a misspelled VALUE instead of
+    // shrugging at an unknown key.
+    manual(
+        "windowing_behavior",
+        "Where a new terminal opens",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: WINDOWING_BEHAVIORS,
+        }),
+        &["launch", "attach", "instance", "window", "tab", "single"],
         true,
     ),
     manual(
@@ -1770,6 +1799,10 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         // `prefs::LEGACY_DISPLAY_FONT_IDS`.
         crate::prefs::EDIT_DISPLAY_FONT => crate::prefs::LEGACY_DISPLAY_FONT_IDS,
         "sparkle_words.custom.burst.kind" => CUSTOM_BURST_KIND_ALIASES,
+        // Windows Terminal's own value spellings, plus the hyphen/compact forms
+        // `aterm_cli::WindowingBehavior::parse` accepts. Accepted, never OFFERED
+        // — completion suggests the two canonical names.
+        "windowing_behavior" => WINDOWING_BEHAVIOR_ALIASES,
         _ => &[],
     }
 }
@@ -4738,6 +4771,10 @@ home = "~/aterm"
             "window_colorspace",
             "window_theme",
             "window_title_format",
+            // Manual-only (off `prefs::editable_fields` — see its
+            // DEFERRED_CONFIG_KEYS rationale), but a real enum an operator types
+            // into aterm.toml, so it gets the same domain coverage as the rest.
+            "windowing_behavior",
         ]);
         assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
@@ -4778,6 +4815,11 @@ home = "~/aterm"
                 crate::prefs::EDIT_DISPLAY_FONT,
                 crate::prefs::LEGACY_DISPLAY_FONT_IDS,
             ),
+            // Windows Terminal's `useNew`/`useExisting` and the compact
+            // spellings — every one `aterm_cli::WindowingBehavior::parse`
+            // accepts must LOAD without an error, or Manual would red-flag a
+            // value the front door happily honours.
+            ("windowing_behavior", WINDOWING_BEHAVIOR_ALIASES),
         ] {
             for alias in aliases {
                 let source = source_for(key, alias);

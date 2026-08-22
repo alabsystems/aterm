@@ -822,10 +822,20 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
         let id = a11y_node_id_for(epoch, slot);
         let mut node = Node::new(Role::MenuItem);
         node.set_label(row.label.as_ref());
-        let description = if row.shortcut.is_empty() {
+        // Through the platform filter (audit I9): this string is what a screen
+        // reader SPEAKS, so it is the one place a macOS-only "Cmd-F" does actual
+        // harm — Narrator reading out a chord the keyboard does not have.
+        //
+        // Deliberately `platform_accel(&row.shortcut)` and NOT the full
+        // `row_accel`: the latter would ALSO fold a menu row's ⌘-glyph
+        // key-equivalent into the description, which is a macOS-side change to
+        // what VoiceOver says about every menu row. This lane is about removing
+        // a lie off macOS, not about adding speech on it.
+        let accel = platform_accel(&row.shortcut);
+        let description = if accel.is_empty() {
             row.section.to_string()
         } else {
-            format!("{} · {}", row.section, row.shortcut)
+            format!("{} \u{b7} {accel}", row.section)
         };
         node.set_description(description);
         if let Some(on) = row.checked {
@@ -994,13 +1004,81 @@ fn accel(mods: MenuMods, key: &str) -> String {
     format!("{m}{}", key.to_uppercase())
 }
 
-/// One accelerator projection for every observer. Native rows preserve their command
-/// metadata verbatim; menu rows retain the platform-aware visual key-equivalent policy.
+/// Drop the macOS-only key-equivalents from a native app's `shortcut` string, off
+/// macOS. `·`-separated alternatives are kept individually, so "Cmd-S · C-x C-s"
+/// becomes "C-x C-s" on Windows/Linux — the half that is actually true there.
+///
+/// AUDIT I9. `row_accel` used to pass `row.shortcut` through VERBATIM, which walked
+/// straight past the platform-aware blanking [`accel`] applies to menu rows a few
+/// lines above — so the palette over Settings advertised "Cmd-F"/"Cmd-Z" on
+/// Windows, and (worse, because it is not merely cosmetic) the string is folded
+/// into the AccessKit `description`, so Narrator READ "Cmd-F" ALOUD to a user with
+/// no Cmd key. `accel`'s own comment already ratified the rule this restores: off
+/// macOS a ⌘ glyph "would MISLEAD".
+///
+/// REJECTED — rewriting `Cmd-` to `Ctrl-` mechanically. It would be a LIE at
+/// exactly the rows that matter: Settings ▸ Search is `Ctrl+Shift+F` off macOS
+/// (NOT Ctrl+F), Reader ▸ Copy is `Ctrl+Shift+C`, and the editor's `Cmd-S` has no
+/// Ctrl twin at all outside Windows. A mechanical rewrite trades an obviously
+/// foreign chord for a plausible WRONG one, which is the worse failure: the user
+/// tries it and something else happens. (Some rows DO translate — `settings/undo`
+/// really is Ctrl+Z off macOS — which is precisely why the translation belongs to
+/// each `commands()` site, where the dispatch is known, and not to a blanket
+/// string rewrite here.)
+///
+/// Where a platform-true chord DOES exist, the honest answer is to say so at the
+/// SOURCE (`commands()` emits the right string per platform) — this function is the
+/// backstop that keeps a future macOS-only chord from leaking again. What counts
+/// as macOS-only is [`accel_is_mac_only`], which is deliberately spelling-agnostic:
+/// every literal in the tree happens to use the ASCII `Cmd-` form today, so a
+/// prefix test would have full coverage RIGHT NOW and silently lose it the first
+/// time someone writes `⌘S` or `Cmd+S`.
+fn platform_accel(shortcut: &str) -> String {
+    if cfg!(target_os = "macos") {
+        return shortcut.to_string();
+    }
+    shortcut
+        .split('\u{b7}')
+        .map(str::trim)
+        .filter(|part| !part.is_empty() && !accel_is_mac_only(part))
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// Whether ONE accelerator alternative names a chord that exists only on macOS,
+/// in any of the spellings this tree might grow.
+///
+/// PURE and cfg-free, so both answers are testable in one build — `platform_accel`
+/// itself is `cfg!`-selected, so a table driven only through it asserts one of its
+/// two columns per platform and the other is never executed anywhere.
+///
+/// - ⌘ / `Cmd` / `Command` is macOS-only outright: there is no Command key here.
+/// - ⌥ / `Opt` / `Option` names a key that DOES exist off macOS — as Alt — but
+///   the ⌥/Option SPELLING is macOS notation, and this function's whole rule is
+///   to say nothing rather than show a foreign chord (the string is also folded
+///   into the AccessKit description a screen reader speaks aloud). A part that
+///   genuinely means the Windows/Linux key is spelled `Alt-`/`M-` and survives.
+fn accel_is_mac_only(part: &str) -> bool {
+    const MAC_ONLY_WORDS: &[&str] = &["Cmd", "Command", "Opt", "Option"];
+    if part.contains('\u{2318}') || part.contains('\u{2325}') {
+        return true;
+    }
+    // A leading modifier word, in either separator spelling. Checked on the WHOLE
+    // part (not just its head) so `Shift-Cmd-S` is caught too.
+    part.split(['-', '+'])
+        .any(|segment| MAC_ONLY_WORDS.contains(&segment))
+}
+
+/// One accelerator projection for every observer. Native rows carry their command
+/// metadata through the platform-aware [`platform_accel`] filter; menu rows retain
+/// the platform-aware visual key-equivalent policy of [`accel`]. Both observers —
+/// the painted card AND the AccessKit description a screen reader speaks — go
+/// through here, so what is SHOWN and what is SAID cannot drift apart.
 fn row_accel(row: &PaletteRow) -> String {
     if row.shortcut.is_empty() {
         accel(row.mods, row.key)
     } else {
-        row.shortcut.to_string()
+        platform_accel(&row.shortcut)
     }
 }
 
@@ -1372,6 +1450,85 @@ mod tests {
         assert_eq!(s.rows.len(), model_items);
     }
 
+    /// AUDIT I9 — the accelerator projection, both platforms in one table.
+    ///
+    /// macOS keeps every string verbatim (it mirrors the menu bar there).
+    /// Elsewhere the `Cmd-` alternatives are dropped and the platform-true ones
+    /// survive, so a `·`-separated pair collapses to its portable half rather
+    /// than to nothing, and a lone `Cmd-*` collapses to the empty string — the
+    /// same "say nothing rather than mislead" rule `accel` already applied to
+    /// menu rows.
+    #[test]
+    fn platform_accel_keeps_only_chords_that_exist_here() {
+        let cases = [
+            // (source, macOS, elsewhere)
+            ("Cmd-S \u{b7} C-x C-s", "Cmd-S \u{b7} C-x C-s", "C-x C-s"),
+            ("Cmd-Z \u{b7} C-/", "Cmd-Z \u{b7} C-/", "C-/"),
+            ("Cmd-F", "Cmd-F", ""),
+            ("Cmd-Shift-Z", "Cmd-Shift-Z", ""),
+            // Nothing macOS-only in these: they survive everywhere.
+            ("C-s", "C-s", "C-s"),
+            ("M-g g", "M-g g", "M-g g"),
+            ("Shift-F8", "Shift-F8", "Shift-F8"),
+            ("Esc", "Esc", "Esc"),
+            ("Ctrl-Shift-F", "Ctrl-Shift-F", "Ctrl-Shift-F"),
+            ("", "", ""),
+        ];
+        for (source, mac, other) in cases {
+            let want = if cfg!(target_os = "macos") { mac } else { other };
+            assert_eq!(platform_accel(source), want, "{source:?}");
+        }
+    }
+
+    /// The backstop's PREDICATE, tested on every platform — `platform_accel` is
+    /// `cfg!`-selected, so a table driven only through it executes one of its two
+    /// columns per build and the other is proven nowhere.
+    ///
+    /// Spelling-agnostic on purpose: every literal in the tree uses the ASCII
+    /// `Cmd-` form today, so a bare `starts_with("Cmd-")` had complete coverage
+    /// right up until the first `⌘S` or `Cmd+S`, and would then have leaked a
+    /// foreign chord into the painted card AND into the AccessKit description a
+    /// screen reader speaks aloud.
+    #[test]
+    fn accel_mac_only_catches_every_spelling_of_a_macos_chord() {
+        for mac_only in [
+            "Cmd-S",
+            "Cmd+S",
+            "Cmd-Shift-Z",
+            "Shift-Cmd-Z",
+            "Command-S",
+            "\u{2318}S",
+            "Shift-\u{2318}S",
+            "Opt-Left",
+            "Option-Left",
+            "\u{2325}\u{2318}C",
+        ] {
+            assert!(
+                accel_is_mac_only(mac_only),
+                "{mac_only:?} names a chord that does not exist off macOS"
+            );
+        }
+        // …and everything that IS reachable off macOS survives, including the
+        // Alt/Meta spellings that mean the very same physical key as ⌥.
+        for portable in [
+            "C-s",
+            "C-x C-s",
+            "C-/",
+            "M-g g",
+            "M-x",
+            "M-s",
+            "Alt-Left",
+            "Ctrl-A",
+            "Ctrl-Shift-F",
+            "Shift-F8",
+            "F8",
+            "Esc",
+            "",
+        ] {
+            assert!(!accel_is_mac_only(portable), "{portable:?} exists here");
+        }
+    }
+
     #[test]
     fn native_commands_prepend_one_scoped_identity_safe_section() {
         let window = crate::WindowId(7);
@@ -1401,7 +1558,11 @@ mod tests {
 
         assert_eq!(s.rows[0].section, "Editor App");
         assert_eq!(s.rows[0].label, "Save");
-        assert_eq!(row_accel(&s.rows[0]), "Cmd-S");
+        // The row's METADATA is preserved verbatim (that is this test's subject);
+        // its PROJECTION is platform-aware — a lone macOS key-equivalent leaves
+        // nothing behind off macOS (audit I9).
+        let expect_accel = if cfg!(target_os = "macos") { "Cmd-S" } else { "" };
+        assert_eq!(row_accel(&s.rows[0]), expect_accel);
         assert!(matches!(
             &s.rows[0].action,
             PaletteTarget::Native(target)
@@ -1417,10 +1578,11 @@ mod tests {
         );
 
         let controls = s.controls_lines();
+        let expect_line = format!("accel={expect_accel:?}");
         assert!(controls.iter().any(|line| {
             line.contains("target=native window=7 instance=11 view=13 generation=17")
                 && line.contains("action=editor/save")
-                && line.contains("accel=\"Cmd-S\"")
+                && line.contains(&expect_line)
         }));
     }
 
@@ -2174,7 +2336,17 @@ mod tests {
             .find(|(id, _)| *id == s.a11y_node_id(0))
             .expect("first native command");
         assert_eq!(search.label(), Some("Settings: Search"));
-        assert_eq!(search.description(), Some("Settings App · Cmd-F"));
+        // AUDIT I9 — this is the string a SCREEN READER speaks. Off macOS the
+        // macOS-only key-equivalent must not be in it: Narrator saying "Cmd-F"
+        // to a user with no Cmd key was the defect.
+        assert_eq!(
+            search.description(),
+            Some(if cfg!(target_os = "macos") {
+                "Settings App \u{b7} Cmd-F"
+            } else {
+                "Settings App"
+            })
+        );
         assert!(search.supports_action(Action::Click));
 
         let undo_slot = s

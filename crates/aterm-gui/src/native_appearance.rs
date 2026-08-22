@@ -13,7 +13,7 @@
 use std::cell::Cell;
 use std::f32::consts::TAU;
 #[cfg(not(test))]
-use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use aterm_render::Theme;
 
@@ -46,6 +46,55 @@ static ACCESSIBILITY_FLAGS: AtomicU8 = AtomicU8::new(0);
 #[cfg(not(test))]
 static TEXT_SCALE_BITS: AtomicU32 = AtomicU32::new(1.0_f32.to_bits());
 
+/// Sticky "an OS-owned chrome input MOVED and no re-sample has settled the windows
+/// for it yet". Set by [`install_preferences`] and by
+/// [`crate::chrome_band::install_forced_chrome`]; drained by exactly one consumer,
+/// `App::resample_os_preferences`, through [`take_chrome_inputs_moved`].
+///
+/// WHY A LATCH AND NOT THE `install_*` RETURN VALUE. Those returns are EDGES, and an
+/// edge belongs to whoever reads it first. `AppRt::native_appearance_preferences` is
+/// also called at window attach, at startup and by the settings preview, and on
+/// Windows that read republishes the High-Contrast palette as a documented side
+/// effect. So an HC-scheme switch landing between a window attach and the settings
+/// `Wake` had its movement consumed by the attach: the `Wake`'s re-sample then saw
+/// "nothing moved", skipped the `last_strip_fp` invalidation, and left every
+/// PRE-EXISTING window painting the old OS palette until the next tab open/close.
+/// Latching makes the answer independent of who happened to read first.
+#[cfg(not(test))]
+static CHROME_INPUTS_MOVED: AtomicBool = AtomicBool::new(false);
+
+// Same test/production split, and the same rationale, as the snapshot below: libtest
+// runs independent Apps on a reused worker pool, so a process-global latch would let
+// one worker drain another worker's pending settle.
+#[cfg(test)]
+thread_local! {
+    static TEST_CHROME_INPUTS_MOVED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Record that an OS-owned chrome input moved. Idempotent; see
+/// [`CHROME_INPUTS_MOVED`].
+pub(crate) fn note_chrome_inputs_moved() {
+    #[cfg(test)]
+    TEST_CHROME_INPUTS_MOVED.with(|slot| slot.set(true));
+    #[cfg(not(test))]
+    CHROME_INPUTS_MOVED.store(true, Ordering::Release);
+}
+
+/// Consume the latch: `true` when an OS-owned chrome input has moved since the last
+/// re-sample settled the windows. THE one caller is `App::resample_os_preferences`.
+#[must_use]
+pub(crate) fn take_chrome_inputs_moved() -> bool {
+    #[cfg(test)]
+    {
+        TEST_CHROME_INPUTS_MOVED.with(|slot| slot.replace(false))
+    }
+
+    #[cfg(not(test))]
+    {
+        CHROME_INPUTS_MOVED.swap(false, Ordering::AcqRel)
+    }
+}
+
 // Production has one platform appearance observer and therefore one process-wide
 // snapshot. Libtest deliberately runs independent Apps on a reused worker pool;
 // a process-global test snapshot lets one worker change another worker's layout
@@ -64,21 +113,32 @@ thread_local! {
 
 /// Install the platform-observed appearance snapshot. Returns `true` only when
 /// paint/layout inputs changed, allowing the host to avoid redundant redraws.
+///
+/// A `true` also arms [`CHROME_INPUTS_MOVED`], so the re-sample that settles the
+/// windows still learns about the move even when this edge was consumed by an
+/// unrelated caller (window attach, startup, the settings preview).
 pub(crate) fn install_preferences(preferences: AppearancePreferences) -> bool {
     let preferences = preferences.normalized();
-    #[cfg(test)]
-    {
-        TEST_APPEARANCE.with(|snapshot| snapshot.replace(preferences) != preferences)
-    }
+    let moved = {
+        #[cfg(test)]
+        {
+            TEST_APPEARANCE.with(|snapshot| snapshot.replace(preferences) != preferences)
+        }
 
-    #[cfg(not(test))]
-    {
-        let flags = (u8::from(preferences.high_contrast) * HIGH_CONTRAST)
-            | (u8::from(preferences.reduced_transparency) * REDUCED_TRANSPARENCY);
-        let old_flags = ACCESSIBILITY_FLAGS.swap(flags, Ordering::AcqRel);
-        let old_scale = TEXT_SCALE_BITS.swap(preferences.text_scale.to_bits(), Ordering::AcqRel);
-        old_flags != flags || old_scale != preferences.text_scale.to_bits()
+        #[cfg(not(test))]
+        {
+            let flags = (u8::from(preferences.high_contrast) * HIGH_CONTRAST)
+                | (u8::from(preferences.reduced_transparency) * REDUCED_TRANSPARENCY);
+            let old_flags = ACCESSIBILITY_FLAGS.swap(flags, Ordering::AcqRel);
+            let old_scale =
+                TEXT_SCALE_BITS.swap(preferences.text_scale.to_bits(), Ordering::AcqRel);
+            old_flags != flags || old_scale != preferences.text_scale.to_bits()
+        }
+    };
+    if moved {
+        note_chrome_inputs_moved();
     }
+    moved
 }
 
 #[must_use]
@@ -431,6 +491,46 @@ fn ensure_contrast(fg: [u8; 3], bg: [u8; 3], target: f32) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A preference move that some OTHER caller consumed must still reach the
+    /// re-sample that settles the windows.
+    ///
+    /// `install_preferences` is called at window attach, at startup and by the
+    /// settings preview as well as from `App::resample_os_preferences`, and its
+    /// `bool` is an EDGE — the first caller to see it takes it. So an accessibility
+    /// flip landing between a window attach and the settings `Wake` used to be
+    /// consumed by the attach, and the re-sample would then conclude that nothing had
+    /// moved, skip the strip-cache invalidation and the chrome re-resolve, and leave
+    /// every pre-existing window painting the stale appearance.
+    #[test]
+    fn a_consumed_preference_edge_still_reaches_the_resample() {
+        let previous = current_preferences();
+        let _ = take_chrome_inputs_moved();
+
+        let moved = AppearancePreferences {
+            high_contrast: !previous.high_contrast,
+            reduced_transparency: !previous.reduced_transparency,
+            text_scale: 1.25,
+        };
+        // The attach reads first and takes the edge.
+        assert!(install_preferences(moved), "off → on is a change");
+        assert!(
+            !install_preferences(moved),
+            "the edge is gone: a second install reports no movement"
+        );
+        // The re-sample runs later and must still be told to settle the windows.
+        assert!(
+            take_chrome_inputs_moved(),
+            "the preference move was swallowed by the non-resample reader"
+        );
+        assert!(
+            !take_chrome_inputs_moved(),
+            "the latch is drained by its one consumer"
+        );
+
+        install_preferences(previous);
+        let _ = take_chrome_inputs_moved();
+    }
 
     const THEMES: [Theme; 6] = [
         Theme {

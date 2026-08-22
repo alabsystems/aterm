@@ -546,8 +546,20 @@ pub mod macho {
             keep: &[String],
             drop: &[String],
         ) -> Result<(), String> {
-            // Mach-O rpaths are additive: add the vendored search path, then delete
-            // each machine-local one (keep the rest untouched).
+            // Mach-O rpaths are additive: DELETE each machine-local one first, then add
+            // the vendored search path (keep the rest untouched).
+            //
+            // Order matters, and the other way round is not merely untidy. LC_RPATH lives
+            // in the Mach-O header, whose size is fixed at link time; adding before
+            // deleting makes the object momentarily hold BOTH sets, and if that peak does
+            // not fit, `install_name_tool` refuses with "larger updated load commands do
+            // not fit ... the program must be relinked". Deleting first means the load
+            // commands never exceed their original size, so an object with no headerpad
+            // slack still relocates. Observed 2026-08-21 on the x86_64 trust bundle: six
+            // binaries (ay, targo-fmt, targo-miri, trust-wp, cargo-trust-wp,
+            // targo-trust-wp) failed this way while their arm64 counterparts, built with
+            // more slack, happened to fit. The payload is a staging tree, so the window
+            // between delete and add is not observable by anything.
             //
             // "Is `rel_origin` already there?" is answered from `keep` instead of a THIRD
             // `otool -l` spawn on this object. `keep` and `drop` ARE the caller's exact
@@ -556,11 +568,11 @@ pub mod macho {
             // so `keep ∪ drop` is still the live rpath set. `rel_origin` is an
             // `@loader_path`-relative path, never machine-local, so it can only ever land
             // in `keep` (asserted by `origin_relative_rpath_is_never_machine_local`).
-            if !keep.iter().any(|r| r == rel_origin) {
-                install_name_tool(&["-add_rpath", rel_origin], path)?;
-            }
             for d in drop {
                 install_name_tool(&["-delete_rpath", d], path)?;
+            }
+            if !keep.iter().any(|r| r == rel_origin) {
+                install_name_tool(&["-add_rpath", rel_origin], path)?;
             }
             Ok(())
         }

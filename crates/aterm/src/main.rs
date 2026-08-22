@@ -66,25 +66,23 @@ fn main() -> ExitCode {
     let argv0 = argv0
         .strip_suffix(std::env::consts::EXE_SUFFIX)
         .unwrap_or(&argv0);
-    match argv0 {
-        "aterm-ctl" => return aterm_ctl::main_entry(rest),
-        "atpkg" => return atpkg::cli::main_entry(rest),
-        "aterm-fleet" => aterm_agent::fleet_cli::main_entry(rest),
-        "aterm-drive" => return aterm_agent::drive_cli::main_entry(rest),
-        "aterm-gui" => {
-            aterm_gui::main_entry(rest);
-            return ExitCode::SUCCESS;
-        }
-        // `aterm`, the old `aterm-cli` symlink target, and anything else
-        // (a renamed copy) are all the front door.
-        _ => {}
-    }
-
-    // --- the front door -----------------------------------------------------
     let first = rest
         .first()
         .map(|a| a.to_string_lossy().into_owned())
         .unwrap_or_default();
+    match alias_route(argv0, &first) {
+        AliasRoute::Ctl => return aterm_ctl::main_entry(rest),
+        AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
+        AliasRoute::Fleet => aterm_agent::fleet_cli::main_entry(rest),
+        AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
+        AliasRoute::AliasWindowVerb => return window_verb(&first, &rest[1..]),
+        AliasRoute::AliasWindow => return gui_alias_entry(rest),
+        // `aterm`, the old `aterm-cli` symlink target, and anything else
+        // (a renamed copy) are all the front door.
+        AliasRoute::FrontDoor => {}
+    }
+
+    // --- the front door -----------------------------------------------------
 
     // VERBS: the one command's own powers, routed HERE — ABOVE the mode fork, so a
     // verb answers identically at a terminal and through a pipe.
@@ -122,6 +120,14 @@ fn main() -> ExitCode {
             aterm_cli::Verb::Agents => {
                 let _ = aterm_cli::parse_args(rest);
                 ExitCode::SUCCESS
+            }
+            // The wt-shaped WINDOWING grammar (S12). Routed HERE, above the mode
+            // fork, for the same reason as every other verb: `aterm new-tab` is
+            // typed at a prompt, where a TTY on stdin would otherwise select the
+            // SESSION and its parser would reject the word as an unknown option
+            // — the exact `ship` failure this dispatch table exists to prevent.
+            aterm_cli::Verb::NewTab | aterm_cli::Verb::NewWindow | aterm_cli::Verb::SplitPane => {
+                window_verb(verb.name(), &forwarded)
             }
         };
     }
@@ -197,11 +203,7 @@ fn main() -> ExitCode {
     // contract) and passes through VERBATIM. The `aterm-cli` argv0 alias
     // keeps its binary-era contract: the session regardless of TTY (old
     // installs pipe it in scripts).
-    let boundary = rest
-        .iter()
-        .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
-        .unwrap_or(rest.len());
-    let scan = &rest[..boundary];
+    let scan = &rest[..payload_boundary(&rest)];
     let force_session =
         argv0 == "aterm-cli" || scan.iter().any(|a| a.to_string_lossy() == "--session");
     let windowish = !force_session
@@ -220,16 +222,22 @@ fn main() -> ExitCode {
     // printed at all; testing the value here would send `ATERM_HEADLESS=0` into
     // the SESSION, where nothing would ever mention it — the silent outcome
     // this whole path exists to prevent.
-    let mode_args: Vec<OsString> = rest
-        .iter()
-        .enumerate()
-        .filter(|(i, a)| {
-            let a = a.to_string_lossy();
-            *i >= boundary || (a != "--window" && a != "--session")
-        })
-        .map(|(_, a)| a.clone())
-        .collect();
+    let mode_args = strip_mode_flags(&rest);
     if windowish {
+        // SINGLE-INSTANCE ROUTING (S12), applied to a PLAIN window launch —
+        // Explorer / the Start menu / a pinned tile / `aterm --window` with
+        // nothing else asked of it. Under the shipped default
+        // (`windowing_behavior = "new_window"`) this is a no-op and the launch
+        // proceeds exactly as it did before the key existed. The same call sits
+        // in `gui_alias_entry`, because on Windows the shortcut this machine
+        // actually launches names an ALIAS copy of this binary.
+        //
+        // `rest`, NOT `scan`: the mode fork's scan stops at the `-e`/`--` payload
+        // boundary, so handing it to the gate would present `aterm -e vim` as an
+        // empty (maximally eligible) argument list. See `plain_launch_request`.
+        if let Some(code) = plain_launch_policy(&rest) {
+            return code;
+        }
         aterm_gui::main_entry(mode_args);
         return ExitCode::SUCCESS;
     }
@@ -273,6 +281,363 @@ fn main() -> ExitCode {
     }
 
     aterm_cli::session_main(quiet);
+}
+
+// ---------------------------------------------------------------------------
+// ARGV0 ALIAS DISPATCH
+// ---------------------------------------------------------------------------
+
+/// How an invocation arriving under an argv0 ALIAS name is served.
+///
+/// Extracted from `main` as a pure decision so the one case that matters most on
+/// Windows is unit-testable: the shipped install is SEVERAL IDENTICAL COPIES of
+/// this binary (`aterm.exe`, `aterm-gui.exe`, `aterm-ctl.exe`, …), the Start-Menu
+/// shortcut targets `aterm-gui.exe`, and the taskbar jump list is committed by
+/// whichever copy is running — so the windowing verbs and the routing policy have
+/// to work under the alias, not only under `aterm.exe`.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum AliasRoute {
+    /// `aterm-ctl` — the control client.
+    Ctl,
+    /// `atpkg` — the package manager.
+    Pkg,
+    /// `aterm-fleet` — fleet federation.
+    Fleet,
+    /// `aterm-drive` — the agent drive CLI.
+    Drive,
+    /// `aterm-gui <new-tab|new-window|split-pane> …` — a WINDOWING VERB typed at
+    /// (or, far more often, committed into the jump list by) an alias copy. It is
+    /// routed exactly as `aterm <verb>` is; handing it to the window's own flag
+    /// parser instead is how a taskbar row becomes `unknown option 'new-window'`
+    /// against a console that does not exist.
+    AliasWindowVerb,
+    /// `aterm-gui …` — the window, with the plain-launch routing policy applied
+    /// (see [`gui_alias_entry`]).
+    AliasWindow,
+    /// Not an alias: `aterm`, the old `aterm-cli` symlink target, a renamed copy.
+    FrontDoor,
+}
+
+/// The alias decision: argv0's file stem (already `EXE_SUFFIX`-trimmed) plus the
+/// first operand, which is what separates a windowing verb from a window flag.
+fn alias_route(argv0: &str, first: &str) -> AliasRoute {
+    match argv0 {
+        "aterm-ctl" => AliasRoute::Ctl,
+        "atpkg" => AliasRoute::Pkg,
+        "aterm-fleet" => AliasRoute::Fleet,
+        "aterm-drive" => AliasRoute::Drive,
+        "aterm-gui" => match aterm_cli::Verb::from_operand(first) {
+            Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
+            // Every OTHER verb stays out of the alias on purpose: `aterm-gui`'s
+            // binary-era contract is "the window", and `aterm-gui ctl …` was
+            // never a thing anyone could have scripted. Only the verbs that open
+            // a terminal — the ones the shell itself launches from the jump list
+            // — are lifted into it.
+            _ => AliasRoute::AliasWindow,
+        },
+        _ => AliasRoute::FrontDoor,
+    }
+}
+
+/// The `aterm-gui` argv0 alias: the WINDOW mode, reached through the same
+/// plain-launch policy and the same mode-flag stripping the front door applies.
+///
+/// It used to be a bare `aterm_gui::main_entry(rest)`, and that was a hole with
+/// two live consequences on the shipped Windows install, where this alias is what
+/// the Start-Menu shortcut actually launches:
+///
+/// * the `windowing_behavior` policy never ran for the launcher every real launch
+///   goes through, so the headline feature was unreachable from the Start menu;
+/// * `--window` — the command line `RegisterApplicationRestart` registers, and the
+///   documented "give me the window" flag — reached the window's parser, which
+///   knows no such option, so an OS-driven relaunch of this copy exited 2.
+///
+/// Running the policy fixes the first; stripping `--window` fixes the second.
+///
+/// ONLY `--window` is stripped, not both mode flags. `--session` asks for a mode
+/// this alias cannot serve — the alias IS the window — and it has always been
+/// answered with the window parser's `unknown option '--session'`, exit 2.
+/// Silently swallowing a mode request would be a worse answer than refusing it,
+/// so that one is left exactly where it was.
+fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
+    if let Some(code) = plain_launch_policy(&rest) {
+        return code;
+    }
+    aterm_gui::main_entry(strip_flags(&rest, &["--window"]));
+    ExitCode::SUCCESS
+}
+
+/// The index of the `-e`/`--command`/`--` PAYLOAD BOUNDARY, or `rest.len()`.
+/// Past it every token belongs to a child command line and is neither scanned
+/// nor stripped — the window's `-e` contract.
+fn payload_boundary(rest: &[OsString]) -> usize {
+    rest.iter()
+        .position(|a| matches!(a.to_string_lossy().as_ref(), "-e" | "--command" | "--"))
+        .unwrap_or(rest.len())
+}
+
+/// The two MODE flags: they select which mode runs, and the mode libraries do
+/// not know them.
+const MODE_FLAGS: &[&str] = &["--window", "--session"];
+
+/// `rest` with `flags` removed — but only BEFORE the payload boundary: a `--` or
+/// `-e` payload is a child command line and passes through verbatim, a
+/// `--window` inside it included.
+fn strip_flags(rest: &[OsString], flags: &[&str]) -> Vec<OsString> {
+    let boundary = payload_boundary(rest);
+    rest.iter()
+        .enumerate()
+        .filter(|(i, a)| *i >= boundary || !flags.contains(&a.to_string_lossy().as_ref()))
+        .map(|(_, a)| a.clone())
+        .collect()
+}
+
+/// `rest` with both [`MODE_FLAGS`] removed — the front door's own strip, applied
+/// once the fork has read them.
+fn strip_mode_flags(rest: &[OsString]) -> Vec<OsString> {
+    strip_flags(rest, MODE_FLAGS)
+}
+
+/// The request a PLAIN window launch would forward, or `None` when this launch
+/// must not be routed by policy at all.
+///
+/// `argv` is THE WHOLE ARGUMENT LIST — every token, `-e` payload included — and
+/// that word is the point. The mode fork works from `scan`, which stops AT the
+/// payload boundary, so `aterm -e vim` reaches a gate handed that slice as an
+/// EMPTY list: the barest, most obviously-forwardable launch there is. The gate's
+/// documented `-e` exclusion would then never fire, and under `attach` a launch
+/// carrying a child command line would forward into a tab that cannot run it and
+/// exit 0 with the command silently dropped. The boundary is refused here too, so
+/// the rule holds however this is called.
+///
+/// Apart from resolving `-d` against the real filesystem this is pure, which is
+/// what lets the payload rule be pinned by a unit test.
+fn plain_launch_request(
+    argv: &[OsString],
+    env: aterm_cli::LaunchEnv,
+) -> Option<aterm_cli::WindowRequest> {
+    if payload_boundary(argv) != argv.len() {
+        return None;
+    }
+    if !aterm_cli::plain_launch_is_policy_eligible(argv, env) {
+        return None;
+    }
+    let dir = plain_launch_dir(argv).ok()?;
+    Some(aterm_cli::WindowRequest {
+        intent: aterm_cli::LaunchIntent::Plain,
+        dir,
+        split: aterm_cli::SplitOrientation::default(),
+    })
+}
+
+/// SINGLE-INSTANCE ROUTING (S12) for a PLAIN window launch — Explorer, the Start
+/// menu, a pinned tile, `aterm --window` with nothing else asked of it.
+/// `Some(code)` when the running instance served it; `None` to go on and open a
+/// window here.
+///
+/// The eligibility gate is `plain_launch_is_policy_eligible` and it is
+/// deliberately narrow: `-e`, `--headless`/`$ATERM_HEADLESS`, `--diagnose` and an
+/// update successor's inherited argv all carry instructions a forwarded tab
+/// cannot honour, so they fail closed to spawning. See that function for the
+/// case-by-case reasoning. Under the shipped default this returns `None` without
+/// dialing anything.
+fn plain_launch_policy(argv: &[OsString]) -> Option<ExitCode> {
+    let env = aterm_cli::LaunchEnv {
+        updated_from: std::env::var_os("ATERM_UPDATED_FROM").is_some(),
+        // PRESENCE, matching the mode fork's own test for the same variable, so
+        // "this launch is headless-shaped" means one thing in both places.
+        headless: std::env::var_os("ATERM_HEADLESS").is_some(),
+    };
+    let request = plain_launch_request(argv, env)?;
+    route_and_maybe_forward(&request)
+}
+
+// ---------------------------------------------------------------------------
+// THE WINDOWING VERBS AND THE ROUTING POLICY (S12 / design §5)
+// ---------------------------------------------------------------------------
+
+/// `aterm new-tab | new-window | split-pane [-d <dir>] [-H|-V]` — the wt-shaped
+/// front door.
+///
+/// The grammar and the routing rule are both PURE and live in `aterm-cli`
+/// ([`aterm_cli::parse_window_request`] / [`aterm_cli::route_launch`]); this
+/// function is only the impure half — resolving a directory against the real
+/// filesystem, asking whether an instance is reachable, and performing whichever
+/// of the two routes came back.
+///
+/// EXIT CODES, which matter more here than they look. This binary is
+/// GUI-subsystem on Windows (see the crate attribute), so the console it prints
+/// to is the parent's, reattached by `attach_parent_console` before ANY route
+/// runs — including this one. That reattachment deliberately restores the
+/// parent's own redirected handles (the `aterm --version > out.txt` invariant
+/// `build.ps1` depends on), and nothing here disturbs it: this route only ever
+/// writes to the already-resolved `stderr`, and it returns an `ExitCode` rather
+/// than calling `process::exit`, so `main`'s normal teardown still runs.
+///   * `0` — the tab/window/pane was opened (forwarded or spawned).
+///   * `1` — the running instance answered `ERR`; its text is on stderr.
+///   * `2` — a grammar error (unknown option, missing `<dir>`, bad directory).
+fn window_verb(verb: &str, args: &[OsString]) -> ExitCode {
+    // `-h`/`--help` on a verb answers with that verb's own synopsis rather than
+    // the "unknown option" the strict grammar would otherwise produce. Every
+    // other front-door verb forwards `--help` to the tool it dispatches to and
+    // gets help; these dispatch to no tool, so the front door owns the answer.
+    // First position only, exactly like the sibling verbs' pre-verb flags.
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.to_string_lossy().as_ref(), "-h" | "--help"))
+    {
+        println!("{}", aterm_cli::window_verb_usage(verb));
+        if let Some(v) = aterm_cli::Verb::from_operand(verb) {
+            for line in v.blurb() {
+                println!("    {line}");
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let request = match aterm_cli::parse_window_request(verb, args, resolve_dir_absolute) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("aterm: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    if let Some(code) = route_and_maybe_forward(&request) {
+        return code;
+    }
+    // The SPAWN route. `split-pane` lands here when nothing was reachable (or
+    // under the default policy): a brand-new window is a single pane, so there
+    // is nothing to split. Say so rather than open a window that silently is not
+    // what was asked for — `wt split-pane` under `useNew` has exactly this
+    // outcome, and quietly is the wrong way to have it.
+    if request.intent == aterm_cli::LaunchIntent::SplitPane {
+        eprintln!(
+            "aterm: no running aterm to split — opening a new window instead \
+             (a fresh window is one pane; `aterm split-pane` again inside it splits that)"
+        );
+    }
+    aterm_gui::main_entry(request.window_args());
+    ExitCode::SUCCESS
+}
+
+/// Decide the route for `request` and, when it is `Forward`, perform it.
+///
+/// Returns `Some(code)` when the request was answered by the running instance
+/// (the process should exit with that code) and `None` when the caller should
+/// go on to start a window itself. The two impure inputs — the effective policy
+/// and whether an instance answered — are gathered here and handed to the pure
+/// [`aterm_cli::route_launch`], so the decision itself stays testable.
+///
+/// The reachability probe and the forward are two separate dials, so an instance
+/// can die in between. That race resolves to `None` (spawn), not an error: the
+/// operator asked for a terminal and a transport failure is not a reason to
+/// refuse one. An `ERR` reply is the opposite case — the instance IS there and
+/// REFUSED — and is reported as a failure, because spawning a window then would
+/// contradict the policy the operator chose AND could double-open if the refusal
+/// was partial.
+fn route_and_maybe_forward(request: &aterm_cli::WindowRequest) -> Option<ExitCode> {
+    let behavior = effective_windowing_behavior();
+    // The probe is skipped entirely under `new_window`: it costs a connect
+    // attempt on the front door of every launch, and its answer cannot change
+    // the route. `route_launch` is still consulted with `false`, so the table in
+    // its tests remains the single description of the rule.
+    let should_probe = behavior == aterm_cli::WindowingBehavior::Attach;
+    let sock = if should_probe {
+        aterm_ctl::front_door_instance()
+    } else {
+        None
+    };
+    let route = aterm_cli::route_launch(request.intent, behavior, sock.is_some());
+    if route != aterm_cli::WindowRoute::Forward {
+        return None;
+    }
+    let sock = sock?;
+    let line = match request.control_request() {
+        Ok(line) => line,
+        Err(message) => {
+            eprintln!("aterm: {message}");
+            return Some(ExitCode::from(2));
+        }
+    };
+    match aterm_ctl::front_door_send(&sock, &line) {
+        // `spawn` replies `OK <sid>`. The sid is deliberately NOT printed: `wt
+        // new-tab` prints nothing, and a shell prompt is not a log.
+        Ok(reply) if reply.starts_with("OK") => Some(ExitCode::SUCCESS),
+        Ok(reply) => {
+            eprintln!("aterm: the running aterm refused: {reply}");
+            Some(ExitCode::FAILURE)
+        }
+        Err(error) => {
+            // Raced (the instance exited between the probe and the dial), or the
+            // socket wedged. Fall back to starting one — with a line saying why,
+            // so an operator who set `attach` is never left wondering why a
+            // second window appeared.
+            eprintln!("aterm: could not reach the running aterm ({error}); opening a new window");
+            None
+        }
+    }
+}
+
+/// The effective `windowing_behavior`: `$ATERM_WINDOWING_BEHAVIOR`, else the
+/// `aterm.toml` key, else the default. An unrecognized spelling warns ONCE and
+/// falls back — silently treating a typo as `attach` would move where every
+/// terminal on the machine opens.
+fn effective_windowing_behavior() -> aterm_cli::WindowingBehavior {
+    let raw = aterm_gui::windowing_behavior_setting();
+    match raw.as_deref() {
+        None => aterm_cli::WindowingBehavior::NewWindow,
+        Some(value) => match aterm_cli::WindowingBehavior::parse(value) {
+            Some(behavior) => behavior,
+            None => {
+                eprintln!(
+                    "aterm: windowing_behavior {value:?} is not new_window or attach; \
+                     using new_window"
+                );
+                aterm_cli::WindowingBehavior::NewWindow
+            }
+        },
+    }
+}
+
+/// Resolve one `-d <dir>` operand to the ABSOLUTE native path a forwarded
+/// request must carry.
+///
+/// Absolute because the request may be served by a process whose working
+/// directory is elsewhere entirely — a relative `-d src` forwarded verbatim
+/// would open the running instance's `src`, not the caller's. `std::path::
+/// absolute` rather than `canonicalize`: on Windows the latter returns the
+/// `\\?\C:\…` extended-length form, which is a legal path but an ugly one to
+/// hand a shell as its cwd (and one some shells' own prompt logic mishandles),
+/// and it resolves symlinks the operator may have deliberately used.
+///
+/// The directory is checked HERE, before anything is dialed, so `aterm new-tab
+/// -d nope` fails the same way under both policies with the same wording the
+/// window library's own `-d` uses.
+fn resolve_dir_absolute(raw: &str) -> Result<String, String> {
+    let path = std::path::Path::new(raw);
+    let absolute = std::path::absolute(path).map_err(|e| format!("cannot resolve {raw}: {e}"))?;
+    if !absolute.is_dir() {
+        return Err(format!("not a directory: {raw}"));
+    }
+    Ok(absolute.to_string_lossy().into_owned())
+}
+
+/// The `-d <dir>` of a PLAIN window launch, resolved to an absolute path.
+///
+/// The scan itself is `aterm_cli::plain_launch_dir_operand`, which shares its
+/// flag set with the eligibility gate — the two must never disagree about what a
+/// directory flag looks like, and that set is deliberately only the spellings the
+/// WINDOW's own parser accepts (see `PLAIN_LAUNCH_DIR_FLAGS`). This function adds
+/// the impure half: resolving the value against the real filesystem.
+///
+/// `Err` means the operand cannot be resolved — the caller then declines to
+/// route by policy and lets the ordinary spawn path report it, so there is
+/// exactly ONE "not a directory" message and it is the window library's, which
+/// is where `-d` has always been validated.
+fn plain_launch_dir(scan: &[OsString]) -> Result<Option<String>, ()> {
+    match aterm_cli::plain_launch_dir_operand(scan) {
+        Some(value) => resolve_dir_absolute(&value).map(Some).map_err(|_| ()),
+        None => Ok(None),
+    }
 }
 
 /// `aterm update [status|check]` — the headless update lane, served in-process
@@ -441,6 +806,226 @@ const COMPLETION_FLAGS: &[(&str, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-d` must reach the running instance as an ABSOLUTE native path: the
+    /// process that serves the request has its own working directory, so a
+    /// relative operand forwarded verbatim would open somewhere else entirely.
+    ///
+    /// The relative leg deliberately uses `.` against the process's real cwd
+    /// (which `cargo test` sets to the crate dir) rather than mutating the
+    /// environment — `set_current_dir` is process-global and this suite runs
+    /// threaded.
+    #[test]
+    fn a_directory_operand_resolves_to_an_absolute_native_path() {
+        let cwd = std::env::current_dir().expect("a working directory");
+        let here = resolve_dir_absolute(".").expect("`.` is a directory");
+        assert_eq!(std::path::Path::new(&here), cwd.as_path());
+        assert!(std::path::Path::new(&here).is_absolute());
+
+        let absolute = resolve_dir_absolute(&cwd.to_string_lossy()).expect("an absolute directory");
+        assert_eq!(std::path::Path::new(&absolute), cwd.as_path());
+
+        // NOT the extended-length `\\?\C:\…` form: that is what `canonicalize`
+        // would hand back, and it is a poor thing to give a shell as its cwd.
+        assert!(!absolute.starts_with(r"\\?\"), "{absolute}");
+    }
+
+    /// A `-d` that is not a directory fails BEFORE any socket is dialed, with
+    /// the same wording the window library's own `-d` uses — one message, one
+    /// meaning, whichever route the launch was going to take.
+    #[test]
+    fn a_directory_operand_that_is_not_a_directory_is_refused() {
+        let not_a_dir = std::path::Path::new(file!()).to_string_lossy().into_owned();
+        let err = resolve_dir_absolute(&not_a_dir).expect_err("a source file is not a directory");
+        assert!(err.starts_with("not a directory:"), "{err}");
+        let missing = resolve_dir_absolute("definitely-not-here-9f3a").expect_err("missing");
+        assert!(missing.starts_with("not a directory:"), "{missing}");
+    }
+
+    /// The plain-launch scan finds `-d` in the spellings the WINDOW parses, and
+    /// reports an unusable one as `Err` so the caller declines to route by
+    /// policy and lets the ordinary window path print the error.
+    #[test]
+    fn a_plain_launch_carries_its_directory_or_declines_to_route() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        assert_eq!(plain_launch_dir(&osv(&["--window"])), Ok(None));
+        let cwd = std::env::current_dir().expect("a working directory");
+        for spelling in [
+            osv(&["--window", "-d", "."]),
+            osv(&["--working-directory", "."]),
+        ] {
+            let found = plain_launch_dir(&spelling).expect("resolvable");
+            assert_eq!(
+                found.as_deref().map(std::path::Path::new),
+                Some(cwd.as_path()),
+                "{spelling:?}"
+            );
+        }
+        assert_eq!(
+            plain_launch_dir(&osv(&["-d", "definitely-not-here-9f3a"])),
+            Err(())
+        );
+    }
+
+    /// A CHILD COMMAND LINE IS NEVER ROUTED BY POLICY. `spawn` cannot carry one,
+    /// so a forwarded `aterm -e vim` opens an empty tab, exits 0, and drops the
+    /// command without a word.
+    ///
+    /// The trap, executable: the mode fork's own `scan` stops AT the payload
+    /// boundary, so `-e vim` truncates to an EMPTY argument list — the barest,
+    /// most obviously-eligible launch there is. Feeding the gate that slice makes
+    /// its documented `-e` exclusion unreachable, which is why
+    /// `plain_launch_request` takes the WHOLE argv and refuses the boundary
+    /// itself.
+    #[test]
+    fn a_child_command_payload_is_never_routed_by_policy() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        let env = aterm_cli::LaunchEnv::default();
+        for argv in [
+            osv(&["-e", "vim"]),
+            osv(&["--window", "-e", "vim"]),
+            osv(&["--command", "vim"]),
+            osv(&["--", "sh", "-c", "echo hi"]),
+            osv(&["--window", "-d", ".", "-e", "vim"]),
+        ] {
+            assert_eq!(
+                plain_launch_request(&argv, env),
+                None,
+                "{argv:?} carries a payload a forwarded tab cannot run"
+            );
+        }
+        // The truncated slice IS eligible — that is the whole hazard.
+        let dash_e = osv(&["-e", "vim"]);
+        assert_eq!(payload_boundary(&dash_e), 0);
+        assert!(
+            plain_launch_request(&dash_e[..0], env).is_some(),
+            "the pre-boundary scan of `-e vim` is an empty, maximally eligible argv — \
+             the gate must never be handed it"
+        );
+        // …and a genuinely bare launch still routes.
+        assert!(plain_launch_request(&osv(&[]), env).is_some());
+        assert!(plain_launch_request(&osv(&["--window"]), env).is_some());
+    }
+
+    /// THE ALIAS TABLE. The one that matters is the `aterm-gui` row: on the
+    /// shipped Windows install every sibling name is an identical copy of this
+    /// binary, the Start-Menu shortcut targets `aterm-gui.exe`, and the taskbar
+    /// jump list is committed by whichever copy is running — so
+    /// `aterm-gui.exe new-window` is a command line the SHELL issues, from a
+    /// launcher with no console to print an error to. It must route as a verb.
+    #[test]
+    fn the_gui_alias_routes_the_windowing_verbs_and_nothing_else() {
+        for verb in aterm_cli::Verb::ALL {
+            let expected = if verb.is_windowing() {
+                AliasRoute::AliasWindowVerb
+            } else {
+                AliasRoute::AliasWindow
+            };
+            assert_eq!(
+                alias_route("aterm-gui", verb.name()),
+                expected,
+                "aterm-gui {}",
+                verb.name()
+            );
+        }
+        // A bare launch and the window's own flags stay the window.
+        for operand in ["", "--window", "-d", "--headless", "--diagnose"] {
+            assert_eq!(
+                alias_route("aterm-gui", operand),
+                AliasRoute::AliasWindow,
+                "aterm-gui {operand:?}"
+            );
+        }
+        // The other aliases are untouched by the windowing grammar: `aterm-ctl
+        // new-tab` is a ctl invocation, and ctl gets to say so itself.
+        assert_eq!(alias_route("aterm-ctl", "new-tab"), AliasRoute::Ctl);
+        assert_eq!(alias_route("atpkg", "new-tab"), AliasRoute::Pkg);
+        assert_eq!(alias_route("aterm-fleet", ""), AliasRoute::Fleet);
+        assert_eq!(alias_route("aterm-drive", ""), AliasRoute::Drive);
+        // And the front door is still the front door under every other name.
+        for name in ["aterm", "aterm-cli", "my-renamed-aterm"] {
+            assert_eq!(
+                alias_route(name, "new-window"),
+                AliasRoute::FrontDoor,
+                "{name}"
+            );
+            assert_eq!(alias_route(name, ""), AliasRoute::FrontDoor, "{name}");
+        }
+    }
+
+    /// THE OS-DRIVEN RELAUNCH. `RegisterApplicationRestart` fires after a
+    /// Restart-Manager reboot AND — `dwFlags = 0`, deliberately — after a crash
+    /// or a hang, and the command line it registers comes straight back through
+    /// this router. It must be a request the routing POLICY never redirects: with
+    /// `windowing_behavior = "attach"` and any sibling instance alive, a
+    /// forwardable relaunch opens a TAB IN THE SIBLING, so the crashed window
+    /// never returns and the WM_QUERYENDSESSION-persisted session manifest is
+    /// never restored — the whole reason the relaunch exists. `--window`, the
+    /// flag it used to register, is an ordinary policy-eligible plain launch.
+    ///
+    /// It must ALSO survive the argv0 alias, because the relaunched image is
+    /// whatever `current_exe()` was, which on the shipped Windows install is
+    /// normally `aterm-gui.exe`.
+    #[cfg(windows)]
+    #[test]
+    fn the_os_restart_command_line_is_the_one_verb_policy_never_forwards() {
+        let line = aterm_gui::OS_RESTART_COMMAND_LINE;
+        let verb = aterm_cli::Verb::from_operand(line)
+            .unwrap_or_else(|| panic!("{line:?} must be a routed front-door verb"));
+        assert!(verb.is_windowing(), "{line:?}");
+        for behavior in [
+            aterm_cli::WindowingBehavior::NewWindow,
+            aterm_cli::WindowingBehavior::Attach,
+        ] {
+            for reachable in [true, false] {
+                assert_eq!(
+                    aterm_cli::route_launch(
+                        aterm_cli::LaunchIntent::NewWindow,
+                        behavior,
+                        reachable
+                    ),
+                    aterm_cli::WindowRoute::Spawn,
+                    "an OS relaunch must come back as a WINDOW under {behavior:?}"
+                );
+            }
+        }
+        assert_eq!(verb, aterm_cli::Verb::NewWindow);
+        // …and it routes under the name the shipped shortcut actually launches.
+        assert_eq!(
+            alias_route("aterm-gui", line),
+            AliasRoute::AliasWindowVerb,
+            "the relaunched image is current_exe(), normally aterm-gui.exe"
+        );
+    }
+
+    /// The mode flags are stripped for the alias exactly as they are for the
+    /// front door — `RegisterApplicationRestart` and every "give me the window"
+    /// script spell it `--window`, and the window's own parser rejects it as an
+    /// unknown option. Past an `-e`/`--` payload boundary nothing is touched.
+    #[test]
+    fn the_mode_flags_are_stripped_before_the_window_but_never_inside_a_payload() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        assert_eq!(strip_mode_flags(&osv(&["--window"])), osv(&[]));
+        assert_eq!(
+            strip_mode_flags(&osv(&["--window", "-d", "/tmp"])),
+            osv(&["-d", "/tmp"])
+        );
+        assert_eq!(strip_mode_flags(&osv(&["--session"])), osv(&[]));
+        // The payload is a child command line, verbatim, `--window` included.
+        assert_eq!(
+            strip_mode_flags(&osv(&["--window", "-e", "sh", "--window"])),
+            osv(&["-e", "sh", "--window"])
+        );
+        assert_eq!(payload_boundary(&osv(&["-d", "/tmp"])), 2);
+        assert_eq!(payload_boundary(&osv(&["--window", "--", "x"])), 1);
+        // The `aterm-gui` alias strips ONLY `--window`: `--session` names a mode
+        // this alias cannot serve, and refusing it out loud (the window parser's
+        // `unknown option`) beats swallowing it.
+        assert_eq!(
+            strip_flags(&osv(&["--window", "--session"]), &["--window"]),
+            osv(&["--session"])
+        );
+    }
 
     /// The verb list the completions offer is EXACTLY the routed surface:
     /// `help`, every [`aterm_cli::Verb`] in the roster, and every

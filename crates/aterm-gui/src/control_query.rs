@@ -2169,6 +2169,8 @@ fn write_styled_cell_json(out: &mut String, snap: &StyledCellSnap) {
     }
     out.push_str(",\"emoji_presentation\":");
     push_bool(out, cell.emoji_presentation);
+    out.push_str(",\"text_presentation\":");
+    push_bool(out, cell.text_presentation);
     out.push_str(",\"wide\":");
     push_bool(out, cell.wide);
     out.push_str(",\"wide_lead\":");
@@ -2603,6 +2605,7 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         default_fg: _, // OMITTED: its twin — the effects layer's tint anchor, not per-cell content
         cursor_color: _, // frame "cursor.color" (fixed RGB or "default")
         snapshot_seq: _, // frame "seq" (the engine content version stamp)
+        process_sequence: _, // OMITTED: parser-batch provenance used only by host cursor-effect admission
         input_hot: _, // OMITTED: present-time bloom-defer latency hint, display-only (not cell content)
         // OMITTED (DMG-1 damage carrier): extraction-CONTINUITY tokens, not
         // cell content. They answer "may this scratch's undamaged rows be

@@ -41,6 +41,7 @@ const FACES: &[FaceId] = &[
     FaceId::Procedural,
     FaceId::ColorEmoji,
     FaceId::ColorEmojiMono,
+    FaceId::DisplayMix,
     FaceId::RuntimeFallback,
 ];
 
@@ -77,6 +78,7 @@ fn key(
         glyph_class,
         ch_or_id,
         style,
+        cell_span: 0,
         px_q,
     }
 }
@@ -177,6 +179,35 @@ fn glyph_key_smallest_px_step_is_distinct() {
     assert!(a < b, "keys of the same glyph order by ascending px_q");
 }
 
+/// Materialized width is independently load-bearing for proportional fallback
+/// rasters: the same scalar and pixel size can coexist at one and two cells
+/// after an ambiguous-width reload, so they must occupy separate cache/atlas
+/// slots even when every traditional glyph field agrees.
+#[test]
+fn glyph_key_separates_materialized_fallback_spans() {
+    let narrow = GlyphKey {
+        cell_span: 1,
+        ..key(
+            FaceId::Fallback,
+            GlyphClass::Mono,
+            0x00B7,
+            StyleBits::REGULAR,
+            GlyphKey::quantize_px(16.0),
+        )
+    };
+    let wide = GlyphKey {
+        cell_span: 2,
+        ..narrow
+    };
+    assert_ne!(narrow, wide);
+    let mut cache = HashMap::new();
+    cache.insert(narrow, "one-cell");
+    cache.insert(wide, "two-cell");
+    assert_eq!(cache.len(), 2);
+    assert_eq!(cache.get(&narrow), Some(&"one-cell"));
+    assert_eq!(cache.get(&wide), Some(&"two-cell"));
+}
+
 /// NEGATIVE CONTROL: the pre-enabler world where the key did NOT carry px (one cache
 /// could host only one size). Projecting a key onto its non-px fields makes the two
 /// sizes COLLIDE — exactly the aliasing the `px_q` component prevents. This shows the
@@ -203,8 +234,8 @@ fn dropping_px_from_the_key_reproduces_the_collision() {
     // With px in the key: distinct (the fix).
     assert_ne!(a, b);
 
-    // The pre-fix key: drop px_q, keeping only (source, class, ch_or_id, style).
-    let project = |k: &GlyphKey| (k.source, k.glyph_class, k.ch_or_id, k.style);
+    // The pre-fix key: drop px_q, keeping every other raster field.
+    let project = |k: &GlyphKey| (k.source, k.glyph_class, k.ch_or_id, k.style, k.cell_span);
     assert_eq!(
         project(&a),
         project(&b),
@@ -212,7 +243,7 @@ fn dropping_px_from_the_key_reproduces_the_collision() {
     );
 
     // A px-less cache would hold ONE entry for both -> a genuine collision.
-    let mut pxless: HashMap<(FaceId, GlyphClass, u32, StyleBits), &str> = HashMap::new();
+    let mut pxless: HashMap<(FaceId, GlyphClass, u32, StyleBits, u8), &str> = HashMap::new();
     pxless.insert(project(&a), "1x-raster");
     pxless.insert(project(&b), "2x-raster");
     assert_eq!(

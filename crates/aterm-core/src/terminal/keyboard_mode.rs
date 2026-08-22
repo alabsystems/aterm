@@ -83,6 +83,29 @@ impl Terminal {
             .contains(KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
     }
 
+    /// Whether the active Kitty keyboard mode reports FUNCTIONAL keys that have
+    /// no legacy escape form at all — the Menu/Application key (`57363`),
+    /// F13-F35, the media cluster.
+    ///
+    /// These keys are invisible to an application in every legacy mode: the
+    /// legacy encoder has no sequence for them, so the press produces zero
+    /// bytes. `DISAMBIGUATE_ESC_CODES` and `REPORT_ALL_KEYS_AS_ESC` are exactly
+    /// the two enhancements under which `should_encode_kitty_event` routes a
+    /// bare `Key::Named` press through the CSI-u encoder and the app finally
+    /// receives it.
+    ///
+    /// The point of the projection is CHROME DEFERENCE: a host gesture must not
+    /// claim a key that the front application has negotiated for. Off the two
+    /// flags the key reaches nobody, so binding it to chrome costs the app
+    /// nothing; on them the app asked for it and must get it. Kept a narrow,
+    /// read-only projection of [`Self::keyboard_mode`] for the same reason
+    /// [`Self::kitty_report_all_keys`] is — it never feeds an encoder.
+    #[must_use]
+    pub fn kitty_reports_functional_keys(&self) -> bool {
+        self.keyboard_mode()
+            .intersects(KeyboardMode::DISAMBIGUATE_ESC_CODES | KeyboardMode::REPORT_ALL_KEYS_AS_ESC)
+    }
+
     /// Whether the active Kitty keyboard mode makes predictive local echo unsafe.
     ///
     /// `REPORT_ALL_KEYS_AS_ESC` routes even plain text through CSI-u, so there is no
@@ -186,6 +209,60 @@ mod shift_enter_e2e_tests {
         // eligible for conservative Adaptive prediction.
         term.process(b"\x1b[=1u");
         assert!(!term.kitty_suppresses_predictive_echo());
+    }
+
+    /// C5 REMEDIATION — `kitty_reports_functional_keys` is the CHROME-DEFERENCE
+    /// projection: it must be true in exactly the modes where a key with no
+    /// legacy form (here the Menu key, `57363`) actually reaches the app, and
+    /// false everywhere else — otherwise host chrome either steals a key the
+    /// application negotiated for, or refuses a key nobody can receive.
+    ///
+    /// Pinned against the ENCODER, not against a re-read of the flags, so the
+    /// projection cannot drift from what `encode_key_with_layout` really emits.
+    #[test]
+    fn functional_key_reporting_tracks_what_the_encoder_actually_emits() {
+        let menu = |term: &Terminal| {
+            encode_key_with_layout(
+                &Key::Named(NamedKey::ContextMenu),
+                Modifiers::empty(),
+                term.keyboard_mode(),
+                KeyEventType::Press,
+                None,
+            )
+        };
+        // Baseline: no negotiation ⇒ the Menu key encodes to NOTHING at all.
+        let term = Terminal::new(24, 80);
+        assert!(!term.kitty_reports_functional_keys());
+        assert!(
+            menu(&term).is_empty(),
+            "legacy has no sequence for the Menu key"
+        );
+
+        // Disambiguate (`CSI > 1 u`) is the weakest flag that turns it on.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[>1u");
+        assert!(term.kitty_reports_functional_keys());
+        assert_eq!(
+            menu(&term),
+            b"\x1b[57363u",
+            "…and the app really does receive 57363"
+        );
+
+        // Report-all is the strongest and also reports it.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[>8u");
+        assert!(term.kitty_reports_functional_keys());
+        assert!(term.kitty_report_all_keys());
+
+        // Event types ALONE (`CSI > 2 u`) do NOT: a bare press still takes the
+        // legacy path, so the app never sees the key and chrome may claim it.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[>2u");
+        assert!(!term.kitty_reports_functional_keys());
+        assert!(
+            menu(&term).is_empty(),
+            "event-types-only still cannot deliver the Menu key"
+        );
     }
 
     #[test]

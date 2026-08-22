@@ -102,8 +102,7 @@ impl TerminalHandler<'_> {
     /// non-cap; the fail-closed policy posture applies to response gating,
     /// not to the per-sequence amplification bound.
     pub(super) fn palette_per_sequence_cap(&self) -> usize {
-        if let Some(engine) = self.policy_engine.as_ref()
-            && let Some(cfg) = engine.rate_limit_config("palette")
+        if let Some(cfg) = self.policy.rate_limit_config("palette")
             && cfg.per_sequence_max > 0
         {
             return cfg.per_sequence_max as usize;
@@ -119,12 +118,10 @@ impl TerminalHandler<'_> {
     /// returns `true` so the legacy behavior (no cross-sequence throttle)
     /// is preserved.
     fn palette_rate_limit_consume_one(&mut self) -> bool {
-        if let Some(engine) = self.policy_engine.as_mut() {
-            let clock = aterm_policy::limits::SystemClock;
-            engine.rate_limit_try_consume("palette", 1, &clock)
-        } else {
-            true
-        }
+        let clock = aterm_policy::limits::SystemClock;
+        self.policy
+            .rate_limit_try_consume("palette", 1, &clock)
+            .unwrap_or(true)
     }
 
     /// Handle OSC 4 - color palette manipulation.

@@ -331,6 +331,16 @@ pub enum FaceId {
     RuntimeFallback,
 }
 
+/// Mono faces whose proportional rasters are normalized into the logical cell
+/// span carried by [`GlyphKey::cell_span`]. Kept as one predicate so key
+/// construction, span overrides, and the final raster pass cannot drift.
+const fn harmonized_fallback_source(source: FaceId) -> bool {
+    matches!(
+        source,
+        FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback | FaceId::DisplayMix
+    )
+}
+
 /// The pixel class of a glyph image: what one cache/atlas texel holds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GlyphClass {
@@ -371,6 +381,17 @@ impl StyleBits {
     }
 }
 
+/// Scalar presentation used only while resolving a character to a face. The
+/// resulting [`GlyphKey`] remains the raster identity, but the resolve memo must
+/// distinguish a Unicode-default request from explicit VS15: the same U+1F600
+/// legitimately resolves to colour RGBA in the first case and a mono text glyph
+/// in the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ScalarPresentation {
+    Default,
+    Text,
+}
+
 /// Cache/atlas identity of one rasterized glyph image.
 ///
 /// This is the long-term key for everything glyph-shaped: which face it came
@@ -391,6 +412,17 @@ pub struct GlyphKey {
     /// own cache/atlas slot.
     pub ch_or_id: u32,
     pub style: StyleBits,
+    /// Logical terminal-cell span whose box the raster is fitted into.
+    ///
+    /// This participates in cache/atlas identity because a materialized
+    /// East-Asian Ambiguous character can coexist in one row as both a
+    /// one-cell and two-cell glyph after an `ambiguous_width` reload. It is
+    /// meaningful for proportional mono fallback sources and for an explicit
+    /// VS15 primary-family glyph: `0` means ordinary/unqualified (or a
+    /// zero-width combining overlay), `1`/`2` mean the stored cell span. A VS15
+    /// primary key carries `1` so its potentially overwide custom-font raster is
+    /// a distinct, cell-fitted cache/atlas identity from the bare/default form.
+    pub cell_span: u8,
     /// Pixel size in 26.6 fixed point ([`GlyphKey::quantize_px`]), so the key
     /// stays `Eq + Hash` and one cache can host multiple sizes.
     pub px_q: u32,
@@ -409,6 +441,11 @@ impl GlyphKey {
             glyph_class: GlyphClass::Mono,
             ch_or_id: ch as u32,
             style,
+            cell_span: if harmonized_fallback_source(source) {
+                aterm_grapheme::char_width(ch).min(2) as u8
+            } else {
+                0
+            },
             px_q,
         }
     }
@@ -422,6 +459,7 @@ impl GlyphKey {
             glyph_class: GlyphClass::Rgba,
             ch_or_id: ch as u32,
             style: StyleBits::REGULAR,
+            cell_span: 0,
             px_q,
         }
     }
@@ -434,6 +472,7 @@ impl GlyphKey {
             glyph_class: GlyphClass::RgbaGid,
             ch_or_id: gid as u32,
             style: StyleBits::REGULAR,
+            cell_span: 0,
             px_q,
         }
     }
@@ -447,6 +486,7 @@ impl GlyphKey {
             glyph_class: GlyphClass::MonoGid,
             ch_or_id: gid as u32,
             style,
+            cell_span: 0,
             px_q,
         }
     }
@@ -468,6 +508,7 @@ impl GlyphKey {
             glyph_class: GlyphClass::MonoGid,
             ch_or_id: (gid as u32) | ((slice as u32 + 1) << LIG_SLICE_SHIFT),
             style,
+            cell_span: 0,
             px_q,
         }
     }
@@ -483,6 +524,23 @@ impl GlyphKey {
         }
         char::from_u32(self.ch_or_id)
     }
+}
+
+/// Stamp an explicit text-presentation request into a mono raster identity.
+///
+/// A configured primary can itself cover an `Emoji_Presentation=Yes` scalar.
+/// Its default and VS15 resolve decisions then name the same face/glyph id, so
+/// presentation-qualified resolve memos alone are insufficient: without this
+/// one-cell span the two forms alias in the glyph/atlas caches and an overwide
+/// custom-primary bitmap can still paint the following cell. Colour silhouettes
+/// and proportional fallbacks are already one-cell paths, but carrying the same
+/// qualifier keeps every mono text result unambiguous.
+#[inline]
+fn qualify_text_presentation_key(mut key: GlyphKey) -> GlyphKey {
+    if matches!(key.glyph_class, GlyphClass::Mono | GlyphClass::MonoGid) {
+        key.cell_span = 1;
+    }
+    key
 }
 
 /// Bit position in [`GlyphKey::ch_or_id`] where a COLLAPSED-ligature slice index
@@ -880,6 +938,44 @@ pub struct ChromeBleed {
     /// underline geometry [`Renderer::deco_metrics`] gives those cells, so the
     /// gutter segment and the cell segments are one continuous rule.
     pub seam: Option<u32>,
+    /// Whether row 0's CELL backgrounds — not just the flat [`Self::color`] tone —
+    /// own the `[0, grid_top)` strip above the grid, column by column.
+    ///
+    /// `false` (the default, and every pre-existing caller) is the flat fill: the
+    /// strip is one tone edge to edge. That is right when the strip is a thin lip,
+    /// which is all it ever was — `head == 0`, so it is just the top pad.
+    ///
+    /// It stops being right the moment a host reserves a REAL chrome band there
+    /// (the Windows WinUI-height tab band: a `head` sized so the whole band reads
+    /// as a native tab row). Then the flat fill leaves the raised active chip, the
+    /// hover wash and the `+` button painting only their own cell row and floating
+    /// at the BOTTOM of the band with a dead lip above them — the same "dead space
+    /// above the label" defect the taller band was supposed to close, moved up by
+    /// one surface. With this set, the whole `[0, grid_top)` strip continues each
+    /// column's own background, so a chip fills the band to the window's top edge.
+    ///
+    /// The gutters keep [`Self::color`] either way — the grid has no columns there.
+    ///
+    /// THE PRECONDITION THE TWO BACKENDS SHARE, stated because it is load-bearing
+    /// and nothing else states it. The CPU twin extends the strip by COPYING row 0's
+    /// assembled scanline upward, so it carries whatever that row holds. The GPU twin
+    /// instead grows row 0's background RUN quads, and two `continue` gates sit above
+    /// the run push: the wallpaper skip (an unselected cell whose bg IS the resolved
+    /// default bg pushes nothing, because the wallpaper base quad already laid the
+    /// backdrop) and the off-screen `clip_cols` skip. A column that takes either gate
+    /// contributes no quad, and the GPU leaves [`Self::color`] standing there while
+    /// the CPU carries the column's real pixels. The two therefore agree pixel for
+    /// pixel only while EVERY chrome cell in row 0 carries an explicit background
+    /// distinct from the frame default — which is exactly what the host guarantees
+    /// today (`tab_bar::blank_cell` pre-fills the whole strip row at the band tone
+    /// before any segment is painted, so `cell_bg != default_bg` and the
+    /// background-opacity transmittance never applies either). The `clip_cols` half is
+    /// off-screen by construction and invisible on both. Break that guarantee — a
+    /// theme whose band tone happens to equal `theme.bg`, with a wallpaper live — and
+    /// the backends split; the fix would belong in the host's tone derivation, not
+    /// here, since a chrome band indistinguishable from the terminal background is
+    /// already not a band.
+    pub top_extends_cells: bool,
 }
 
 /// Monospace CPU rasterizer.
@@ -1159,6 +1255,26 @@ pub struct Renderer {
     /// including the scroll-apron re-render, which plans a DIFFERENT row (`r + 1`),
     /// so a hit can never hand the cut-out another row's glyphs.
     glyph_plan_row: Option<usize>,
+    /// DIAGNOSTIC ONLY (bench/test REACH GUARD — never read by rendering): how
+    /// many background RUNS [`Renderer::render_row_bg`] resolved during the last
+    /// [`Renderer::render_core`], and how many of those carried exactly the
+    /// colour the row band's base already holds (see `band_base` in that
+    /// function). The pair is what lets a bench prove, from OUTSIDE, that its
+    /// fixture actually reaches the redundant-background state — and that a
+    /// control fixture does not. Both counters are computed identically whether
+    /// or not the redundant run is emitted, so a guard written against them
+    /// reads the same on either side of that elision.
+    ///
+    /// `Cell` because `render_row_bg` takes `&self`; `Renderer` is per-window
+    /// and never shared across threads.
+    bg_runs_total: std::cell::Cell<u32>,
+    bg_runs_at_base: std::cell::Cell<u32>,
+    /// DIAGNOSTIC ONLY (bench/test REACH GUARD — never read by rendering): how
+    /// many image-covered cells the last [`Self::render_core`] handed to
+    /// [`Self::blit_image_cell`]. It counts CALLS, which no change to what those
+    /// calls do inside can move, so a guard written against it is valid on both
+    /// sides of one. `Cell` because `blit_image_cell` takes `&self`.
+    image_cells: std::cell::Cell<u32>,
     /// Reused per-row run text/char scratch for [`ligature_shaping::plan_row_runs`],
     /// cleared+reused each row instead of a fresh `String`/`Vec<char>` per row per
     /// frame on the shaping path. Mirrors `shapeable_scratch`.
@@ -1314,9 +1430,11 @@ pub struct Renderer {
     cursor_opacity: f32,
     /// The glyph cache, keyed by full rasterization identity.
     glyphs: FxHashMap<GlyphKey, GlyphImage>,
-    /// Per-char key resolve cache (primary-vs-fallback dispatch happens once
-    /// per char, not once per blit — the hot path stays two cheap lookups).
-    keys: FxHashMap<char, GlyphKey>,
+    /// Per-char/presentation key resolve cache (primary-vs-fallback dispatch
+    /// happens once per request, not once per blit). Explicit VS15 uses a
+    /// distinct entry from Unicode default presentation so one cannot poison
+    /// the other when both forms of the same scalar coexist on screen.
+    keys: FxHashMap<(char, ScalarPresentation), GlyphKey>,
     /// Per-char PRIMARY-face glyph-id cache, resolved through the font's UNICODE
     /// cmap via ttf-parser (see [`primary_unicode_gid`](Renderer::primary_unicode_gid)).
     /// fontdue's own char lookup prefers a legacy (1,0) Mac Roman cmap subtable on
@@ -1337,10 +1455,9 @@ pub struct Renderer {
     /// grapheme clusters, the working set is tiny (distinct emoji on screen), and the
     /// memory profile is identical to SipHash — the standard Alacritty/WezTerm choice.
     cluster_gids: TwoGenTextCache<Option<u16>>,
-    /// Resolve cache for BOLD/ITALIC cells, keyed by `(char, style)` since the
-    /// same char has a distinct synthetic-styled glyph per weight/slant. The
-    /// unstyled hot path keeps using `keys` (plain `char`).
-    styled_keys: FxHashMap<(char, StyleBits), GlyphKey>,
+    /// Resolve cache for BOLD/ITALIC cells, keyed by character, style, and
+    /// scalar presentation. The unstyled hot path keeps using `keys`.
+    styled_keys: FxHashMap<(char, StyleBits, ScalarPresentation), GlyphKey>,
     /// Glyph-ROUTING generation: bumped whenever a background fallback parse
     /// completes (face landed OR gave up), i.e. whenever UNCHANGED cell content
     /// can suddenly rasterize differently. [`RenderCache`] records the epoch it
@@ -1377,8 +1494,10 @@ pub struct Renderer {
     /// W7): signed px delta added to the resolved thickness. `0` = pure.
     underline_adjust_thick: i32,
     /// Descender ink-skip (config `underline_skip_descenders`, W7, DEFAULT ON):
-    /// zero underline coverage within a 1px dilation of the cell's own glyph
-    /// ink, so g/j/p/q/y descenders are never struck through by the underline.
+    /// zero underline coverage within a 1px dilation of the cell's own
+    /// DESCENDER ink (ink at or below the baseline row), so g/j/p/q/y
+    /// descenders are never struck through by the underline. Letter bottoms
+    /// resting ON the baseline are not descenders and never chop the line.
     /// Cells with no descender ink render byte-identically either way (the
     /// coverage-monotone invariant, `tests/deco_lines.rs`).
     underline_skip_descenders: bool,
@@ -3668,6 +3787,95 @@ pub fn condense_ink_w(ink_w: usize, box_w: usize) -> usize {
     box_w.max(ink_w.div_ceil(CONDENSE_MAX_RATIO))
 }
 
+/// Default terminal-cell span for a scalar when no materialized cell is
+/// available. Bare text-presentation symbols such as U+26A0 stay narrow, CJK
+/// ideographs stay wide, and East-Asian Ambiguous characters follow `shaping`.
+///
+/// A rendered frame MUST instead use [`materialized_cell_span`]: width policy
+/// changes affect only subsequently received text, so old narrow and new wide
+/// instances of the same scalar can coexist. This helper is the fallback for
+/// non-cell diagnostic/API callers such as [`Renderer::glyph_key`].
+#[doc(hidden)]
+#[must_use]
+pub fn fallback_cell_count(
+    ch: char,
+    shaping: &aterm_types::text_shaping::TextShapingConfig,
+) -> usize {
+    let cjk = matches!(
+        shaping.ambiguous_width,
+        aterm_types::text_shaping::AmbiguousWidth::Double
+    );
+    if cjk {
+        aterm_grapheme::char_width_cjk(ch)
+    } else {
+        aterm_grapheme::char_width(ch)
+    }
+    .min(2)
+}
+
+/// Logical span stored in a render-ready row for its lead cell. The engine's
+/// materialized continuation marker is the source of truth; Unicode width or a
+/// current global config would reinterpret cells received before a width-policy
+/// reload. `RenderCell::wide` is already the engine-resolved *continuation*
+/// predicate (not the aliased raw bit), so looking at the next cell is sound for
+/// CJK, emoji, and East-Asian Ambiguous text alike.
+#[doc(hidden)]
+#[must_use]
+pub fn materialized_cell_span(row: &[RenderCell], col: usize) -> u8 {
+    if row.get(col + 1).is_some_and(|next| next.wide) {
+        2
+    } else {
+        1
+    }
+}
+
+/// Uniform scale that fits a proportional fallback raster into its terminal
+/// cell box without changing the glyph's aspect ratio.
+///
+/// Horizontal fit accounts for BOTH the bitmap ink box (`xmin..xmin+width`)
+/// and the face's advance box (`0..advance`), after centring the latter in the
+/// terminal box. This is what prevents a square fallback symbol from painting
+/// into the next one-cell character while preserving the whole shape instead of
+/// clipping its sides. The vertical term prevents the scaled mask itself from
+/// exceeding the row band; final integer-rounding fringes are still clamped by
+/// [`clamp_to_row_band`]. Degenerate inputs return the neutral scale `1.0`.
+#[doc(hidden)]
+#[must_use]
+pub fn fallback_fit_scale(
+    box_w: usize,
+    box_h: usize,
+    width: usize,
+    height: usize,
+    xmin: i32,
+    advance: f32,
+) -> f32 {
+    if box_w == 0 || box_h == 0 || width == 0 || height == 0 {
+        return 1.0;
+    }
+    let advance = if advance.is_finite() && advance > 0.0 {
+        advance
+    } else {
+        width as f32
+    };
+    let centre = advance * 0.5;
+    let ink_left = xmin as f32 - centre;
+    let ink_right = xmin as f32 + width as f32 - centre;
+    // Twice the farthest extent from the advance centre is the smallest
+    // symmetric box that contains both advance and ink.
+    let centred_w = 2.0 * ink_left.abs().max(ink_right.abs()).max(centre.abs());
+    if !centred_w.is_finite() || centred_w <= 0.0 {
+        return 1.0;
+    }
+    let sx = box_w as f32 / centred_w;
+    let sy = box_h as f32 / height as f32;
+    let scale = sx.min(sy).min(1.0);
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
 /// W8 (f): clamp a fallback glyph's bitmap rows to its CELL ROW BAND. `top`
 /// is the ink's cell-relative top row (`baseline - height - ymin`), `height`
 /// the bitmap rows, `band_h` the cell height. Returns `(skip, new_height)`:
@@ -3738,6 +3946,72 @@ fn clamp_to_band(pos: i32, len: usize, band: usize) -> (usize, usize) {
     }
     let new_len = (len - skip).min(band - new_pos).max(0);
     (skip as usize, new_len as usize)
+}
+
+/// Area-filter a grayscale coverage mask. This is the one-channel twin of the
+/// colour-emoji area resampler: every destination texel integrates the complete
+/// rational source footprint via [`area_overlap`], so aggressive fallback-symbol
+/// minification cannot skip triangle edges or punctuation details. `None` means
+/// malformed dimensions.
+fn resample_mask_area(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Option<Vec<u8>> {
+    let src_len = sw.checked_mul(sh)?;
+    let dst_len = dw.checked_mul(dh)?;
+    if src.len() != src_len || sw == 0 || sh == 0 || dw == 0 || dh == 0 {
+        return None;
+    }
+    if (sw, sh) == (dw, dh) {
+        return Some(src.to_vec());
+    }
+    let mut out = vec![0u8; dst_len];
+    let denom = (sw as u128) * (sh as u128);
+    for dy in 0..dh {
+        let sy0 = dy.saturating_mul(sh) / dh;
+        let sy1 = (dy
+            .saturating_add(1)
+            .saturating_mul(sh)
+            .saturating_add(dh - 1)
+            / dh)
+            .min(sh);
+        for dx in 0..dw {
+            let sx0 = dx.saturating_mul(sw) / dw;
+            let sx1 = (dx
+                .saturating_add(1)
+                .saturating_mul(sw)
+                .saturating_add(dw - 1)
+                / dw)
+                .min(sw);
+            let mut sum = 0u128;
+            for sy in sy0..sy1 {
+                let wy = area_overlap(dy, sy, sh, dh) as u128;
+                for sx in sx0..sx1 {
+                    let wx = area_overlap(dx, sx, sw, dw) as u128;
+                    sum += u128::from(src[sy * sw + sx]) * wx * wy;
+                }
+            }
+            out[dy * dw + dx] = ((sum + denom / 2) / denom).min(255) as u8;
+        }
+    }
+    Some(out)
+}
+
+/// Keep `width` columns of a row-major mask after skipping `skip` source
+/// columns. Used only for the at-most-one-pixel integer-rounding fringe after
+/// proportional fitting; the substantive fit is a shape-preserving resample.
+fn crop_mask_columns(
+    src: &[u8],
+    src_w: usize,
+    height: usize,
+    skip: usize,
+    width: usize,
+) -> Option<Vec<u8>> {
+    if src.len() != src_w.checked_mul(height)? || skip.checked_add(width)? > src_w {
+        return None;
+    }
+    let mut out = Vec::with_capacity(width.checked_mul(height)?);
+    for row in src.chunks_exact(src_w) {
+        out.extend_from_slice(&row[skip..skip + width]);
+    }
+    Some(out)
 }
 
 /// W8 (e): the runtime-fallback candidate RANK for a face of OS/2 weight
@@ -4563,6 +4837,36 @@ pub fn pad_split(win_px: usize, pad: usize, cell_px: usize) -> PadSplit {
     }
 }
 
+/// THE FRAME LAW, pure: the pixel size of a `rows`×`cols` grid whose cell box is
+/// `cell_w`×`cell_h`, INCLUDING `2·pad` of interior padding (one `pad` per edge)
+/// plus the top-only `head` chrome band. With `pad == 0` and `head == 0` this is
+/// the original `cols·cell_w × rows·cell_h`.
+///
+/// Split out of [`Renderer::frame_size`] (which is now exactly this function fed
+/// its own metrics) because ONE host path has to size a window from cell metrics
+/// it holds directly rather than from a live renderer: the Windows warm-launch
+/// early reveal predicts the exact frame from CACHED metrics, precisely because
+/// the backend that owns the live derivation has not joined yet. That prediction
+/// was open-coded arithmetic — a second copy of this law, and the `head` term is
+/// the one a synthetic tab band makes non-zero, so a drift between the two would
+/// surface as a visible resize on glass right after the reveal. Sharing the law
+/// makes the drift unrepresentable instead of merely logged.
+///
+/// The `head` band is TOP-only and additive; the caller applies any top-pad crop
+/// afterwards (the host's `visible_frame_height`), which is why this returns the
+/// RAW frame the renderers rasterize at.
+#[must_use]
+pub fn frame_size_px(
+    rows: usize,
+    cols: usize,
+    cell_w: usize,
+    cell_h: usize,
+    pad: usize,
+    head: usize,
+) -> (usize, usize) {
+    (cols * cell_w + 2 * pad, rows * cell_h + 2 * pad + head)
+}
+
 /// W1: where the (grid + `2·pad`) frame's leading edge sits inside a raw-window
 /// surface of `dst_px`, for one axis: `floor((dst_px - src_px) / 2)`. Positive =
 /// a padding band precedes the frame; negative = the frame overflows the window
@@ -5254,6 +5558,9 @@ impl Renderer {
             run_boundary_scratch: Vec::new(),
             glyph_plan_scratch: Vec::new(),
             glyph_plan_row: None,
+            bg_runs_total: std::cell::Cell::new(0),
+            bg_runs_at_base: std::cell::Cell::new(0),
+            image_cells: std::cell::Cell::new(0),
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
             deco_scratch: Vec::new(),
@@ -6230,6 +6537,7 @@ impl Renderer {
                 bg: [0; 3],
                 wide: false,
                 emoji_presentation: false,
+                text_presentation: false,
                 bold,
                 italic,
                 underline: UnderlineStyle::None,
@@ -6955,20 +7263,14 @@ impl Renderer {
     ///   fail-safe and the byte-stable portable/test backend;
     /// * (c) metric normalization — the face rasterizes at
     ///   `px * fallback_face_scale(..)`, not the primary's raw px;
-    /// * (d) wide (2-cell) glyphs centred in the 2-cell box by scaled advance
-    ///   ([`wide_center_offset`], the colour-emoji recipe);
-    /// * (f) coverage clamped to the cell row band ([`clamp_to_row_band`]), so
-    ///   a fallback blit can never paint outside its row — on the CPU blit and
-    ///   the GPU atlas quad alike (they share these bytes + placement);
-    /// * (g) a glyph whose RASTER overruns its cell box is CONDENSED along x
-    ///   to fit ([`condense_ink_w`] + the [`area_overlap`] weights) and centred
-    ///   by [`wide_center_offset`] — the fix for symbol-tier glyphs like the
-    ///   1.499 em long arrows (U+27F5..U+27FC), which used to paint ~2.9 cells
-    ///   inside a 1-cell grid box and bury the two columns to their right;
-    /// * (h) coverage clamped to the cell COLUMN band ([`clamp_to_col_band`])
-    ///   as a hard backstop, the twin of the (f) row clamp — so a fallback
-    ///   blit can never paint far into its neighbours' columns even when the
-    ///   condense floor binds.
+    /// * (d)+(f)+(g)+(h) the caller's final harmony pass (after any synthetic
+    ///   style) uniformly area-filters an oversized mask into its materialized
+    ///   one- or two-cell box, centres the scaled advance with
+    ///   [`wide_center_offset`], then clamps rounding fringes through
+    ///   [`clamp_to_row_band`] and [`clamp_to_col_band`]. This preserves the
+    ///   complete silhouette of one-cell symbols such as U+26A0 while retaining
+    ///   the hard containment fix for 1.499 em long arrows (U+27F5..U+27FC),
+    ///   and prevents bold dilation or italic shear from re-introducing spill.
     ///
     /// Fail-safe on every missing part: the primary face's `.notdef` raster,
     /// exactly the pre-W8 behaviour.
@@ -7048,7 +7350,7 @@ impl Renderer {
         };
         #[cfg(not(target_os = "macos"))]
         let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
-        let raw = if let Some(t) = ct {
+        if let Some(t) = ct {
             t
         } else if let Some(f) = font.as_ref().and_then(|lazy| lazy.get(&bytes)) {
             // The portable fontdue raster (and the CT fail-safe), by char —
@@ -7086,8 +7388,7 @@ impl Renderer {
             }
             let (m, b) = self.font.rasterize(ch, self.px);
             (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
-        };
-        self.harmonize_fallback_raster(source, ch, raw)
+        }
     }
 
     /// Drop the chain entry backed by `bytes` because its DEFERRED fontdue parse
@@ -7153,90 +7454,67 @@ impl Renderer {
         x_height_em_of(&face, upem)
     }
 
-    /// W8 (d)+(g)+(f)+(h): post-process a fallback raster, in that order —
-    /// centre a WIDE glyph's advance box in the 2-cell box, CONDENSE a glyph
-    /// whose coverage overruns its cell box until it fits and centre it, clamp
-    /// the coverage rows to the cell row band, then clamp the coverage columns
-    /// to the cell column band as a backstop. Pure placement/trim/resample
-    /// edits of the tuple; the proven policies are [`wide_center_offset`],
-    /// [`condense_ink_w`], [`clamp_to_row_band`] and [`clamp_to_col_band`].
+    /// W8 (d)+(f)+(g)+(h), extended to every terminal width: post-process a
+    /// proportional mono raster into the materialized cell's assigned box.
+    /// Uniform area filtering preserves the complete shape of a square warning
+    /// sign or a long mathematical arrow; an x-only squeeze or clip would not.
+    /// The final, post-style placement centres the scaled advance and clamps
+    /// integer-rounding fringes on both axes, so synthetic bold/italic cannot
+    /// re-introduce spill. Zero-width combining marks deliberately skip the
+    /// horizontal policy — their caller centres the overlay on its base cell.
     ///
-    /// ANTI-FIGHT LAW: (g) and (h) are two mechanisms aimed at one axis, so
-    /// they must not be able to disagree. They cannot: (g) keys off the
-    /// rasterized width and fits in integers, and (h)'s band is the cell box
-    /// widened by half a cell per side, so on everything (g) fitted, (h)
-    /// returns the exact identity. The only regime where BOTH act is the
-    /// `CONDENSE_MAX_RATIO` floor — i.e. precisely "no legible fit exists".
-    /// Pinned by `condense_then_clamp_never_fight` in the Tier-1 file.
+    /// `cells` comes from [`GlyphKey::cell_span`]. Frame rendering stamps that
+    /// key from [`materialized_cell_span`], preserving old-cell geometry across
+    /// an ambiguous-width reload; non-cell callers use [`fallback_cell_count`].
     fn harmonize_fallback_raster(
         &self,
-        source: FaceId,
-        ch: char,
+        cells: usize,
         raw: (usize, usize, i32, i32, f32, Vec<u8>),
     ) -> (usize, usize, i32, i32, f32, Vec<u8>) {
         let (mut w, mut h, mut xmin, mut ymin, mut adv, mut bytes) = raw;
-        let cw = aterm_grapheme::char_width(ch);
-        // (g)/(h) apply to the THREE fallback TIERS only. `DisplayMix` also
-        // rasterizes through this function but is deliberately excluded twice
-        // over: `display_fit_place` recomputes its `xmin` downstream (so a
-        // condense-time centring would simply be overwritten), and
-        // `calibrate_fitted_cell` GROWS `cell_w` to the widest measured glyph
-        // — condensing against a `cell_w` that is itself derived from the
-        // condensed widths could ping-pong. Display faces already carry the
-        // "never past the cell" law by their own route (`tests/display_faces.rs`).
-        let harmonized = matches!(
-            source,
-            FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
-        );
-        // The grid's own box. `cw == 0` (combining marks) is EXCLUDED from
-        // both stages, not folded to one cell: a mark's overhang is the
-        // mechanism, not a defect — U+0361 is DESIGNED to span two base cells
-        // — and its on-screen left comes from `mark_cell_x_at`'s centring,
-        // which cancels `xmin` entirely, so band coordinates are not even
-        // knowable here.
-        let box_w = cw * self.cell_w;
-        if cw == 2 {
-            let box_w = box_w as i32;
-            // `round` (not truncate) so a x.5 advance splits its gap evenly.
-            xmin += wide_center_offset(box_w, adv.round() as i32);
-            // The wide glyph OWNS its 2-cell box (the emoji recipe).
+        let cells = cells.min(2);
+        if cells > 0 && w > 0 && h > 0 {
+            if !adv.is_finite() || adv <= 0.0 {
+                adv = w as f32;
+            }
+            let box_w = cells.saturating_mul(self.cell_w).max(1);
+            let scale = fallback_fit_scale(box_w, self.cell_h, w, h, xmin, adv);
+            if scale < 1.0 {
+                let dst_w = ((w as f32 * scale).round() as usize).clamp(1, box_w);
+                let dst_h = ((h as f32 * scale).round() as usize).clamp(1, self.cell_h.max(1));
+                if let Some(scaled) = resample_mask_area(&bytes, w, h, dst_w, dst_h) {
+                    bytes = scaled;
+                    w = dst_w;
+                    h = dst_h;
+                    xmin = (xmin as f32 * scale).round() as i32;
+                    ymin = (ymin as f32 * scale).round() as i32;
+                    adv *= scale;
+                }
+            }
+
+            let box_w_i32 = i32::try_from(box_w).unwrap_or(i32::MAX);
+            // `round` (not truncate) so an x.5 advance splits its gap evenly.
+            xmin = xmin.saturating_add(wide_center_offset(
+                box_w_i32,
+                adv.round().clamp(i32::MIN as f32, i32::MAX as f32) as i32,
+            ));
+
+            // The fit inequality is continuous; raster/bearing rounding can
+            // leave a one-pixel fringe. Trim only that fringe so the final mask
+            // has the same hard cell-box guarantee on CPU and GPU.
+            let (skip_x, new_w) = clamp_to_col_band(xmin, w, box_w);
+            if (skip_x != 0 || new_w != w)
+                && let Some(cropped) = crop_mask_columns(&bytes, w, h, skip_x, new_w)
+            {
+                bytes = cropped;
+                xmin = xmin.saturating_add(i32::try_from(skip_x).unwrap_or(i32::MAX));
+                w = new_w;
+            }
+            // Every non-zero-width fitted glyph owns its terminal cell box,
+            // including CJK (2 cells) and bare text symbols (1 cell).
             adv = box_w as f32;
         }
-        // (g) CONDENSE. A fallback glyph whose RASTER is wider than its cell
-        // box is area-resampled along x until it fits (at most
-        // `CONDENSE_MAX_RATIO`:1) and its ink centred in the box. This is the
-        // fix for the long-arrow overrun: U+27F5..U+27FC paint ~2.9 cells of
-        // STIX Two Math inside a 1-cell grid box and bury their neighbours.
-        // MUST run before the (f) row clamp, which slices `bytes` by the
-        // current `w` — so `w` has to be final by then.
-        // `cw == 1` ONLY. A 2-cell glyph is already fitted by the emoji recipe
-        // immediately above — it is centred in its box and OWNS its advance —
-        // and it must not then be condensed as well. The CoreText raster's
-        // width includes the antialiasing pad, so an ideograph whose ink fits
-        // its 2-cell box perfectly well can still report `w > 2 * cell_w` and
-        // be squashed by a stage that only ever meant to catch the 1-cell
-        // overrun. That is a regression of the CJK fitting this function was
-        // written for, and it is why the gate is an equality, not `>= 1`.
-        if harmonized && cw == 1 && w > 0 && h > 0 {
-            let new_w = condense_ink_w(w, box_w);
-            if new_w != w {
-                bytes = condense_coverage(&bytes, w, h, new_w);
-                // ASSIGN, not `+=`: a side bearing designed for a 1.61 em
-                // advance is meaningless once the ink lives in a 0.58 em cell,
-                // so it is folded away and the ink placed by the proven
-                // balance law instead.
-                xmin = wide_center_offset(box_w as i32, new_w as i32);
-                w = new_w;
-                // And the ADVANCE follows the ink. The face's advance described
-                // the glyph that no longer exists (the arrows report 1.61 em —
-                // 2.9 cells — after condensing to one); no live layout consults
-                // it for a mono fallback glyph today, but a metric that
-                // contradicts the raster beside it is a trap for the first
-                // consumer that does. Same rule as the `cw == 2` branch: the
-                // glyph OWNS its box.
-                adv = box_w as f32;
-            }
-        }
+
         let top = self.baseline - h as i32 - ymin;
         let (skip, new_h) = clamp_to_row_band(top, h, self.cell_h);
         if new_h != h {
@@ -7246,37 +7524,6 @@ impl Renderer {
             // dropping top rows only lowers the anchor (ymin untouched).
             ymin += bottom_trim as i32;
             h = new_h;
-        }
-        // (h) BACKSTOP. No fallback glyph may paint more than HALF A CELL
-        // outside its own cell box, whatever the face claims. Inert in the
-        // fitted regime (see the anti-fight law above); it exists for the
-        // `CONDENSE_MAX_RATIO` floor, a pathological side bearing, and future
-        // faces — so the law here is unconditional rather than resting on
-        // trusting the rasterizer's reported width. Marks (`cw == 0`) are
-        // excluded for the reason given at `box_w` above.
-        if harmonized && cw >= 1 && w > 0 && h > 0 {
-            let bleed = (self.cell_w / 2).max(1);
-            let band_w = box_w + 2 * bleed;
-            let (skip, new_w) = clamp_to_col_band(xmin + bleed as i32, w, band_w);
-            // NEVER ANNIHILATE. A trim that leaves no coverage renders the cell
-            // BLANK, and a blank cell is strictly worse than the overrun this
-            // stage exists to bound — the reader loses the character entirely
-            // rather than seeing it encroach. Measured: U+E000 and U+E001 were
-            // erased outright by an unguarded trim (their rasters already fitted
-            // the box; a far-off `xmin` put the whole band off their ink). The
-            // backstop is a bound on spill, never a licence to delete a glyph.
-            let trimmed = (new_w != w).then(|| trim_coverage_cols(&bytes, w, h, skip, new_w));
-            let survives = trimmed
-                .as_ref()
-                .is_some_and(|t| t.iter().any(|&px| px != 0));
-            if let Some(t) = trimmed.filter(|_| survives) {
-                bytes = t;
-                // Dropping LEADING columns moves the ink's origin right;
-                // dropping trailing ones does not (the mirror of the row
-                // clamp's `ymin` rule, which the bottom trim raises).
-                xmin += skip as i32;
-                w = new_w;
-            }
         }
         (w, h, xmin, ymin, adv, bytes)
     }
@@ -7854,7 +8101,9 @@ impl Renderer {
 
     /// Enable/disable descender ink-skip (config `underline_skip_descenders`,
     /// W7, DEFAULT ON): underline coverage is zeroed within a 1px dilation of
-    /// the cell's own glyph ink. Draw-time only (no cache invalidation).
+    /// the cell's own DESCENDER ink (ink at or below the baseline — letter
+    /// bottoms resting on the baseline never chop the line). Draw-time only
+    /// (no cache invalidation).
     pub fn set_underline_skip_descenders(&mut self, on: bool) {
         self.underline_skip_descenders = on;
     }
@@ -8132,6 +8381,15 @@ impl Renderer {
     #[must_use]
     pub fn glyph_cache_len(&self) -> usize {
         self.glyphs.len()
+    }
+
+    /// TEST/DIAGNOSTIC: whether one exact raster key is resident. This lets
+    /// end-to-end frame tests prove that both materialized span variants of the
+    /// same fallback scalar actually travelled through the shipping draw path.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn glyph_cache_contains(&self, key: GlyphKey) -> bool {
+        self.glyphs.contains_key(&key)
     }
 
     /// Set the explicit selected-text foreground (theme `selectionForeground`), or
@@ -8456,11 +8714,12 @@ impl Renderer {
     /// Pixel size of a `rows`x`cols` grid, INCLUDING `2·pad` of interior padding
     /// (one `pad` on each of the four edges) plus the top-only `head` band. With
     /// `pad == 0` and `head == 0` this is the original `cols·cell_w × rows·cell_h`.
+    ///
+    /// This renderer's metrics fed through the free [`frame_size_px`] — the law is
+    /// shared so a host that must size a window WITHOUT a live renderer cannot
+    /// drift from it.
     pub fn frame_size(&self, rows: usize, cols: usize) -> (usize, usize) {
-        (
-            cols * self.cell_w + 2 * self.pad,
-            rows * self.cell_h + 2 * self.pad + self.head,
-        )
+        frame_size_px(rows, cols, self.cell_w, self.cell_h, self.pad, self.head)
     }
 
     /// The font baseline (pixels from the cell top to the glyph baseline).
@@ -8529,7 +8788,18 @@ impl Renderer {
     /// fallback lazily loaded and consulted), memoized per char so the hot path
     /// pays the face lookups once, not once per blit.
     pub fn glyph_key(&mut self, ch: char) -> GlyphKey {
-        self.glyph_key_inner(ch).0
+        self.glyph_key_inner(ch, ScalarPresentation::Default).0
+    }
+
+    /// Resolve `ch` under an explicit VS15 text-presentation request. Unlike
+    /// [`Self::glyph_key`], this never selects the colour-RGBA face merely
+    /// because `ch` has Unicode `Emoji_Presentation=Yes`; it follows the same
+    /// mono-first chain with `wants_emoji=false`, falling back to the colour
+    /// font's foreground-tinted one-cell silhouette when no text face covers it.
+    /// The memo is presentation-qualified so bare `😀` and `😀︎` can
+    /// coexist without whichever one rendered first poisoning the other.
+    pub fn glyph_key_text(&mut self, ch: char) -> GlyphKey {
+        qualify_text_presentation_key(self.glyph_key_inner(ch, ScalarPresentation::Text).0)
     }
 
     /// [`Self::glyph_key`] plus a PROVISIONAL flag: `true` means a background
@@ -8543,8 +8813,9 @@ impl Renderer {
     /// probes: each coverage fact is computed when, and only when, every
     /// higher-priority tier has already missed, so the heavy fallback / symbol /
     /// colour faces are never loaded for a char the primary face covers.
-    fn glyph_key_inner(&mut self, ch: char) -> (GlyphKey, bool) {
-        if let Some(&key) = self.keys.get(&ch) {
+    fn glyph_key_inner(&mut self, ch: char, presentation: ScalarPresentation) -> (GlyphKey, bool) {
+        let memo_key = (ch, presentation);
+        if let Some(&key) = self.keys.get(&memo_key) {
             return (key, false);
         }
         // FONT-DISPLAY MIX: with extra display faces installed, every character
@@ -8572,9 +8843,10 @@ impl Renderer {
                     .get(&face.bytes)
                     .is_some_and(|f| f.lookup_glyph_index(ch) != 0)
             {
-                let key =
+                let mut key =
                     GlyphKey::mono_char(FaceId::DisplayMix, ch, StyleBits::REGULAR, self.px_q);
-                self.keys.insert(ch, key);
+                key.cell_span = fallback_cell_count(ch, &self.shaping) as u8;
+                self.keys.insert(memo_key, key);
                 return (key, false);
             }
         }
@@ -8587,7 +8859,8 @@ impl Renderer {
             // face is `include_bytes!`'d — no I/O, no host query — so it stays
             // reachable. Conflating these two gates is what tofu'd U+276F.
             sealed: self.admitted_sources_sealed,
-            wants_emoji: aterm_grapheme::is_emoji_presentation(ch),
+            wants_emoji: presentation == ScalarPresentation::Default
+                && aterm_grapheme::is_emoji_presentation(ch),
         };
         let mut primary_gid: Option<u16> = None;
         let mut probe = RendererProbe {
@@ -8599,7 +8872,7 @@ impl Renderer {
         let face = match resolved {
             font_chain::Resolution::Provisional => {
                 debug_assert!(
-                    !self.keys.contains_key(&ch),
+                    !self.keys.contains_key(&memo_key),
                     "a provisional `.notdef` must never be memoized — it strands the tofu",
                 );
                 return (
@@ -8621,7 +8894,7 @@ impl Renderer {
             font_chain::Resolution::Runtime(_) => FaceId::RuntimeFallback,
             font_chain::Resolution::Face(f) => f,
         };
-        let key = match face {
+        let mut key = match face {
             // The colour face carries a 32-bit RGBA sbix bitmap (🚀 😀); every
             // other outcome — including the monochromatized colour silhouette
             // (`ColorEmojiMono`) and the runtime-discovered fallback — is a
@@ -8636,6 +8909,9 @@ impl Renderer {
             }
             source => GlyphKey::mono_char(source, ch, StyleBits::REGULAR, self.px_q),
         };
+        if key.glyph_class == GlyphClass::Mono && harmonized_fallback_source(key.source) {
+            key.cell_span = fallback_cell_count(ch, &self.shaping) as u8;
+        }
         // P3 KEY/RASTER AGREEMENT: the record this resolution WROTE must be the
         // record `fallback_mono_raster` READS back from the key's face. Breaking
         // it is a silent tofu — the `.notdef` raster wearing a fallback face id.
@@ -8645,7 +8921,7 @@ impl Renderer {
                 .is_none_or(|slot| font_chain::slot_for_source(key.source) == Some(slot)),
             "glyph key {key:?} cannot recover the face that {resolved:?} resolved",
         );
-        self.keys.insert(ch, key);
+        self.keys.insert(memo_key, key);
         (key, false)
     }
 
@@ -8686,13 +8962,31 @@ impl Renderer {
     /// colour-emoji glyphs ignore `style` — they have no synthetic variant.
     /// `REGULAR` short-circuits to the plain unstyled cache.
     pub fn glyph_key_styled(&mut self, ch: char, style: StyleBits) -> GlyphKey {
+        self.glyph_key_styled_inner(ch, style, ScalarPresentation::Default)
+    }
+
+    /// Styled twin of [`Self::glyph_key_text`] for an explicit VS15 cell.
+    pub fn glyph_key_text_styled(&mut self, ch: char, style: StyleBits) -> GlyphKey {
+        self.glyph_key_styled_inner(ch, style, ScalarPresentation::Text)
+    }
+
+    fn glyph_key_styled_inner(
+        &mut self,
+        ch: char,
+        style: StyleBits,
+        presentation: ScalarPresentation,
+    ) -> GlyphKey {
         if style == StyleBits::REGULAR {
-            return self.glyph_key(ch);
+            return match presentation {
+                ScalarPresentation::Default => self.glyph_key(ch),
+                ScalarPresentation::Text => self.glyph_key_text(ch),
+            };
         }
-        if let Some(&key) = self.styled_keys.get(&(ch, style)) {
+        let memo_key = (ch, style, presentation);
+        if let Some(&key) = self.styled_keys.get(&memo_key) {
             return key;
         }
-        let (base, provisional) = self.glyph_key_inner(ch);
+        let (base, provisional) = self.glyph_key_inner(ch, presentation);
         // INJECTED REAL BOLD (highest priority): a bold cell on a PRIMARY-face char
         // (Mono `.notdef` or MonoGid) that the host-injected bold face covers becomes
         // a BoldPrimary glyph addressed by the bold gid. Drop BOLD from the carried
@@ -8729,6 +9023,7 @@ impl Renderer {
                 glyph_class: GlyphClass::MonoGid,
                 ch_or_id: gid as u32,
                 style: residual,
+                cell_span: 0,
                 px_q: self.px_q,
             }
         } else if base.source == FaceId::Procedural || base.source == FaceId::ColorEmojiMono {
@@ -8744,10 +9039,15 @@ impl Renderer {
         } else {
             base
         };
+        let key = if presentation == ScalarPresentation::Text {
+            qualify_text_presentation_key(key)
+        } else {
+            key
+        };
         // A PROVISIONAL base (fallback parse in flight) re-resolves once the
         // face lands; memoizing it here would pin the `.notdef` routing forever.
         if !provisional {
-            self.styled_keys.insert((ch, style), key);
+            self.styled_keys.insert(memo_key, key);
         }
         key
     }
@@ -8769,7 +9069,7 @@ impl Renderer {
             // No colour glyph for this char — honour the ordinary text dispatch.
             // A PROVISIONAL resolution (fallback parse in flight) must not be
             // memoized; it re-resolves once the face lands.
-            let (key, provisional) = self.glyph_key_inner(ch);
+            let (key, provisional) = self.glyph_key_inner(ch, ScalarPresentation::Default);
             if provisional {
                 return key;
             }
@@ -8843,12 +9143,23 @@ impl Renderer {
         Some(GlyphKey::rgba_gid(FaceId::ColorEmoji, gid, self.px_q))
     }
 
-    /// Install the text-shaping config (ligature mode + features). DEFAULT is
-    /// `LigatureMode::Enabled`; set `Disabled` to render strictly per-cell (the
-    /// pre-ligature behaviour). Clears the shaped-run cache so a mode flip takes
-    /// effect on the next frame.
+    /// Install the text-shaping config (ligature mode + features + ambiguous
+    /// width). DEFAULT is `LigatureMode::Enabled`; set `Disabled` to render
+    /// strictly per-cell (the pre-ligature behaviour). Clears the shaped-run
+    /// cache so a mode flip takes effect on the next frame. An ambiguous-width
+    /// flip also drops scalar-key/raster caches used by non-cell callers. Frame
+    /// rendering does not depend on this global: it stamps each key from the
+    /// engine's materialized continuation marker, preserving pre-reload cells.
     pub fn set_text_shaping(&mut self, shaping: aterm_types::text_shaping::TextShapingConfig) {
+        let ambiguous_width_changed = self.shaping.ambiguous_width != shaping.ambiguous_width;
         self.shaping = shaping;
+        if ambiguous_width_changed {
+            self.keys.clear();
+            self.styled_keys.clear();
+            self.emoji_keys.clear();
+            self.glyphs.clear();
+            self.deco_masks.borrow_mut().clear();
+        }
         // PRIMARY-face (`font_id == 0`) user features — the only ones this shaper drives.
         let primary: Vec<aterm_types::text_shaping::FontFeature> = self
             .shaping
@@ -8935,6 +9246,69 @@ impl Renderer {
     #[must_use]
     pub fn stem_gamma(&self) -> f32 {
         self.stem_gamma
+    }
+
+    /// Set the Linux grid-fitting mode (config `font_hinting`, aliased by the
+    /// `ATERM_FONT_HINTING` env var — the host resolves env > config and
+    /// passes the winner here, the `stem_gamma` discipline). Spellings:
+    /// `"full"` (the default — and, like the env, what any unrecognized value
+    /// resolves to) / `"light"` / `"native"` / `"off"|"0"|"none"|"false"`.
+    /// Under `ATERM_RASTERIZER=fontdue` the byte-stable fontdue pin stays
+    /// forced regardless, so the golden/parity exports cannot be re-hinted by
+    /// a config file. A change drops the per-size hinting-instance bank and
+    /// the rasterized-glyph caches (grid fitting bakes into the cached
+    /// coverage bytes — an atlas split between two modes is exactly what the
+    /// construction-time-only rule existed to prevent); a same-value call is
+    /// free. Returns whether the mode changed (the GPU wrapper invalidates
+    /// its atlas on `true`). On macOS (CoreText applies its own grid
+    /// discipline) and Windows/wasm (no hint seam) this is an inert `false`.
+    pub fn set_font_hinting(&mut self, mode: &str) -> bool {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mode = if hinted::HintMode::fontdue_forced() {
+                hinted::HintMode::Off
+            } else {
+                hinted::HintMode::parse(mode)
+            };
+            if mode == self.hint_mode {
+                return false;
+            }
+            self.hint_mode = mode;
+            self.hint_bank.clear();
+            // Cached coverage is mode-specific; re-rasterize everything on the
+            // new mode (the `debug_force_fontdue` discipline, plus the styled
+            // keys — bold/italic coverage is grid-fitted too).
+            self.glyphs.clear();
+            self.keys.clear();
+            self.styled_keys.clear();
+            true
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            let _ = mode;
+            false
+        }
+    }
+
+    /// The active Linux grid-fitting mode's canonical spelling (`"full"` /
+    /// `"light"` / `"native"` / `"off"`) — the [`Self::set_font_hinting`]
+    /// round-trip, for change detection and diagnostics. Always `"full"` (the
+    /// inert default) on the targets without the hint seam.
+    #[must_use]
+    pub fn font_hinting(&self) -> &'static str {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            match self.hint_mode {
+                hinted::HintMode::Full => "full",
+                hinted::HintMode::Light => "light",
+                hinted::HintMode::Native => "native",
+                hinted::HintMode::Off => "off",
+            }
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            "full"
+        }
     }
 
     /// The user-configured PRIMARY-face `font_features` tags that the active font does
@@ -9566,22 +9940,34 @@ impl Renderer {
                     synth_style
                 };
                 let (width, bytes) = apply_synthetic_style(synth_style, gw, gh, bytes, self.px);
+                let xmin = if key.source == FaceId::Primary {
+                    self.display_fit_place(gxmin, width)
+                } else {
+                    gxmin
+                };
+                let (width, height, xmin, ymin, advance, bytes) =
+                    if harmonized_fallback_source(key.source)
+                        || (key.cell_span > 0
+                            && matches!(key.source, FaceId::Primary | FaceId::BoldPrimary))
+                    {
+                        // FINAL (post-style) fit: synthetic dilation/shear is part
+                        // of the mask whose terminal-cell containment we promise.
+                        self.harmonize_fallback_raster(
+                            usize::from(key.cell_span),
+                            (width, gh, xmin, gymin, gadv, bytes),
+                        )
+                    } else {
+                        (width, gh, xmin, gymin, gadv, bytes)
+                    };
                 GlyphImage::Mono {
                     width,
-                    height: gh,
-                    // FONT-DISPLAY-FIT (rhythm): centre the glyph in its cell for a
-                    // fitted face. Only the two sources that draw from a display face
-                    // in a fitted cell take it — procedural cells (box
-                    // drawing) are cell-filling by construction and must stay put.
-                    // `width` (post-dilation), not `gw`: the placement has to know
-                    // how wide the coverage actually ENDED UP.
-                    xmin: if matches!(key.source, FaceId::Primary | FaceId::DisplayMix) {
-                        self.display_fit_place(gxmin, width)
-                    } else {
-                        gxmin
-                    },
-                    ymin: gymin,
-                    advance: gadv,
+                    height,
+                    // Primary FONT-DISPLAY-FIT was applied above. DisplayMix
+                    // has exactly one placement owner: fallback harmony, so it
+                    // cannot be centred once by each policy.
+                    xmin,
+                    ymin,
+                    advance,
                     bytes,
                 }
             }
@@ -9800,17 +10186,25 @@ impl Renderer {
                     synth
                 };
                 let (width, bytes) = apply_synthetic_style(synth, gw, gh, bytes, self.px);
+                let (width, height, xmin, ymin, advance, bytes) = if key.cell_span > 0 {
+                    self.harmonize_fallback_raster(
+                        usize::from(key.cell_span),
+                        (width, gh, gxmin, gymin, gadv, bytes),
+                    )
+                } else {
+                    (width, gh, gxmin, gymin, gadv, bytes)
+                };
                 GlyphImage::Mono {
                     width,
-                    height: gh,
+                    height,
                     // FONT-DISPLAY-FIT (rhythm): centre in the cell, as above.
                     xmin: if matches!(pick, FacePick::Primary) {
-                        self.display_fit_place(gxmin, width)
+                        self.display_fit_place(xmin, width)
                     } else {
-                        gxmin
+                        xmin
                     },
-                    ymin: gymin,
-                    advance: gadv,
+                    ymin,
+                    advance,
                     bytes,
                 }
             }
@@ -10118,6 +10512,11 @@ impl Renderer {
         // is frame-scoped by construction. Cleared AFTER the fallback install above,
         // which is the last thing that can re-route glyphs this frame.
         self.glyph_plan_row = None;
+        // Frame-scope the background-run diagnostic (see the fields): both
+        // render paths below run underneath this entry.
+        self.bg_runs_total.set(0);
+        self.bg_runs_at_base.set(0);
+        self.image_cells.set(0);
         let (rows, cols) = (input.rows, input.cols);
         let (w, h) = self.frame_size(rows, cols);
         // Convert (or drop) the WALLPAPER base layer for this frame BEFORE the
@@ -10699,6 +11098,26 @@ impl Renderer {
         // which is the same defect as the side margins turned ninety degrees.
         if r == 0 {
             self.fill_rect(pixels, w, h, 0, 0, w, self.grid_top(), color);
+            // …and with `top_extends_cells`, each COLUMN continues its own cell
+            // background through that strip, so a raised tab chip fills the band
+            // instead of floating at the bottom of it (see the field's docs).
+            //
+            // The scanline at `y0` IS the surface we want, already assembled and
+            // with no second source of truth to drift from: phase A has laid this
+            // row's cell backgrounds, the two gutter fills happened three lines up,
+            // and NO ink pass has run yet (`composite_free` completes phase A for
+            // every row before phase B touches a glyph). So the extension is one
+            // row-wide copy per line, not a re-derivation of the row's colours.
+            if bleed.top_extends_cells && y0 > 0 && y0 < h && w > 0 {
+                let src = y0 * w;
+                if src + w <= pixels.len() {
+                    let (above, rest) = pixels.split_at_mut(src);
+                    let line = &rest[..w];
+                    for y in 0..y0 {
+                        above[y * w..y * w + w].copy_from_slice(line);
+                    }
+                }
+            }
         }
         // The seam, in the gutters only: the cells of this row carry their own
         // per-cell underline (the host stamps it), and these two segments continue it
@@ -11276,6 +11695,45 @@ impl Renderer {
         }
     }
 
+    /// `(total, at_base)` background runs resolved by the LAST
+    /// [`Self::render_input_cached`] / [`Self::render_input`] — the outside view
+    /// of the `bg_runs_*` diagnostic. `at_base` counts the runs whose colour is
+    /// exactly the one the band's base already carries, i.e. the runs whose fill
+    /// stores bytes that are already there.
+    ///
+    /// A REACH GUARD reads it two-sided: a plain-text fixture must show
+    /// `at_base > 0` (the state exists), and an all-SGR-background control must
+    /// show `at_base == 0` with `total > 0` (the state is not universal, so the
+    /// count is measuring the content and not the walk).
+    #[must_use]
+    pub fn last_bg_runs(&self) -> (u32, u32) {
+        (self.bg_runs_total.get(), self.bg_runs_at_base.get())
+    }
+
+    /// How many image-covered cells the LAST render blitted — the outside view of
+    /// the `image_cells` diagnostic.
+    ///
+    /// A REACH GUARD reads it two-sided: a frame repainting a placement must show
+    /// a four-figure count (the state exists, and the row really is dirty — a
+    /// SETTLED image row is not dirty and blits nothing), and the image-free twin
+    /// of the same script must show 0 (the counter is reading the image path and
+    /// not the row walk).
+    #[must_use]
+    pub fn last_image_cells(&self) -> u32 {
+        self.image_cells.get()
+    }
+
+    /// Record one resolved background run for [`Self::last_bg_runs`].
+    #[inline]
+    fn note_bg_run(&self, color: u32, band_base: Option<u32>) {
+        self.bg_runs_total
+            .set(self.bg_runs_total.get().saturating_add(1));
+        if band_base == Some(color) {
+            self.bg_runs_at_base
+                .set(self.bg_runs_at_base.get().saturating_add(1));
+        }
+    }
+
     /// Pass 1 of one row: fill every cell rect with its background colour.
     /// Done before any glyph so a wide glyph (which overflows into its
     /// continuation column) isn't clobbered by that column's fill.
@@ -11305,6 +11763,24 @@ impl Renderer {
         // fill opaquely. `false` on every wallpaper-less frame, so the historical
         // paths stay byte-identical.
         let wallpaper = input.wallpaper.is_some();
+        // THE BAND'S BASE COLOUR — the u32 already standing in every pixel of
+        // this row's band when this pass starts, or `None` when there is no such
+        // single value. Phase A's pre-step is the only writer between the base
+        // and here: `full_render` starts from `pixels.resize(w·h, frame_bg |
+        // bg_t<<24)` and passes `band_bg: None`; the damaged path calls
+        // `fill_band_bg` with exactly `frame_bg | bg_t<<24` across the row's FULL
+        // width. Both are the scalars `row_ctx` hoisted, so the value is
+        // `ctx.frame_bg | (bg_t << 24)` on either path.
+        //
+        // `None` under a live wallpaper: there the band's base is the BACKDROP
+        // texels (`base_span`), not one scalar, so no comparison is meaningful.
+        // (`resolve` already returns `None` for a default-bg cell in that regime,
+        // so the two exclusions never overlap.)
+        let band_base = if wallpaper {
+            None
+        } else {
+            Some(ctx.frame_bg | (bg_t << 24))
+        };
         // The cell's resolved fill colour — identical on both arms, hoisted so
         // the uniform arm can compare consecutive cells' colours. `None` = leave
         // the wallpaper base texels (never returned without a live wallpaper).
@@ -11360,6 +11836,16 @@ impl Renderer {
                     run_bg = bg;
                 } else if bg != run_bg {
                     if let Some(color) = run_bg {
+                        self.note_bg_run(color, band_base);
+                    }
+                    // FRM-1: a run whose colour is the one the band's base ALREADY
+                    // carries would `fill` the u32 that is already in every pixel it
+                    // covers, so skipping it is byte-identical by construction (see
+                    // `band_base`). This is the elision the sparse-TAIL loop below
+                    // already performs ("The framebuffer clear already paints their
+                    // frame-wide default background"), extended to the materialized
+                    // PREFIX — which is where the area is.
+                    if let Some(color) = run_bg.filter(|_| run_bg != band_base) {
                         let x = self.pad + run_start * cw;
                         self.fill_rect(
                             pixels,
@@ -11378,6 +11864,12 @@ impl Renderer {
             }
             if n > 0
                 && let Some(color) = run_bg
+            {
+                self.note_bg_run(color, band_base);
+            }
+            // Same FRM-1 elision as the mid-run flush above.
+            if n > 0
+                && let Some(color) = run_bg.filter(|_| run_bg != band_base)
             {
                 let x = self.pad + run_start * cw;
                 self.fill_rect(
@@ -11401,9 +11893,16 @@ impl Renderer {
                 // marching across the split). Strictly PER COLUMN: each column
                 // clamps to its own DEC run box, so runs cannot be merged.
                 if let Some(color) = resolve(c, cell) {
-                    let p = self.mixed_cell_place(input, row, c, y0);
-                    if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
-                        self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, color);
+                    self.note_bg_run(color, band_base);
+                    // Same FRM-1 elision as the uniform arm: `fill_band_bg` spans
+                    // the FULL width of the band on a composed row too (and the
+                    // full path's clear covers the whole buffer), so a column that
+                    // resolved to the band's own colour has nothing to write.
+                    if band_base != Some(color) {
+                        let p = self.mixed_cell_place(input, row, c, y0);
+                        if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
+                            self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, color);
+                        }
                     }
                 }
             }
@@ -11747,7 +12246,11 @@ impl Renderer {
                     ColumnGlyph::LigatedSlice { gid, k, .. } => {
                         self.ligature_slice_key(gid, k, cell_style(cell))
                     }
-                    ColumnGlyph::PerCell => self.resolve_cell_key(cluster, cell),
+                    ColumnGlyph::PerCell => self.resolve_cell_key_for_span(
+                        cluster,
+                        cell,
+                        materialized_cell_span(cells, c),
+                    ),
                 };
                 // Shade dithers key on the cell's ABSOLUTE pixel parity (a
                 // no-op for every other glyph) — the GPU quad emission folds
@@ -12159,7 +12662,9 @@ impl Renderer {
 
     /// Descender ink-skip (W7): compute the kept x-spans (ABSOLUTE px) of cell
     /// `(r, c)`'s underline after zeroing coverage within a 1px dilation of
-    /// the cell's own glyph ink. Returns `false` — and leaves `out`
+    /// the cell's own DESCENDER ink — ink at or below the baseline row; letter
+    /// bottoms sitting ON the baseline never count (see the probe-bounds
+    /// comment in the body). Returns `false` — and leaves `out`
     /// unspecified — when no skipping applies (knob off, DEC-scaled row,
     /// image-covered / blank cell, or NO ink intersects the dilated band): the
     /// caller then draws the full span, taking the exact code path of the
@@ -12258,7 +12763,11 @@ impl Renderer {
             ColumnGlyph::LigatedSlice { gid, k, .. } => {
                 self.ligature_slice_key(gid, k, cell_style(cell))
             }
-            ColumnGlyph::PerCell => self.resolve_cell_key(input.cluster_at(r, c), cell),
+            ColumnGlyph::PerCell => self.resolve_cell_key_for_span(
+                input.cluster_at(r, c),
+                cell,
+                materialized_cell_span(&input.cells[r], c),
+            ),
         };
         let baseline = self.baseline;
         let img = self.glyph_image(key);
@@ -12271,9 +12780,22 @@ impl Renderer {
             GlyphImage::Rgba { bytes, .. } => bytes[(gy * gw + gx) * 4 + 3] > 0,
         };
         // The blit anchors the bitmap at cell row `baseline - height - ymin`
-        // (see `Renderer::blit`); probe the band dilated by 1px vertically.
+        // (see `Renderer::blit`); probe the band dilated by 1px vertically —
+        // but never above the BASELINE row. Ink at rows < baseline is a letter
+        // BOTTOM sitting on the baseline ('a', 'n', the strip's title text),
+        // not a descender, and at small sizes the underline band starts within
+        // 1px of the baseline, so the unclamped dilation used to classify
+        // EVERY letter as a descender and chop the underline into dashes
+        // (measured at the live 12px: the tab strip's accent underline
+        // survived only in the inter-word gaps). Descender ink — the feature's
+        // whole subject — occupies rows >= baseline (`ymin < 0` glyphs), which
+        // the clamp keeps probing, 1px dilation included, whenever the band
+        // itself sits at or below the baseline (the resolved metrics always
+        // put it there; an operator-adjusted band pushed above the baseline
+        // deliberately overlaps x-height ink everywhere, and carving around
+        // ALL of it would erase the line, so no skip is the honest draw).
         let gy0 = baseline - gh as i32 - ymin;
-        let (ylo, yhi) = (by0 as i32 - 1, by1 as i32 + 1);
+        let (ylo, yhi) = ((by0 as i32 - 1).max(baseline), by1 as i32 + 1);
         ink.clear();
         ink.resize(dw, false);
         // The band filter as LOOP BOUNDS instead of a per-row `continue`:
@@ -13340,7 +13862,11 @@ impl Renderer {
                         }
                         ColumnGlyph::PerCell => {
                             let cluster = cluster_for(&input.clusters[cr], c);
-                            self.resolve_cell_key(cluster, &src)
+                            self.resolve_cell_key_for_span(
+                                cluster,
+                                &src,
+                                materialized_cell_span(&input.cells[cr], c),
+                            )
                         }
                     };
                     // Same absolute shade phase as the base pass (the column's
@@ -13459,6 +13985,8 @@ impl Renderer {
         image: &aterm_core::grid::extra::ImageRef,
         x_clip: usize,
     ) {
+        self.image_cells
+            .set(self.image_cells.get().saturating_add(1));
         let cw = self.cell_w;
         let ch = self.cell_h;
         let fp_w = image.image.cols as usize * cw;
@@ -13528,12 +14056,16 @@ impl Renderer {
         }
     }
 
-    /// Resolve a cell to its glyph key: a shaped emoji CLUSTER (ZWJ / skin-tone
-    /// / keycap) takes priority, then a VS16 emoji-presentation base, then the
-    /// ordinary text dispatch. `cluster` is the cell's grapheme-cluster string
-    /// when [`RenderInput::clusters`] holds one for it. Public so the GPU atlas
-    /// builder resolves keys through the EXACT same dispatch (CPU/GPU parity).
+    /// Resolve a cell to its glyph key: an explicit VS15 text request is
+    /// authoritative, then a shaped emoji CLUSTER (ZWJ / skin-tone / keycap),
+    /// then a VS16 emoji-presentation base, then the ordinary Unicode-default
+    /// dispatch. `cluster` is the cell's grapheme-cluster string when
+    /// [`RenderInput::clusters`] holds one for it. Public so the GPU atlas builder
+    /// resolves keys through the EXACT same dispatch (CPU/GPU parity).
     pub fn resolve_cell_key(&mut self, cluster: Option<&str>, cell: &RenderCell) -> GlyphKey {
+        if cell.text_presentation {
+            return self.glyph_key_text_styled(cell.ch, cell_style(cell));
+        }
         if let Some(cl) = cluster
             && let Some(k) = self.glyph_key_cluster(cl)
         {
@@ -13544,6 +14076,32 @@ impl Renderer {
         } else {
             self.glyph_key_styled(cell.ch, cell_style(cell))
         }
+    }
+
+    /// Resolve a materialized cell like [`Self::resolve_cell_key`], then stamp
+    /// the raster box into its [`GlyphKey`] identity. Proportional fallback keys
+    /// carry the stored 0/1/2-cell span, preserving old cells across an
+    /// ambiguous-width reload. An explicit VS15 Primary/BoldPrimary mono key is
+    /// always stamped one cell: unlike an ordinary primary key, its post-style
+    /// raster is fitted/clipped to that box so a custom font's emoji glyph cannot
+    /// paint the adjacent cell. Colour/procedural and ordinary primary keys stay
+    /// unchanged because their raster bytes do not use this span fit.
+    pub fn resolve_cell_key_for_span(
+        &mut self,
+        cluster: Option<&str>,
+        cell: &RenderCell,
+        cell_span: u8,
+    ) -> GlyphKey {
+        let mut key = self.resolve_cell_key(cluster, cell);
+        if cell.text_presentation
+            && matches!(key.source, FaceId::Primary | FaceId::BoldPrimary)
+            && matches!(key.glyph_class, GlyphClass::Mono | GlyphClass::MonoGid)
+        {
+            key.cell_span = 1;
+        } else if key.glyph_class == GlyphClass::Mono && harmonized_fallback_source(key.source) {
+            key.cell_span = cell_span.min(2);
+        }
+        key
     }
 
     /// Blit one glyph into the framebuffer for the already-resolved `key`,
@@ -15100,9 +15658,11 @@ pub fn scroll_blit_plan(
     // the exposed strip PLUS the `OVERSHOOT_APRON_ROWS` retained rows directly
     // above it — the reconciliation depth for the ≤1-cell upward overshoot of the
     // supported glyphs (proven geometry-independent by the tests/scroll_blit.rs
-    // sweep). Only fires toward the bottom (`da > 0`): into history the exposed
-    // strip is at the TOP and the retained region below moved as one rigid block,
-    // so no retained row sits above an exposed row and this marks nothing.
+    // sweep). Toward the bottom (`da > 0`) this reconciles the retained rows
+    // directly above the exposed strip. Into history (`da < 0`) the exposed strip
+    // is at the TOP, but the new BOTTOM row has lost its old below-neighbour: its
+    // copied pixel band can still contain that neighbour's upward overshoot. The
+    // bottom retained row is therefore re-rastered separately below.
     // composite_free draws each exposed / apron row's fresh overshoot into the
     // re-rastered band above it; the UPPER apron protects the topmost still-blitted
     // neighbour from the double-composite. Keyed off the EXPOSED set (source out of
@@ -15117,6 +15677,12 @@ pub fn scroll_blit_plan(
                     mark(dirty, rr as usize);
                 }
             }
+        }
+    }
+    if da < 0 {
+        let bottom = rows - 1;
+        if (0..rows as i64).contains(&(bottom as i64 + i64::from(da))) {
+            mark(dirty, bottom);
         }
     }
     Some(da)
@@ -16156,18 +16722,6 @@ pub fn condense_coverage(cov: &[u8], w: usize, h: usize, new_w: usize) -> Vec<u8
             // is belt-and-braces (the partition of unity bounds it already).
             out[y * new_w + d] = ((acc + w as u64 / 2) / w as u64).min(255) as u8;
         }
-    }
-    out
-}
-
-/// W8 (h): drop `skip` leading columns and every column past `new_w` from a
-/// coverage bitmap. The column twin of the (f) row clamp's byte slice — rows
-/// are contiguous, so unlike the row case this one has to RE-PACK rather than
-/// reslice. Caller guarantees `skip + new_w <= w`.
-fn trim_coverage_cols(cov: &[u8], w: usize, h: usize, skip: usize, new_w: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(new_w * h);
-    for y in 0..h {
-        out.extend_from_slice(&cov[y * w + skip..y * w + skip + new_w]);
     }
     out
 }
@@ -20867,7 +21421,7 @@ mod tests {
         // set_fallback_bytes: must drop the stale Fallback bitmaps + the per-char key.
         seed_glyph(&mut r, FaceId::Fallback, '中');
         r.keys.insert(
-            '中',
+            ('中', ScalarPresentation::Default),
             GlyphKey::mono_char(FaceId::Fallback, '中', StyleBits::REGULAR, r.px_q),
         );
         r.set_fallback_bytes(&bytes).expect("valid font installs");
@@ -20884,7 +21438,7 @@ mod tests {
         // both, so even a char already cached as a Primary `.notdef` re-routes.
         seed_glyph(&mut r, FaceId::SymbolFallback, '⏸');
         r.keys.insert(
-            '⏸',
+            ('⏸', ScalarPresentation::Default),
             GlyphKey::mono_char(FaceId::Primary, '⏸', StyleBits::REGULAR, r.px_q),
         );
         r.set_symbol_fallback_bytes(&bytes)
@@ -20922,7 +21476,7 @@ mod tests {
         // set_bold_font: must drop glyphs alongside the styled_keys/bold_gid memos.
         seed_glyph(&mut r, FaceId::BoldPrimary, 'B');
         r.styled_keys.insert(
-            ('B', StyleBits::BOLD),
+            ('B', StyleBits::BOLD, ScalarPresentation::Default),
             GlyphKey::mono_gid(7, StyleBits::BOLD, r.px_q),
         );
         r.set_bold_font(&bytes).expect("valid font installs");
@@ -21387,7 +21941,7 @@ mod tests {
         r.fallback_chain = vec![first, second];
         r.fallback_pick.insert('Z', 0);
         let key = GlyphKey::mono_char(FaceId::Fallback, 'Z', StyleBits::REGULAR, r.px_q);
-        r.keys.insert('Z', key);
+        r.keys.insert(('Z', ScalarPresentation::Default), key);
         let _ = r.glyph_image(key);
         let epoch = r.font_epoch;
 
@@ -22060,7 +22614,8 @@ mod tests {
             "while the parse is in flight the char renders provisional .notdef"
         );
         assert!(
-            !r.keys.contains_key(&UNCOVERED),
+            !r.keys
+                .contains_key(&(UNCOVERED, ScalarPresentation::Default)),
             "a provisional resolution must NOT be memoized"
         );
         assert!(
@@ -22086,7 +22641,8 @@ mod tests {
         let key2 = r.glyph_key(UNCOVERED);
         assert_eq!(key2.source, FaceId::Primary);
         assert!(
-            r.keys.contains_key(&UNCOVERED),
+            r.keys
+                .contains_key(&(UNCOVERED, ScalarPresentation::Default)),
             "the post-landing resolution is final and memoized"
         );
         let _ = std::fs::remove_file(&path);
@@ -23215,6 +23771,7 @@ mod tests {
             rows: 1,
             color: BAND,
             seam: Some(SEAM),
+            top_extends_cells: false,
         }));
         let bled = r.render_input(&input);
         assert_eq!(
@@ -23286,9 +23843,190 @@ mod tests {
             rows: 0,
             color: BAND,
             seam: None,
+            top_extends_cells: false,
         }));
         assert_eq!(r.chrome_bleed(), None, "a zero-row bleed is no bleed");
         assert_eq!(r.render_input(&input).pixels, base.pixels);
+    }
+
+    /// C3 — `top_extends_cells`: the `[0, grid_top)` strip stops being ONE tone and
+    /// becomes each column's OWN background continued upward, so a raised chrome chip
+    /// fills a tall band instead of floating at its bottom with a dead lip above.
+    /// The gutters, which have no columns, keep the flat band tone either way; and
+    /// `false` (every pre-C3 caller, and every non-Windows caller today) is the
+    /// byte-identical flat fill.
+    #[test]
+    fn top_extends_cells_continues_each_column_through_the_head_strip() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 8;
+        const H: usize = 10;
+        const BAND: u32 = 0x0030_3135;
+        // The "raised chip" tone: a distinct explicit background on the left half of
+        // the chrome row, so the extension has something to be visibly different from.
+        const CHIP: [u8; 3] = [0x52, 0x52, 0x56];
+        const CHIP_PX: u32 = 0x0052_5256;
+        let (cw, _) = r.cell_size();
+        let (rows, cols) = (3usize, 12usize);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        // Materialize row 0 (a blank row ships as an empty sparse prefix, so there
+        // would be no cell to give a chip background to), then raise columns 1..5
+        // the way the strip's active chip does.
+        term.process(b"chrome band");
+        let input = {
+            let mut input = term.cell_frame(rows, cols);
+            for cell in input.cells[0].iter_mut().take(5).skip(1) {
+                cell.bg = CHIP;
+            }
+            input
+        };
+        r.set_pad(P);
+        r.set_head(H);
+        let top = r.grid_top();
+        assert!(top > 0, "the strip above the grid must exist to be extended");
+
+        let flat = {
+            r.set_chrome_bleed(Some(ChromeBleed {
+                rows: 1,
+                color: BAND,
+                seam: None,
+                top_extends_cells: false,
+            }));
+            r.render_input(&input)
+        };
+        let extended = {
+            r.set_chrome_bleed(Some(ChromeBleed {
+                rows: 1,
+                color: BAND,
+                seam: None,
+                top_extends_cells: true,
+            }));
+            r.render_input(&input)
+        };
+        let w = flat.width;
+        assert_eq!((extended.width, extended.height), (w, flat.height));
+        let at = |px: &[u32], x: usize, y: usize| px[y * w + x];
+
+        // Under a CHIP column (cell 2, clear of both the cursor and the glyph ink
+        // that later passes stamp on top of row 0): flat paints the band tone all
+        // the way up; extended carries the chip's own background to the very top row.
+        let chip_x = P + cw * 2 + cw / 2;
+        for y in 0..top {
+            assert_eq!(at(&flat.pixels, chip_x, y), BAND, "flat strip at y={y}");
+            assert_eq!(
+                at(&extended.pixels, chip_x, y),
+                CHIP_PX,
+                "extended strip continues the chip column at y={y}"
+            );
+        }
+        // Beyond the chip the row is ordinary chrome, so both paths agree there…
+        let plain_x = P + cw * 7 + cw / 2;
+        // …while a non-chip column carries ITS background instead of the band tone,
+        // which is the difference between "one flat lip" and "the band continues
+        // every column". (Its exact value is the row's own default fill — the point
+        // is only that the strip stops being one tone.)
+        assert_ne!(
+            at(&extended.pixels, plain_x, 0),
+            at(&extended.pixels, chip_x, 0),
+            "the strip above the grid is per-column, not one flat tone"
+        );
+        assert_eq!(
+            at(&flat.pixels, plain_x, 0),
+            at(&flat.pixels, chip_x, 0),
+            "…which is exactly what the flat fill could not express"
+        );
+        // The extension is a straight copy, so every line of the strip is identical.
+        assert_eq!(
+            &extended.pixels[0..w],
+            &extended.pixels[(top - 1) * w..top * w],
+            "every line of the extended strip is the same surface"
+        );
+        // …and the GUTTERS keep the band tone under both, because there is no column
+        // out there to continue.
+        for x in [0usize, P - 1, w - 1] {
+            assert_eq!(at(&extended.pixels, x, 0), BAND, "gutter x={x} stays band");
+            assert_eq!(at(&extended.pixels, x, top - 1), BAND, "gutter x={x}");
+        }
+        // The GRID itself is untouched: this is a border fill, not a bg policy.
+        assert_eq!(
+            &extended.pixels[top * w..],
+            &flat.pixels[top * w..],
+            "everything from the grid down is byte-identical"
+        );
+    }
+
+    /// C3 (the frame half) — the CHROME HEAD adds exactly its own pixels to the
+    /// frame height and nothing to its width, `grid_top` follows it, and the RENDERED
+    /// framebuffer really is that tall. Pinned against the free [`frame_size_px`] as
+    /// well as the method, because the Windows warm-launch early reveal predicts the
+    /// window size through the free function from CACHED cell metrics while the
+    /// post-join path derives it through the method from the live renderer: the two
+    /// must be the same arithmetic, or the prediction is wrong by the head and the
+    /// user sees a resize on glass right after the window appears.
+    #[test]
+    fn the_chrome_head_adds_exactly_its_own_pixels_to_the_frame() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        const P: usize = 6;
+        const PT: usize = 2;
+        let (cw, ch) = r.cell_size();
+        r.set_pad(P);
+        r.set_pad_top(PT);
+        let (rows, cols) = (26usize, 80usize);
+
+        r.set_head(0);
+        let (w0, h0) = r.frame_size(rows, cols);
+        assert_eq!(
+            (w0, h0),
+            frame_size_px(rows, cols, cw, ch, P, 0),
+            "the method IS the free law with the renderer's own metrics"
+        );
+        // `pad_top` is a CROP the host applies over this raw frame, not a term in it —
+        // pinning that here is what makes the early-reveal composition legal.
+        assert_eq!(
+            h0,
+            rows * ch + 2 * P,
+            "no head, no band: the historical frame"
+        );
+
+        for head in [1usize, 11, 17, 4 * ch] {
+            r.set_head(head);
+            let (w1, h1) = r.frame_size(rows, cols);
+            assert_eq!(
+                w1, w0,
+                "the head is TOP-only: width cannot move (head={head})"
+            );
+            assert_eq!(
+                h1,
+                h0 + head,
+                "the frame grows by EXACTLY the head, never a rounded or scaled \
+                 approximation of it (head={head})"
+            );
+            assert_eq!(
+                (w1, h1),
+                frame_size_px(rows, cols, cw, ch, P, head),
+                "method and free law agree at head={head} — the early reveal predicts \
+                 through the free one"
+            );
+            assert_eq!(
+                r.grid_top(),
+                PT + head,
+                "the grid origin absorbs the whole head (head={head})"
+            );
+        }
+
+        // …and the head is REAL pixels, not just arithmetic: the framebuffer the
+        // renderer actually produces is that tall.
+        r.set_head(11);
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let out = r.render_input(&term.cell_frame(rows, cols));
+        let (w1, h1) = r.frame_size(rows, cols);
+        assert_eq!((out.width, out.height), (w1, h1));
+        assert_eq!(out.pixels.len(), w1 * h1);
     }
 
     /// `row_pixel_band` extends BOTH grid-edge bands over the chrome strips,
@@ -23421,6 +24159,246 @@ mod tests {
         assert!(
             matches!(img, GlyphImage::Rgba { .. }) && img.width() > 0 && img.height() > 0,
             "VS16 heart colour glyph is empty"
+        );
+    }
+
+    /// VS15 is an explicit presentation override, not merely a width hint. A
+    /// default-emoji scalar must coexist in the resolve cache as both its normal
+    /// two-cell RGBA form and a one-cell mono form, and the latter must not paint
+    /// any pixel in an independently-authored adjacent `X` cell. The same test
+    /// exercises every SGR style and pins VS16/default-emoji/CJK controls so the
+    /// fix cannot demote unrelated wide content.
+    #[test]
+    fn vs15_text_presentation_is_one_cell_and_does_not_overpaint_adjacent_cell() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        let grin = '\u{1F600}';
+        if !r.color_font_has(grin) {
+            eprintln!("SKIP: no colour-emoji glyph for 😀 on this system");
+            return;
+        }
+        r.debug_block_on_lazy_fallbacks();
+
+        // Non-vacuous cache control: the ordinary/default form genuinely takes
+        // the colour two-cell path on this host.
+        let default_key = r.glyph_key(grin);
+        if !matches!(default_key.glyph_class, GlyphClass::Rgba)
+            || default_key.source != FaceId::ColorEmoji
+        {
+            eprintln!("SKIP: a mono face outranks colour for 😀 on this host: {default_key:?}");
+            return;
+        }
+
+        let mut vs15_term = Terminal::new(1, 4);
+        // VS15 leaves the incremental writer's cursor after the former wide cell;
+        // put X explicitly in column 1 so it is truly adjacent to the now-narrow
+        // glyph. Hide the cursor so its fill cannot satisfy the pixel assertions.
+        vs15_term.process("\x1b[?25l😀\u{FE0E}\x1b[2GX".as_bytes());
+        let vs15 = vs15_term.cell_frame(1, 4);
+        let cell = vs15.cells[0][0];
+        assert!(cell.text_presentation);
+        assert!(!cell.emoji_presentation);
+        assert_eq!(materialized_cell_span(&vs15.cells[0], 0), 1);
+        assert_eq!(vs15.cells[0][1].ch, 'X');
+
+        let text_key = r.resolve_cell_key_for_span(None, &cell, 1);
+        assert_ne!(
+            text_key, default_key,
+            "default and explicit-text forms must not alias in the resolve cache"
+        );
+        assert_ne!(text_key.source, FaceId::ColorEmoji);
+        assert!(
+            matches!(text_key.glyph_class, GlyphClass::Mono | GlyphClass::MonoGid),
+            "VS15 must resolve to foreground-tinted text coverage: {text_key:?}"
+        );
+        // Reverse the insertion order and prove the memo is qualified in BOTH
+        // poisoning directions: explicit text first must not demote the later
+        // bare/default lookup back to that mono entry.
+        r.keys.clear();
+        r.styled_keys.clear();
+        let text_first = r.resolve_cell_key_for_span(None, &cell, 1);
+        let default_after_text = r.glyph_key(grin);
+        assert_eq!(text_first, text_key);
+        assert_eq!(
+            default_after_text, default_key,
+            "a text-first memo entry must not poison later default emoji"
+        );
+
+        let (cw, ch) = r.cell_size();
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut styled = cell;
+            styled.bold = bold;
+            styled.italic = italic;
+            let key = r.resolve_cell_key_for_span(None, &styled, 1);
+            assert_ne!(key.source, FaceId::ColorEmoji);
+            assert!(matches!(
+                key.glyph_class,
+                GlyphClass::Mono | GlyphClass::MonoGid
+            ));
+            let img = r.glyph_image(key).clone();
+            assert!(
+                img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cw as i32,
+                "VS15 style bold={bold} italic={italic} escaped one-cell box: {img:?}"
+            );
+            assert!(img.height() <= ch);
+        }
+
+        let vs15_frame = r.render_input(&vs15);
+        let mut control_term = Terminal::new(1, 4);
+        control_term.process(b"\x1b[?25l X");
+        let control = control_term.cell_frame(1, 4);
+        let control_frame = r.render_input(&control);
+        let cell_band = |frame: &Frame, col: usize| -> Vec<u32> {
+            (0..ch)
+                .flat_map(|y| {
+                    let start = y * frame.width + col * cw;
+                    frame.pixels[start..start + cw].iter().copied()
+                })
+                .collect()
+        };
+        assert_ne!(
+            cell_band(&vs15_frame, 0),
+            cell_band(&control_frame, 0),
+            "VS15 assertion must be non-vacuous: the text glyph drew no pixels"
+        );
+        assert_eq!(
+            cell_band(&vs15_frame, 1),
+            cell_band(&control_frame, 1),
+            "one-cell VS15 glyph overpainted the independently-rendered adjacent X"
+        );
+
+        // Width/presentation controls: VS16 and bare default emoji remain colour
+        // and wide, while CJK remains a non-presentation two-cell scalar.
+        let mut vs16_term = Terminal::new(1, 5);
+        vs16_term.process("\x1b[?25l\u{2764}\u{FE0F}X".as_bytes());
+        let vs16 = vs16_term.cell_frame(1, 5);
+        assert!(vs16.cells[0][0].emoji_presentation);
+        assert!(!vs16.cells[0][0].text_presentation);
+        assert_eq!(materialized_cell_span(&vs16.cells[0], 0), 2);
+        assert_eq!(
+            r.resolve_cell_key_for_span(None, &vs16.cells[0][0], 2)
+                .glyph_class,
+            GlyphClass::Rgba
+        );
+
+        let mut bare_term = Terminal::new(1, 5);
+        bare_term.process("\x1b[?25l😀X".as_bytes());
+        let bare = bare_term.cell_frame(1, 5);
+        assert!(!bare.cells[0][0].text_presentation);
+        assert_eq!(materialized_cell_span(&bare.cells[0], 0), 2);
+        assert_eq!(
+            r.resolve_cell_key_for_span(None, &bare.cells[0][0], 2),
+            default_key
+        );
+
+        let mut cjk_term = Terminal::new(1, 5);
+        cjk_term.process("\x1b[?25l中X".as_bytes());
+        let cjk = cjk_term.cell_frame(1, 5);
+        assert!(!cjk.cells[0][0].text_presentation);
+        assert!(!cjk.cells[0][0].emoji_presentation);
+        assert_eq!(materialized_cell_span(&cjk.cells[0], 0), 2);
+    }
+
+    /// A configured PRIMARY can itself own an `Emoji_Presentation=Yes` scalar;
+    /// DejaVu's ⚡ is the committed deterministic example. In that case VS15
+    /// and the bare/default form resolve to the same face + glyph id, so the
+    /// one-cell presentation qualifier must survive into `GlyphKey` (the
+    /// glyph/atlas identity), not stop at the resolve memo. Shrinking the test
+    /// cell below that glyph's natural ink is an adversarial custom-font metric
+    /// mismatch: the unqualified bitmap demonstrably escapes, while regular,
+    /// injected-bold, and real styled text paths must all fit and leave an
+    /// independently-rendered adjacent X byte-identical.
+    #[test]
+    fn vs15_primary_owned_emoji_has_distinct_contained_raster_keys() {
+        let font = include_bytes!("../assets/DejaVuSansMono.ttf");
+        let mut r = Renderer::from_bytes(font, 18.0, Theme::default()).expect("fixture primary");
+        r.set_bold_font(font).expect("fixture injected bold");
+        r.set_styled_font_bytes(1, font)
+            .expect("fixture real italic");
+        r.set_styled_font_bytes(2, font)
+            .expect("fixture real bold-italic");
+
+        let bolt = '\u{26A1}';
+        assert!(aterm_grapheme::is_emoji_presentation(bolt));
+        let default_key = r.glyph_key(bolt);
+        assert_eq!(default_key.source, FaceId::Primary);
+        assert_eq!(default_key.glyph_class, GlyphClass::MonoGid);
+        assert_eq!(default_key.cell_span, 0);
+        let raw = r.glyph_image(default_key).clone();
+        assert!(raw.width() >= 2, "fixture must have reducible primary ink");
+
+        // Emulate an admitted custom primary whose emoji glyph is wider than
+        // the M-derived grid cell. This is exactly the geometry the qualifier
+        // must make safe; the default form remains intentionally unqualified.
+        r.cell_w = (raw.width() / 2).max(1);
+        r.glyphs.clear();
+        let raw = r.glyph_image(default_key).clone();
+        assert!(
+            raw.xmin() < 0 || raw.xmin() + raw.width() as i32 > r.cell_w as i32,
+            "negative control must begin with an overwide primary bitmap: {raw:?}"
+        );
+
+        let mut term = Terminal::new(1, 4);
+        term.process("\x1b[?25l⚡\u{FE0E}\x1b[2GX".as_bytes());
+        let input = term.cell_frame(1, 4);
+        let cell = input.cells[0][0];
+        assert!(cell.text_presentation);
+        assert_eq!(materialized_cell_span(&input.cells[0], 0), 1);
+        assert_eq!(input.cells[0][1].ch, 'X');
+
+        let text_after_default = r.resolve_cell_key_for_span(None, &cell, 1);
+        assert_eq!(text_after_default.cell_span, 1);
+        assert_ne!(text_after_default, default_key);
+        assert_eq!(text_after_default.source, default_key.source);
+        assert_eq!(text_after_default.glyph_class, default_key.glyph_class);
+        assert_eq!(text_after_default.ch_or_id, default_key.ch_or_id);
+
+        // Reverse-order poisoning control for the primary-owned case too.
+        r.keys.clear();
+        let text_first = r.resolve_cell_key_for_span(None, &cell, 1);
+        let default_after_text = r.glyph_key(bolt);
+        assert_eq!(text_first, text_after_default);
+        assert_eq!(default_after_text, default_key);
+
+        let (cw, ch) = r.cell_size();
+        for (bold, italic) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut styled = cell;
+            styled.bold = bold;
+            styled.italic = italic;
+            let key = r.resolve_cell_key_for_span(None, &styled, 1);
+            assert_eq!(key.cell_span, 1);
+            assert!(matches!(key.source, FaceId::Primary | FaceId::BoldPrimary));
+            let img = r.glyph_image(key).clone();
+            assert!(
+                img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cw as i32,
+                "VS15 primary style bold={bold} italic={italic} escaped one cell: {img:?}"
+            );
+            assert!(img.height() <= ch);
+        }
+
+        let vs15_frame = r.render_input(&input);
+        let mut control_term = Terminal::new(1, 4);
+        control_term.process(b"\x1b[?25l X");
+        let control_frame = r.render_input(&control_term.cell_frame(1, 4));
+        let cell_band = |frame: &Frame, col: usize| -> Vec<u32> {
+            (0..ch)
+                .flat_map(|y| {
+                    let start = y * frame.width + col * cw;
+                    frame.pixels[start..start + cw].iter().copied()
+                })
+                .collect()
+        };
+        assert_ne!(
+            cell_band(&vs15_frame, 0),
+            cell_band(&control_frame, 0),
+            "primary-owned VS15 glyph must draw non-vacuous pixels"
+        );
+        assert_eq!(
+            cell_band(&vs15_frame, 1),
+            cell_band(&control_frame, 1),
+            "primary-owned VS15 glyph overpainted the adjacent X"
         );
     }
 

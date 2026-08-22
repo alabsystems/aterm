@@ -96,6 +96,12 @@ impl Grid {
     /// (#7644). When `selective`, only unprotected cells are cleared and extras
     /// are preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_to_end_of_line_impl(&mut self, selective: bool) {
+        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
+        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
+        // under a live highlight and left it painted: a copy then returned text the
+        // user never selected. One row of damage, the cursor's.
+        let cursor_row = self.storage.cursor.row;
+        self.damage_selection_visible_rows(cursor_row, cursor_row);
         self.erase_to_end_of_line_core(selective, true);
     }
 
@@ -141,6 +147,12 @@ impl Grid {
     /// When `selective`, only unprotected cells are cleared and extras are
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_from_start_of_line_impl(&mut self, selective: bool) {
+        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
+        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
+        // under a live highlight and left it painted: a copy then returned text the
+        // user never selected. One row of damage, the cursor's.
+        let cursor_row = self.storage.cursor.row;
+        self.damage_selection_visible_rows(cursor_row, cursor_row);
         self.erase_from_start_of_line_core(selective, true);
     }
 
@@ -187,6 +199,11 @@ impl Grid {
     /// preserved. Non-selective erase uses the BCE cursor template for fill.
     fn erase_line_impl(&mut self, selective: bool) {
         let cursor_row = self.storage.cursor.row;
+        // SELECTION CUSTODY Phase 4 — the INVERSE hole, now closed. EL recorded
+        // NOTHING before, so a `\r` + EL progress bar or spinner rewrote the row
+        // under a live highlight and left it painted: a copy then returned text the
+        // user never selected. One row of damage, the cursor's.
+        self.damage_selection_visible_rows(cursor_row, cursor_row);
         let cursor_col = self.storage.cursor.col;
         let fill = self.storage.cursor_template;
         // When DECLRMM is active and cursor is within margins, erase only
@@ -313,8 +330,10 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, false);
-        // Invalidate selection — erased content makes coordinates stale.
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), true);
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
@@ -330,8 +349,10 @@ impl Grid {
         // ED is NOT affected by DECLRMM horizontal margins per VT420 spec.
         // Use _core with respect_margins=false to bypass margin clamping.
         self.erase_from_start_of_line_core(false, false);
-        // Invalidate selection — erased content makes coordinates stale.
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        self.damage_selection_visible_rows_ext(0, cursor_row, true);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
     }
@@ -360,8 +381,11 @@ impl Grid {
         // above, which resets row flags to LINE_ATTRIBUTES | DIRTY (#7872).
         // Note: any_double_width is NOT cleared because erase preserves
         // DECDWL/DECDHL line attributes per VT spec (#7497).
-        // Invalidate selection — entire screen erased.
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        let last = self.storage.visible_rows.saturating_sub(1);
+        self.damage_selection_visible_rows_ext(0, last, true);
         self.storage.mark_content_full();
     }
 
@@ -408,8 +432,10 @@ impl Grid {
             self.storage.ring_extras.clear();
             self.storage.display_offset = 0;
             self.storage.mark_content_full();
-            // Invalidate any selection anchored in scrollback (matches main path).
-            self.storage.content_scroll_delta = i32::MAX;
+            // SELECTION CUSTODY Phase 4: ED 3 destroys the coordinate space itself —
+            // history is discarded wholesale — so no band can describe it. `All` is
+            // the honest answer, and `force_selection_invalidation` is now its name.
+            self.force_selection_invalidation();
             // ED 3 touches only scrollback, not the active line — deferred wrap
             // survives (xterm preserves it; see erase_to_end_of_line).
             debug_assert_eq!(self.storage.display_offset, 0);
@@ -450,9 +476,9 @@ impl Grid {
         // Note: extras are keyed by visible row, so we don't need to clear them here
         // as scrollback rows don't have extras (they're saved as Line objects)
         self.storage.mark_content_full();
-        // Signal post_process to clear any selection anchored in scrollback.
-        // i32::MAX is the sentinel that adjust_for_scroll interprets as "clear".
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: as above — ED 3 discards history wholesale, so
+        // the damage is `All`, not a band.
+        self.force_selection_invalidation();
         // ED 3 touches only scrollback, not the active line — deferred wrap
         // survives (xterm preserves it; see erase_to_end_of_line).
         debug_assert_eq!(self.storage.display_offset, 0);
@@ -505,8 +531,10 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, true);
-        // Invalidate selection — erased cells may be part of selection (#7499).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        self.damage_selection_visible_rows_ext(cursor_row, visible_rows.saturating_sub(1), true);
         // cursor row already marked by erase_to_end_of_line_impl; mark remaining rows.
         self.storage
             .mark_content_rows(cursor_row.saturating_add(1), visible_rows);
@@ -523,8 +551,10 @@ impl Grid {
         self.clear_rows(0..cursor_row, true);
         // DECSED is NOT affected by DECLRMM horizontal margins per VT420 spec.
         self.erase_from_start_of_line_core(true, false);
-        // Invalidate selection — erased cells may be part of selection (#7499).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        self.damage_selection_visible_rows_ext(0, cursor_row, true);
         // cursor row already marked by erase_from_start_of_line_impl; mark rows above.
         self.storage.mark_content_rows(0, cursor_row);
     }
@@ -535,8 +565,11 @@ impl Grid {
     pub fn selective_erase_screen(&mut self) {
         // Deferred wrap survives a cell erase (see erase_to_end_of_line).
         self.clear_rows(0..self.storage.visible_rows, true);
-        // Invalidate selection — erased cells may be part of selection (#7499).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
+        // touch history, so a selection anchored in scrollback survives it — the
+        // sentinel used to kill that too.
+        let last = self.storage.visible_rows.saturating_sub(1);
+        self.damage_selection_visible_rows_ext(0, last, true);
         self.storage.mark_content_full();
     }
 
@@ -585,8 +618,10 @@ impl Grid {
         // Move cursor to home position
         self.storage.cursor = Cursor::default();
 
-        // Invalidate selection — entire screen content was replaced (#7481).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: DECALN replaces every VISIBLE cell; history is
+        // untouched, so a scrollback selection survives.
+        let last = self.storage.visible_rows.saturating_sub(1);
+        self.damage_selection_visible_rows_ext(0, last, true);
         self.storage.mark_content_full();
         debug_assert_eq!(self.storage.cursor.row, 0);
         debug_assert_eq!(self.storage.cursor.col, 0);
@@ -619,6 +654,13 @@ impl Grid {
         if top > bottom || left > right {
             return;
         }
+
+        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
+        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
+        // over the rectangle survived as a lie: a copy returned text the user never
+        // selected. Row-granular, so the band is the rect's rows — wider than the
+        // rectangle in the column direction, which fails SAFE.
+        self.damage_selection_visible_rows(top, bottom);
 
         let end_col = right.saturating_add(1);
         let fill = self.storage.cursor_template;
@@ -680,6 +722,13 @@ impl Grid {
         if top > bottom || left > right {
             return;
         }
+
+        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
+        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
+        // over the rectangle survived as a lie: a copy returned text the user never
+        // selected. Row-granular, so the band is the rect's rows — wider than the
+        // rectangle in the column direction, which fails SAFE.
+        self.damage_selection_visible_rows(top, bottom);
 
         let end_col = right.saturating_add(1);
 
@@ -744,6 +793,13 @@ impl Grid {
             return;
         }
 
+        // SELECTION CUSTODY Phase 4 — the rest of the INVERSE hole. DECERA / DECFRA /
+        // DECSERA replace cells in place and recorded NOTHING before, so a highlight
+        // over the rectangle survived as a lie: a copy returned text the user never
+        // selected. Row-granular, so the band is the rect's rows — wider than the
+        // rectangle in the column direction, which fails SAFE.
+        self.damage_selection_visible_rows(top, bottom);
+
         let end_col = right.saturating_add(1);
 
         // Selectively erase each row in the rectangle, preserving the SGR
@@ -791,6 +847,13 @@ impl Grid {
     ///
     /// REQUIRES: self.storage.visible_rows > 0
     /// REQUIRES: self.storage.cols > 0
+    /// SELECTION CUSTODY Phase 4 — deliberately records NO selection damage.
+    ///
+    /// DECCARA changes ATTRIBUTES (bold, underline, reverse) over a rectangle; the
+    /// characters are untouched. A selection over those cells still names exactly the
+    /// text it named before, and a copy returns the same string — so clearing the
+    /// highlight would destroy something for a change the user cannot even copy. The
+    /// sibling rect ops above replace CONTENT and do damage.
     pub fn change_attrs_rect(
         &mut self,
         top: u16,
@@ -1095,6 +1158,11 @@ impl Grid {
         let dst_bottom_eff = dst_top
             .saturating_add(rect_height.saturating_sub(1))
             .min(max_row);
+        // SELECTION CUSTODY Phase 4: DECCRA replaces the DESTINATION cells (the source
+        // is only read), so the destination rows are the damage. Like its DECERA /
+        // DECFRA / DECSERA siblings this recorded nothing before, leaving a highlight
+        // over overwritten text.
+        self.damage_selection_visible_rows(dst_top, dst_bottom_eff);
         let dst_right_eff = dst_left
             .saturating_add(rect_width.saturating_sub(1))
             .min(max_col);

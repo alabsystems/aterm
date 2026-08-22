@@ -263,31 +263,47 @@ fn gpu_scissor_repaint_byte_identical() {
             None,
             Path::Any,
         ),
-        // 27. Scroll back into history. `display_offset` AND the absolute anchor
-        //     both move, so `compute_dirty_rows` returns `FullRepaint` — and the E7
-        //     rescue turns that verdict into a band shift plus an exposed-strip
-        //     scissor, exactly as the CPU backend has always done for this frame
-        //     class. Byte-identity is asserted for every step regardless, so this
-        //     line is about WHICH path pays for the frame, not whether it is right.
+        // 27. Scroll back into history. The live DECTCEM cursor becomes hidden
+        //     at this coordinate-class boundary, so the retained offscreen is
+        //     not a pure rigid grid band: shifting it would also drag the old
+        //     cursor over history. This transition must repaint fully.
         step(
             "scroll back",
             |t| t.scroll_display(3),
             true,
             None,
-            Path::ScrollRescue,
+            Path::Full,
         ),
         // 28. Idle scrolled — offset unchanged ⇒ scissor.
         step("idle scrolled", |_| {}, true, None, Path::Scissor),
-        // 29. Scroll to bottom — the same rigid slide in the OTHER direction (the
-        //     overshoot-apron side), so the same rescue.
+        // 29-30. Once both endpoints are history viewports, the raw cursor is
+        //        hidden on BOTH sides and these are genuine rigid slides. Pin
+        //        the E7 rescue in both directions without crossing cursor
+        //        visibility classes.
+        step(
+            "scroll farther back",
+            |t| t.scroll_display(2),
+            true,
+            None,
+            Path::ScrollRescue,
+        ),
+        step(
+            "scroll forward in history",
+            |t| t.scroll_display(-2),
+            true,
+            None,
+            Path::ScrollRescue,
+        ),
+        // 31. Returning to live view makes the raw cursor visible again, so it
+        //     is the inverse coordinate-class transition and must repaint fully.
         step(
             "scroll to bottom",
             |t| t.scroll_to_bottom(),
             true,
             None,
-            Path::ScrollRescue,
+            Path::Full,
         ),
-        // 30. Full-screen TUI repaint (clear + redraw): MANY rows change at once.
+        // 32. Full-screen TUI repaint (clear + redraw): MANY rows change at once.
         //     Reusable (same dims/offset/selection, no double-height) ⇒ scissor
         //     over the (large) dirty band — still byte-identical.
         step(
@@ -416,10 +432,10 @@ fn gpu_scissor_repaint_byte_identical() {
         scissor_seen >= 10,
         "scissor path barely fired ({scissor_seen}) — not exercised"
     );
-    // The full-repaint fallback is now reached by the first frame and by the
-    // DECDHL trio only: the two scroll steps that used to pad this count are the
-    // E7 rescue's whole point, and `rescue_seen` below is the guard that they did
-    // not silently fall back INTO this count instead.
+    // The full-repaint fallback is reached by the first frame, the DECDHL trio,
+    // and the two live↔history cursor-visibility boundaries. History↔history
+    // scrolls remain E7 rescues; `rescue_seen` guards that they did not silently
+    // fall back into this count instead.
     assert!(
         full_seen >= 4,
         "full-repaint fallback barely fired ({full_seen}) — not exercised"

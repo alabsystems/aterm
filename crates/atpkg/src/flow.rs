@@ -95,6 +95,53 @@ pub trait Fetcher {
     fn cacheable_candidates(&self, resolved: &[Candidate]) -> Option<Vec<Candidate>> {
         Some(resolved.to_vec())
     }
+    /// A CHEAP fingerprint of each candidate [`Fetcher::index_candidates`] would return
+    /// THIS pass, in the SAME order — or `None` (the default) when this fetcher cannot
+    /// answer without doing the expensive work.
+    ///
+    /// # What this is for
+    ///
+    /// `index_candidates` is the most expensive thing a no-op update does. The production
+    /// fetcher spends one listing request plus FOUR asset downloads per candidate — with
+    /// `INDEX_CANDIDATE_CAP = 4`, sixteen sequential `curl` subprocesses each paying its
+    /// own DNS+TLS handshake — and the §14 cache beside it held those very bytes but was
+    /// consulted only when the fetch FAILED. Steady state therefore re-downloaded, every
+    /// pass and in every fresh process, bytes it could prove it already had.
+    ///
+    /// The saving is ROUND-TRIPS, not rate-limit budget, and the difference matters: the
+    /// sixteen asset reads already go to the unmetered release CDN, and the listing — the
+    /// one `api.github.com` request — still happens. Claiming the anonymous 60/hr budget
+    /// back would be describing the code as it was before the zero-API asset fetch landed.
+    ///
+    /// This method is the proof. The production impl derives it from the release LISTING
+    /// (which `index_candidates` must fetch anyway, and memoizes), so answering costs
+    /// nothing beyond the request that was always going to happen — and the listing
+    /// already carries each asset's identity, because a GitHub asset URL names an id that
+    /// changes if and only if the asset is re-uploaded.
+    ///
+    /// # Contract
+    ///
+    /// * SAME ORDER, SAME LENGTH as `index_candidates` would return this pass. The
+    ///   position is the pairing; [`crate::IndexCache::store`] drops the whole vector on
+    ///   a length disagreement rather than zipping a prefix.
+    /// * A fingerprint must change whenever ANY of the four assets behind that candidate
+    ///   changes. It need not be unforgeable — see the module doc of [`crate::cache`]:
+    ///   equality only decides whether to re-download bytes that face every trust gate
+    ///   either way.
+    /// * `None` or an empty vector means "no cheap answer", which is always safe: the
+    ///   caller then takes the historical download path.
+    ///
+    /// # Why the default is `None` — and why [`crate::net::ChainFetcher`] keeps it
+    ///
+    /// A fetcher that opts in is telling the resolver it may skip `index_candidates`
+    /// entirely. For a chained fetcher that would skip the SEED leg too, because the §14
+    /// cache holds only the network leg's candidates ([`Fetcher::cacheable_candidates`]) —
+    /// and the seed union is exactly what the 2026-07-30 cache-masking review put there.
+    /// The chain is joined only on an EMPTY store (one bootstrap pass), so opting it in
+    /// would trade the crate's most adversarially-reviewed property for nothing.
+    fn index_identities(&self) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// What an install did.
@@ -1454,6 +1501,35 @@ pub(crate) fn index_is_fresh(index: &Index, now_unix: i64) -> bool {
 fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Candidate>, FlowError> {
     let cache = crate::cache::IndexCache::new(layout.prefix.join("index-cache.toml"));
     let src = fetcher.cache_source_id();
+    // THE HIT PATH (see `Fetcher::index_identities`). Ask the cheap question first: is
+    // the source still publishing the very assets the cached bytes came from? On the
+    // production fetcher that question is answered by the release LISTING, which
+    // `index_candidates` fetches and memoizes anyway — so this costs zero extra requests
+    // whether it hits or misses, and when it hits it removes the sixteen asset downloads
+    // that were the entire cost of a no-op update pass.
+    //
+    // WHAT THIS DOES NOT CHANGE, and the reason it is not a trust decision: the bytes
+    // returned here are the same raw candidate bytes `load` has always been allowed to
+    // return on a failed fetch. They go straight into `select_index` → `admit_roster` →
+    // `authorize_index` → the durable `index_build` floor → the `roster_seq` ratchet →
+    // the `valid_until` freshness window, every one of them unchanged. A stale or
+    // tampered cache installs nothing the live path would not, exactly as §14 already
+    // states — the identity match only decides whether re-fetching provably-identical
+    // bytes is worth sixteen round-trips.
+    //
+    // A host that wants to hold a client on an old index does not need this seam: it can
+    // simply keep serving the old assets, which is the suppression the freshness window
+    // bounds. And a LOCAL attacker who can write `<prefix>/index-cache.toml` (0700,
+    // owner-only) already owns the store the shims point into.
+    //
+    // `unwrap_or_default()` collapses "no cheap answer" to an empty vector, which
+    // `load_if_identical` refuses outright — so every non-participating fetcher (the seed
+    // `DirFetcher`, `ChainFetcher`, every test double) takes the historical path below,
+    // byte for byte.
+    let live = fetcher.index_identities().unwrap_or_default();
+    if let Some(hit) = cache.load_if_identical(&src, &live) {
+        return Ok(hit);
+    }
     match fetcher.index_candidates() {
         Ok(c) if !c.is_empty() => {
             match fetcher.cacheable_candidates(&c) {
@@ -1463,7 +1539,11 @@ fn resolve_candidates(fetcher: &dyn Fetcher, layout: &Layout) -> Result<Vec<Cand
                 // `None` does: "the network found no index" and "the network could not
                 // be reached" both mean the authoritative leg said nothing this pass.
                 Some(cacheable) if !cacheable.is_empty() => {
-                    cache.store(&src, &cacheable);
+                    // Stamped with the identities probed ABOVE — the same listing that
+                    // produced these bytes, so the pairing cannot straddle a publish. A
+                    // fetcher that gave no identities stores none (`&[]`), and the entry
+                    // stays the failure-time fallback it has always been.
+                    cache.store(&src, &cacheable, &live);
                     Ok(c)
                 }
                 // The CACHEABLE (network) leg contributed NOTHING, yet the fetch as a
@@ -4378,6 +4458,133 @@ mod tests {
              strictly greater index_build, so a tie must go to the network's last-good \
              index rather than the seal — got {labels:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A [`Fake`] that COUNTS index fetches and answers the cheap identity probe from a
+    /// cell, so a test can move one asset's fingerprint and watch the resolve react.
+    struct IdentityFake {
+        inner: Fake,
+        fetches: std::cell::Cell<u32>,
+        identity: std::cell::RefCell<Vec<String>>,
+    }
+    impl IdentityFake {
+        fn new(inner: Fake, identity: &[&str]) -> Self {
+            Self {
+                inner,
+                fetches: std::cell::Cell::new(0),
+                identity: std::cell::RefCell::new(
+                    identity.iter().map(|s| (*s).to_string()).collect(),
+                ),
+            }
+        }
+    }
+    impl Fetcher for IdentityFake {
+        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            self.fetches.set(self.fetches.get().saturating_add(1));
+            self.inner.index_candidates()
+        }
+        fn pkg_manifest(
+            &self,
+            repo: &str,
+            program: &str,
+            build: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+            self.inner.pkg_manifest(repo, program, build)
+        }
+        fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+            self.inner.download(repo, asset, dest)
+        }
+        fn source_id(&self) -> String {
+            "src:identity".to_string()
+        }
+        fn index_identities(&self) -> Option<Vec<String>> {
+            Some(self.identity.borrow().clone())
+        }
+    }
+
+    /// THE HIT PATH, end to end and two-sided. A resolve whose cheap identity probe
+    /// matches the §14 cache must do NO index fetch at all and must hand selection
+    /// byte-identical candidates; the moment an identity moves — a re-uploaded asset, a
+    /// new carrying release — the fetch comes straight back.
+    ///
+    /// The counter is the instrument. Without it this optimization is unfalsifiable: a
+    /// resolve that quietly re-downloaded everything would still pass every functional
+    /// assertion, which is exactly how a "cache" ends up never being a hit path (the
+    /// state this crate was in — `resolve_candidates` consulted the cache only when the
+    /// fetch had already failed).
+    #[test]
+    fn a_matching_identity_serves_the_cache_with_no_index_fetch() {
+        let dir = scratch("identity-hit");
+        let layout = layout(&dir);
+        let f = IdentityFake::new(fixture(&dir), &["id-v0"]);
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        // 1. COLD. The install fetches for real and caches the candidates WITH their
+        //    identity.
+        install(&f, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        let cold = f.fetches.get();
+        assert!(cold >= 1, "the cold pass must actually fetch — got {cold}");
+
+        // 2. WARM, same identity: zero fetches, and the SAME bytes reach selection.
+        let got = resolve_candidates(&f, &layout).expect("the warm cache resolves");
+        assert_eq!(
+            f.fetches.get(),
+            cold,
+            "a matching identity must skip index_candidates entirely"
+        );
+        let fresh = f.inner.index_candidates().expect("fixture candidates");
+        assert_eq!(got.len(), fresh.len(), "same candidate set");
+        assert_eq!(got[0].label, fresh[0].label);
+        assert_eq!(
+            got[0].index_bytes, fresh[0].index_bytes,
+            "the cache serves the very bytes the source publishes"
+        );
+        assert_eq!(got[0].sig, fresh[0].sig);
+        assert_eq!(
+            got[0].roster_bytes, fresh[0].roster_bytes,
+            "the roster rides with its index through the hit path too"
+        );
+        assert_eq!(got[0].roster_sig, fresh[0].roster_sig);
+
+        // 3. THE OTHER SIDE. Move the identity (an asset re-uploaded, a release cut) and
+        //    the resolve must go back to the network — otherwise this seam would be a
+        //    permanent downgrade oracle rather than a cache.
+        f.identity.borrow_mut()[0] = "id-v1".to_string();
+        let after_move = f.fetches.get();
+        resolve_candidates(&f, &layout).expect("a moved identity re-fetches");
+        assert_eq!(
+            f.fetches.get(),
+            after_move + 1,
+            "a changed identity must re-download"
+        );
+
+        // 4. And a COUNT change (a newly published carrying release) refuses too.
+        f.identity.borrow_mut().push("id-extra".to_string());
+        let before_grow = f.fetches.get();
+        resolve_candidates(&f, &layout).expect("a grown candidate set re-fetches");
+        assert_eq!(
+            f.fetches.get(),
+            before_grow + 1,
+            "a different candidate COUNT must re-download"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fetcher that answers the identity probe still has NOTHING to serve without a
+    /// same-source cache: the probe is a permission to reuse, never a source of bytes.
+    #[test]
+    fn an_identity_without_a_cache_still_fetches() {
+        let dir = scratch("identity-cold");
+        let layout = layout(&dir);
+        let f = IdentityFake::new(fixture(&dir), &["id-v0"]);
+        let got = resolve_candidates(&f, &layout).expect("cold resolve");
+        assert_eq!(f.fetches.get(), 1, "no cache ⇒ the fetch must happen");
+        assert_eq!(got.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

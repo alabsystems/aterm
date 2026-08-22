@@ -55,7 +55,12 @@ impl FileLock {
 
     #[cfg(unix)]
     pub fn acquire(path: &Path) -> io::Result<Self> {
-        let file = Self::open_lock_file(path)?;
+        // The ascription is LOAD-BEARING: it is the lock-order census's File
+        // evidence (aterm-census `is_file_binding_rhs`), which keeps the flock
+        // below categorized as the cross-process advisory lock it is rather
+        // than graphed as an in-process mutex. The helper refactor removed the
+        // constructor from this binding and silently did exactly that.
+        let file: std::fs::File = Self::open_lock_file(path)?;
         // std's `File::lock` IS `flock(fd, LOCK_EX)` on unix — the same syscall with
         // the same blocking semantics, released on close/drop exactly as a direct
         // `libc::flock` call, and failures map to the same `io::Error`. Using the
@@ -80,7 +85,8 @@ impl FileLock {
     /// on the build already installed, which is always a safe outcome.
     #[cfg(unix)]
     pub fn acquire_within(path: &Path, limit: std::time::Duration) -> io::Result<Self> {
-        let file = Self::open_lock_file(path)?;
+        // Ascription load-bearing — census File evidence, as in `acquire`.
+        let file: std::fs::File = Self::open_lock_file(path)?;
         let deadline = std::time::Instant::now() + limit;
         loop {
             match file.try_lock() {

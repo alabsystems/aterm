@@ -558,7 +558,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [cwd=<path>]: mint a new tab session, reply OK <sid> - immediately addressable",
+        "spawn [cwd=<path>] [split=<v|h>]: mint a new tab (or split the focused pane), reply OK <sid>",
     ),
     v(
         "close",

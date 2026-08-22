@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use aterm_containment::ContainmentMode;
 use aterm_core::bell::{BellFlash, BellRateLimiter};
 use aterm_core::selection::{SelectionAnchor, SelectionSide, SelectionState, SelectionType};
-use aterm_core::terminal::{CursorStyle, RenderCell, Terminal};
+use aterm_core::terminal::{ContentScrollState, CursorStyle, RenderCell, Terminal};
 use aterm_render::{Frame, RenderInput, Renderer, Theme, WindowCpu};
 use aterm_session::sink::SinkWriter;
 use aterm_session::{EdgeTable, LaunchNonce, SessionId};
@@ -78,6 +78,7 @@ mod app_update_screen;
 mod app_window;
 #[cfg(test)]
 mod artifact_transaction_conformance;
+mod bench_knobs;
 /// BENCH-ONLY observation seam (the `test-open-probe` precedent applied to this
 /// crate): the one public wrapper the external `frame_latency` bench drives the
 /// `#[cfg(any(test, feature = "bench-support"))]` headless fixtures through.
@@ -86,7 +87,6 @@ mod artifact_transaction_conformance;
 /// build compiles this module.
 #[cfg(feature = "bench-support")]
 pub mod bench_support;
-mod bench_knobs;
 mod build_badge;
 mod build_info;
 
@@ -130,6 +130,16 @@ mod control_auth;
 mod control_connection_conformance;
 mod crash_signal;
 mod cwd_native;
+/// The DefTerm handoff broker: an STA thread with its own Win32 message pump,
+/// running BESIDE winit (winit stays the UI event loop; this is a satellite).
+/// Refuses to start while no COM handoff server can answer.
+#[cfg(windows)]
+mod defterm_broker_win;
+/// Windows 11 default-terminal (DefTerm) handoff registration — the opt-in that
+/// makes a double-clicked `.bat` open in aterm. Inert until a COM handoff server
+/// can answer; the receiving half lives in `aterm_pty::adopt_handoff`.
+#[cfg(windows)]
+mod defterm_win;
 #[cfg(windows)]
 mod explorer_win;
 /// The seamless handoff's out-of-band transport: the single-use `SCM_RIGHTS`
@@ -182,18 +192,17 @@ mod keybinding;
 mod keymap;
 /// The Kitty Log (§F4): durable kitty-sighting ledger + settings collection book.
 mod kitty_log;
-mod launch_kitty;
 /// The typed-word detector: feline completions record a Kitty Log sighting,
 /// profanity winces the companion, and `dog` past the typed-a-lot gate pops a
 /// visiting dog.
 mod kitty_summon;
+mod launch_kitty;
 /// The "level up" update celebration (pulsing border glow + rising up-arrow).
 mod level_up;
 mod logging;
 mod markdown;
 mod menu;
 mod metrics;
-mod status_item;
 /// W11: MotionPolicy — the single accessibility gate for decorative animation.
 mod motion;
 #[cfg(feature = "a11y-accesskit")]
@@ -220,6 +229,7 @@ mod native_markdown;
 #[cfg(test)]
 mod native_packages_conformance;
 mod native_settings;
+mod status_item;
 #[doc(hidden)]
 pub use native_settings::{SettingsPageScrollCommand, settings_page_scroll_transition};
 mod native_text;
@@ -286,6 +296,10 @@ mod spawn;
 mod stream_fade;
 mod subscribe;
 mod tab_bar;
+/// C5: the in-grid popup a right-click (or Shift+F10) on a tab chip drops —
+/// the missing RENDERER for the long-shipped `session_chrome::compose_tab_menu`
+/// model, which off macOS was composed and then only ever introspected.
+mod tab_menu;
 mod tab_model;
 #[cfg(test)]
 mod tab_model_conformance;
@@ -312,9 +326,9 @@ use platform::AppRt;
 use spawn::{SessionFactory, spawn_session};
 
 // Default glyph rasterization size in PHYSICAL px — DELIBERATELY platform-split.
-// Do NOT collapse these two arms back into one shared constant: the number is a
+// Do NOT collapse these arms back into one shared constant: the number is a
 // 1× seed denominated in the host OS's LOGICAL unit, and those units are not the
-// same size, so no single value can be right on both.
+// same size, so no single value can be right everywhere.
 //
 // The auto-scale law is `round(FONT_PX · scale)` (`font_px_for_scale`, applied at
 // `attach_os_window` / `on_scale_factor_changed`), so FONT_PX is always the size
@@ -337,17 +351,26 @@ use spawn::{SessionFactory, spawn_session};
 //     conhost's Consolas is 16 px, VS Code's terminal is 14. 16 restores 12 pt,
 //     and `round(16·1.5)=24` at 144 dpi is 12 pt again.
 //
-// Linux/BSD share Windows' 1/96-in logical px and so inherit the same 9 pt, but
-// they are left at 12 here rather than swept along: the toolkit-scale story there
-// (Xft.dpi, GDK_SCALE, fractional Wayland scales) is its own judgement call and
-// was not part of the Windows pass that split this. Treat the `not(windows)` arm
-// as "macOS-tuned, Linux untouched", not as a blessed cross-platform value.
+//   * Linux/BSD — the same 1/96-in logical px as Windows, so the macOS-tuned 12
+//     was **9 pt at every DPI** here too. That arm was consciously deferred
+//     ("macOS-tuned, Linux untouched") until the Linux typography pass made the
+//     judgement call, and TYPOGRAPHY R2 made it: every desktop reference renders
+//     bigger — GNOME Terminal ships Monospace 12 pt (16 logical px), kitty and
+//     alacritty 11 pt (≈14.7), the GNOME default UI monospace is 11 pt — and no
+//     amount of grid-fitting makes 9 pt DejaVu read "crisp and clean" beside
+//     them (at 12 px the x-height is 6 px and bold counters close). 15 px is
+//     11.25 pt: inside the 11–12 pt reference cluster, matching the desktop's
+//     own 11 pt monospace default, and at 15 px the hinted raster carries
+//     visibly cleaner stems and open bold counters (captured side-by-side in
+//     the R2 evidence). The auto-scale law is untouched: `round(15·scale)`.
 //
 // Override with `$ATERM_FONT_PX`, config `font_px`, or live Cmd/Ctrl +/-/0.
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const FONT_PX: f32 = 12.0;
 #[cfg(windows)]
 const FONT_PX: f32 = 16.0;
+#[cfg(not(any(target_os = "macos", windows)))]
+const FONT_PX: f32 = 15.0;
 
 /// Whether `--verbose` / `$ATERM_VERBOSE` is set. Gates the routine startup
 /// plumbing notices (containment mode, OS-sandbox status) so a normal
@@ -1411,6 +1434,12 @@ mod win32 {
         }
     }
 
+    /// The command line `RegisterApplicationRestart` re-launches this process
+    /// with. Named so the routing rule it depends on can be asserted in a test
+    /// without repeating the literal (see
+    /// `the_os_restart_command_line_is_the_one_verb_policy_never_forwards`).
+    pub(super) const RESTART_COMMAND_LINE: &str = "new-window";
+
     /// Register this process for OS-driven relaunch (`RegisterApplicationRestart`):
     /// after a Windows-Update / Restart-Manager reboot, and with the
     /// "Automatically save my restartable apps…" sign-in setting, Windows brings
@@ -1422,15 +1451,38 @@ mod win32 {
     /// cannot loop: the API's own guard only restarts a process that stayed alive
     /// ≥ 60 seconds, so a build that dies at startup is restarted at most once.
     ///
-    /// The registered command line is `--window` (the router's explicit
-    /// window-mode flag; the exe name is added by the OS) so the relaunch is
-    /// unambiguously window-shaped no matter what launched the original process.
+    /// The registered command line is the `new-window` VERB (the exe name is
+    /// added by the OS), not the `--window` flag it used to be, and the
+    /// difference is load-bearing twice over:
+    ///
+    /// * **It must not be routed by policy.** With `windowing_behavior =
+    ///   "attach"`, `--window` is an ordinary policy-eligible plain launch: a
+    ///   crash-restart with any sibling instance alive would forward into the
+    ///   SIBLING as a tab, so the crashed window never comes back and the
+    ///   manifest this feature exists to restore is never read. `new-window` is
+    ///   the one intent `aterm_cli::route_launch` refuses to forward under either
+    ///   policy — it is the escape hatch, and an OS-driven relaunch is exactly
+    ///   what it is for.
+    /// * **It is reachable under the alias.** The shipped Windows install is
+    ///   several identical copies of the one binary and the Start-Menu shortcut
+    ///   targets `aterm-gui.exe`, so the relaunch is usually
+    ///   `aterm-gui.exe <cmdline>`; the front door routes windowing verbs under
+    ///   that argv0 alias (see `AliasRoute` in `crates/aterm/src/main.rs`).
+    ///
+    /// It is also unambiguously window-shaped no matter what launched the
+    /// original process, which is what `--window` was chosen for: the verb is
+    /// dispatched above the mode fork, so no TTY probe can turn it into a
+    /// session.
+    ///
     /// The relaunch only PAYS OFF because the end-session hook
     /// (`platform_win`'s WM_QUERYENDSESSION subclass) persists the session
     /// manifest before the reboot — the two ship together. Best-effort: the
     /// HRESULT is ignored (failure degrades to today's no-relaunch behaviour).
     pub(super) fn register_application_restart() {
-        let wide: Vec<u16> = "--window".encode_utf16().chain(std::iter::once(0)).collect();
+        let wide: Vec<u16> = RESTART_COMMAND_LINE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
         // SAFETY: `wide` is a valid NUL-terminated UTF-16 buffer that outlives
         // the call; the API copies the string. No pointers escape.
         unsafe {
@@ -1799,6 +1851,15 @@ struct RepaintKey {
     /// strip even when the terminal grid below is unchanged. Always `0` when
     /// `tab_strip_rows == 0` — then the key is byte-identical to the pre-strip path.
     tab_strip: u64,
+    /// C5 — fingerprint of the OPEN tab CONTEXT MENU (which tab, where it
+    /// landed, which row is lit, and the model's own shape), so popping the
+    /// card, stepping its highlight and closing it each present. None of those
+    /// dirty a terminal cell, so without this term the settled-screen early-out
+    /// would swallow both the frame that DRAWS the card and the frame that
+    /// ERASES it — leaving a menu painted over live output with no way to
+    /// repaint it away. Always `0` while no menu is open ⇒ byte-identical to
+    /// the pre-menu path (the idle invariant every sibling `*_fp` holds).
+    tab_menu_fp: u64,
     /// Fingerprint of the in-window SETTINGS overlay (selection + scroll + status + each
     /// control's displayed value), so opening / moving / editing / closing the modal
     /// repaints even when the grid below is unchanged. Always `0` when the panel is
@@ -2265,15 +2326,25 @@ enum Wake {
         generation: native_document_journal::JournalRewriteGeneration,
         result: native_document_journal::JournalRewriteResult,
     },
-    /// The OS "Reduce Motion" accessibility preference CHANGED (macOS:
-    /// `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`, observed by
-    /// the apprt seam's retained target — see `platform::reduce_motion`). The
-    /// main thread re-queries the flag and repaints every window so the motion
-    /// policy's consumers (aurora / sparkle words / scene / settings demo) settle
-    /// to the new state on the next present. Never posted off macOS (no
-    /// observer — hence the cfg'd `dead_code` allow), but the variant exists on
-    /// every target so `Wake` stays platform-independent.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// An OS ACCESSIBILITY / APPEARANCE preference changed — Reduce Motion, High
+    /// Contrast, reduced transparency, or the accessibility text scale. The main
+    /// thread re-queries them all (`App::resample_os_preferences`) and repaints every
+    /// window whose paint depends on one, so the motion policy's consumers (aurora /
+    /// sparkle words / scene / settings demo) and the native-view palette settle on
+    /// the next present.
+    ///
+    /// Posted by:
+    /// * macOS — `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification`,
+    ///   observed by the apprt seam's retained target (`platform::reduce_motion`).
+    /// * Windows — the aterm window subclass's coalesced settings hook
+    ///   (`platform_win.rs`, W0 §3.2): the broadcast messages that carry these flips
+    ///   never enter the `GetMessage` stream, so they are caught in the window
+    ///   procedure and forwarded here as ONE wake per burst.
+    ///
+    /// The name is narrower than the payload for compatibility with the macOS
+    /// observer that has always posted it; there is no payload, and the handler
+    /// re-reads everything, so widening the meaning cost nothing.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
     ReduceMotionChanged,
     /// SELF-HEALING surfacing from the background update thread: the health ledger
     /// crossed a threshold (persistent pipeline failure). Shown as an OS notification
@@ -2344,6 +2415,10 @@ enum Wake {
         /// Optional working-directory override (`spawn cwd=<path>`); `None` inherits
         /// the focused pane's cwd like a Cmd-T tab.
         cwd: Option<String>,
+        /// `Some(dir)` (`spawn split=<v|h>`) splits the FOCUSED PANE instead of
+        /// opening a tab — the wire half of the front door's `aterm split-pane`
+        /// (S12). `None` is the historical tab behaviour, unchanged.
+        split: Option<pane::SplitDir>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `@<sid> close` (control socket): retire a session by id — the death half of
@@ -2404,6 +2479,17 @@ enum Wake {
         /// racing a tab switch: `input_to_session` re-resolves and falls back to
         /// the hidden-session path if the answer turned out to be no.
         session: Option<u64>,
+    },
+    /// Reply-bearing, side-effect-free cursor-provenance fence for a control
+    /// operation (notably `signal`) that acts directly on a visible session and
+    /// therefore has no [`InputEvent`] of its own. The main thread re-resolves
+    /// the named session across every window that still presents it before
+    /// clearing only the two cursor-engine candidates (OS focus-in/out events
+    /// can overlap during a handoff);
+    /// it does not impersonate a key, touch cadence/rain/latency, or write bytes.
+    CursorCandidateCancel {
+        session: u64,
+        reply: std::sync::mpsc::Sender<bool>,
     },
     /// The Linux/X11 paste worker finished reading a FOREIGN clipboard owner off the
     /// UI thread — `text` is the clipboard body to deliver into `wid` (the paste's
@@ -2545,6 +2631,12 @@ enum Wake {
         tab: tab_model::TabId,
         action: menu::MenuAction,
     },
+    /// A native tab context menu began tracking. The menu may be dismissed
+    /// without choosing an item, so the opening gesture itself carries the
+    /// candidate-only fence; the later action wake repeats it after the nested
+    /// tracking loop in case a newer proof was armed meanwhile.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    TabContextMenuOpening { window: WindowId },
     /// A tab chip was DOUBLE-CLICKED (macOS strip): open the inline pin editor
     /// over that tab. Carries the STABLE [`tab_model::TabId`] captured at the
     /// gesture, for the same reason [`Wake::TabMenuAction`] does — an editor
@@ -2700,29 +2792,21 @@ enum Wake {
     /// from the streamed `seed-starting:` marker before the multi-GB extraction, so the
     /// user is told what is happening while it happens rather than after. Non-clickable
     /// transient pill only, same as [`Wake::PkgSeed`]; no authority crosses it.
-    PkgSeedStarted {
-        detail: String,
-    },
+    PkgSeedStarted { detail: String },
     /// The bundled toolchain has no build this machine can run — raised from the
     /// streamed `seed-unusable:` marker. It exists so the "Installing…" notice
     /// [`Wake::PkgSeedStarted`] raised is always ANSWERED: an announced install that
     /// silently delivers nothing is worse than one that never announced itself.
-    PkgSeedUnusable {
-        detail: String,
-    },
+    PkgSeedUnusable { detail: String },
     /// The seed pass ran and every member failed to install — raised from the streamed
     /// `seed-failed:` marker so the "Installing…" notice is retired with the truth
     /// rather than left standing forever. Retryable, unlike [`Wake::PkgSeedUnusable`].
-    PkgSeedFailed {
-        detail: String,
-    },
+    PkgSeedFailed { detail: String },
     /// Some members installed and some did not — raised from `seed-partial:`. Its own
     /// variant because the two obvious renderings are both lies: the success pill
     /// claims a toolchain the machine does not have, and the failure pill hides the
     /// programs that did arrive.
-    PkgSeedPartial {
-        detail: String,
-    },
+    PkgSeedPartial { detail: String },
 }
 
 /// MEM-ACCT-3(b) shed policy: the low scrollback watermark (bytes) to evict down to when
@@ -3756,6 +3840,19 @@ impl Backend {
         }
     }
 
+    /// Install the Linux grid-fitting mode (config `font_hinting` /
+    /// `$ATERM_FONT_HINTING`, W13/R2) on the live renderer. A change
+    /// re-rasterizes (glyph caches / GPU atlas dropped); inert on the targets
+    /// without the hint seam.
+    fn set_font_hinting(&mut self, mode: &str) {
+        match self {
+            Backend::Cpu(r) => {
+                r.set_font_hinting(mode);
+            }
+            Backend::Gpu(g) => g.set_font_hinting(mode),
+        }
+    }
+
     /// Install the W9 variable-font instantiation config (`font_variation` /
     /// `font_weight` requests + `font_weight_dark_nudge`) on the live
     /// renderer. A coord change re-rasterizes (CPU glyph caches / GPU atlas
@@ -4215,6 +4312,10 @@ impl BackendSlot {
 
     fn set_stem_gamma(&mut self, gamma: f32) {
         self.ready_mut().set_stem_gamma(gamma);
+    }
+
+    fn set_font_hinting(&mut self, mode: &str) {
+        self.ready_mut().set_font_hinting(mode);
     }
 
     fn set_selection_inactive(&mut self, inactive: bool) {
@@ -5960,7 +6061,29 @@ struct WindowState {
     /// Titlebar band height in POINTS (logical), captured from AppKit at attach
     /// (see `AppRt::titlebar_band_pts`). Kept in points — not px — so a scale
     /// change recomputes the device-px headroom (`round(head_pts · scale)`)
-    /// without an AppKit round-trip. 0.0 for chromeless / non-macOS windows.
+    /// without an AppKit round-trip. 0.0 for chromeless windows.
+    ///
+    /// ON WINDOWS the same slot carries the C3 SYNTHETIC tab band — the extra
+    /// pixels that make the in-grid strip a real WinUI-height tab band
+    /// (`App::synthetic_strip_head_px`, config `tab_band_height`). Not measured
+    /// but derived, and written at the same two moments (attach, then every
+    /// `on_resize`); everything downstream reads one band and is indifferent to
+    /// which platform produced it.
+    ///
+    /// POINTS ARE A LOSSY CARRIER FOR THE DERIVED BAND — the one place the "same
+    /// slot, same meaning" framing does not hold exactly. A MEASURED band is a
+    /// logical quantity, so `round(head_pts · scale)` reproduces it at any DPI. The
+    /// SYNTHETIC band is `round(target · scale) − pad_top(scale) − rows·cell_h(scale)`,
+    /// and only the first term scales; the shared re-derivations
+    /// (`on_scale_factor_changed`, `refresh_all_window_metrics`) therefore reproduce
+    /// it exactly only while `pad_top` and `cell_h` move with the DPI too — which
+    /// `font_px_explicit` and `ATERM_FORCE_SCALE` deliberately stop them doing. The
+    /// residue is bounded and transient: the `Resized` winit emits after every
+    /// `ScaleFactorChanged` re-enters `on_resize`, which re-derives from the law. See
+    /// the C3 block there. The `last_windowed_band_pts` acceptance law
+    /// below is macOS-only and never touches the synthetic value: aterm's
+    /// Windows fullscreen keeps its in-grid strip, so the band must keep its
+    /// height there rather than collapse the way a detaching titlebar does.
     ///
     /// TWO-SLOT BAND DESIGN: this slot is the APPLIED band — what the window is
     /// rendering with right now, including the fullscreen-forced 0. Its sibling
@@ -6007,6 +6130,14 @@ struct WindowState {
     /// event rounded up to ≥1 line and dropped the fraction, making slow/precise
     /// trackpad scrollback over-sensitive. Stays in `(-1, 1)` between emits.
     scroll_residual: f64,
+    /// The HORIZONTAL twin of [`Self::scroll_residual`], in cells, for tilt-wheel
+    /// notches and two-finger horizontal swipes (audit I7). Kept SEPARATE rather
+    /// than reusing the vertical accumulator: they are different gestures on
+    /// different axes, and banking a horizontal flick into the vertical residual
+    /// would let a sideways swipe pay off — or cancel — pending vertical motion,
+    /// which is exactly the axis bleed the dominance guard exists to prevent.
+    /// Only ever drained toward a `WheelDir::Left`/`Right` report.
+    scroll_residual_x: f64,
     /// Whether the OS cursor is currently the link "pointer" (Cmd-hovering a link),
     /// so `set_cursor` is only called on a state change, not every mouse move.
     hover_pointer: bool,
@@ -6050,8 +6181,13 @@ struct WindowState {
     /// in tracking apps (vim `mouse=a` visual drag, tmux pane drag, less, htop)
     /// emitted `button 3` — which 1002 drops entirely and 1003 misreads as hover.
     held_mouse_button: Option<aterm_types::mouse::MouseButton>,
-    /// Bitmask (`1 << button.code()`) of buttons whose PRESS was reported to a
-    /// mouse-tracking app, so each RELEASE can be paired with its own press. The
+    /// Bitmask (`1 << button.slot()`) of buttons whose PRESS was reported to a
+    /// mouse-tracking app, so each RELEASE can be paired with its own press.
+    ///
+    /// Keyed on the DENSE `slot()`, never on the wire `code()`: the thumb
+    /// buttons' codes are 128/129, so `1 << (code & 7)` folds Back onto Left's
+    /// bit and Forward onto Middle's, and a thumb release would then clear a
+    /// live drag's press bit and orphan its release (audit I8). The
     /// split-pane focusing press returns early WITHOUT reporting, so its bit is never
     /// set and its orphan release is skipped — while every genuine press sets its bit,
     /// so a release (including a SECOND button in a two-button chord) still reports.
@@ -6386,30 +6522,14 @@ struct WindowState {
     poof_row_above_buf: Vec<char>,
     /// The row BELOW the probed cursor row (see `poof_row_above_buf`).
     poof_row_below_buf: Vec<char>,
-    /// Last frame's scrollback total — the poof probe's "content shifted"
-    /// fence: a frame whose history count moved (output scrolled the screen)
-    /// skips the capture for one frame, so row content sliding through the
-    /// cursor row can never read as a kill (belt-and-braces on top of the
-    /// engine's same-row + stable-prefix/suffix guards). `None` until the
-    /// first probe-eligible frame.
-    poof_scrollback: Option<usize>,
-    /// Whether LAST frame observed an open scrollback DETACH window
-    /// (`Grid::reflow_offload_in_flight`). A width reflow hands the tiered store
-    /// to a worker thread, so `scrollback_lines()` COLLAPSES on detach and SPIKES
-    /// by the whole history when the worker re-attaches — a bookkeeping swing of
-    /// tens of thousands of lines that is not a scroll and that no PTY caused.
-    ///
-    /// Diffing across that boundary made `scrolled_rows` saturate, which called
-    /// `note_scroll` with a full screen height and slammed the trail engines'
-    /// remembered cursor cell to row 0; the next observed move then read as a
-    /// full-screen jump. Cold typing momentum used to swallow the result, but a
-    /// resize-licensed streak (`note_reflow`) would have drawn it as a rainbow
-    /// beam across the whole window, out of nowhere.
-    ///
-    /// So the counter is only COMPARABLE between two frames that both sat
-    /// outside a detach window; otherwise the baseline is re-anchored and no
-    /// scroll is reported. `false` until the first probe-eligible frame.
-    poof_offload_in_flight: bool,
+    /// Last non-destructive terminal content-scroll snapshot consumed by this
+    /// window's cursor effects. Unlike retained `scrollback_lines()`, the
+    /// terminal counters continue at a full/zero history cap and distinguish a
+    /// uniform upward translation from region/down/splice mutations that must
+    /// fail closed. Each window owns its baseline so one renderer/capture never
+    /// consumes another window's observation. `None` reseeds after a pane/tab
+    /// switch without comparing unrelated terminals.
+    cursor_scroll_state: Option<ContentScrollState>,
     /// Last-seen `Terminal::repaint_blink_epoch` for the focused pane — the
     /// REPAINT-BLINK edge detector, read under the SAME LOCK A as the poof
     /// probe (zero new lock acquisitions). An advance means the attached app
@@ -6847,6 +6967,30 @@ struct WindowState {
     /// motivates `strip_press`'s tab key cannot move background under a
     /// stationary pointer between two presses that opened no chip.
     strip_band_press: Option<Instant>,
+    /// C5 — the OPEN tab CONTEXT MENU on this window's in-grid strip, or `None`.
+    /// While `Some` it owns the pointer and the keyboard (the gates in
+    /// `on_mouse_input` / `on_key_tab_menu_mode`) exactly as the modal overlays
+    /// do, and `splice_tab_menu` paints it over the composed frame. Per-window
+    /// because the card hangs off THIS window's chip; global state would pop a
+    /// menu on the wrong strip when two windows are open.
+    tab_menu: Option<tab_menu::TabMenu>,
+    /// Where `splice_tab_menu` last placed that card, in FRAME cell
+    /// coordinates. The hit-test reads THIS rather than re-deriving the
+    /// placement, so the pixels and the click can never disagree — the same
+    /// painter-records/hit-test-reads rule `find_bar_hit` follows. `None` until
+    /// the first frame after the menu opens (a press in that window is then
+    /// swallowed but activates nothing, which is the safe half).
+    tab_menu_rect: Option<tab_menu::MenuRect>,
+    /// The controller BUTTON whose press dismissed the card, held until its
+    /// RELEASE arrives. A press off a menu dismisses AND is consumed, so the
+    /// matching release must be consumed too — otherwise a tracking TUI is
+    /// handed half a press pair from under a modal. Outlives `tab_menu` for
+    /// exactly the same reason [`Self::overlay_consumed_keys`] outlives its
+    /// overlay: the dismiss closes the card, so `tab_menu.is_some()` is already
+    /// false by the time the release is seen. Human pointer input never reaches
+    /// this gate (`on_mouse_input` returns before the seam), so this is the
+    /// `aterm ctl mouse` route's own latch.
+    tab_menu_consumed_button: Option<aterm_types::mouse::MouseButton>,
     /// The live inline SESSION-RENAME edit on this window's tab strip, or `None`
     /// when nothing is being edited. See [`app_rename::TabRenameEdit`] for why
     /// it is keyed on a session id and carries the tab id only for positioning.
@@ -7968,6 +8112,7 @@ impl WindowState {
             last_cursor_px: (0.0, 0.0),
             last_mouse_px_off: crate::input::PixelOffset::CELL_ORIGIN,
             scroll_residual: 0.0,
+            scroll_residual_x: 0.0,
             hover_pointer: false,
             native_text_cursor: false,
             selecting: false,
@@ -8030,8 +8175,7 @@ impl WindowState {
             poof_row_buf: Vec::new(),
             poof_row_above_buf: Vec::new(),
             poof_row_below_buf: Vec::new(),
-            poof_scrollback: None,
-            poof_offload_in_flight: false,
+            cursor_scroll_state: None,
             blink_epoch_seen: 0,
             last_blink_at: None,
             blink_reseed: false,
@@ -8113,6 +8257,9 @@ impl WindowState {
             strip_hover: None,
             strip_press: None,
             strip_band_press: None,
+            tab_menu: None,
+            tab_menu_rect: None,
+            tab_menu_consumed_button: None,
             rename_edit: None,
             cached_strip_rows: Vec::new(),
             strip_row_pool: Vec::new(),
@@ -9049,6 +9196,77 @@ enum RobiDismissal {
     AwaitingConfig,
 }
 
+/// Why [`App::resample_os_preferences`] is running. It has three callers with two
+/// very different characters, and the difference decides who pays for a repaint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ResampleCause {
+    /// An OS settings/theme BROADCAST reached us: the coalesced `Wake` from the
+    /// Windows subclass hook, the macOS `NSWorkspace` observer, or winit's own
+    /// `WindowEvent::ThemeChanged`. Something outside aterm has been writing to our
+    /// chrome, so on Windows this owes every window a repair frame.
+    SettingsBurst,
+    /// A POLL on an event that merely happens to be a convenient moment to re-read
+    /// — today Windows' `WindowEvent::Focused(true)`, kept because it covers the gap
+    /// between process start and the first window attach (where the subclass, and
+    /// therefore the hook, gets installed). Nothing has clobbered the chrome, so a
+    /// poll pays only for what actually moved.
+    /// Constructed only under `cfg(windows)` (the `Focused(true)` arm) and in tests, so
+    /// every other platform sees a variant nothing builds.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Poll,
+}
+
+/// Does this re-sample owe every window a frame even when nothing it sampled moved?
+///
+/// WINDOWS, AND ONLY ON A BROADCAST. winit re-themes the non-client area on every
+/// `WM_SETTINGCHANGE` it forwards — including the ones that changed no preference
+/// aterm samples — and with `preferred_theme` permanently `None` under `Auto` that
+/// re-theme writes the OS light/dark answer straight over the caption aterm resolved
+/// from the TERMINAL background. MEASURED: delivering a bare `WM_THEMECHANGED` to an
+/// idle window flipped `aterm-ctl chrome`'s `immersive_dark` from true to false, and
+/// it STAYED false, because the per-frame `verify_chrome_appearance` guard that heals
+/// exactly this clobber only runs when a frame runs — and nothing had asked for one.
+/// So a settings burst buys its own repair frame: coalesced by construction (one wake
+/// per burst) and one cheap present on an idle terminal.
+///
+/// A [`ResampleCause::Poll`] buys nothing. Focus-gain re-samples on EVERY window
+/// activation, and the repair loop touches `self.windows` wholesale — so an
+/// unconditional `cfg!(windows)` meant every alt-tab into aterm scheduled a full
+/// present on the N−1 BACKGROUND windows that nothing had asked to repaint (the
+/// focused one already gets its redraw from the `Focused(true)` arm). Nothing has
+/// re-themed anything on a focus change; there is nothing to repair.
+fn resample_wants_repair_frame(cause: ResampleCause) -> bool {
+    cfg!(windows) && matches!(cause, ResampleCause::SettingsBurst)
+}
+
+#[cfg(test)]
+mod resample_cause_tests {
+    use super::{ResampleCause, resample_wants_repair_frame};
+
+    /// The repair frame is for a BROADCAST, never for a poll.
+    ///
+    /// `resample_os_preferences` has three callers and the repair loop it gates walks
+    /// EVERY window. Windows' `WindowEvent::Focused(true)` is one of those callers, so
+    /// an unconditional `cfg!(windows)` meant every alt-tab or click into aterm
+    /// scheduled a full present on all the background windows — the focused one
+    /// already gets its own redraw from the `Focused(true)` arm, so that work bought
+    /// nothing. Only a settings/theme broadcast can have re-themed the non-client area
+    /// behind our back, and only that case owes the windows a frame.
+    #[test]
+    fn only_a_settings_burst_buys_the_repair_frame() {
+        assert!(
+            !resample_wants_repair_frame(ResampleCause::Poll),
+            "focus-gain must not repaint every window"
+        );
+        assert_eq!(
+            resample_wants_repair_frame(ResampleCause::SettingsBurst),
+            cfg!(windows),
+            "the repair frame exists to undo winit's Win32 non-client re-theme, \
+             and only Windows has one"
+        );
+    }
+}
+
 struct App {
     /// The native application-runtime (`apprt`) seam: the platform impl that backs
     /// every OS-integration operation (window chrome colour/appearance, menu bar,
@@ -9591,6 +9809,11 @@ struct App {
     /// W2). Source of truth re-applied after rebuilds. Live-reloadable. GLOBAL
     /// (window-uniform).
     stem_gamma: f32,
+    /// EFFECTIVE Linux grid-fitting mode (`$ATERM_FONT_HINTING` > config
+    /// `font_hinting` > `"full"`, W13/R2). Source of truth re-applied after
+    /// rebuilds. Live-reloadable. GLOBAL (window-uniform); inert on macOS /
+    /// Windows (no hint seam there).
+    font_hinting: String,
     /// W9 variable-font requests (config `font_variation` + `font_weight`,
     /// parsed `(tag, value)` pairs): the source of truth re-applied after
     /// every rebuild ([`apply_font_config_to_backend`]). A change re-instantiates
@@ -10879,8 +11102,7 @@ impl App {
             // the moment anything reads the anchor before the engines re-seed.
             // Re-anchor on the next frame instead (`None` reports no scroll and
             // then records the new pane's true total).
-            ws.poof_scrollback = None;
-            ws.poof_offload_in_flight = false;
+            ws.cursor_scroll_state = None;
             ws.last_blink_at = None;
             ws.blink_reseed = true;
             // PHOSPHOR rain: a RETAINED engine now watches a DIFFERENT grid
@@ -11429,7 +11651,9 @@ impl App {
             kitty_log: crate::kitty_log::KittyLogHost::in_memory(),
             // A FIXED seed: tests must never roll a random cat (assertions
             // compare against `KittyLook::for_launch(TEST_LAUNCH_SEED)`).
-            launch_kitty: aterm_effects::kitty_registry::KittyLook::for_launch(Self::TEST_LAUNCH_SEED),
+            launch_kitty: aterm_effects::kitty_registry::KittyLook::for_launch(
+                Self::TEST_LAUNCH_SEED,
+            ),
             kitty_summon_seq: 0,
             os_appearance: aterm_types::Appearance::default(),
             font_family: None,
@@ -11437,6 +11661,7 @@ impl App {
             text_blending: aterm_render::TextBlending::default(),
             font_thicken: false,
             stem_gamma: Config::default().stem_gamma_or_default(),
+            font_hinting: Config::default().font_hinting_or_default(),
             font_variations: Vec::new(),
             font_weight_dark_nudge: 0.0,
             render_knobs: app_config::RenderKnobs::default(),
@@ -11662,6 +11887,21 @@ impl App {
     }
 
     fn split_focused_pane(&mut self, dir: pane::SplitDir) {
+        // Every in-app split (chord, menu, palette) inherits the focused pane's
+        // cwd — the historical behaviour, and the only sensible one for a
+        // keystroke. A cwd is supplied ONLY by the control socket's
+        // `spawn split=<v|h> cwd=<path>`, i.e. the front door's
+        // `aterm split-pane -d <dir>`, where the operator named a directory
+        // out loud.
+        self.split_focused_pane_in(dir, None);
+    }
+
+    /// [`App::split_focused_pane`] with an explicit working directory for the
+    /// NEW pane. Written as an override on the existing path rather than a
+    /// parallel one so a split is a split however it was asked for: the same
+    /// shared-session refusal, the same family-tree parenting, the same
+    /// `resize_panes` follow-up.
+    fn split_focused_pane_in(&mut self, dir: pane::SplitDir, cwd_override: Option<String>) {
         // The split spawns a NEW session (views=1, never `attach`) owned by the
         // frontmost window, so its output/exit/bell route back to THIS window.
         let Some(owner) = self.frontmost_window else {
@@ -11689,8 +11929,9 @@ impl App {
         };
         // Spawn at the window grid; `resize_panes` immediately re-sizes every pane
         // (incl. this one) to its computed sub-rect, so the initial size is transient.
-        // The split inherits the focused pane's cwd (the pane it was split from).
-        let cwd = self.focused_pane_cwd(owner);
+        // The split inherits the focused pane's cwd (the pane it was split from)
+        // unless the caller named one — see `split_focused_pane_in`.
+        let cwd = cwd_override.or_else(|| self.focused_pane_cwd(owner));
         match spawn_session(
             id,
             owner,
@@ -11849,26 +12090,79 @@ impl App {
     /// Callers, by platform:
     /// * macOS — the `Wake::ReduceMotionChanged` arm, posted by the
     ///   NSWorkspace observer (`platform.rs`): a real change notification.
-    /// * Windows — the `ThemeChanged` and focus-gain window events. There is no
-    ///   live observer there yet (`observe_reduce_motion` returns `None` until
-    ///   the §3.2 `WM_SETTINGCHANGE` hook, W0), and both re-sample targets are
-    ///   process-global, so before this seam a Settings flip reached a RUNNING
-    ///   window only at the next window ATTACH. Refocusing aterm — which is what
-    ///   a user does right after toggling "Animation effects" in Settings — now
-    ///   closes the visible case; the hook remains the durable fix (it would
-    ///   also catch flips made while aterm keeps focus).
-    fn resample_os_preferences(&mut self) {
+    /// * Windows — the same `Wake`, posted by the aterm window subclass's
+    ///   coalesced `WM_SETTINGCHANGE`/`WM_SYSCOLORCHANGE`/`WM_THEMECHANGED` hook
+    ///   (`platform_win.rs`, the W0 §3.2 seam). The `ThemeChanged` and focus-gain
+    ///   window events still call it too: they cost two reads on a rare event and
+    ///   they cover the gap between process start and the first window attach,
+    ///   which is when the subclass — and therefore the hook — is installed.
+    ///
+    /// `cause` separates those: only a settings/theme BROADCAST can have re-themed
+    /// the non-client area behind our back, so only a broadcast buys the repair
+    /// frame — see [`resample_wants_repair_frame`]. Focus-gain is a POLL and pays
+    /// only for what actually moved.
+    ///
+    /// WINDOWS-ONLY EXTRA WORK, and why it lives here rather than behind the
+    /// `AppRt` seam: three things move on an OS appearance change that
+    /// `AppearancePreferences` cannot express. The forced CHROME PALETTE (High
+    /// Contrast's system colours) can change while every preference stays equal —
+    /// switching between two HC schemes — so it reports its own movement, through
+    /// `native_appearance`'s sticky latch rather than a return value (see below); the
+    /// CAPTION has to be re-resolved through DWM, which needs the `&Window`; and
+    /// the strip's painted-row cache is keyed on a fingerprint that carries neither,
+    /// so it must be dropped by hand or the OS palette would not reach the screen
+    /// until the next tab change. `AppRt` has no method shaped like any of those,
+    /// and inventing three Windows-only trait methods to avoid one `cfg` block in
+    /// the one function that already owns "the OS appearance moved" is worse.
+    fn resample_os_preferences(&mut self, cause: ResampleCause) {
+        // Re-arm the settings coalescer FIRST, so a broadcast that races this
+        // re-read posts again rather than being swallowed (Windows sends trailing
+        // `ImmersiveColorSet` broadcasts after the setting itself has landed).
+        #[cfg(windows)]
+        crate::platform_win::note_os_settings_resample();
+        // The OS chrome palette, republished before the preferences are read. The
+        // `AppRt` preference read refreshes it too (documented side effect), but
+        // stating it here keeps this seam's palette refresh explicit rather than
+        // hostage to another trait method's internals. Its `bool` is deliberately
+        // dropped: movement is reported through the latch drained below, because a
+        // return value is an EDGE and an edge belongs to whoever reads it first.
+        #[cfg(windows)]
+        let _ = crate::platform_win::resync_forced_chrome_palette();
         let v = self.apprt.reduce_motion();
         // `motion = "full"` may override this OS fact; the shared edge
         // reducer checks effective per-window policy and settles only
         // windows that actually became Reduced.
         let motion_changed = self.apply_system_reduce_motion(v, Instant::now());
-        let appearance_changed = native_appearance::install_preferences(
-            self.apprt.native_appearance_preferences(),
-        );
-        if motion_changed || appearance_changed {
-            for ws in self.windows.values() {
+        native_appearance::install_preferences(self.apprt.native_appearance_preferences());
+        // Drained AFTER both publishes, and drained rather than read off the
+        // `install_*` returns: window attach and startup call
+        // `native_appearance_preferences()` too — which on Windows republishes the
+        // High-Contrast palette — so an HC-scheme switch that landed between an
+        // attach and this `Wake` had its edge consumed by the attach, and this
+        // re-sample would then see "nothing moved" and leave every PRE-EXISTING
+        // window painting the old palette until the next tab open/close. The latch
+        // is sticky and has exactly one consumer: here.
+        let chrome_changed = native_appearance::take_chrome_inputs_moved();
+        let repair_frame = resample_wants_repair_frame(cause);
+        if motion_changed || chrome_changed || repair_frame {
+            for ws in self.windows.values_mut() {
+                // The strip's painted rows are cached on `(fingerprint, cols,
+                // update, hover, subtitle)` — none of which moves when the OS
+                // palette does, exactly as none of them moves on a theme change
+                // (`reload_config` drops the cache for the same reason). Without
+                // this the High-Contrast band would appear only after the next tab
+                // open/close.
+                if chrome_changed {
+                    ws.last_strip_fp = None;
+                }
                 if let Some(w) = ws.os_window.as_ref() {
+                    // Re-resolve the DWM caption under the new appearance. Only on a
+                    // real change: this writes four window attributes, and focus-gain
+                    // calls this function on every window activation.
+                    #[cfg(windows)]
+                    if chrome_changed {
+                        crate::platform_win::resync_chrome_appearance(w);
+                    }
                     w.request_redraw();
                 }
             }
@@ -11904,6 +12198,16 @@ impl App {
         // clipboard and PRIMARY must not be written from it.
         if !focused {
             self.settle_selection_gesture(wid);
+            // C5 — DISMISS the tab context menu. Every native menu on Windows
+            // goes away when its owner is deactivated, and this one is modal
+            // over both the pointer and the keyboard: left up across an
+            // alt-tab it would keep overpainting live output, keep swallowing
+            // keys, and eat the user's first click back into the window as a
+            // click-away dismiss. Same reasoning as the drag/gesture drops
+            // below — focus loss settles transient GUI-local state — but hoisted
+            // here because `close_tab_menu` needs the whole `App` (it requests
+            // the repaint that ERASES the card).
+            self.close_tab_menu(wid);
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.focused = focused;
@@ -12046,6 +12350,12 @@ impl App {
         )
     )]
     fn on_modifiers_changed(&mut self, wid: WindowId, mods: ModifiersState) {
+        // A modifier snapshot is a newer human-input boundary even though it
+        // writes no PTY bytes itself.  Retire any still-unobserved cursor-move
+        // proof before publishing the new chord state: otherwise a swallowed
+        // key followed by (say) Shift alone could leave its exact candidate
+        // available for an unrelated child cursor move to borrow.
+        self.cancel_cursor_move_candidate(wid);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.mods = mods;
         }
@@ -13584,6 +13894,11 @@ impl ApplicationHandler<Wake> for App {
                     .then(|| self.capture_restore_manifest()),
             );
         }
+        // THE HONESTY DRAIN: explanations queued from contexts that cannot reach
+        // `App` (the backend build thread, an `AppRt` chrome call, `run()` before
+        // App exists) become an in-window notice here. One relaxed atomic load on
+        // an empty lane, which is every park but a handful per run.
+        self.drain_deferred_config_notices();
         // A title snapshot that lost a nonblocking terminal-lock race is retried from
         // this event-loop-owned lane. Its short fixed deadline below preserves
         // one-shot OSC/block transitions without ever waiting on the parser mutex.
@@ -15221,6 +15536,9 @@ impl ApplicationHandler<Wake> for App {
             // the window (`sync_active_session` when it is the front window); the
             // native segments then re-track via `refresh_window_tabs` in `sync_window`.
             Wake::SelectTab { window, index } => {
+                // Native TabView consumes this mouse/VoiceOver gesture directly,
+                // so it never crosses winit/app_mouse's ingress fence.
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 // A click on a DIFFERENT chip is "a click away", and clicking away
                 // keeps what you typed. The macOS strip's `TabView` is a plain
                 // NSView that never takes first responder, so AppKit never ends
@@ -15238,6 +15556,7 @@ impl ApplicationHandler<Wake> for App {
             // take. If it was the window's LAST tab, flag + escalate (we have `el`
             // here) so the window tears down, exactly like a tab-strip close.
             Wake::CloseTab { window, index } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 // Settle FIRST, like every other spelling of "close". The native
                 // close ✕ posts this wake, while the in-grid ✕, ⌘W and the
                 // context menu all settle on their way in — without this, the
@@ -15262,6 +15581,7 @@ impl ApplicationHandler<Wake> for App {
                 tab,
                 action,
             } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 // The SAME divert the menu bar takes (`dispatch_menu_action` runs
                 // it first thing). Without it the two spellings of one command
                 // disagreed: Close Tab from the menu bar committed the edit, while
@@ -15276,9 +15596,13 @@ impl ApplicationHandler<Wake> for App {
                 }
                 self.dispatch_tab_menu_action(el, window, tab, action);
             }
+            Wake::TabContextMenuOpening { window } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+            }
             // A tab chip was double-clicked: open the inline pin editor over that
             // tab's FOCUSED pane's session, resolved from the stable id here.
             Wake::BeginSessionRename { window, tab } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 self.begin_session_rename(window, tab);
             }
             // The editor ended keeping what was typed (Return / Tab / click away).
@@ -15289,11 +15613,13 @@ impl ApplicationHandler<Wake> for App {
                 session,
                 text,
             } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 self.commit_session_rename(window, session, &text);
             }
             // Escape, or the strip discovering its edited tab is gone: tear the
             // editor down and write nothing.
             Wake::CancelSessionRename { window, session } => {
+                self.cancel_tab_surface_cursor_move_candidate(Some(window));
                 self.cancel_session_rename(window, session);
             }
             // The control socket's `tab` verb (new/<N>/next/prev), driving the FRONT
@@ -15302,6 +15628,10 @@ impl ApplicationHandler<Wake> for App {
             // reply with the resulting `(active_index, tab_count)`. A window with no
             // tabs / no front window replies `(0, 0)`.
             Wake::TabCmd { action, reply } => {
+                // Native TabView drag gestures and controller tab commands share
+                // this wake. A reorder that leaves the active tab unchanged is
+                // still a newer input/coordinate boundary.
+                self.cancel_tab_surface_cursor_move_candidate(None);
                 // A control-socket `tab close` is a DELIBERATE, non-interactive
                 // instruction — it must NOT pop the blocking native confirm dialog
                 // (that would wedge the UI thread inside `runModal` and hang the
@@ -15517,13 +15847,16 @@ impl ApplicationHandler<Wake> for App {
                 generation,
                 result,
             } => self.finish_native_document_journal_rewrite(document, generation, result),
-            // The OS "Reduce Motion" flag flipped: re-query once (a notification
-            // burst coalesces to the latest value) and repaint every window so
-            // each policy consumer settles — an active aurora clears on its next
-            // tick, sparkles go static, the scene re-geometries, the demo freezes.
-            // (macOS posts this; the Windows seams call the same reducer directly —
-            // see `resample_os_preferences`.)
-            Wake::ReduceMotionChanged => self.resample_os_preferences(),
+            // An OS accessibility/appearance preference flipped: re-query once (a
+            // notification burst coalesces to the latest value) and repaint every
+            // window so each consumer settles — an active aurora clears on its next
+            // tick, sparkles go static, the scene re-geometries, the demo freezes,
+            // and on Windows the High-Contrast chrome palette + caption re-resolve.
+            // (macOS posts it from the NSWorkspace observer; Windows from the window
+            // subclass's settings hook — see `resample_os_preferences`.)
+            Wake::ReduceMotionChanged => {
+                self.resample_os_preferences(ResampleCause::SettingsBurst);
+            }
             // Self-healing: a ledger threshold event from the background update
             // thread (persistent failure) — surface it.
             Wake::UpdateHealth { title, body } => {
@@ -15665,9 +15998,7 @@ impl ApplicationHandler<Wake> for App {
                     .and_then(|(_, t)| t.strip_suffix(')'))
                     .map(|s| format!(" {s}"))
                     .unwrap_or_default();
-                self.surface_held_update_status(&format!(
-                    "⇣ Installing the ALab toolchain{size}…"
-                ));
+                self.surface_held_update_status(&format!("⇣ Installing the ALab toolchain{size}…"));
             }
             // Answer the "Installing…" notice honestly rather than leaving it as the
             // last thing the user saw.
@@ -15703,8 +16034,8 @@ impl ApplicationHandler<Wake> for App {
             }
             // `settings` control verb: drive the native Settings tab and reply its open
             // state. The enum variant keeps the historical wire-facing name only.
-            Wake::SpawnSession { cwd, reply } => {
-                let _ = reply.send(self.spawn_tab_session(cwd));
+            Wake::SpawnSession { cwd, split, reply } => {
+                let _ = reply.send(self.spawn_tab_session(cwd, split));
             }
             Wake::CloseSession { session, reply } => {
                 let _ = reply.send(self.close_session_by_id(session));
@@ -15748,6 +16079,10 @@ impl ApplicationHandler<Wake> for App {
             // P2: an AccessKit adapter event (initial-tree request / OS action / deactivate).
             #[cfg(feature = "a11y-accesskit")]
             Wake::Accessibility(event) => self.on_accessibility_event(event),
+            Wake::CursorCandidateCancel { session, reply } => {
+                let canceled = self.cancel_cursor_move_candidate_for_session(session);
+                let _ = reply.send(canceled);
+            }
             // Phase 0.5 (A.2.3): apply a controller-built batch on the main thread
             // (the sole owner of term geometry + gesture state + the encoders), IN
             // ORDER, so a press/move/release gesture lands atomically in this one
@@ -15852,8 +16187,12 @@ impl ApplicationHandler<Wake> for App {
             // duplicated; the menu is just a second entry point. `el` is needed
             // because Quit / the last-tab Close must exit the loop.
             Wake::MenuAction { action } => self.dispatch_menu_action(el, action),
-            Wake::OperatorAction { action } => self.dispatch_operator_action(el, action),
+            Wake::OperatorAction { action } => {
+                self.cancel_front_cursor_move_candidate();
+                self.dispatch_operator_action(el, action);
+            }
             Wake::OperatorMenuOpening => {
+                self.cancel_front_cursor_move_candidate();
                 if let Some(proxy) = self.proxy.clone() {
                     fleet_watch::request_scan(proxy);
                 }
@@ -15986,16 +16325,19 @@ impl ApplicationHandler<Wake> for App {
                     if self.pending_deminiaturize_focus == Some(wid) {
                         self.pending_deminiaturize_focus = None;
                     }
-                    // H5 partial: Windows has no live `WM_SETTINGCHANGE` observer
-                    // yet (§3.2/W0), and focus-gain is exactly when a Settings
-                    // flip made in another window becomes user-visible — so
-                    // re-sample the OS reduce-motion / appearance preferences
-                    // here. Two `SystemParametersInfoW` reads on a rare event;
-                    // a no-op repaint-wise unless a sampled fact changed. macOS
-                    // needs none of this (its NSWorkspace observer posts
-                    // `Wake::ReduceMotionChanged` live).
+                    // H5: the live `WM_SETTINGCHANGE` hook now exists (§3.2/W0, the
+                    // aterm window subclass), so this focus-gain re-sample is no
+                    // longer the primary route — it is KEPT because it covers the
+                    // one window the hook cannot: the interval between process start
+                    // and the first `install_toolbar`, which is where the subclass
+                    // gets chained. Cheap on a rare event, and a no-op repaint-wise
+                    // unless a sampled fact changed. macOS needs none of this (its
+                    // NSWorkspace observer posts `Wake::ReduceMotionChanged` live).
+                    // A POLL, not a burst: nothing has re-themed the chrome, so this
+                    // must not drag every OTHER window through a repaint on every
+                    // alt-tab — see [`resample_wants_repair_frame`].
                     #[cfg(windows)]
-                    self.resample_os_preferences();
+                    self.resample_os_preferences(ResampleCause::Poll);
                 }
                 self.on_focus(wid, f);
             }
@@ -16258,14 +16600,18 @@ impl ApplicationHandler<Wake> for App {
                 // Also re-resolve aterm's OWN rendered theme if `theme` config uses a
                 // `dark:…,light:…` split (a no-op for a single, non-split theme).
                 self.sync_app_theme_to_appearance(appearance);
-                // H5 partial: an OS light/dark move often travels WITH an
-                // accessibility change (activating a High Contrast scheme flips
-                // the apps theme too), and this is the one live OS-appearance
-                // event Windows delivers without the §3.2 hook — so re-sample the
-                // reduce-motion / appearance preferences on the same edge.
-                // Cheap (two SPI reads) and idempotent; see the focus-gain twin.
+                // H5: an OS light/dark move often travels WITH an accessibility
+                // change (activating a High Contrast scheme flips the apps theme
+                // too). The §3.2 hook now catches the same burst and posts its own
+                // wake, so this is a duplicate — kept deliberately, because it is
+                // the one appearance signal that works before the window subclass is
+                // installed, and because the re-sample is coalesced and idempotent:
+                // the duplicate costs a handful of reads and no repaint. See the
+                // focus-gain twin. A BURST, not a poll: `ThemeChanged` is winit
+                // telling us it just re-themed the non-client area, which is
+                // precisely what the repair frame exists to undo.
                 #[cfg(windows)]
-                self.resample_os_preferences();
+                self.resample_os_preferences(ResampleCause::SettingsBurst);
             }
             _ => {}
         }
@@ -16720,6 +17066,16 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
     if let Some(detail) = marked(atpkg::cli::SEED_UNUSABLE_MARKER) {
         return Some(Wake::PkgSeedUnusable { detail });
     }
+    // The network lane's ANNOUNCEMENT and failure TERMINAL ride the seed
+    // lane's card semantics — to the user they are the same events (an install
+    // is starting; an install came to nothing), and the held "Installing…"
+    // card the announcement opens is retired by exactly the same terminals.
+    if let Some(detail) = marked(atpkg::cli::NET_STARTING_MARKER) {
+        return Some(Wake::PkgSeedStarted { detail });
+    }
+    if let Some(detail) = marked(atpkg::cli::NET_FAILED_MARKER) {
+        return Some(Wake::PkgSeedFailed { detail });
+    }
     // The NETWORK completion lane's arrival — same pill as a local install, because
     // to the user it is the same event: the toolchain is now here.
     if let Some(detail) = marked(atpkg::cli::NET_INSTALLED_MARKER) {
@@ -16782,7 +17138,10 @@ mod seed_marker_tests {
         );
         match started {
             Some(Wake::PkgSeedStarted { detail }) => {
-                assert!(detail.starts_with("installing the ALab toolset"), "{detail}");
+                assert!(
+                    detail.starts_with("installing the ALab toolset"),
+                    "{detail}"
+                );
                 assert!(
                     !detail.contains("seed-starting"),
                     "the marker prefix is stripped, not echoed: {detail}"
@@ -16800,7 +17159,10 @@ mod seed_marker_tests {
         }
         // …and ordinary chatter raises nothing at all.
         assert!(parse_seed_line("atpkg: no bundled seed — bootstrap is network-only").is_none());
-        assert!(parse_seed_line("atpkg: seed-starting: ").is_none(), "empty tail");
+        assert!(
+            parse_seed_line("atpkg: seed-starting: ").is_none(),
+            "empty tail"
+        );
     }
 
     #[test]
@@ -16844,12 +17206,23 @@ mod seed_marker_tests {
     #[test]
     fn every_atpkg_marker_constant_has_a_wake_arm() {
         use super::parse_seed_line;
-        let cases: [(&str, &str); 6] = [
-            (atpkg::cli::SEED_STARTING_MARKER, "installing 8 ALab program(s)"),
+        let cases: [(&str, &str); 8] = [
+            (
+                atpkg::cli::SEED_STARTING_MARKER,
+                "installing 8 ALab program(s)",
+            ),
             (atpkg::cli::SEED_PARTIAL_MARKER, "3 installed, 5 failed"),
             (atpkg::cli::SEED_FAILED_MARKER, "nothing could be installed"),
-            (atpkg::cli::SEED_UNUSABLE_MARKER, "no build for this architecture"),
+            (
+                atpkg::cli::SEED_UNUSABLE_MARKER,
+                "no build for this architecture",
+            ),
             (atpkg::cli::NET_INSTALLED_MARKER, "ay, clean"),
+            (
+                atpkg::cli::NET_STARTING_MARKER,
+                "installing 2 program(s) over the network: ay, clean",
+            ),
+            (atpkg::cli::NET_FAILED_MARKER, "network provisioning installed nothing"),
             (atpkg::cli::SEED_INSTALLED_MARKER, "ay, trust"),
         ];
         for (marker, tail) in cases {
@@ -16862,7 +17235,10 @@ mod seed_marker_tests {
         }
         // The network lane's arrival renders as an install, because to the user that
         // is exactly what it is.
-        match parse_seed_line(&format!("atpkg: {}ay, clean", atpkg::cli::NET_INSTALLED_MARKER)) {
+        match parse_seed_line(&format!(
+            "atpkg: {}ay, clean",
+            atpkg::cli::NET_INSTALLED_MARKER
+        )) {
             Some(Wake::PkgSeed { installed, .. }) => assert_eq!(installed, ["ay", "clean"]),
             other => panic!("expected PkgSeed for the network lane, got {other:?}"),
         }
@@ -16919,6 +17295,65 @@ static JUST_UPDATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 pub fn attach_parent_console() {
     win32::attach_parent_console();
 }
+
+/// The raw `windowing_behavior` setting (`$ATERM_WINDOWING_BEHAVIOR`, else the
+/// `aterm.toml` key), or `None` when neither is set. The STRING, not a parsed
+/// policy: `aterm-cli` owns the front-door grammar and this crate does not
+/// depend on it, so the value crosses the boundary as text and is parsed once,
+/// in one place, by `aterm_cli::WindowingBehavior`.
+///
+/// Read here, and NOT through [`app_config::load_config`], on purpose. This runs
+/// on the front door of every launch — including the ones that end up spawning a
+/// window anyway — so it must be a bounded file read and a parse, with no
+/// diagnostics: `load_config` prints "ignoring invalid config …" on stderr,
+/// which would fire this warning a second time (the window prints it moments
+/// later) and would put a config complaint in front of a `-d` typo the operator
+/// is actually chasing. A config too broken to parse simply yields the default
+/// policy, which is today's behaviour and therefore the safe answer.
+///
+/// The env var wins, matching every other `ATERM_*` twin, and is what makes the
+/// policy testable on a machine without editing the user's config file.
+///
+/// The TOML is deserialized into a one-field view rather than the whole
+/// [`app_config::Config`]. Serde ignores unknown fields, so the answer is
+/// identical — but this sits on the cold-start path the project instruments with
+/// `mark_rust_main_start`, and the same file is parsed again into a real `Config`
+/// moments later by `load_config`. Materializing ~200 `Option`s, several nested
+/// tables and their `Vec`s twice, to read one string, is a cost the launch does
+/// not have to pay.
+#[must_use]
+pub fn windowing_behavior_setting() -> Option<String> {
+    /// The one-key view of `aterm.toml`. `#[serde(default)]` + serde's
+    /// ignore-unknown-fields default make this parse every config the real
+    /// `Config` parses, and answer `None` for every one that has no such key.
+    #[derive(serde::Deserialize, Default)]
+    #[serde(default)]
+    struct WindowingBehaviorOnly {
+        windowing_behavior: Option<String>,
+    }
+
+    if let Some(env) = std::env::var("ATERM_WINDOWING_BEHAVIOR")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(env);
+    }
+    let path = app_config::config_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let view: WindowingBehaviorOnly = toml::from_str(&text).ok()?;
+    view.windowing_behavior
+}
+
+/// The command line Windows re-launches aterm with after a Restart-Manager
+/// reboot, a crash, or a hang (`RegisterApplicationRestart`).
+///
+/// Exported so the FRONT DOOR can pin in a test that it is a verb the routing
+/// policy never redirects and that the argv0 alias routes — this crate cannot
+/// assert either itself (it deliberately does not depend on `aterm-cli`). See
+/// `win32::register_application_restart` for why both properties matter.
+#[cfg(windows)]
+pub const OS_RESTART_COMMAND_LINE: &str = win32::RESTART_COMMAND_LINE;
 
 /// Anchor the broader shipped one-binary timing boundary before its router.
 ///
@@ -17467,6 +17902,23 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                  (the DirectComposition backdrop swapchain cannot carry the scRGB EDR tag); \
                  keeping hdr_glow — set hdr_glow = false to see the backdrop"
             );
+            // THE HONESTY GAP. This is the DEFAULT-CONFIG collision — `hdr_glow`
+            // is on unless the user turned it off — so it is the commonest reason
+            // a Windows user sets `background_material` and sees no Mica. And
+            // aterm-gui is a GUI-subsystem binary: launched from the Start Menu,
+            // a pinned tile or Explorer, the line above reaches NOBODY. Give it
+            // the two surfaces a windowed launch actually has: the in-window
+            // notice banner, and the `client=opaque(hdr_glow)` qualifier on
+            // `aterm-ctl chrome` so it is diagnosable with no console at all.
+            crate::config_notice::queue_deferred(
+                "background_material has no effect while hdr_glow is on (Windows): the HDR \
+                 swapchain and the Mica backdrop cannot coexist. Set hdr_glow = false and \
+                 relaunch."
+                    .to_string(),
+            );
+            platform_win::note_client_backdrop_declined(
+                platform_win::ClientBackdropDecline::HdrGlow,
+            );
         } else {
             aterm_gpu::request_dx12_visual_swapchain();
         }
@@ -17572,6 +18024,20 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                             "aterm-gui: background_material needs the GPU renderer; the backdrop \
                              is disabled this run (an already-created window may render blank — \
                              remove background_material or fix the GPU to recover)"
+                        );
+                        // Same honesty gap as the hdr_glow arm above, and reached
+                        // from the BACKEND BUILD THREAD — which is exactly why the
+                        // notice lane is a process-global queue the event loop
+                        // drains rather than a call into `App` (there is no `App`
+                        // here, and this thread must not touch one if there were).
+                        crate::config_notice::queue_deferred(
+                            "background_material is off this run: the GPU renderer did not \
+                             start, and the backdrop needs it. A window opened before this \
+                             point may render blank until relaunch."
+                                .to_string(),
+                        );
+                        platform_win::note_client_backdrop_declined(
+                            platform_win::ClientBackdropDecline::NoGpu,
                         );
                     }
                     (Backend::Cpu(build_cpu()), false)
@@ -18506,6 +18972,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         text_blending: config.text_blending_or_default(),
         font_thicken: config.font_thicken_or_default(),
         stem_gamma: config.stem_gamma_or_default(),
+        font_hinting: config.font_hinting_or_default(),
         font_variations,
         font_weight_dark_nudge: config.font_weight_dark_nudge_or_default(),
         render_knobs: app_config::RenderKnobs::from_config(&config),
@@ -18564,7 +19031,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             !headless && !bench_knobs::flood_quiet() && !config.serious_mode_or_default(),
         ),
         typing_sound_auditioned: config.trail_sound_voice(),
-        lock_modifiers: if headless { keymap::no_lock_modifiers } else { keymap::lock_modifiers },
+        lock_modifiers: if headless {
+            keymap::no_lock_modifiers
+        } else {
+            keymap::lock_modifiers
+        },
         user_input_recent: if headless {
             platform::no_recent_user_input_event
         } else {
@@ -21617,21 +22088,11 @@ mod multi_window_tests {
         assert!(app.structural_invariants_ok());
     }
 
-    /// RESIZE STREAK LICENSE — one gesture, one streak, and the discriminator is
-    /// the HAND, not the code path.
-    ///
-    /// A live drag fires a trailing settle every `RESIZE_THROTTLE` (~20 Hz), and
-    /// every one of those lands a real reflow with `resize_live_drag` CLEAR. So
-    /// licensing the streak on "this is a settle" grants ~20 per second for the
-    /// whole drag — the rainbow scribble the settle-only design existed to stop.
-    /// The license therefore keys on `last_resized_event_at`: mid-drag it is
-    /// milliseconds old and grants nothing; a full throttle window of silence
-    /// means the hand let go.
-    ///
-    /// Drives `apply_term_resize` directly at both ages, since that is where the
-    /// predicate lives and what every resize path funnels through.
+    /// Every committed resize is a coordinate-space reset. Even a hand-authored
+    /// drag cannot truthfully connect old cell geometry to the reflowed grid, so
+    /// mid-drag, settled-drag, and out-of-band commits all remain dark.
     #[test]
-    fn the_resize_license_is_granted_when_the_hand_stops_not_on_every_settle() {
+    fn every_resize_commit_retires_reflow_provenance_regardless_of_gesture_age() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
 
@@ -21647,24 +22108,224 @@ mod multi_window_tests {
             "a mid-drag settle must NOT license a streak (else ~20/sec of scribble)"
         );
 
-        // HAND STOPPED: the last interactive event is a full throttle window old.
+        // HAND STOPPED: age does not make incomparable coordinate spaces
+        // correlatable.
         app.windows.get_mut(&wid).unwrap().last_resized_event_at =
             Some(Instant::now() - crate::RESIZE_THROTTLE - std::time::Duration::from_millis(5));
-        assert!(app.apply_term_resize(wid, 32, 104), "geometry applies");
-        assert!(
-            app.windows[&wid].cursor_glow.reflow_hint_armed(),
-            "the settle after the hand stops licenses exactly one streak"
+        // Give the settled reflow a real cursor landing: shrinking a live
+        // logical line wraps the caret into the next row.
+        let term = app.pool.get(0).unwrap().term.clone();
+        term_lock(&term).process(&[b'x'; 75]);
+        let before = term_lock(&term).cursor();
+        assert!(app.apply_term_resize(wid, 32, 50), "geometry applies");
+        let after = term_lock(&term).cursor();
+        assert_ne!(
+            (before.row, before.col),
+            (after.row, after.col),
+            "fixture must exercise a real reflow landing"
         );
+        assert!(!app.windows[&wid].cursor_glow.reflow_hint_armed());
+        assert!(!app.windows[&wid].cursor_glow.is_active());
+        assert!(!app.windows[&wid].cursor_trail.is_active());
 
-        // OUT-OF-BAND (control-socket `resize`, font zoom, scale change): no
-        // interactive stamp at all — already one complete gesture, licensed.
+        // OUT-OF-BAND (control-socket `resize`, font zoom, scale change) is the
+        // same hard reset even without an interactive stamp.
         let mut fresh = App::headless_for_test();
         assert!(fresh.windows[&wid].last_resized_event_at.is_none());
-        assert!(fresh.apply_term_resize(wid, 28, 90), "geometry applies");
-        assert!(
-            fresh.windows[&wid].cursor_glow.reflow_hint_armed(),
-            "an out-of-band re-grid is its own gesture and is licensed"
+        let term = fresh.pool.get(0).unwrap().term.clone();
+        term_lock(&term).process(&[b'x'; 70]);
+        let before = term_lock(&term).cursor();
+        assert!(fresh.apply_term_resize(wid, 28, 40), "geometry applies");
+        let after = term_lock(&term).cursor();
+        assert_ne!(
+            (before.row, before.col),
+            (after.row, after.col),
+            "out-of-band fixture must exercise a real reflow landing"
         );
+        assert!(!fresh.windows[&wid].cursor_glow.reflow_hint_armed());
+        assert!(!fresh.windows[&wid].cursor_glow.is_active());
+        assert!(!fresh.windows[&wid].cursor_trail.is_active());
+    }
+
+    /// A committed resize changes the coordinate meaning of every retained
+    /// endpoint, even when reflow leaves the focused cursor at the same numeric
+    /// cell. Both engines retire before the new layout can seed; an authored
+    /// moving landing may arm a one-shot, but an unseeded first tick consumes it
+    /// dark rather than borrowing geometry from the old layout.
+    #[test]
+    fn committed_resize_retires_geometry_and_cannot_leak_its_reflow_licence() {
+        use std::time::Duration;
+
+        use crate::cursor_glow::{Geom, GlowStyle};
+        use crate::cursor_trail::TrailConfig;
+
+        let wid = WindowId(0);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.0,
+            warmth: 0.0,
+        };
+
+        let configure = |app: &mut App| {
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        };
+
+        // SAME-CELL completion: seed both engine anchors at A, resize an empty
+        // terminal (A remains A), then prove a cold A→B move stays dark.
+        let mut still = App::headless_for_test();
+        configure(&mut still);
+        let glow_cfg = still.glow_config();
+        assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
+        let before_geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 24,
+            cols: 80,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 640,
+            win_h: 384,
+            head: 0,
+        };
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        let seed = Instant::now();
+        {
+            let ws = still.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), seed, &glow_cfg, before_geom, &mut glow_out);
+            ws.cursor_trail
+                .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
+        }
+        assert!(still.apply_term_resize(wid, 30, 100));
+        assert!(
+            !still.windows[&wid].cursor_glow.reflow_hint_armed(),
+            "the synchronous same-cell completion retires its reflow class"
+        );
+        let moved = seed + Duration::from_millis(4);
+        let after_geom = Geom {
+            rows: 30,
+            cols: 100,
+            win_w: 800,
+            win_h: 480,
+            ..before_geom
+        };
+        let ws = still.windows.get_mut(&wid).unwrap();
+        assert_eq!(
+            ws.cursor_glow
+                .tick(Some((0, 1)), moved, &glow_cfg, after_geom, &mut glow_out,),
+            0
+        );
+        assert_eq!(
+            ws.cursor_trail
+                .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out,),
+            0
+        );
+        assert!(
+            glow_out.is_empty()
+                && trail_out.is_empty()
+                && ws.cursor_glow.halos().is_empty()
+                && ws.cursor_glow.under_quads().is_empty(),
+            "a later program move cannot borrow the completed resize"
+        );
+
+        // MOVING completion: a wrapped logical line changes the cursor cell,
+        // but the old-layout anchors were retired before reflow. The first
+        // post-resize tick can only seed the new coordinate space and consumes
+        // its one-shot dark; it must not connect across incomparable layouts.
+        let mut landing = App::headless_for_test();
+        configure(&mut landing);
+        let glow_cfg = landing.glow_config();
+        let term = landing.pool.get(0).unwrap().term.clone();
+        term_lock(&term).process(&[b'x'; 70]);
+        let before = term_lock(&term).cursor();
+        let before_cell = (before.row, before.col);
+        let seed = Instant::now();
+        glow_out.clear();
+        trail_out.clear();
+        {
+            let ws = landing.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow.tick(
+                Some(before_cell),
+                seed,
+                &glow_cfg,
+                before_geom,
+                &mut glow_out,
+            );
+            ws.cursor_trail
+                .tick(Some(before_cell), seed, &trail_cfg, &mut trail_out);
+        }
+        assert!(landing.apply_term_resize(wid, 30, 40));
+        let after = term_lock(&term).cursor();
+        let after_cell = (after.row, after.col);
+        assert_ne!(before_cell, after_cell, "fixture must move under reflow");
+        assert!(
+            !landing.windows[&wid].cursor_glow.is_active()
+                && !landing.windows[&wid].cursor_trail.is_active(),
+            "the resize commit retires every old-coordinate survivor"
+        );
+        let moved = seed + Duration::from_millis(4);
+        let after_geom = Geom {
+            rows: 30,
+            cols: 40,
+            win_w: 320,
+            win_h: 480,
+            ..before_geom
+        };
+        let ws = landing.windows.get_mut(&wid).unwrap();
+        let glow_fp = ws.cursor_glow.tick(
+            Some(after_cell),
+            moved,
+            &glow_cfg,
+            after_geom,
+            &mut glow_out,
+        );
+        let trail_fp = ws
+            .cursor_trail
+            .tick(Some(after_cell), moved, &trail_cfg, &mut trail_out);
+        assert_eq!((glow_fp, trail_fp), (0, 0));
+        assert!(
+            glow_out.is_empty()
+                && trail_out.is_empty()
+                && ws.cursor_glow.halos().is_empty()
+                && ws.cursor_glow.under_quads().is_empty(),
+            "an unseeded reflow landing cannot bridge old and new layouts"
+        );
+
+        // Tier 1: the shipping same-cell completion projects onto the derived
+        // fail-closed revocation transition. `RevokeQueued` is the model's
+        // shared abstraction for an armed host class whose owned landing is
+        // proven not to occur; retaining the class is the negative control.
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let mut armed = model.init_state();
+        armed.insert("strong_class", 1);
+        let mut revoked = armed.clone();
+        revoked.insert("strong_class", 0);
+        revoked.insert("queued_revoked", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &revoked,
+            Some("RevokeQueued"),
+            "same-cell resize reflow revocation",
+        );
+        assert!(ok, "same-cell resize revocation rejected: {why}");
+        let mut sticky = revoked;
+        sticky.insert("strong_class", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &sticky,
+            Some("RevokeQueued"),
+            "same-cell resize sticky-hint negative control",
+        );
+        assert!(!ok, "same-cell resize may not retain a reflow licence");
     }
 
     /// MPT-1 BEHAVIOUR IDENTITY, end to end: an all-tabs WIDTH settle across a
@@ -22409,7 +23070,10 @@ mod multi_window_tests {
         let bytes = codex_l_bytes(app.windows[&wid].mods, KeyEventType::Press);
         let ctrl_press = codex_l_bytes(ModifiersState::CONTROL, KeyEventType::Press);
         assert_eq!(bytes, ctrl_press);
-        assert_eq!(bytes, b"\x1b[108;5u", "headless: no lock bits, so the byte pin is exact");
+        assert_eq!(
+            bytes, b"\x1b[108;5u",
+            "headless: no lock bits, so the byte pin is exact"
+        );
         let next = project_focus_modifier_cache(&app, wid, 1, i64::from(bytes == ctrl_press));
         assert_conforms(&model, "PressL", &state, &next);
         state = next;
@@ -22424,7 +23088,10 @@ mod multi_window_tests {
             bytes, ctrl_release,
             "real release keeps the same authoritative Ctrl modifier"
         );
-        assert_eq!(bytes, b"\x1b[108;5:3u", "headless: no lock bits, so the byte pin is exact");
+        assert_eq!(
+            bytes, b"\x1b[108;5:3u",
+            "headless: no lock bits, so the byte pin is exact"
+        );
         assert!(!app.physical_press_owners.contains_key(&physical_l));
 
         // A genuine focused Ctrl-up remains authoritative too.
@@ -24213,6 +24880,9 @@ mod early_out_tests {
             // No tab strip in these unit frames (the disabled-strip sentinel), so the
             // key matches the byte-identical no-strip path.
             tab_strip: 0,
+            // No tab context menu in these unit frames — the closed sentinel keeps
+            // the key byte-identical to the pre-menu path.
+            tab_menu_fp: 0,
             // No Settings overlay in these unit frames — the closed sentinel keeps the
             // key byte-identical to the no-overlay path.
             settings_fp: 0,
@@ -24975,6 +25645,9 @@ mod tests {
         let mut emitted_trail = Vec::new();
         ws.cursor_trail
             .tick(Some((0, 0)), now, &trail_cfg, &mut emitted_trail);
+        // This synthetic four-cell hop is a generic authored landing, not a
+        // one-glyph echo (which the real classifier correctly re-anchors).
+        ws.cursor_trail.note_synthetic_move(now);
         ws.cursor_trail.tick(
             Some((0, 4)),
             now + Duration::from_millis(1),
@@ -26115,15 +26788,18 @@ mod tests {
         }
         // Concrete values: PAD_LOGICAL_PX=12, PAD_TOP_LOGICAL_PX=2, round(·scale),
         // font clamped — and FONT_PX, which is platform-split at its definition
-        // because it is denominated in the host's LOGICAL unit (12 on macOS/Linux
-        // where 1 logical px == 1 pt; 16 on Windows where 1 logical px == 1/96 in,
-        // so 16 is the same 12 pt). The literals are gated rather than derived from
+        // because it is denominated in the host's LOGICAL unit (12 on macOS where
+        // 1 logical px == 1 pt; 16 on Windows where 1 logical px == 1/96 in, so 16
+        // is 12 pt; 15 on Linux/BSD — the same 1/96-in unit, 11.25 pt, the R2
+        // desktop-reference size). The literals are gated rather than derived from
         // FONT_PX on purpose: writing `FONT_PX * s` here would restate the very
         // multiplication under test and the proof would pass for any constant.
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         let (f1x, f2x, f3x) = (12.0, 24.0, 36.0);
         #[cfg(windows)]
         let (f1x, f2x, f3x) = (16.0, 32.0, 48.0);
+        #[cfg(not(any(target_os = "macos", windows)))]
+        let (f1x, f2x, f3x) = (15.0, 30.0, 45.0);
         assert_eq!(
             MetricsView::for_scale(1.0),
             MetricsView {
@@ -28332,7 +29008,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            128,
+            133,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -28366,7 +29042,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 128-machine DesignOnly report shape must classify honestly"
+            "the real 133-machine DesignOnly report shape must classify honestly"
         );
     }
 
@@ -30481,9 +31157,11 @@ mod tab_strip_math_tests {
         prepend_strip_rows(&mut frame, &[strip_row], 16, 0, &mut Vec::new());
         // The composed frame is one row taller; the strip is row 0.
         assert_eq!(frame.rows, 4);
-        // The active tab's title 'z','s','h' appears in the strip row.
+        // The active tab's title 'z','s','h' appears in the strip row, at the
+        // content start (a chip-card band adds an interior pad after the
+        // gutter; the flat strip starts right after the single leading pad).
         let t0 = &segments[0];
-        let ts = (t0.start_col + 1) as usize;
+        let ts = t0.start_col as usize + 1 + usize::from(tab_bar::STRIP_CHIP_CARDS);
         assert_eq!(frame.cells[0][ts].ch, 'z');
         // The `+` affordance is present in the strip row.
         let plus = segments.last().unwrap();

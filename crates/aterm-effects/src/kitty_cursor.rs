@@ -613,6 +613,39 @@ impl Default for CursorCat {
 }
 
 impl CursorCat {
+    /// Retire an ordinary cursor-following flight after the host observes a
+    /// cursor relocation that no authored movement candidate owned.
+    ///
+    /// Collection hellos and the sing-along are independent, explicitly
+    /// promised presentations, so this fence leaves them alone.  An earned
+    /// typing flight, however, is positioned from the live caret every frame;
+    /// allowing it to survive a program-owned CUP would make the already-live
+    /// sprite jump to an unrelated cell even though the trail engine correctly
+    /// denied that move.
+    pub fn retire_unowned_cursor_motion(&mut self) {
+        if self.collection_hello || self.sing > 0.0 || matches!(self.state, State::Hidden) {
+            return;
+        }
+        self.momentum = TypingMomentum::default();
+        self.sustain = 0.0;
+        self.run_keys = 0;
+        self.last = None;
+        self.state = State::Hidden;
+        self.exit = CatExit::Plain;
+        self.flight = None;
+        self.stride = 0.0;
+        self.stride_at = None;
+        self.reaction = CatReaction::Cruise;
+        self.reaction_until = None;
+        self.discovery_until = None;
+        self.collection_paused_at = None;
+        self.colors = None;
+        if let Some(pending) = self.pending_look.take() {
+            self.look = pending;
+        }
+        self.reset_spine();
+    }
+
     /// Stamp one committed text keystroke: `forward` for a normal char / space /
     /// newline (the cursor advances), `!forward` for a backspace. Only text keys.
     pub fn on_key(&mut self, now: Instant, forward: bool) {
@@ -2108,6 +2141,33 @@ mod tests {
         }
         assert!(!c.is_active(), "a short burst does not earn the cat");
         assert_eq!(c.frame(t + Duration::from_millis(220)).alpha, 0);
+    }
+
+    #[test]
+    fn unowned_cursor_relocation_retires_only_the_earned_flying_episode() {
+        let now = Instant::now();
+        let mut earned = CursorCat {
+            state: State::Shown,
+            flight: Some(now),
+            ..CursorCat::default()
+        };
+        earned.momentum.set_value(now, 1.0);
+        assert!(earned.is_active());
+        earned.retire_unowned_cursor_motion();
+        assert!(!earned.is_active());
+        assert_eq!(earned.frame(now).alpha, 0);
+
+        let mut promised = CursorCat::default();
+        promised.on_collect(now, KittyLook::default());
+        promised.retire_unowned_cursor_motion();
+        assert!(promised.is_active(), "a collection hello is independently owned");
+        assert!(
+            promised
+                .frame(now + Duration::from_secs_f32(FADE_IN * 0.5))
+                .alpha
+                > 0,
+            "the independently owned hello remains visible after its fade-in begins"
+        );
     }
 
     /// A CASUAL burst — a word or two at speed — never summons the companion,

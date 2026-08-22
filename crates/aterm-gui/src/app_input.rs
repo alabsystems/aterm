@@ -401,13 +401,14 @@ pub(crate) mod paste_order {
     }
 
     /// Enqueue `ev` onto `master`'s FIFO so it reaches the PTY in submission order.
-    /// Returns `Err(ev)` (handing the event back) when no writer is available, so
-    /// the caller falls back to an inline write.
+    /// Returns whether the new job joined an already-pending FIFO. `Err(ev)`
+    /// hands the event back when no writer is available, so the caller falls
+    /// back to an inline write.
     pub(super) fn enqueue(
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
         ev: InputEvent,
-    ) -> Result<(), InputEvent> {
+    ) -> Result<bool, InputEvent> {
         let master = sink.master();
         let (tx, pending) = {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
@@ -421,7 +422,7 @@ pub(crate) mod paste_order {
         };
         // Claim the FIFO slot BEFORE releasing to the writer: a later keystroke on
         // this same (UI) thread then observes pending > 0 and queues behind us.
-        pending.fetch_add(1, Ordering::AcqRel);
+        let queued_behind_existing = pending.fetch_add(1, Ordering::AcqRel) > 0;
         ACTIVE.fetch_add(1, Ordering::AcqRel);
         // Claim the arrival here so the UI thread's `note_pty_write` cannot
         // consume it on the way out and book a channel push as the write.
@@ -447,7 +448,7 @@ pub(crate) mod paste_order {
             key_ns,
         };
         match tx.send(job) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(queued_behind_existing),
             Err(std::sync::mpsc::SendError(job)) => {
                 // Writer gone (should not happen while the entry lives): undo the
                 // counters and hand the event back for an inline write. Give the
@@ -478,7 +479,7 @@ pub(crate) mod paste_order {
     ) -> (crate::input::Egress, bool) {
         if is_ordering(sink.master()) {
             match enqueue(term, sink, ev.clone()) {
-                Ok(()) => (
+                Ok(_) => (
                     crate::input::Egress::Reported(crate::input::Delivery::Full),
                     false,
                 ),
@@ -518,6 +519,11 @@ pub(crate) mod paste_order {
         let master = sink.master();
         let (_tx, pending) = {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
+            // Test pipes reuse raw fd numbers aggressively. Mirror `enqueue`'s
+            // stale-session pruning before resolving by that number, or a pin
+            // can attach to a dead serializer from the previous fixture while
+            // the real enqueue creates a fresh unpinned one.
+            reg.retain(|_, s| s.sink.strong_count() > 0);
             writer_for(&mut reg, master, sink).expect("egress-order writer thread")
         };
         pending.fetch_add(1, Ordering::AcqRel);
@@ -725,6 +731,46 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
         Key::Named(NamedKey::Home) => Some(ScrollIntent::Top),
         Key::Named(NamedKey::End) => Some(ScrollIntent::Bottom),
         _ => None,
+    }
+}
+
+/// C5 — whether this press is the OS "show the context menu" chord aterm is
+/// allowed to CLAIM: the dedicated Menu / Application key, or Shift+F10 (the
+/// keyboard equivalent Windows has shipped since NT, and the one every Windows
+/// accessibility guide names). Shift is required for the F10 spelling because
+/// bare F10 is a real terminal function key an app is entitled to receive.
+///
+/// Written over the ENGINE key rather than the winit one so the physical route
+/// (`on_key`) and the convergence seam (`tab_menu_input_event`, where
+/// `aterm ctl key menu` arrives) ask the SAME question of the same value. That
+/// is not tidiness: a chord the glass claims and the controller does not is a
+/// feature no one can verify through aterm's own introspection surface.
+///
+/// A free function, and NOT a `keybinding::Action`, on purpose: this is an OS
+/// convention like Alt+Space, not an aterm command, and putting it in the
+/// rebindable table would invite a config that silently SHADOWS the only
+/// keyboard route to the menu. The escape hatch is `policy` — a one-key
+/// surrender ([`TabMenuChord`]) that can only ever give keys back.
+///
+/// `policy` is the user's standing choice; the ORTHOGONAL, always-on deference
+/// to a kitty-protocol client lives in `App::front_defers_tab_menu_chord`,
+/// which the callers `&&` in — a key the front application negotiated for is
+/// never claimed no matter what this returns.
+#[cfg(windows)]
+fn tab_menu_chord(
+    policy: crate::app_config::TabMenuChord,
+    mods: aterm_types::keyboard::Modifiers,
+    key: &aterm_types::keyboard::Key,
+) -> bool {
+    use aterm_types::keyboard::{Key as EKey, Modifiers, NamedKey as ENamed};
+    match key {
+        EKey::Named(ENamed::ContextMenu) => policy.claims_menu_key(),
+        EKey::Named(ENamed::F10) => {
+            policy.claims_shift_f10()
+                && mods.contains(Modifiers::SHIFT)
+                && !mods.intersects(Modifiers::CTRL | Modifiers::ALT | Modifiers::SUPER)
+        }
+        _ => false,
     }
 }
 
@@ -1004,6 +1050,320 @@ struct PressClass<'ev> {
     inert_modifier: bool,
 }
 
+/// Whether committed text can advance/reposition the terminal cursor. A run
+/// made only of combining marks, variation selectors or joiners is valid text
+/// but zero cells wide; arming a typed hint for it leaves a licence that an
+/// unrelated PTY move can borrow. Explicit tab/line movement remains eligible.
+fn committed_text_moves_cursor(text: &str) -> bool {
+    text.chars().any(|ch| matches!(ch, '\t' | '\n' | '\r')) || committed_text_cells(text, false) > 0
+}
+
+/// Exact terminal-cell advance represented by one committed Text/IME event.
+///
+/// Price the same grapheme clusters the terminal materializes. Scalar-summing
+/// widths overprices regional-indicator flags, skin-tone sequences and ZWJ
+/// families, while underpricing VS16 emoji such as `⚠️`; either mismatch leaves
+/// surplus/short typed credits that can be spent by a later TUI cursor hop.
+fn committed_text_cells(text: &str, ambiguous_width_double: bool) -> u16 {
+    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+    // A base-less run of combining marks/selectors/joiners does not advance
+    // the terminal even if the grapheme classifier groups those scalars into
+    // an emoji-shaped cluster. Preserve the no-licence law before applying
+    // cluster-aware width to real graphemes.
+    if aterm_grapheme::str_width(text) == 0 {
+        return 0;
+    }
+    let shaping = TextShapingConfig {
+        ambiguous_width: if ambiguous_width_double {
+            AmbiguousWidth::Double
+        } else {
+            AmbiguousWidth::Single
+        },
+        ..TextShapingConfig::default()
+    };
+    u16::try_from(aterm_grapheme::grapheme_width_with_config(text, &shaping).display_width)
+        .unwrap_or(u16::MAX)
+}
+
+fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
+    let width = if ambiguous_width_double {
+        aterm_grapheme::char_width_cjk(ch)
+    } else {
+        aterm_grapheme::char_width(ch)
+    };
+    u16::try_from(width).unwrap_or(u16::MAX)
+}
+
+/// Exact rendered cell material expected from one committed Text/IME event.
+/// The first scalar of each grapheme is the terminal cell's lead character;
+/// every additional display column is represented by the same `\0` convention
+/// as `Terminal::row_cols_into`. Oversized/control-only commits deliberately
+/// return `None` and receive no cursor-motion cosmetics.
+fn committed_expected_cells(
+    text: &str,
+    ambiguous_width_double: bool,
+) -> Option<aterm_effects::cursor_trail::ExpectedCellSpan> {
+    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+    let shaping = TextShapingConfig {
+        ambiguous_width: if ambiguous_width_double {
+            AmbiguousWidth::Double
+        } else {
+            AmbiguousWidth::Single
+        },
+        ..TextShapingConfig::default()
+    };
+    let mut graphemes = aterm_grapheme::split_graphemes_with_config(text, &shaping);
+    let grapheme = graphemes.next()?;
+    // `row_cols_into` carries one scalar per lead cell. Multi-scalar clusters
+    // (VS/ZWJ/modifier/combining sequences) therefore cannot be identified
+    // exactly and deliberately receive no movement candidate.
+    if graphemes.next().is_some() || grapheme.text.chars().count() != 1 {
+        return None;
+    }
+    let width = grapheme.width;
+    if !(1..=2).contains(&width) {
+        return None;
+    }
+    let lead = grapheme.text.chars().next()?;
+    let cells = std::iter::once(lead).chain(std::iter::repeat_n('\0', width - 1));
+    aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(cells)
+}
+
+fn direct_expected_cell(
+    ch: char,
+    ambiguous_width_double: bool,
+) -> Option<aterm_effects::cursor_trail::ExpectedCellSpan> {
+    let mut utf8 = [0u8; 4];
+    committed_expected_cells(ch.encode_utf8(&mut utf8), ambiguous_width_double)
+}
+
+#[derive(Clone, Copy)]
+struct CommittedMoveProof {
+    origin: (u16, u16),
+    target: (u16, u16),
+    material: (u16, u16),
+    expected: aterm_effects::cursor_trail::ExpectedCellSpan,
+    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
+    baseline_generation: aterm_effects::cursor_trail::ContentGeneration,
+}
+
+#[derive(Clone, Copy)]
+struct DeleteMoveProof {
+    origin: (u16, u16),
+    target: (u16, u16),
+    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
+    baseline_generation: aterm_effects::cursor_trail::ContentGeneration,
+}
+
+/// Predict the real Terminal cursor/material geometry for one simple scalar
+/// under the conservative full-width DECAWM subset. Margins, no-wrap, bottom
+/// scrolling, and larger clusters fail closed. A glyph that fills the margin
+/// leaves the cursor on the final cell with deferred-wrap armed; a glyph that
+/// starts at an already-pending margin resolves the wrap before materializing.
+fn committed_move_geometry(
+    origin: (u16, u16),
+    cells: usize,
+    rows: u16,
+    cols: u16,
+    pending_wrap: bool,
+    auto_wrap: bool,
+    horizontal_margins: bool,
+) -> Option<((u16, u16), (u16, u16))> {
+    if !auto_wrap || horizontal_margins || rows == 0 || cols == 0 || !(1..=2).contains(&cells) {
+        return None;
+    }
+    let (mut row, mut col) = origin;
+    if pending_wrap {
+        row = row.checked_add(1).filter(|row| *row < rows)?;
+        col = 0;
+    }
+    if cells == 2 && col.saturating_add(1) >= cols {
+        row = row.checked_add(1).filter(|row| *row < rows)?;
+        col = 0;
+    }
+    // Cross-row materialization also mutates wrap metadata and, for a wide
+    // pre-wrap, blanks the old-row tail. One-row evidence cannot prove that
+    // whole transition, so it stays deliberately dark.
+    if row != origin.0 {
+        return None;
+    }
+    let material = (row, col);
+    let advance = col.saturating_add(cells as u16);
+    let target = (row, advance.min(cols.saturating_sub(1)));
+    Some((target, material))
+}
+
+fn capture_committed_move_proof(
+    term: &aterm_core::terminal::Terminal,
+    expected: aterm_effects::cursor_trail::ExpectedCellSpan,
+    row: &mut Vec<char>,
+) -> Option<CommittedMoveProof> {
+    let cursor = term.cursor();
+    let origin = (cursor.row, cursor.col);
+    let rows = term.rows();
+    let cols = term.cols();
+    let (target, material) = committed_move_geometry(
+        origin,
+        expected.as_slice().len(),
+        rows,
+        cols,
+        term.grid().pending_wrap(),
+        term.modes().auto_wrap,
+        term.grid().has_horizontal_margins(),
+    )?;
+    term.row_cols_into(usize::from(material.0), row);
+    // Grid rows are sparse: an untouched row can materialize as zero cells,
+    // while the exact proof is deliberately a full visible-row snapshot.
+    // Fill the implicit tail just as the renderer and pipeline hosts do.
+    row.resize(usize::from(term.cols()), ' ');
+    let baseline = aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(row)?;
+    Some(CommittedMoveProof {
+        origin,
+        target,
+        material,
+        expected,
+        baseline,
+        baseline_generation: aterm_effects::cursor_trail::ContentGeneration {
+            process_sequence: term.pipeline_timestamps().process_sequence,
+            terminal_id: term.render_identity(),
+            alternate_screen: term.is_alternate_screen(),
+        },
+    })
+}
+
+fn capture_delete_move_proof(
+    term: &aterm_core::terminal::Terminal,
+    row: &mut Vec<char>,
+) -> Option<DeleteMoveProof> {
+    let cursor = term.cursor();
+    if cursor.col == 0 || term.grid().pending_wrap() {
+        return None;
+    }
+    let target = (cursor.row, cursor.col - 1);
+    term.row_cols_into(usize::from(cursor.row), row);
+    row.resize(usize::from(term.cols()), ' ');
+    let baseline = aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(row)?;
+    let erased = baseline.as_slice().get(usize::from(target.1))?;
+    if *erased == ' ' || *erased == '\0' {
+        return None;
+    }
+    // The conservative proof is plain EOL Backspace only. Mid-line editor
+    // semantics may shift/repaint an arbitrary suffix; without an operation
+    // token that suffix cannot be attributed to this key exactly.
+    let fill = baseline
+        .as_slice()
+        .iter()
+        .rposition(|cell| *cell != ' ')
+        .map_or(0, |index| index + 1);
+    if fill != usize::from(cursor.col) {
+        return None;
+    }
+    Some(DeleteMoveProof {
+        origin: (cursor.row, cursor.col),
+        target,
+        baseline,
+        baseline_generation: aterm_effects::cursor_trail::ContentGeneration {
+            process_sequence: term.pipeline_timestamps().process_sequence,
+            terminal_id: term.render_identity(),
+            alternate_screen: term.is_alternate_screen(),
+        },
+    })
+}
+
+fn committed_proof_still_current(
+    term: &aterm_core::terminal::Terminal,
+    origin: (u16, u16),
+    material_row: u16,
+    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
+    generation: aterm_effects::cursor_trail::ContentGeneration,
+    row: &mut Vec<char>,
+) -> bool {
+    let cursor = term.cursor();
+    let current_generation = aterm_effects::cursor_trail::ContentGeneration {
+        process_sequence: term.pipeline_timestamps().process_sequence,
+        terminal_id: term.render_identity(),
+        alternate_screen: term.is_alternate_screen(),
+    };
+    if (cursor.row, cursor.col) != origin || current_generation != generation {
+        return false;
+    }
+    term.row_cols_into(usize::from(material_row), row);
+    row.resize(usize::from(term.cols()), ' ');
+    row.as_slice() == baseline.as_slice()
+}
+
+/// Upgrade a pre-write proof only after synchronous inline delivery, provided
+/// the post-write Terminal is still byte-for-byte at that captured boundary.
+/// This is a separate seam so the delivery race has a real-code Tier-1 control:
+/// any intervening process generation, identity/screen/cursor change, or row
+/// mutation cancels both engines and all plain-Backspace poof provenance.
+fn arm_committed_move_after_inline(
+    window: &mut crate::WindowState,
+    term: &Terminal,
+    at: std::time::Instant,
+    typed: Option<CommittedMoveProof>,
+    delete: Option<DeleteMoveProof>,
+) -> bool {
+    let mut row = std::mem::take(&mut window.poof_row_buf);
+    let armed = if let Some(proof) = typed
+        && committed_proof_still_current(
+            term,
+            proof.origin,
+            proof.material.0,
+            proof.baseline,
+            proof.baseline_generation,
+            &mut row,
+        )
+        && window.cursor_glow.cursor_anchor() == Some(proof.origin)
+        && window.cursor_trail.cursor_anchor() == Some(proof.origin)
+    {
+        window.cursor_glow.note_typed_expected(
+            at,
+            proof.expected,
+            proof.target,
+            proof.material,
+            proof.baseline,
+            proof.baseline_generation,
+        );
+        window
+            .cursor_trail
+            .note_typed_expected(at, proof.expected, proof.target, proof.material);
+        window.cursor_glow.move_candidate_pending()
+            && window.cursor_trail.move_candidate_pending()
+    } else if let Some(proof) = delete
+        && committed_proof_still_current(
+            term,
+            proof.origin,
+            proof.origin.0,
+            proof.baseline,
+            proof.baseline_generation,
+            &mut row,
+        )
+        && window.cursor_glow.cursor_anchor() == Some(proof.origin)
+        && window.cursor_trail.cursor_anchor() == Some(proof.origin)
+    {
+        window.cursor_glow.note_delete_candidate(
+            at,
+            proof.target,
+            proof.baseline,
+            proof.baseline_generation,
+        );
+        window.cursor_trail.note_delete_expected(at, proof.target);
+        window.cursor_glow.move_candidate_pending()
+            && window.cursor_trail.move_candidate_pending()
+    } else {
+        false
+    };
+    if !armed {
+        window.cursor_glow.cancel_authored_move_candidate();
+        window.cursor_trail.cancel_authored_move_candidate();
+    }
+    window.poof_row_buf = row;
+    armed
+}
+
 fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
     let predict_candidate: Option<(Option<char>, bool)> = match ev {
@@ -1034,7 +1394,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
                 && !mods.contains(TMods::SUPER) =>
         {
             match key {
-                TKey::Character(_) => Some(true),
+                TKey::Character(c) if aterm_grapheme::char_width(*c) > 0 => Some(true),
                 TKey::Named(TNamed::Space | TNamed::Enter) => Some(true),
                 TKey::Named(TNamed::Backspace) => Some(false),
                 _ => None,
@@ -1043,7 +1403,7 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
         // A committed IME run is typed text: its echo advances the caret — and
         // can WRAP an Ink box exactly like a plain Character, so it must arm
         // the re-anchor hint.
-        InputEvent::Text(t) if !t.is_empty() => Some(true),
+        InputEvent::Text(t) if committed_text_moves_cursor(t) => Some(true),
         _ => None,
     };
     let navigation_key: bool = match ev {
@@ -1237,6 +1597,63 @@ fn feed_classified_press<T>(
 }
 
 impl App {
+    /// Supersede any unobserved exact cursor-move proof at a newer input
+    /// boundary. Unsupported/local input stays cosmetically dark, but it must
+    /// still close an older swallowed key's one-shot candidate.
+    pub(crate) fn cancel_cursor_move_candidate(&mut self, wid: WindowId) {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.cancel_authored_move_candidate();
+            ws.cursor_trail.cancel_authored_move_candidate();
+        }
+    }
+
+    /// Main-thread, session-resolving twin used by reply-bearing control
+    /// operations that have no `InputEvent` of their own (notably `signal`).
+    /// `false` means the named session stopped being visible before this fence;
+    /// there is then no matching window candidate to clear and the authorized
+    /// background operation may continue.
+    pub(crate) fn cancel_cursor_move_candidate_for_session(&mut self, session: u64) -> bool {
+        // Focus notifications from two OS windows are not ordered: B may gain
+        // focus before A reports its loss. Resolve every window currently
+        // presenting this session so an A-side proof cannot survive and become
+        // borrowable merely because `frontmost_window` already points at B.
+        let targets: Vec<_> = self
+            .windows
+            .keys()
+            .copied()
+            .filter(|wid| self.front_terminal(*wid).map(|terminal| terminal.session) == Some(session))
+            .collect();
+        for wid in &targets {
+            self.cancel_cursor_move_candidate(*wid);
+        }
+        !targets.is_empty()
+    }
+
+    /// External OS command surfaces (native menu key equivalents and
+    /// accessibility actions) can consume an input before `on_key`/`App::input`.
+    /// Give them the same candidate-only supersession boundary without
+    /// manufacturing a key, cadence heat, or terminal bytes.
+    pub(crate) fn cancel_front_cursor_move_candidate(&mut self) {
+        if let Some(wid) = self.frontmost_window {
+            self.cancel_cursor_move_candidate(wid);
+        }
+    }
+
+    /// Candidate-only ingress fence for native tab-strip wakes. AppKit's
+    /// custom TabView consumes mouse and accessibility gestures without a
+    /// winit pointer event, while controller `TabCmd` addresses the front
+    /// window. Keeping both spellings here makes the headless regression drive
+    /// the exact production boundary without fabricating an event loop.
+    pub(crate) fn cancel_tab_surface_cursor_move_candidate(
+        &mut self,
+        window: Option<WindowId>,
+    ) {
+        match window {
+            Some(wid) => self.cancel_cursor_move_candidate(wid),
+            None => self.cancel_front_cursor_move_candidate(),
+        }
+    }
+
     /// Phase 0.5 — the App::input CONVERGENCE SEAM (design Addendum A.2).
     ///
     /// The SOLE policy site for input egress. The byte-producing core lives in the
@@ -1508,7 +1925,10 @@ impl App {
     /// tenured program cat currently on glass there, else the launch kitty.
     /// Reads the tenure gate without advancing it (`&self`), so the palette
     /// resolver and the press agree.
-    pub(crate) fn promotable_kitty(&self, wid: WindowId) -> aterm_effects::kitty_registry::KittyLook {
+    pub(crate) fn promotable_kitty(
+        &self,
+        wid: WindowId,
+    ) -> aterm_effects::kitty_registry::KittyLook {
         self.windows
             .get(&wid)
             .and_then(|ws| ws.kitty_tenure.worn().map(|i| i.look))
@@ -1764,6 +2184,23 @@ impl App {
         {
             return InputOutcome::Ok;
         }
+        let release_only = matches!(
+            &ev,
+            InputEvent::Key {
+                event_type: aterm_types::keyboard::KeyEventType::Release,
+                ..
+            }
+        );
+        let input_superseded_candidate = if release_only {
+            false
+        } else {
+            let pending = self.windows.get(&wid).is_some_and(|ws| {
+                ws.cursor_glow.move_candidate_pending()
+                    || ws.cursor_trail.move_candidate_pending()
+            });
+            self.cancel_cursor_move_candidate(wid);
+            pending
+        };
         // SETTINGS MODAL: while the overlay owns this window, swallow PTY-bound input.
         // Human keys/clicks are already gated in `on_key`/`on_mouse_input`; CONTROLLER
         // bytes arrive HERE via `Wake::Input` (bypassing `on_key`), so the modal must
@@ -1833,6 +2270,27 @@ impl App {
                 }
                 return InputOutcome::Ok;
             }
+        }
+        // C5 TAB CONTEXT MENU: the engine-neutral twin of `on_key_tab_menu_mode`
+        // AND of `on_key`'s chord arm, in the same slot the winit route puts
+        // them — after the overlay gate, before the rename field. Controller
+        // `key` bytes arrive HERE and never pass through `on_key`, so without
+        // this the physical Menu key popped the card while `aterm ctl key menu`
+        // wrote `57363` to the PTY: the glass and the introspection mirror
+        // answering differently for the same key. A consumed PRESS is recorded
+        // in the same set the overlay gate uses, so its RELEASE is swallowed by
+        // the pre-gate check at the top of this function and a Kitty
+        // `REPORT_EVENT_TYPES` app is never left with an orphan.
+        if target_session.is_none() && self.tab_menu_input_event(wid, &ev) {
+            if let InputEvent::Key {
+                key, event_type, ..
+            } = &ev
+                && matches!(event_type, aterm_types::keyboard::KeyEventType::Press)
+                && let Some(ws) = self.windows.get_mut(&wid)
+            {
+                ws.overlay_consumed_keys.insert(key.clone());
+            }
+            return InputOutcome::Ok;
         }
         // INLINE RENAME FIELD: the engine-neutral twin of `on_key_rename_mode`.
         // Controller `key`/`text`/`paste` bytes arrive HERE (they never pass
@@ -1913,6 +2371,22 @@ impl App {
                 _ => InputOutcome::Ok,
             };
         };
+        // One injected clock sample for every press-like keyboard or paste
+        // dispatch.  The consuming arm receives this exact stamp; it must not
+        // resample deeper in a helper, or coupled one-shot licences can acquire
+        // subtly different freshness origins.  Releases and unrelated input
+        // retain their zero-clock-read path.
+        let input_now = match &ev {
+            InputEvent::Key {
+                event_type: aterm_types::keyboard::KeyEventType::Release,
+                ..
+            } => None,
+            InputEvent::Key { .. }
+            | InputEvent::Text(_)
+            | InputEvent::KeySequence(_)
+            | InputEvent::Paste(_) => Some(std::time::Instant::now()),
+            _ => None,
+        };
         match ev {
             // --- Keyboard egress (kills f/h; uniform k/g side-effects) ---------
             ev @ (InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)) => {
@@ -1944,7 +2418,7 @@ impl App {
                 // and repeated clock reads on the latency-critical key path. `Some`
                 // is exactly the `!is_release` gate: a release still pays no clock
                 // read and runs no press side-effect.
-                let input_now = (!is_release).then(std::time::Instant::now);
+                debug_assert_eq!(input_now.is_some(), !is_release);
                 // ONE pure classification of this press (see `PressClass`),
                 // shared by the pre-egress hint/predictor block and the
                 // post-egress cosmetic feeds.
@@ -1986,7 +2460,12 @@ impl App {
                         if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
                 );
                 let press_disturbs = !is_release && !is_repeat && !inert_modifier;
-                if let Some(input_now) = input_now {
+                // The exact pre-write proofs are produced only on a press-like
+                // event. Keep them available across the PTY dispatch below so
+                // the synchronous post-write fence can upgrade them; releases
+                // take the fail-closed tuple and can never arm or revoke one.
+                let (candidate_was_pending, typed_move_proof, delete_move_proof) =
+                    if let Some(input_now) = input_now {
                     self.reset_blink(wid);
                     // Predictive local echo (mosh-style): register the classified
                     // `predict_candidate` glyph so it can paint before the shell
@@ -2053,6 +2532,28 @@ impl App {
                         bed: self.config.trail_sound_bed_or_default(),
                         tone_melody: self.config.tone_melody_or_default(),
                     });
+                    // Proof capture is eligible only when both engines own the
+                    // exact same source and no earlier commit is still pending.
+                    // In a split layout those anchors are window-space while
+                    // Terminal's cursor is pane-local, so the three-way check
+                    // below deliberately declines rather than guessing an
+                    // offset in the input owner.
+                    // Reuse the window's row scratch so the key hot path does
+                    // not allocate or scan a row for unseeded/mismatched state.
+                    let (candidate_origin, candidate_was_pending, mut proof_row_buf) = self
+                        .windows
+                        .get_mut(&wid)
+                        .map_or((None, false, None), |ws| {
+                            let pending = input_superseded_candidate
+                                || ws.cursor_glow.move_candidate_pending()
+                                || ws.cursor_trail.move_candidate_pending();
+                            let origin = (!pending)
+                                .then(|| ws.cursor_glow.cursor_anchor())
+                                .flatten()
+                                .filter(|origin| ws.cursor_trail.cursor_anchor() == Some(*origin));
+                            let buf = origin.map(|_| std::mem::take(&mut ws.poof_row_buf));
+                            (origin, pending, buf)
+                        });
                     // ONE term-lock scope for every press-path terminal touch: the
                     // viewport snap, the "typing deselects" clear, and the predictor's
                     // cursor/cols/alt sample. These were three separate acquisitions
@@ -2060,7 +2561,17 @@ impl App {
                     // independently behind the PTY reader's 8 KiB process() bouts
                     // during output floods. The redraw side-effects run AFTER the
                     // guard drops — never window calls under the term lock.
-                    let (scrolled, cleared, sample, is_alt, kitty_owns_keyboard, term_cols) = {
+                    let (
+                        scrolled,
+                        cleared,
+                        sample,
+                        is_alt,
+                        kitty_owns_keyboard,
+                        term_cols,
+                        ambiguous_width_double,
+                        typed_move_proof,
+                        delete_move_proof,
+                    ) = {
                         let mut t = term_lock(&term);
                         // SELECTION CUSTODY (R1). `press_disturbs` short-circuits
                         // BEFORE the two reads, so an inert modifier / repeat /
@@ -2105,6 +2616,41 @@ impl App {
                         // the keystroke actually went to). Unconditional and
                         // scalar: the `sample` above is gated on the predictor.
                         let term_cols = t.cols();
+                        let ambiguous_width_double = t.modes().ambiguous_width_double;
+                        let typed_expected = (typed_forward == Some(true) && !enter_like)
+                            .then(|| {
+                                ime.and_then(|text| {
+                                    committed_expected_cells(text, ambiguous_width_double)
+                                })
+                                .or_else(|| {
+                                    typed.and_then(|ch| {
+                                        direct_expected_cell(ch, ambiguous_width_double)
+                                    })
+                                })
+                            })
+                            .flatten();
+                        let terminal_origin = {
+                            let cursor = t.cursor();
+                            (cursor.row, cursor.col)
+                        };
+                        let proof_eligible = candidate_origin == Some(terminal_origin);
+                        let typed_move_proof = proof_eligible
+                            .then(|| {
+                                typed_expected.zip(proof_row_buf.as_mut()).and_then(
+                                    |(expected, row)| {
+                                        capture_committed_move_proof(&t, expected, row)
+                                    },
+                                )
+                            })
+                            .flatten();
+                        let delete_move_proof = (proof_eligible
+                            && typed_forward == Some(false))
+                            .then(|| {
+                                proof_row_buf
+                                    .as_mut()
+                                    .and_then(|row| capture_delete_move_proof(&t, row))
+                            })
+                            .flatten();
                         (
                             scrolled,
                             cleared,
@@ -2112,8 +2658,16 @@ impl App {
                             is_alt,
                             kitty_owns_keyboard,
                             term_cols,
+                            ambiguous_width_double,
+                            typed_move_proof,
+                            delete_move_proof,
                         )
                     };
+                    if let Some(buf) = proof_row_buf.take()
+                        && let Some(ws) = self.windows.get_mut(&wid)
+                    {
+                        ws.poof_row_buf = buf;
+                    }
                     // Publish what this press learned so the matching key RELEASE can
                     // decide LOCK-FREE whether it has anything to encode. Without a
                     // negotiated `REPORT_EVENT_TYPES` the encoder returns an empty vec
@@ -2143,6 +2697,11 @@ impl App {
                     // lock.
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
+                        // Every newer press supersedes an unobserved candidate.
+                        // Class-specific code below may arm a new exact proof;
+                        // raw/unsupported input deliberately leaves both dark.
+                        ws.cursor_glow.clear_typed(input_now);
+                        ws.cursor_trail.clear_typed();
                         // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
                         // content present after the key would not correlate it with THIS
                         // keystroke: in a session that is already streaming (a build log,
@@ -2196,54 +2755,17 @@ impl App {
                         // to arm (cheap scalar bumps); only the fire style reads it.
                         if typed_forward == Some(false) {
                             ws.cursor_glow.note_backspace(input_now);
-                            // The trail engine shares the re-anchor hint: a
-                            // Backspace at an Ink wrap boundary re-anchors the
-                            // caret UP a row — same repaint choreography, same
-                            // "lay no comet across cells the caret never swept".
-                            // Armed ALWAYS (like the typed hint below): the
-                            // engine-side alt/repaint-blink conjunct is the
-                            // discriminator — plain vim (alt screen, never
-                            // blinks inside DEC-2026) keeps its jump drama
-                            // through blink-absence, while full-redraw agent
-                            // TUIs (including Codex) re-anchor through their
-                            // per-keystroke repaint blink. The behavioral blink
-                            // is authoritative regardless of Kitty flags.
-                            ws.cursor_trail.note_typed(input_now);
                         }
-                        // Arm the TYPED-GLYPH hint on plain Character/Space
-                        // echoes — plus bare SHIFT+Enter (agent composers can
-                        // use Shift+Enter to INSERT a newline, a wrap-shaped move
-                        // that must re-anchor, not meteor; in a plain shell
-                        // its echo is a plain Enter move — dr==1 to col ~0,
-                        // shape-wrap-adjacent — so collapsing it to typing
-                        // reads right there too). A paired one-row move beyond
-                        // the typed advance is a TUI repaint RE-ANCHOR (an
-                        // Ink-style box rewraps per keystroke), never a jump.
-                        // Plain Enter, Tab, nav keys, and modified chords never
-                        // arm — their jumps keep the owner-mandated
-                        // meteors/ZOOMs. Armed ALWAYS: keyboard negotiation
-                        // does not classify repaint geometry. vim safety lives
-                        // in the engines — their re-anchor conjunct requires a
-                        // fresh REPAINT BLINK on the alt screen (the hide-inside-
-                        // DEC-2026 bracket only per-keystroke-repaint TUIs
-                        // emit), so vim's hinted one-row motions keep their
-                        // drama through blink-ABSENCE, not arming-absence.
-                        // Both cursor engines take the hint; bracketed paste is
-                        // not a Key event, so paste landings keep their jumps.
-                        // Alt-gated: agent-composer insert-newline lives on the alt
-                        // screen; in a plain (main-screen) shell Shift+Enter IS Enter
-                        // and keeps its meteor.
+                        // Feed only classifier/cadence state here. Movement
+                        // admission is stricter: after a successful inline PTY
+                        // write the host upgrades a simple same-row scalar to an
+                        // exact origin/content/target candidate. Plain Enter,
+                        // Shift+Enter, Tab, navigation and modified chords have
+                        // no causal landing proof and therefore stay dark even
+                        // when their classifier timestamps are fresh.
                         let shift_enter_insert = enter_like && !typed_enter && is_alt;
-                        // A COMPOSER NEWLINE IS AUTHORED, NOT A REPAINT. The
-                        // ribbon's TUI-relocation retirement treats a caret row
-                        // change with no scroll signal as a repaint that moved
-                        // the prompt, and retires the light on the vacated row —
-                        // correct for a redraw, wrong here, because the row above
-                        // still holds the glyphs this trail decorates and the
-                        // user put the caret on a new line deliberately. The
-                        // engine already accepts and consumes this signal; without
-                        // it a Shift+Enter in the composer eats its own previous
-                        // row's ribbon.
+                        // Composer-newline remains a useful morphology hint for
+                        // non-movement consumers, but it is never provenance.
                         if shift_enter_insert {
                             ws.cursor_glow.note_newline_break(input_now);
                         }
@@ -2260,12 +2782,16 @@ impl App {
                             // here trusts the PTY: the credit comes from the
                             // committed text itself.
                             let typed_cells: u16 = ime
-                                .map(|t| aterm_grapheme::str_width(t) as u16)
+                                .map(|text| committed_text_cells(text, ambiguous_width_double))
                                 .or_else(|| {
-                                    typed.map(|c| aterm_grapheme::char_width(c) as u16)
+                                    typed.map(|ch| committed_char_cells(ch, ambiguous_width_double))
                                 })
                                 .unwrap_or(1)
                                 .max(1);
+                            // Cadence/audio/activity see the commit now, but the
+                            // exact movement candidate is deferred until the
+                            // inline PTY write returns and the terminal proves
+                            // that no output raced ahead of delivery.
                             ws.cursor_glow.note_typed_cells(input_now, typed_cells);
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
@@ -2333,22 +2859,10 @@ impl App {
                                     w.request_redraw();
                                 }
                             }
-                        } else if enter_like && typed_forward == Some(true) {
-                            // A REAL Enter (deliberately NOT a typed hint — the
-                            // Rainbow Return snap needs its move to classify as
-                            // a jump): arm the RETURN license so the anti-stray
-                            // momentum gate lets a bare Enter at an idle prompt
-                            // keep its snap. A program's CUP never lands here.
-                            ws.cursor_glow.note_return(input_now);
                         }
-                        // Arm the KILL hint (erase poof): the paired content
-                        // change — or, for a reflowing TUI, the keypress itself
-                        // — puffs smoke; for fire it also escalates the quench.
-                        // Backward kills additionally ride the nav-hint
-                        // choreography (Ctrl-U's leap flies the meteor, no
-                        // field-wide flare); stationary kills must not.
+                        // The companion's delete reaction is independent of
+                        // the cursor-effect classifier established below.
                         if kill_key {
-                            ws.cursor_glow.note_kill(input_now, kill_moves);
                             // The companion's delete "oops" fires for span
                             // kills too: Ctrl-K/U/W, Alt-D, forward Delete,
                             // and word-backspaces erase text just as surely as
@@ -2365,20 +2879,10 @@ impl App {
                                 ws.cursor_cat.on_kill(input_now);
                             }
                         }
-                        // DISARM dangling typed hints on keys with their OWN
-                        // move semantics (plain Enter, nav, kills): a hint left
-                        // by a no-move echo (password prompt, vim x/r) must not
-                        // re-anchor the NEXT legit jump. RAINBOW RETURN: plain
-                        // Enter intentionally stays a real row-change jump, so
-                        // Rainbow kitty turns the submitted newline into its official
-                        // short rainbow snap/ZOOM. The glow's clear_typed also
-                        // drops a dangling backspace quench hint, so a no-move
-                        // backspace's surviving pairing cannot "re-anchor" a
-                        // following Ctrl-A/E and eat its meteor.
-                        // Tab joins the disarm set: with the re-anchor now
-                        // accepting dr == 0 (the box-growth wrap), a completion
-                        // landing after Tab must not pair with the previous
-                        // char's hint — completions keep their jump look.
+                        // Unsupported movement classes are supersession-only.
+                        // Return, Tab, navigation and kill chords do not carry
+                        // causal content/target evidence, so they close any
+                        // swallowed exact candidate but never arm a replacement.
                         if (typed_enter && !shift_enter_insert)
                             || navigation_key
                             || kill_key
@@ -2387,12 +2891,12 @@ impl App {
                             ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
                         }
-                        // Arm the fire NAVIGATION hint so the paired cursor move
-                        // (Ctrl-A/E, Home/End, arrows) ignites no fire — keeps
-                        // line-start/end navigation instant, never a blaze.
-                        if navigation_key {
-                            ws.cursor_glow.note_navigation(input_now);
-                            ws.cursor_trail.note_navigation(input_now);
+                        // Establish KILL AFTER the generic disarm. Moving kills
+                        // need `note_kill`'s fresh nav classifier; stationary
+                        // kills retain only their row-shrink poof proof and arm
+                        // no movement class.
+                        if kill_key {
+                            ws.cursor_glow.note_kill(input_now, kill_moves);
                         }
                         // Feed the kitty-cursor metric — DELETES ONLY, at the key.
                         // A backspace drains the cat's momentum at the KEY instant,
@@ -2543,7 +3047,14 @@ impl App {
                             }
                         }
                     }
-                }
+                    (
+                        candidate_was_pending,
+                        typed_move_proof,
+                        delete_move_proof,
+                    )
+                } else {
+                    (true, None, None)
+                };
                 // If a paste is currently draining for THIS session, submit this
                 // key onto the SAME per-session FIFO so it cannot overtake the
                 // pasted bytes (the submission-order fix). Otherwise the common
@@ -2560,6 +3071,55 @@ impl App {
                     input::EgressMode::Interactive,
                 );
                 let outcome = egress_to_outcome(egress);
+                // Exact cursor provenance begins only after a successful INLINE
+                // PTY write. Re-lock and require the terminal generation,
+                // identity, screen, cursor and full source row to remain exactly
+                // the pre-write snapshot. If output raced ahead (including an
+                // ultra-fast echo), the safe cosmetic result is dark; arming
+                // before delivery would let that unrelated batch borrow the key.
+                if wrote_inline
+                    && outcome == InputOutcome::Ok
+                    && !candidate_was_pending
+                    && let Some(armed_at) = input_now
+                    && (typed_move_proof.is_some() || delete_move_proof.is_some())
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    let t = term_lock(&term);
+                    let _ = arm_committed_move_after_inline(
+                        ws,
+                        &t,
+                        armed_at,
+                        typed_move_proof,
+                        delete_move_proof,
+                    );
+                }
+                if wrote_inline
+                    && outcome == InputOutcome::Ok
+                    && input_now.is_some()
+                    && typed_forward == Some(false)
+                    && delete_move_proof.is_none()
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    // A Backspace with no exact input-time EOL proof may still
+                    // edit normally, but its timestamp/quench state cannot
+                    // license a later unrelated shrink/poof.
+                    ws.cursor_glow.cancel_authored_move_candidate();
+                    ws.cursor_trail.cancel_authored_move_candidate();
+                }
+                // A queued key has not crossed the PTY boundary yet, and a
+                // failed inline write never will. Its arrival-time cursor
+                // licences must not be spendable by concurrent program output.
+                // This whole method is one event-loop turn, so effects cannot
+                // tick between the arm above and this timestamp-specific
+                // revoke; the safe cost is only missing cosmetics for the
+                // eventual queued echo.
+                if (!wrote_inline || outcome == InputOutcome::WriteFailed)
+                    && let Some(armed_at) = input_now
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    ws.cursor_glow.revoke_input_hints_at(armed_at);
+                    ws.cursor_trail.revoke_input_hints_at(armed_at);
+                }
                 // The PTY write has now RETURNED — close the key→write latency slice
                 // here (a press-path key only), so it isolates a blocking WriteFile
                 // within the end-to-end input_present interval. Paired with
@@ -2802,6 +3362,8 @@ impl App {
                     unreachable!()
                 };
                 if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.cursor_glow.cancel_authored_move_candidate();
+                    ws.cursor_trail.cancel_authored_move_candidate();
                     // `last_mouse_cell` is the PANE-LOCAL cell already published by
                     // `on_cursor_moved` (window cell minus the focused pane origin); do
                     // NOT clobber it with this event's coordinates — a follow-up press
@@ -2827,7 +3389,13 @@ impl App {
             ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &sink),
             // --- Explicit, tracking-agnostic scrollback nav (A.6) --------------
             InputEvent::ScrollView(intent) => self.input_scroll_view(wid, intent, &term),
-            ev @ InputEvent::Paste(_) => self.input_paste(wid, ev, &term, &sink),
+            ev @ InputEvent::Paste(_) => self.input_paste(
+                wid,
+                ev,
+                &term,
+                &sink,
+                input_now.expect("paste dispatch owns an injected input timestamp"),
+            ),
             // --- Geometry (range-reject reportable) ----------------------------
             InputEvent::Resize {
                 rows,
@@ -2842,6 +3410,13 @@ impl App {
             }
             // --- Focus reporting (kills j) -------------------------------------
             ev @ InputEvent::Focus(_) => {
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    // A focus report has no causally observable cursor target.
+                    // Whether the child consumes or ignores it, it supersedes
+                    // an older swallowed typed/delete proof.
+                    ws.cursor_glow.cancel_authored_move_candidate();
+                    ws.cursor_trail.cancel_authored_move_candidate();
+                }
                 // SOLE focus-report egress (in `seam_egress`): identical bytes to
                 // the engine's `encode_focus_state` (ESC[I / ESC[O), gated on DEC
                 // 1004. The GUI-visual blink/cursor-override side-effect stays in
@@ -2868,6 +3443,10 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.cancel_authored_move_candidate();
+            ws.cursor_trail.cancel_authored_move_candidate();
+        }
         // Carry the gesture-relevant fields out before `seam_egress` (which borrows
         // `ev`) for the tracking-OFF local fallback.
         let (button, pressed, row, col, click_count, side, block, suppress_copy_on_select) =
@@ -2931,6 +3510,10 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.cancel_authored_move_candidate();
+            ws.cursor_trail.cancel_authored_move_candidate();
+        }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6), stamped HOST-side
         // at the input funnel BEFORE egress: an alt-screen wheel becomes PTY
         // bytes (DEC-1007 arrows / mouse reports) whose echo advances
@@ -3340,6 +3923,12 @@ impl App {
         intent: ScrollIntent,
         term: &Arc<Mutex<Terminal>>,
     ) -> InputOutcome {
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            // Viewport control is not terminal-cursor authorship. Close an
+            // older candidate before the coordinate class changes.
+            ws.cursor_glow.cancel_authored_move_candidate();
+            ws.cursor_trail.cancel_authored_move_candidate();
+        }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6): PgUp/PgDn (and
         // the keybinding/controller scroll verbs) are reading intent exactly
         // like the wheel — stamp the same host-side quiet deadline when the
@@ -3425,20 +4014,35 @@ impl App {
         ev: InputEvent,
         term: &Arc<Mutex<Terminal>>,
         sink: &Arc<SinkWriter>,
+        _input_now: std::time::Instant,
     ) -> InputOutcome {
+        debug_assert!(matches!(&ev, InputEvent::Paste(_)));
         self.snap_to_bottom(wid);
+        // Paste is always asynchronous, so event-loop arrival is not delivery
+        // evidence. Supersede any older candidate and stay dark; a future
+        // completion-correlated text API can arm an exact content proof.
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.cursor_glow.cancel_authored_move_candidate();
+            ws.cursor_trail.cancel_authored_move_candidate();
+        }
         // Enqueue the paste on the session's ordered FIFO: it writes OFF the UI
         // thread (a 16 MiB paste into a stalled child must never block the event
         // loop) AND any keystroke submitted while it drains queues BEHIND it, so
         // the child sees the paste before that later input. Falls back to a
         // detached write only if the FIFO writer thread could not be spawned.
-        if let Err(ev) = paste_order::enqueue(term, sink, ev) {
-            let term = term.clone();
-            let sink = sink.clone();
-            std::thread::spawn(move || {
-                // Detached paste fallback: expendable thread, block under SPILL_CAP.
-                input::seam_egress(&term, &sink, &ev, input::EgressMode::Backpressured);
-            });
+        match paste_order::enqueue(term, sink, ev) {
+            Ok(_queued_behind_existing) => {}
+            Err(ev) => {
+                // Detached fallback has no delivery-completion edge back to
+                // the event loop. Fail closed: its asynchronous/unproven bytes
+                // cannot leave a movement licence live for concurrent output.
+                let term = term.clone();
+                let sink = sink.clone();
+                std::thread::spawn(move || {
+                    // Detached paste fallback: expendable thread, block under SPILL_CAP.
+                    input::seam_egress(&term, &sink, &ev, input::EgressMode::Backpressured);
+                });
+            }
         }
         InputOutcome::Ok
     }
@@ -4591,6 +5195,11 @@ impl App {
             self.release_physical_press(wid, ev.physical_key);
             return;
         }
+        // Every newer physical press is a supersession boundary, including a
+        // local overlay/keybinding/native-view action that returns before the
+        // PTY seam. Repeats are new attempts too; releases deliberately are not
+        // (they may precede a delayed echo from their delivered press).
+        self.cancel_cursor_move_candidate(wid);
         // A repeat belongs to the physical PRESS epoch, not to the content,
         // focus, modifiers, or keybinding state visible when winit delivers it.
         // Route it before even resetting this arrival window's blink: routing any
@@ -4633,6 +5242,48 @@ impl App {
                 &ev,
                 overlay_repeat.map(crate::LocalRepeatAction::Palette),
             );
+            return;
+        }
+        // C5 TAB CONTEXT MENU: an open popup owns the keyboard exactly as it
+        // owns the pointer — swallow every key BEFORE any keybinding,
+        // `[key_sequences]` rule or hardcoded chord can fire, mirroring the
+        // overlay gate directly above (and the modal gate ordering in
+        // `on_mouse_input`). Without this a configured rule would write RAW
+        // BYTES to the PTY from under a menu the user is aiming at.
+        if self.on_key_tab_menu_mode(wid, &ev) {
+            self.note_press_disposition(wid, &ev, None);
+            return;
+        }
+        // C5 — Shift+F10 / the Menu key POPS that same menu for the focused
+        // window's active tab. This is the Windows-wide "context menu for the
+        // focused thing" chord, and it is what makes the popup reachable
+        // without a mouse at all. It is deliberately NOT a rebindable `Action`:
+        // it is an OS convention like Alt+Space, not an aterm command, and
+        // seeding it into the keybinding table would let a config typo SHADOW
+        // the only keyboard route to the menu. `tab_menu_chord`'s `policy`
+        // argument is the escape hatch instead — a knob that can only surrender
+        // keys, never re-point them.
+        //
+        // WINDOWS ONLY. macOS chips carry a real `NSMenu` (⇧F10 is not a menu
+        // chord there); Linux has no ratified lane for a new modal surface —
+        // see the note on the `RightPressPlan::Chrome` arm in `app_mouse`.
+        //
+        // Two things can decline the claim, and both matter: `front_defers_…`
+        // hands the key back to a kitty-protocol client that negotiated for it,
+        // and `open_active_tab_context_menu` returns `false` for a window with
+        // no strip / no terminal tab. Either way the key falls through here
+        // UNTOUCHED and takes the ordinary encoder path.
+        #[cfg(windows)]
+        if let Some(ekey) = aterm_types::keyboard::map_logical_key(&ev.logical_key)
+            && tab_menu_chord(
+                self.config.tab_menu_chord_or_default(),
+                keymap::modifiers_from_winit(mods),
+                &ekey,
+            )
+            && !self.front_defers_tab_menu_chord(wid, &ekey)
+            && self.open_active_tab_context_menu(wid)
+        {
+            self.note_press_disposition(wid, &ev, None);
             return;
         }
         // INLINE RENAME FIELD (the in-grid strip's own editor): a focused text
@@ -5895,6 +6546,293 @@ impl App {
         }
     }
 
+    /// C5 — while a tab CONTEXT MENU is open on `wid`, drive it from the
+    /// keyboard and SWALLOW every key (return `true`); closed ⇒ `false` (keys
+    /// flow normally, byte-identical to the pre-menu path).
+    ///
+    /// The bindings are the Win32 menu ones, implemented here because a
+    /// self-drawn popup gets none of them for free (see the module note in
+    /// [`crate::tab_menu`] on why it is self-drawn):
+    ///   * ↑/↓ step the highlight over ENABLED actions only, wrapping;
+    ///   * Home/End jump to the first/last enabled action;
+    ///   * ↵ / Space activate the highlighted row;
+    ///   * Esc dismisses;
+    ///   * a bare MODIFIER or LOCK press is INERT — swallowed, card stays;
+    ///   * ANY other key dismisses AND IS SWALLOWED. That last rule is the
+    ///     deliberate one: a menu is a mode, and letting an unhandled keystroke
+    ///     both close the card and land in the shell would type into a terminal
+    ///     the user believed was behind a menu. (Win32 uses those keys as
+    ///     mnemonics; we have no mnemonic model, so the safe reading of an
+    ///     unknown key is "dismiss".)
+    ///
+    /// The highlight can only ever land on a row the card is SHOWING: a window
+    /// too short for the whole model truncates it, and `visible_entries` bounds
+    /// the walk so ↵ can never fire an action that is not on the glass.
+    ///
+    /// The key→meaning table itself lives in [`crate::tab_menu::nav_for_key`],
+    /// shared with the convergence seam's [`Self::tab_menu_input_event`] so a
+    /// hand and `aterm ctl key` drive the card identically. This function is
+    /// only the winit ADAPTER: it resolves the bare-modifier class with
+    /// `keymap::press_is_inert` (which also covers AltGr / Fn / Symbol, winit
+    /// spellings the engine has no `NamedKey` for at all) and maps everything
+    /// else onto the engine key the shared table reads.
+    fn on_key_tab_menu_mode(&mut self, wid: WindowId, ev: &KeyEvent) -> bool {
+        if !self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_some())
+        {
+            return false;
+        }
+        // SELECTION CUSTODY's inert class, reused verbatim: a bare Shift/Ctrl/
+        // Alt/AltGr/Caps/Num press must not dismiss the card. Without this,
+        // reaching for ⇧F10 to re-pop the menu dismisses it on the ⇧ half of
+        // the very chord that opened it.
+        let nav = if crate::keymap::press_is_inert(ev) {
+            crate::tab_menu::MenuNav::Inert
+        } else {
+            aterm_types::keyboard::map_logical_key(&ev.logical_key)
+                .as_ref()
+                .map_or(
+                    crate::tab_menu::MenuNav::Dismiss,
+                    crate::tab_menu::nav_for_key,
+                )
+        };
+        self.tab_menu_nav(wid, nav)
+    }
+
+    /// C5 — apply one [`MenuNav`](crate::tab_menu::MenuNav) to `wid`'s open
+    /// card. Returns whether a menu was open (i.e. whether the key is
+    /// swallowed); `false` leaves everything untouched.
+    ///
+    /// The SOLE mutator behind both routes, so the physical and controller
+    /// spellings of a key cannot drift apart in behaviour even if their
+    /// adapters drift in coverage.
+    fn tab_menu_nav(&mut self, wid: WindowId, nav: crate::tab_menu::MenuNav) -> bool {
+        use crate::tab_menu::MenuNav;
+        let Some((entries, highlight, limit)) = self.windows.get(&wid).and_then(|ws| {
+            let menu = ws.tab_menu.as_ref()?;
+            // No painted rect yet (the card popped this turn and the frame has
+            // not landed) ⇒ the whole model is a fair bound; the paint clamps.
+            let limit = ws
+                .tab_menu_rect
+                .map_or(menu.entries.len(), crate::tab_menu::visible_entries);
+            Some((menu.entries.clone(), menu.highlight, limit))
+        }) else {
+            return false;
+        };
+        let step = |from, down| crate::tab_menu::step_selectable(&entries, from, down, limit);
+        match nav {
+            MenuNav::Activate => match highlight {
+                Some(i) => self.activate_tab_menu_entry(wid, i),
+                // ↵ with nothing lit is a dismiss, not a guess.
+                None => {
+                    self.close_tab_menu(wid);
+                }
+            },
+            MenuNav::Dismiss => {
+                self.close_tab_menu(wid);
+            }
+            MenuNav::Down => self.set_tab_menu_highlight(wid, step(highlight, true)),
+            MenuNav::Up => self.set_tab_menu_highlight(wid, step(highlight, false)),
+            MenuNav::First => self.set_tab_menu_highlight(wid, step(None, true)),
+            MenuNav::Last => self.set_tab_menu_highlight(wid, step(None, false)),
+            // Swallowed and otherwise ignored — the card is untouched.
+            MenuNav::Inert => {}
+        }
+        true
+    }
+
+    /// C5 — whether the FRONT terminal's application has negotiated the keyboard
+    /// enhancement that makes `key` reportable, and so must keep it.
+    ///
+    /// A host gesture may only claim a key the application cannot otherwise
+    /// receive. The Menu / Application key is `57363` in this tree's kitty table
+    /// (`NamedKey::kitty_code`) and reaches an app under `DISAMBIGUATE_ESC_CODES`
+    /// or `REPORT_ALL_KEYS_AS_ESC` — in every other mode the legacy encoder has
+    /// no sequence for it and the press produces zero bytes, so binding it to
+    /// chrome takes nothing from anybody. Shift+F10 is different: it encodes as
+    /// `ESC[21;2~` in plain legacy too, so only the strongest contract —
+    /// `REPORT_ALL_KEYS_AS_ESC`, literally "report every key" — buys it back
+    /// automatically; a user who wants it back unconditionally sets
+    /// `tab_menu_chord = "menu_key"`.
+    ///
+    /// Reads the two NARROW read-only projections on `Terminal`
+    /// (`kitty_reports_functional_keys` / `kitty_report_all_keys`) under ONE
+    /// lock. It never calls an encoder — the seam remains the sole caller of
+    /// `encode_key_with_layout`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn front_defers_tab_menu_chord(
+        &self,
+        wid: WindowId,
+        key: &aterm_types::keyboard::Key,
+    ) -> bool {
+        use aterm_types::keyboard::{Key as EKey, NamedKey as ENamed};
+        let Some(term) = self.front_terminal(wid).map(|m| m.term.clone()) else {
+            return false;
+        };
+        let tl = crate::term_lock(&term);
+        match key {
+            EKey::Named(ENamed::ContextMenu) => tl.kitty_reports_functional_keys(),
+            EKey::Named(ENamed::F10) => tl.kitty_report_all_keys(),
+            _ => false,
+        }
+    }
+
+    /// C5 — the CONVERGENCE-SEAM twin of [`Self::on_key_tab_menu_mode`] plus the
+    /// `on_key` chord arm: the tab context menu, driven by an engine-neutral
+    /// [`InputEvent`](crate::input::InputEvent). Returns `true` when the event is
+    /// consumed by the menu (the caller then swallows it from the PTY).
+    ///
+    /// This exists because `aterm ctl key menu` / `ctl key shift+f10` arrive
+    /// HERE via `Wake::Input` and never pass through `on_key` at all. Without it
+    /// the physical Menu key popped a card while the controller wrote `57363`
+    /// to the PTY — the glass and the introspection mirror answering differently
+    /// for the same key, which makes the whole feature unverifiable through
+    /// aterm's own control surface. Same shape, and same reason, as
+    /// `rename_input_event` being the engine-neutral twin of the in-grid rename.
+    ///
+    /// EVERY input class the card is modal over is handled, but the POINTER is
+    /// handled at LOWER RESOLUTION than the glass, and that is deliberate.
+    /// `InputEvent::MouseButton` carries a GRID cell; the card's recorded rect
+    /// is in FRAME coordinates and its hit-test (`tab_menu_probe`) is fed by
+    /// physical pixels, so a controller press cannot be resolved against the
+    /// card without inventing a second, differently-derived geometry — and two
+    /// geometries for one card is exactly the class of bug this whole function
+    /// exists to remove. So a controller press CANNOT activate a row; it does
+    /// the other thing every press off a menu does — dismisses, and is
+    /// consumed. What matters, and what holds on both routes, is the invariant:
+    /// while the card is up, no pointer event reaches the PTY or the viewport.
+    /// (The human pointer never arrives here at all: `on_mouse_input` /
+    /// `on_cursor_moved` / their gates return before the seam.)
+    pub(crate) fn tab_menu_input_event(
+        &mut self,
+        wid: WindowId,
+        ev: &crate::input::InputEvent,
+    ) -> bool {
+        use crate::input::InputEvent;
+        use aterm_types::keyboard::KeyEventType;
+        let open = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu.is_some());
+        if open {
+            return match ev {
+                InputEvent::Key {
+                    event_type: KeyEventType::Release,
+                    ..
+                } => {
+                    // A RELEASE is not a menu command. Its PRESS was recorded in
+                    // the caller's consumed-press set, which swallows the pair
+                    // before this gate is reached; an UNTRACKED release belongs
+                    // to a press that predates the card and must still reach a
+                    // Kitty `REPORT_EVENT_TYPES` app, exactly as the overlay
+                    // gate above reasons.
+                    false
+                }
+                InputEvent::Key { key, .. } => {
+                    self.tab_menu_nav(wid, crate::tab_menu::nav_for_key(key))
+                }
+                // Committed text, a `[key_sequences]` payload and a paste are all
+                // "an unhandled keystroke" by the card's rule: dismiss and
+                // swallow rather than let raw bytes out from under a menu.
+                InputEvent::Text(_) | InputEvent::KeySequence(_) | InputEvent::Paste(_) => {
+                    self.close_tab_menu(wid);
+                    true
+                }
+                // A controller PRESS cannot be resolved against the card (see
+                // the scope note above), so it takes the other outcome every
+                // press off a menu has: dismiss, and be CONSUMED. The matching
+                // RELEASE and any motion are swallowed with it, so a tracking
+                // TUI is never handed half a press pair from under a modal.
+                InputEvent::MouseButton {
+                    button,
+                    pressed: true,
+                    ..
+                } => {
+                    self.close_tab_menu(wid);
+                    // The dismiss CLOSED the card, so the matching release will
+                    // find `open` already false. Latch the button so the closed
+                    // path below still swallows it.
+                    if let Some(ws) = self.windows.get_mut(&wid) {
+                        ws.tab_menu_consumed_button = Some(*button);
+                    }
+                    true
+                }
+                // The wheel needs no hit test at all: while the card is up a
+                // notch scrolls nothing and reports nothing, on either route.
+                InputEvent::MouseButton { .. }
+                | InputEvent::MouseMove { .. }
+                | InputEvent::Wheel { .. }
+                | InputEvent::ScrollView(_) => true,
+                _ => false,
+            };
+        }
+        // Closed — but a press that DISMISSED the card may still be down. Its
+        // release (and any drag motion before it) is swallowed so the pair the
+        // modal ate stays whole: handing a tracking TUI a release whose press it
+        // never saw is the same defect as the orphan key release the
+        // consumed-press sets exist to prevent. Only the latched button is
+        // eaten; a different button falls through as ordinary input.
+        if self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_menu_consumed_button.is_some())
+        {
+            match ev {
+                InputEvent::MouseButton {
+                    button,
+                    pressed: false,
+                    ..
+                } => {
+                    if let Some(ws) = self.windows.get_mut(&wid)
+                        && ws.tab_menu_consumed_button == Some(*button)
+                    {
+                        ws.tab_menu_consumed_button = None;
+                        return true;
+                    }
+                }
+                InputEvent::MouseMove { .. } => return true,
+                _ => {}
+            }
+        }
+
+        // Closed: the chord may POP it. Windows only, and only for a genuine
+        // PRESS — a repeat of a held Menu key must not re-pop a card the first
+        // press already opened (and then closed, on the second press's own
+        // dismiss rule).
+        #[cfg(windows)]
+        if let InputEvent::Key {
+            key,
+            mods,
+            event_type: KeyEventType::Press,
+            ..
+        } = ev
+            && tab_menu_chord(self.config.tab_menu_chord_or_default(), *mods, key)
+            && !self.front_defers_tab_menu_chord(wid, key)
+        {
+            return self.open_active_tab_context_menu(wid);
+        }
+        false
+    }
+
+    /// C5 — set the open menu's highlight and repaint if it moved.
+    fn set_tab_menu_highlight(&mut self, wid: WindowId, to: Option<usize>) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        let Some(menu) = ws.tab_menu.as_mut() else {
+            return;
+        };
+        if menu.highlight == to {
+            return;
+        }
+        menu.highlight = to;
+        if let Some(w) = &ws.os_window {
+            w.request_redraw();
+        }
+    }
+
     /// While the Settings overlay is open on `wid`, drive it from the keyboard and
     /// SWALLOW every key (return `true`) so nothing reaches the PTY (design §6):
     /// Tab/⇧Tab toggle the sidebar/content panes; sidebar ↑/↓ move the category and
@@ -6312,8 +7250,14 @@ impl App {
             // the human `on_mouse_wheel` path converges HERE too (the modal gate in
             // [`Self::input`] routes a swallowed Wheel to this handler), so mouse and
             // controller wheel scrolling are one code path.
-            InputEvent::Wheel { dir_up, lines, .. } => {
-                let delta = if *dir_up {
+            InputEvent::Wheel { dir, lines, .. } => {
+                // The panel is a VERTICAL list; a horizontal flick (audit I7)
+                // has nothing to move here, so it is swallowed rather than
+                // being folded into the vertical delta.
+                let Some(up) = dir.vertical_up() else {
+                    return;
+                };
+                let delta = if up {
                     -(*lines as isize)
                 } else {
                     *lines as isize
@@ -6525,6 +7469,10 @@ impl App {
         text: String,
         cursor: Option<(usize, usize)>,
     ) {
+        // Preedit is a newer user-input boundary but has no PTY delivery or
+        // causally correlated landing. Retire a swallowed older proof before
+        // native/modal handling can return locally.
+        self.cancel_cursor_move_candidate(wid);
         // Track the composition on the WINDOW before any native-tab routing:
         // `ws.preedit` feeds `on_key`'s suppress_direct_send gate, so a preedit
         // that resolves while a native tab is frontmost must still update it —
@@ -6639,6 +7587,10 @@ impl App {
     /// engine path (each grapheme encoded as a `Character` key, NOT `& 0x1f`), so
     /// it goes out exactly as typed text. Clears the selection like any typing.
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
+        // This fence must precede every early consumer below (native tabs,
+        // rename/find fields, and the empty commit). A simple terminal commit
+        // may arm its own exact post-delivery proof later in `App::input`.
+        self.cancel_cursor_move_candidate(wid);
         // End the composition on the WINDOW even when a native tab consumes the
         // committed text — the same stale-preedit hazard as `on_ime_preedit`.
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -6858,6 +7810,7 @@ impl App {
     /// ever constructs the variant), so it stays warning-clean on every target.
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
         use menu::MenuAction;
+        self.cancel_front_cursor_move_candidate();
         if self.divert_menu_action_around_rename(action) {
             return;
         }
@@ -10217,10 +11170,15 @@ mod smooth_scroll_tests {
 
 #[cfg(test)]
 mod keystroke_press_side_effect_tests {
+    use std::time::Instant;
+
+    use super::{
+        classify_press, committed_char_cells, committed_text_cells, committed_text_moves_cursor,
+    };
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_core::selection::{SelectionSide, SelectionType};
-    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey as TNamed};
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
     fn key(event_type: KeyEventType) -> InputEvent {
         InputEvent::Key {
@@ -10305,16 +11263,16 @@ mod keystroke_press_side_effect_tests {
         // may move the viewport or drop the highlight — this is what made ⌘-C
         // copy nothing.
         for k in [
-            Key::Named(TNamed::SuperLeft),
-            Key::Named(TNamed::SuperRight),
-            Key::Named(TNamed::ShiftLeft),
-            Key::Named(TNamed::ControlLeft),
-            Key::Named(TNamed::AltLeft),
-            Key::Named(TNamed::MetaLeft),
-            Key::Named(TNamed::HyperLeft),
-            Key::Named(TNamed::CapsLock),
-            Key::Named(TNamed::NumLock),
-            Key::Named(TNamed::ScrollLock),
+            Key::Named(NamedKey::SuperLeft),
+            Key::Named(NamedKey::SuperRight),
+            Key::Named(NamedKey::ShiftLeft),
+            Key::Named(NamedKey::ControlLeft),
+            Key::Named(NamedKey::AltLeft),
+            Key::Named(NamedKey::MetaLeft),
+            Key::Named(NamedKey::HyperLeft),
+            Key::Named(NamedKey::CapsLock),
+            Key::Named(NamedKey::NumLock),
+            Key::Named(NamedKey::ScrollLock),
         ] {
             let _ = app.input(wid, modifier_press(k.clone()), Source::Human);
             let t = term_lock(&term);
@@ -10334,6 +11292,286 @@ mod keystroke_press_side_effect_tests {
         let t = term_lock(&term);
         assert_eq!(t.grid().display_offset(), 0, "press snaps to bottom");
         assert!(!t.text_selection().has_selection(), "press deselects");
+    }
+
+    #[test]
+    fn zero_width_commits_and_stationary_kills_arm_no_cursor_move() {
+        use std::time::Duration;
+
+        use crate::cursor_glow::{CursorGlow, Geom, GlowStyle};
+        use crate::cursor_trail::TrailConfig;
+
+        let combining = InputEvent::Text("\u{0301}\u{fe0f}\u{200d}".to_string());
+        assert!(!committed_text_moves_cursor("\u{0301}\u{fe0f}\u{200d}"));
+        assert_eq!(classify_press(&combining).typed_forward, None);
+        assert!(committed_text_moves_cursor("中🙂"));
+        for (text, cells) in [("⚠️", 2), ("🇺🇸", 2), ("👨‍👩‍👧‍👦", 2), ("中", 2), ("中🙂", 4)]
+        {
+            assert_eq!(
+                committed_text_cells(text, false),
+                cells,
+                "Text/IME credit must match terminal grapheme materialization for {text:?}"
+            );
+        }
+        assert_eq!(
+            committed_text_cells("\u{0301}\u{fe0f}\u{200d}", false),
+            0,
+            "combining/VS/joiner-only commits own no cells"
+        );
+        assert_eq!(
+            committed_text_cells("°", false),
+            1,
+            "single-width mode prices an ambiguous grapheme as one terminal cell"
+        );
+        assert_eq!(
+            committed_text_cells("°", true),
+            2,
+            "CJK ambiguous-double mode prices the same grapheme as two terminal cells"
+        );
+        assert_eq!(committed_char_cells('°', false), 1);
+        assert_eq!(
+            committed_char_cells('°', true),
+            2,
+            "direct Character input follows the same terminal CJK-width mode"
+        );
+        assert_eq!(
+            classify_press(&InputEvent::Text("中🙂".to_string())).typed_forward,
+            Some(true),
+            "CJK and emoji bases retain typed-cell provenance"
+        );
+
+        let ctrl_k = InputEvent::Key {
+            key: Key::Character('k'),
+            mods: Modifiers::CTRL,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        let class = classify_press(&ctrl_k);
+        assert!(class.kill_key && !class.kill_moves);
+
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.0,
+            warmth: 0.0,
+        };
+        for arm_glow in [
+            CursorGlow::note_user_gesture as fn(&mut CursorGlow, Instant),
+            CursorGlow::note_return,
+            CursorGlow::note_reflow,
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            let glow_cfg = app.glow_config();
+            assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
+            let seed = Instant::now();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            {
+                let ws = app.windows.get_mut(&wid).unwrap();
+                ws.cursor_glow
+                    .tick(Some((0, 0)), seed, &glow_cfg, geom, &mut glow_out);
+                ws.cursor_trail
+                    .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
+                // Simulate swallowed older movement gestures. Ctrl-K is newer,
+                // stationary input and must supersede them without replacing
+                // them with another move licence.
+                arm_glow(&mut ws.cursor_glow, seed);
+                ws.cursor_trail.note_user_gesture(seed);
+            }
+            // The headless fixture's synthetic PTY peer may already be closed;
+            // classifier supersession is intentionally a pre-egress host side
+            // effect and is the behavior under test.
+            let _ = app.input(wid, ctrl_k.clone(), Source::Human);
+            let moved = Instant::now();
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let glow_fp = ws
+                .cursor_glow
+                .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out);
+            let trail_fp = ws
+                .cursor_trail
+                .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out);
+            assert_eq!(glow_fp, 0, "stationary kill clears prior glow licences");
+            assert_eq!(trail_fp, 0, "stationary kill clears prior trail licences");
+            assert!(glow_out.is_empty() && trail_out.is_empty());
+        }
+
+        for moving_kill in [
+            InputEvent::Key {
+                key: Key::Character('u'),
+                mods: Modifiers::CTRL,
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            InputEvent::Key {
+                key: Key::Character('w'),
+                mods: Modifiers::CTRL,
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            InputEvent::Key {
+                key: Key::Named(NamedKey::Backspace),
+                mods: Modifiers::ALT,
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+        ] {
+            let class = classify_press(&moving_kill);
+            assert!(class.kill_key && class.kill_moves);
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("comet".to_string());
+            let cfg = app.trail_config();
+            let mut out = Vec::new();
+            app.windows.get_mut(&wid).unwrap().cursor_trail.tick(
+                Some((0, 20)),
+                Instant::now(),
+                &cfg,
+                &mut out,
+            );
+            let _ = app.input(wid, moving_kill, Source::Human);
+            let fp = app.windows.get_mut(&wid).unwrap().cursor_trail.tick(
+                Some((0, 2)),
+                Instant::now(),
+                &cfg,
+                &mut out,
+            );
+            assert_eq!(fp, 0, "moving span kills are navigation-class");
+            assert!(out.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_inline_key_write_revokes_every_new_movement_licence() {
+        use std::time::Duration;
+
+        use crate::cursor_glow::Geom;
+        use crate::cursor_trail::TrailConfig;
+
+        let events = [
+            InputEvent::Key {
+                key: Key::Character('a'),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            InputEvent::Key {
+                key: Key::Named(NamedKey::Enter),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            InputEvent::Key {
+                key: Key::Named(NamedKey::Tab),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+        ];
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.0,
+            warmth: 0.0,
+        };
+
+        for event in events {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            let glow_cfg = app.glow_config();
+            let now = Instant::now();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            {
+                let ws = app.windows.get_mut(&wid).unwrap();
+                ws.cursor_glow
+                    .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
+                ws.cursor_trail
+                    .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
+            }
+            assert_eq!(
+                app.input(wid, event, Source::Human),
+                crate::input::InputOutcome::WriteFailed,
+                "the synthetic headless sink proves no bytes landed"
+            );
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let moved = now + Duration::from_millis(4);
+            assert_eq!(
+                ws.cursor_glow
+                    .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow_out),
+                0,
+                "failed input cannot fund a later glow move"
+            );
+            assert_eq!(
+                ws.cursor_trail
+                    .tick(Some((0, 1)), moved, &trail_cfg, &mut trail_out),
+                0,
+                "failed input cannot fund a later classic comet move"
+            );
+            assert!(glow_out.is_empty() && trail_out.is_empty());
+        }
+
+        // Tier 1: a failed inline write is the same fail-closed
+        // "dispatch never reached PTY" transition as a key queued behind a
+        // paste. Bind the genuine WriteFailed path above to that derived
+        // revocation decision, with the retained-class mutant as control.
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let mut source = model.init_state();
+        source.insert("typed_class", 1);
+        let mut projected = source.clone();
+        projected.insert("typed_class", 0);
+        projected.insert("queued_revoked", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &projected,
+            Some("RevokeQueued"),
+            "failed inline input revocation",
+        );
+        assert!(ok, "failed-write revocation rejected by model: {why}");
+        let mut sticky = projected;
+        sticky.insert("typed_class", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &sticky,
+            Some("RevokeQueued"),
+            "failed inline input sticky-hint negative control",
+        );
+        assert!(!ok, "a failed write cannot retain its movement class");
     }
 }
 
@@ -10911,6 +12149,170 @@ mod press_path_lock_elision_tests {
     }
 }
 
+#[cfg(all(test, unix))]
+mod paste_cursor_gesture_tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use aterm_core::terminal::Terminal;
+    use aterm_session::sink::SinkWriter;
+
+    use crate::cursor_glow::{Geom, GlowStyle};
+    use crate::input::{InputEvent, Source};
+    use crate::{App, WindowId};
+
+    /// Drive the genuine asynchronous input seam, then present a cold one-cell
+    /// program cursor delta before delivery is proven. A private sink keeps the
+    /// process-global paste-order registry isolated from other parallel tests.
+    fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let sink = Arc::new(SinkWriter::new(pipe[1]));
+        let master = sink.master();
+        let mut app = App::headless_for_test_with_sink(sink.clone());
+        let wid = WindowId(0);
+        let ordering_pin =
+            queue_behind_existing.then(|| super::paste_order::pin_ordering_for_test(&sink));
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let cfg = app.glow_config();
+        assert!(cfg.enabled && matches!(cfg.style, GlowStyle::RainbowKitty));
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let mut out = Vec::new();
+        let seed = Instant::now();
+        assert_eq!(
+            app.windows.get_mut(&wid).unwrap().cursor_glow.tick(
+                Some((2, 2)),
+                seed,
+                &cfg,
+                geom,
+                &mut out
+            ),
+            0
+        );
+        assert_eq!(
+            app.input(wid, InputEvent::Paste(text.to_string()), Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+
+        let now = Instant::now();
+        let glow = &mut app.windows.get_mut(&wid).unwrap().cursor_glow;
+        let fingerprint = glow.tick(Some((2, 3)), now, &cfg, geom, &mut out);
+        let admitted = fingerprint != 0
+            || !out.is_empty()
+            || !glow.halos().is_empty()
+            || !glow.under_quads().is_empty();
+
+        drop(ordering_pin);
+        // Let the tiny ordered write release its registry key before closing
+        // this fixture's descriptors.
+        for _ in 0..200 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        admitted
+    }
+
+    #[test]
+    fn empty_or_sanitizer_empty_paste_cannot_fund_a_program_trail() {
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let source = model.init_state();
+        let mut ignored = source.clone();
+        ignored.insert("no_move_ignored", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &ignored,
+            Some("IgnoreNoMoveInput"),
+            "App empty-paste gesture decision",
+        );
+        assert!(ok, "empty-paste host decision rejected: {why}");
+
+        for text in ["", "\x1b\x03\u{009b}\x7f", "\u{0301}\u{fe0f}\u{200d}"] {
+            assert!(
+                !program_move_after_paste(text, false),
+                "paste with no sanitizer-surviving payload funded later program light"
+            );
+        }
+
+        // Negative control: the model rejects exactly the old host decision,
+        // where an empty event armed a fresh one-shot hint.
+        let mut wrongly_armed = ignored;
+        wrongly_armed.insert("gesture_hint", 1);
+        wrongly_armed.insert("gesture_arms", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &wrongly_armed,
+            Some("IgnoreNoMoveInput"),
+            "App empty-paste arm negative control",
+        );
+        assert!(!ok, "an empty paste that arms a move must be rejected");
+
+        assert!(
+            Terminal::paste_has_payload("中🙂"),
+            "CJK/emoji bases remain movement-eligible"
+        );
+        assert!(
+            !program_move_after_paste("中🙂", false),
+            "even the first FIFO paste is asynchronous and cannot fund concurrent program motion"
+        );
+        assert!(
+            !program_move_after_paste("中🙂", true),
+            "a paste queued behind existing egress cannot fund concurrent program motion"
+        );
+
+        // Tier 1: a real movement-capable paste first arms the generic class,
+        // then every asynchronous enqueue revokes it before the event loop can
+        // observe a frame. The mutant retains that arrival-time licence.
+        let mut async_armed = model.init_state();
+        async_armed.insert("gesture_hint", 1);
+        async_armed.insert("gesture_arms", 1);
+        let mut async_revoked = async_armed.clone();
+        async_revoked.insert("gesture_hint", 0);
+        async_revoked.insert("async_paste_revoked", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &async_armed,
+            &async_revoked,
+            Some("RevokeAsyncPaste"),
+            "App asynchronous paste revocation",
+        );
+        assert!(ok, "async-paste revocation rejected: {why}");
+        let mut sticky = async_revoked;
+        sticky.insert("gesture_hint", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &async_armed,
+            &sticky,
+            Some("RevokeAsyncPaste"),
+            "App asynchronous paste sticky-hint negative control",
+        );
+        assert!(!ok, "an enqueued paste cannot retain arrival-time provenance");
+    }
+}
+
 #[cfg(test)]
 mod predictive_echo_input_gate_tests {
     use std::time::{Duration, Instant};
@@ -11275,6 +12677,7 @@ mod vi_dispatch_tests {
 /// when nothing could draw.
 #[cfg(test)]
 mod typed_kitty_summon_tests {
+    use super::{arm_committed_move_after_inline, capture_committed_move_proof};
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_spec::derive::cursor_cat_model;
@@ -11562,6 +12965,631 @@ mod typed_kitty_summon_tests {
         let mut app = App::headless_for_test_with_sink(sink.clone());
         app.recompute_sparkle();
         (app, sink, pipe)
+    }
+
+    #[cfg(unix)]
+    fn drain(pipe: [i32; 2]) -> Vec<u8> {
+        let mut bytes = [0u8; 64];
+        let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        if read <= 0 {
+            return Vec::new();
+        }
+        bytes[..read as usize].to_vec()
+    }
+
+    #[cfg(unix)]
+    fn cursor_move_after_input(ev: InputEvent, queued: bool) -> (bool, bool) {
+        use crate::cursor_glow::{Geom, GlowStyle};
+        use crate::cursor_trail::TrailConfig;
+
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let master = sink.master();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+        let glow_cfg = app.glow_config();
+        assert!(glow_cfg.enabled && matches!(glow_cfg.style, GlowStyle::RainbowKitty));
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.0,
+            warmth: 0.0,
+        };
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let seed = Instant::now();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), seed, &glow_cfg, geom, &mut glow_out);
+            ws.cursor_trail
+                .tick(Some((0, 0)), seed, &trail_cfg, &mut trail_out);
+        }
+        let typed_echo = (!queued)
+            .then(|| match &ev {
+                InputEvent::Key {
+                    key: Key::Character('x'),
+                    ..
+                } => Some("x".to_string()),
+                InputEvent::Text(text) if text == "中" => Some(text.clone()),
+                _ => None,
+            })
+            .flatten();
+        let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
+        assert_eq!(
+            app.input(wid, ev, Source::Human),
+            crate::input::InputOutcome::Ok
+        );
+        let mut observed_cur = (0, 1);
+        if let Some(echo) = typed_echo {
+            let terminal = app.front_terminal(wid).unwrap().term.clone();
+            let (cur, generation, row) = {
+                let mut term = term_lock(&terminal);
+                term.process(echo.as_bytes());
+                let cursor = term.cursor();
+                let mut row = Vec::new();
+                term.row_cols_into(usize::from(cursor.row), &mut row);
+                // `row_cols_into` preserves the grid's sparse physical row;
+                // exact evidence compares the canonical visible row, including
+                // its implicit blank tail.
+                row.resize(usize::from(term.cols()), ' ');
+                (
+                    (cursor.row, cursor.col),
+                    aterm_effects::cursor_trail::ContentGeneration {
+                        process_sequence: term.pipeline_timestamps().process_sequence,
+                        terminal_id: term.render_identity(),
+                        alternate_screen: term.is_alternate_screen(),
+                    },
+                    row,
+                )
+            };
+            observed_cur = cur;
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow.observe_row(cur.0, cur.1, &row, Instant::now());
+            if let Some(aterm_effects::cursor_glow::ContentCandidateDecision::Confirmed {
+                at,
+                origin,
+                target,
+            }) = ws
+                .cursor_glow
+                .confirm_content_candidate(Some(cur), Instant::now(), generation)
+            {
+                ws.cursor_trail
+                    .confirm_content_candidate(at, origin, target);
+            }
+        }
+        let moved = Instant::now();
+        let ws = app.windows.get_mut(&wid).unwrap();
+        let glow_fp = ws
+            .cursor_glow
+            .tick(Some(observed_cur), moved, &glow_cfg, geom, &mut glow_out);
+        let trail_fp = ws
+            .cursor_trail
+            .tick(Some(observed_cur), moved, &trail_cfg, &mut trail_out);
+        let glow_admitted = glow_fp != 0
+            || !glow_out.is_empty()
+            || !ws.cursor_glow.halos().is_empty()
+            || !ws.cursor_glow.under_quads().is_empty();
+        let trail_admitted = trail_fp != 0 || !trail_out.is_empty();
+
+        drop(pin);
+        for _ in 0..200 {
+            if !super::paste_order::is_ordering(master) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!super::paste_order::is_ordering(master));
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        (glow_admitted, trail_admitted)
+    }
+
+    /// Only a stable inline delivery followed by the exact next-generation
+    /// content diff can light. Queued, Return, Tab, and zero-cell input stay
+    /// dark even if a numerically matching program move follows.
+    #[cfg(unix)]
+    #[test]
+    fn queued_key_and_tab_cannot_fund_concurrent_program_motion() {
+        assert_eq!(
+            cursor_move_after_input(key('x'), false),
+            (true, true),
+            "ordinary inline typing retains both cursor effects"
+        );
+        assert_eq!(
+            cursor_move_after_input(named(NamedKey::Enter), false),
+            (false, false),
+            "Return has no causal content witness"
+        );
+        assert_eq!(
+            cursor_move_after_input(key('x'), true),
+            (false, false),
+            "queued typed input has not authored a cursor landing yet"
+        );
+        assert_eq!(
+            cursor_move_after_input(named(NamedKey::Tab), true),
+            (false, false),
+            "queued Tab cannot license concurrent PTY output"
+        );
+        assert_eq!(
+            cursor_move_after_input(named(NamedKey::Tab), false),
+            (false, false),
+            "even delivered Tab cannot lend a timestamp to a later CUP"
+        );
+        assert_eq!(
+            cursor_move_after_input(InputEvent::Text("\u{0301}".to_string()), false),
+            (false, false),
+            "a zero-cell IME commit cannot lend a hint to later motion"
+        );
+        assert_eq!(
+            cursor_move_after_input(InputEvent::Text("中".to_string()), false),
+            (true, true),
+            "simple width-two CJK retains exact native content provenance"
+        );
+
+        // Tier-1 projection of the real `wrote_inline == false` branch. The
+        // observable dark result above is paired with the abstract one-shot
+        // class withdrawal; retaining only that class is the negative control.
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let mut armed = model.init_state();
+        armed.insert("typed_class", 1);
+        let mut revoked = armed.clone();
+        revoked.insert("typed_class", 0);
+        revoked.insert("queued_revoked", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &revoked,
+            Some("RevokeQueued"),
+            "App queued cursor-licence revocation",
+        );
+        assert!(ok, "real queued-revocation decision rejected: {why}");
+        let mut sticky = revoked;
+        sticky.insert("typed_class", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &sticky,
+            Some("RevokeQueued"),
+            "App queued-revocation negative control",
+        );
+        assert!(!ok, "a queued dispatch cannot retain its arrival licence");
+
+        // The exact-candidate lifecycle models the same shipping branch: the
+        // input-time baseline was captured, but a queued delivery consumes it
+        // before any content generation can be attributed to this key.
+        let candidate_model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut captured = candidate_model.init_state();
+        assert!(candidate_model.fire("ArmTyped", &mut captured));
+        let mut queued = captured.clone();
+        assert!(candidate_model.fire("DeliverQueued", &mut queued));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &candidate_model,
+            &[],
+            &captured,
+            &queued,
+            Some("DeliverQueued"),
+            "real queued exact-candidate retirement",
+        );
+        assert!(ok, "queued exact candidate rejected: {why}");
+        let mut forged = queued;
+        forged.insert("phase", 2);
+        forged.insert("delivery_stable", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &candidate_model,
+            &[],
+            &captured,
+            &forged,
+            Some("DeliverQueued"),
+            "forged queued candidate retention",
+        );
+        assert!(!ok, "queued input cannot retain an armed exact candidate");
+    }
+
+    /// Tier-1 bind for the native post-inline delivery fence. The exact same
+    /// production helper that `App::input` calls accepts a stable boundary and
+    /// rejects an intervening parser generation before arming either engine.
+    #[test]
+    fn native_exact_candidate_arms_only_after_a_stable_inline_boundary() {
+        use crate::cursor_glow::{Geom, GlowStyle};
+        use crate::cursor_trail::TrailConfig;
+
+        let prepare = || {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            let glow_cfg = app.glow_config();
+            assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
+            let trail_cfg = TrailConfig {
+                enabled: true,
+                duration: Duration::from_millis(300),
+                max_len: 24,
+                color: 0x0050_FA7B,
+                intensity: 0.0,
+                warmth: 0.0,
+            };
+            let geom = Geom {
+                cw: 8,
+                ch: 16,
+                rows: 6,
+                cols: 40,
+                origin_x: 0,
+                origin_y: 0,
+                win_w: 320,
+                win_h: 96,
+                head: 0,
+            };
+            let now = Instant::now();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            {
+                let ws = app.windows.get_mut(&wid).unwrap();
+                ws.cursor_glow
+                    .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
+                ws.cursor_trail
+                    .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
+            }
+            let terminal = app.front_terminal(wid).unwrap().term.clone();
+            let proof = {
+                let term = term_lock(&terminal);
+                let mut row = Vec::new();
+                capture_committed_move_proof(
+                    &term,
+                    aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(['x']).unwrap(),
+                    &mut row,
+                )
+                .unwrap()
+            };
+            (app, terminal, proof, now)
+        };
+
+        let (mut stable, stable_term, stable_proof, stable_at) = prepare();
+        {
+            let term = term_lock(&stable_term);
+            let ws = stable.windows.get_mut(&WindowId(0)).unwrap();
+            assert!(arm_committed_move_after_inline(
+                ws,
+                &term,
+                stable_at,
+                Some(stable_proof),
+                None,
+            ));
+            assert!(
+                ws.cursor_glow.move_candidate_pending()
+                    && ws.cursor_trail.move_candidate_pending()
+            );
+        }
+
+        let (mut raced, raced_term, raced_proof, raced_at) = prepare();
+        {
+            // A title batch changes no source row or cursor, but it is still an
+            // intervening child-output generation and therefore breaks causal
+            // attribution before the post-write arm.
+            term_lock(&raced_term).process(b"\x1b]0;unrelated\x07");
+            let term = term_lock(&raced_term);
+            let ws = raced.windows.get_mut(&WindowId(0)).unwrap();
+            assert!(!arm_committed_move_after_inline(
+                ws,
+                &term,
+                raced_at,
+                Some(raced_proof),
+                None,
+            ));
+            assert!(
+                !ws.cursor_glow.move_candidate_pending()
+                    && !ws.cursor_trail.move_candidate_pending()
+            );
+        }
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut captured = source.clone();
+        assert!(model.fire("ArmTyped", &mut captured));
+        let mut stable_projection = captured.clone();
+        assert!(model.fire("DeliverStable", &mut stable_projection));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &captured,
+            &stable_projection,
+            Some("DeliverStable"),
+            "native stable inline delivery",
+        );
+        assert!(ok, "stable native delivery rejected: {why}");
+        let mut raced_projection = captured.clone();
+        assert!(model.fire("DeliverRaced", &mut raced_projection));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &captured,
+            &raced_projection,
+            Some("DeliverRaced"),
+            "native pre-arm generation race",
+        );
+        assert!(ok, "raced native delivery rejected: {why}");
+        let mut forged = raced_projection;
+        forged.insert("phase", 2);
+        forged.insert("delivery_stable", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &captured,
+            &forged,
+            Some("DeliverRaced"),
+            "native race forged stable negative control",
+        );
+        assert!(!ok, "an intervening native generation must fail closed");
+    }
+
+    /// The reply-bearing control `signal` fence is deliberately not an empty
+    /// synthetic key. It clears only the two exact movement candidates: no PTY
+    /// bytes, typing heat, rain scheduling, or latency-hot stamp. A tab-switch
+    /// race returns `false` (nothing visible to clear) without touching the
+    /// newly-front window.
+    #[cfg(unix)]
+    #[test]
+    fn session_candidate_cancel_is_side_effect_free_and_tab_switch_safe() {
+        use crate::cursor_glow::{Geom, GlowStyle};
+        use crate::cursor_trail::TrailConfig;
+
+        let (mut app, sink, pipe) = app_with_private_pty();
+        let wid = WindowId(0);
+        let session = app.front_terminal(wid).unwrap().session;
+        let second = app
+            .open_active_session_in_new_window_logical()
+            .expect("share the active session through the canonical view-count seam");
+        // Focused(true) for B can precede Focused(false) for A. Both windows
+        // temporarily present the same session while the global front already
+        // points at B; the fence must still retire A and B together.
+        assert_eq!(app.frontmost_window, Some(second));
+        assert_eq!(app.pool.views(session), Some(2));
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("lumen".to_string());
+        let glow_cfg = app.glow_config();
+        assert!(matches!(glow_cfg.style, GlowStyle::Lumen));
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let geom = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let now = Instant::now();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        for candidate in [wid, second] {
+            let ws = app.windows.get_mut(&candidate).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
+            ws.cursor_trail
+                .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
+            ws.cursor_glow.note_synthetic_move(now);
+            ws.cursor_trail.note_synthetic_move(now);
+            assert!(ws.cursor_glow.move_candidate_pending());
+            assert!(ws.cursor_trail.move_candidate_pending());
+        }
+        let (cadence_before, rain_deadline_before, input_hot_before) = {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.typing_cadence.on_keystroke(now);
+            (
+                ws.typing_cadence.sample(now),
+                ws.next_rain_tick,
+                ws.input_hot_until,
+            )
+        };
+
+        assert!(app.cancel_cursor_move_candidate_for_session(session));
+        for candidate in [wid, second] {
+            let ws = &app.windows[&candidate];
+            assert!(!ws.cursor_glow.move_candidate_pending());
+            assert!(!ws.cursor_trail.move_candidate_pending());
+        }
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.typing_cadence.sample(now), cadence_before);
+        assert_eq!(ws.next_rain_tick, rain_deadline_before);
+        assert_eq!(ws.input_hot_until, input_hot_before);
+        assert!(drain(pipe).is_empty(), "candidate fence writes no PTY bytes");
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut pending = model.init_state();
+        assert!(model.fire("ArmSynthetic", &mut pending));
+        let mut canceled = pending.clone();
+        assert!(model.fire("UnsupportedInput", &mut canceled));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &pending,
+            &canceled,
+            Some("UnsupportedInput"),
+            "visible-front signal candidate-only fence",
+        );
+        assert!(ok, "control cancellation projection rejected: {why}");
+        let mut forged = canceled;
+        forged.insert("phase", 2);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &pending,
+            &forged,
+            Some("UnsupportedInput"),
+            "forged signal candidate retention",
+        );
+        assert!(!ok, "front signal cannot retain an older exact proof");
+
+        assert!(
+            !app.cancel_cursor_move_candidate_for_session(session.wrapping_add(1)),
+            "a session that is no longer front has no visible candidate to clear"
+        );
+        drop(app);
+        drop(sink);
+        unsafe { libc::close(pipe[0]) };
+    }
+
+    #[test]
+    fn ime_and_external_local_boundaries_retire_older_candidates_before_consumers() {
+        use crate::cursor_glow::Geom;
+        use crate::cursor_trail::TrailConfig;
+
+        fn assert_boundary_dark(mut app: App, boundary: impl FnOnce(&mut App, WindowId)) {
+            let wid = WindowId(0);
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("lumen".to_string());
+            let glow_cfg = app.glow_config();
+            let trail_cfg = TrailConfig {
+                enabled: true,
+                duration: Duration::from_millis(300),
+                max_len: 24,
+                color: 0x0050_FA7B,
+                intensity: 0.5,
+                warmth: 0.0,
+            };
+            let geom = Geom {
+                cw: 8,
+                ch: 16,
+                rows: 6,
+                cols: 40,
+                origin_x: 0,
+                origin_y: 0,
+                win_w: 320,
+                win_h: 96,
+                head: 0,
+            };
+            let now = Instant::now();
+            let mut glow = Vec::new();
+            let mut trail = Vec::new();
+            {
+                let ws = app.windows.get_mut(&wid).unwrap();
+                ws.cursor_glow
+                    .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow);
+                ws.cursor_trail
+                    .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
+                ws.cursor_glow.note_synthetic_move(now);
+                ws.cursor_trail.note_synthetic_move(now);
+            }
+
+            boundary(&mut app, wid);
+            let ws = app.windows.get_mut(&wid).unwrap();
+            assert!(!ws.cursor_glow.move_candidate_pending());
+            assert!(!ws.cursor_trail.move_candidate_pending());
+            let moved = now + Duration::from_millis(1);
+            assert_eq!(
+                ws.cursor_glow
+                    .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow),
+                0
+            );
+            assert_eq!(
+                ws.cursor_trail
+                    .tick(Some((0, 1)), moved, &trail_cfg, &mut trail),
+                0
+            );
+            assert!(glow.is_empty() && trail.is_empty());
+        }
+
+        assert_boundary_dark(App::headless_for_test(), |app, wid| {
+            app.on_ime_preedit(wid, "compose".to_string(), None);
+        });
+        assert_boundary_dark(App::headless_for_test(), |app, wid| {
+            app.on_ime_commit(wid, String::new());
+        });
+        assert_boundary_dark(App::headless_for_test(), |app, wid| {
+            app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::SHIFT);
+        });
+
+        let mut search = App::headless_for_test();
+        search.search_enter();
+        assert_boundary_dark(search, |app, wid| {
+            app.on_ime_commit(wid, "é".to_string());
+        });
+
+        let mut native = App::headless_for_test();
+        assert!(native.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert_boundary_dark(native, |app, wid| {
+            app.on_ime_commit(wid, "é".to_string());
+        });
+
+        // This is the exact candidate-only preflight used at the top of
+        // `dispatch_menu_action`; even an inert Copy with no selection reaches
+        // it before rename/native/menu routing can return.
+        assert_boundary_dark(App::headless_for_test(), |app, _wid| {
+            app.cancel_front_cursor_move_candidate();
+        });
+        assert_boundary_dark(App::headless_for_test(), |app, wid| {
+            app.cancel_tab_surface_cursor_move_candidate(Some(wid));
+        });
+        assert_boundary_dark(App::headless_for_test(), |app, _wid| {
+            app.cancel_tab_surface_cursor_move_candidate(None);
+        });
+        let source = include_str!("app_input.rs");
+        let dispatch = source
+            .split_once("pub(crate) fn dispatch_menu_action")
+            .expect("menu dispatcher")
+            .1;
+        assert!(
+            dispatch.find("cancel_front_cursor_move_candidate()").unwrap()
+                < dispatch.find("divert_menu_action_around_rename").unwrap(),
+            "menu candidate fence must precede every local/no-op early return"
+        );
+
+        // Native TabView consumes select/close/context-menu/rename gestures
+        // outside winit, while its context menu can be dismissed without an
+        // action. Every wake (including rename completion and TabCmd drag) and
+        // both status-item ingress points must cross the helper above.
+        let lib_source = include_str!("lib.rs");
+        assert_eq!(
+            lib_source
+                .matches("cancel_tab_surface_cursor_move_candidate")
+                .count(),
+            8,
+            "all custom tab-strip wake boundaries remain fenced",
+        );
+        let toolbar_source = include_str!("toolbar.rs");
+        let context_menu = toolbar_source
+            .split_once("fn show_context_menu")
+            .expect("native context-menu entry")
+            .1;
+        assert!(
+            context_menu.find("Wake::TabContextMenuOpening").unwrap()
+                < context_menu.find("entries.is_empty()").unwrap(),
+            "context-menu open/dismiss must fence before every early return",
+        );
+        for wake in ["Wake::OperatorAction", "Wake::OperatorMenuOpening"] {
+            let arm = lib_source.rsplit_once(wake).expect("operator wake arm").1;
+            assert!(
+                arm.find("cancel_front_cursor_move_candidate").unwrap()
+                    < arm.find("Wake::FleetInstances").unwrap(),
+                "{wake} must fence before its first no-op/dispatch path",
+            );
+        }
     }
 
     /// THE WITNESS CLOCK STARTS AT THE WIRE, NOT AT THE EVENT LOOP.
@@ -11937,7 +13965,11 @@ mod typed_kitty_summon_tests {
             .find(|item| item.key == glyph_key(launch.variant))
             .expect("the summon minted the launch kitty's head as a roster row")
             .clone();
-        assert_eq!((row.coat, row.iris), (launch.coat, launch.iris), "…in the launch coat");
+        assert_eq!(
+            (row.coat, row.iris),
+            (launch.coat, launch.iris),
+            "…in the launch coat"
+        );
 
         // Pin a DIFFERENT cat: the verdict moves to the pin, and so does what
         // the next summon logs.
@@ -11972,7 +14004,11 @@ mod typed_kitty_summon_tests {
             .find(|item| item.key == glyph_key(pinned.variant))
             .expect("the summon logged the pinned head")
             .clone();
-        assert_eq!((row.coat, row.iris), (pinned.coat, pinned.iris), "…in the pinned coat");
+        assert_eq!(
+            (row.coat, row.iris),
+            (pinned.coat, pinned.iris),
+            "…in the pinned coat"
+        );
     }
 }
 
@@ -12002,7 +14038,10 @@ mod favourite_kitty_tests {
             .expect("headless front terminal")
             .session;
         let look = KittyLook::for_launch(App::TEST_LAUNCH_SEED);
-        assert_eq!(app.launch_kitty, look, "the harness wears the fixed-seed cat");
+        assert_eq!(
+            app.launch_kitty, look,
+            "the harness wears the fixed-seed cat"
+        );
         let now = std::time::Instant::now();
 
         // Collect something ELSE first: a discovery must not become the pin
@@ -12096,15 +14135,25 @@ mod favourite_kitty_tests {
         {
             let gate = &mut app.windows.get_mut(&wid).expect("window").kitty_tenure;
             gate.observe(Some(&claude), t0);
-            assert!(gate.observe(Some(&claude), t0 + TENURE).is_some(), "fixture: tenure served");
+            assert!(
+                gate.observe(Some(&claude), t0 + TENURE).is_some(),
+                "fixture: tenure served"
+            );
         }
-        assert_eq!(app.promotable_kitty(wid), claude.look, "the promotable cat is the program's");
+        assert_eq!(
+            app.promotable_kitty(wid),
+            claude.look,
+            "the promotable cat is the program's"
+        );
         assert!(!app.palette_live().kitty_favourited, "not pinned yet");
 
         app.favourite_kitty(wid, t0 + TENURE);
 
         assert_eq!(app.kitty_log.favourite_look(), Some(claude.look));
-        assert!(app.palette_live().kitty_favourited, "the checkmark asks about the same cat");
+        assert!(
+            app.palette_live().kitty_favourited,
+            "the checkmark asks about the same cat"
+        );
         assert_eq!(
             app.companion_verdict(wid, 0, t0 + TENURE),
             claude.look,
@@ -12191,7 +14240,11 @@ mod favourite_kitty_tests {
             t.process(b"\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
         }
         assert_eq!(app.companion_verdict(wid, session, t0), launch);
-        assert_eq!(dressed(&mut app, t0), launch, "at the prompt: the launch kitty");
+        assert_eq!(
+            dressed(&mut app, t0),
+            launch,
+            "at the prompt: the launch kitty"
+        );
 
         // claude starts (the exact byte stream the zsh integration emits).
         let t1 = t0 + std::time::Duration::from_secs(1);
@@ -12216,7 +14269,11 @@ mod favourite_kitty_tests {
             claude,
             "tenure served: the claude cat"
         );
-        assert_eq!(dressed(&mut app, t2), claude, "…and the capture seam agrees");
+        assert_eq!(
+            dressed(&mut app, t2),
+            claude,
+            "…and the capture seam agrees"
+        );
 
         // claude exits, back at the prompt: the claude cat LINGERS.
         let t3 = t2 + std::time::Duration::from_secs(60);
@@ -12233,13 +14290,21 @@ mod favourite_kitty_tests {
             t.process(b"ls\x1b]633;E;ls\x07\r\n\x1b]133;C\x07");
         }
         let t4 = t3 + std::time::Duration::from_millis(300);
-        assert_eq!(app.companion_verdict(wid, session, t4), claude, "`ls` earns nothing");
+        assert_eq!(
+            app.companion_verdict(wid, session, t4),
+            claude,
+            "`ls` earns nothing"
+        );
         {
             let mut t = crate::term_lock(&term);
             t.process(b"\x1b]133;D;0\x07\x1b]133;A\x07user@host repo % \x1b]133;B\x07");
         }
         let t5 = t4 + std::time::Duration::from_millis(200);
-        assert_eq!(app.companion_verdict(wid, session, t5), claude, "home: still lingering");
+        assert_eq!(
+            app.companion_verdict(wid, session, t5),
+            claude,
+            "home: still lingering"
+        );
         // Settled at the prompt for RELEASE: the base cat returns.
         let t6 = t5 + RELEASE;
         assert_eq!(
@@ -12256,7 +14321,10 @@ mod favourite_kitty_tests {
             ..KittyLook::default()
         }
         .normalized();
-        assert!(pinned != launch && pinned != claude, "fixture: distinguishable");
+        assert!(
+            pinned != launch && pinned != claude,
+            "fixture: distinguishable"
+        );
         app.kitty_log.favourite(
             &aterm_effects::kitty_registry::KittySighting {
                 kitty_type: aterm_effects::kitty_registry::KittyType::HeadPeek,
@@ -12281,7 +14349,11 @@ mod favourite_kitty_tests {
             pinned,
             "the pin outranks a tenured program cat"
         );
-        assert_eq!(dressed(&mut app, t7), pinned, "the capture seam wears the pin");
+        assert_eq!(
+            dressed(&mut app, t7),
+            pinned,
+            "the capture seam wears the pin"
+        );
     }
 
     /// The whole menu/palette/`invoke` wiring in one assertion, plus the
@@ -12487,6 +14559,467 @@ mod full_kitty_sing_seam_tests {
                 "…into the crossfade, never a hard cut"
             );
         }
+    }
+}
+
+/// C5 — KEYBOARD parity for the tab context menu, driven through the shipping
+/// `on_key` routing with real winit events. WINDOWS only: the chord is
+/// `#[cfg]`-ed out elsewhere (macOS's native strip carries a real `NSMenu`;
+/// Linux is not offered the card at all).
+#[cfg(all(test, windows))]
+mod tab_menu_key_tests {
+    use crate::{App, WindowId};
+    use winit::event::{ElementState, KeyEvent};
+    use winit::keyboard::{
+        Key, KeyCode, KeyLocation, ModifiersState, NamedKey, PhysicalKey, SmolStr,
+    };
+
+    fn named(key: NamedKey) -> KeyEvent {
+        KeyEvent::synthetic_for_test(
+            PhysicalKey::Code(KeyCode::KeyA),
+            Key::Named(key),
+            key.to_text().map(SmolStr::new),
+            KeyLocation::Standard,
+            ElementState::Pressed,
+            false,
+        )
+    }
+
+    fn app_with_strip() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        (app, wid)
+    }
+
+    /// Shift+F10 is the Windows-wide "context menu for the focused thing"
+    /// chord; bare F10 is a terminal function key an app is entitled to receive
+    /// and must NOT be stolen.
+    #[test]
+    fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "bare F10 belongs to the program in the terminal"
+        );
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "⇧F10 pops the focused tab's menu"
+        );
+    }
+
+    #[test]
+    fn the_menu_key_pops_it_too_and_esc_dismisses() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(app.windows[&wid].tab_menu.is_some());
+        app.on_key(wid, named(NamedKey::Escape));
+        assert!(app.windows[&wid].tab_menu.is_none(), "Esc dismisses");
+    }
+
+    /// ↑/↓ walk ENABLED actions only, and the walk is a real cycle.
+    #[test]
+    fn arrows_step_the_highlight_over_enabled_actions_only() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        let lit = |app: &App| app.windows[&wid].tab_menu.as_ref().unwrap().highlight;
+        let entered = lit(&app).expect("a keyboard open enters on a row");
+        let mut seen = vec![entered];
+        for _ in 0..6 {
+            app.on_key(wid, named(NamedKey::ArrowDown));
+            let at = lit(&app).expect("the highlight never falls off the card");
+            let entries = &app.windows[&wid].tab_menu.as_ref().unwrap().entries;
+            assert!(
+                crate::tab_menu::is_selectable(&entries[at]),
+                "↓ only ever lands on an enabled action"
+            );
+            if at == entered {
+                break;
+            }
+            seen.push(at);
+        }
+        assert!(seen.len() >= 2, "more than one action to walk: {seen:?}");
+        app.on_key(wid, named(NamedKey::ArrowUp));
+        assert!(lit(&app).is_some());
+    }
+
+    /// A key the menu does not own dismisses it AND IS SWALLOWED — it must not
+    /// also type into the terminal the user believed was behind a menu.
+    #[test]
+    fn an_unowned_key_dismisses_without_reaching_the_terminal() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(app.windows[&wid].tab_menu.is_some());
+        app.on_key(wid, named(NamedKey::Tab));
+        assert!(app.windows[&wid].tab_menu.is_none(), "dismissed");
+        // The press was recorded as CONSUMED, which is what keeps its release
+        // from leaking an orphan report to a Kitty-protocol app.
+        assert!(
+            app.windows[&wid]
+                .consumed_press_keys
+                .contains(&PhysicalKey::Code(KeyCode::KeyA)),
+            "a key swallowed by the menu never reaches the seam"
+        );
+    }
+
+    // ---------------------------------------------------------------- C5 fixes
+
+    /// KEY THEFT, half one. The Menu key is `NamedKey::ContextMenu => 57363` in
+    /// this tree's kitty table. A client that negotiated the enhancement which
+    /// makes it reportable MUST still receive it — chrome may only claim a key
+    /// nobody downstream can hear.
+    ///
+    /// Driven through the REAL negotiation (`CSI > 1 u` on the front terminal),
+    /// not by poking a flag, so the deference cannot pass while the encoder
+    /// disagrees.
+    #[test]
+    fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
+        let (mut app, wid) = app_with_strip();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+
+        // No negotiation: the key reaches nobody, so chrome claims it.
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "with no client claim the Menu key pops the card"
+        );
+        app.on_key(wid, named(NamedKey::Escape));
+
+        // The app pushes disambiguate — exactly what a kitty-aware TUI sends.
+        crate::term_lock(&term).process(b"\x1b[>1u");
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "a negotiated Menu key belongs to the application, not the chrome"
+        );
+
+        // Pop the flags back off and the chord is aterm's again.
+        crate::term_lock(&term).process(b"\x1b[<u");
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "…and it returns the moment the app stops asking for it"
+        );
+    }
+
+    /// ⇧F10 is a DIFFERENT bargain: it encodes as `ESC[21;2~` in plain legacy,
+    /// so only the strongest contract — `REPORT_ALL_KEYS_AS_ESC`, literally
+    /// "report every key" — buys it back automatically. Disambiguate alone does
+    /// not, or the accessibility chord would blink out under every modern TUI.
+    #[test]
+    fn shift_f10_defers_only_to_report_all_keys() {
+        let (mut app, wid) = app_with_strip();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+
+        crate::term_lock(&term).process(b"\x1b[>1u"); // disambiguate only
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "disambiguate does not take ⇧F10 away from the chrome"
+        );
+        app.on_key(wid, named(NamedKey::Escape));
+
+        crate::term_lock(&term).process(b"\x1b[>8u"); // report all keys
+        app.on_key(wid, named(NamedKey::F10));
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "\"report every key\" means every key"
+        );
+    }
+
+    /// KEY THEFT, half two: the ESCAPE HATCH. The chord is deliberately not a
+    /// rebindable `Action`, so `tab_menu_chord` is the only way a user gives
+    /// the keys back — and its middle value has to surrender ⇧F10 while keeping
+    /// the Menu key, because their costs differ.
+    #[test]
+    fn the_config_knob_hands_each_spelling_back() {
+        let shift_f10 = |app: &mut App, wid| {
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::SHIFT;
+            app.on_key(wid, named(NamedKey::F10));
+            let open = app.windows[&wid].tab_menu.is_some();
+            app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+            if open {
+                app.on_key(wid, named(NamedKey::Escape));
+            }
+            open
+        };
+        let menu_key = |app: &mut App, wid| {
+            app.on_key(wid, named(NamedKey::ContextMenu));
+            let open = app.windows[&wid].tab_menu.is_some();
+            if open {
+                app.on_key(wid, named(NamedKey::Escape));
+            }
+            open
+        };
+
+        let (mut app, wid) = app_with_strip();
+        app.config.tab_menu_chord = Some("menu_key".to_string());
+        assert!(menu_key(&mut app, wid), "menu_key keeps the Menu key");
+        assert!(!shift_f10(&mut app, wid), "…and surrenders ⇧F10");
+
+        app.config.tab_menu_chord = Some("off".to_string());
+        assert!(!menu_key(&mut app, wid), "off surrenders the Menu key");
+        assert!(!shift_f10(&mut app, wid), "…and ⇧F10");
+
+        app.config.tab_menu_chord = None;
+        assert!(menu_key(&mut app, wid), "the default claims both");
+        assert!(shift_f10(&mut app, wid));
+    }
+
+    /// A bare MODIFIER press must not dismiss the card. Reaching for ⇧F10 to
+    /// re-pop the menu would otherwise close it on the ⇧ half of the very chord
+    /// that opens it — and no Win32 menu closes because a finger touched Shift.
+    #[test]
+    fn a_bare_modifier_press_leaves_the_card_up() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        let lit = app.windows[&wid].tab_menu.as_ref().unwrap().highlight;
+        for m in [
+            NamedKey::Shift,
+            NamedKey::Control,
+            NamedKey::Alt,
+            NamedKey::CapsLock,
+            NamedKey::NumLock,
+            NamedKey::AltGraph,
+        ] {
+            app.on_key(wid, named(m));
+            assert!(
+                app.windows[&wid].tab_menu.is_some(),
+                "{m:?} must not dismiss the card"
+            );
+        }
+        assert_eq!(
+            app.windows[&wid].tab_menu.as_ref().unwrap().highlight,
+            lit,
+            "…and must not move the highlight either"
+        );
+    }
+
+    /// FOCUS LOSS dismisses. Every native menu on Windows goes away when its
+    /// owner is deactivated; this one is modal over the pointer AND the
+    /// keyboard, so left up across an alt-tab it would overpaint live output,
+    /// swallow keys, and eat the first click back into the window.
+    #[test]
+    fn losing_focus_dismisses_the_card() {
+        let (mut app, wid) = app_with_strip();
+        app.on_key(wid, named(NamedKey::ContextMenu));
+        assert!(app.windows[&wid].tab_menu.is_some());
+        app.on_focus(wid, false);
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "an alt-tab away takes the card with it"
+        );
+        assert!(app.windows[&wid].tab_menu_rect.is_none());
+    }
+}
+
+/// C5 REMEDIATION — the CONTROL SEAM must answer for the tab menu exactly as
+/// the glass does. `aterm ctl key menu` / `ctl key down` / `ctl mouse wheel`
+/// arrive at `App::input` and never pass through `on_key`, so before this the
+/// physical Menu key popped a card while the controller wrote `57363` to the
+/// PTY — the introspection mirror and the glass disagreeing about the same key,
+/// which makes the feature unverifiable through aterm's own control surface.
+///
+/// Windows only, mirroring the chord's own gate.
+#[cfg(all(test, windows))]
+mod tab_menu_seam_tests {
+    use crate::input::{InputEvent, Source};
+    use crate::{App, WindowId};
+    use aterm_types::keyboard::{Key as EKey, KeyEventType, Modifiers, NamedKey as ENamed};
+
+    /// The source an `aterm ctl key` verb stamps. Bound only for audit — the
+    /// seam never branches on it (`bytes_human_eq_controller`) — so it is the
+    /// ROUTE these tests are pinning, not the label.
+    const CTL: Source = Source::Controller {
+        op: aterm_session::Op::WriteInput,
+    };
+
+    fn app_with_strip() -> (App, WindowId) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        (app, wid)
+    }
+
+    /// The exact event `control_input`'s `"menu" | "contextmenu"` arm builds.
+    fn key(named: ENamed, mods: Modifiers) -> InputEvent {
+        InputEvent::Key {
+            key: EKey::Named(named),
+            mods,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        }
+    }
+
+    /// THE AGREEMENT. `aterm ctl key menu` must pop the same card the physical
+    /// Menu key does — and the press must be booked as consumed, so its RELEASE
+    /// cannot leak an orphan `REPORT_EVENT_TYPES` report for a press the
+    /// application never saw.
+    #[test]
+    fn ctl_key_menu_pops_the_card_the_physical_key_pops() {
+        let (mut app, wid) = app_with_strip();
+        app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
+        let menu = app.windows[&wid]
+            .tab_menu
+            .as_ref()
+            .expect("the controller pops the same card");
+        assert!(
+            menu.highlight.is_some(),
+            "…as a KEYBOARD open, entered on the first live row"
+        );
+        assert!(
+            app.windows[&wid]
+                .overlay_consumed_keys
+                .contains(&EKey::Named(ENamed::ContextMenu)),
+            "the swallowed press is booked so its release cannot orphan"
+        );
+    }
+
+    /// …and ⇧F10 through the seam, with the same modifier rule the glass uses:
+    /// bare F10 belongs to the program.
+    #[test]
+    fn ctl_key_shift_f10_pops_it_and_bare_f10_does_not() {
+        let (mut app, wid) = app_with_strip();
+        app.input(wid, key(ENamed::F10, Modifiers::empty()), CTL);
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "bare F10 is the program's function key"
+        );
+        app.input(wid, key(ENamed::F10, Modifiers::SHIFT), CTL);
+        assert!(app.windows[&wid].tab_menu.is_some(), "⇧F10 pops it");
+    }
+
+    /// The card is DRIVABLE from the controller once up — the whole point of
+    /// the agreement is that an AI can verify the feature it just built.
+    #[test]
+    fn the_controller_walks_and_activates_the_card() {
+        let (mut app, wid) = app_with_strip();
+        app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
+        let first = app.windows[&wid].tab_menu.as_ref().unwrap().highlight;
+        app.input(wid, key(ENamed::ArrowDown, Modifiers::empty()), CTL);
+        let stepped = app.windows[&wid].tab_menu.as_ref().unwrap().highlight;
+        assert_ne!(first, stepped, "↓ moved the highlight");
+        app.input(wid, key(ENamed::Escape, Modifiers::empty()), CTL);
+        assert!(app.windows[&wid].tab_menu.is_none(), "Esc dismissed it");
+    }
+
+    /// Deference holds on BOTH routes off one predicate: a client that
+    /// negotiated for the Menu key keeps it whether a hand or a controller
+    /// presses it. A seam that declined differently would be a new disagreement
+    /// in place of the old one.
+    #[test]
+    fn the_seam_defers_to_a_kitty_client_exactly_as_the_glass_does() {
+        let (mut app, wid) = app_with_strip();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        crate::term_lock(&term).process(b"\x1b[>1u");
+        app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "the controller must not pop a card the physical key would decline"
+        );
+    }
+
+    /// THE WHEEL. The gate's doc calls the card modal over the pointer; a notch
+    /// under an open card must therefore scroll nothing and report nothing, on
+    /// either route (`on_mouse_wheel` and `ctl mouse wheel` both converge here).
+    #[test]
+    fn a_wheel_notch_under_the_card_is_swallowed() {
+        use winit::event::MouseScrollDelta;
+
+        let (mut app, wid) = app_with_strip();
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        {
+            // Enough history that scrolling up is a real move, or the assertion
+            // below would pass on a viewport that had nowhere to go.
+            let mut t = crate::term_lock(&term);
+            for line in 0..100 {
+                t.process(format!("history {line}\r\n").as_bytes());
+            }
+            assert!(t.grid().scrollback_lines() > 0);
+            assert_eq!(t.grid().display_offset(), 0);
+        }
+
+        app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 3.0));
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "the notch neither dismissed the card"
+        );
+        assert_eq!(
+            crate::term_lock(&term).grid().display_offset(),
+            0,
+            "…nor scrolled the viewport underneath it"
+        );
+        assert!(
+            app.windows[&wid].scroll_glide.is_none(),
+            "and it armed no smooth-scroll glide either"
+        );
+
+        // NEGATIVE CONTROL: the identical notch with the card down really does
+        // reach the terminal path, so the assertions above are about the gate
+        // and not about a viewport that could never have moved.
+        app.input(wid, key(ENamed::Escape, Modifiers::empty()), CTL);
+        assert!(app.windows[&wid].tab_menu.is_none());
+        app.on_mouse_wheel(wid, MouseScrollDelta::LineDelta(0.0, 3.0));
+        assert!(
+            app.windows[&wid].scroll_glide.is_some()
+                || crate::term_lock(&term).grid().display_offset() > 0
+        );
+    }
+
+    /// THE POINTER. A controller press cannot be resolved against the card
+    /// (grid cell vs frame rect — see the scope note), so it takes the other
+    /// outcome every press off a menu has: dismiss and be CONSUMED. What must
+    /// hold is the invariant the human route already has: while the card is up,
+    /// a press does NOTHING underneath it — here witnessed by the selection the
+    /// same press starts once the card is gone.
+    #[test]
+    fn a_controller_press_under_the_card_dismisses_and_acts_on_nothing() {
+        use aterm_types::mouse::MouseButton;
+
+        let (mut app, wid) = app_with_strip();
+        let press = |pressed| InputEvent::MouseButton {
+            button: MouseButton::Left,
+            pressed,
+            row: 4,
+            col: 4,
+            mods: 0,
+            click_count: 1,
+            side: aterm_core::selection::SelectionSide::Left,
+            block: false,
+            suppress_copy_on_select: false,
+            px_off: crate::input::PixelOffset::CELL_ORIGIN,
+        };
+
+        app.input(wid, key(ENamed::ContextMenu, Modifiers::empty()), CTL);
+        assert!(app.windows[&wid].tab_menu.is_some());
+        app.input(wid, press(true), CTL);
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "the press dismissed the card"
+        );
+        assert!(
+            !app.windows[&wid].selecting,
+            "…and did NOT also start a selection underneath it — click-away \
+             costs a click, on this route exactly as on the glass"
+        );
+
+        // NEGATIVE CONTROL: the identical press with the card down really does
+        // reach the grid, so the assertion above is about the gate.
+        app.input(wid, press(true), CTL);
+        assert!(
+            app.windows[&wid].selecting,
+            "the same press starts a selection once the card is gone"
+        );
+        app.input(wid, press(false), CTL);
     }
 }
 

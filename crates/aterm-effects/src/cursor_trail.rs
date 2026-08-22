@@ -3,12 +3,14 @@
 
 //! Cursor MOTION TRAIL — the "streaming trailer" effect — pure animation state.
 //!
-//! A cursor move (a single keystroke advance, or a big Ctrl-A/Ctrl-E jump) spawns
-//! a comet of fading [`TrailCell`]s along the path the cursor swept, brightest at
-//! the head (nearest the new cursor position) and dimming toward the tail. The
-//! whole comet fades to nothing within a few hundred milliseconds, so motion is
-//! unmistakable — and an idle screen returns to zero work (no live sparks → no
-//! animation timer; see the scheduler in `main.rs`).
+//! A cursor move with a correlated authored-input candidate spawns a comet of
+//! fading [`TrailCell`]s along the path the cursor swept, brightest at the head
+//! (nearest the new cursor position) and dimming toward the tail. Bare cursor
+//! deltas and timestamp-only input hints stay dark: neither proves that the
+//! observed landing came from that input. The whole comet fades to nothing
+//! within a few hundred milliseconds, so admitted motion is unmistakable — and
+//! an idle screen returns to zero work (no live sparks → no animation timer; see
+//! the scheduler in `main.rs`).
 //!
 //! This module owns only the *math*: it takes the observed cursor cell + the wall
 //! clock each frame and produces the current trail cells (in TERMINAL coordinates
@@ -84,12 +86,13 @@ pub const HIDE_BRIDGE_MS: u64 = 150;
 /// the phantom-comet case the hide/show guard exists for.
 pub const HIDE_BRIDGE_MAX_DIST: u16 = 2;
 /// The bridge's WIDER reach while a typed/backspace key-hint is fresh: a real
-/// keystroke caused the hidden move, so batched echoes (PTY coalescing under
-/// fast typing / key-repeat) that hop several cells inside one hide window
-/// still spawn their wake instead of silently dropping it — the "trail gap on
-/// every fast burst" hole. Unhinted moves keep [`HIDE_BRIDGE_MAX_DIST`]
-/// byte-identically (the pinned bridge law): an app repositioning its cursor
-/// mid-repaint without input still spawns nothing.
+/// keypress makes a longer hidden echo plausible, so batched echoes (PTY
+/// coalescing under fast typing / key-repeat) may still use their last visible
+/// cell as a source. This is only a source classifier: the correlated movement
+/// candidate must separately admit the landing before any wake is born.
+/// Unhinted moves keep [`HIDE_BRIDGE_MAX_DIST`] byte-identically (the pinned
+/// bridge law): an app repositioning its cursor mid-repaint still spawns
+/// nothing.
 pub const HIDE_BRIDGE_TYPED_MAX_DIST: u16 = 8;
 
 /// The bridge reach for one reappear: widened while a typed/backspace echo
@@ -102,6 +105,125 @@ pub fn hide_bridge_reach(typed_hint_fresh: bool) -> u16 {
         HIDE_BRIDGE_TYPED_MAX_DIST
     } else {
         HIDE_BRIDGE_MAX_DIST
+    }
+}
+
+/// Maximum number of terminal cells one committed-text admission candidate may
+/// describe.  This is deliberately the same small order as the swept-echo
+/// classifier: larger IME commits still reach the PTY, but their cosmetics fail
+/// closed instead of allocating an unbounded proof beside the cursor engine.
+pub const EXPECTED_MOVE_CELLS_MAX: usize = 8;
+
+/// Maximum terminal width for an exact deletion proof. Wider rows still edit
+/// normally, but their cursor cosmetics fail closed instead of storing an
+/// unbounded input-time snapshot in the cursor engine.
+pub const EXPECTED_ROW_CELLS_MAX: usize = 256;
+
+/// Identity of the terminal content generation around one authored input.
+/// `process_sequence` advances once per parser batch; `alternate_screen`
+/// prevents a main/alt swap from masquerading as the expected edit. Every host
+/// binds the terminal's render identity as well, so equal numeric sequences
+/// from two tabs/panes cannot share provenance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContentGeneration {
+    pub process_sequence: u32,
+    pub terminal_id: u64,
+    pub alternate_screen: bool,
+}
+
+/// The exact cell material a committed text event is expected to leave at the
+/// pre-input caret: one lead scalar followed by `\0` continuation cells for a
+/// wide grapheme.  The host builds this from the same grapheme/ambiguous-width
+/// policy the terminal uses.  A timestamp or cell count alone is not evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedCellSpan {
+    cells: [char; EXPECTED_MOVE_CELLS_MAX],
+    len: u8,
+}
+
+impl ExpectedCellSpan {
+    /// Build one bounded exact span. Empty and over-cap spans are deliberately
+    /// refused: neither can honestly correlate a cursor move.
+    pub fn from_cells(cells: impl IntoIterator<Item = char>) -> Option<Self> {
+        let mut out = [' '; EXPECTED_MOVE_CELLS_MAX];
+        let mut len = 0usize;
+        for cell in cells {
+            if len == EXPECTED_MOVE_CELLS_MAX {
+                return None;
+            }
+            out[len] = cell;
+            len += 1;
+        }
+        (len != 0).then_some(Self {
+            cells: out,
+            len: len as u8,
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[char] {
+        &self.cells[..usize::from(self.len)]
+    }
+}
+
+/// Exact input-time row material used to prove a simple end-of-line deletion.
+/// The fixed cap keeps the one-shot candidate bounded; this is copied only for
+/// Backspace, never on the render hot path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpectedRowSnapshot {
+    cells: [char; EXPECTED_ROW_CELLS_MAX],
+    len: u16,
+}
+
+impl ExpectedRowSnapshot {
+    /// Capture one complete visible row. Oversized rows deliberately decline.
+    pub fn from_slice(cells: &[char]) -> Option<Self> {
+        if cells.is_empty() || cells.len() > EXPECTED_ROW_CELLS_MAX {
+            return None;
+        }
+        let mut out = [' '; EXPECTED_ROW_CELLS_MAX];
+        out[..cells.len()].copy_from_slice(cells);
+        Some(Self {
+            cells: out,
+            len: cells.len() as u16,
+        })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[char] {
+        &self.cells[..usize::from(self.len)]
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveIntent {
+    Typed(ExpectedCellSpan),
+    Delete,
+    Synthetic,
+    SyntheticTyped,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MoveCandidate {
+    at: Instant,
+    origin: (u16, u16),
+    intent: MoveIntent,
+    target: Option<(u16, u16)>,
+    material: Option<(u16, u16)>,
+    content_confirmed: bool,
+}
+
+impl MoveCandidate {
+    fn admits(self, from: (u16, u16), to: (u16, u16), now: Instant, fresh_s: f32) -> bool {
+        if self.origin != from || now.saturating_duration_since(self.at).as_secs_f32() > fresh_s {
+            return false;
+        }
+        match self.intent {
+            MoveIntent::Typed(_) | MoveIntent::Delete => {
+                self.content_confirmed && self.target == Some(to)
+            }
+            MoveIntent::Synthetic | MoveIntent::SyntheticTyped => true,
+        }
     }
 }
 
@@ -185,9 +307,10 @@ pub struct CursorTrail {
     /// hide/show guard above would drop the spark for essentially EVERY key —
     /// the "gaps in the back of the trail" report (macOS passes the raw stream,
     /// no hide, no gap). When the cursor reappears within the bridge window at a
-    /// PLAUSIBLE TYPING DISTANCE (≤ [`HIDE_BRIDGE_MAX_DIST`]), the move spawns
-    /// from here as if never hidden; a long hide or a far teleport (full-screen
-    /// app repaints, alt-screen) stays suppressed exactly as before.
+    /// PLAUSIBLE TYPING DISTANCE (≤ [`HIDE_BRIDGE_MAX_DIST`]), an admitted move
+    /// may use this cell as its source as if never hidden; a long hide or a far
+    /// teleport (full-screen app repaints, alt-screen) stays suppressed exactly
+    /// as before.
     last_visible: Option<((u16, u16), Instant)>,
     /// A fresh typed-echo key-hint ([`Self::note_typed`]) — the trail twin of
     /// `CursorGlow`'s typed/backspace hints: armed by the host on a PLAIN
@@ -195,20 +318,38 @@ pub struct CursorTrail {
     /// chords), it classifies a paired one-row move beyond the typed advance
     /// as a TUI repaint RE-ANCHOR (Claude Code's Ink prompt rewraps its whole
     /// inset input box per keystroke) — the caret never swept those cells, so
-    /// `spawn` lays NO comet across them. Hosts that never arm it are
-    /// byte-identical.
+    /// `spawn` lays NO comet across them.
     type_hint: Option<Instant>,
     /// Fresh-navigation veto twin of `CursorGlow::nav_hint` (armed from the
     /// same host site): a deliberate Ctrl-A/E leap must never re-anchor even
     /// when a typed hint + blink are live (adversarial review — the two
     /// engines must agree on a nav jump).
     nav_hint: Option<Instant>,
+    /// One-shot morphology timestamp for a cursor movement that is not a
+    /// typed-glyph echo. Return, Tab/paste, and reflow callers may still use it
+    /// to classify a scripted preview, but the timestamp is not provenance and
+    /// cannot fund a comet without [`Self::move_candidate`]. Consumed on the
+    /// first observed move, fresh or stale.
+    move_hint: Option<Instant>,
+    /// Correlated admission proof for the one-shot hints above. Hints retain
+    /// their classifier roles, but no style may birth trail geometry unless
+    /// this candidate also matches the seeded origin and the observed landing.
+    move_candidate: Option<MoveCandidate>,
+    /// Last coherent terminal content generation presented to this engine.
+    /// Resident sparks are valid only while this identity stays unchanged, or
+    /// while the host proves the change was the exact candidate it just
+    /// confirmed.
+    last_content_generation: Option<ContentGeneration>,
+    /// A newer unsupported input canceled an unobserved candidate. The next
+    /// provable arm is consumed as the second half of that ambiguous cohort
+    /// instead of silently replacing the first.
+    candidate_superseded: bool,
     /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]) — the trail
     /// twin of `CursorGlow`'s: the host saw the focused terminal's
     /// hide-inside-DEC-2026 repaint bracket (its `repaint_blink_epoch`
     /// advanced). On the alt screen ([`Self::ctx_alt`]) the re-anchor
-    /// additionally requires it fresh, so vim/less (never blink) keep their
-    /// hinted one-row jumps' comets while Claude Code still re-anchors.
+    /// additionally requires it fresh, so candidate-backed vim/less moves
+    /// (never blink) keep their one-row comets while Claude Code re-anchors.
     blink_hint: Option<Instant>,
     /// Per-frame ALT-SCREEN context ([`Self::note_context`], stamped by the
     /// host each frame beside the glow's). `false` (main screen / unwired
@@ -248,25 +389,105 @@ impl CursorTrail {
     /// A navigation key-hint stays armed this long for its paired move
     /// (seconds) — mirrors `CursorGlow::NAV_HINT_FRESH`.
     const NAV_HINT_FRESH: f32 = 0.25;
+    /// Generic-movement classifier window (seconds). Admission still requires
+    /// a matching correlated candidate.
+    const MOVE_HINT_FRESH: f32 = 0.25;
+
+    /// Last honest visible source owned by this engine. Hosts compare this
+    /// with CursorGlow before arming a candidate; an unseeded/reset pair must
+    /// fail closed because no swept path can be reconstructed.
+    #[must_use]
+    pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
+        self.last.or_else(|| self.last_visible.map(|(cell, _)| cell))
+    }
+
+    /// Whether one authored move is still awaiting its first observation.
+    #[must_use]
+    pub fn move_candidate_pending(&self) -> bool {
+        self.move_candidate.is_some()
+    }
+
+    fn arm_candidate(&mut self, at: Instant, intent: MoveIntent) {
+        self.move_candidate = self.cursor_anchor().map(|origin| MoveCandidate {
+            at,
+            origin,
+            intent,
+            target: None,
+            material: None,
+            content_confirmed: false,
+        });
+    }
 
     /// HOST KEY-HINT: one PLAIN typed-glyph or Backspace echo keypress (never
-    /// Enter/Tab/nav/modified chords — their jumps keep the deliberate comet).
-    /// Arms the [`Self::type_hint`] re-anchor classifier; see the field doc.
+    /// Enter/Tab/nav/modified chords). Arms only the [`Self::type_hint`]
+    /// re-anchor classifier; see the field doc. It cannot admit a comet.
     pub fn note_typed(&mut self, now: Instant) {
+        self.move_hint = None;
+        self.nav_hint = None;
         self.type_hint = Some(now);
+        // Text-blind callers may still feed cadence/classifier state, but they
+        // cannot create an admission candidate. Use `note_typed_expected` when
+        // exact committed cell material is available.
+        self.move_candidate = None;
+    }
+
+    /// Arm typed movement with exact committed terminal-cell material.
+    pub fn note_typed_expected(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        target: (u16, u16),
+        material: (u16, u16),
+    ) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.note_typed(now);
+            self.type_hint = None;
+            return;
+        }
+        let pending = self.move_candidate.is_some();
+        self.note_typed(now);
+        if pending {
+            // One one-shot timestamp cannot correlate two unobserved commits.
+            // Invalidate both rather than silently replacing the older proof.
+            self.type_hint = None;
+            return;
+        }
+        self.arm_candidate(now, MoveIntent::Typed(expected));
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+            candidate.material = Some(material);
+        }
+    }
+
+    /// HOST COALESCED TYPING: an embedder may batch several key events between
+    /// two render callbacks. One or two cells still fit the typed echo/re-anchor
+    /// classifier; a larger batch selects the generic morphology so the
+    /// classifier does not mistake three genuinely typed cells for a repaint
+    /// teleport. This text-blind seam never creates an admission candidate.
+    pub fn note_typed_batch(&mut self, now: Instant, keys: u32) {
+        if keys == 0 {
+            return;
+        }
+        if keys <= u32::from(HIDE_BRIDGE_MAX_DIST) {
+            self.note_typed(now);
+        } else {
+            self.note_move(now);
+        }
     }
 
     /// HOST REPAINT-BLINK (see `CursorGlow::note_repaint_blink`): the focused
     /// terminal's `repaint_blink_epoch` advanced — the attached app brackets
     /// its redraws in DECTCEM-hide-inside-DEC-2026 (Claude Code, per
-    /// keystroke). Licenses the alt-screen re-anchor; never gates bytes.
+    /// keystroke). Participates in the alt-screen re-anchor classifier; it is
+    /// neither movement evidence nor a byte gate.
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.blink_hint = Some(now);
     }
 
     /// Drop the blink hint — a tab/pane switch re-pointed this window at a
     /// DIFFERENT terminal, and a blink carried from the old one must not
-    /// license a re-anchor (or, host-side, the probe) against the new one.
+    /// classify a re-anchor (or, host-side, the probe) against the new one.
     pub fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
@@ -278,29 +499,221 @@ impl CursorTrail {
         self.ctx_alt = alt;
     }
 
-    /// DISARM a dangling typed hint (see `CursorGlow::clear_typed`): a key
-    /// with its own move semantics (plain Enter, nav, kills) must not have its
-    /// jump re-anchored on a stale license from a no-move echo.
+    /// DISARM dangling movement state (see `CursorGlow::clear_typed`): a newer
+    /// key with its own semantics (plain Enter, nav, kills, Tab) supersedes a
+    /// swallowed typed or generic move. A stationary or unsupported event
+    /// intentionally arms nothing.
     pub fn clear_typed(&mut self) {
         self.type_hint = None;
+        self.nav_hint = None;
+        self.move_hint = None;
+        self.move_candidate = None;
+    }
+
+    /// Fail-closed boundary for an input with no exact movement proof.
+    pub fn cancel_authored_move_candidate(&mut self) {
+        self.candidate_superseded |= self.move_candidate.is_some();
+        self.clear_typed();
+    }
+
+    /// Discharge a supersession boundary whose triggering input was itself
+    /// declined by the host. The next independently submitted exact proof may
+    /// then arm normally; this never preserves or creates a candidate.
+    pub(crate) fn consume_declined_candidate_supersession(&mut self) {
+        debug_assert!(self.move_candidate.is_none());
+        self.candidate_superseded = false;
+    }
+
+    /// Fence resident comet cells against an in-place terminal rewrite.
+    ///
+    /// `exact_candidate_confirmed` is true only for the exact authored edit
+    /// confirmed in this same frame. Any other parser-generation change can
+    /// replace text beneath a still-live cell without moving the cursor, so
+    /// retire the visual trail while preserving the honest cursor anchor. A
+    /// scroll signal still translates geometry when no parser generation
+    /// changed; a parser batch that also scrolls is conservatively retired.
+    /// The first observation is a silent baseline.
+    pub fn observe_content_generation(
+        &mut self,
+        generation: ContentGeneration,
+        exact_candidate_confirmed: bool,
+    ) -> bool {
+        let changed = self
+            .last_content_generation
+            .is_some_and(|previous| previous != generation);
+        self.last_content_generation = Some(generation);
+        if !changed {
+            return false;
+        }
+        // Even an exact candidate owns only the cells it will forge now; it
+        // cannot certify older sparks elsewhere in the same parser batch.
+        self.sparks.clear();
+        if exact_candidate_confirmed {
+            return true;
+        }
+        self.type_hint = None;
+        self.nav_hint = None;
+        self.move_hint = None;
+        self.move_candidate = None;
+        self.candidate_superseded = false;
+        true
     }
 
     /// Arm the navigation veto — see `CursorGlow::note_navigation`.
     pub fn note_navigation(&mut self, now: Instant) {
+        self.type_hint = None;
+        self.move_hint = None;
         self.nav_hint = Some(now);
+        // A generic "navigation happened" timestamp is not a landing proof.
+        self.move_candidate = None;
     }
 
-    /// PTY scroll translation — see `CursorGlow::note_scroll`: the previous
-    /// caret cell now sits `rows` higher, so the next move classifies against
-    /// where it actually is (a bottom-anchored TUI's box-growing wrap
-    /// otherwise flattens to dr==0 and sweeps the trail across the line).
+    /// Arm one generic movement classifier, superseding any swallowed
+    /// typed/navigation classifier. This timestamp alone deliberately stays
+    /// dark; only a correlated candidate can admit geometry.
+    fn note_move(&mut self, now: Instant) {
+        self.type_hint = None;
+        self.nav_hint = None;
+        self.move_hint = Some(now);
+        self.move_candidate = None;
+    }
+
+    /// Classify a Tab completion or non-empty paste without claiming that its
+    /// eventual cursor landing was caused by this timestamp.
+    pub fn note_user_gesture(&mut self, now: Instant) {
+        self.note_move(now);
+    }
+
+    /// A Backspace/delete move whose exact row shrink must be confirmed before
+    /// the retreat can birth a trail.
+    pub fn note_delete_expected(&mut self, now: Instant, target: (u16, u16)) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.type_hint = None;
+            return;
+        }
+        self.type_hint = Some(now);
+        self.nav_hint = None;
+        self.move_hint = None;
+        self.arm_candidate(now, MoveIntent::Delete);
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+        }
+    }
+
+    /// Classify a plain Return. Return has no exact landing proof here, so this
+    /// timestamp alone cannot birth a trail.
+    pub fn note_return(&mut self, now: Instant) {
+        self.note_move(now);
+    }
+
+    /// Classify a settled user resize/re-grid. Reflow changes the coordinate
+    /// space, so this timestamp deliberately carries no movement admission and
+    /// all observed relocations stay dark.
+    pub fn note_reflow(&mut self, now: Instant) {
+        self.note_move(now);
+    }
+
+    /// Explicit test/preview driver for a deliberately scripted move. Shipping
+    /// input hosts must use one of the correlated methods above.
+    #[doc(hidden)]
+    pub fn note_synthetic_move(&mut self, now: Instant) {
+        self.note_move(now);
+        self.arm_candidate(now, MoveIntent::Synthetic);
+    }
+
+    /// Scripted typed-move twin for previews, examples and benchmarks that
+    /// deliberately exercise the typing classifier without a live terminal.
+    #[doc(hidden)]
+    pub fn note_synthetic_typed(&mut self, now: Instant) {
+        self.note_typed(now);
+        self.arm_candidate(now, MoveIntent::SyntheticTyped);
+    }
+
+    /// Mark a matching content candidate as proven by CursorGlow's coherent
+    /// previous/current row snapshots. The token includes its origin so two
+    /// engines that were not seeded on the same cell cannot accidentally pair.
+    pub fn confirm_content_candidate(
+        &mut self,
+        at: Instant,
+        origin: (u16, u16),
+        target: (u16, u16),
+    ) {
+        if let Some(candidate) = self.move_candidate.as_mut()
+            && candidate.at == at
+            && candidate.origin == origin
+            && matches!(
+                candidate.intent,
+                MoveIntent::Typed(_) | MoveIntent::Delete
+            )
+        {
+            candidate.content_confirmed = true;
+            candidate.target = Some(target);
+        }
+    }
+
+    /// Consume a candidate that the coherent content probe completed without a
+    /// drawable move (same-cell materialization or expiry).
+    pub fn retire_content_candidate(&mut self, at: Instant, origin: (u16, u16)) {
+        if self
+            .move_candidate
+            .is_some_and(|candidate| candidate.at == at && candidate.origin == origin)
+        {
+            self.move_candidate = None;
+            for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
+                if *hint == Some(at) {
+                    *hint = None;
+                }
+            }
+        }
+    }
+
+    /// Cancel only the classifier/candidate written by one not-yet-egressed
+    /// dispatch. See `CursorGlow::revoke_input_hints_at` for the host contract.
+    pub fn revoke_input_hints_at(&mut self, at: Instant) {
+        for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
+            if *hint == Some(at) {
+                *hint = None;
+            }
+        }
+        if self.move_candidate.is_some_and(|candidate| candidate.at == at) {
+            self.move_candidate = None;
+        }
+    }
+
+    /// PTY scroll translation — see `CursorGlow::note_scroll`: every live
+    /// terminal-coordinate member now sits `rows` higher. That includes the
+    /// classifier anchors AND the already-visible cells; moving only `last`
+    /// leaves the old comet painted over unrelated post-scroll text. Anything
+    /// pushed above row 0 is retired rather than clamped there, because row 0
+    /// is a real cell and no longer owns that light/source anchor.
     pub fn note_scroll(&mut self, rows: u16) {
         if rows == 0 {
             return;
         }
-        if let Some((r, c)) = self.last {
-            self.last = Some((r.saturating_sub(rows), c));
+        self.last = self
+            .last
+            .and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
+        self.last_visible = self
+            .last_visible
+            .and_then(|((row, col), at)| row.checked_sub(rows).map(|row| ((row, col), at)));
+        if let Some(candidate) = self.move_candidate.take() {
+            // Live sparks translate; a pre/post input content proof does not.
+            // Retire its exact one-shot at the content-generation boundary.
+            for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
+                if *hint == Some(candidate.at) {
+                    *hint = None;
+                }
+            }
         }
+        self.sparks
+            .retain_mut(|spark| match spark.row.checked_sub(rows) {
+                Some(row) => {
+                    spark.row = row;
+                    true
+                }
+                None => false,
+            });
     }
 
     /// Whether any spark is still alive (so the host should keep the animation
@@ -318,16 +731,21 @@ impl CursorTrail {
         self.last_visible = None;
         self.type_hint = None;
         self.nav_hint = None;
+        self.move_hint = None;
+        self.move_candidate = None;
+        self.candidate_superseded = false;
         self.blink_hint = None;
         self.ctx_alt = false;
+        self.last_content_generation = None;
     }
 
     /// Advance the trail one frame: observe the cursor at `cur` (`Some(row,col)`
-    /// when the cursor is visible, `None` when hidden), spawn a comet on a move,
-    /// decay expired sparks, then write the CURRENT trail cells (terminal coords)
-    /// into `out` and return a fingerprint of them. The fingerprint changes on
-    /// every visible change, so the host's repaint key never skips an animating
-    /// frame; it is `0` for an empty trail (idle).
+    /// when the cursor is visible, `None` when hidden), spawn a comet only when
+    /// a one-shot movement candidate admits that delta, decay expired sparks,
+    /// then write the CURRENT trail cells (terminal coords) into `out` and
+    /// return a fingerprint of them. The fingerprint changes on every visible
+    /// change, so the host's repaint key never skips an animating frame; it is
+    /// `0` for an empty trail (idle).
     pub fn tick(
         &mut self,
         cur: Option<(u16, u16)>,
@@ -344,22 +762,26 @@ impl CursorTrail {
             self.last_visible = cur.map(|c| (c, now));
             self.type_hint = None;
             self.nav_hint = None;
+            self.move_hint = None;
+            self.move_candidate = None;
+            self.candidate_superseded = false;
             self.blink_hint = None;
             return 0;
         }
 
-        // Spawn on a real move between two VISIBLE positions — where "visible"
-        // BRIDGES ConPTY's per-echo hide window: if the previous frame(s) hid the
-        // cursor but it was visible within HIDE_BRIDGE_MS and reappears within a
-        // plausible typing distance, the move spawns from the last VISIBLE cell
-        // (see the `last_visible` field doc — without this, Windows drops the
-        // spark for nearly every keystroke at human cadence).
+        // Select the source for a move between two VISIBLE positions — where
+        // "visible" BRIDGES ConPTY's per-echo hide window: if the previous
+        // frame(s) hid the cursor but it was visible within HIDE_BRIDGE_MS and
+        // reappears within a plausible typing distance, an admitted move may
+        // start at the last VISIBLE cell. The source bridge never substitutes
+        // for the candidate gate in `spawn`.
         let spawn_from = self.last.or_else(|| {
             let ((r, c), seen) = self.last_visible?;
             let fresh = now.saturating_duration_since(seen).as_millis() as u64 <= HIDE_BRIDGE_MS;
-            // A fresh typed hint widens the plausible reach (PEEKED — `spawn`
-            // still owns consumption): batched echoes hop farther than 2 cells
-            // inside one hide window; unhinted moves keep the classic law.
+            // A fresh typed hint widens only the plausible source reach (PEEKED
+            // — `spawn` still owns consumption and candidate admission):
+            // batched echoes hop farther than 2 cells inside one hide window;
+            // unhinted moves keep the classic source law.
             let typed_fresh = self.type_hint.is_some_and(|t| {
                 now.saturating_duration_since(t).as_secs_f32() <= Self::TYPE_HINT_FRESH
             });
@@ -367,10 +789,52 @@ impl CursorTrail {
             let plausible = cur.is_some_and(|(cr, cc)| cr.abs_diff(r).max(cc.abs_diff(c)) <= reach);
             (fresh && plausible).then_some((r, c))
         });
+        let declined_hidden_relocation = spawn_from.is_none()
+            && self.last.is_none()
+            && cur
+                .zip(self.last_visible.map(|(cell, _)| cell))
+                .is_some_and(|(current, previous)| current != previous);
+        let completed_hidden_reappearance =
+            self.last.is_none() && cur.is_some() && self.last_visible.is_some();
+        let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
         if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
             && (pr != cr || pc != cc)
         {
             self.spawn(pr, pc, cr, cc, now, cfg);
+        } else if declined_hidden_relocation {
+            // A far/stale hidden→visible relocation declined the ConPTY
+            // bridge, so `spawn` did not get a chance to consume its one-shot
+            // classifiers. Retire them here before the new visible cell becomes
+            // `last`; otherwise the following unrelated small program move can
+            // borrow the typed/nav/gesture classifier or candidate and mint a
+            // detached comet.
+            self.type_hint = None;
+            self.nav_hint = None;
+            self.move_hint = None;
+            self.move_candidate = None;
+            self.candidate_superseded = false;
+            self.sparks.clear();
+        } else if completed_hidden_reappearance {
+            // A visible→hidden→visible cycle that returns to the SAME cell is
+            // still the completion boundary for one-shot input state.
+            // No move reached `spawn`, so consume the hints dark; otherwise the
+            // next unrelated PTY/CUP delta could borrow them.
+            self.type_hint = None;
+            self.nav_hint = None;
+            self.move_hint = None;
+            self.move_candidate = None;
+            self.candidate_superseded = false;
+        } else if unseeded_visible {
+            // A fresh/reset engine has no honest source cell from which to
+            // render this landing. Seed the visible anchor, but spend every
+            // one-shot classifier now: retaining it would let the following
+            // unrelated CUP borrow an input classifier or candidate. Losing
+            // cosmetics for the impossible source-less move is fail-closed.
+            self.type_hint = None;
+            self.nav_hint = None;
+            self.move_hint = None;
+            self.move_candidate = None;
+            self.candidate_superseded = false;
         }
         self.last = cur;
         if let Some(c) = cur {
@@ -476,12 +940,21 @@ impl CursorTrail {
         fp
     }
 
-    /// Spawn a comet for a move from `(pr,pc)` to `(cr,cc)`: the cells the cursor
-    /// swept (the straight cell-line from origin toward the destination, EXCLUDING
-    /// the destination cell — the live cursor draws there). On a long jump only
-    /// the `max_len` cells nearest the destination survive, so the comet has a
-    /// bounded length regardless of the jump distance.
-    fn spawn(&mut self, pr: u16, pc: u16, cr: u16, cc: u16, now: Instant, cfg: &TrailConfig) {
+    /// Try to spawn a comet for a candidate-backed move from `(pr,pc)` to
+    /// `(cr,cc)`: the cells the cursor swept (the straight cell-line from origin
+    /// toward the destination, EXCLUDING the destination cell — the live cursor
+    /// draws there). On a long jump only the `max_len` cells nearest the
+    /// destination survive, so the comet has a bounded length regardless of the
+    /// jump distance.
+    fn spawn(
+        &mut self,
+        pr: u16,
+        pc: u16,
+        cr: u16,
+        cc: u16,
+        now: Instant,
+        cfg: &TrailConfig,
+    ) -> bool {
         // TYPED RE-ANCHOR (the `CursorGlow` wrap classifier's trail twin): a
         // fresh typed/backspace echo hint paired with a ONE-ROW move beyond the
         // typed advance is a TUI repaint re-anchoring its caret (Ink rewraps
@@ -494,14 +967,27 @@ impl CursorTrail {
         // dr == 0 with a large column delta);
         // `raw_dist > 2` keeps every ConPTY hide-bridgeable move (chebyshev ≤
         // [`HIDE_BRIDGE_MAX_DIST`] = 2) byte-identical. The hint is consumed on
-        // any paired move (bounded state, one hint = one echo), so a host that
-        // never arms it — every existing test — is byte-identical.
+        // any paired move (bounded state, one hint = one echo); it influences
+        // morphology only after the correlated candidate admits the delta.
         let dr_abs = (cr as i32 - pr as i32).abs();
         let raw_dist = dr_abs.max((cc as i32 - pc as i32).abs());
-        let paired = self
-            .type_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::TYPE_HINT_FRESH)
-            .is_some();
+        // The candidate is consumed on the first observed delta whether it
+        // matches or not. A swallowed key therefore cannot lend its timestamp
+        // to a later CUP, and an exact-but-ignored navigation target cannot be
+        // retried against the following move.
+        self.candidate_superseded = false;
+        let candidate = self.move_candidate.take();
+        let admitted_intent = candidate
+            .filter(|candidate| {
+                candidate.admits((pr, pc), (cr, cc), now, Self::MOVE_HINT_FRESH)
+            })
+            .map(|candidate| candidate.intent);
+        let paired = self.type_hint.take().is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::TYPE_HINT_FRESH
+        }) && matches!(
+            admitted_intent,
+            Some(MoveIntent::Typed(_) | MoveIntent::Delete | MoveIntent::SyntheticTyped)
+        );
         // ALT-SCREEN blink requirement (the glow classifier's twin): on the
         // alt screen only a repaint-BLINKING app (Claude Code's
         // hide-inside-sync bracket) re-anchors — vim's hinted one-row motions
@@ -509,28 +995,40 @@ impl CursorTrail {
         let blink_fresh = self.blink_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::BLINK_HINT_FRESH
         });
-        let nav_paired = self
-            .nav_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
-            .is_some();
-        // NAVIGATION (Ctrl-A/E, Home/End, arrows, word/line motions): a move
-        // paired with a fresh nav hint is scrubbing, not typing — lay NO comet,
-        // exactly as the `CursorGlow` engine's nav gate suppresses the wake/meteor
-        // for every other style. Without this the ember bed painted a full-span
-        // band across the whole jump on every Ctrl-A/Ctrl-E (the "nav paints a
-        // comet other styles suppress" report); the live cursor still draws
+        let _nav_fresh = self.nav_hint.take().is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::NAV_HINT_FRESH
+        });
+        let nav_paired = false;
+        let move_paired = self.move_hint.take().is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::MOVE_HINT_FRESH
+        }) && matches!(
+            admitted_intent,
+            Some(MoveIntent::Synthetic | MoveIntent::SyntheticTyped)
+        );
+        // NAVIGATION (Ctrl-A/E, Home/End, arrows, word/line motions): its bare
+        // timestamp is never a landing candidate, so it stays dark just like
+        // CursorGlow. Retain the classifier consumption here so no stale nav
+        // hint can escape this observed boundary; the live cursor still draws
         // itself, and `last`/`last_visible` already carried over in `tick`.
         if nav_paired {
-            return;
+            return false;
+        }
+        // An observed PTY/program cursor delta is not evidence that the user
+        // moved. Before this gate every spinner/CUP/repaint laid a comet and
+        // could leave its prior cells stranded. Fail closed and retire the old
+        // cell bed unless a current correlated candidate owns this exact move.
+        if !paired && !move_paired {
+            self.sparks.clear();
+            return false;
         }
         if paired && dr_abs <= 1 && raw_dist > 2 && (!self.ctx_alt || blink_fresh) {
-            return;
+            return false;
         }
         let mut path = line_cells(pr as i32, pc as i32, cr as i32, cc as i32);
         // Drop the destination cell (last entry) — the cursor occupies it.
         path.pop();
         if path.is_empty() {
-            return;
+            return false;
         }
         // Keep at most `max_len` cells NEAREST the destination (the path's tail).
         let max_len = cfg.max_len.max(1);
@@ -576,6 +1074,7 @@ impl CursorTrail {
             let drop = self.sparks.len() - Self::MAX_SPARKS;
             self.sparks.drain(0..drop);
         }
+        true
     }
 }
 
@@ -845,6 +1344,495 @@ mod tests {
         assert!(!t.is_active());
     }
 
+    /// PTY scrolls carry the classic terminal-cell trail just like the glow
+    /// engine's pixel/cell pools. A survivor moves by the exact row delta,
+    /// while visible light and classifier anchors that cross the top retire;
+    /// none may clamp to row 0 and later seed an unrelated move.
+    #[test]
+    fn scroll_translates_every_live_trail_cell_and_retires_off_top_state() {
+        let now = Instant::now();
+        let mut trail = CursorTrail {
+            last: Some((10, 4)),
+            last_visible: Some(((10, 4), now)),
+            ..CursorTrail::default()
+        };
+        trail.sparks.push(Spark {
+            row: 10,
+            col: 3,
+            born_alpha: 42,
+            born: now,
+            life_ms: 500,
+        });
+        trail.sparks.push(Spark {
+            row: 1,
+            col: 2,
+            born_alpha: 42,
+            born: now,
+            life_ms: 500,
+        });
+
+        trail.note_scroll(2);
+        assert_eq!(trail.last, Some((8, 4)), "classifier anchor follows");
+        assert_eq!(
+            trail.last_visible.map(|(cell, _)| cell),
+            Some((8, 4)),
+            "hide-bridge anchor follows"
+        );
+        assert_eq!(trail.sparks.len(), 1, "off-top light retires");
+        assert_eq!(trail.sparks[0].row, 8, "surviving light follows exactly");
+
+        // Tier 1: bind the genuine CursorTrail transition to the same derived
+        // all-effect scroll decision used by CursorGlow. The concrete asserts
+        // above cover every position-bearing field in this engine.
+        let base_model = aterm_spec::derive::cursor_effect_scroll_model();
+        let overrides = [("StartY", 10), ("Delta", 2)];
+        let model = aterm_spec::interp::with_consts(&base_model, &overrides);
+        let mut source = model.init_state();
+        source.insert("survivor_y", 10);
+        let mut projected = source.clone();
+        projected.insert("survivor_y", i64::from(trail.sparks[0].row));
+        projected.insert("off_top_alive", 0);
+        // This engine owns no row-probe proof; absence projects to the
+        // family-wide post-scroll cleared state.
+        projected.insert("stale_proof_alive", 0);
+        projected.insert("scrolled", 1);
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &projected,
+            Some("Scroll"),
+            "CursorTrail all-family scroll translation",
+        );
+        assert!(admitted, "real trail scroll transition rejected: {why}");
+
+        // Negative controls prove the bind observes both decisions rather than
+        // accepting any post-state with the right action name.
+        let mut stranded = projected.clone();
+        stranded.insert("survivor_y", 10);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &stranded,
+            Some("Scroll"),
+            "CursorTrail stranded-scroll negative control",
+        );
+        assert!(!admitted, "an untranslated trail cell must be rejected");
+        let mut retained = projected;
+        retained.insert("off_top_alive", 1);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &retained,
+            Some("Scroll"),
+            "CursorTrail off-top-retention negative control",
+        );
+        assert!(!admitted, "an off-top trail cell must be rejected");
+
+        trail.note_scroll(20);
+        assert!(
+            trail.sparks.is_empty(),
+            "remaining trail scrolls off cleanly"
+        );
+        assert!(
+            trail.last.is_none() && trail.last_visible.is_none(),
+            "off-top anchors retire instead of forging a row-0 source"
+        );
+    }
+
+    /// Paste/Tab supersedes swallowed typed/navigation classifiers, but its
+    /// text-blind timestamp is not movement evidence. A scripted candidate
+    /// proves the identical geometry is non-vacuously drawable.
+    #[test]
+    fn timestamp_only_user_gesture_clears_stale_classifiers_but_stays_dark() {
+        let now = Instant::now();
+        let mut trail = CursorTrail::default();
+        let mut out = Vec::new();
+        let c = cfg(true);
+        trail.tick(Some((2, 20)), now, &c, &mut out);
+        trail.note_typed(now);
+        trail.note_navigation(now);
+
+        trail.note_user_gesture(now);
+        assert!(
+            trail.type_hint.is_none() && trail.nav_hint.is_none(),
+            "the gesture establishes one unambiguous generic class"
+        );
+        let moved = now + Duration::from_millis(10);
+        assert_eq!(
+            trail.tick(Some((3, 3)), moved, &c, &mut out),
+            0,
+            "a paste/Tab timestamp cannot prove its eventual landing"
+        );
+        assert!(out.is_empty());
+
+        let mut scripted = CursorTrail::default();
+        scripted.tick(Some((2, 20)), now, &c, &mut out);
+        scripted.note_synthetic_move(now);
+        assert_ne!(
+            scripted.tick(Some((3, 3)), moved, &c, &mut out),
+            0,
+            "the candidate-gated geometry remains non-vacuously drawable"
+        );
+        assert!(!out.is_empty());
+
+        // Tier 1: project the real classifier supersession onto the shared
+        // gesture model. `gesture_hint=1` records the classifier timestamp,
+        // while the two superseded class variables come directly from this
+        // engine. Movement admission is bound by the candidate model.
+        let base_model = aterm_spec::derive::rainbow_move_admission_model();
+        let model = aterm_spec::interp::with_consts(&base_model, &[]);
+        let mut source = model.init_state();
+        source.insert("typed_class", 1);
+        source.insert("strong_class", 1);
+        let mut projected = source.clone();
+        projected.insert("gesture_hint", 1);
+        projected.insert("gesture_arms", 1);
+        projected.insert("typed_class", i64::from(trail.type_hint.is_some()));
+        projected.insert("strong_class", i64::from(trail.nav_hint.is_some()));
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &[],
+            &source,
+            &projected,
+            Some("ArmGesture"),
+            "CursorTrail gesture-class supersession",
+        );
+        assert!(admitted, "real trail supersession rejected: {why}");
+
+        let mut ambiguous = projected;
+        ambiguous.insert("typed_class", 1);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &[],
+            &source,
+            &ambiguous,
+            Some("ArmGesture"),
+            "CursorTrail stale-typed negative control",
+        );
+        assert!(!admitted, "a retained typed class must be rejected");
+
+        // The same stale classes are observably harmful without supersession:
+        // each one independently suppresses this large one-row move.
+        for arm in [CursorTrail::note_typed, CursorTrail::note_navigation] {
+            let mut stale = CursorTrail::default();
+            stale.tick(Some((2, 20)), now, &c, &mut out);
+            arm(&mut stale, now);
+            assert_eq!(stale.tick(Some((3, 3)), moved, &c, &mut out), 0);
+            assert!(out.is_empty(), "negative control must suppress the move");
+        }
+    }
+
+    /// Tier-1 provenance bind for the classic opaque comet. Program/TUI cursor
+    /// deltas and timestamp-only input classes stay dark even while the
+    /// configured colour/heat is warm; an explicit candidate admits exactly
+    /// one move and is consumed whether fresh or stale.
+    #[test]
+    fn classic_trail_requires_one_shot_correlated_candidate() {
+        let now = Instant::now();
+        let mut hot = cfg(true);
+        hot.intensity = 1.0;
+        hot.warmth = 1.0;
+
+        let mut cold = CursorTrail::default();
+        assert!(
+            !cold.spawn(0, 0, 0, 1, now, &hot),
+            "warm configuration is amplitude, not user provenance"
+        );
+        assert!(cold.sparks.is_empty());
+
+        // Text-blind typed/Return/reflow and Tab/paste timestamps are
+        // classifiers only. None may mint geometry by itself.
+        for arm in [
+            CursorTrail::note_typed,
+            CursorTrail::note_return,
+            CursorTrail::note_reflow,
+            CursorTrail::note_user_gesture,
+        ] {
+            let mut timestamp_only = CursorTrail::default();
+            arm(&mut timestamp_only, now);
+            assert!(
+                !timestamp_only.spawn(0, 0, 0, 1, now + Duration::from_millis(1), &hot),
+                "a timestamp-only movement class must stay dark"
+            );
+            assert!(timestamp_only.sparks.is_empty());
+        }
+
+        let mut witnessed = CursorTrail {
+            last: Some((0, 0)),
+            last_visible: Some(((0, 0), now)),
+            ..CursorTrail::default()
+        };
+        witnessed.note_synthetic_move(now);
+        assert!(witnessed.spawn(0, 0, 0, 1, now, &hot));
+        assert!(!witnessed.sparks.is_empty());
+
+        let mut one_shot = CursorTrail {
+            last: Some((0, 0)),
+            ..CursorTrail::default()
+        };
+        one_shot.note_synthetic_move(now);
+        assert!(one_shot.spawn(0, 0, 0, 1, now, &hot));
+        assert!(
+            !one_shot.spawn(0, 1, 0, 2, now + Duration::from_millis(1), &hot),
+            "one candidate cannot fund a second program delta"
+        );
+        assert!(
+            one_shot.sparks.is_empty(),
+            "a denied relocation retires the detached old comet bed"
+        );
+
+        let mut stale = CursorTrail {
+            last: Some((0, 0)),
+            ..CursorTrail::default()
+        };
+        stale.note_synthetic_move(now);
+        assert!(
+            !stale.spawn(0, 0, 0, 1, now + Duration::from_millis(251), &hot),
+            "expired candidate is consumed dark"
+        );
+        assert!(stale.move_hint.is_none());
+
+        let mut nav = CursorTrail::default();
+        nav.note_navigation(now);
+        assert!(!nav.spawn(0, 0, 0, 1, now, &hot));
+
+        for arm in [
+            CursorTrail::note_typed,
+            CursorTrail::note_navigation,
+            CursorTrail::note_return,
+            CursorTrail::note_user_gesture,
+        ] {
+            let mut hidden = CursorTrail::default();
+            let mut out = Vec::new();
+            hidden.tick(Some((0, 0)), now, &hot, &mut out);
+            hidden.tick(None, now + Duration::from_millis(1), &hot, &mut out);
+            arm(&mut hidden, now + Duration::from_millis(2));
+            hidden.tick(
+                Some((0, 20)),
+                now + Duration::from_millis(3),
+                &hot,
+                &mut out,
+            );
+            assert!(out.is_empty(), "far reappearance declines the bridge");
+            assert!(
+                hidden.type_hint.is_none()
+                    && hidden.nav_hint.is_none()
+                    && hidden.move_hint.is_none(),
+                "declined hidden relocation consumes every movement class"
+            );
+            hidden.tick(
+                Some((0, 21)),
+                now + Duration::from_millis(4),
+                &hot,
+                &mut out,
+            );
+            assert!(
+                out.is_empty() && !hidden.is_active(),
+                "the next cold program move cannot borrow a declined hint"
+            );
+        }
+
+        // SAME-CELL completion is a distinct no-spawn shape: the bounded hide
+        // bridge resolves back to its source, so neither `spawn` nor the
+        // far-relocation decline arm runs. Typed, Return, and Tab/paste must
+        // still spend their one-shot at this hidden→visible boundary.
+        for arm in [
+            CursorTrail::note_typed,
+            CursorTrail::note_return,
+            CursorTrail::note_user_gesture,
+        ] {
+            let mut hidden = CursorTrail::default();
+            let mut out = Vec::new();
+            hidden.tick(Some((2, 4)), now, &hot, &mut out);
+            hidden.tick(None, now + Duration::from_millis(1), &hot, &mut out);
+            arm(&mut hidden, now + Duration::from_millis(2));
+            hidden.tick(Some((2, 4)), now + Duration::from_millis(3), &hot, &mut out);
+            assert!(out.is_empty(), "same-cell reappearance paints nothing");
+            assert!(
+                hidden.type_hint.is_none()
+                    && hidden.nav_hint.is_none()
+                    && hidden.move_hint.is_none(),
+                "same-cell hidden completion consumes its movement class"
+            );
+            hidden.tick(Some((2, 5)), now + Duration::from_millis(4), &hot, &mut out);
+            assert!(
+                out.is_empty() && !hidden.is_active(),
+                "the next cold CUP move cannot borrow a same-cell hide hint"
+            );
+        }
+
+        // FRESH/RESET first draw has no source anchor. Input or reflow may
+        // already have landed before that draw (tab switch, effect enable, or
+        // synchronous resize), so the seed tick must consume the one-shot
+        // dark instead of lending it to the next program CUP.
+        for reset_first in [false, true] {
+            for arm in [
+                CursorTrail::note_typed,
+                CursorTrail::note_navigation,
+                CursorTrail::note_return,
+                CursorTrail::note_user_gesture,
+                CursorTrail::note_reflow,
+            ] {
+                let mut unseeded = CursorTrail::default();
+                let mut out = Vec::new();
+                if reset_first {
+                    unseeded.tick(Some((4, 4)), now, &hot, &mut out);
+                    unseeded.reset();
+                }
+                arm(&mut unseeded, now + Duration::from_millis(1));
+                unseeded.tick(
+                    Some((4, 10)),
+                    now + Duration::from_millis(2),
+                    &hot,
+                    &mut out,
+                );
+                assert!(out.is_empty(), "a source-less seed paints nothing");
+                assert!(
+                    unseeded.type_hint.is_none()
+                        && unseeded.nav_hint.is_none()
+                        && unseeded.move_hint.is_none(),
+                    "a source-less seed consumes every movement class"
+                );
+                unseeded.tick(
+                    Some((4, 11)),
+                    now + Duration::from_millis(3),
+                    &hot,
+                    &mut out,
+                );
+                assert!(
+                    out.is_empty() && !unseeded.is_active(),
+                    "the next cold CUP cannot borrow a pre-seed class"
+                );
+            }
+        }
+
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let mut hidden_source = model.init_state();
+        hidden_source.insert("gesture_hint", 1);
+        hidden_source.insert("gesture_arms", 1);
+        let mut hidden_projected = hidden_source.clone();
+        hidden_projected.insert("gesture_hint", 0);
+        hidden_projected.insert("hidden_declined", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &hidden_source,
+            &hidden_projected,
+            Some("DeclineHidden"),
+            "CursorTrail declined hidden relocation",
+        );
+        assert!(ok, "real hidden-decline transition rejected: {why}");
+        let mut hidden_sticky = hidden_projected.clone();
+        hidden_sticky.insert("gesture_hint", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &hidden_source,
+            &hidden_sticky,
+            Some("DeclineHidden"),
+            "CursorTrail declined-hidden negative control",
+        );
+        assert!(!ok, "a declined hidden hint must not remain armed");
+
+        // Model conformance: bind the real cold decision, candidate arm, and
+        // admitted observation, then mutate only `admitted` as a non-vacuity
+        // control.
+        let source = model.init_state();
+        let cold_projected = source.clone();
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &cold_projected,
+            Some("UnwitnessedMove"),
+            "CursorTrail cold program denial",
+        );
+        assert!(ok, "real cold-trail decision rejected: {why}");
+        let mut leaked = cold_projected;
+        leaked.insert("admitted", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &leaked,
+            Some("UnwitnessedMove"),
+            "CursorTrail cold program negative control",
+        );
+        assert!(!ok, "model must reject the historical cold fall-through");
+
+        let mut armed = source.clone();
+        armed.insert("candidate_admitted", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &source,
+            &armed,
+            Some("AdmitCandidate"),
+            "CursorTrail correlated-candidate arm",
+        );
+        assert!(ok, "real candidate arm rejected: {why}");
+
+        let mut witnessed_projected = armed.clone();
+        witnessed_projected.insert("witnessed", 1);
+        witnessed_projected.insert("admitted", 1);
+        witnessed_projected.insert("candidate_admitted", 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &witnessed_projected,
+            Some("WitnessedMove"),
+            "CursorTrail candidate-backed move admission",
+        );
+        assert!(ok, "real witnessed-trail decision rejected: {why}");
+    }
+
+    /// An unsupported second event invalidates an unobserved exact candidate.
+    /// Once a cold observed delta consumes that ambiguity boundary, the latch
+    /// must converge so a later independently proven edit can trail normally.
+    #[test]
+    fn canceled_candidate_recovers_after_cold_observed_move() {
+        let mut trail = CursorTrail::default();
+        let mut out = Vec::new();
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        trail.tick(Some((0, 0)), t0, &c, &mut out);
+        let first = t0 + Duration::from_millis(1);
+        trail.note_typed_expected(first, expected, (0, 1), (0, 0));
+        assert!(trail.move_candidate_pending());
+        trail.cancel_authored_move_candidate();
+        assert!(!trail.move_candidate_pending());
+
+        let cold = t0 + Duration::from_millis(2);
+        assert_eq!(
+            trail.tick(Some((0, 1)), cold, &c, &mut out),
+            0,
+            "the ambiguous canceled cohort must be consumed dark"
+        );
+        assert!(out.is_empty());
+
+        let second = t0 + Duration::from_millis(3);
+        trail.note_typed_expected(second, expected, (0, 2), (0, 1));
+        assert!(
+            trail.move_candidate_pending(),
+            "the supersession latch must converge after a cold observation"
+        );
+        trail.confirm_content_candidate(second, (0, 1), (0, 2));
+        let fp = trail.tick(
+            Some((0, 2)),
+            t0 + Duration::from_millis(4),
+            &c,
+            &mut out,
+        );
+        assert_ne!(fp, 0, "the later exact candidate admits its own move");
+        assert!(!out.is_empty());
+    }
+
     #[test]
     fn same_row_jump_spawns_a_bounded_comet_nearest_the_cursor() {
         let mut t = CursorTrail::default();
@@ -852,7 +1840,8 @@ mod tests {
         let mut out = Vec::new();
         let c = cfg(true);
         t.tick(Some((0, 0)), now, &c, &mut out); // seed last = (0,0)
-        // Jump to col 40 on the same row: a long move, capped to max_len cells.
+        // A deliberately scripted jump to col 40: capped to max_len cells.
+        t.note_synthetic_move(now);
         let fp = t.tick(Some((0, 40)), now, &c, &mut out);
         assert_ne!(fp, 0);
         assert!(t.is_active());
@@ -882,6 +1871,7 @@ mod tests {
             // Deterministic seed → identical cells for both colours; the
             // single shared `now` keeps the alphas byte-identical too.
             t.tick(Some((0, 0)), now, &c, &mut out);
+            t.note_synthetic_move(now);
             let fp = t.tick(Some((0, 5)), now, &c, &mut out);
             (fp, out.clone())
         };
@@ -910,6 +1900,7 @@ mod tests {
         let mut out = Vec::new();
         let c = cfg(true);
         t.tick(Some((0, 0)), t0, &c, &mut out);
+        t.note_synthetic_move(t0);
         t.tick(Some((0, 5)), t0, &c, &mut out);
         assert!(t.is_active());
         // Halfway: still alive, dimmer.
@@ -967,6 +1958,7 @@ mod tests {
             ..cfg(true)
         };
         t.tick(Some((0, 0)), t0, &c, &mut out);
+        t.note_synthetic_typed(t0);
         t.tick(Some((0, 1)), t0, &c, &mut out); // typing advance, warmth 0.5
         // life = 200ms * (1 + 1.5*0.5) = 350ms → still alive at +340ms…
         let alive = t.tick(Some((0, 1)), t0 + Duration::from_millis(340), &c, &mut out);
@@ -992,10 +1984,10 @@ mod tests {
     }
 
     /// TYPED RE-ANCHOR LAW (the trail twin of the `CursorGlow` classifier): a
-    /// typed-hinted one-row move beyond the typed advance — Claude Code's Ink
-    /// box rewrapping its inset prompt — lays NO comet (the caret never swept
-    /// those cells), while the SAME move without the hint keeps today's comet
-    /// byte-identically, and a hinted plain typing advance still trails.
+    /// candidate-backed typed one-row move beyond the typed advance — Claude
+    /// Code's Ink box rewrapping its inset prompt — lays NO comet (the caret
+    /// never swept those cells), while the SAME move with a scripted generic
+    /// candidate keeps its comet, and a scripted typed advance still trails.
     #[test]
     fn hinted_ink_wrap_lays_no_comet_but_typing_still_trails() {
         let c = cfg(true);
@@ -1005,34 +1997,35 @@ mod tests {
         // Hinted Ink wrap: (0,30) -> (1,3) — dr=1, dc=-27. No cells.
         let mut t = CursorTrail::default();
         t.tick(Some((0, 30)), t0, &c, &mut out);
-        t.note_typed(t0 + Duration::from_millis(5));
+        t.note_synthetic_typed(t0 + Duration::from_millis(5));
         let fp = t.tick(Some((1, 3)), t0 + Duration::from_millis(10), &c, &mut out);
         assert_eq!(fp, 0, "a typed re-anchor sweeps no comet");
         assert!(out.is_empty());
         assert!(!t.is_active());
 
-        // IDENTITY: the same move with NO hint keeps its comet exactly.
-        let mut bare = CursorTrail::default();
-        bare.tick(Some((0, 30)), t0, &c, &mut out);
-        let fp = bare.tick(Some((1, 3)), t0 + Duration::from_millis(10), &c, &mut out);
-        assert_ne!(fp, 0, "unhinted hosts are byte-identical to before");
+        // A scripted generic candidate owns the same sweep without borrowing
+        // the typed repaint classifier.
+        let mut generic = CursorTrail::default();
+        generic.tick(Some((0, 30)), t0, &c, &mut out);
+        generic.note_synthetic_move(t0 + Duration::from_millis(5));
+        let fp = generic.tick(Some((1, 3)), t0 + Duration::from_millis(10), &c, &mut out);
+        assert_ne!(fp, 0, "a candidate-backed generic jump keeps its comet");
         assert!(!out.is_empty());
 
         // A hinted PLAIN advance (dist 1) still lays its typing spark.
         let mut typing = CursorTrail::default();
         typing.tick(Some((0, 3)), t0, &c, &mut out);
-        typing.note_typed(t0 + Duration::from_millis(5));
+        typing.note_synthetic_typed(t0 + Duration::from_millis(5));
         let fp = typing.tick(Some((0, 4)), t0 + Duration::from_millis(10), &c, &mut out);
-        assert_ne!(fp, 0, "ordinary typing still trails under the hint");
+        assert_ne!(fp, 0, "candidate-backed typing still trails");
         assert!(!out.is_empty());
     }
 
     /// THE KITTY→BLINK SWAP (trail twin of the glow law): on the ALT screen a
-    /// typed hint alone no longer re-anchors — without a fresh REPAINT BLINK
-    /// (vim never hides inside DEC-2026) the hinted dr==1 big-dc move keeps
-    /// its comet, while WITH the blink (Claude Code's per-keystroke bracket)
-    /// the same move lays none. Main-screen behavior is pinned byte-identical
-    /// by `hinted_ink_wrap_lays_no_comet_but_typing_still_trails` above.
+    /// typed classifier alone no longer re-anchors — for a candidate-backed
+    /// typed move without a fresh REPAINT BLINK (vim never hides inside
+    /// DEC-2026), the dr==1 big-dc move keeps its comet; WITH the blink (Claude
+    /// Code's per-keystroke bracket), the same admitted move lays none.
     #[test]
     fn alt_without_blink_keeps_the_jump_comet() {
         let c = cfg(true);
@@ -1043,17 +2036,20 @@ mod tests {
         let mut vim = CursorTrail::default();
         vim.note_context(true);
         vim.tick(Some((0, 30)), t0, &c, &mut out);
-        vim.note_typed(t0 + Duration::from_millis(5));
+        vim.note_synthetic_typed(t0 + Duration::from_millis(5));
         vim.note_context(true);
         let fp = vim.tick(Some((1, 3)), t0 + Duration::from_millis(10), &c, &mut out);
-        assert_ne!(fp, 0, "alt + hint + NO blink: the jump keeps its comet");
+        assert_ne!(
+            fp, 0,
+            "alt + typed candidate + NO blink: the jump keeps its comet"
+        );
         assert!(!out.is_empty());
 
         // Claude Code (alt ctx, hint armed, FRESH blink): the wrap re-anchors.
         let mut cc = CursorTrail::default();
         cc.note_context(true);
         cc.tick(Some((0, 30)), t0, &c, &mut out);
-        cc.note_typed(t0 + Duration::from_millis(5));
+        cc.note_synthetic_typed(t0 + Duration::from_millis(5));
         cc.note_repaint_blink(t0 + Duration::from_millis(8));
         cc.note_context(true);
         let fp = cc.tick(Some((1, 3)), t0 + Duration::from_millis(10), &c, &mut out);
@@ -1235,6 +2231,7 @@ mod tests {
             let mut out = Vec::new();
             let c = cfg_q(q);
             tr.tick(Some((0, 0)), now, &c, &mut out); // seed
+            tr.note_synthetic_move(now);
             tr.tick(Some((0, 40)), now, &c, &mut out); // long jump → many cells
             assert!(!out.is_empty());
             for cell in &out {
@@ -1256,6 +2253,7 @@ mod tests {
             let mut out = Vec::new();
             let c = cfg_q(q);
             tr.tick(Some((0, 0)), now, &c, &mut out);
+            tr.note_synthetic_move(now);
             tr.tick(Some((0, 5)), now, &c, &mut out); // same-row jump
             let head = out.iter().map(|t| t.alpha).max().unwrap();
             // The base fade is 200 ms; look 250 ms out — past the gentle life, but
@@ -1301,20 +2299,21 @@ mod tests {
         );
     }
 
-    /// NAVIGATION SUPPRESSION: a move paired with a fresh nav hint (Ctrl-A/E,
-    /// Home/End, arrows) lays NO comet — the ember bed is silent on navigation,
-    /// matching the glow engine's nav gate for every other style. Without the
-    /// hint the same jump still spawns its comet (byte-identical to before).
+    /// NAVIGATION SUPPRESSION: a move paired only with a nav timestamp
+    /// (Ctrl-A/E, Home/End, arrows) lays NO comet — the ember bed is silent on
+    /// navigation, matching the glow engine's candidate gate. The same geometry
+    /// with an explicit scripted candidate proves the positive path is live.
     #[test]
     fn navigation_lays_no_comet() {
         let now = Instant::now();
         let c = cfg(true);
-        // Baseline: a bare same-row jump (no nav hint) DOES spawn a comet.
+        // Baseline: an explicitly candidate-backed same-row jump spawns.
         let mut plain = CursorTrail::default();
         let mut out = Vec::new();
         plain.tick(Some((0, 30)), now, &c, &mut out); // seed last
+        plain.note_synthetic_move(now);
         let fp = plain.tick(Some((0, 0)), now, &c, &mut out); // Ctrl-A-shaped move
-        assert_ne!(fp, 0, "an un-hinted jump still lays a comet");
+        assert_ne!(fp, 0, "a candidate-backed jump lays a comet");
         assert!(plain.is_active());
         // With a fresh nav hint the identical move lays nothing.
         let mut nav = CursorTrail::default();
@@ -1356,12 +2355,15 @@ mod tests {
                 // revisit only after 600 frames, far past any spark lifetime.
                 (((f / 10) % 60) as u16, ((f % 10) * 24) as u16)
             } else if f < 360 {
-                // Ping-pong: a 200-column unhinted move every frame.
+                // Ping-pong: a 200-column scripted move every frame.
                 (4, if f.is_multiple_of(2) { 5 } else { 205 })
             } else {
                 // Stop moving: the population decays out to empty.
                 (4, 205)
             };
+            if trail.cursor_anchor().is_some_and(|anchor| anchor != cur) {
+                trail.note_synthetic_move(now);
+            }
             let fp = trail.tick(Some(cur), now, &c, &mut out);
             // The reference: the retired linear-scan merge, byte for byte.
             let mut want: Vec<TrailCell> = Vec::new();

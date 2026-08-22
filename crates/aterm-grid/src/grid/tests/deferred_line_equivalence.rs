@@ -739,3 +739,136 @@ fn recycling_preserves_flooded_scrollback_content() {
         "flooded history must be intact and ordered"
     );
 }
+
+// =============================================================================
+// Attribute-run SHAPE: what `Line::from_parts` keeps vs discards
+// =============================================================================
+//
+// Materialization builds the attribute runs in two locals and only spills into
+// a real `Rle` once a SECOND distinct `CellAttrs` appears, so an all-default
+// line allocates nothing. These four tests pin the boundary of that rule — in
+// particular the case a naive "single run => hand from_parts None" would get
+// WRONG: a wholly-coloured line (a red error line, a highlighted grep hit) is
+// ONE run and must still be stored.
+
+/// A line of plain cells stores NO attrs Rle (the all-default run is dropped).
+#[test]
+fn materialized_all_default_line_stores_no_attrs() {
+    let cells: Vec<Cell> = b"plain text"
+        .iter()
+        .map(|&b| Cell::from_ascii_fast(b))
+        .collect();
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&cells, 80, false);
+    let extras = ScrolledRowExtras::default();
+
+    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
+    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
+
+    assert!(
+        eager.attrs().is_none(),
+        "an all-default line must not carry an attrs Rle"
+    );
+    assert!(lazy.attrs().is_none(), "deferred path must agree");
+    assert_lines_equivalent(&eager, &lazy, "all-default line");
+}
+
+/// A line that is ENTIRELY one non-default style is a SINGLE run and must be
+/// KEPT — dropping it would silently lose the colour of every uniformly styled
+/// line in history.
+#[test]
+fn materialized_single_nondefault_run_is_kept() {
+    let fg = PackedColor::indexed(1);
+    let cells: Vec<Cell> = b"error: everything is on fire"
+        .iter()
+        .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::empty()))
+        .collect();
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&cells, 80, false);
+    let extras = ScrolledRowExtras::default();
+
+    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
+    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
+
+    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
+    assert_eq!(runs, 1, "a uniformly styled line is exactly one run");
+    assert_eq!(
+        eager.get_attr(0).fg,
+        lazy.get_attr(0).fg,
+        "the single run's colour must survive materialization"
+    );
+    assert_ne!(
+        eager.get_attr(0),
+        aterm_scrollback::CellAttrs::DEFAULT,
+        "the run under test must actually be non-default"
+    );
+    assert_lines_equivalent(&eager, &lazy, "single non-default run");
+}
+
+/// Several styles: every run is emitted, in order, and the LAST one being
+/// default must not cause the earlier ones to be dropped.
+#[test]
+fn materialized_multi_run_keeps_every_run_including_default_tail() {
+    let fg = PackedColor::indexed(2);
+    let mut cells: Vec<Cell> = b"warn"
+        .iter()
+        .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::BOLD))
+        .collect();
+    cells.extend(b": tail".iter().map(|&b| Cell::from_ascii_fast(b)));
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&cells, 80, false);
+    let extras = ScrolledRowExtras::default();
+
+    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
+    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
+
+    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
+    assert_eq!(runs, 2, "styled prefix + default tail is two runs");
+    assert_ne!(
+        eager.get_attr(0),
+        aterm_scrollback::CellAttrs::DEFAULT,
+        "the styled prefix must be preserved"
+    );
+    assert_eq!(
+        eager.get_attr(5),
+        aterm_scrollback::CellAttrs::DEFAULT,
+        "the trailing run must read back as default"
+    );
+    assert_lines_equivalent(&eager, &lazy, "styled prefix + default tail");
+}
+
+/// The reverse order: default prefix, styled tail. The spill happens at the
+/// boundary, so the FIRST (default) run must be flushed rather than dropped.
+#[test]
+fn materialized_default_prefix_then_styled_tail_keeps_both() {
+    let fg = PackedColor::indexed(3);
+    let mut cells: Vec<Cell> = b"plain "
+        .iter()
+        .map(|&b| Cell::from_ascii_fast(b))
+        .collect();
+    cells.extend(
+        b"styled"
+            .iter()
+            .map(|&b| Cell::with_style(b as char, fg, PackedColor::DEFAULT_BG, CellFlags::empty())),
+    );
+    let mut rb = RowBuilder::new();
+    let row = rb.build(&cells, 80, false);
+    let extras = ScrolledRowExtras::default();
+
+    let eager = Grid::row_to_line_with_stored_extras(&row, &extras);
+    let lazy = DeferredLine::new(&row, extras, Vec::new()).into_line();
+
+    let runs = eager.attrs().map_or(0, aterm_rle::Rle::run_count);
+    assert_eq!(runs, 2, "default prefix + styled tail is two runs");
+    assert_eq!(
+        eager.get_attr(0),
+        aterm_scrollback::CellAttrs::DEFAULT,
+        "the leading default run must still occupy its columns"
+    );
+    assert_ne!(
+        eager.get_attr(8),
+        aterm_scrollback::CellAttrs::DEFAULT,
+        "the styled tail must be preserved"
+    );
+    assert_lines_equivalent(&eager, &lazy, "default prefix + styled tail");
+}

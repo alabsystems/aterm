@@ -519,10 +519,10 @@ impl TerminalHandler<'_> {
         // is not reached and no PTY response is emitted. Engine-consulting
         // variant (#7994): when a policy is installed, its rule decision
         // wins over the legacy `authorize_query` bool per design §6.3.
-        let Some(token) = self.clipboard_auth.try_mint_query_capability_with_engine(
-            self.policy_engine.as_ref(),
-            aterm_policy::OriginTag::Pty,
-        ) else {
+        let Some(token) = self
+            .clipboard_auth
+            .try_mint_query_capability_with_engine(self.policy.gates())
+        else {
             return;
         };
         let Some(content) =
@@ -567,10 +567,10 @@ impl TerminalHandler<'_> {
         // Engine-consulting variant (#7994): the OSC 52 *set* rule gates
         // *clear* too (per invoke_clear's doc, clear is strictly-less-
         // dangerous than set and shares the write capability).
-        let Some(token) = self.clipboard_auth.try_mint_write_capability_with_engine(
-            self.policy_engine.as_ref(),
-            aterm_policy::OriginTag::Pty,
-        ) else {
+        let Some(token) = self
+            .clipboard_auth
+            .try_mint_write_capability_with_engine(self.policy.gates())
+        else {
             return;
         };
         super::clipboard_auth::invoke_clear(&mut self.clipboard.callback, token, selections);
@@ -592,10 +592,10 @@ impl TerminalHandler<'_> {
         // terminal should not burn CPU on decode we'll throw away.
         // Engine-consulting variant (#7994): policy decision wins over
         // the legacy bool per design §6.3.
-        let Some(token) = self.clipboard_auth.try_mint_write_capability_with_engine(
-            self.policy_engine.as_ref(),
-            aterm_policy::OriginTag::Pty,
-        ) else {
+        let Some(token) = self
+            .clipboard_auth
+            .try_mint_write_capability_with_engine(self.policy.gates())
+        else {
             return;
         };
 

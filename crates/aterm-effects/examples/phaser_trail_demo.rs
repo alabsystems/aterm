@@ -172,6 +172,7 @@ fn main() {
     for i in 0..24u16 {
         t += Duration::from_millis(45);
         col = 3 + i;
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((row, col)), t, &cfg, geom, &mut quads);
         let _ = i;
     }
@@ -203,6 +204,7 @@ fn main() {
     //    a crisp short blip.
     t += Duration::from_millis(1000);
     col += 1;
+    glow.note_synthetic_typed(t, 1);
     glow.tick(Some((row, col)), t, &cfg, geom, &mut quads);
     shoot(
         &mut glow,
@@ -229,10 +231,12 @@ fn main() {
     for _ in 0..6u16 {
         t += Duration::from_millis(45);
         col += 1;
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((row, col)), t, &cfg, geom, &mut quads);
     }
     t += Duration::from_millis(60);
     let landing = (row + 1, 0u16);
+    glow.note_synthetic_move(t);
     glow.tick(Some(landing), t, &cfg, geom, &mut quads);
     shoot(&mut glow, &mut em, &mut quads, landing, t, 0.6, "enter_0ms");
     t += Duration::from_millis(300);

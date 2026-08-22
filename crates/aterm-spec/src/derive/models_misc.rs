@@ -521,30 +521,70 @@ pub fn top_anchored_scroll_history_model() -> Model {
             var selection_alive = 1;
             var selection_region_row = 2;
             var selection_footer_row = 4;
+            // SELECTION CUSTODY Phase 4: whether the selection lies OUTSIDE the rows
+            // this scroll damages. Chosen alongside the regime below, because the two
+            // together are what decide the selection's fate — and before Phase 4 the
+            // model could not express the question at all.
+            var selection_disjoint = 0;
 
-            action ChooseArchival when (phase == 0) {
+            // Split into DISJOINT / OVERLAPPING flavours rather than adding a phase:
+            // renumbering phases would touch every invariant in this model, while a
+            // second dimension on the existing choice keeps `phase == 2` tests intact.
+            action ChooseArchivalOverlapping when (phase == 0) {
                 phase = 1;
                 top = 0;
                 full_width = 1;
                 history_enabled = 1;
+                selection_disjoint = 0;
             }
-            action ChooseInterior when (phase == 0) {
+            action ChooseArchivalDisjoint when (phase == 0) {
+                phase = 1;
+                top = 0;
+                full_width = 1;
+                history_enabled = 1;
+                selection_disjoint = 1;
+            }
+            action ChooseInteriorOverlapping when (phase == 0) {
                 phase = 1;
                 top = 1;
                 full_width = 1;
                 history_enabled = 1;
+                selection_disjoint = 0;
             }
-            action ChooseMargined when (phase == 0) {
+            action ChooseInteriorDisjoint when (phase == 0) {
+                phase = 1;
+                top = 1;
+                full_width = 1;
+                history_enabled = 1;
+                selection_disjoint = 1;
+            }
+            action ChooseMarginedOverlapping when (phase == 0) {
                 phase = 1;
                 top = 0;
                 full_width = 0;
                 history_enabled = 1;
+                selection_disjoint = 0;
             }
-            action ChooseEphemeral when (phase == 0) {
+            action ChooseMarginedDisjoint when (phase == 0) {
+                phase = 1;
+                top = 0;
+                full_width = 0;
+                history_enabled = 1;
+                selection_disjoint = 1;
+            }
+            action ChooseEphemeralOverlapping when (phase == 0) {
                 phase = 1;
                 top = 0;
                 full_width = 1;
                 history_enabled = 0;
+                selection_disjoint = 0;
+            }
+            action ChooseEphemeralDisjoint when (phase == 0) {
+                phase = 1;
+                top = 0;
+                full_width = 1;
+                history_enabled = 0;
+                selection_disjoint = 1;
             }
             action Scroll when (phase == 1) {
                 phase = 2;
@@ -558,7 +598,16 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor
                 };
+                // SELECTION CUSTODY Phase 4: the non-archival regimes no longer clear
+                // unconditionally. An interior or margined scroll damages only ITS
+                // rows, so a selection disjoint from them survives — which is the
+                // whole reported bug (a status bar repaint destroying a highlight up
+                // in scrollback). An OVERLAPPING selection still clears in both
+                // variants: over-clearing is safe, a stale highlight over replaced
+                // content is not.
                 selection_alive = if top == 0 && full_width == 1 && history_enabled == 1 {
+                    if Buggy == 1 { 0 } else { selection_alive }
+                } else if selection_disjoint == 1 {
                     if Buggy == 1 { 0 } else { selection_alive }
                 } else {
                     0
@@ -587,9 +636,18 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     footer_anchor == 0
                 };
+            // SELECTION CUSTODY Phase 4 restated this. It used to assert
+            // `selection_alive == 0` for EVERY settled non-archival regime — i.e. it
+            // PROVED that an interior or margined region scroll must kill the
+            // selection, which is exactly the defect. Now it says: a selection
+            // survives iff it was piecewise-remapped (the archival regime) OR it was
+            // disjoint from the damage.
             invariant EligibleSelectionUsesPiecewiseRemap:
                 if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1 {
                     selection_alive == 1 && selection_region_row == 1 &&
+                    selection_footer_row == 4
+                } else if phase == 2 && selection_disjoint == 1 {
+                    selection_alive == 1 && selection_region_row == 2 &&
                     selection_footer_row == 4
                 } else if phase == 2 {
                     selection_alive == 0 && selection_region_row == 2 &&
@@ -602,7 +660,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 phase <= 2 && top <= 1 && full_width <= 1 &&
                 history_enabled <= 1 && history_len <= 1 && footer <= 1 &&
                 footer_anchor <= 1 && selection_alive <= 1 &&
-                selection_region_row <= 2 && selection_footer_row <= 4;
+                selection_region_row <= 2 && selection_footer_row <= 4 &&
+                selection_disjoint <= 1;
         }
     }
 }

@@ -232,16 +232,15 @@ fn post_clamp_mutations_preserve_invariant() {
     );
 }
 
-/// Regression: the linear find_run fallback must handle near-MAX offsets exactly.
+/// Regression: the linear find_run walk must handle near-MAX offsets exactly.
 #[test]
 fn linear_find_run_after_clamp_handles_near_max_offsets() {
     let mut rle = Rle::<u8>::new();
     rle.extend_with(1, u32::MAX - 1);
     rle.extend_with(2, 10); // Clamp to a single trailing cell.
 
-    // Force the linear fallback path instead of the cached prefix-sum search.
-    rle.prefix_sums.clear();
-
+    // `find_run` is the linear walk unconditionally now (the prefix-sum index
+    // was deleted), so no cache has to be cleared to reach this path.
     assert_eq!(rle.get(u32::MAX - 2), Some(1));
     assert_eq!(rle.get(u32::MAX - 1), Some(2));
     assert!(rle.set(u32::MAX - 1, 3));

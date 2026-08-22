@@ -96,6 +96,13 @@ pub struct RenderCell {
     /// `❤️` (U+2764 U+FE0F) is the canonical case. Bare `❤` (no VS16) stays
     /// narrow and mono. SMP emoji (🚀) are already colour via the normal path.
     pub emoji_presentation: bool,
+    /// True when this lead cell carries an explicit VS15 (U+FE0E) request whose
+    /// final materialized geometry is narrow. This is distinct from the Unicode
+    /// default presentation: a default-emoji scalar such as 😀 normally takes
+    /// the colour path, but `😀︎` must take the text/mono path and stay in
+    /// one cell. A later effective VS16 re-widens the cell and clears this state
+    /// by construction (`CellFlags::WIDE` is then set again).
+    pub text_presentation: bool,
     /// SGR 1 bold: the renderer rasterizes the glyph with extra stroke weight.
     /// (Bold-to-bright colour, when enabled, is already applied in `fg`.)
     pub bold: bool,
@@ -126,6 +133,7 @@ impl Default for RenderCell {
             bg: [0, 0, 0],
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,
@@ -162,6 +170,7 @@ impl Terminal {
             bg: [bg.r, bg.g, bg.b],
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,
@@ -356,12 +365,24 @@ impl Terminal {
             };
             let ch = if wide || raw == '\0' { ' ' } else { raw };
 
+            // Read the selector/cluster tail once. Besides feeding the optional
+            // cluster/combining snapshot below, it preserves an explicit VS15
+            // request for the renderer: Unicode default presentation alone cannot
+            // distinguish bare 😀 (colour) from narrow `😀︎` (text).
+            let marks = data.marks();
+
             // Emoji presentation: a text-default emoji base that VS16 widened to
             // 2 cells. Such a char is narrow by default, so a WIDE main cell
             // holding an emoji-capable base can ONLY have been widened by VS16
             // (`widen_previous_cell_for_vs16`). Lead cells only (`!wide`).
             let emoji_presentation =
                 !wide && cell.is_wide() && super::handler::is_vs16_emoji_capable(ch);
+            // VS15 text presentation is authoritative only while the resulting
+            // lead remains narrow. This also handles selector replay exactly:
+            // `⌚︎️` is wide again (VS16 took effect) and therefore not text,
+            // while an ineffective later VS16 at the row edge leaves VS15 active.
+            let text_presentation =
+                !wide && !cell.is_wide() && marks.contains(&'\u{FE0E}');
 
             // Line decorations (SGR 4 family / 9 / 53).
             let cflags = eff_cell.flags();
@@ -400,6 +421,7 @@ impl Terminal {
                 bg: [bg.r, bg.g, bg.b],
                 wide,
                 emoji_presentation,
+                text_presentation,
                 bold,
                 italic,
                 underline,
@@ -415,7 +437,6 @@ impl Terminal {
             // requested by `cell_frame_into`. `marks()` reads the live combining
             // slice, or reconstructs a materialized cell's cluster tail.
             if let Some((clusters, combining_out)) = extras_out.as_mut() {
-                let marks = data.marks();
                 if marks.iter().copied().any(is_emoji_sequence_marker) {
                     // Multi-codepoint EMOJI sequence (ZWJ / skin-tone / keycap /
                     // regional-indicator pair): surface the whole grapheme for
@@ -966,6 +987,10 @@ impl Terminal {
         reason = "display_offset is a scrollback row count that fits i32 in practice; \
                   the snapshot field is i32 (viewport row = r - display_offset)"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one fill boundary stamps every RenderInput channel coherently"
+    )]
     fn cell_frame_fill(
         &mut self,
         scratch: &mut crate::render::RenderInput,
@@ -1053,9 +1078,15 @@ impl Terminal {
         let cur = self.cursor();
         scratch.cursor_row = cur.row as usize;
         scratch.cursor_col = cur.col as usize;
-        scratch.cursor_visible = self.cursor_visible();
+        let display_offset = self.grid().display_offset();
+        // The DEC cursor is anchored in the active grid. While the viewport is
+        // showing retained history, projecting that cell over a historical row
+        // draws a cursor on unrelated text. Host copy/vi modes deliberately
+        // override this snapshot after extraction with their own history-space
+        // cursor; the ordinary terminal cursor therefore fails closed here.
+        scratch.cursor_visible = self.cursor_visible() && display_offset == 0;
         scratch.cursor_style = self.cursor_style();
-        scratch.display_offset = self.grid().display_offset() as i32;
+        scratch.display_offset = display_offset as i32;
         // Capture base_y (absolute row of the top visible line) under the SAME lock as
         // the cells, so a host that re-anchors absolute rows into this frame (⌘F find
         // highlight) uses a value consistent with the exact grid just extracted.
@@ -1131,6 +1162,7 @@ impl Terminal {
         // O(1), and idempotent within a damage session, so reading it here is free
         // even when the frontend also reads it for its present early-out.
         scratch.snapshot_seq = self.damage_epoch();
+        scratch.process_sequence = self.transient.pipeline_timestamps.process_sequence;
 
         // DMG-1 damage carrier: extraction-continuity tokens. Stamped by EVERY
         // engine fill (full or scoped) so any scratch can later prove — or
@@ -1556,6 +1588,26 @@ mod tests {
     }
 
     #[test]
+    fn vs15_narrowed_default_emoji_sets_text_presentation() {
+        // Bare 😀 defaults to a wide colour emoji. VS15 both narrows its
+        // materialized geometry and must survive in the render snapshot so the
+        // renderer can force the text/mono face instead of painting a 2-cell
+        // colour bitmap over the following cell.
+        let mut term = Terminal::new(2, 8);
+        term.process("😀\u{FE0E}".as_bytes());
+        let cells = term.render_row(0);
+        assert_eq!(cells[0].ch, '😀');
+        assert!(!cells[0].wide, "lead cell is not a continuation");
+        assert!(
+            cells[0].text_presentation,
+            "VS15-narrowed 😀 must request text presentation"
+        );
+        assert!(!cells[0].emoji_presentation);
+        assert!(!cells[1].wide, "VS15 must remove the former continuation");
+        assert!(!cells[1].text_presentation);
+    }
+
+    #[test]
     fn bare_emoji_base_without_vs16_is_text_presentation() {
         // Bare ❤ (no VS16) stays narrow and text — NO emoji presentation, so
         // the renderer keeps drawing the mono black-heart glyph.
@@ -1950,6 +2002,33 @@ mod tests {
             text(&term.render_row(0)),
             live0,
             "offset-aware render_row moved with the scroll"
+        );
+    }
+
+    /// The DEC cursor belongs to the active grid, not retained history. The
+    /// frame snapshot therefore suppresses it at a non-zero viewport offset;
+    /// a host copy/vi cursor may still deliberately override this field after
+    /// extraction in its own history coordinate space.
+    #[test]
+    fn cell_frame_hides_the_dec_cursor_over_history() {
+        let mut term = Terminal::new(2, 8);
+        term.process(b"L0\r\nL1\r\nL2\r\nL3");
+        let live = term.cell_frame(2, 8);
+        assert_eq!(live.display_offset, 0);
+        assert!(live.cursor_visible, "live DECTCEM cursor is present");
+
+        term.scroll_display(1);
+        let history = term.cell_frame(2, 8);
+        assert!(history.display_offset > 0, "fixture entered history");
+        assert!(
+            !history.cursor_visible,
+            "active-grid DEC cursor must not be projected over history"
+        );
+
+        term.scroll_to_bottom();
+        assert!(
+            term.cell_frame(2, 8).cursor_visible,
+            "returning live restores the ordinary DEC cursor"
         );
     }
 

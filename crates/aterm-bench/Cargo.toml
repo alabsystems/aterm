@@ -33,6 +33,10 @@ proptest = { workspace = true }
 # is an rlib as well as a cdylib, and its closure is platform-free, so it links
 # natively without a wasm32 toolchain.
 aterm-wasm = { path = "../aterm-wasm" }
+# The policy-gate bench installs the SAME engine the shipping GUI installs
+# (`PolicyEngine::new(profiles::standard())`, aterm-gui/src/spawn.rs:733). Without
+# it, no bench in the tree ever takes the engine branch of a capability gate.
+aterm-policy = { workspace = true }
 
 [[bench]]
 name = "engine_throughput"
@@ -60,6 +64,18 @@ harness = false
 
 [[bench]]
 name = "wasm_frame_gate"
+harness = false
+
+[[bench]]
+name = "policy_gate"
+harness = false
+
+# The only target in the tree that attaches a tiered scrollback STORE, so the
+# only one that ever reaches `DeferredLine::materialize*` (row -> Line + attrs
+# `Rle`). Every other target builds `Terminal::new`, whose Grid has
+# `scrollback: None`, and therefore never builds a `Line` at all.
+[[bench]]
+name = "scrollback_materialize"
 harness = false
 
 [lints]

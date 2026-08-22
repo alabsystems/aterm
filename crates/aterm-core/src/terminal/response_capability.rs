@@ -165,8 +165,26 @@ impl ResponseCapability {
     /// callers should use [`mint_for_dispatch`] and defer engine
     /// consultation to the specific capability module (clipboard,
     /// notification, etc.) which has a full parameter view.
+    ///
+    /// # Not on the dispatch path any more
+    ///
+    /// The single production caller was the `send_response` sink, whose probe
+    /// (`ProbeKind::response_sink()`) and origin (`OriginTag::Pty`) are
+    /// compile-time constants — so its verdict is now resolved once per
+    /// installed policy in [`super::policy_gates`] and read as a field. This
+    /// function is retained as the **reference implementation** that the
+    /// compiled table is checked against: `policy_gates`'s
+    /// `compiled_gate_matches_the_per_dispatch_mint` test asserts the two agree
+    /// for every built-in profile and for hand-written allow/deny policies, so a
+    /// future change to probe shape or bridge semantics that forgets the table
+    /// fails a test instead of silently answering a gate from the wrong rule.
     #[inline]
     #[must_use]
+    #[allow(
+        dead_code,
+        reason = "reference implementation for the compiled gate table in policy_gates.rs; \
+                  the production dispatch path reads the compiled verdict instead"
+    )]
     pub(super) fn mint_for_dispatch_with_engine(
         engine: Option<&aterm_policy::engine::PolicyEngine>,
         origin: aterm_policy::OriginTag,
@@ -184,31 +202,7 @@ impl ResponseCapability {
         if engine.is_none() {
             return Some(Self::mint_for_dispatch());
         }
-        let seq = match kind {
-            ProbeKind::Csi { final_byte } => aterm_policy::selector::DispatchedSequence::csi(
-                None,
-                final_byte,
-                std::iter::empty::<String>(),
-            ),
-            ProbeKind::Esc { final_byte } => aterm_policy::selector::DispatchedSequence::csi(
-                None,
-                final_byte,
-                std::iter::empty::<String>(),
-            ),
-            ProbeKind::Osc { command } => aterm_policy::selector::DispatchedSequence::osc(
-                command,
-                std::iter::empty::<String>(),
-            ),
-            ProbeKind::Dcs { final_byte } => {
-                // DCS has no major code; the "response any" catch-all
-                // covers it via the wildcard bucket in the standard
-                // profile.
-                let suffix = std::str::from_utf8(&[final_byte])
-                    .map(str::to_owned)
-                    .unwrap_or_default();
-                aterm_policy::selector::DispatchedSequence::dcs(&suffix)
-            }
-        };
+        let seq = probe_for(kind);
         let decision = super::policy_bridge::engine_decision(engine, &seq, origin);
         if decision.resolve(true) {
             Some(Self::mint_for_dispatch())
@@ -238,6 +232,40 @@ impl ResponseCapability {
     pub(crate) fn as_host_auth_token(&self) -> aterm_provenance::HostAuthorizationToken<'_> {
         let _ = self;
         aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
+    }
+}
+
+/// Build the [`aterm_policy::selector::DispatchedSequence`] a [`ProbeKind`]
+/// stands for.
+///
+/// This is the **single** definition of every dispatch probe.
+/// [`ResponseCapability::mint_for_dispatch_with_engine`] calls it on the
+/// per-dispatch path, and [`super::policy_gates::PolicyGates`] calls it when it
+/// compiles a constant probe's verdict once per installed policy. Sharing one
+/// definition is what makes the compiled verdict provably the verdict the
+/// per-dispatch call would have produced — a second, hand-copied probe could
+/// drift and silently answer a gate from the wrong rule bucket.
+#[must_use]
+pub(super) fn probe_for(kind: ProbeKind) -> aterm_policy::selector::DispatchedSequence {
+    match kind {
+        ProbeKind::Csi { final_byte } | ProbeKind::Esc { final_byte } => {
+            aterm_policy::selector::DispatchedSequence::csi(
+                None,
+                final_byte,
+                std::iter::empty::<String>(),
+            )
+        }
+        ProbeKind::Osc { command } => {
+            aterm_policy::selector::DispatchedSequence::osc(command, std::iter::empty::<String>())
+        }
+        ProbeKind::Dcs { final_byte } => {
+            // DCS has no major code; the "response any" catch-all covers it via
+            // the wildcard bucket in the standard profile.
+            let suffix = std::str::from_utf8(&[final_byte])
+                .map(str::to_owned)
+                .unwrap_or_default();
+            aterm_policy::selector::DispatchedSequence::dcs(&suffix)
+        }
     }
 }
 

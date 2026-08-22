@@ -60,6 +60,87 @@ impl ConfigNotice {
     pub(crate) fn wanted_rows(&self) -> usize {
         (self.lines.len() + 1).min(MAX_NOTICE_ROWS)
     }
+
+    /// Fold more notices into a LIVE banner and restart its clock, skipping any
+    /// line already listed. Merging rather than replacing is the point: the
+    /// deferred lane below can arrive while the startup banner is still up, and
+    /// `self.config_notice = ConfigNotice::new(..)` would silently delete the
+    /// user's config warnings to show one late chrome notice. The TTL restarts so
+    /// the newly-added line gets its full read time — an 8 s banner that vanishes
+    /// in 200 ms because it inherited an old deadline is the same as no banner.
+    /// De-duplicating keeps a lane that re-queues (a live reload re-declining the
+    /// same material) from stacking the same sentence until it overflows.
+    pub(crate) fn extend(&mut self, lines: impl IntoIterator<Item = String>, now: Instant) {
+        let before = self.lines.len();
+        for line in lines {
+            if !self.lines.contains(&line) {
+                self.lines.push(line);
+            }
+        }
+        if self.lines.len() != before {
+            self.until = now + NOTICE_TTL;
+        }
+    }
+}
+
+/// THE DEFERRED NOTICE LANE. Not every honest explanation is discovered somewhere
+/// that can reach `App` — the client-backdrop declines are decided on the backend
+/// BUILD THREAD, inside an `AppRt` chrome call that is handed only a `&Window`, and
+/// in `run()` before `App` exists at all. Those sites used to `eprintln!` and stop,
+/// which on a GUI-subsystem Windows launch (Start Menu, Explorer, a pinned tile)
+/// means the sentence reaches nobody: the user sets `background_material`, sees no
+/// Mica, and has no way to learn why.
+///
+/// So they queue here instead, and the event loop drains it on its next park
+/// ([`crate::App::drain_deferred_config_notices`]) into the same in-window banner
+/// the config warnings use. A `Mutex<Vec<String>>` behind an `AtomicBool` so the
+/// drain — which runs on EVERY park — is one relaxed load in the overwhelmingly
+/// common empty case and never touches the lock.
+static DEFERRED_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static DEFERRED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Cap the deferred lane: a pathological loop that queued forever must not grow
+/// this vector without bound between two parks. The banner shows at most
+/// [`MAX_NOTICE_ROWS`] anyway, and every queuing site is `Once`-guarded, so this is
+/// a backstop rather than a policy.
+const MAX_DEFERRED: usize = 16;
+
+/// Queue one notice for the next event-loop park. Safe from ANY thread and from
+/// before `App` exists. Callers should still `eprintln!` the same text — a console
+/// launch keeps its diagnostic, and this adds the surface a windowed launch has.
+pub(crate) fn queue_deferred(line: String) {
+    let Ok(mut q) = DEFERRED.lock() else {
+        return; // a poisoned notice queue must never take the app down
+    };
+    if q.len() < MAX_DEFERRED && !q.contains(&line) {
+        q.push(line);
+        DEFERRED_PENDING.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// SERIALIZE the lane across tests. The queue is process-global by design (its
+/// whole point is being reachable from threads that have no `App`), so two tests
+/// exercising it in the same binary would steal each other's lines. Every test
+/// that queues or drains takes this first.
+#[cfg(test)]
+pub(crate) fn lane_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LANE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LANE_TEST.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// Take everything queued (empty when nothing is). The `Acquire` load pairs with
+/// [`queue_deferred`]'s `Release` store, so a line queued on the backend build
+/// thread is visible to the event loop that observes the flag.
+pub(crate) fn take_deferred() -> Vec<String> {
+    if !DEFERRED_PENDING.load(std::sync::atomic::Ordering::Acquire) {
+        return Vec::new();
+    }
+    DEFERRED_PENDING.store(false, std::sync::atomic::Ordering::Relaxed);
+    DEFERRED
+        .lock()
+        .map(|mut q| std::mem::take(&mut *q))
+        .unwrap_or_default()
 }
 
 /// The banner's left margin and the extra indent its warning list hangs at, in cells.
@@ -179,6 +260,55 @@ mod tests {
         let now = Instant::now();
         assert!(ConfigNotice::new(vec![], now).is_none());
         assert!(ConfigNotice::new(vec!["x".into()], now).is_some());
+    }
+
+    /// Merging, not replacing — and the merged banner gets a FULL read window.
+    /// Both halves are load-bearing: the deferred lane fires while the startup
+    /// config banner is up, so replacing would delete the user's real warnings,
+    /// and inheriting the old deadline would flash the new line for whatever was
+    /// left of the previous eight seconds.
+    #[test]
+    fn extend_merges_dedupes_and_restarts_the_clock() {
+        let t0 = Instant::now();
+        let mut n = ConfigNotice::new(vec!["config warning".into()], t0).unwrap();
+        let later = t0 + Duration::from_secs(5);
+        n.extend(["chrome notice".to_string()], later);
+        assert_eq!(n.lines, vec!["config warning", "chrome notice"]);
+        assert_eq!(n.deadline(), later + NOTICE_TTL, "the clock restarts");
+        // A repeat of a line already shown adds nothing and does NOT extend the
+        // banner's life — a lane that re-queues the same sentence on every reload
+        // must not be able to pin the banner open.
+        let even_later = later + Duration::from_secs(1);
+        n.extend(["chrome notice".to_string()], even_later);
+        assert_eq!(n.lines.len(), 2, "no duplicate row");
+        assert_eq!(n.deadline(), later + NOTICE_TTL, "and no clock restart");
+    }
+
+    /// The lane a non-`App` context queues into: it round-trips, it de-duplicates,
+    /// and a take on an empty lane is free (the flag short-circuits before the
+    /// lock — this asserts the observable half, that it yields nothing).
+    #[test]
+    fn the_deferred_lane_round_trips_and_dedupes() {
+        let _guard = lane_test_guard();
+        let _ = take_deferred(); // start from a known-empty lane
+        assert!(take_deferred().is_empty(), "an empty lane yields nothing");
+        queue_deferred("first".into());
+        queue_deferred("first".into());
+        queue_deferred("second".into());
+        assert_eq!(take_deferred(), vec!["first", "second"]);
+        assert!(take_deferred().is_empty(), "taking drains");
+    }
+
+    /// The backstop: a site that queued without bound between two parks cannot
+    /// grow the lane past [`MAX_DEFERRED`].
+    #[test]
+    fn the_deferred_lane_is_capped() {
+        let _guard = lane_test_guard();
+        let _ = take_deferred();
+        for i in 0..(MAX_DEFERRED * 3) {
+            queue_deferred(format!("line {i}"));
+        }
+        assert_eq!(take_deferred().len(), MAX_DEFERRED);
     }
 
     #[test]

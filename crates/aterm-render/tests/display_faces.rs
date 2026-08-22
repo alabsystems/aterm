@@ -362,12 +362,26 @@ fn mixed_renderer_routes_characters_across_faces() {
     );
     let mut mixed = 0usize;
     let mut primary = 0usize;
+    let (cell_w, _) = renderer.cell_size();
     for ch in 'A'..='z' {
         let key = renderer.glyph_key(ch);
         let again = renderer.glyph_key(ch);
         assert_eq!(key, again, "routing is stable for {ch:?}");
         match key.source {
-            aterm_render::FaceId::DisplayMix => mixed += 1,
+            aterm_render::FaceId::DisplayMix => {
+                mixed += 1;
+                assert_eq!(key.cell_span, 1);
+                let image = renderer.glyph_image(key);
+                assert_eq!(
+                    image.advance(),
+                    cell_w as f32,
+                    "DisplayMix has one placement owner: fallback harmony"
+                );
+                assert!(
+                    image.xmin() >= 0 && image.xmin() + image.width() as i32 <= cell_w as i32,
+                    "DisplayMix {ch:?} escaped after its single harmony placement"
+                );
+            }
             _ => primary += 1,
         }
     }

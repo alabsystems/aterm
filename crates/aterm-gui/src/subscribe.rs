@@ -354,13 +354,65 @@ pub struct Subscription {
     sessions: Vec<u64>,
     /// This subscription's unique token (matches its handles in the registry).
     token: u64,
-    /// The blocking wake end. `recv` parks until the producer notifies (or every
-    /// sender is dropped, which only happens when the registry entry is removed —
-    /// i.e. after our own `Drop`, so in practice `recv` returns on a real notify).
+    /// The blocking wake end. `recv` parks until the producer notifies or the
+    /// timeout elapses. It can no longer observe a hangup at all — this struct
+    /// retains a sender (`notify`, below) for the lifetime of the subscription —
+    /// and [`Self::wait`] already treated `Disconnected` and `Timeout`
+    /// identically, so nothing above it changes.
     rx: Receiver<()>,
+    /// The SEND end of the same single-slot notify, retained so the target set can
+    /// GROW after registration ([`Self::watch`]).
+    ///
+    /// It used to be dropped at the end of `register`, which is precisely why a
+    /// subscription's watch set was frozen for life: adding a session needs a
+    /// handle to clone into the registry, and there was none. Retaining it costs
+    /// one `SyncSender` (a pointer) and buys a live target set.
+    notify: SyncSender<()>,
 }
 
 impl Subscription {
+    /// Add `local_id` to this subscription's watch set, mid-stream.
+    ///
+    /// Idempotent per subscription: a session already registered under OUR token
+    /// is not registered twice (a duplicate handle would double every notify for
+    /// that session and leave a stale entry behind on drop).
+    pub fn watch(&mut self, local_id: u64) {
+        if self.sessions.contains(&local_id) {
+            return;
+        }
+        let mut g = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        g.by_session
+            .entry(local_id)
+            .or_default()
+            .push(SubscriberHandle {
+                token: self.token,
+                notify: self.notify.clone(),
+            });
+        self.registry.refresh_any(&g);
+        drop(g);
+        self.sessions.push(local_id);
+    }
+
+    /// Drop `local_id` from this subscription's watch set.
+    ///
+    /// Called when a watched session leaves the store. Without it, a LONG-LIVED
+    /// subscription (the whole point of a live target set) accumulates registry
+    /// entries for dead sessions: every one is a `Vec` slot the producer's
+    /// `notify` walks and a `sessions` entry `Drop` must later clean up. The
+    /// same precise `token` match `Drop` uses, so it can only ever remove OUR
+    /// handle, never another connection's on the same session.
+    pub fn unwatch(&mut self, local_id: u64) {
+        let mut g = self.registry.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = g.by_session.get_mut(&local_id) {
+            v.retain(|h| h.token != self.token);
+            if v.is_empty() {
+                g.by_session.remove(&local_id);
+            }
+        }
+        self.registry.refresh_any(&g);
+        drop(g);
+        self.sessions.retain(|s| *s != local_id);
+    }
     /// Block until the producer notifies this subscriber (output landed on one of
     /// the watched sessions), or until `timeout` elapses. Returns `true` on a wake,
     /// `false` on timeout. A spurious/coalesced wake is fine: the caller re-reads
@@ -411,6 +463,7 @@ impl SubscriberSet {
             sessions: sessions.to_vec(),
             token,
             rx,
+            notify: tx,
         }
     }
 
@@ -523,6 +576,42 @@ struct Watch {
     /// `every-frame` mode: re-emit the `cells` frame on EVERY wake even when
     /// `content_seq` is unchanged (animation fidelity), instead of only on advance.
     non_coalesced: bool,
+}
+
+/// AUTHORITY for the `@*` LIVE TARGET SET: whether this subscription may adopt
+/// sessions that are created AFTER it subscribed.
+///
+/// Constructible only by [`Self::authorize`], which ANDs the request with
+/// `Scope::Owner` — the same shape (and the same reason) as
+/// [`InstanceStreams::authorize`]. `@*` names sessions the subscriber could not
+/// have named itself, so it reveals the existence and opaque sid of siblings
+/// exactly the way the instance `sessions` stream does, and it is gated exactly
+/// the way that stream is. Because Owner is the only holder, the per-target
+/// `ReadScreen` gate an adopted session would face is trivially satisfied by
+/// construction — which is WHY the capability is Owner-only rather than "Owner
+/// or an edge that happens to reach far enough": there is no such edge, and a
+/// type that cannot represent one cannot leak one.
+#[derive(Clone, Copy)]
+pub struct AdoptScope(bool);
+
+impl AdoptScope {
+    /// Grant `@*` adoption IFF it was requested AND the connection is Owner.
+    #[must_use]
+    pub fn authorize(requested: bool, scope: Scope) -> Self {
+        AdoptScope(requested && matches!(scope, Scope::Owner))
+    }
+
+    /// The refusing default — no adoption. What every non-`@*` subscribe passes.
+    #[must_use]
+    #[allow(dead_code)] // used by tests + any future non-adopting `push_loop` caller
+    pub fn none() -> Self {
+        AdoptScope(false)
+    }
+
+    /// Whether this subscription adopts.
+    fn on(self) -> bool {
+        self.0
+    }
 }
 
 /// A frame's CHANNEL tag — which of a subscription's channels the frame speaks for.
@@ -829,20 +918,26 @@ fn frame_block_complete(sid: &str, id: u64, exit: Option<i32>) -> String {
 /// last drain (OSC 0/2, often the cwd or running command via shell integration) —
 /// a fleet-supervision signal on the `events` stream. Returns the new watermark.
 /// The title is pct-encoded so a title with spaces/newlines stays one line.
+///
+/// PURE (takes the already-sampled `title`, not the engine handle): the digest
+/// samples the title, the bell total and the new completed blocks in ONE
+/// [`sample_engine_events`] lock hold, because an events-only subscription used
+/// to take `term_lock` three separate times per target per 250 ms tick purely to
+/// learn that nothing had changed — and that lock is the one the renderer and
+/// the keystroke-encode path contend for.
 fn drain_title_event(
-    term: &Arc<Mutex<Terminal>>,
     sid: &str,
+    title: &str,
     last_title: Option<String>,
     out: &mut String,
 ) -> Option<String> {
-    let title = crate::term_lock(term).title().to_string();
-    if last_title.as_deref() != Some(title.as_str()) {
+    if last_title.as_deref() != Some(title) {
         out.push_str(&format!(
             "EVENT {sid} title {}\n",
-            crate::control::pct_encode(&title)
+            crate::control::pct_encode(title)
         ));
     }
-    Some(title)
+    Some(title.to_string())
 }
 
 /// Scan the target's EVENT TIMELINE and emit `EVENT <sid> meta <payload>` for
@@ -862,12 +957,26 @@ fn drain_meta_events(
 ) -> Option<u64> {
     let (fresh, high) = {
         let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
-        let fresh: Vec<String> = tl
-            .since(last_id)
-            .filter(|e| e.kind == "meta-change")
-            .map(|e| e.payload.clone())
-            .collect();
-        (fresh, tl.high_id().or(last_id))
+        // O(1) HIGH-WATER COMPARE BEFORE THE SCAN. `high_id()` is `back()`, so
+        // this is one integer compare; the overwhelmingly common wake is a bare
+        // 250 ms liveness tick on a session whose timeline has not moved, and
+        // that wake must not touch the retained deque at all. Returning
+        // `Some(hi)` (not `last_id`) reproduces the old
+        // `tl.high_id().or(last_id)` watermark byte-for-byte on this arm.
+        match tl.high_id() {
+            None => return last_id,
+            Some(hi) if last_id.is_some_and(|a| hi <= a) => return Some(hi),
+            Some(hi) => {
+                // `since` now SEEKS (partition_point) instead of filtering the
+                // whole retained ring, so this costs O(log n + matched).
+                let fresh: Vec<String> = tl
+                    .since(last_id)
+                    .filter(|e| e.kind == "meta-change")
+                    .map(|e| e.payload.clone())
+                    .collect();
+                (fresh, Some(hi))
+            }
+        }
     };
     for payload in fresh {
         out.push_str(&format!("EVENT {sid} meta {payload}\n"));
@@ -880,41 +989,108 @@ fn drain_meta_events(
 /// `events` stream. Returns the new watermark. One event per drain even if several
 /// bells fired between wakes (the total tells how many); the throttle already
 /// collapses bursts, so this cannot flood.
-fn drain_bell_event(
-    term: &Arc<Mutex<Terminal>>,
-    sid: &str,
-    last_bell: u64,
-    out: &mut String,
-) -> u64 {
-    let total = crate::term_lock(term).bell_total();
+///
+/// PURE (takes the already-sampled `total`) — see [`drain_title_event`] for why
+/// the engine reads are hoisted into one [`sample_engine_events`] lock hold.
+fn drain_bell_event(sid: &str, total: u64, last_bell: u64, out: &mut String) -> u64 {
     if total > last_bell {
         out.push_str(&format!("EVENT {sid} bell total={total}\n"));
     }
     total
 }
 
-/// The instance's live session ids (stable sids). Cheap: one read-lock + clone of
-/// the small id list; never held across a Terminal lock or a socket write.
-fn store_live_sids(store: &Store) -> std::collections::HashSet<String> {
-    // `live_sids` clones only the sid strings (no whole-handle clone, no sort) —
-    // this runs every wake for a `sessions` subscriber, incl. idle 250ms ticks.
-    store.read().unwrap_or_else(|p| p.into_inner()).live_sids()
+/// A `sessions` subscriber's position on the instance roster: the journal
+/// watermark it has drained to, plus the live set as of that watermark.
+///
+/// The SET is not the cursor — the watermark is. The set is carried only so the
+/// RECOVERY path (a watermark that fell past the journal's drop-oldest
+/// low-water) can still produce a correct diff instead of replaying a lossy
+/// delta or resyncing the client with a new wire frame nobody parses. On the
+/// normal path it is mutated by the journal records themselves, one insert or
+/// remove per real lifecycle event, so it costs nothing on an idle tick.
+struct RosterCursor {
+    /// Highest roster-journal seq already drained. `0` = "seen nothing".
+    seq: u64,
+    /// The live sids as of `seq` (recovery input only — see the type doc).
+    known: std::collections::HashSet<String>,
 }
 
-/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid>` for the
-/// delta between the last-known live-session set and the current one — the
-/// INSTANCE lifecycle stream (`*` = instance-level, not a per-channel event).
-/// Surfaces a SIBLING spawn/exit a fleet supervisor is not watching, so it need not
-/// poll `ls`. Advances `known` in place, so the watermark cannot be updated without
-/// the frames having been produced (the two used to be separate returns).
-fn drain_session_events(
-    store: &Store,
-    known: &mut std::collections::HashSet<String>,
-) -> Vec<Frame> {
-    let live = store_live_sids(store);
+/// Emit `EVENT * session-created <sid>` / `EVENT * session-exited <sid>` for
+/// every roster change since the cursor's watermark — the INSTANCE lifecycle
+/// stream (`*` = instance-level, not a per-channel event). Surfaces a SIBLING
+/// spawn/exit a fleet supervisor is not watching, so it need not poll `ls`.
+///
+/// THREE THINGS CHANGED HERE, AND THE THIRD IS A CORRECTNESS FIX.
+///
+///  1. AN IDLE TICK IS O(1). The store now keeps a monotonic membership journal,
+///     so "did anything change?" is one `u64` compare under a read lock. It used
+///     to be: build a fresh `HashSet<String>` of every live sid (one allocation
+///     and one hash per session), then run two `HashSet::difference` passes over
+///     it — for every `sessions` subscriber, on every 250 ms wake, including the
+///     bare liveness ticks that are the overwhelming majority.
+///
+///  2. A TICK WITH CHANGES IS O(changes), not O(sessions).
+///
+///  3. A SUB-TICK SPAWN+EXIT NOW SURFACES. The old design could not report it,
+///     and the push loop's own module doc said so: "A sibling that both spawns
+///     AND exits inside one 250ms window appears in neither snapshot and emits
+///     neither event — the store keeps no monotonic lifecycle log." A snapshot
+///     diff reports only the NET change between two instants; events that
+///     cancelled out are gone. The journal records each transition as it
+///     happens, so BOTH events are emitted, in order, on the next wake — without
+///     shortening the tick or adding a notify path.
+///
+/// The `known` set and [`diff_session_events`] survive as the RECOVERY path: a
+/// cursor that fell past the journal's retained low-water rebuilds and diffs
+/// exactly as before. That arm is behaviour-identical to the old code (it IS the
+/// old code), so the worst case degrades to today's cost rather than to a wire
+/// change or a dropped event.
+///
+/// The cursor is advanced in place only after its frames have been produced, so
+/// the watermark can never move without the events having been written.
+fn drain_session_events(store: &Store, cursor: &mut RosterCursor) -> Vec<Frame> {
     let mut out = String::new();
-    diff_session_events(&live, known, &mut out);
-    *known = live;
+    {
+        // ONE read-lock hold. Never taken across a Terminal lock or a socket
+        // write — the guard is dropped before the frame goes out, exactly like
+        // the snapshot read it replaces.
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        let high = g.roster_seq();
+        if high == cursor.seq {
+            // THE IDLE TICK: nothing has entered or left the registry since we
+            // last looked. One integer compare, no allocation, no set build.
+            return Vec::new();
+        }
+        match g.roster_low_seq() {
+            // Fast path: every record we have not seen is still retained, so the
+            // delta is exact and complete.
+            Some(low) if cursor.seq + 1 >= low => {
+                for rec in g.roster_since(cursor.seq) {
+                    match rec.change {
+                        crate::session_store::RosterChange::Created => {
+                            out.push_str(&format!("EVENT * session-created {}\n", rec.sid));
+                            cursor.known.insert(rec.sid.clone());
+                        }
+                        crate::session_store::RosterChange::Exited => {
+                            out.push_str(&format!("EVENT * session-exited {}\n", rec.sid));
+                            cursor.known.remove(&rec.sid);
+                        }
+                    }
+                }
+            }
+            // RECOVERY: records between our watermark and the retained window
+            // were drop-oldest evicted (or the journal is somehow empty at a
+            // non-zero high). Rebuild and diff — the pre-journal behaviour,
+            // verbatim. Net-lossy for the cancelled-out pairs, which is exactly
+            // and only as lossy as the design was before the journal existed.
+            _ => {
+                let live = g.live_sids();
+                diff_session_events(&live, &cursor.known, &mut out);
+                cursor.known = live;
+            }
+        }
+        cursor.seq = high;
+    }
     if out.is_empty() {
         return Vec::new();
     }
@@ -950,9 +1126,21 @@ fn drain_turn_events(
 ) -> Option<u64> {
     let fresh: Vec<(u64, bool, &'static str, u64)> = {
         let l = turns.lock().unwrap_or_else(|p| p.into_inner());
-        l.since(last_turn_id)
-            .map(|r| (r.id, r.submitted, r.status, r.dur_ms))
-            .collect()
+        // O(1) HIGH-WATER COMPARE BEFORE THE SCAN — the timeline twin. `high_id()`
+        // is `back()`. An idle wake (the common case: 4 Hz liveness ticks on a
+        // session nobody is driving) now costs one integer compare instead of a
+        // walk over up to `LEDGER_CAP` retained records. The early-out returns
+        // `last_turn_id` unchanged, which is exactly what the old fold produced
+        // when it collected nothing.
+        match l.high_id() {
+            None => return last_turn_id,
+            Some(hi) if last_turn_id.is_some_and(|a| hi <= a) => return last_turn_id,
+            // `since` SEEKS now (partition_point), so this is O(log n + matched).
+            Some(_) => l
+                .since(last_turn_id)
+                .map(|r| (r.id, r.submitted, r.status, r.dur_ms))
+                .collect(),
+        }
     };
     let mut high = last_turn_id;
     for (id, submitted, status, dur_ms) in fresh {
@@ -991,33 +1179,97 @@ fn frame_gap_events(tag: Tag, floor: u64) -> Frame {
     Frame::text(tag, format!("GAP {tag} events-resync={floor}\n"))
 }
 
-/// Scan the target's completed blocks and emit a `block-complete` EVENT for every
-/// block whose id is strictly greater than `last_block_id`, advancing it. The scan
-/// clones the small `(id, exit)` tuples OUT under the lock and releases BEFORE any
-/// socket write (the lock is never held across a write). Returns the new
-/// `last_block_id` watermark.
+/// Emit a `block-complete` EVENT for every already-sampled completed block,
+/// advancing and returning the `last_block_id` watermark.
+///
+/// PURE (takes the `(id, exit)` tuples [`sample_engine_events`] cloned out under
+/// the one lock hold): the SCAN moved there, so this side does only formatting
+/// and the Terminal lock is never held across it. `completed` is oldest-first
+/// and every id in it is strictly greater than `last_block_id`, so the fold's
+/// `max` is just the last element — it is kept as a fold so the watermark can
+/// never advance past a block whose line was not actually written.
 fn drain_block_events(
-    term: &Arc<Mutex<Terminal>>,
     sid: &str,
+    completed: &[(u64, Option<i32>)],
     last_block_id: Option<u64>,
     out: &mut String,
 ) -> Option<u64> {
-    // Apply the watermark UNDER the lock (block ids are monotonic), so an idle wake
-    // on a near-cap shell session collects an EMPTY Vec instead of cloning the whole
-    // ~1000-entry completed-block history under the session's Terminal lock 4×/sec.
-    let completed: Vec<(u64, Option<i32>)> = {
-        let t = crate::term_lock(term);
-        t.all_blocks()
-            .filter(|b| b.is_complete() && last_block_id.is_none_or(|h| b.id > h))
-            .map(|b| (b.id, b.exit_code))
-            .collect()
-    };
     let mut high = last_block_id;
-    for (id, exit) in completed {
+    for &(id, exit) in completed {
         out.push_str(&frame_block_complete(sid, id, exit));
         high = Some(high.map_or(id, |h| h.max(id)));
     }
     high
+}
+
+/// Everything the `events` digest reads out of the ENGINE for one target, taken
+/// under ONE `term_lock` hold: the completed blocks past the watermark, the
+/// window title, and the monotonic bell total.
+///
+/// WHY IT EXISTS — TWO SEPARATE COSTS, BOTH PAID ON EVERY IDLE TICK.
+///
+///  1. THE SCAN. The old `drain_block_events` walked `all_blocks()` — up to
+///     `OUTPUT_BLOCKS_MAX` = 1000 records — and filtered by watermark, for every
+///     watched target on every 250 ms wake, INCLUDING the bare liveness timeouts
+///     where nothing has happened. Its own comment claimed the watermark made an
+///     idle wake cheap; it made the OUTPUT empty, not the walk. Work scaled with
+///     RETAINED HISTORY DEPTH rather than with the live window.
+///
+///  2. THE LOCK. Blocks, title and bell each took `term_lock` separately, so an
+///     events-only subscription acquired the session's Terminal lock THREE times
+///     per target per tick to learn that nothing changed — on the same lock the
+///     renderer's frame snapshot and the keystroke-encode path contend for.
+///
+/// Both go away here. `newest_completed_block()` is the O(1) high-water of block
+/// COMPLETION (`&self`, reverse `VecDeque` walk, `current_block` checked first),
+/// and it is EXACT for this purpose: `all_blocks()` yields strictly increasing
+/// ids, so the newest complete block also holds the largest complete id — if that
+/// id is at or below the watermark, no completed block can be new, and the deque
+/// is never touched. When something IS new, the walk runs BACKWARD from the
+/// newest and breaks the moment it reaches the watermark, so it visits exactly
+/// the un-reported suffix (plus any not-yet-complete blocks inside it — a block
+/// can be archived without ever reaching OSC 133;D, e.g. a Ctrl-C'd prompt, so
+/// the break is keyed on the ID, never on `is_complete()`), then reverses to
+/// restore the oldest-first emission order the wire format has always used.
+struct EngineSample {
+    /// Blocks that COMPLETED past the watermark, oldest-first — empty on an idle
+    /// wake, which is the point.
+    blocks: Vec<(u64, Option<i32>)>,
+    /// The live window title (`OSC 0/2`).
+    title: String,
+    /// The monotonic fired-bell count.
+    bell: u64,
+}
+
+fn sample_engine_events(term: &Arc<Mutex<Terminal>>, last_block_id: Option<u64>) -> EngineSample {
+    let t = crate::term_lock(term);
+    let blocks = match t.newest_completed_block().map(|b| b.id) {
+        // Nothing has ever completed, or nothing completed past the watermark:
+        // the O(1) early-out. No deque walk, no allocation.
+        None => Vec::new(),
+        Some(hi) if last_block_id.is_some_and(|h| hi <= h) => Vec::new(),
+        Some(_) => {
+            let mut v: Vec<(u64, Option<i32>)> = Vec::new();
+            for b in t.all_blocks().rev() {
+                if last_block_id.is_some_and(|h| b.id <= h) {
+                    break;
+                }
+                if b.is_complete() {
+                    v.push((b.id, b.exit_code));
+                }
+            }
+            v.reverse();
+            v
+        }
+    };
+    // Small, bounded clones OUT under the lock; every format!/push_str happens
+    // above us with the guard already dropped, and the guard is never held
+    // across a socket write (the caller writes; we only fill a String).
+    EngineSample {
+        blocks,
+        title: t.title().to_string(),
+        bell: t.bell_total(),
+    }
 }
 
 /// Build the frames a single wake produces for one watched target, mutating its
@@ -1167,12 +1419,31 @@ fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Ve
     }
 
     if streams.events {
-        watch.last_block_id = drain_block_events(&watch.term, &sid, watch.last_block_id, &mut out);
+        // ONE Terminal-lock hold covers all three ENGINE-sourced sources (blocks,
+        // title, bell); the turn ledger and the event timeline have their own
+        // small mutexes and each is now gated by an O(1) high-water compare. An
+        // events-only subscription's idle wake is therefore: one lock acquisition
+        // + three integer compares, where it used to be three lock acquisitions
+        // and a walk over ~2000 retained records per target.
+        //
+        // EMISSION ORDER IS UNCHANGED — blocks, turns, meta, title, bell — which
+        // is the only order the wire has ever promised. What did move is the
+        // SAMPLING INSTANT of title and bell: they are now read at the top of the
+        // events pass instead of the bottom. Each of the five sources carries its
+        // own independent watermark and none is derived from another, so the only
+        // effect is which side of a 250 ms tick boundary a title/bell change that
+        // races the pass lands on — the same one-tick skew the old order had in
+        // the opposite direction, and a skew every watermark-driven stream here
+        // already tolerates by construction.
+        let engine = sample_engine_events(&watch.term, watch.last_block_id);
+        watch.last_block_id =
+            drain_block_events(&sid, &engine.blocks, watch.last_block_id, &mut out);
         watch.last_turn_id = drain_turn_events(&watch.turns, &sid, watch.last_turn_id, &mut out);
         watch.last_timeline_id =
             drain_meta_events(&watch.timeline, &sid, watch.last_timeline_id, &mut out);
-        watch.last_title = drain_title_event(&watch.term, &sid, watch.last_title.take(), &mut out);
-        watch.last_bell = drain_bell_event(&watch.term, &sid, watch.last_bell, &mut out);
+        watch.last_title =
+            drain_title_event(&sid, &engine.title, watch.last_title.take(), &mut out);
+        watch.last_bell = drain_bell_event(&sid, engine.bell, watch.last_bell, &mut out);
     }
 
     if out.is_empty() {
@@ -1192,6 +1463,82 @@ pub type ResolvedTarget = (
     Arc<Mutex<TurnLedger>>,
     Arc<Mutex<crate::session_timeline::SessionTimeline>>,
 );
+
+/// Build one target's send cursors — the per-`Watch` seeding, in ONE place.
+///
+/// It was inline in [`push_loop`]'s `map`, which was fine while the target set
+/// was frozen at subscribe time. A `@*` subscription ADOPTS sessions later, and
+/// an adopted watch has to be seeded by exactly the same rules or it would
+/// replay a backlog (empty watermarks) or start blind (wrong watermarks). One
+/// function is the only way to keep those two paths from drifting.
+///
+/// The `opts.since*` resume anchors are per-session and are refused for a
+/// multi-target subscription (and for `@*` outright), so in adopt mode they are
+/// always `None` here and this function behaves identically for both callers.
+fn new_watch(target: &ResolvedTarget, streams: TargetStreams, opts: &PushOptions) -> Watch {
+    let (id, term, fanout, turns, timeline) = target;
+    Watch {
+        local_id: *id,
+        term: term.clone(),
+        turns: turns.clone(),
+        // `since-turn=<id>` resumes the turn stream from that id (push turns
+        // with id > since_turn); absent it, seed to the live high so only
+        // post-subscription turns push. Only meaningful with the events stream.
+        last_turn_id: opts
+            .since_turn
+            .or_else(|| initial_turn_watermark(turns, streams)),
+        timeline: timeline.clone(),
+        // Seed to the live timeline high so only meta changes AFTER
+        // subscription push (a live stream, like turns/blocks/title).
+        last_timeline_id: initial_timeline_watermark(timeline, streams),
+        // Seed to the live title so a fresh `events` subscriber gets title
+        // CHANGES from here, not a spurious event for the title already showing.
+        last_title: streams
+            .events
+            .then(|| crate::term_lock(term).title().to_string()),
+        // Seed to the live bell total so a fresh subscriber gets bells from here.
+        last_bell: if streams.events {
+            crate::term_lock(term).bell_total()
+        } else {
+            0
+        },
+        last_sent_seq: opts.since.unwrap_or(0),
+        // Seed to the live alt-screen state so a subscriber that connects while
+        // a TUI is already on the alt buffer does not spuriously resync on its
+        // first wake; a genuine swap after this flips it.
+        last_alt: if streams.wants_content() {
+            crate::term_lock(term).is_alternate_screen()
+        } else {
+            false
+        },
+        // Seed to a sentinel so the FIRST content/cursor wake always emits the
+        // caret (a fresh subscriber has no prior cursor); real positions differ.
+        last_cursor: (u16::MAX, u16::MAX, false, ""),
+        // Seed the render signature to the LIVE value so a subscriber does
+        // not spuriously resync on its first wake; a later recolor,
+        // selection/cursor change, or DECSCNM flip changes it. Only
+        // meaningful for a content-bearing subscription.
+        last_render_sig: if streams.wants_content() {
+            render_sig(&crate::term_lock(term))
+        } else {
+            0
+        },
+        // Seed the block watermark to the CURRENT high so we only push blocks
+        // that COMPLETE after subscription, never the historical backlog —
+        // `events` is a live stream, not a replay (matches `since` for screen).
+        last_block_id: opts
+            .since_block
+            .or_else(|| initial_block_watermark(term, streams)),
+        // Register on the byte fan-out ONLY when `bytes` is requested, so an
+        // idle/unsubscribed session pays nothing for the live byte channel.
+        byte_sub: if streams.bytes {
+            Some(fanout.subscribe())
+        } else {
+            None
+        },
+        non_coalesced: opts.non_coalesced,
+    }
+}
 
 /// The PUSH LOOP for a `subscribe` connection. The connection has already
 /// AUTHORIZED every target via the control gate; here we just register for wakes,
@@ -1216,24 +1563,72 @@ pub type ResolvedTarget = (
 /// `ReadScreen` gate individually. `instance` is connection-wide and can only be
 /// built by [`InstanceStreams::authorize`], which is why the roster read below
 /// cannot be reached by a subscriber that only proved per-target authority.
+/// The three authorization tokens a push connection carries, kept together
+/// because they are checked in three different places and must travel as a set.
+///
+/// `streams` is PER-TARGET: every entry of `targets` passed the `ReadScreen` gate
+/// individually. `instance` is CONNECTION-WIDE and can only be built by
+/// [`InstanceStreams::authorize`]. `adopt` gates late-joining targets. Bundling
+/// them is not just argument-count hygiene: a caller can no longer pass two of
+/// the three and silently default the third, because the struct has no `Default`
+/// and every field must be named at the construction site.
+#[derive(Clone, Copy)]
+pub struct PushScopes {
+    /// Per-target `ReadScreen` authority, one check per entry of `targets`.
+    pub streams: TargetStreams,
+    /// Connection-wide authority; the only key to the whole-instance roster.
+    pub instance: InstanceStreams,
+    /// Whether targets that appear AFTER subscription may be adopted.
+    pub adopt: AdoptScope,
+}
+
+/// The two watermarks a push connection advances as it runs: the roster cursor
+/// (whole-instance lifecycle) and the adopt sequence (late-joining targets).
+/// Paired so [`pump`] takes one `&mut` instead of two — they are advanced together
+/// on every wake, and a caller holding only one of them would be describing an
+/// inconsistent point in the stream.
+struct PushCursors {
+    roster: Option<RosterCursor>,
+    adopt_seq: u64,
+}
+
 pub fn push_loop<W: Write>(
     registry: &Subscribers,
     store: &Store,
     targets: &[ResolvedTarget],
-    streams: TargetStreams,
-    instance: InstanceStreams,
+    scopes: PushScopes,
     opts: PushOptions,
     writer: &mut W,
 ) {
+    // `adopt` is deliberately NOT unpacked here: adoption is decided per wake
+    // inside `pump`, which receives the whole `scopes` value. Naming it in this
+    // scope too would invite a second, divergent read of the same authority.
+    let PushScopes {
+        streams, instance, ..
+    } = scopes;
     let local_ids: Vec<u64> = targets.iter().map(|(id, _, _, _, _)| *id).collect();
-    let sub = SubscriberSet::register(registry, &local_ids);
+    let mut sub = SubscriberSet::register(registry, &local_ids);
 
-    // INSTANCE lifecycle watermark: seed to the CURRENT live set so only
-    // spawns/exits AFTER subscription are pushed (a fresh subscriber `ls`s for the
-    // baseline). The 250ms bounded wait below already re-polls, so a sibling
-    // spawn surfaces within one tick — no separate notify wiring needed. This is the
-    // WHOLE-INSTANCE roster, hence the `InstanceStreams` gate on reaching it at all.
-    let mut known_sids = instance.sessions().then(|| store_live_sids(store));
+    // INSTANCE lifecycle watermark: seed to the CURRENT journal high (and the
+    // current live set, for the recovery path) so only spawns/exits AFTER
+    // subscription are pushed — a fresh subscriber `ls`s for the baseline. The
+    // 250ms bounded wait below already re-polls, so a sibling spawn surfaces
+    // within one tick; no separate notify wiring is needed. This is the
+    // WHOLE-INSTANCE roster, hence the `InstanceStreams` gate on reaching it at
+    // all.
+    //
+    // BOTH fields are read under ONE guard. That is not cosmetic: taking the
+    // seq and the set in two separate lock acquisitions would let a spawn land
+    // between them and be counted twice (once in the baseline set, once again
+    // when the journal replayed it), which is exactly the class of bug a
+    // watermark is supposed to remove.
+    let roster = instance.sessions().then(|| {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        RosterCursor {
+            seq: g.roster_seq(),
+            known: g.live_sids(),
+        }
+    });
 
     // Build the per-target send cursors. `since` seeds `last_sent_seq` so the
     // IMMEDIATE catch-up below fires exactly when the live content advanced past
@@ -1241,80 +1636,31 @@ pub fn push_loop<W: Write>(
     // gets a full snapshot on the first wake / immediate pass).
     let mut watches: Vec<Watch> = targets
         .iter()
-        .map(|(id, term, fanout, turns, timeline)| Watch {
-            local_id: *id,
-            term: term.clone(),
-            turns: turns.clone(),
-            // `since-turn=<id>` resumes the turn stream from that id (push turns
-            // with id > since_turn); absent it, seed to the live high so only
-            // post-subscription turns push. Only meaningful with the events stream.
-            last_turn_id: opts
-                .since_turn
-                .or_else(|| initial_turn_watermark(turns, streams)),
-            timeline: timeline.clone(),
-            // Seed to the live timeline high so only meta changes AFTER
-            // subscription push (a live stream, like turns/blocks/title).
-            last_timeline_id: initial_timeline_watermark(timeline, streams),
-            // Seed to the live title so a fresh `events` subscriber gets title
-            // CHANGES from here, not a spurious event for the title already showing.
-            last_title: streams
-                .events
-                .then(|| crate::term_lock(term).title().to_string()),
-            // Seed to the live bell total so a fresh subscriber gets bells from here.
-            last_bell: if streams.events {
-                crate::term_lock(term).bell_total()
-            } else {
-                0
-            },
-            last_sent_seq: opts.since.unwrap_or(0),
-            // Seed to the live alt-screen state so a subscriber that connects while
-            // a TUI is already on the alt buffer does not spuriously resync on its
-            // first wake; a genuine swap after this flips it.
-            last_alt: if streams.wants_content() {
-                crate::term_lock(term).is_alternate_screen()
-            } else {
-                false
-            },
-            // Seed to a sentinel so the FIRST content/cursor wake always emits the
-            // caret (a fresh subscriber has no prior cursor); real positions differ.
-            last_cursor: (u16::MAX, u16::MAX, false, ""),
-            // Seed the render signature to the LIVE value so a subscriber does
-            // not spuriously resync on its first wake; a later recolor,
-            // selection/cursor change, or DECSCNM flip changes it. Only
-            // meaningful for a content-bearing subscription.
-            last_render_sig: if streams.wants_content() {
-                render_sig(&crate::term_lock(term))
-            } else {
-                0
-            },
-            // Seed the block watermark to the CURRENT high so we only push blocks
-            // that COMPLETE after subscription, never the historical backlog —
-            // `events` is a live stream, not a replay (matches `since` for screen).
-            last_block_id: opts
-                .since_block
-                .or_else(|| initial_block_watermark(term, streams)),
-            // Register on the byte fan-out ONLY when `bytes` is requested, so an
-            // idle/unsubscribed session pays nothing for the live byte channel.
-            byte_sub: if streams.bytes {
-                Some(fanout.subscribe())
-            } else {
-                None
-            },
-            non_coalesced: opts.non_coalesced,
-        })
+        .map(|t| new_watch(t, streams, &opts))
         .collect();
 
     let mut egress = Egress::new(writer, opts.timestamps);
     // `Gone` is not a failure to report: the client hanging up IS how a push-only
     // connection ends. Returning here drops `sub`, which deregisters this subscriber
     // from every session it watched.
+    // ADOPTION WATERMARK, seeded at ZERO on purpose. The initial target set was
+    // resolved from a store snapshot taken in the control dispatch, strictly
+    // BEFORE this point, so a session created in between belongs to neither the
+    // snapshot nor a delta anchored at "now". Anchoring at 0 makes the first
+    // adoption pass replay the retained journal, which is bounded, happens once,
+    // and is self-correcting: a record for a session already watched (or already
+    // gone) resolves to nothing and is skipped.
+    let mut cursors = PushCursors {
+        roster,
+        adopt_seq: 0,
+    };
     let _ = pump(
         store,
-        &sub,
+        &mut sub,
         &mut watches,
-        streams,
-        &mut known_sids,
-        opts.since_turn,
+        scopes,
+        &opts,
+        &mut cursors,
         &mut egress,
     );
 }
@@ -1329,13 +1675,23 @@ pub fn push_loop<W: Write>(
 /// (It cannot be `push_loop` itself: `Gone` is private and `push_loop` is `pub`.)
 fn pump<W: Write>(
     store: &Store,
-    sub: &Subscription,
+    sub: &mut Subscription,
     watches: &mut Vec<Watch>,
-    streams: TargetStreams,
-    known_sids: &mut Option<std::collections::HashSet<String>>,
-    since_turn: Option<u64>,
+    scopes: PushScopes,
+    opts: &PushOptions,
+    cursors: &mut PushCursors,
     egress: &mut Egress<'_, W>,
 ) -> Result<(), Gone> {
+    // The same authority set `push_loop` was handed, carried whole rather than
+    // re-split into the two tokens this body happens to read today: a later wake
+    // that needs `instance` must not have to widen the signature to get it, and a
+    // caller must never be able to hand `pump` a scope set the connection did not
+    // actually prove.
+    let PushScopes {
+        streams, adopt, ..
+    } = scopes;
+    let PushCursors { roster, adopt_seq } = cursors;
+    let since_turn = opts.since_turn;
     // The catch-up is a wake like any other, so it opens one: its frames share a
     // stamp ledger, and its flush is `end_wake`.
     egress.begin_wake();
@@ -1390,15 +1746,33 @@ fn pump<W: Write>(
         // `app_tabs` issues no subscriber notify at all, so the death is always
         // discovered on our own 250ms tick with a full tick of bytes queued.
         for closing in prune_closed(store, watches) {
+            // Leave the notify registry too. Harmless-but-wasteful on a
+            // fixed-target subscription (it ends soon after its last target
+            // dies); load-bearing on a `@*` one, which outlives an unbounded
+            // number of sessions and would otherwise accumulate a registry
+            // entry per dead session for the producer's `notify` to walk.
+            sub.unwatch(closing.local_id());
             for f in closing.drain(streams) {
+                egress.emit(f)?;
+            }
+        }
+
+        // ADOPT: a `@*` subscription's target set is LIVE — sessions created
+        // after it subscribed join it here, each acked with the same
+        // `sub <local> <sid>` line the initial handshake emits, so a client
+        // demultiplexes an adopted channel exactly the way it does an original
+        // one (the shipped bridge already reads `sub` lines anywhere in the
+        // stream, because the ack was never guaranteed to arrive in one read).
+        if adopt.on() {
+            for f in adopt_new_targets(store, watches, sub, streams, opts, adopt_seq) {
                 egress.emit(f)?;
             }
         }
 
         // INSTANCE lifecycle (connection-level, once per wake): a sibling spawn/exit
         // the subscriber is not watching, so a fleet supervisor need not poll `ls`.
-        if let Some(known) = known_sids.as_mut() {
-            for f in drain_session_events(store, known) {
+        if let Some(cursor) = roster.as_mut() {
+            for f in drain_session_events(store, cursor) {
                 egress.emit(f)?;
             }
         }
@@ -1407,7 +1781,11 @@ fn pump<W: Write>(
         // them: the last watch's tail and the `EVENT * session-exited` that reports
         // its death are produced by exactly the wake that discovers it, and returning
         // above them would have discarded both.
-        if watches.is_empty() {
+        // ...but a `@*` subscription's empty set is NOT the end of the stream: it
+        // is an instance that momentarily has no sessions, and the whole point of
+        // the live target set is that the next one gets adopted. A fixed-target
+        // subscription still ends here, unchanged.
+        if watches.is_empty() && !adopt.on() {
             return egress.end_wake();
         }
 
@@ -1436,11 +1814,16 @@ fn initial_block_watermark(term: &Arc<Mutex<Terminal>>, streams: TargetStreams) 
     if !streams.events {
         return None;
     }
-    let t = crate::term_lock(term);
-    t.all_blocks()
-        .filter(|b| b.is_complete())
+    // IDENTICAL to the `all_blocks().filter(is_complete).map(id).max()` this
+    // replaces: `all_blocks()` yields strictly increasing ids, so the newest
+    // COMPLETE block by position is also the largest complete id — which is
+    // what `newest_completed_block` returns, in O(1) instead of a walk over up
+    // to `OUTPUT_BLOCKS_MAX` records. One seed per subscription, but it is the
+    // same identity the per-tick early-out in `sample_engine_events` rests on,
+    // so stating it once, here, keeps the two from drifting apart.
+    crate::term_lock(term)
+        .newest_completed_block()
         .map(|b| b.id)
-        .max()
 }
 
 /// Seed the turn watermark to the ledger's current high so the `events` digest
@@ -1463,6 +1846,124 @@ fn initial_timeline_watermark(
         return None;
     }
     timeline.lock().unwrap_or_else(|p| p.into_inner()).high_id()
+}
+
+/// ADOPT every live session this `@*` subscription is not already watching —
+/// driven by the STORE'S ROSTER JOURNAL, so an idle wake costs one integer
+/// compare and a busy one costs O(sessions created).
+///
+/// THE COST CATEGORY THIS DELETES. `subscribe` froze its target list at
+/// subscribe time, and the push loop is documented PUSH-ONLY — it never reads
+/// another request line — so there was NO way to add a session to a live
+/// subscription. A federation bridge that wanted a newly-opened tab therefore
+/// had to open a WHOLE NEW subscription for it: a fresh child process, a fresh
+/// UDS connection, and a fresh server push thread, once per DISCOVERY MOMENT
+/// rather than once per instance. The server admits
+/// `CONTROL_SUBSCRIPTION_WORKERS` = 4 of those at a time, so the fifth tab-open
+/// was refused — and refused silently, because a push-only client that has
+/// already marked the sid as seen never asks again. Past four staggered
+/// discoveries, sessions simply stopped being federated. One live target set
+/// replaces all of it with one connection per instance.
+///
+/// WHY IT RIDES THE SAME JOURNAL THE `sessions` STREAM DOES. "Which sessions am
+/// I not watching?" and "which sessions appeared?" are the same question asked
+/// by two consumers, and answering it by rebuilding the whole roster is what
+/// made the second one expensive in the first place. The journal answers both
+/// from one monotonic log: `roster_seq()` says whether anything moved at all,
+/// and `roster_since` names exactly what did. So adoption does not re-introduce
+/// the per-tick whole-registry walk the roster cursor just deleted.
+///
+/// DISCIPLINE. Clone-then-release: handles are cloned out under the store read
+/// guard, which is dropped before `new_watch` takes any `Terminal` lock and
+/// before any write. The `MAX_SUBSCRIBE_TARGETS` cap that bounds an explicit
+/// selector list bounds this too — a subscription cannot fan out past it by
+/// living a long time. When the cap is reached adoption is DEFERRED, not
+/// dropped: the watermark is NOT advanced, so a later wake with a free slot
+/// picks the same session up, and an Owner that also asked for the `sessions`
+/// stream saw its `session-created` immediately regardless.
+fn adopt_new_targets(
+    store: &Store,
+    watches: &mut Vec<Watch>,
+    sub: &mut Subscription,
+    streams: TargetStreams,
+    opts: &PushOptions,
+    adopt_seq: &mut u64,
+) -> Vec<Frame> {
+    let room = crate::control::MAX_SUBSCRIBE_TARGETS.saturating_sub(watches.len());
+    if room == 0 {
+        return Vec::new();
+    }
+    let fresh: Vec<(ResolvedTarget, String)> = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        let high = g.roster_seq();
+        if high == *adopt_seq {
+            // THE IDLE TICK: nothing has entered or left the registry.
+            return Vec::new();
+        }
+        let unwatched = |h: &&crate::session_store::SessionHandle| {
+            !watches.iter().any(|w| w.local_id == h.local_id)
+        };
+        let carve = |h: &crate::session_store::SessionHandle| {
+            (
+                (
+                    h.local_id,
+                    h.term.clone(),
+                    h.ctx.byte_fanout.clone(),
+                    h.ctx.turns.clone(),
+                    h.ctx.timeline.clone(),
+                ),
+                h.sid.as_str().to_string(),
+            )
+        };
+        let mut picked: Vec<(ResolvedTarget, String)> = match g.roster_low_seq() {
+            // FAST PATH: resolve only the sids the journal says were CREATED.
+            // An `Exited` record needs nothing — `prune_closed` above already
+            // retired that watch — and a Created sid that has since exited
+            // resolves to `None` and is skipped, which is what makes replaying
+            // a stale watermark safe.
+            Some(low) if adopt_seq.saturating_add(1) >= low => g
+                .roster_since(*adopt_seq)
+                .filter(|r| r.change == crate::session_store::RosterChange::Created)
+                .filter_map(|r| g.by_sid(&aterm_session::SessionId::new(&r.sid)))
+                .filter(|h| unwatched(h))
+                .map(carve)
+                .collect(),
+            // RECOVERY: the watermark fell past the journal's retained window
+            // (or this is the very first pass on an instance whose journal has
+            // already rolled). Walk the registry once — the pre-journal cost,
+            // paid only where the journal genuinely cannot answer.
+            _ => g
+                .live_handles()
+                .filter(|h| unwatched(h))
+                .map(carve)
+                .collect(),
+        };
+        // ADVANCE ONLY IF WE TOOK EVERYTHING. Truncating to the cap and moving
+        // the watermark anyway would put the deferred sessions permanently
+        // behind it — the exact "seen, therefore never retried" bug that made
+        // the old bridge lose sessions.
+        if picked.len() <= room {
+            *adopt_seq = high;
+        } else {
+            picked.truncate(room);
+        }
+        picked
+        // guard drops here, BEFORE `new_watch` takes any Terminal lock
+    };
+    let mut out = Vec::with_capacity(fresh.len());
+    for (target, sid) in fresh {
+        // Register for wakes BEFORE building the watch, so a burst that lands
+        // between the two still wakes us. (It could not be lost either way — a
+        // wake re-reads the session's CURRENT state — but registering second
+        // would mean the first burst waited for the 250 ms liveness tick.)
+        sub.watch(target.0);
+        out.push(Frame::text(
+            Tag::Instance,
+            format!("sub {} {sid}\n", target.0),
+        ));
+        watches.push(new_watch(&target, streams, opts));
+    }
+    out
 }
 
 /// A watch whose session has left the store but whose buffered TAIL has not been
@@ -1491,6 +1992,12 @@ impl Closing {
     /// `woke = false`: this pass exists to deliver state the client has not SEEN, not
     /// to re-emit. An `every-frame` re-emit at an unchanged seq would only append a
     /// duplicate frame to a session that is already gone.
+    /// The process-local id of the watch inside — read BEFORE `drain` consumes
+    /// it, so the notify registry can be cleaned up in the same pass.
+    fn local_id(&self) -> u64 {
+        self.0.local_id
+    }
+
     fn drain(mut self, streams: TargetStreams) -> Vec<Frame> {
         let tag = Tag::Channel(self.0.local_id);
         let mut out = frames_for_watch(&mut self.0, streams, false);
@@ -1527,6 +2034,308 @@ fn prune_closed(store: &Store, watches: &mut Vec<Watch>) -> Vec<Closing> {
     dead.into_iter().map(Closing).collect()
 }
 
+/// BENCH-ONLY driver for the `events` DIGEST (`benches/subscribe_digest.rs`) —
+/// the `bench_support` precedent applied inside this module.
+///
+/// WHY IT LIVES HERE. The thing that has to be timed is [`frames_for_watch`],
+/// the per-target per-wake body the push loop runs, and the [`Watch`] it mutates
+/// — both module-private, as they should be. A bench is an EXTERNAL target and
+/// sees neither. This module is the one seam they are driven through; it is
+/// gated on the `bench-support` feature, which no shipping build enables, and it
+/// contains NO logic of its own beyond fixture construction: `wake` calls the
+/// shipping function directly, in the same loop shape `pump` uses.
+///
+/// WHAT THE FIXTURE HAS TO GET RIGHT. A `Watch` seeded with `None` watermarks
+/// would emit the entire retained backlog on its first wake and then be silent —
+/// which would price the wrong thing twice over. So the watermarks here are
+/// seeded exactly as [`push_loop`] seeds them (live highs, so `events` is a live
+/// stream and never a replay), and the bench PROVES that with a two-sided guard:
+/// an idle wake must produce zero bytes, and a wake after a real ledger append
+/// must produce a frame.
+#[cfg(feature = "bench-support")]
+pub(crate) mod bench_seam {
+    use super::{TargetStreams, Watch, frames_for_watch};
+    use crate::session_timeline::SessionTimeline;
+    use crate::turn_ledger::{TurnLedger, TurnRecord};
+    use aterm_core::terminal::Terminal;
+    use std::sync::{Arc, Mutex};
+
+    /// One shell-integration command cycle: prompt, command, output, exit 0.
+    /// Two archived rows per cycle, one `OutputBlock` per cycle.
+    const CYCLE: &[u8] =
+        b"\x1b]133;A\x07$ \x1b]133;B\x07cmd\r\n\x1b]133;C\x07out\r\n\x1b]133;D;0\x07";
+
+    /// K watched targets whose three per-target event ledgers are filled to a
+    /// requested RETAINED DEPTH — the scaling variable the digest's cost was
+    /// found to track.
+    pub(crate) struct DigestFixture {
+        watches: Vec<Watch>,
+        streams: TargetStreams,
+        terms: Vec<Arc<Mutex<Terminal>>>,
+        turns: Vec<Arc<Mutex<TurnLedger>>>,
+        timelines: Vec<Arc<Mutex<SessionTimeline>>>,
+        next_turn_id: u64,
+    }
+
+    impl DigestFixture {
+        /// `targets` watches, each carrying `blocks` shell blocks, `turns` turn
+        /// records and `timeline` timeline events. Depths above the shipping caps
+        /// simply saturate — [`Self::retained`] reports what was actually reached
+        /// so the bench can assert on the real numbers rather than the asked-for
+        /// ones.
+        /// NOT named `new`: the lock-order census resolves a held one-hop call
+        /// by callee NAME, so a `fn new` here captured every `Vec::new()` and
+        /// `Scrollback::new()` made under a held `term` guard and reported an
+        /// OB-7 re-entrancy suspect against this fixture's own private engine.
+        /// The distinct name is what keeps that census honest.
+        pub(crate) fn build(targets: usize, blocks: usize, turns: usize, timeline: usize) -> Self {
+            let mut f = DigestFixture {
+                watches: Vec::with_capacity(targets),
+                // EVENTS ONLY — the shape the finding is about. A content-bearing
+                // subscription takes its own Terminal lock for the grid; an
+                // events-only one used to take three purely to learn nothing had
+                // changed, and that is the cost being priced.
+                streams: TargetStreams {
+                    events: true,
+                    ..Default::default()
+                },
+                terms: Vec::with_capacity(targets),
+                turns: Vec::with_capacity(targets),
+                timelines: Vec::with_capacity(targets),
+                next_turn_id: 0,
+            };
+            for i in 0..targets {
+                // `fixture_term`, not `term`: the census's identity is the
+                // receiver NAME, so a local called `term` would MERGE with the
+                // shipping session mutex and put this private, never-shared
+                // engine into the production lock graph.
+                let fixture_term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+                {
+                    let mut t = fixture_term.lock().expect("fresh engine");
+                    for _ in 0..blocks {
+                        t.process(CYCLE);
+                    }
+                    // A settled title, so the title watermark seeds to a real value.
+                    t.process(b"\x1b]2;bench\x07");
+                }
+                let ledger = Arc::new(Mutex::new(TurnLedger::default()));
+                {
+                    let mut l = ledger.lock().expect("fresh ledger");
+                    for _ in 0..turns {
+                        f.next_turn_id += 1;
+                        l.push(turn_record(f.next_turn_id));
+                    }
+                }
+                let tl = Arc::new(Mutex::new(SessionTimeline::default()));
+                {
+                    let mut t = tl.lock().expect("fresh timeline");
+                    for j in 0..timeline {
+                        // A realistic mix: the digest FILTERS for `meta-change`,
+                        // so an all-`meta-change` fixture would flatter a design
+                        // that scanned the whole ring, and an all-other fixture
+                        // would never exercise the emit path.
+                        if j % 8 == 0 {
+                            t.record("meta-change", "field=role value=lead".to_string());
+                        } else {
+                            t.record("state-change", "state=alive".to_string());
+                        }
+                    }
+                }
+                f.watches.push(seeded_watch(i as u64, &fixture_term, &ledger, &tl));
+                f.terms.push(fixture_term);
+                f.turns.push(ledger);
+                f.timelines.push(tl);
+            }
+            f
+        }
+
+        /// ONE wake: the shipping per-target body for every watch, in the loop
+        /// shape `pump` runs it in. Returns the total frame bytes produced —
+        /// `0` is what an idle wake must produce, and the bench asserts it.
+        pub(crate) fn wake(&mut self, woke: bool) -> usize {
+            let mut bytes = 0usize;
+            for w in &mut self.watches {
+                for f in frames_for_watch(w, self.streams, woke) {
+                    bytes += f.body.len();
+                }
+            }
+            bytes
+        }
+
+        /// What the fixture ACTUALLY reached on target 0: `(blocks, turns,
+        /// timeline events)`. The lower half of the bench's reach guard — a
+        /// fixture that failed to fill the ledgers would price an empty scan.
+        pub(crate) fn retained(&self) -> (usize, usize, usize) {
+            // Bound to NAMED locals rather than locked through `self.terms[0]`
+            // directly: the census takes a lock's identity from the receiver
+            // NAME, and an index expression has none — locking through one
+            // leaves an UNKNOWN-identity site, which is the honesty gap this
+            // crate's `no_unknown_identities_on_this_tree` exists to hold at
+            // zero. The `fixture_` prefix keeps them out of the production
+            // `term` / `turns` / `timelines` identities as well.
+            let fixture_term = &self.terms[0];
+            let fixture_turns = &self.turns[0];
+            let fixture_timeline = &self.timelines[0];
+            (
+                fixture_term
+                    .lock()
+                    .expect("bench engine")
+                    .all_blocks()
+                    .count(),
+                fixture_turns.lock().expect("bench ledger").len(),
+                fixture_timeline.lock().expect("bench timeline").len(),
+            )
+        }
+
+        /// Land ONE genuinely new turn record on every target — the "something
+        /// happened" arm, and the other half of the reach guard: after this, a
+        /// wake MUST produce frames, which proves the digest reaches the ledger
+        /// rather than short-circuiting somewhere above it.
+        pub(crate) fn land_turn(&mut self) {
+            let mut id = self.next_turn_id;
+            // Named, not `l`: a single-letter receiver is UNKNOWN to the
+            // census for the same reason an index expression is.
+            for fixture_ledger in &self.turns {
+                id += 1;
+                fixture_ledger
+                    .lock()
+                    .expect("bench ledger")
+                    .push(turn_record(id));
+            }
+            self.next_turn_id = id;
+        }
+    }
+
+    /// A watch seeded EXACTLY as `push_loop` seeds one for an events-only
+    /// subscription: every watermark at the live high, so only what happens
+    /// AFTER this point is pushed.
+    fn seeded_watch(
+        local_id: u64,
+        term: &Arc<Mutex<Terminal>>,
+        turns: &Arc<Mutex<TurnLedger>>,
+        timeline: &Arc<Mutex<SessionTimeline>>,
+    ) -> Watch {
+        let (last_block_id, last_title, last_bell) = {
+            let t = term.lock().expect("bench engine");
+            (
+                t.all_blocks()
+                    .filter(|b| b.is_complete())
+                    .map(|b| b.id)
+                    .max(),
+                Some(t.title().to_string()),
+                t.bell_total(),
+            )
+        };
+        Watch {
+            local_id,
+            term: term.clone(),
+            last_sent_seq: 0,
+            last_alt: false,
+            last_cursor: (u16::MAX, u16::MAX, false, ""),
+            last_render_sig: 0,
+            last_block_id,
+            turns: turns.clone(),
+            last_turn_id: turns.lock().expect("bench ledger").high_id(),
+            timeline: timeline.clone(),
+            last_timeline_id: timeline.lock().expect("bench timeline").high_id(),
+            last_title,
+            last_bell,
+            byte_sub: None,
+            non_coalesced: false,
+        }
+    }
+
+    /// The INSTANCE ROSTER tick: rebuild the live-sid set, then run the SHIPPING
+    /// set-diff against the last one. This is what a `sessions` subscriber pays
+    /// on every 250 ms wake, changed or not.
+    ///
+    /// WHAT IS REAL AND WHAT IS MODELLED, stated plainly so the number is not
+    /// over-claimed. The DIFF is the shipping function, called directly. The
+    /// REBUILD is modelled: `SessionStore::live_sids` walks a `HashMap` of
+    /// registered handles and allocates one `String` per session, and this
+    /// walks a `HashSet` of the same sid strings and allocates one `String` per
+    /// session. Allocation count, string width and hashing are therefore
+    /// identical; the gap is the container being walked (and the store's
+    /// uncontended `RwLock` read, which the roster journal does not remove
+    /// anyway). Building the real thing would need a registered `SessionHandle`,
+    /// which needs a whole `SessionCtx` — a fixture that exists only behind
+    /// `#[cfg(test)]` and would have to be duplicated here to be reachable, at
+    /// which point it could drift from the real handle shape. Naming the gap is
+    /// the more honest trade.
+    pub(crate) struct RosterRebuild {
+        /// The set as the subscriber last saw it (its watermark, pre-journal).
+        known: std::collections::HashSet<String>,
+        /// The instance's live sids right now.
+        live: std::collections::HashSet<String>,
+        /// Source of fresh sids for [`Self::churn`].
+        next: u64,
+    }
+
+    impl RosterRebuild {
+        /// An instance with `sessions` live sessions, and a subscriber already
+        /// caught up to them (so the first tick is an UNCHANGED one).
+        pub(crate) fn new(sessions: usize) -> Self {
+            let live: std::collections::HashSet<String> =
+                (0..sessions as u64).map(sid_string).collect();
+            RosterRebuild {
+                known: live.clone(),
+                live,
+                next: sessions as u64,
+            }
+        }
+
+        /// ONE wake of the pre-journal roster body: rebuild the set, diff it,
+        /// adopt it. Returns the emitted bytes — `0` on an unchanged tick, which
+        /// is the state the bench measures and asserts.
+        pub(crate) fn tick(&mut self) -> usize {
+            // Models `SessionStore::live_sids` (see the type doc): one owned
+            // `String` per live session, collected into a fresh set.
+            let live: std::collections::HashSet<String> =
+                self.live.iter().map(|s| s.to_string()).collect();
+            let mut out = String::new();
+            super::diff_session_events(&live, &self.known, &mut out);
+            self.known = live;
+            out.len()
+        }
+
+        /// Retire one session and open another — so the NEXT tick has a real
+        /// created + exited pair to report. The upper half of the reach guard:
+        /// a diff that emitted nothing after this would not be running.
+        pub(crate) fn churn(&mut self) {
+            if let Some(victim) = self.live.iter().next().cloned() {
+                self.live.remove(&victim);
+            }
+            self.live.insert(sid_string(self.next));
+            self.next += 1;
+        }
+
+        /// How many sessions this instance has live — the lower reach guard.
+        pub(crate) fn sessions(&self) -> usize {
+            self.live.len()
+        }
+    }
+
+    /// A stable sid string of the shipped width (`s-` + 16 lowercase hex), so the
+    /// modelled rebuild allocates and hashes the same bytes the real one does.
+    fn sid_string(i: u64) -> String {
+        format!("s-{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+    }
+
+    /// A small, realistic turn record (the ledger clamps text itself).
+    fn turn_record(id: u64) -> TurnRecord {
+        TurnRecord {
+            id,
+            started_ms: id,
+            dur_ms: 12,
+            submitted: true,
+            status: "settled",
+            text: "run the suite".to_string(),
+            screen_hash: id.wrapping_mul(0x9E37_79B9_7F4A_7C15),
+            seq: id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1552,6 +2361,135 @@ mod tests {
             byte_sub: None,
             non_coalesced: false,
         }
+    }
+
+    /// `@*` ADOPTION IS OWNER-ONLY, at the type level. The capability has no
+    /// public constructor that can produce a permissive value from a non-Owner
+    /// scope, so a future caller that forgets the refusal in `run_subscribe`
+    /// still cannot grant it — the same invariant `InstanceStreams::authorize`
+    /// carries for the instance `sessions` stream, and for the same reason: a
+    /// live target set names sessions the subscriber could not have named.
+    #[test]
+    fn adopt_scope_is_owner_only() {
+        assert!(
+            AdoptScope::authorize(true, Scope::Owner).on(),
+            "Owner asking for @* gets it"
+        );
+        let edge = Scope::Edge(aterm_session::EdgeToken::from_bytes([9u8; 32]));
+        assert!(
+            !AdoptScope::authorize(true, edge).on(),
+            "an EDGE asking for @* is refused, whatever its per-target reach"
+        );
+        assert!(
+            !AdoptScope::authorize(false, Scope::Owner).on(),
+            "not asked for = not granted"
+        );
+        assert!(!AdoptScope::none().on(), "the refusing default refuses");
+    }
+
+    /// A LIVE target set's notify registration must track its watch set exactly:
+    /// an adopted session starts waking the subscription, a closed one stops, and
+    /// neither leaves a handle behind.
+    ///
+    /// The leak is the point of the second half. A `@*` subscription outlives an
+    /// unbounded number of sessions; without `unwatch`, every dead one leaves a
+    /// registry entry the producer's `notify` walks on every output burst, and
+    /// the `any()` fast-path flag can never fall back to false.
+    #[test]
+    fn watch_and_unwatch_track_the_registry_exactly() {
+        let registry = new_registry();
+        let mut sub = SubscriberSet::register(&registry, &[1]);
+        let watchers = |id: u64| registry.lock().unwrap().watchers(id);
+        assert_eq!((watchers(1), watchers(2)), (1, 0));
+
+        sub.watch(2);
+        assert_eq!(watchers(2), 1, "an adopted session is registered");
+        sub.watch(2);
+        assert_eq!(
+            watchers(2),
+            1,
+            "adoption is idempotent — no duplicate handle"
+        );
+
+        // The adopted session really does wake us.
+        registry.lock().unwrap().notify(2);
+        assert!(
+            sub.wait(Duration::from_millis(500)),
+            "a notify on the adopted session wakes the subscription"
+        );
+
+        sub.unwatch(2);
+        assert_eq!(watchers(2), 0, "a closed session is deregistered");
+        assert!(registry.any(), "session 1 is still watched");
+        registry.lock().unwrap().notify(2);
+        assert!(
+            !sub.wait(Duration::from_millis(50)),
+            "a notify on a dropped session no longer wakes the subscription"
+        );
+
+        sub.unwatch(1);
+        assert!(
+            !registry.any(),
+            "the lock-free fast-path flag follows the LAST removal, so a producer \
+             stops paying for a subscription that watches nothing"
+        );
+    }
+
+    /// THE `@*` END-TO-END CLAIM: a subscription ADOPTS a session created after
+    /// it subscribed — the thing a frozen target list could not express at all,
+    /// and the reason the old federation bridge had to open a whole new
+    /// connection (and eventually ran out of the four the server admits).
+    ///
+    /// It also pins the three properties the adoption has to have to be usable:
+    /// the adopted channel is acked with the SAME `sub <local> <sid>` line the
+    /// handshake emits (so a client demultiplexes it identically), it is
+    /// registered for wakes, and it is seeded LIVE — an adopted watch that
+    /// replayed a backlog would flood a fleet supervisor on every tab-open.
+    #[test]
+    fn adoption_picks_up_a_session_created_after_subscribe() {
+        let store = crate::session_store::new_store();
+        let registry = new_registry();
+        let mut sub = SubscriberSet::register(&registry, &[]);
+        let mut watches: Vec<Watch> = Vec::new();
+        let mut adopt_seq = 0u64;
+        let streams = TargetStreams {
+            events: true,
+            ..Default::default()
+        };
+        let opts = PushOptions::default();
+        let adopt = |w: &mut Vec<Watch>, sub: &mut Subscription, seq: &mut u64| {
+            text(&adopt_new_targets(&store, w, sub, streams, &opts, seq))
+        };
+
+        assert!(
+            adopt(&mut watches, &mut sub, &mut adopt_seq).is_empty(),
+            "an instance with no sessions adopts nothing"
+        );
+
+        let h = crate::session_store::test_handle(5);
+        let sid = h.sid.as_str().to_string();
+        store.write().unwrap_or_else(|p| p.into_inner()).register(h);
+
+        assert_eq!(
+            adopt(&mut watches, &mut sub, &mut adopt_seq),
+            format!("sub 5 {sid}\n"),
+            "the adopted channel is acked exactly like a handshake channel"
+        );
+        assert_eq!(watches.len(), 1, "and it joined the watch set");
+        assert_eq!(
+            registry.lock().unwrap().watchers(5),
+            1,
+            "and it is registered for producer wakes"
+        );
+
+        assert!(
+            adopt(&mut watches, &mut sub, &mut adopt_seq).is_empty(),
+            "a second pass adopts nothing — the watermark caught up"
+        );
+        assert!(
+            frames_for_watch(&mut watches[0], streams, true).is_empty(),
+            "an adopted watch is seeded at the LIVE highs, so it replays no backlog"
+        );
     }
 
     /// A subscriber registered for a session is woken by a notify on that session,
@@ -2513,23 +3451,93 @@ mod tests {
         // OSC 2 sets the window title to "my dir" (a space -> pct-encoded).
         crate::term_lock(&term).process(b"\x1b]2;my dir\x07");
         let mut out = String::new();
+        // Sampled through the SHIPPING sampler, so this test now covers the one
+        // lock hold as well as the formatter it feeds.
+        let title = |t: &Arc<Mutex<Terminal>>| sample_engine_events(t, None).title;
         // First drain with no watermark emits the current title.
-        let wm = drain_title_event(&term, "3", None, &mut out);
+        let wm = drain_title_event("3", &title(&term), None, &mut out);
         assert!(
             out.contains("EVENT 3 title my%20dir\n"),
             "title emitted + pct-encoded: {out:?}"
         );
         // A re-scan with the same title emits nothing.
         out.clear();
-        let wm = drain_title_event(&term, "3", wm, &mut out);
+        let wm = drain_title_event("3", &title(&term), wm, &mut out);
         assert!(out.is_empty(), "unchanged title emits nothing: {out:?}");
         // A new title emits again.
         crate::term_lock(&term).process(b"\x1b]2;other\x07");
         out.clear();
-        let _ = drain_title_event(&term, "3", wm, &mut out);
+        let _ = drain_title_event("3", &title(&term), wm, &mut out);
         assert!(
             out.contains("EVENT 3 title other\n"),
             "change re-emits: {out:?}"
+        );
+    }
+
+    /// DIFFERENTIAL + REACH for the block half of [`sample_engine_events`]: the
+    /// O(1) early-out and the reverse walk must agree with the forward
+    /// `all_blocks().filter(is_complete && id > wm)` scan they replaced, at
+    /// EVERY watermark — and in particular across a block that was ARCHIVED
+    /// WITHOUT EVER COMPLETING (an abandoned prompt / Ctrl-C'd command line).
+    /// That is the case a reverse walk which stopped on `!is_complete()` rather
+    /// than on the ID would silently truncate, and no dense all-completed
+    /// fixture can catch it.
+    #[test]
+    fn sample_engine_events_blocks_match_the_forward_filter() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let run = |bytes: &[u8]| {
+            crate::term_lock(&term).process(bytes);
+        };
+        // Two completed commands, an ABANDONED prompt, then a third completed one.
+        run(b"\x1b]133;A\x07$ \x1b]133;B\x07one\n\x1b]133;C\x07o\n\x1b]133;D;0\x07");
+        run(b"\x1b]133;A\x07$ \x1b]133;B\x07two\n\x1b]133;C\x07t\n\x1b]133;D;1\x07");
+        run(b"\x1b]133;A\x07$ \x1b]133;B\x07abandoned");
+        run(b"\x1b]133;A\x07$ \x1b]133;B\x07three\n\x1b]133;C\x07x\n\x1b]133;D;0\x07");
+
+        // The exact expression the sampler replaced, kept here as the oracle.
+        let reference = |wm: Option<u64>| -> Vec<(u64, Option<i32>)> {
+            let t = crate::term_lock(&term);
+            t.all_blocks()
+                .filter(|b| b.is_complete() && wm.is_none_or(|h| b.id > h))
+                .map(|b| (b.id, b.exit_code))
+                .collect()
+        };
+        let all = reference(None);
+        assert_eq!(
+            all.len(),
+            3,
+            "REACH: the fixture must produce three COMPLETED blocks around one \
+             abandoned prompt, not {all:?} — otherwise the walk is priced against \
+             a shape that cannot exercise the break"
+        );
+        assert!(
+            all.iter().any(|&(_, exit)| exit == Some(1)),
+            "REACH: a non-zero exit must be present so the payload is not degenerate"
+        );
+
+        // Every watermark from below the floor to past the ceiling, plus `None`.
+        let ceiling = all.last().expect("three blocks").0;
+        let mut probes: Vec<Option<u64>> = vec![None];
+        for id in 0..=(ceiling + 2) {
+            probes.push(Some(id));
+        }
+        for wm in probes {
+            assert_eq!(
+                sample_engine_events(&term, wm).blocks,
+                reference(wm),
+                "watermark {wm:?} diverged from the forward filter"
+            );
+        }
+
+        // The two arms the digest stands on, named explicitly.
+        assert!(
+            sample_engine_events(&term, Some(ceiling)).blocks.is_empty(),
+            "at the high-water an idle wake must produce nothing"
+        );
+        assert_eq!(
+            sample_engine_events(&term, None).blocks,
+            all,
+            "no watermark = every completed block, oldest-first"
         );
     }
 
@@ -2563,26 +3571,135 @@ mod tests {
         assert!(out2.is_empty(), "unchanged set emits nothing: {out2:?}");
     }
 
+    /// A cursor seeded at the current journal high, the way `push_loop` seeds one.
+    fn roster_cursor(store: &Store) -> RosterCursor {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        RosterCursor {
+            seq: g.roster_seq(),
+            known: g.live_sids(),
+        }
+    }
+
+    /// THE SCP-4 CORRECTNESS FIX, with its own negative control.
+    ///
+    /// A sibling that BOTH spawns and exits between two wakes used to appear in
+    /// neither snapshot and emit neither event — the push loop's module doc says
+    /// so outright. The journal records each transition as it happens, so both
+    /// events now surface, in order, on the next wake.
+    ///
+    /// The negative control is the OLD mechanism run over the SAME two instants:
+    /// it must emit nothing. Without it this test could pass for the wrong
+    /// reason (e.g. if the fixture accidentally left the session registered),
+    /// and the whole claim is that the two mechanisms DISAGREE here.
+    #[test]
+    fn a_sub_tick_spawn_and_exit_both_surface() {
+        let store = crate::session_store::new_store();
+        let mut cursor = roster_cursor(&store);
+        let before = cursor.known.clone();
+
+        let h = crate::session_store::test_handle(7);
+        let sid = h.sid.as_str().to_string();
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            g.register(h);
+            g.deregister_local(7);
+        }
+
+        // NEGATIVE CONTROL: the pre-journal snapshot diff, on the same instants.
+        let after = store.read().unwrap_or_else(|p| p.into_inner()).live_sids();
+        let mut old_way = String::new();
+        diff_session_events(&after, &before, &mut old_way);
+        assert!(
+            old_way.is_empty(),
+            "the snapshot diff cannot see a cancelled-out pair — if it can, this \
+             fixture is not reproducing the sub-tick window: {old_way:?}"
+        );
+
+        let got = text(&drain_session_events(&store, &mut cursor));
+        assert!(
+            got.contains(&format!("EVENT * session-created {sid}\n")),
+            "the spawn must surface: {got:?}"
+        );
+        assert!(
+            got.contains(&format!("EVENT * session-exited {sid}\n")),
+            "the exit must surface: {got:?}"
+        );
+        assert!(
+            got.find("session-created") < got.find("session-exited"),
+            "in the order they happened: {got:?}"
+        );
+        // The cursor advanced exactly once: a second drain is silent (and, being
+        // the idle path, never touches the registry's contents at all).
+        assert!(
+            drain_session_events(&store, &mut cursor).is_empty(),
+            "a caught-up cursor emits nothing"
+        );
+    }
+
+    /// RECOVERY: a cursor that fell past the journal's drop-oldest low-water
+    /// rebuilds and diffs the whole set — the pre-journal behaviour, reached
+    /// only in the case the journal cannot answer. It reports the NET set change
+    /// and nothing else, and it leaves the cursor caught up.
+    #[test]
+    fn a_cursor_past_the_journal_low_water_rebuilds_and_diffs() {
+        use crate::session_store::ROSTER_JOURNAL_CAP;
+        let store = crate::session_store::new_store();
+        // A cursor from before anything happened...
+        let mut cursor = RosterCursor {
+            seq: 0,
+            known: std::collections::HashSet::new(),
+        };
+        // ...then churn far past the cap. One session (id 0) survives.
+        let survivor;
+        {
+            let mut g = store.write().unwrap_or_else(|p| p.into_inner());
+            let h0 = crate::session_store::test_handle(0);
+            survivor = h0.sid.as_str().to_string();
+            g.register(h0);
+            for i in 1..=(ROSTER_JOURNAL_CAP as u64) {
+                g.register(crate::session_store::test_handle(i));
+                g.deregister_local(i);
+            }
+            assert!(
+                g.roster_low_seq().expect("journal is non-empty") > cursor.seq + 1,
+                "REACH: the fixture must push the cursor PAST the retained window, \
+                 or this test silently exercises the fast path instead"
+            );
+        }
+
+        let got = text(&drain_session_events(&store, &mut cursor));
+        assert_eq!(
+            got,
+            format!("EVENT * session-created {survivor}\n"),
+            "recovery reports the NET set change, not the evicted history"
+        );
+        assert!(
+            drain_session_events(&store, &mut cursor).is_empty(),
+            "recovery leaves the cursor caught up"
+        );
+    }
+
     /// The `events` digest emits `EVENT <sid> bell total=<n>` when the monotonic
     /// fired-bell count advances, and NOT on an unchanged re-scan (watermark).
     #[test]
     fn drain_bell_event_emits_on_new_bells() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
         let mut out = String::new();
+        let bell = |t: &Arc<Mutex<Terminal>>| sample_engine_events(t, None).bell;
         // No bells yet: baseline 0, nothing emitted.
-        let wm = drain_bell_event(&term, "4", 0, &mut out);
+        let wm = drain_bell_event("4", bell(&term), 0, &mut out);
         assert!(out.is_empty() && wm == 0, "no bell yet: {out:?}");
         // A BEL fires: total advances to 1, event emitted.
         crate::term_lock(&term).process(b"\x07");
         out.clear();
-        let wm = drain_bell_event(&term, "4", wm, &mut out);
+        let wm = drain_bell_event("4", bell(&term), wm, &mut out);
         assert!(
             out.contains("EVENT 4 bell total=1\n"),
             "bell emitted: {out:?}"
         );
         // A re-scan with no new bell emits nothing.
         out.clear();
-        let _ = drain_bell_event(&term, "4", wm, &mut out);
+        let _ = drain_bell_event("4", bell(&term), wm, &mut out);
         assert!(
             out.is_empty(),
             "unchanged bell total emits nothing: {out:?}"
@@ -2749,8 +3866,11 @@ mod tests {
             &registry,
             &store,
             &targets,
-            streams,
-            InstanceStreams::default(),
+            PushScopes {
+                streams,
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
             PushOptions::default(),
             &mut sink,
         );
@@ -2863,8 +3983,11 @@ mod tests {
             &registry,
             &store,
             &targets,
-            streams,
-            InstanceStreams::default(),
+            PushScopes {
+                streams,
+                instance: InstanceStreams::default(),
+                adopt: AdoptScope::none(),
+            },
             PushOptions::default(),
             &mut sink,
         );

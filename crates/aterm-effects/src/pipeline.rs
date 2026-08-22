@@ -35,13 +35,18 @@ use std::time::Duration;
 use web_time::Instant;
 
 use aterm_core::render::RenderInput;
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{ContentScrollState, Terminal};
 use aterm_render::{
     GlowQuad, InkCell, RainHalo, SpriteQuad, TrailCell, WordDecoration, theme_is_dark,
 };
 
-use crate::cursor_glow::{CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST};
-use crate::cursor_trail::{CursorTrail, TrailConfig, TypingCadence};
+use crate::cursor_glow::{
+    ContentCandidateDecision, CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST,
+};
+use crate::cursor_trail::{
+    ContentGeneration, CursorTrail, ExpectedCellSpan, ExpectedRowSnapshot, TrailConfig,
+    TypingCadence,
+};
 use crate::matrix_rain::{
     MatrixRain, RAIN_ALPHA_CAP, RAIN_ALPHA_FLOOR, RainConfig, RainHue, RainTickInput,
     RainVisibility,
@@ -67,6 +72,53 @@ pub fn lexicon_warning_applies(warning: &str, cjk_single_char: bool) -> bool {
     !(cjk_single_char && warning.contains("requires cjk_single_char = true"))
 }
 
+/// One pipeline consumer's projection of two cumulative terminal scroll
+/// snapshots. A translation is admitted only when the whole visible content
+/// plane moved uniformly upward by an exactly representable number of rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContentScrollDecision {
+    Baseline,
+    Unchanged,
+    Translate(u16),
+    Invalidate,
+}
+
+/// Coordinate identity for cursor-owned pixel/cell geometry in an embedder.
+/// Any change makes retained endpoints incomparable with the next frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CursorCoordinateSpace {
+    rows: usize,
+    cols: usize,
+    cell_w: usize,
+    cell_h: usize,
+    chrome_pad: u16,
+    chrome_head: u16,
+}
+
+/// Pure comparison kept separate from effect mutation so the web host's
+/// decision can be bound directly to the derived cursor-scroll model.
+fn content_scroll_decision(
+    previous: Option<ContentScrollState>,
+    current: ContentScrollState,
+) -> ContentScrollDecision {
+    let Some(previous) = previous else {
+        return ContentScrollDecision::Baseline;
+    };
+    if current.invalidation_epoch != previous.invalidation_epoch
+        || current.uniform_up_rows < previous.uniform_up_rows
+    {
+        return ContentScrollDecision::Invalidate;
+    }
+    let delta = current.uniform_up_rows - previous.uniform_up_rows;
+    if delta == 0 {
+        ContentScrollDecision::Unchanged
+    } else if let Ok(delta) = u16::try_from(delta) {
+        ContentScrollDecision::Translate(delta)
+    } else {
+        ContentScrollDecision::Invalidate
+    }
+}
+
 /// Owns the effect engines + scratch and applies them to a frame snapshot.
 pub struct EffectsPipeline {
     /// Host-advanced monotonic offset from `t0` (the injected clock).
@@ -74,6 +126,12 @@ pub struct EffectsPipeline {
     /// Epoch captured at construction; only differences ever matter.
     t0: Instant,
     focused: bool,
+    /// Last non-destructive terminal content-scroll snapshot consumed by this
+    /// pipeline. `None` is a silent baseline, never a synthetic scroll.
+    cursor_scroll_state: Option<ContentScrollState>,
+    /// Last frame geometry bound to the retained cursor engines. First sample
+    /// baselines silently; every later difference retires both engines.
+    cursor_coordinate_space: Option<CursorCoordinateSpace>,
 
     glow: CursorGlow,
     glow_cfg: GlowConfig,
@@ -100,6 +158,10 @@ pub struct EffectsPipeline {
     /// Capped well past the cadence's saturation point (heat clamps at
     /// `knee_hi` ≈ 7 unit gains) so a paste flood bounds the replay work.
     pending_keys: u32,
+    /// Reused exact-row material for the opt-in, text-aware movement proof.
+    /// The legacy [`Self::note_keystroke`] API has no glyph/content evidence
+    /// and therefore remains cadence-only.
+    candidate_row_scratch: Vec<char>,
 
     decos: WordDecorations,
     /// Compiled lexicon + resolved config; `None` while sparkle words are off.
@@ -181,6 +243,8 @@ impl EffectsPipeline {
             clock: Duration::ZERO,
             t0: Instant::now(),
             focused: true,
+            cursor_scroll_state: None,
+            cursor_coordinate_space: None,
             glow: CursorGlow::default(),
             glow_cfg: GlowConfig {
                 // A COHERENT cold-start pair for `dark_theme: true` — the
@@ -220,6 +284,7 @@ impl EffectsPipeline {
             trail_color_from_cursor: true,
             typing_cadence: TypingCadence::default(),
             pending_keys: 0,
+            candidate_row_scratch: Vec::new(),
             decos: WordDecorations::default(),
             sparkle: None,
             // v3 §4: the web resolver honors the orca suspension from
@@ -305,10 +370,23 @@ impl EffectsPipeline {
             if n > 0 {
                 self.pending_keys = 0;
                 let dt = self.clock - prev;
+                let mut newest = self.t0 + self.clock;
                 for i in 1..=n {
                     let at = self.t0 + prev + dt.mul_f64(f64::from(i) / f64::from(n));
                     self.typing_cadence.on_keystroke(at);
+                    // One physical key owns one one-cell typed credit. The
+                    // glow's fixed-size credit ring bounds a paste flood while
+                    // preserving the per-key injected timestamps that classify
+                    // an ordinary or coalesced Rainbow Kitty echo.
+                    self.glow.note_typed_cells(at, 1);
+                    newest = at;
                 }
+                // CursorTrail also admits movement only with positive host
+                // provenance. Replay its aggregate witness at the newest key's
+                // injected instant. A 3+ key rAF batch uses the engine's
+                // coalesced-typing class, so a legitimate multi-cell sweep is
+                // not misread as a one-key repaint re-anchor.
+                self.trail.note_typed_batch(newest, n);
             }
             // The rain engine accumulates whole host milliseconds; feed it the
             // delta of the pipeline clock's ms floor so sub-ms rAF fractions
@@ -409,15 +487,28 @@ impl EffectsPipeline {
     /// Record the visibility and replay it onto a live engine (a lazily-built
     /// one receives it at construction).
     fn set_rain_visibility(&mut self, v: RainVisibility) {
+        if v == RainVisibility::Hidden && self.rain_visibility != RainVisibility::Hidden {
+            // Hidden is a hard cursor-coordinate boundary, not merely an
+            // amplitude demotion. A host may refocus without an intervening
+            // `apply`; retaining resident light or an exact candidate across
+            // that gap would resurrect old geometry/provenance on the same
+            // generation.
+            self.glow.reset();
+            self.trail.reset();
+            self.glow_scratch.clear();
+            self.trail_scratch.clear();
+            self.pending_keys = 0;
+            self.typing_cadence = TypingCadence::default();
+        }
         self.rain_visibility = v;
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.set_visibility(v);
         }
     }
 
-    /// Register one keystroke for the comet ignition: fast, sustained calls heat
-    /// the typing cadence so `apply` ignites the trail; a few (or slow) calls keep
-    /// it gentle. Keystrokes are QUEUED and fed to the cadence by the next
+    /// Register one text-blind keystroke for cursor-wake ignition: fast,
+    /// sustained calls heat the cadence and Rainbow activity spines, but cannot
+    /// prove a cursor relocation. Keystrokes are QUEUED and fed by the next
     /// [`Self::advance`], spread evenly across its `dt` — so a host that batches
     /// several key events between rAF callbacks no longer collapses them onto one
     /// injected instant (a zero inter-key gap the cadence over-ignites on). A
@@ -427,6 +518,11 @@ impl EffectsPipeline {
     /// (signal code 10) from its submit handler; occupancy continues to track
     /// the live grid.
     pub fn note_keystroke(&mut self) {
+        // A newer text-blind event is an unsupported admission boundary. Do
+        // this at call time, not at the later rAF replay: an intervening apply
+        // must never observe the older candidate against the newer key's echo.
+        self.glow.cancel_authored_move_candidate();
+        self.trail.cancel_authored_move_candidate();
         // Cap far past cadence saturation (heat clamps at knee_hi ≈ 7 gains):
         // bounds the advance-side replay under a paste flood.
         self.pending_keys = self.pending_keys.saturating_add(1).min(64);
@@ -435,6 +531,209 @@ impl EffectsPipeline {
         if let Some(rain) = self.rain.as_deref_mut() {
             rain.note_keystroke();
         }
+    }
+
+    /// Register one simple committed glyph with an input-time content witness.
+    ///
+    /// Call this only after the committed bytes were synchronously accepted by
+    /// the terminal sink. It is the embedder's delivery receipt; calling before
+    /// delivery would recreate the native pre-write race this API exists to
+    /// exclude. `input` must be the immediately-current pre-echo engine snapshot
+    /// of `term`: the
+    /// damage epoch, engine-fill sequence, dimensions, viewport and cursor must
+    /// all still agree. This closes the stale-snapshot hole without rescanning
+    /// the terminal. Only a same-row one- or two-cell scalar is accepted; wrap,
+    /// margins, complex grapheme clusters and a second unobserved commit fail
+    /// closed. The later [`Self::apply`] admits movement only if the new row is
+    /// an exact diff of that snapshot inside the owned span and the cursor lands
+    /// at the predicted target.
+    ///
+    /// Even this strongest observable proof cannot distinguish a swallowed key
+    /// from unrelated PTY output that writes the exact same scalar into the exact
+    /// cell and lands on the exact predicted target before the next snapshot.
+    /// No PTY protocol token causally ties output to an input write; callers that
+    /// need to exclude that information-theoretic mimic must leave trails dark.
+    #[must_use]
+    pub fn note_committed_cells(
+        &mut self,
+        term: &mut Terminal,
+        input: &RenderInput,
+        expected: ExpectedCellSpan,
+    ) -> bool {
+        let now = self.now();
+        let pending = self.glow.move_candidate_pending() || self.trail.move_candidate_pending();
+        self.glow.cancel_authored_move_candidate();
+        self.trail.cancel_authored_move_candidate();
+
+        // Preserve the non-movement consumers of a real committed key.
+        self.typing_cadence.on_keystroke(now);
+        self.rain_material_editing = true;
+        if let Some(rain) = self.rain.as_deref_mut() {
+            rain.note_keystroke();
+        }
+        if pending {
+            // This call is the newer half of the ambiguous overlap, and it is
+            // already being declined here. Consume that boundary explicitly so
+            // a later independent commit is not reported armed while both
+            // engines silently spend a stale supersession latch.
+            self.glow.consume_declined_candidate_supersession();
+            self.trail.consume_declined_candidate_supersession();
+            return false;
+        }
+
+        let cells = expected.as_slice();
+        if !(1..=2).contains(&cells.len())
+            || cells[0] == '\0'
+            || cells[0].is_control()
+            || cells[1..].iter().any(|cell| *cell != '\0')
+            || input.display_offset != 0
+            || input.snapshot_seq != input.engine_fill_seq
+            || term.damage_epoch() != input.snapshot_seq
+            || input.terminal_id != term.render_identity()
+            || input.engine_alt != term.is_alternate_screen()
+            || input.process_sequence != term.pipeline_timestamps().process_sequence
+            || usize::from(term.rows()) != input.rows
+            || usize::from(term.cols()) != input.cols
+            || term.grid().pending_wrap()
+            || !term.modes().auto_wrap
+            || term.grid().has_horizontal_margins()
+        {
+            self.glow.note_typed_cells(now, cells.len() as u16);
+            self.trail.note_typed(now);
+            return false;
+        }
+        let cursor = term.cursor();
+        let origin = (cursor.row, cursor.col);
+        if input.cursor_row != usize::from(origin.0)
+            || input.cursor_col != usize::from(origin.1)
+            || self.glow.cursor_anchor() != Some(origin)
+            || self.trail.cursor_anchor() != Some(origin)
+        {
+            self.glow.note_typed_cells(now, cells.len() as u16);
+            self.trail.note_typed(now);
+            return false;
+        }
+        let row = usize::from(origin.0);
+        let col = usize::from(origin.1);
+        let Some(render_row) = input.cells.get(row) else {
+            self.glow.note_typed_cells(now, cells.len() as u16);
+            self.trail.note_typed(now);
+            return false;
+        };
+        // Starting on the final column is ambiguous without the full deferred-
+        // wrap history. Filling it from the penultimate column is unambiguous:
+        // the cursor remains on the final cell with pending-wrap set.
+        if input.cols == 0 || col >= input.cols.saturating_sub(1) || col + cells.len() > input.cols {
+            self.glow.note_typed_cells(now, cells.len() as u16);
+            self.trail.note_typed(now);
+            return false;
+        }
+        self.candidate_row_scratch.clear();
+        self.candidate_row_scratch.extend((0..input.cols).map(|col| {
+            render_row
+                .get(col)
+                .map_or(' ', |cell| if cell.wide { '\0' } else { cell.ch })
+        }));
+        let Some(baseline) = ExpectedRowSnapshot::from_slice(&self.candidate_row_scratch) else {
+            self.glow.note_typed_cells(now, cells.len() as u16);
+            self.trail.note_typed(now);
+            return false;
+        };
+        let target = (
+            origin.0,
+            u16::try_from(col + cells.len())
+                .unwrap_or(u16::MAX)
+                .min(u16::try_from(input.cols - 1).unwrap_or(u16::MAX)),
+        );
+        self.glow.note_typed_expected(
+            now,
+            expected,
+            target,
+            origin,
+            baseline,
+            ContentGeneration {
+                process_sequence: input.process_sequence,
+                terminal_id: input.terminal_id,
+                alternate_screen: term.is_alternate_screen(),
+            },
+        );
+        self.trail
+            .note_typed_expected(now, expected, target, origin);
+        let glow_armed = self.glow.move_candidate_pending();
+        let trail_armed = self.trail.move_candidate_pending();
+        if glow_armed != trail_armed {
+            // Dual-engine admission is atomic at this host seam. A partial arm
+            // cannot honestly own a later cursor landing, so retire both.
+            self.glow.cancel_authored_move_candidate();
+            self.trail.cancel_authored_move_candidate();
+            return false;
+        }
+        glow_armed
+    }
+
+    /// Feed the current coherent row into the shared candidate verifier and
+    /// mirror its one-shot decision into the classic trail before either engine
+    /// observes this frame's cursor delta.
+    fn confirm_cursor_move_candidate(
+        &mut self,
+        term: &Terminal,
+        input: &RenderInput,
+        cur: Option<(u16, u16)>,
+        now: Instant,
+    ) {
+        let generation = ContentGeneration {
+            process_sequence: term.pipeline_timestamps().process_sequence,
+            terminal_id: term.render_identity(),
+            alternate_screen: term.is_alternate_screen(),
+        };
+        let candidate_confirmed = if self.glow.move_candidate_pending() {
+            let Some((row, col)) = cur else {
+                self.glow.cancel_authored_move_candidate();
+                self.trail.cancel_authored_move_candidate();
+                self.glow
+                    .observe_content_generation(generation, false);
+                self.trail
+                    .observe_content_generation(generation, false);
+                return;
+            };
+            let Some(render_row) = input.cells.get(usize::from(row)) else {
+                self.glow.cancel_authored_move_candidate();
+                self.trail.cancel_authored_move_candidate();
+                self.glow
+                    .observe_content_generation(generation, false);
+                self.trail
+                    .observe_content_generation(generation, false);
+                return;
+            };
+            self.candidate_row_scratch.clear();
+            self.candidate_row_scratch.extend((0..input.cols).map(|col| {
+                render_row
+                    .get(col)
+                    .map_or(' ', |cell| if cell.wide { '\0' } else { cell.ch })
+            }));
+            self.glow
+                .observe_row(row, col, &self.candidate_row_scratch, now);
+            match self
+                .glow
+                .confirm_content_candidate(cur, now, generation)
+            {
+                Some(ContentCandidateDecision::Confirmed { at, origin, target }) => {
+                    self.trail.confirm_content_candidate(at, origin, target);
+                    true
+                }
+                Some(ContentCandidateDecision::Retired { at, origin }) => {
+                    self.trail.retire_content_candidate(at, origin);
+                    false
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        self.glow
+            .observe_content_generation(generation, candidate_confirmed);
+        self.trail
+            .observe_content_generation(generation, candidate_confirmed);
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT
@@ -1014,6 +1313,55 @@ impl EffectsPipeline {
         }
     }
 
+    /// Apply one cumulative terminal scroll snapshot to both cursor engines.
+    ///
+    /// The first observation is deliberately silent. A later exact whole-grid
+    /// upward delta translates all surviving terminal-coordinate light before
+    /// either engine observes the current cursor. Any epoch change, counter
+    /// regression, or delta wider than the engines' `u16` row contract retires
+    /// both coordinate spaces wholesale.
+    fn sync_content_scroll(&mut self, current: ContentScrollState) -> ContentScrollDecision {
+        let decision = content_scroll_decision(self.cursor_scroll_state, current);
+        self.cursor_scroll_state = Some(current);
+        match decision {
+            ContentScrollDecision::Baseline | ContentScrollDecision::Unchanged => {}
+            ContentScrollDecision::Translate(rows) => {
+                self.trail.note_scroll(rows);
+                self.glow.note_scroll(rows);
+                // A row probe is content identity, not visible geometry. Even
+                // though note_scroll translates light, pre-scroll proof bytes
+                // must never compare against the newly occupying row.
+                self.glow.drop_row_probe();
+            }
+            ContentScrollDecision::Invalidate => {
+                self.trail.reset();
+                self.glow.reset();
+            }
+        }
+        decision
+    }
+
+    /// Bind cursor geometry to this exact frame. A changed cell grid, metric,
+    /// or chrome origin invalidates every retained cell/pixel endpoint before
+    /// the next cursor sample; the current scroll snapshot is re-baselined so
+    /// the same layout transition cannot also replay as content motion.
+    fn sync_cursor_coordinate_space(
+        &mut self,
+        current: CursorCoordinateSpace,
+        scroll: ContentScrollState,
+    ) -> bool {
+        let changed = self
+            .cursor_coordinate_space
+            .is_some_and(|previous| previous != current);
+        self.cursor_coordinate_space = Some(current);
+        if changed {
+            self.trail.reset();
+            self.glow.reset();
+            self.cursor_scroll_state = Some(scroll);
+        }
+        changed
+    }
+
     // --- per-frame application ---------------------------------------------
 
     /// Run every enabled effect for the current injected instant and fill the
@@ -1033,7 +1381,21 @@ impl EffectsPipeline {
         cell_w: usize,
         cell_h: usize,
     ) -> u64 {
+        let content_scroll_state = term.content_scroll_state();
+        let coordinate_space = CursorCoordinateSpace {
+            rows: input.rows,
+            cols: input.cols,
+            cell_w,
+            cell_h,
+            chrome_pad: self.chrome_pad,
+            chrome_head: self.chrome_head,
+        };
         if !self.enabled_any() {
+            // Disabled effects have no coordinate-bearing state to mutate, but
+            // still consume a silent baseline so re-enabling cannot replay a
+            // historical scroll as current-frame motion.
+            self.cursor_scroll_state = Some(content_scroll_state);
+            self.cursor_coordinate_space = Some(coordinate_space);
             input.cursor_trail.clear();
             input.cursor_glow_add.clear();
             input.glow_halo.clear();
@@ -1054,10 +1416,50 @@ impl EffectsPipeline {
             input.rain_add.clear();
             return 0;
         }
+        // This fence must precede every cursor probe/context/tick: the terminal
+        // snapshot and its overlays then describe one coherent coordinate
+        // space for the entire frame.
+        let coordinate_changed =
+            self.sync_cursor_coordinate_space(coordinate_space, content_scroll_state);
+        if !coordinate_changed {
+            let _ = self.sync_content_scroll(content_scroll_state);
+        }
+        // Invalidation resets both engines, including their cached screen
+        // context. Re-feed the current terminal context after that fence and
+        // before any hint replay/tick so an alt-screen TUI never falls through
+        // the more permissive main-screen re-anchor classifier for one frame.
+        let alt = term.is_alternate_screen();
+        self.glow.note_context(alt);
+        self.trail.note_context(alt);
         let now = self.now();
         let (rows, cols) = (input.rows, input.cols);
-        let cur = input
-            .cursor_visible
+        let cursor_snapshot_coherent = input.process_sequence
+            == term.pipeline_timestamps().process_sequence
+            && input.terminal_id == term.render_identity()
+            && input.engine_alt == alt;
+        if !cursor_snapshot_coherent {
+            // `input` and `term` straddle two parser generations/owners. The
+            // embedder may still use the stale cell snapshot for its own frame
+            // policy, but cursor-coordinate effects cannot honestly combine
+            // that plane with the newer live terminal. Seed nothing and clear
+            // every retained cursor channel for this apply.
+            self.glow.reset();
+            self.trail.reset();
+            input.cursor_visible = false;
+        }
+        // Use the exact RenderInput snapshot, not a second live grid read: PTY
+        // or host viewport motion between extraction and apply must not mix a
+        // history cell plane with a live-grid cursor decision (or vice versa).
+        let live_viewport = cursor_snapshot_coherent && input.display_offset == 0;
+        if !live_viewport {
+            // Cursor-owned state is in active-grid coordinates. History is a
+            // distinct viewport; clearing (rather than merely passing None)
+            // prevents resident light from painting over unrelated lines.
+            self.glow.reset();
+            self.trail.reset();
+            input.cursor_visible = false;
+        }
+        let cur = (live_viewport && input.cursor_visible)
             .then_some((input.cursor_row as u16, input.cursor_col as u16));
         // Fire/Water/Vapor choose additive-vs-contrast treatment from the
         // background actually presented by this frame, not the construction
@@ -1096,10 +1498,19 @@ impl EffectsPipeline {
         // the current instant so a host that renders without advancing first
         // still ignites this frame — the pre-queue behavior, zero-gap and all;
         // the honest spread needs an `advance` delta to spread across.
-        for _ in 0..self.pending_keys {
+        let pending_keys = self.pending_keys;
+        for _ in 0..pending_keys {
             self.typing_cadence.on_keystroke(now);
+            if live_viewport {
+                self.glow.note_typed_cells(now, 1);
+            }
+        }
+        if live_viewport {
+            self.trail.note_typed_batch(now, pending_keys);
         }
         self.pending_keys = 0;
+
+        self.confirm_cursor_move_candidate(term, input, cur, now);
 
         // Why: native suppresses unfocused animation with a motion-policy
         // AMPLITUDE fold (app_render: `intensity *=` / `enabled &=`) that the web
@@ -1202,6 +1613,7 @@ impl EffectsPipeline {
         // DECSCUSR shape, matching the native GUI's shared override seam.
         input.cursor_fill_override = (self.glow_cfg.enabled
             && self.glow_cfg.intensity > 0.0
+            && cur.is_some()
             && matches!(self.glow_cfg.style, GlowStyle::Fire))
         .then(|| self.glow.forge_fill())
         .flatten();
@@ -1413,6 +1825,7 @@ impl EffectsPipeline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aterm_core::terminal::TerminalBuilder;
 
     const SYNTHWAVE: &str = include_str!("../assets/trail-packs/synthwave.toml");
 
@@ -1423,6 +1836,436 @@ mod tests {
             term.default_background()
         };
         input.default_bg = aterm_render::rgb_to_u32([color.r, color.g, color.b]);
+    }
+
+    /// Drive one simple, synchronously committed scalar through the embedded
+    /// host's exact post-delivery candidate seam. Visual/lifecycle tests use
+    /// this instead of the text-blind `note_keystroke` classifier so a claimed
+    /// live trail is non-vacuous under the universal admission gate.
+    fn commit_ascii(
+        pipeline: &mut EffectsPipeline,
+        term: &mut Terminal,
+        input: &mut RenderInput,
+        ch: &[u8],
+        dt_ms: f64,
+    ) -> u64 {
+        assert_eq!(ch.len(), 1, "fixture accepts one ASCII byte");
+        let expected = ExpectedCellSpan::from_cells([char::from(ch[0])])
+            .expect("ASCII scalar has one exact terminal cell");
+        assert!(
+            pipeline.note_committed_cells(term, input, expected),
+            "fixture must arm an exact post-delivery candidate"
+        );
+        term.process(ch);
+        pipeline.advance(dt_ms);
+        let (rows, cols) = (input.rows, input.cols);
+        term.cell_frame_into(input, rows, cols);
+        pipeline.apply(term, input, 10, 19)
+    }
+
+    fn validate_cursor_scroll_action(action: &str, event: i64, decision: ContentScrollDecision) {
+        let base = aterm_spec::derive::cursor_scroll_signal_model();
+        let model = aterm_spec::interp::with_consts(&base, &[]);
+        let source = model.init_state();
+        let mut projected = source.clone();
+        projected.insert("event", event);
+        match decision {
+            ContentScrollDecision::Translate(delta) => {
+                assert_eq!(delta, 2, "model fixture uses the exact two-row batch");
+                projected.insert("uniform_rows", i64::from(delta));
+                projected.insert("decision", 1);
+                projected.insert("survivor_y", 1);
+                projected.insert("proof_alive", 0);
+            }
+            ContentScrollDecision::Invalidate => {
+                projected.insert("epoch", 1);
+                projected.insert("decision", 2);
+                projected.insert("geometry_alive", 0);
+                projected.insert("proof_alive", 0);
+            }
+            other => panic!("model event must produce a host action, got {other:?}"),
+        }
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &base,
+            &[],
+            &source,
+            &projected,
+            Some(action),
+            "EffectsPipeline cumulative cursor-scroll decision",
+        );
+        assert!(admitted, "real pipeline decision rejected by model: {why}");
+
+        // Negative control: retaining the historical no-op decision is the
+        // stale-coordinate bug and must not validate for any motion event.
+        let mut stranded = projected;
+        stranded.insert("decision", 0);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base,
+            &[],
+            &source,
+            &stranded,
+            Some(action),
+            "EffectsPipeline retained-count negative control",
+        );
+        assert!(
+            !admitted,
+            "a stranded no-op scroll decision must be rejected"
+        );
+    }
+
+    fn seed_pipeline_trail(
+        pipeline: &mut EffectsPipeline,
+        term: &mut Terminal,
+        row: u16,
+    ) -> (RenderInput, Vec<TrailCell>) {
+        pipeline.set_cursor_trail(true, 400, 24, None, 0x0050_FA7B);
+        term.process(format!("\x1b[{};2H", row + 1).as_bytes());
+        let mut input = term.cell_frame(5, 16);
+        pipeline.apply(term, &mut input, 10, 19); // silent scroll baseline + cursor seed
+        commit_ascii(pipeline, term, &mut input, b"x", 16.0);
+        assert!(
+            !input.cursor_trail.is_empty(),
+            "fixture must own live geometry"
+        );
+        let trail = input.cursor_trail.clone();
+        (input, trail)
+    }
+
+    fn validate_pipeline_layout_prepare(label: &str) {
+        let model = aterm_spec::derive::layout_coordinate_reset_model();
+        let charged = model.successors("Charge", &model.init_state())[0].clone();
+        let changed = model.successors("ChangeCoordinate", &charged)[0].clone();
+        let mut prepared = changed.clone();
+        prepared.insert("charged", 0);
+        prepared.insert("bound_coordinate", changed["coordinate"]);
+        prepared.insert("prepared", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &changed,
+            &prepared,
+            Some("Prepare"),
+            label,
+        );
+        assert!(ok, "real pipeline coordinate reset rejected: {why}");
+
+        let mut stale = prepared;
+        stale.insert("charged", 1);
+        stale.insert("bound_coordinate", charged["bound_coordinate"]);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &changed,
+            &stale,
+            Some("Prepare"),
+            "EffectsPipeline retained-coordinate negative control",
+        );
+        assert!(!ok, "a changed pipeline coordinate may not retain geometry");
+    }
+
+    #[test]
+    fn pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state() {
+        let mut term = TerminalBuilder::new()
+            .size(5, 16)
+            .ring_buffer_size(32)
+            .build();
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.8,
+            true,
+            0x0050_FA7B,
+        );
+        let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
+        assert!(pipeline.trail.is_active(), "fixture owns classic geometry");
+        assert!(pipeline.glow.is_active(), "fixture owns Glow geometry");
+
+        term.process(&b"history\r\n".repeat(12));
+        term.scroll_display(1);
+        term.cell_frame_into(&mut input, 5, 16);
+        assert!(input.display_offset > 0, "fixture extracted retained history");
+        assert!(
+            !input.cursor_visible,
+            "the exact frame snapshot centrally suppresses the DEC cursor"
+        );
+        // A deliberately stale raw bit still cannot bypass the pipeline's
+        // independent coordinate-class gate.
+        input.cursor_visible = true;
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            !pipeline.trail.is_active()
+                && !pipeline.glow.is_active()
+                && input.cursor_trail.is_empty()
+                && input.cursor_glow_add.is_empty()
+                && input.glow_halo.is_empty()
+                && input.fire_patch.is_empty()
+                && input.glow_under.is_empty()
+                && input.cursor_fill_override.is_none()
+                && !input.cursor_visible,
+            "history hard-clears every pipeline-owned cursor channel"
+        );
+
+        // Tier 1 for the pipeline-owned projection of the shared cursor
+        // viewport lifecycle. The GUI companion test binds the pet variables;
+        // this host binds Glow, classic trail, body/fill and DEC cursor.
+        let model = aterm_spec::derive::cursor_viewport_lifecycle_model();
+        let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
+        let mut history = charged.clone();
+        history.insert("live_viewport", 0);
+        history.insert("glow_visible", 0);
+        history.insert("trail_visible", 0);
+        history.insert("cursor_body_visible", 0);
+        history.insert("pet_visible", 0);
+        history.insert("base_cursor_visible", 0);
+        history.insert("pet_brain_ticked", 1);
+        history.insert("scheduler_stuck", 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &history,
+            Some("EnterHistory"),
+            "EffectsPipeline exact history snapshot",
+        );
+        assert!(ok, "pipeline history projection rejected: {why}");
+        let mut forged_fill = history;
+        forged_fill.insert("cursor_body_visible", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &forged_fill,
+            Some("EnterHistory"),
+            "EffectsPipeline forged-fill negative control",
+        );
+        assert!(!ok, "a forged cursor fill cannot survive history");
+    }
+
+    #[test]
+    fn pipeline_rows_metrics_and_chrome_changes_reset_seeded_geometry() {
+        for case in ["rows", "cell-metrics", "chrome-origin"] {
+            let mut term = Terminal::new(5, 16);
+            let mut pipeline = EffectsPipeline::new();
+            pipeline.set_cursor_glow(
+                true,
+                "lumen",
+                None,
+                None,
+                400,
+                24,
+                0.9,
+                0.8,
+                true,
+                0x0050_FA7B,
+            );
+            let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
+            assert!(
+                pipeline.trail.is_active() && pipeline.glow.is_active(),
+                "{case}: fixture owns retained geometry"
+            );
+
+            let (cell_w, cell_h) = match case {
+                "rows" => {
+                    term.resize(6, 16);
+                    input = term.cell_frame(6, 16);
+                    (10, 19)
+                }
+                "cell-metrics" => (11, 20),
+                "chrome-origin" => {
+                    pipeline.set_chrome(3, 7);
+                    (10, 19)
+                }
+                _ => unreachable!(),
+            };
+            pipeline.apply(&mut term, &mut input, cell_w, cell_h);
+            assert!(
+                !pipeline.trail.is_active()
+                    && !pipeline.glow.is_active()
+                    && input.cursor_trail.is_empty()
+                    && input.cursor_glow_add.is_empty(),
+                "{case}: changed coordinate space retained a seeded survivor"
+            );
+            validate_pipeline_layout_prepare(case);
+        }
+    }
+
+    #[test]
+    fn pipeline_translates_real_zero_and_saturated_scrollback_exactly() {
+        for cap in [0usize, 1] {
+            let mut term = TerminalBuilder::new()
+                .size(5, 16)
+                .ring_buffer_size(cap)
+                .build();
+            if cap == 1 {
+                term.process(b"\x1b[5;1H\n");
+                assert_eq!(term.grid().scrollback_lines(), 1);
+            }
+            let mut pipeline = EffectsPipeline::new();
+            let (mut input, before_trail) = seed_pipeline_trail(&mut pipeline, &mut term, 3);
+            let before_signal = term.content_scroll_state();
+
+            // Move the terminal cursor to the bottom only inside this parser
+            // batch, scroll twice, then leave it exactly where the translated
+            // effect anchor lands. The cumulative signal must still classify
+            // this as an exact translation, but the same parser generation is
+            // unowned and therefore retires the resident visual afterward.
+            term.process(b"\x1b[5;1H\n\n\x1b[2;3H");
+            let after_signal = term.content_scroll_state();
+            assert_eq!(
+                content_scroll_decision(Some(before_signal), after_signal),
+                ContentScrollDecision::Translate(2)
+            );
+            assert_eq!(term.grid().scrollback_lines(), cap);
+
+            term.cell_frame_into(&mut input, 5, 16);
+            pipeline.apply(&mut term, &mut input, 10, 19);
+            assert!(!before_trail.is_empty(), "cap={cap}: fixture must be charged");
+            assert!(
+                input.cursor_trail.is_empty() && !pipeline.trail.is_active(),
+                "cap={cap}: unowned parser generation retained translated geometry"
+            );
+
+            if cap == 0 {
+                validate_cursor_scroll_action(
+                    "UniformAtCap",
+                    1,
+                    ContentScrollDecision::Translate(2),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_real_region_alt_reset_and_restore_invalidate_geometry() {
+        fn region_scroll(term: &mut Terminal) {
+            term.process(b"\x1b[2;4r\x1b[4;1H\n\x1b[r\x1b[3;3H");
+        }
+        fn alt_scroll(term: &mut Terminal) {
+            term.process(b"\x1b[5;1H\n\x1b[3;3H");
+        }
+        fn direct_reset(term: &mut Terminal) {
+            term.reset();
+        }
+        fn checkpoint_restore(term: &mut Terminal) {
+            let checkpoint = Terminal::new(5, 16).checkpoint();
+            term.restore_checkpoint(&checkpoint);
+        }
+
+        type ScrollMutationCase = (&'static str, i64, bool, fn(&mut Terminal));
+        let cases: [ScrollMutationCase; 4] = [
+            ("RegionInvalidation", 2, false, region_scroll),
+            ("AltInvalidation", 3, true, alt_scroll),
+            ("ResetInvalidation", 4, false, direct_reset),
+            ("RestoreInvalidation", 5, false, checkpoint_restore),
+        ];
+
+        for (action, event, enter_alt, mutate) in cases {
+            let mut term = Terminal::new(5, 16);
+            if enter_alt {
+                // Mode entry is a coordinate-space transition of its own. The
+                // case under test is a scroll wholly inside the alt screen.
+                term.process(b"\x1b[?1049h");
+            }
+            let mut pipeline = EffectsPipeline::new();
+            if enter_alt {
+                pipeline.set_cursor_glow(
+                    true,
+                    "lumen",
+                    None,
+                    None,
+                    400,
+                    24,
+                    0.7,
+                    0.6,
+                    true,
+                    0x0050_FA7B,
+                );
+            }
+            let (mut input, _) = seed_pipeline_trail(&mut pipeline, &mut term, 2);
+            let before = term.content_scroll_state();
+            mutate(&mut term);
+            let after = term.content_scroll_state();
+            let decision = content_scroll_decision(Some(before), after);
+            assert_eq!(decision, ContentScrollDecision::Invalidate, "{action}");
+            validate_cursor_scroll_action(action, event, decision);
+
+            term.cell_frame_into(&mut input, 5, 16);
+            pipeline.apply(&mut term, &mut input, 10, 19);
+            assert!(
+                input.cursor_trail.is_empty(),
+                "{action} retained stale cells"
+            );
+            assert!(!pipeline.trail.is_active(), "{action} retained trail state");
+
+            if enter_alt {
+                // Behavioral ordering bind: the invalidation above reset both
+                // engines' context to main. `apply` must restore ALT after the
+                // reset and before this typed same-row jump. With ALT + no
+                // repaint blink it is deliberate TUI motion and remains
+                // visible; if context is omitted/re-fed before reset, both
+                // engines misclassify it as a main-screen re-anchor and emit
+                // nothing.
+                let scripted = pipeline.now();
+                pipeline.glow.note_synthetic_typed(scripted, 1);
+                pipeline.trail.note_synthetic_typed(scripted);
+                term.grid_mut().cursor_forward(6);
+                pipeline.advance(16.0);
+                term.cell_frame_into(&mut input, 5, 16);
+                pipeline.apply(&mut term, &mut input, 10, 19);
+                assert!(
+                    !input.cursor_trail.is_empty(),
+                    "alt context must survive invalidation for classic classification"
+                );
+                assert!(
+                    !input.cursor_glow_add.is_empty() || !input.glow_halo.is_empty(),
+                    "alt context must survive invalidation for glow classification"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_scroll_baseline_regressions_and_wide_deltas_fail_closed() {
+        let mut pipeline = EffectsPipeline::new();
+        let baseline = ContentScrollState {
+            uniform_up_rows: 10,
+            invalidation_epoch: 4,
+        };
+        assert_eq!(
+            pipeline.sync_content_scroll(baseline),
+            ContentScrollDecision::Baseline,
+            "a first observation is silent"
+        );
+        assert_eq!(
+            pipeline.sync_content_scroll(baseline),
+            ContentScrollDecision::Unchanged
+        );
+
+        for invalid in [
+            ContentScrollState {
+                uniform_up_rows: 9,
+                invalidation_epoch: 4,
+            },
+            ContentScrollState {
+                uniform_up_rows: 10,
+                invalidation_epoch: 3,
+            },
+            ContentScrollState {
+                uniform_up_rows: 10 + u64::from(u16::MAX) + 1,
+                invalidation_epoch: 4,
+            },
+        ] {
+            assert_eq!(
+                content_scroll_decision(Some(baseline), invalid),
+                ContentScrollDecision::Invalidate
+            );
+        }
     }
 
     #[test]
@@ -1656,11 +2499,10 @@ mod tests {
         // Drive a real frame: with the pack cleared and style Phaser, the glow
         // renders through the built-in path (non-empty on a hot typing run).
         let mut term = Terminal::new(6, 40);
+        let mut input = term.cell_frame(6, 40);
+        p.apply(&mut term, &mut input, 8, 16);
         for _ in 0..6 {
-            term.process(b"a");
-            p.advance(60.0);
-            let mut input = term.cell_frame(6, 40);
-            p.apply(&mut term, &mut input, 8, 16);
+            commit_ascii(&mut p, &mut term, &mut input, b"a", 60.0);
         }
         // The pack stays cleared across ticks (no resurrection of the custom path).
         assert!(
@@ -1787,16 +2629,15 @@ mod tests {
             0x00FF_8833,
         );
         let mut term = Terminal::new(12, 40);
+        let mut input = term.cell_frame(12, 40);
+        p.apply(&mut term, &mut input, cell_w, cell_h);
         let (mut any_patch, mut band_patch, mut any_companion) = (false, false, false);
         // Type on row 0 (the burn ignites on observed cursor motion), then let
         // the field churn a few frames — flames rise off the row toward the
         // chrome-relaxed clamp (fx_top = pad).
         for _ in 0..3 {
             for ch in [b"a", b"b", b"c", b"d"] {
-                term.process(ch);
-                p.advance(30.0);
-                let mut input = term.cell_frame(12, 40);
-                p.apply(&mut term, &mut input, cell_w, cell_h);
+                commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
                 any_patch |= !input.fire_patch.is_empty();
                 band_patch |= input.fire_patch.iter().any(|q| q.y < origin_y);
                 // The splice carries the burn's companion streams too (frames
@@ -1919,12 +2760,11 @@ mod tests {
             0x0050_FA7B,
         );
         let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
         let (mut lit, mut fp_focused) = (false, 0u64);
         for ch in [b"a", b"b", b"c"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            fp_focused = p.apply(&mut term, &mut input, 10, 19);
+            fp_focused = commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
             lit |= !input.cursor_glow_add.is_empty();
         }
         assert!(lit, "a focused pane emits cursor light");
@@ -1933,10 +2773,7 @@ mod tests {
         // Unfocused, still ticking, still MOVING: the gate must zero all of it.
         p.set_focused(false);
         for ch in [b"d", b"e", b"f"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            let fp = p.apply(&mut term, &mut input, 10, 19);
+            let fp = commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
             assert!(
                 input.cursor_glow_add.is_empty(),
                 "an unfocused pane emits no aurora"
@@ -1976,11 +2813,10 @@ mod tests {
             0x0050_FA7B,
         );
         let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
         for ch in [b"a", b"b", b"c"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            p.apply(&mut term, &mut input, 10, 19);
+            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
         }
         assert!(p.is_active(), "a live focused glow holds the engine active");
 
@@ -1994,6 +2830,128 @@ mod tests {
             !p.is_active(),
             "an idle unfocused pane settles so the shared rAF can drop it"
         );
+    }
+
+    #[test]
+    fn hidden_visibility_hard_drains_cursor_state_before_refocus_without_apply() {
+        let mut p = EffectsPipeline::new();
+        p.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            400,
+            24,
+            0.9,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        p.set_cursor_trail(true, 400, 24, None, 0x0050_FA7B);
+        let g = Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 20,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 160,
+            win_h: 96,
+            head: 0,
+        };
+        let now = Instant::now();
+        p.glow
+            .tick(Some((2, 2)), now, &p.glow_cfg, g, &mut p.glow_scratch);
+        p.trail.tick(
+            Some((2, 2)),
+            now,
+            &p.trail_cfg,
+            &mut p.trail_scratch,
+        );
+        let moved = now + Duration::from_millis(1);
+        p.glow.note_synthetic_move(moved);
+        p.trail.note_synthetic_move(moved);
+        p.glow.tick(
+            Some((2, 3)),
+            moved,
+            &p.glow_cfg,
+            g,
+            &mut p.glow_scratch,
+        );
+        p.trail.tick(
+            Some((2, 3)),
+            moved,
+            &p.trail_cfg,
+            &mut p.trail_scratch,
+        );
+        assert!(p.glow.is_active() && p.trail.is_active());
+
+        let pending = moved + Duration::from_millis(1);
+        p.note_keystroke();
+        p.glow.note_synthetic_move(pending);
+        p.trail.note_synthetic_move(pending);
+        assert!(p.glow.move_candidate_pending() && p.trail.move_candidate_pending());
+        p.set_effects_visibility("hidden");
+        assert!(!p.glow.is_active() && !p.trail.is_active());
+        assert!(!p.glow.move_candidate_pending() && !p.trail.move_candidate_pending());
+        assert!(p.glow_scratch.is_empty() && p.trail_scratch.is_empty());
+        assert_eq!(p.pending_keys, 0, "hidden drops queued cursor-key replay");
+        assert_eq!(p.typing_cadence.sample(pending), (0.0, 0.0));
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut before_hidden = model.init_state();
+        assert!(model.fire("NextHost", &mut before_hidden));
+        assert!(model.fire("ChargeResident", &mut before_hidden));
+        assert!(model.fire("ArmSynthetic", &mut before_hidden));
+        let mut after_hidden = before_hidden.clone();
+        assert!(model.fire("HiddenBoundary", &mut after_hidden));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before_hidden,
+            &after_hidden,
+            Some("HiddenBoundary"),
+            "EffectsPipeline hidden cursor hard drain",
+        );
+        assert!(ok, "pipeline hidden boundary rejected: {why}");
+        let mut forged = after_hidden;
+        forged.insert("resident_charged", 1);
+        forged.insert("phase", 2);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before_hidden,
+            &forged,
+            Some("HiddenBoundary"),
+            "forged hidden resident/candidate retention",
+        );
+        assert!(!ok, "hidden pipeline state cannot retain cursor provenance");
+
+        // No hidden-frame apply occurred. Refocus alone must not resurrect the
+        // same-generation resident geometry or pending proof; the first sample
+        // only seeds the new coordinate owner.
+        p.set_effects_visibility("focused");
+        let refocused = pending + Duration::from_millis(1);
+        assert_eq!(
+            p.glow.tick(
+                Some((2, 3)),
+                refocused,
+                &p.glow_cfg,
+                g,
+                &mut p.glow_scratch,
+            ),
+            0
+        );
+        assert_eq!(
+            p.trail.tick(
+                Some((2, 3)),
+                refocused,
+                &p.trail_cfg,
+                &mut p.trail_scratch,
+            ),
+            0
+        );
+        assert!(p.glow_scratch.is_empty() && p.trail_scratch.is_empty());
     }
 
     /// Refocus must not fire a comet across the ground the cursor covered while
@@ -2030,6 +2988,394 @@ mod tests {
         );
     }
 
+    /// The embedded/web host contract mirrors native input provenance: an rAF
+    /// batch of typed keys admits exactly its coalesced cursor sweep, while a
+    /// cursor relocation caused only by PTY/program output stays dark.
+    #[test]
+    fn pipeline_text_blind_keys_and_cold_program_motion_stay_dark() {
+        let mut typed = EffectsPipeline::new();
+        typed.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
+        let mut typed_term = Terminal::new(6, 20);
+        let mut typed_input = typed_term.cell_frame(6, 20);
+        typed.apply(&mut typed_term, &mut typed_input, 10, 19); // seed cursor
+
+        for _ in 0..4 {
+            typed.note_keystroke();
+            typed_term.process(b"x");
+        }
+        typed.advance(16.0);
+        typed_term.cell_frame_into(&mut typed_input, 6, 20);
+        typed.apply(&mut typed_term, &mut typed_input, 10, 19);
+        assert!(
+            typed_input.cursor_trail.is_empty(),
+            "text-blind rAF keys have no exact committed-content witness"
+        );
+
+        let mut witnessed = EffectsPipeline::new();
+        witnessed.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
+        let mut witnessed_term = Terminal::new(6, 20);
+        let mut witnessed_input = witnessed_term.cell_frame(6, 20);
+        witnessed.apply(&mut witnessed_term, &mut witnessed_input, 10, 19);
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        assert!(witnessed.note_committed_cells(
+            &mut witnessed_term,
+            &witnessed_input,
+            expected,
+        ));
+        witnessed_term.process(b"x");
+        witnessed_term.cell_frame_into(&mut witnessed_input, 6, 20);
+        witnessed.apply(&mut witnessed_term, &mut witnessed_input, 10, 19);
+        assert!(
+            !witnessed_input.cursor_trail.is_empty(),
+            "exact committed content admits one classic comet"
+        );
+
+        let mut cold = EffectsPipeline::new();
+        cold.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
+        let mut cold_term = Terminal::new(6, 20);
+        let mut cold_input = cold_term.cell_frame(6, 20);
+        cold.apply(&mut cold_term, &mut cold_input, 10, 19); // seed cursor
+        cold_term.process(b"\x1b[1;5H");
+        cold.advance(16.0);
+        cold_term.cell_frame_into(&mut cold_input, 6, 20);
+        cold.apply(&mut cold_term, &mut cold_input, 10, 19);
+        assert!(
+            cold_input.cursor_trail.is_empty(),
+            "unwitnessed program CUP movement cannot mint a classic comet"
+        );
+        assert!(!cold.trail.is_active());
+    }
+
+    #[test]
+    fn pipeline_overlap_declines_second_then_fresh_third_arms_both() {
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            560,
+            48,
+            1.0,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        pipeline.set_cursor_trail(true, 560, 48, None, 0x0050_FA7B);
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        assert_eq!(pipeline.apply(&mut term, &mut input, 10, 19), 0);
+
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        assert!(pipeline.note_committed_cells(&mut term, &input, expected));
+        assert!(
+            pipeline.glow.move_candidate_pending()
+                && pipeline.trail.move_candidate_pending(),
+            "the first exact commit arms both engines"
+        );
+
+        assert!(
+            !pipeline.note_committed_cells(&mut term, &input, expected),
+            "an overlapping second commit must fail closed"
+        );
+        assert!(
+            !pipeline.glow.move_candidate_pending()
+                && !pipeline.trail.move_candidate_pending(),
+            "the overlap retires both halves of the ambiguous cohort"
+        );
+
+        let third_accepted = pipeline.note_committed_cells(&mut term, &input, expected);
+        let both_pending = pipeline.glow.move_candidate_pending()
+            && pipeline.trail.move_candidate_pending();
+        assert_eq!(
+            third_accepted, both_pending,
+            "the pipeline may report success only for a real dual-engine arm"
+        );
+        assert!(third_accepted, "a fresh third commit arms after the declined overlap");
+
+        term.process(b"x");
+        term.cell_frame_into(&mut input, 6, 20);
+        let fp = pipeline.apply(&mut term, &mut input, 10, 19);
+        assert_ne!(fp, 0, "the exact next-generation move changes the frame");
+        assert!(
+            !input.cursor_glow_add.is_empty(),
+            "the glow engine consumes the fresh exact candidate"
+        );
+        assert!(
+            !input.cursor_trail.is_empty(),
+            "the classic trail consumes the same fresh exact candidate"
+        );
+    }
+
+    /// The web pipeline must feed the same positive typed provenance into the
+    /// Rainbow Kitty engine that it feeds into the classic trail. Four keys
+    /// observed as one rAF cursor sweep spend four bounded cell credits; the
+    /// identical program-authored CUP without those credits remains dark.
+    #[test]
+    fn pipeline_exact_delayed_ascii_and_cjk_light_but_text_blind_and_cup_stay_dark() {
+        let configure = |pipeline: &mut EffectsPipeline| {
+            pipeline.set_cursor_glow(
+                true,
+                "rainbow kitty",
+                None,
+                None,
+                560,
+                48,
+                1.0,
+                0.9,
+                true,
+                0x0050_FA7B,
+            );
+            pipeline.set_cursor_trail(true, 560, 48, None, 0x0050_FA7B);
+        };
+
+        let mut typed = EffectsPipeline::new();
+        configure(&mut typed);
+        let mut typed_term = Terminal::new(6, 20);
+        let mut typed_input = typed_term.cell_frame(6, 20);
+        assert_eq!(typed.apply(&mut typed_term, &mut typed_input, 10, 19), 0);
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let candidate_model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut model_source = candidate_model.init_state();
+        assert!(candidate_model.fire("NextStyle", &mut model_source));
+        assert!(candidate_model.fire("NextStyle", &mut model_source));
+        assert!(candidate_model.fire("NextHost", &mut model_source));
+        assert_eq!(model_source["style"], 2, "Rainbow Kitty selector");
+        assert_eq!(model_source["host"], 1, "embedded pipeline selector");
+        let mut model_captured = model_source.clone();
+        assert!(candidate_model.fire("ArmTyped", &mut model_captured));
+        assert!(typed.note_committed_cells(&mut typed_term, &typed_input, expected));
+        let mut model_armed = model_captured.clone();
+        assert!(candidate_model.fire("DeliverStable", &mut model_armed));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &candidate_model,
+            &[],
+            &model_captured,
+            &model_armed,
+            Some("DeliverStable"),
+            "EffectsPipeline certified post-delivery candidate",
+        );
+        assert!(ok, "pipeline delivery projection rejected: {why}");
+        // An unchanged present before the delayed echo must keep the proof, not
+        // consume it or manufacture light.
+        typed.apply(&mut typed_term, &mut typed_input, 10, 19);
+        assert!(typed_input.cursor_glow_add.is_empty());
+        typed_term.process(b"x");
+        typed.advance(16.0);
+        typed_term.cell_frame_into(&mut typed_input, 6, 20);
+        let typed_fp = typed.apply(&mut typed_term, &mut typed_input, 10, 19);
+        assert_ne!(typed_fp, 0, "an exact delayed ASCII echo must light");
+        assert!(
+            !typed_input.cursor_glow_add.is_empty() || !typed_input.glow_under.is_empty(),
+            "Rainbow Kitty must publish visible ribbon geometry"
+        );
+        assert!(
+            !typed_input.cursor_trail.is_empty(),
+            "the pipeline's classic engine consumes the same exact candidate"
+        );
+        let mut model_confirmed = model_armed.clone();
+        assert!(candidate_model.fire("ConfirmTypedNext", &mut model_confirmed));
+        let mut model_consumed = model_confirmed.clone();
+        assert!(candidate_model.fire("ObserveMove", &mut model_consumed));
+        let mut model_projected = model_consumed.clone();
+        assert!(candidate_model.fire("FinalExtractSame", &mut model_projected));
+        assert_eq!(model_projected["host"], 1);
+        assert_eq!(model_projected["projection"], 1);
+        for (from, to, action) in [
+            (&model_armed, &model_confirmed, "ConfirmTypedNext"),
+            (&model_confirmed, &model_consumed, "ObserveMove"),
+            (&model_consumed, &model_projected, "FinalExtractSame"),
+        ] {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &candidate_model,
+                &[],
+                from,
+                to,
+                Some(action),
+                "EffectsPipeline exact candidate",
+            );
+            assert!(ok, "pipeline {action} projection rejected: {why}");
+        }
+        let mut classic_source = model_source.clone();
+        assert!(candidate_model.fire("NextEngine", &mut classic_source));
+        let mut classic = classic_source.clone();
+        for action in [
+            "ArmTyped",
+            "DeliverStable",
+            "ConfirmTypedNext",
+            "ObserveMove",
+            "FinalExtractSame",
+        ] {
+            assert!(candidate_model.fire(action, &mut classic));
+        }
+        assert_eq!(classic["engine"], 1);
+        assert_eq!(classic["host"], 1);
+        assert_eq!(classic["projection"], 1);
+        let mut classic_armed = classic_source.clone();
+        assert!(candidate_model.fire("ArmTyped", &mut classic_armed));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &candidate_model,
+            &[],
+            &classic_source,
+            &classic_armed,
+            Some("ArmTyped"),
+            "EffectsPipeline classic candidate selector",
+        );
+        assert!(ok, "pipeline classic selector rejected: {why}");
+
+        // A text-blind key immediately supersedes an older exact candidate;
+        // the later matching content/move cannot borrow it.
+        let mut superseded = EffectsPipeline::new();
+        configure(&mut superseded);
+        let mut superseded_term = Terminal::new(6, 20);
+        let mut superseded_input = superseded_term.cell_frame(6, 20);
+        superseded.apply(&mut superseded_term, &mut superseded_input, 10, 19);
+        assert!(superseded.note_committed_cells(
+            &mut superseded_term,
+            &superseded_input,
+            expected,
+        ));
+        superseded.note_keystroke();
+        superseded_term.process(b"x");
+        superseded_term.cell_frame_into(&mut superseded_input, 6, 20);
+        superseded.apply(&mut superseded_term, &mut superseded_input, 10, 19);
+        assert!(superseded_input.cursor_glow_add.is_empty());
+        assert!(superseded_input.glow_under.is_empty());
+        let mut unsupported = model_armed.clone();
+        assert!(candidate_model.fire("UnsupportedInput", &mut unsupported));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &candidate_model,
+            &[],
+            &model_armed,
+            &unsupported,
+            Some("UnsupportedInput"),
+            "EffectsPipeline text-blind supersession",
+        );
+        assert!(ok, "pipeline text-blind supersession rejected: {why}");
+
+        let mut wide = EffectsPipeline::new();
+        configure(&mut wide);
+        let mut wide_term = Terminal::new(6, 20);
+        let mut wide_input = wide_term.cell_frame(6, 20);
+        wide.apply(&mut wide_term, &mut wide_input, 10, 19);
+        let cjk = ExpectedCellSpan::from_cells(['中', '\0']).unwrap();
+        assert!(wide.note_committed_cells(&mut wide_term, &wide_input, cjk));
+        wide_term.process("中".as_bytes());
+        wide_term.cell_frame_into(&mut wide_input, 6, 20);
+        wide.apply(&mut wide_term, &mut wide_input, 10, 19);
+        assert!(
+            !wide_input.cursor_glow_add.is_empty() || !wide_input.glow_under.is_empty(),
+            "simple width-two CJK exact evidence stays supported"
+        );
+
+        let mut cold = EffectsPipeline::new();
+        configure(&mut cold);
+        let mut cold_term = Terminal::new(6, 20);
+        let mut cold_input = cold_term.cell_frame(6, 20);
+        assert_eq!(cold.apply(&mut cold_term, &mut cold_input, 10, 19), 0);
+        cold_term.process(b"\x1b[1;5H");
+        cold.advance(16.0);
+        cold_term.cell_frame_into(&mut cold_input, 6, 20);
+        let cold_fp = cold.apply(&mut cold_term, &mut cold_input, 10, 19);
+        assert_eq!(cold_fp, 0, "an unwitnessed CUP must not change the frame");
+        assert!(cold_input.cursor_glow_add.is_empty());
+        assert!(cold_input.glow_halo.is_empty());
+        assert!(cold_input.fire_patch.is_empty());
+        assert!(cold_input.glow_under.is_empty());
+        assert!(cold_input.char_fg.is_empty());
+        assert!(cold_input.fire_halo.is_empty());
+        assert!(cold_input.cursor_trail.is_empty());
+        assert!(
+            !cold.glow.is_active(),
+            "a cold CUP cannot arm delayed light"
+        );
+    }
+
+    #[test]
+    fn pipeline_generation_fence_retires_same_cursor_rewrite_but_not_same_generation_decay() {
+        let mut pipeline = EffectsPipeline::new();
+        pipeline.set_cursor_glow(
+            true,
+            "lumen",
+            None,
+            None,
+            560,
+            48,
+            1.0,
+            0.9,
+            true,
+            0x0050_FA7B,
+        );
+        pipeline.set_cursor_trail(true, 400, 24, None, 0x0050_FA7B);
+        let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        assert!(pipeline.note_committed_cells(&mut term, &input, expected));
+        term.process(b"x");
+        term.cell_frame_into(&mut input, 6, 20);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(!input.cursor_glow_add.is_empty());
+        assert!(!input.cursor_trail.is_empty());
+
+        pipeline.advance(16.0);
+        term.cell_frame_into(&mut input, 6, 20);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(
+            !input.cursor_glow_add.is_empty() && !input.cursor_trail.is_empty(),
+            "same-generation animation retains its resident trail"
+        );
+
+        // A parser batch can change title/status or rewrite another row while
+        // leaving this cursor and its row untouched. No authored candidate
+        // owns that generation, so old light is retired before projection.
+        let cursor_before = term.cursor();
+        term.process(b"\x1b]0;status rewrite\x07");
+        assert_eq!(term.cursor(), cursor_before);
+        term.cell_frame_into(&mut input, 6, 20);
+        pipeline.apply(&mut term, &mut input, 10, 19);
+        assert!(input.cursor_glow_add.is_empty());
+        assert!(input.glow_halo.is_empty());
+        assert!(input.fire_patch.is_empty());
+        assert!(input.glow_under.is_empty());
+        assert!(input.char_fg.is_empty());
+        assert!(input.fire_halo.is_empty());
+        assert!(input.cursor_trail.is_empty());
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut pipeline_host = source.clone();
+        assert!(model.fire("NextHost", &mut pipeline_host));
+        let mut charged = pipeline_host.clone();
+        assert!(model.fire("ChargeResident", &mut charged));
+        let mut projected = charged.clone();
+        assert!(model.fire("FinalExtractSame", &mut projected));
+        let mut rewritten = projected.clone();
+        assert!(model.fire("UnownedContentRewrite", &mut rewritten));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &projected,
+            &rewritten,
+            Some("UnownedContentRewrite"),
+            "EffectsPipeline same-cursor content rewrite",
+        );
+        assert!(ok, "pipeline resident rewrite projection rejected: {why}");
+        let mut forged = rewritten;
+        forged.insert("resident_charged", 1);
+        forged.insert("resident_projection", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &projected,
+            &forged,
+            Some("UnownedContentRewrite"),
+            "forged EffectsPipeline resident retention",
+        );
+        assert!(!ok, "pipeline rewrite cannot keep resident cursor light");
+    }
+
     /// The trail's gated branch is a hard clear (native does the identical
     /// `enabled &=`), but the trail COLOUR is a config value, not animation —
     /// it must keep being published so an unfocused frame carries a defined
@@ -2040,12 +3386,11 @@ mod tests {
         let mut p = EffectsPipeline::new();
         p.set_cursor_trail(true, 260, 24, None, 0x0050_FA7B);
         let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
         let mut swept = false;
         for ch in [b"a", b"b", b"c"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            p.apply(&mut term, &mut input, 10, 19);
+            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
             swept |= !input.cursor_trail.is_empty();
         }
         assert!(swept, "a focused pane sweeps a comet");
@@ -2057,7 +3402,7 @@ mod tests {
         // stale value from the focused run.
         p.set_focused(false);
         p.advance(30.0);
-        let mut input = term.cell_frame(6, 20);
+        term.cell_frame_into(&mut input, 6, 20);
         p.apply(&mut term, &mut input, 10, 19);
         assert!(
             input.cursor_trail.is_empty(),
@@ -2075,7 +3420,7 @@ mod tests {
         // Once the cadence goes cold `ignite` leaves the colour untouched, so
         // the published value is exactly the configured one.
         p.advance(1000.0);
-        let mut input = term.cell_frame(6, 20);
+        term.cell_frame_into(&mut input, 6, 20);
         p.apply(&mut term, &mut input, 10, 19);
         assert_eq!(
             input.cursor_trail_color, 0x0050_FA7B,
@@ -2147,12 +3492,11 @@ mod tests {
         );
         let configured = p.glow_cfg.intensity;
         let mut term = Terminal::new(6, 20);
+        let mut input = term.cell_frame(6, 20);
+        p.apply(&mut term, &mut input, 10, 19);
         p.set_focused(false);
         for ch in [b"a", b"b", b"c"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            p.apply(&mut term, &mut input, 10, 19);
+            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
         }
         assert_eq!(
             p.glow_cfg.intensity, configured,
@@ -2163,10 +3507,7 @@ mod tests {
         p.set_focused(true);
         let mut relit = false;
         for ch in [b"d", b"e", b"f"] {
-            term.process(ch);
-            p.advance(30.0);
-            let mut input = term.cell_frame(6, 20);
-            p.apply(&mut term, &mut input, 10, 19);
+            commit_ascii(&mut p, &mut term, &mut input, ch, 30.0);
             relit |= !input.cursor_glow_add.is_empty();
         }
         assert!(relit, "refocus restores the light");
@@ -2528,6 +3869,7 @@ mod tests {
             bg: [(bg >> 16) as u8, (bg >> 8) as u8, bg as u8],
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,
@@ -2641,8 +3983,13 @@ mod tests {
             .tick(Some((4, 4)), now, &p.trail_cfg, &mut p.trail_scratch);
         p.advance(1.0);
         let now = p.now();
+        p.trail.note_synthetic_move(now);
         p.trail
             .tick(Some((4, 8)), now, &p.trail_cfg, &mut p.trail_scratch);
+        assert!(
+            !p.trail_scratch.is_empty(),
+            "the synthetic motion arm must make the deadline control non-vacuous"
+        );
         assert!(p.is_active());
         assert_eq!(
             p.next_deadline_ms(),

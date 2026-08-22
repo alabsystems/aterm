@@ -2860,6 +2860,19 @@ mod tests {
         }
     }
 
+    /// The chord that opens the editor's INCREMENTAL SEARCH on THIS platform:
+    /// `C-s` everywhere except Windows, where `C-s` is Save (audit I9 — the
+    /// reflex every Windows app owes its user) and isearch answers to `M-s`.
+    /// One helper so a test about the search MINIBUFFER never has to know which.
+    fn isearch_key() -> InputEvent {
+        let mods = if cfg!(windows) {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL
+        };
+        key(Key::Character('s'), mods)
+    }
+
     fn drive_native(app: &mut App, event: InputEvent) {
         assert!(app.native_input_event(WindowId(0), &event));
     }
@@ -4767,7 +4780,7 @@ mod tests {
             );
 
             if suffix == "escape" {
-                drive_native(&mut app, key(Key::Character('s'), Modifiers::CTRL));
+                drive_native(&mut app, isearch_key());
                 assert!(matches!(
                     &editor_buffer(&app, view).minibuffer,
                     Minibuffer::Search { .. }
@@ -6337,7 +6350,7 @@ mod tests {
         let document = app.native_runtime.document_id(instance).unwrap();
         let original = app.document_store.snapshot(document).unwrap();
 
-        drive_native(&mut app, key(Key::Character('s'), Modifiers::CTRL));
+        drive_native(&mut app, isearch_key());
         drive_native(&mut app, InputEvent::Text("needle".to_string()));
         let searched = app.document_store.snapshot(document).unwrap();
         assert_eq!(searched.seq, original.seq);

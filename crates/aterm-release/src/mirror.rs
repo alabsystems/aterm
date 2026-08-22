@@ -37,8 +37,9 @@
 //! ## What is deliberately NOT mirrored
 //!
 //! Exactly the client-required set plus the human-required `.sha256` sidecars
-//! crosses over: the manifest, the DMG, the updater zip, both containers'
-//! sidecars, and the detached signature when the cut is signed. The provenance
+//! crosses over: the manifest, the DMG (the per-arch pair, when the manifest
+//! names an Intel DMG), the updater zip, every container's sidecar, and the
+//! detached signature when the cut is signed. The provenance
 //! text and the dSYM archive stay private — they are debugging aids for the owner,
 //! the client never reads them, and a public channel should carry the smallest
 //! surface that still satisfies the updater. Keeping the set exact also makes
@@ -195,12 +196,30 @@ pub fn dmg_asset_name(version: &str) -> String {
     format!("aterm-{version}.dmg")
 }
 
+/// The INTEL batteries-included DMG for a release version — the same signed,
+/// notarized universal app with the toolchain seed filtered to
+/// `x86_64-apple-darwin` artifacts. ADDITIVE beside [`dmg_asset_name`]: the
+/// bare `aterm-<version>.dmg` spelling stays the canonical (arm64-seeded)
+/// asset because the deployed fleet binds that exact name
+/// (`aterm-update/src/github.rs` `authoritative_dmg_index`, `install.sh`'s
+/// identity bind) — renaming it would 404 or refuse every installed client,
+/// which is why the split is spelled "bare = arm64, suffixed = x86_64" and
+/// never a symmetric `-arm64`/`-x86_64` pair.
+#[must_use]
+pub fn dmg_x86_64_asset_name(version: &str) -> String {
+    format!("aterm-{version}-x86_64.dmg")
+}
+
 /// The stable, version-independent twin of the DMG every release also carries,
 /// so `releases/latest/download/aterm.dmg` is a permanent direct-download URL
 /// (the alab.systems Download button points at it). Byte-identical to the
-/// [`dmg_asset_name`] asset of the same cut. NO client elects this name:
-/// install.sh and the in-app updater bind to the manifest's version-bound
-/// `dmg` field, so the twin exists purely for the browser download lane.
+/// [`dmg_asset_name`] asset of the same cut — which, on a per-arch-DMG release,
+/// is the CANONICAL (arm64-seeded) DMG: the twin serves the majority-arch
+/// download so the site button and every printed/bookmarked
+/// `releases/latest/download/aterm.dmg` link keeps working unchanged. NO client
+/// elects this name: install.sh and the in-app updater bind to the manifest's
+/// version-bound `dmg` field, so the twin exists purely for the browser
+/// download lane.
 #[must_use]
 pub fn stable_dmg_asset_name() -> String {
     "aterm.dmg".to_string()
@@ -256,8 +275,16 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// the exact failure this module exists to prevent, one tier along. It stays
 /// conditional because with an unpinned master no client ever looks for them, and
 /// the mirrored set must not change by one byte while that is true.
+///
+/// `x86_dmg` adds the Intel DMG and its `.sha256` sidecar. It is a parameter,
+/// not unconditional, for the zip's inverse reason: the pair exists exactly when
+/// the cut's manifest names one (`dmg_x86_64`), and every caller derives the
+/// flag FROM the manifest — so a manifest that names the asset while the channel
+/// lacks it fails this exact-set check, and a channel carrying one the manifest
+/// never named fails it too (an asset no manifest names is an asset no install
+/// can verify a digest for).
 #[must_use]
-pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<String> {
+pub fn required_asset_names(version: &str, signed: bool, rostered: bool, x86_dmg: bool) -> Vec<String> {
     let mut names = vec![
         manifest_out::MANIFEST_ASSET.to_string(),
         dmg_asset_name(version),
@@ -266,6 +293,10 @@ pub fn required_asset_names(version: &str, signed: bool, rostered: bool) -> Vec<
         sha256_sidecar_name(&dmg_asset_name(version)),
         sha256_sidecar_name(&zip_asset_name(version)),
     ];
+    if x86_dmg {
+        names.push(dmg_x86_64_asset_name(version));
+        names.push(sha256_sidecar_name(&dmg_x86_64_asset_name(version)));
+    }
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());
     }
@@ -289,8 +320,9 @@ pub fn validate_mirror_asset_set(
     version: &str,
     signed: bool,
     rostered: bool,
+    x86_dmg: bool,
 ) -> Result<()> {
-    let required = required_asset_names(version, signed, rostered);
+    let required = required_asset_names(version, signed, rostered, x86_dmg);
     let mut observed: Vec<String> = names.to_vec();
     observed.sort();
     if observed == required {
@@ -355,6 +387,38 @@ mod tests {
     use super::*;
 
     const REAL_MANIFEST: &str = include_str!("../../../Cargo.toml");
+
+    /// PINS THE PER-ARCH DMG NAME SHAPES AND SET MEMBERSHIP. The bare
+    /// `aterm-<v>.dmg` spelling is fleet-load-bearing (the deployed updater and
+    /// install.sh bind it exactly), so the split MUST be "bare = arm64,
+    /// `-x86_64` suffix = Intel" — a symmetric rename would 404 every installed
+    /// client. The x86 pair (DMG + sidecar) joins the required set exactly when
+    /// the flag says the manifest names one, and never otherwise: the mirrored
+    /// byte set of an x86-less cut must not change by one name.
+    #[test]
+    fn per_arch_dmg_names_and_required_set_membership() {
+        assert_eq!(dmg_asset_name("0.47.0"), "aterm-0.47.0.dmg");
+        assert_eq!(dmg_x86_64_asset_name("0.47.0"), "aterm-0.47.0-x86_64.dmg");
+        assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
+
+        let without = required_asset_names("0.47.0", true, false, false);
+        assert!(!without.iter().any(|n| n.contains("x86_64")), "{without:?}");
+
+        let with = required_asset_names("0.47.0", true, false, true);
+        assert!(with.contains(&"aterm-0.47.0-x86_64.dmg".to_string()), "{with:?}");
+        assert!(
+            with.contains(&"aterm-0.47.0-x86_64.dmg.sha256".to_string()),
+            "{with:?}"
+        );
+        // Exactly the pair, nothing else, joins the set.
+        let extra: Vec<&String> = with.iter().filter(|n| !without.contains(n)).collect();
+        assert_eq!(extra.len(), 2, "{extra:?}");
+
+        // The exact-set check inherits the flag in both directions.
+        validate_mirror_asset_set(&with, "0.47.0", true, false, true).expect("exact set");
+        assert!(validate_mirror_asset_set(&with, "0.47.0", true, false, false).is_err());
+        assert!(validate_mirror_asset_set(&without, "0.47.0", true, false, true).is_err());
+    }
 
     /// The drift this gate exists to stop, in its exact observed form: the tag
     /// `v0.6.0` came to rest on a public tree still carrying `0.5.0`.
@@ -549,7 +613,7 @@ update_channel = \"someone/else\"
         // stable download twin the website button points at + the two
         // `.sha256` sidecars a human verifies those containers with.
         assert_eq!(
-            required_asset_names("0.5.0", false, false),
+            required_asset_names("0.5.0", false, false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -561,7 +625,7 @@ update_channel = \"someone/else\"
         );
         // Signed (Tier SIG): a pinned client REFUSES a head with no .sig.
         assert_eq!(
-            required_asset_names("0.5.0", true, false),
+            required_asset_names("0.5.0", true, false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -605,7 +669,7 @@ update_channel = \"someone/else\"
             "aterm-0.5.0-mac.zip.sha256".to_string(),
             "aterm.dmg".to_string(),
         ];
-        validate_mirror_asset_set(&ok, "0.5.0", false, false).unwrap();
+        validate_mirror_asset_set(&ok, "0.5.0", false, false, false).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
             "aterm-0.5.0-mac.zip".to_string(),
@@ -615,7 +679,7 @@ update_channel = \"someone/else\"
             "aterm-0.5.0.dmg".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
-        validate_mirror_asset_set(&reordered, "0.5.0", false, false).unwrap();
+        validate_mirror_asset_set(&reordered, "0.5.0", false, false, false).unwrap();
 
         // Every way a plausible-looking mirror silently never updates:
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
@@ -761,7 +825,7 @@ update_channel = \"someone/else\"
         ];
         for (names, version, signed, needle) in cases {
             let names: Vec<String> = names.into_iter().map(str::to_string).collect();
-            let err = validate_mirror_asset_set(&names, version, signed, false)
+            let err = validate_mirror_asset_set(&names, version, signed, false, false)
                 .expect_err(&format!("{names:?} must be refused"));
             assert!(
                 err.to_string().contains(needle),

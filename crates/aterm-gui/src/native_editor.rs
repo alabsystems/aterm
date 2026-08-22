@@ -2373,6 +2373,49 @@ impl Keymap {
             map.bind(sequence, command)
                 .expect("built-in editor key sequence is valid");
         }
+        // WINDOWS: Ctrl+S SAVES (audit I9). This is not a preference — it is the
+        // one chord every Windows application, from Notepad to Visual Studio,
+        // has answered for thirty years, and the editor answering it with an
+        // INCREMENTAL SEARCH is the single most alarming thing the built-in
+        // editor did: the user hits ^S to protect their work and the buffer
+        // starts hunting for text instead. And Save had no single-stroke chord
+        // here at all — only the two-stroke `C-x C-s`, since the ⌘S arm in
+        // `app_native` tests SUPER, which off macOS is the WINDOWS key (Win+S
+        // opens Search) — so the reflex was not merely mismapped, it was
+        // unserved. `bind` on an already-bound chord REPLACES it, so this arm
+        // owns `C-s` on Windows.
+        //
+        // isearch keeps a chord rather than being exiled to `M-x`: `M-s` is
+        // emacs's own SEARCH-MAP prefix letter and is free in this keymap, so
+        // the alias contradicts no emacs muscle memory (nothing else answers
+        // M-s here) and Alt+S is unclaimed on a Windows window with no menu bar.
+        // Both strings are re-advertised platform-aware in `commands()`.
+        //
+        // REJECTED — a global `save` keybinding action (`ACTION_NAMES` +
+        // `PLATFORM_DEFAULT_PAIRS`), which is what the audit line literally
+        // asked for. `on_key` resolves the keybinding table BEFORE the terminal
+        // paths and dispatches unconditionally, so seeding `ctrl+s = "save"`
+        // would swallow ^S over the GRID too — killing XOFF/flow control and
+        // vim's `C-s` for every shell on Windows, a far worse defect than the
+        // one being fixed. A user-bindable-but-unseeded `save` fares no better:
+        // over a terminal the chord would be consumed and do nothing (a dead
+        // key), because the dispatch arm cannot fall through. The editor's own
+        // keymap is the only layer that is live exactly when an editor buffer
+        // is frontmost, which is exactly when "save" means anything.
+        //
+        // NOT gated to `not(macos)` like the arms above: macOS spells Save ⌘S
+        // and `C-s` is isearch there for the same emacs reason it is on Linux —
+        // and Linux/GTK editors (gedit, VS Code) do spell Save Ctrl+S, but this
+        // editor is emacs-shaped and the Linux wave has not asked for it. This
+        // is a `cfg(windows)` fix for a `cfg(windows)` reflex.
+        #[cfg(windows)]
+        for (sequence, command) in [
+            (&["C-s"][..], EditorCommand::Save),
+            (&["M-s"][..], EditorCommand::IncrementalSearch),
+        ] {
+            map.bind(sequence, command)
+                .expect("built-in editor key sequence is valid");
+        }
         map
     }
 
@@ -2474,6 +2517,47 @@ mod tests {
         let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
         assert_eq!(map.resolve(&[chord("C-left")]), KeyResolution::Unbound);
         assert_eq!(map.resolve(&[chord("C-right")]), KeyResolution::Unbound);
+    }
+
+    /// AUDIT I9, Windows: `C-s` SAVES — the reflex every Windows app owes its
+    /// user, and previously the one chord that did something alarming instead
+    /// (it started an incremental search). isearch keeps a chord at `M-s`, and
+    /// the emacs `C-x C-s` spelling still saves, so nothing was traded away.
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_s_saves_on_windows_and_isearch_keeps_a_chord() {
+        let map = Keymap::emacs();
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(
+            map.resolve(&[chord("C-s")]),
+            KeyResolution::Command(EditorCommand::Save),
+            "Ctrl+S must save, not search"
+        );
+        assert_eq!(
+            map.resolve(&[chord("M-s")]),
+            KeyResolution::Command(EditorCommand::IncrementalSearch),
+            "isearch keeps a chord of its own"
+        );
+        assert_eq!(
+            map.resolve(&[chord("C-x"), chord("C-s")]),
+            KeyResolution::Command(EditorCommand::Save),
+            "the emacs spelling is untouched"
+        );
+    }
+
+    /// …and OFF Windows the table is exactly what it always was: `C-s` is
+    /// isearch (emacs's own binding) and `M-s` is unbound. This is the fence
+    /// that keeps the Windows reflex from leaking onto macOS/Linux.
+    #[cfg(not(windows))]
+    #[test]
+    fn ctrl_s_stays_incremental_search_off_windows() {
+        let map = Keymap::emacs();
+        let chord = |s: &str| KeyChord::parse(s).expect("test chord parses");
+        assert_eq!(
+            map.resolve(&[chord("C-s")]),
+            KeyResolution::Command(EditorCommand::IncrementalSearch)
+        );
+        assert_eq!(map.resolve(&[chord("M-s")]), KeyResolution::Unbound);
     }
 
     /// The indexed line oracle must answer EXACTLY what the scanning one does —

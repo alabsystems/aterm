@@ -535,12 +535,23 @@ impl SessionTimeline {
     ///
     /// Double-ended so a caller that only wants the newest few can walk backwards
     /// instead of materializing the whole retained deque; the concrete iterator
-    /// (a filtered `VecDeque::iter`) already was, only the opaque type hid it.
+    /// (a `VecDeque::range`) is, and so was the filtered `iter` before it.
     /// `DoubleEndedIterator: Iterator`, so every existing caller is unaffected.
+    ///
+    /// SEEK, DON'T FILTER — the turn-ledger twin. `next_id` is bumped per record
+    /// and records are pushed to the BACK, so `id <= after` is monotone across
+    /// the deque and `partition_point` lands on the first event past the
+    /// watermark. The subscribe `events` digest calls this on every 250 ms
+    /// liveness tick per watched target purely to learn that nothing changed;
+    /// filtering made that O([`TIMELINE_CAP`]), seeking makes it
+    /// O(log n + matched). A watermark below the retained low-water still yields
+    /// everything (`partition_point` returns 0).
     pub fn since(&self, after: Option<u64>) -> impl DoubleEndedIterator<Item = &TimelineEvent> {
-        self.events
-            .iter()
-            .filter(move |e| after.is_none_or(|a| e.id > a))
+        let start = match after {
+            None => 0,
+            Some(a) => self.events.partition_point(|e| e.id <= a),
+        };
+        self.events.range(start..)
     }
 
     /// The highest recorded event id, or `None` when empty — the events digest
@@ -695,6 +706,59 @@ mod tests {
         // Timestamps never move backward (monotonic clock).
         let ts: Vec<u64> = tl.since(None).map(|e| e.t_ms).collect();
         assert!(ts.windows(2).all(|w| w[1] >= w[0]));
+    }
+
+    /// DIFFERENTIAL: the `partition_point` seek agrees with the linear filter it
+    /// replaced at EVERY watermark, including the two the events digest stands
+    /// on — below the retained low-water (yield everything) and at the high
+    /// (yield nothing). The timeline's ids ARE contiguous, so this fixture also
+    /// probes the boundaries either side of each retained id rather than only
+    /// the gaps a sparse ledger would have.
+    #[test]
+    fn since_seek_matches_the_linear_filter_for_every_watermark() {
+        let mut tl = SessionTimeline::default();
+        for _ in 0..(TIMELINE_CAP + 5) {
+            tl.record("state-change", "state=alive".to_string());
+        }
+        let low = tl.since(None).next().expect("non-empty").id;
+        let high = tl.high_id().expect("non-empty");
+        assert!(
+            low > 1,
+            "the fixture must have evicted, or the below-low arm is vacuous"
+        );
+
+        let reference = |after: Option<u64>| -> Vec<u64> {
+            tl.events
+                .iter()
+                .filter(|e| after.is_none_or(|a| e.id > a))
+                .map(|e| e.id)
+                .collect()
+        };
+        let observed = |after: Option<u64>| -> Vec<u64> { tl.since(after).map(|e| e.id).collect() };
+
+        let mut probes: Vec<Option<u64>> = vec![None, Some(0), Some(1)];
+        for id in [low - 1, low, low + 1, high - 1, high, high + 1, high + 100] {
+            probes.push(Some(id));
+        }
+        for after in probes {
+            assert_eq!(
+                observed(after),
+                reference(after),
+                "since({after:?}) diverged"
+            );
+        }
+        assert_eq!(
+            observed(Some(low - 1)).len(),
+            TIMELINE_CAP,
+            "below low-water = all retained"
+        );
+        assert!(
+            observed(Some(high)).is_empty(),
+            "at the high-water = nothing new"
+        );
+        // Still double-ended: the reverse walk the newest-few readers use.
+        let newest: Vec<u64> = tl.since(None).rev().take(3).map(|e| e.id).collect();
+        assert_eq!(newest, vec![high, high - 1, high - 2]);
     }
 
     #[test]

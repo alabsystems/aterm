@@ -1094,6 +1094,11 @@ pub struct RenderInput {
     /// it advances every damaged frame, so counting it would defeat the renderer's
     /// content-based damage cache.
     pub snapshot_seq: u64,
+    /// Terminal parser batch sequence coherent with this engine-filled
+    /// snapshot. Unlike the damage epoch it advances even when another batch
+    /// joins an already-pending damage session, so one-shot input evidence can
+    /// reject intervening output. Metadata only; excluded from equality.
+    pub process_sequence: u32,
     /// PRESENT-TIME latency hint: this frame is an immediate keystroke-echo that
     /// bypasses present coalescing (`input_hot`). The GPU present path uses it to
     /// DEFER the throwaway-copy present-time bloom halo — a whole-framebuffer copy +
@@ -1255,6 +1260,7 @@ impl Clone for RenderInput {
             default_fg: self.default_fg,
             cursor_color: self.cursor_color,
             snapshot_seq: self.snapshot_seq,
+            process_sequence: self.process_sequence,
             input_hot: self.input_hot,
             terminal_id: self.terminal_id,
             extract_gen: self.extract_gen,
@@ -1327,6 +1333,7 @@ impl Clone for RenderInput {
         self.default_fg = source.default_fg;
         self.cursor_color = source.cursor_color;
         self.snapshot_seq = source.snapshot_seq;
+        self.process_sequence = source.process_sequence;
         self.input_hot = source.input_hot;
         self.terminal_id = source.terminal_id;
         self.extract_gen = source.extract_gen;
@@ -1547,6 +1554,7 @@ impl RenderInput {
             default_fg: COLOR_UNSET,
             cursor_color: COLOR_UNSET,
             snapshot_seq: 0,
+            process_sequence: 0,
             input_hot: false,
             terminal_id: 0,
             extract_gen: 0,
@@ -1899,6 +1907,7 @@ impl RenderInput {
                 bg: seed.bg,
                 wide: false,
                 emoji_presentation: false,
+                text_presentation: false,
                 bold: false,
                 italic: false,
                 underline: crate::terminal::UnderlineStyle::Single,

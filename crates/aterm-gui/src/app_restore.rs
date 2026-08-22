@@ -635,6 +635,9 @@ impl App {
                 // rework — deferred; window-surface failure on an already-running app is
                 // exceptional.
                 eprintln!("aterm-gui: session restore: could not create a window; stopping here");
+                self.surface_gesture_failure(
+                    "✕ Restore stopped early — some saved tabs were not reopened",
+                );
                 // OVERLAP HANDOFF: a carried window is now LOST (and possibly
                 // its adopted shell with it). Withhold the readiness byte —
                 // the parked parent's timeout + rollback recovers EVERY shell
@@ -758,6 +761,9 @@ impl App {
                 }
                 Err(e) => {
                     eprintln!("aterm-gui: seamless: could not adopt an orphan shell: {e}");
+                    self.surface_gesture_failure(&format!(
+                        "✕ A live shell was lost across the update: {e}"
+                    ));
                 }
             }
         }
@@ -1942,6 +1948,9 @@ impl App {
                 }
                 Err(e) => {
                     eprintln!("aterm-gui: session restore: spawn failed: {e}");
+                    self.surface_gesture_failure(&format!(
+                        "✕ A restored tab could not start its shell: {e}"
+                    ));
                     return None; // drops `fresh` → clean hang-up of the partial tab
                 }
             }

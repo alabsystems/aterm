@@ -147,8 +147,24 @@ mod tests {
             }
         }
         let needle = "CARGO_PKG_VERSION";
+        // AUTHORIZED second readers, each with the reason it cannot go through
+        // APP_VERSION. A build script runs before its crate's dependencies are
+        // built, so it CANNOT link aterm-types — and `CARGO_PKG_VERSION_*` in
+        // a build script is the same workspace `version` cargo derives
+        // APP_VERSION's own inputs from (see this module's `app_version()`),
+        // read at the only time a build script can read anything. The
+        // allowlist is exact paths, so a NEW bypass still fails loudly.
+        let authorized: &[&str] = &[
+            // The Windows VS_VERSION_INFO resource embedder.
+            "crates/aterm/build.rs",
+        ];
         let offenders: Vec<_> = sources
             .into_iter()
+            .filter(|path| {
+                !authorized
+                    .iter()
+                    .any(|ok| path.ends_with(std::path::Path::new(ok)))
+            })
             .filter(|path| {
                 std::fs::read_to_string(path)
                     .expect("read shipped Rust source")

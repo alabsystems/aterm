@@ -11,7 +11,6 @@ fn rle_from_raw_runs(runs: Vec<Run<u8>>, total_length: u32) -> Rle<u8> {
     Rle {
         runs,
         total_length,
-        prefix_sums: Vec::new(),
     }
 }
 
@@ -118,7 +117,7 @@ fn rle_push_clamps_at_capacity() {
     }
 }
 
-/// Linear find_run fallback stays exact after clamped growth near capacity.
+/// Linear find_run stays exact after clamped growth near capacity.
 #[kani::proof]
 #[kani::unwind(4)]
 fn rle_linear_find_run_exact_after_clamp() {
@@ -141,9 +140,8 @@ fn rle_linear_find_run_exact_after_clamp() {
 
     let expected_second = l2.min(slack as u32);
 
-    // Force the linear fallback path instead of the cached binary search.
-    rle.prefix_sums.clear();
-
+    // `find_run` is the linear walk unconditionally (the prefix-sum index
+    // was deleted), so this path needs no cache to be cleared.
     kani::assert(
         rle.get(0) == Some(1),
         "first cell should stay in the first run",

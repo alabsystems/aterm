@@ -92,7 +92,7 @@ impl Terminal {
             shell_integration_auth: super::shell_integration_auth::ShellIntegrationAuth::new(),
             hyperlink_auth: super::hyperlink_auth::HyperlinkAuth::new(),
             dcs_auth: super::dcs_auth::DcsAuth::new(),
-            policy_engine: None,
+            policy: super::policy_gates::PolicyState::new(),
             damage_epoch: 0,
             damage_epoch_counted: false,
             extract_identity: EXTRACT_IDENTITY_SOURCE
@@ -107,6 +107,7 @@ impl Terminal {
             budgeted_search: None,
             absolute_row_revision: 0,
             repaint_blink_epoch: 0,
+            content_scroll_state: super::ContentScrollState::default(),
         };
 
         terminal.sync_bidi_resolver_from_config();

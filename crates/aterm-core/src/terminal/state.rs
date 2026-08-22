@@ -20,6 +20,37 @@ use crate::platform::FontDescriptor;
 use aterm_types::charset::CharacterSetState;
 use aterm_types::{KittyKeyboardState, Rgb, XtermKeyboardState};
 
+/// Cumulative, non-consuming summary of terminal content-coordinate motion.
+///
+/// Hosts keep a previous copy and diff it against a later snapshot. An advance
+/// in [`uniform_up_rows`](Self::uniform_up_rows) means the entire primary-screen
+/// viewport moved upward by that many rows. An advance in
+/// [`invalidation_epoch`](Self::invalidation_epoch) means at least one
+/// non-uniform or otherwise ambiguous mutation occurred, so cached coordinates
+/// must be discarded instead of translated.
+///
+/// Both counters are monotonic for the lifetime of a [`Terminal`], survive RIS
+/// and direct [`Terminal::reset`], and are intentionally not checkpointed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContentScrollState {
+    /// Total rows of composable, full-screen upward motion on the primary screen.
+    pub uniform_up_rows: u64,
+    /// Number of coordinate-invalidating content-motion batches observed.
+    pub invalidation_epoch: u64,
+}
+
+impl ContentScrollState {
+    #[inline]
+    pub(super) fn record_uniform_up(&mut self, rows: u64) {
+        self.uniform_up_rows = self.uniform_up_rows.saturating_add(rows);
+    }
+
+    #[inline]
+    pub(super) fn invalidate(&mut self) {
+        self.invalidation_epoch = self.invalidation_epoch.saturating_add(1);
+    }
+}
+
 /// Terminal emulator.
 ///
 /// Combines a [`Parser`] and a [`Grid`] to provide full terminal emulation.
@@ -207,16 +238,21 @@ pub struct Terminal {
     /// emission site wraps it in `Provenance<&[u8], Pty>` at the type
     /// level before erasing provenance at the FFI boundary.
     pub(super) dcs_auth: super::dcs_auth::DcsAuth,
-    /// OSC / escape-sequence policy engine (#7996, placeholder for #7994).
+    /// OSC / escape-sequence policy: the engine installed via
+    /// [`super::Terminal::apply_policy_engine`] **plus** the gate verdicts
+    /// compiled from it.
     ///
-    /// Currently a scaffold: stores the policy engine constructed from a
-    /// loaded TOML document via
-    /// [`super::Terminal::apply_policy_engine`]. The full wiring into
-    /// `TerminalHandler` dispatch lands in #7994 when capability modules
-    /// consult `policy_engine.evaluate(...)` instead of the legacy
-    /// `TerminalModes::allow_*` booleans. Defaults to `None` so existing
+    /// The pair is one field on purpose. Several capability gates consult a
+    /// probe that is a compile-time constant, so their verdict can only change
+    /// when the policy does; `PolicyState` resolves those once at install time
+    /// and keeps the table inseparable from the engine that produced it, so a
+    /// gate can never answer from a policy that is no longer installed. See
+    /// [`super::policy_gates`] for the equivalence and staleness arguments.
+    ///
+    /// Defaults to "no engine installed", where every gate defers to the legacy
+    /// `TerminalModes::allow_*` / per-capability `authorized` bits — existing
     /// callers see no behavioral change until they install an engine.
-    pub(super) policy_engine: Option<aterm_policy::engine::PolicyEngine>,
+    pub(super) policy: super::policy_gates::PolicyState,
     /// Monotonic damage epoch (D-1): bumped once per "damage session" — the
     /// first time [`Terminal::damage_epoch`] observes net-new grid damage after
     /// the previous [`Terminal::take_damage`]. A renderer that records the epoch
@@ -296,6 +332,13 @@ pub struct Terminal {
     /// [`Terminal::damage_epoch`]: never reset (monotonic across RIS), never
     /// checkpointed, never gates bytes.
     pub(super) repaint_blink_epoch: u64,
+    /// Read-only host projection of content-coordinate motion.
+    ///
+    /// Updated once at the terminal post-processing boundary from the grid's
+    /// precise selection-scroll signal. Unlike that take-and-clear signal,
+    /// these cumulative counters can be observed independently by multiple
+    /// renderers without one consumer starving another.
+    pub(super) content_scroll_state: ContentScrollState,
 }
 
 // Grouped sub-state structs extracted to grouped_state.rs (#1977).
@@ -439,6 +482,19 @@ impl Terminal {
     #[inline]
     pub fn content_seq(&self) -> u64 {
         self.grid.content_gen()
+    }
+
+    /// Return the cumulative, non-consuming content-scroll snapshot.
+    ///
+    /// Diff this copy against a previously observed value. If
+    /// [`ContentScrollState::invalidation_epoch`] changed, discard cached grid
+    /// coordinates. Otherwise the increase in
+    /// [`ContentScrollState::uniform_up_rows`] is an exact whole-screen upward
+    /// translation, independent of retained scrollback capacity.
+    #[must_use]
+    #[inline]
+    pub fn content_scroll_state(&self) -> ContentScrollState {
+        self.content_scroll_state
     }
 
     /// Revision for top-anchored protected-footer row insertions.

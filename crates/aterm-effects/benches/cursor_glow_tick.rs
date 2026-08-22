@@ -505,7 +505,7 @@ impl Fixture {
             if self.row as usize + 1 < self.geom.rows {
                 self.row += 1;
             } else {
-                self.glow.note_navigation(self.now);
+                self.glow.note_synthetic_move(self.now);
                 self.row = 0;
             }
         } else {
@@ -551,7 +551,7 @@ fn step(f: &mut Fixture, arm: Arm) -> u64 {
 /// `rainbow.ink_pops`), one glyph laid, the row probe fed.
 fn arm_typing(f: &mut Fixture) {
     f.now += f.dt;
-    f.glow.note_typed(f.now);
+    f.glow.note_synthetic_typed(f.now, 1);
     f.type_one();
     f.probe();
 }
@@ -581,9 +581,14 @@ fn arm_idle(f: &mut Fixture) {
 fn arm_jump(f: &mut Fixture) {
     f.now += f.dt;
     if f.n.is_multiple_of(JUMP_PERIOD) {
+        // This scripted jump represents deliberate word motion. The shipping
+        // engine now fails closed on unproven cursor deltas, so benchmark the
+        // authored ZOOM/starburst path with the same explicit provenance a
+        // real navigation dispatch supplies.
+        f.glow.note_synthetic_move(f.now);
         f.jump();
     } else {
-        f.glow.note_typed(f.now);
+        f.glow.note_synthetic_typed(f.now, 1);
         f.type_one();
     }
     f.probe();
@@ -928,11 +933,7 @@ fn verify_reaches_target(w: &Workload) -> (Fixture, Sampled) {
 
     match w.witness {
         Witness::Bounds => {}
-        Witness::DarkUnless {
-            what,
-            control,
-            arm,
-        } => {
+        Witness::DarkUnless { what, control, arm } => {
             assert_eq!(
                 s.peak.total(),
                 0,

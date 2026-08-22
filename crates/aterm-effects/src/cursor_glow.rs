@@ -33,6 +33,7 @@ use crate::effect_util::{
 };
 use crate::trail_sweep::{line_cells_tail, row_sweep_cells, wrap_fold_cells};
 use crate::typing_momentum::TypingMomentum;
+use crate::cursor_trail::{ContentGeneration, ExpectedCellSpan, ExpectedRowSnapshot};
 // Trail Packs — the user-generated custom trail params driven by `emit_custom`.
 // Re-exported here so the resolved `TrailParams` rides `GlowConfig` inline.
 pub use crate::trail_pack::TrailParams;
@@ -1862,9 +1863,8 @@ const RAINBOW_WAKE_SHOCK_MAX: usize = 6;
 /// negative column through `rem_euclid`, never a `u16` cast.
 #[inline]
 fn rainbow_wake_band_at(bands: &[u32; 6], colx: f32, phase: f32) -> (u32, f32) {
-    let t = rainbow_sweep_reflect(
-        colx * RAINBOW_WAKE_SWEEP_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW,
-    );
+    let t =
+        rainbow_sweep_reflect(colx * RAINBOW_WAKE_SWEEP_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW);
     let u = t * 5.0;
     let i = u.round();
     let frac = u - i; // signed distance to the nearest anchor centre, −0.5..0.5
@@ -2519,10 +2519,10 @@ struct Spark {
 }
 
 /// One FRESH-INK POP: a newly TYPED glyph cell mid-pop (see the FRESH-INK
-/// constants block). Born ONLY on a typed-hint-paired typing advance in
-/// [`CursorGlow::spawn`] — the hint arrives exclusively from the host's
-/// committed-press seam ([`CursorGlow::note_typed`]), so PTY output alone can
-/// never birth one. Killed instantly when a backspace-classified retreat
+/// constants block). Born ONLY on an exact content-confirmed typed candidate
+/// (or its explicit synthetic test twin) in [`CursorGlow::spawn`]. A committed
+/// press timestamp or PTY output alone can never birth one. Killed instantly
+/// when an exact Backspace retreat
 /// erases its cell; reborn (born reset) when its cell is typed again.
 #[derive(Clone, Copy)]
 struct InkPop {
@@ -2755,12 +2755,11 @@ struct RainbowState {
     tail: [Option<(u16, u16)>; 3],
     /// Rolling ring of the most recent COMMITTED presses as `(instant, CELL
     /// CREDITS)` ([`CursorGlow::note_typed_cells`]), newest overwrites oldest.
-    /// The press BUDGET behind two anti-stray gates (the owner: "a stray
-    /// piece of trail appear without text"): a multi-cell typed-coalesce must
-    /// be backed by at least as many recent CELL CREDITS as cells it sweeps,
-    /// and the terminus dissolve requires a press recent enough that the
-    /// ribbon is plausibly still VISIBLE (the eased momentum proxy outlives
-    /// the visible ribbon by seconds).
+    /// The UNSPENT press BUDGET behind the typed-coalesce anti-stray gate (the
+    /// owner: "a stray piece of trail appear without text"): a multi-cell
+    /// typed-coalesce must be backed by at least as many recent CELL CREDITS as
+    /// cells it sweeps. Recent-input visual rewards use the separate
+    /// [`Self::last_committed_type`] stamp and can never contribute cells here.
     ///
     /// CREDITS, not a count (2026-08-15, "the rainbow in typing still has
     /// some gaps"): one press of a WIDE glyph advances two columns and an IME
@@ -2777,6 +2776,11 @@ struct RainbowState {
     type_press_ring: [Option<(Instant, u8)>; CursorGlow::RAINBOW_TYPED_SWEEP_MAX],
     /// Next write slot in [`Self::type_press_ring`].
     type_press_head: usize,
+    /// Most recent committed-text input, independent of the UNSPENT admission
+    /// ledger above. Landing bursts and meteor debris ask only whether typing
+    /// was recently active; spending a move's cell credits must not erase that
+    /// visual reward. Never contributes cells to coalesced-move admission.
+    last_committed_type: Option<Instant>,
     /// Live rainbow kitty finger-lift RETRACT: `(started, ribbon cells at start)`. Set
     /// once the exit swoosh finishes REACHING four letters and begins draining
     /// the ribbon tail→head; cleared by the next typing key. While `Some`, the
@@ -2864,13 +2868,11 @@ struct RainbowState {
 }
 
 impl RainbowState {
-    /// Wipe the TRANSIENT half — the in-flight light and the position-bound
-    /// memory, unconditionally. THE teardown for transient rainbow kitty state, so a
-    /// light-bearing member added above is wiped by every transient teardown
-    /// for free. Deliberately untouched: the thermal spines (see
-    /// [`Self::clear_thermals`]), the press LEDGER, the per-tick momentum
-    /// pulse, and the resident scratch.
-    fn clear_transient(&mut self) {
+    /// Wipe only output-bearing / position-bearing rainbow geometry. Admission
+    /// credits and recent committed-typing activity are intentionally separate:
+    /// an exact next-generation candidate may clear the old ribbon and then
+    /// spend its proof to forge the new one in the same tick.
+    fn clear_visual_geometry(&mut self) {
         self.jumps.clear();
         self.bursts.clear();
         self.tail = [None; 3];
@@ -2879,11 +2881,12 @@ impl RainbowState {
         self.wake_head = None;
         self.wake_at = None;
         self.wake_fold_carry = None;
-        // The anti-stray PRESS WITNESS itself. Stale evidence must not let the
-        // first move after a master-off/on cycle celebrate on typing that
-        // happened before the effect was ever switched off.
+    }
+
+    fn clear_admission(&mut self) {
         self.type_press_ring = [None; CursorGlow::RAINBOW_TYPED_SWEEP_MAX];
         self.type_press_head = 0;
+        self.last_committed_type = None;
     }
 
     /// Zero the THERMAL half — the momentum metric, its eased display spine and
@@ -3217,6 +3220,24 @@ struct RowProbe {
     below: NbrProbe,
 }
 
+fn captured_probe_row<'a>(
+    meta: RowProbe,
+    own: &'a [char],
+    above: &'a [char],
+    below: &'a [char],
+    row: u16,
+) -> Option<&'a [char]> {
+    if row == meta.row {
+        Some(own)
+    } else if row.saturating_add(1) == meta.row && meta.above == NbrProbe::Probed {
+        Some(above)
+    } else if row == meta.row.saturating_add(1) && meta.below == NbrProbe::Probed {
+        Some(below)
+    } else {
+        None
+    }
+}
+
 /// What a [`Vapor`] puff IS — palette + growth curve family.
 ///
 /// `Steam`/`Smoke` are the FIRE style's thermal language (quench flash /
@@ -3457,43 +3478,40 @@ pub struct CursorGlow {
     /// Backspace QUENCH meter 0..1: each delete adds [`Self::QUENCH_GAIN`]
     /// (decaying on [`Self::QUENCH_TAU`]), damps the display temperature —
     /// deletion DOUSES the fire instead of feeding it — and escalates, so a
-    /// backspace RUN reads as a real quench. Fed by the host key hint
-    /// ([`Self::note_backspace`]); the paired echo move earns no heat.
+    /// backspace RUN reads as a real quench. Fed at the host key edge by
+    /// [`Self::note_backspace`]; only a later exact candidate may move visibly.
     quench: f32,
-    /// A fresh backspace key-hint ([`Self::note_backspace`]): the next observed
-    /// single-cell echo move is classified as a DELETION (no heat/coal gain)
-    /// and consumes it. Expires after [`Self::QUENCH_HINT_FRESH`].
+    /// A fresh backspace classifier ([`Self::note_backspace`]). It can classify
+    /// an already content-confirmed one-cell candidate as a DELETION (no
+    /// heat/coal gain), but never admits an observed move by itself. Expires
+    /// after [`Self::QUENCH_HINT_FRESH`].
     quench_hint: Option<Instant>,
-    /// A fresh NAVIGATION key-hint ([`Self::note_navigation`]): the paired
-    /// cursor move (Ctrl-A/E, Home/End, arrow keys, word/line motions) is
-    /// classified as NAVIGATION — it earns NO heat and, crucially for
-    /// responsiveness, spawns NO fire meteor and NEVER slams the arrival flare.
-    /// Navigating around a line is not writing, so it must not ignite a
-    /// full-width white-hot blaze. Expires after
-    /// [`Self::NAV_HINT_FRESH`]; unlike the quench hint it never cools heat/coal.
+    /// A fresh NAVIGATION classifier ([`Self::note_navigation`]). The timestamp
+    /// never admits a cursor delta; it only suppresses an older ambiguous class,
+    /// so Ctrl-A/E, Home/End, arrows and word motions cannot turn a later child
+    /// relocation into heat or light. Expires after [`Self::NAV_HINT_FRESH`];
+    /// unlike the quench hint it never cools heat/coal.
     nav_hint: Option<Instant>,
     /// A fresh TYPED-GLYPH key-hint ([`Self::note_typed`]): armed by the host on
     /// a PLAIN Character/Space echo key only — never Enter, Tab, navigation, or
     /// modified chords, whose jumps keep the owner-mandated meteors/ZOOMs.
-    /// Paired with a one-row cursor move whose delta EXCEEDS the typed advance,
-    /// it classifies the move as a TYPED RE-ANCHOR (see the wrap classifier in
-    /// `spawn`): a TUI that repaints its whole inset input box per keystroke
-    /// (Claude Code's Ink prompt) re-anchors the caret across the box on every
-    /// wrap, and the caret never travelled through the interpolated cells.
-    /// Expires after [`Self::TYPE_HINT_FRESH`]; consumed by the paired move
-    /// (one hint = one echo, so the state stays bounded).
+    /// Once [`Self::note_typed_expected`] has supplied and confirmed the exact
+    /// content/target candidate, this hint classifies a one-row delta beyond the
+    /// typed advance as a TYPED RE-ANCHOR (see `spawn`): a TUI that repaints its
+    /// inset input box per keystroke can relocate the caret without sweeping the
+    /// interpolated cells. The timestamp alone never admits that relocation.
+    /// Expires after [`Self::TYPE_HINT_FRESH`] and is one-shot.
     type_hint: Option<Instant>,
-    /// A fresh RETURN key-hint ([`Self::note_return`] — a main-screen Enter):
-    /// the license for the un-hinted rainbow kitty jump choreography when typing
-    /// momentum is cold. The host deliberately does NOT arm the typed hint on
-    /// Enter (the Rainbow Return snap needs the move to classify as a jump,
-    /// not typing) — so with the choreography momentum-gated (anti-stray), a
-    /// bare Enter at an idle prompt would go mute without its own witness.
-    /// Enter IS a keystroke; a program's CUP to the next line never carries
-    /// this. Expires after [`Self::RETURN_HINT_FRESH`]; consumed by the
-    /// paired move (one press = one snap, so a spinner can never surf one
-    /// stale hint).
+    /// A fresh RETURN key-hint ([`Self::note_return`] — a main-screen Enter).
+    /// This is retained only as a bounded morphology/classifier signal; it is
+    /// never movement provenance. A Return has no causal content witness, so
+    /// its cursor relocation stays dark under the exact-candidate gate.
     return_hint: Option<Instant>,
+    /// A fresh USER-GESTURE classifier for cursor-moving input whose echo is
+    /// not a typed glyph. It never admits movement by itself: Tab, paste,
+    /// controller, mouse, and wheel reports cannot prove which later PTY move
+    /// they caused, so production hosts cancel these candidates fail-closed.
+    user_gesture_hint: Option<Instant>,
     /// A fresh COMPOSER-NEWLINE hint ([`Self::note_newline_break`] — an
     /// alt-screen Shift+Enter, the chord agent composers bind to "insert a line
     /// break without submitting").
@@ -3510,34 +3528,30 @@ pub struct CursorGlow {
     /// why this was carried as a known residual until the host started arming
     /// the distinction.
     ///
-    /// Shift+Enter arms the TYPED hint (the host needs the move to re-anchor
-    /// rather than meteor), so it cannot be told from a glyph echo by hint shape
-    /// either. PEEKED, never consumed, by the retirement: one press can span
+    /// Shift+Enter also carries typed morphology once an exact candidate exists,
+    /// so it cannot be told from a glyph echo by movement shape either. PEEKED,
+    /// never consumed, by the retirement: one press can span
     /// several observed frames of a repainting composer, and consuming it on the
     /// first would strand the rest. Expires after [`Self::RETURN_HINT_FRESH`] —
-    /// the same quarter-second an Enter's license lives for, because it is the
-    /// same key's gesture.
+    /// the same bounded classifier window as Enter.
     newline_hint: Option<Instant>,
-    /// A fresh REFLOW hint ([`Self::note_reflow`] — the host committed a grid
-    /// GEOMETRY change: an interactive window resize, a font-zoom re-grid, a
-    /// scale-factor change): the license for the un-hinted rainbow kitty jump
-    /// choreography when typing momentum is cold, exactly as
-    /// [`Self::return_hint`] licenses a bare Enter.
-    ///
-    /// A resize IS a user gesture — the hand dragged the window edge — even
-    /// though it carries no keystroke, so it earns the ZOOM the same way an
-    /// idle-prompt Enter does. The anti-stray contract is untouched: a
-    /// spinner's CUP loop, a background TUI repaint, and hours of idle output
-    /// arm nothing and so still mint nothing (see
-    /// `cold_program_warp_mints_no_rainbow_choreography`). The host arms this on
-    /// the resize SETTLE only, never on the leading edge or the mid-drag
-    /// throttle steps, so one drag gestures exactly one streak rather than one
-    /// per 50 ms reflow.
-    ///
-    /// Expires after [`Self::REFLOW_HINT_FRESH`]; consumed by the paired move
-    /// (one gesture = one streak, so a resize storm can never surf one stale
-    /// hint).
+    /// A fresh REFLOW classifier. Coordinate-space changes reset both engines;
+    /// no trustworthy old path exists in the new geometry, so reflow is
+    /// deliberately dark and this timestamp never admits a movement birth.
     reflow_hint: Option<Instant>,
+    /// Correlated origin/content/target proof required before any selectable
+    /// style (including data-defined Trail Packs) may birth movement light.
+    /// The timestamp hints above remain classifier inputs, never provenance by
+    /// themselves.
+    move_candidate: Option<GlowMoveCandidate>,
+    /// Last coherent terminal content generation presented to this engine.
+    /// Already-visible cell/pixel light may survive a generation change only
+    /// when the host proves it was the exact candidate observed in this frame.
+    last_content_generation: Option<ContentGeneration>,
+    /// A newer unsupported input canceled an unobserved candidate. The next
+    /// provable arm is consumed as the second half of that ambiguous cohort
+    /// instead of replacing it.
+    candidate_superseded: bool,
     /// A fresh KILL key-hint ([`Self::note_kill`] — Ctrl-K/U/W, Alt-D,
     /// word-delete Backspaces, forward Delete): the license for the erase POOF.
     /// A poof can only fire within [`Self::KILL_HINT_FRESH`] of a kill key AND
@@ -3545,18 +3559,18 @@ pub struct CursorGlow {
     /// key alone never poofs (a kill that erased nothing is silent), and a
     /// shrink alone never poofs (Ink repaints rewrite rows constantly).
     kill_hint: Option<Instant>,
-    /// A fresh PLAIN-BACKSPACE poof hint ([`Self::note_backspace`]): the license
-    /// for the erase POOF on an ORDINARY single Backspace, kept SEPARATE from
+    /// A fresh PLAIN-BACKSPACE poof classifier/scheduler
+    /// ([`Self::note_backspace`]), kept SEPARATE from
     /// [`Self::kill_hint`] so it never borrows the kill hint's nav/quench
-    /// escalation semantics — it ONLY licenses the poof. `poof_scan` ORs it into
-    /// the same `fresh_kill` gate, so a plain Backspace now poofs the vanished
-    /// cell (a shell row shrinks by one; a reflowing TUI takes the caret-anchored
-    /// fallback) exactly like a kill chord, rate-limited by the shared
-    /// [`Self::POOF_MIN_GAP`]. Cat-INDEPENDENT: `poof_scan` never consults the
+    /// escalation semantics. The timestamp alone never poofs: a plain Backspace
+    /// must also carry [`Self::confirmed_delete_span`], proven from its input-time
+    /// baseline and the exact next content generation. Cat-INDEPENDENT:
+    /// `poof_scan` never consults the
     /// cursor cat, so the delete burst fires whether or not the cat is flying
     /// (the cat's tongue-out "oops" layers on top when it happens to be present).
     bs_poof_hint: Option<Instant>,
-    /// The cursor row's FILL as it stood when the erase key arrived —
+    /// Legacy kill/fallback timing witness: the cursor row's FILL as it stood
+    /// when the erase key arrived —
     /// `(row, fill)`, stamped by [`Self::note_backspace`] AND [`Self::note_kill`]
     /// from whatever probe the host had last handed over.
     ///
@@ -3566,28 +3580,25 @@ pub struct CursorGlow {
     /// host probes the row as part of composing, so on a QUIET screen the first
     /// probe a lone Backspace ever produces is already the POST-erase row, and
     /// every diff from then on is post-vs-post — provably equal, forever. The
-    /// plain-Backspace fallback demanded that same proof, so a correction typed
-    /// after a pause could never poof, while a held delete run (whose own
-    /// particles keep the frame train alive, so a real baseline exists) always
-    /// did. That asymmetry is exactly the reported "the delete poof is gone for
-    /// characters".
-    ///
-    /// `None` means the host had nothing to give at the key — which is NOT
-    /// evidence that nothing was erased, and the fallback treats it that way
-    /// (see `poof_scan`).
+    /// Plain Backspace no longer relies on this presented-frame heuristic; its
+    /// exact candidate carries an input-time row snapshot instead.
     ///
     /// It is ALSO the clock the caret fallback's grace can be released early
     /// against — see [`Self::poof_erase_witnessed`].
     bs_baseline: Option<(u16, u16)>,
+    /// Exact one-cell plain-Backspace span proven by the candidate's
+    /// input-time baseline and next-generation row diff. This bypasses the
+    /// older presented-row span detector, whose suffix may predate the key.
+    confirmed_delete_span: Option<(Instant, u16, u16)>,
     /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]): the host saw
     /// the attached app's DECTCEM-hide-inside-DEC-2026 repaint bracket (the
     /// terminal's `repaint_blink_epoch` advanced — Claude Code wraps EVERY
     /// keystroke's redraw in one). On the ALT screen (`ctx_alt`) the typed/
     /// backspace RE-ANCHOR classifier additionally requires this hint to be
     /// fresh ([`Self::BLINK_HINT_FRESH`]): a full-redraw TUI re-anchors its
-    /// caret per keystroke, while vim/less (which never blink-inside-sync)
-    /// keep every hinted one-row jump's owner-mandated drama. Main screen is
-    /// blink-blind (the conjunct is vacuous there).
+    /// caret per keystroke. This only tunes already-admitted candidate
+    /// morphology; the blink itself never authorizes a vim/less relocation.
+    /// Main screen is blink-blind (the conjunct is vacuous there).
     blink_hint: Option<Instant>,
     /// THE SCROLL SIGNAL: the host reported a scroll ([`Self::note_scroll`])
     /// since the last observed MOVE, and `classify_move` has not consumed it
@@ -3890,6 +3901,54 @@ impl Geom {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlowMoveIntent {
+    Typed(ExpectedCellSpan),
+    Delete,
+    Synthetic,
+    SyntheticTyped,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GlowMoveCandidate {
+    at: Instant,
+    origin: (u16, u16),
+    intent: GlowMoveIntent,
+    target: Option<(u16, u16)>,
+    material: Option<(u16, u16)>,
+    baseline_row: Option<ExpectedRowSnapshot>,
+    /// Terminal processing generation sampled under the same input-time lock
+    /// as `baseline_row`. Content evidence is accepted only from the very next
+    /// processed batch; any intervening output completes the candidate dark.
+    baseline_generation: Option<ContentGeneration>,
+    content_confirmed: bool,
+}
+
+/// Host handoff from the coherent row proof to the classic trail twin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentCandidateDecision {
+    Confirmed {
+        at: Instant,
+        origin: (u16, u16),
+        target: (u16, u16),
+    },
+    Retired { at: Instant, origin: (u16, u16) },
+}
+
+impl GlowMoveCandidate {
+    fn admits(self, from: (u16, u16), to: (u16, u16), now: Instant, fresh_s: f32) -> bool {
+        if self.origin != from || now.saturating_duration_since(self.at).as_secs_f32() > fresh_s {
+            return false;
+        }
+        match self.intent {
+            GlowMoveIntent::Typed(_) | GlowMoveIntent::Delete => {
+                self.content_confirmed && self.target == Some(to)
+            }
+            GlowMoveIntent::Synthetic | GlowMoveIntent::SyntheticTyped => true,
+        }
+    }
+}
+
 /// One observed cursor move as [`CursorGlow::spawn`]'s classifier read it: the
 /// raw endpoints / clock / config / geometry plus the typing-vs-jump
 /// classification every later spawn phase keys on. Built once per move by
@@ -3961,32 +4020,23 @@ impl CursorGlow {
     /// Same-row skips shorter than this stay on the ribbon; at/past it (or ANY
     /// row change — wrap, Enter, a jump) the move gets the linear ZOOM streak.
     const RAINBOW_JUMP_MIN: i32 = 8;
-    /// Minimum jump distance (cells) that earns the ZOOM STREAK on a NAVIGATION
-    /// jump (Ctrl-A/E, Home/End, word motions, a held-arrow fling).
+    /// Minimum distance (cells) at which an already-admitted scripted jump earns
+    /// the transient ZOOM streak instead of only short-hop morphology.
     ///
-    /// OWNER, 2026-07-29: "I STILL don't see rainbow streaks when I do control-a
-    /// control-e." The streak existed, but it was `!navigation`-gated — so the very
-    /// gestures a person means by zipping the cursor across the line were the ONLY
-    /// ones that could never draw it. That gate was aimed at a real defect (a bare
-    /// Ctrl-E repainting a saturated per-cell RIBBON over the row it skims), but it
-    /// caught the wrong thing: the ribbon is persistent per-cell light laid by the
-    /// SPARK path, while the streak is ONE transient beam that self-expires. The
-    /// spark path stays navigation-excluded; only the beam is restored.
+    /// Kept separate from the per-cell RIBBON threshold: the streak is one
+    /// transient, self-expiring beam, while the ribbon is persistent cell light.
+    /// A production Ctrl-A/E timestamp is not provenance and therefore never
+    /// reaches either path; previews must arm an explicit synthetic candidate.
     ///
     /// Set ABOVE the burst's own floor deliberately: a two-cell word-hop earns its
     /// starburst but no line, so ordinary arrow-key editing does not draw a beam on
     /// every keypress. A streak means you TRAVELLED.
     const RAINBOW_STREAK_MIN_DIST: f32 = 3.0;
-    /// Minimum EASED momentum for the UN-HINTED jump choreography (ZOOM wake
-    /// streak + landing payload). The un-hinted branch fires on any observed
-    /// cursor delta — including PROGRAM-driven warps (a spinner's CUP loop, a
-    /// TUI repaint) that carry no keystroke at all — so it must prove the user
-    /// was recently TYPING before it celebrates: momentum builds only from
-    /// typed forward echoes, making it exactly the "was this text?" witness.
-    /// Above `RAINBOW_TERMINUS_MIN_DISP` (a barely-warm tail must not
-    /// zoom) and low enough that type-then-Enter still celebrates (disp ≈
-    /// 0.4+ after one word). Nav-HINTED jumps (Ctrl-A/E) are exempt by
-    /// design: the literal gesture was a keypress.
+    /// Minimum EASED momentum for the generic admitted jump choreography (ZOOM
+    /// wake streak + landing payload). Admission is already supplied by exact or
+    /// explicit synthetic provenance; momentum controls amplitude only. Kept
+    /// above `RAINBOW_TERMINUS_MIN_DISP` so a barely warm tail does not zoom and
+    /// low enough for scripted type-then-jump previews (disp ≈ 0.4 after a word).
     const RAINBOW_JUMP_MIN_DISP: f32 = 0.12;
     /// Press-budget window (seconds) for the typed-coalesce gate: the swept
     /// cell count must be covered by presses within this window. Coalescing
@@ -4334,23 +4384,18 @@ impl CursorGlow {
     const QUENCH_COOL: f32 = 0.8;
     /// A full quench suppresses this fraction of the display temperature.
     const QUENCH_DAMP: f32 = 0.6;
-    /// A backspace key-hint stays armed this long for its echo move (seconds).
+    /// A backspace classifier stays fresh this long after its exact candidate.
     const QUENCH_HINT_FRESH: f32 = 0.25;
-    /// A navigation key-hint stays armed this long for its paired cursor move
-    /// (seconds) — see [`Self::note_navigation`].
+    /// A navigation classifier stays fresh this long; it never admits a move.
     const NAV_HINT_FRESH: f32 = 0.25;
-    /// A typed-glyph key-hint stays armed this long for its echo move (seconds)
-    /// — see [`Self::note_typed`]. Same window as the quench/nav hints: echo
-    /// latency is tens of milliseconds; a quarter second comfortably covers a
-    /// loaded PTY without pairing the hint to some later, unrelated move.
+    /// A typed-glyph classifier and its exact candidate stay fresh this long.
+    /// Echo latency is tens of milliseconds; a quarter second covers a loaded
+    /// PTY without correlating the candidate to a later, unrelated move.
     const TYPE_HINT_FRESH: f32 = 0.25;
-    /// Freshness window for the RETURN key-hint ([`Self::return_hint`]) —
-    /// same pairing budget as the typed hint: one frame-quantized move.
+    /// Freshness window for the RETURN classifier ([`Self::return_hint`]).
     const RETURN_HINT_FRESH: f32 = 0.25;
-    /// Freshness window for the REFLOW hint ([`Self::reflow_hint`]). Wider than
-    /// the keystroke hints for the same reason as [`Self::KILL_HINT_FRESH`]: the
-    /// reflow's cursor relocation is only observed on the NEXT redraw, and the
-    /// shell's SIGWINCH prompt repaint can land a frame or two after that.
+    /// Freshness window for the REFLOW classifier ([`Self::reflow_hint`]). It is
+    /// retained for bounded lifecycle observation, not movement admission.
     const REFLOW_HINT_FRESH: f32 = 0.40;
     /// A kill key-hint stays armed this long for its row-shrink echo (seconds)
     /// — see [`Self::note_kill`]. Wider than the typed hint: a kill's erase is
@@ -4915,11 +4960,9 @@ impl CursorGlow {
         self.keyed_click_at = None;
     }
 
-    /// A CURSOR-MOVEMENT threshold (chebyshev cells): a hinted move of at least
-    /// this distance is a fast/coalesced RUN (a Sweep — Ctrl-A/E, word motion,
-    /// a batched held-arrow echo); a shorter one is a single-cell scrub (a
-    /// Glide). Below the always-admit gap the Glide is thinned like a
-    /// keystroke; the Sweep bypasses it (the synth carries the whole run).
+    /// A CURSOR-MOVEMENT threshold (chebyshev cells): an already-admitted move
+    /// of at least this distance is a fast/coalesced Sweep; a shorter one is a
+    /// Glide. The universal candidate gate runs first for every style and cue.
     const SWEEP_MIN_DIST: f32 = 2.0;
 
     /// Record one CURSOR-MOVEMENT cue (Glide/Sweep) carrying the travel
@@ -4997,11 +5040,16 @@ impl CursorGlow {
 
     /// HOST KEY-HINT: one Backspace keypress. Escalates the quench meter,
     /// cools the standing heat AND the coal bed (deleting un-earns momentum),
-    /// and arms a short hint so the paired ECHO move (the cursor stepping left
-    /// when the shell erases the glyph) is classified as a deletion and earns
-    /// no heat. The hint — not move shape — is the classifier, so plain
-    /// arrow-left navigation never quenches.
+    /// and arms a short classifier. Only an exact content-confirmed Delete
+    /// candidate may use it to classify the cursor's one-cell retreat as a
+    /// deletion; the timestamp alone cannot admit movement. Plain arrow-left
+    /// navigation never quenches.
     pub fn note_backspace(&mut self, now: Instant) {
+        // Backspace establishes a new deletion class. Close every older
+        // movement class and, critically, the swallowed typed cohort's
+        // unspent admission credits before arming quench/poof state below.
+        self.clear_typed(now);
+        self.confirmed_delete_span = None;
         self.unsettle();
         self.quench = (self.quench + Self::QUENCH_GAIN).min(1.0);
         self.heat *= Self::QUENCH_COOL;
@@ -5016,12 +5064,9 @@ impl CursorGlow {
         // forward and momentum going backward are now measured identically.
         self.erase_mom.advance(now);
         self.quench_hint = Some(now);
-        // EVERY Backspace licenses the erase POOF (cat-independent). A dedicated
-        // hint — not `kill_hint` — so it never borrows the kill hint's
-        // nav/quench semantics; `poof_scan` ORs it into the `fresh_kill` gate so
-        // the vanished cell puffs (the star-poof on dark, the smoke veil +
-        // saturated sparkle on light). Rate-limited by `POOF_MIN_GAP`, so a
-        // held-repeat Backspace puffs at a readable cadence, not per frame.
+        // Schedule and classify a possible plain-Backspace poof. The timestamp
+        // is never the license: `confirmed_delete_span`, produced only by the
+        // exact next-generation candidate, supplies the vanished cell.
         self.bs_poof_hint = Some(now);
         // Stamp the PRE-erase row fill while it is still the pre-erase row (see
         // [`Self::bs_baseline`]). `row_cur_meta` is the probe from this frame if
@@ -5032,30 +5077,54 @@ impl CursorGlow {
             .map(|m| (m.row, m.fill));
     }
 
+    /// Upgrade the newest Backspace/moving-kill classifier with an origin-bound
+    /// content-shrink candidate after the host proved both engines share it.
+    pub fn note_delete_candidate(
+        &mut self,
+        now: Instant,
+        target: (u16, u16),
+        baseline_row: ExpectedRowSnapshot,
+        baseline_generation: ContentGeneration,
+    ) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.retire_move_candidate_at(now);
+            return;
+        }
+        self.arm_move_candidate(now, GlowMoveIntent::Delete);
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+            candidate.baseline_row = Some(baseline_row);
+            candidate.baseline_generation = Some(baseline_generation);
+        }
+    }
+
     /// HOST KEY-HINT: a NAVIGATION keypress (Ctrl-A/Ctrl-E, Home/End, arrow
-    /// keys, word/line motions). Arms a short hint so the paired cursor move is
-    /// classified as navigation: it earns no heat and never slams the field-wide
-    /// arrival flare — jumping to line start/end must never erupt a full-width
-    /// white-hot blaze. It DOES fly the fire METEOR along the jump vector (with
-    /// nothing flying, the departed position's lingering embers read as lag — the fast retracting
-    /// streak is the responsive read). Unlike [`Self::note_backspace`] it only
-    /// arms the hint; it never touches heat/coal, so a live blaze from real
-    /// typing keeps cooling naturally while you navigate through it.
+    /// keys, word/line motions). This is a bounded classifier signal only; it
+    /// never proves that a later child cursor move was caused by the key. The
+    /// universal candidate gate therefore keeps navigation movement dark.
+    /// Unlike [`Self::note_backspace`] the hint never touches heat/coal, so a
+    /// live blaze from real typing keeps cooling naturally while you navigate.
     pub fn note_navigation(&mut self, now: Instant) {
         self.unsettle();
+        // A newer, stronger input class supersedes a swallowed Tab/paste. If
+        // its own echo is swallowed too, the weaker hint must not survive to
+        // admit an unrelated program move later in the freshness window.
+        self.user_gesture_hint = None;
         self.nav_hint = Some(now);
+        self.move_candidate = None;
     }
 
     /// HOST KEY-HINT: one PLAIN typed-glyph keypress (Character/Space echoes
     /// only — the host must NOT arm this for Enter, Tab, navigation keys, or
-    /// modified chords, whose jumps keep the owner-mandated meteors/ZOOMs).
-    /// Arms a short hint so a paired one-row cursor move whose delta exceeds
+    /// modified chords). Arms a short classifier hint so a proven paired
+    /// one-row cursor move whose delta exceeds
     /// the typed advance is classified as a TYPED RE-ANCHOR — a TUI input box
     /// (Claude Code's Ink prompt) rewraps its whole inset box per keystroke,
     /// so the wrap move lands left of its launch column WITHOUT the caret ever
     /// travelling through the interpolated cells (see the wrap classifier in
-    /// `spawn`). The hint — never move shape alone — is the classifier, so
-    /// hosts/tests that never arm it are byte-identical.
+    /// `spawn`). The hint tunes an independently proven candidate; it never
+    /// admits movement by itself.
     pub fn note_typed(&mut self, now: Instant) {
         self.note_typed_cells(now, 1);
     }
@@ -5068,19 +5137,100 @@ impl CursorGlow {
     /// spend. Everything a plain keyboard produces goes through the 1-cell
     /// [`Self::note_typed`] wrapper unchanged.
     pub fn note_typed_cells(&mut self, now: Instant, cells: u16) {
+        // A one-shot typed classifier and its cell credits are one cohort.
+        // The credit window is deliberately wider than TYPE_HINT_FRESH so a
+        // genuinely batched echo can spend several presses, but once the
+        // previous hint has expired there is no remaining provenance that can
+        // correlate those old credits to a future move. Retire that stale
+        // high-water before a new key starts a fresh cohort; otherwise one
+        // swallowed old key plus one new key can fund a cold two-cell CUP.
+        if let Some(previous) = self.type_hint
+            && now.saturating_duration_since(previous).as_secs_f32() > Self::TYPE_HINT_FRESH
+        {
+            self.retire_typed_commits_through(previous);
+        }
         self.unsettle();
+        self.user_gesture_hint = None;
+        self.nav_hint = None;
+        self.return_hint = None;
+        self.reflow_hint = None;
         self.type_hint = Some(now);
+        // Text-blind width/cadence feeds never admit movement. A native or
+        // embedder host with exact committed cells upgrades this below through
+        // `note_typed_expected`.
+        self.move_candidate = None;
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
         self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some((now, credits));
         self.rainbow.type_press_head =
             (self.rainbow.type_press_head + 1) % Self::RAINBOW_TYPED_SWEEP_MAX;
+        self.rainbow.last_committed_type = Some(now);
     }
 
-    /// A main-screen ENTER keypress landed — arm the RETURN license (see
-    /// [`Self::return_hint`]). Never gates bytes; never classifies as typing.
+    /// Arm typed movement with the exact materialized lead/continuation cells
+    /// expected at the source caret.
+    pub fn note_typed_expected(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        target: (u16, u16),
+        material: (u16, u16),
+        baseline_row: ExpectedRowSnapshot,
+        baseline_generation: ContentGeneration,
+    ) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.note_typed_cells(now, expected.as_slice().len() as u16);
+            self.retire_move_candidate_at(now);
+            return;
+        }
+        let pending = self.move_candidate.is_some();
+        // Native records cadence/activity before the PTY write, then upgrades
+        // to exact evidence only after successful inline delivery. Avoid
+        // double-crediting that same stamped commit; direct embedders that call
+        // this method first still receive the ordinary typed note.
+        if self.type_hint != Some(now) {
+            self.note_typed_cells(now, expected.as_slice().len() as u16);
+        }
+        if pending {
+            // A single latest hint cannot distinguish two unobserved commits.
+            // Retire the whole cohort instead of replacing the older proof.
+            self.retire_move_candidate_at(now);
+            return;
+        }
+        self.arm_move_candidate(now, GlowMoveIntent::Typed(expected));
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+            candidate.material = Some(material);
+            candidate.baseline_row = Some(baseline_row);
+            candidate.baseline_generation = Some(baseline_generation);
+        }
+    }
+
+    /// Record a main-screen ENTER classifier stamp. It never admits movement:
+    /// without exact content/target evidence a swallowed Enter and a program
+    /// CUP are indistinguishable, so the universal candidate gate stays dark.
     pub fn note_return(&mut self, now: Instant) {
         self.unsettle();
+        self.user_gesture_hint = None;
         self.return_hint = Some(now);
+    }
+
+    /// Record a Tab/paste classifier boundary. This never admits movement:
+    /// delivery does not prove that the child consumed the event, and an
+    /// asynchronous paste has no completion-correlated cursor observation.
+    pub fn note_user_gesture(&mut self, now: Instant) {
+        // Establish one unambiguous classifier class. A swallowed prior glyph
+        // must not turn paste into a typed re-anchor, and an absorbed Return,
+        // navigation key, or pending reflow must not survive this boundary.
+        // This class deliberately carries no candidate. Preserve `clear_typed`'s short quench
+        // grace so an already-in-flight Backspace echo can still classify.
+        self.clear_typed(now);
+        self.unsettle();
+        self.nav_hint = None;
+        self.return_hint = None;
+        self.reflow_hint = None;
+        self.user_gesture_hint = Some(now);
+        self.move_candidate = None;
     }
 
     /// A COMPOSER NEWLINE landed — an alt-screen Shift+Enter, which agent
@@ -5088,8 +5238,8 @@ impl CursorGlow {
     /// [`Self::newline_hint`]).
     ///
     /// The host arms this on the SAME arm that arms the typed hint for that
-    /// chord, and only there: a main-screen Shift+Enter IS Enter and keeps its
-    /// meteor, a plain Enter takes [`Self::note_return`], and a modified chord
+    /// chord, and only there: a main-screen Shift+Enter is Enter morphology, a
+    /// plain Enter takes [`Self::note_return`], and a modified chord
     /// that is not a composer newline arms nothing. Never gates bytes; never
     /// classifies as typing on its own — it only tells the ribbon's relocation
     /// retirement that the row change it is about to see was AUTHORED, so the
@@ -5099,22 +5249,39 @@ impl CursorGlow {
         self.newline_hint = Some(now);
     }
 
-    /// The host committed a grid GEOMETRY change (a settled window resize, a
-    /// font-zoom re-grid, a scale-factor change) — arm the REFLOW license (see
-    /// [`Self::reflow_hint`]). Never gates bytes; never classifies as typing.
-    ///
-    /// Arm this on the resize SETTLE, not the leading edge: the throttle applies
-    /// a reflow every ~50 ms during a live drag, and one streak per step reads as
-    /// a rainbow scribble rather than a gesture.
+    /// Record a grid-geometry classifier boundary. Reflow itself is dark: the
+    /// host resets this engine because an old cell-space path is not truthful
+    /// after a resize/font/scale coordinate change.
     pub fn note_reflow(&mut self, now: Instant) {
+        // Reflow is a newer, disjoint movement class. Close any swallowed
+        // typed cohort before arming it so a resize cannot leave old credits
+        // available to pool with a later key.
+        self.clear_typed(now);
         self.unsettle();
         self.reflow_hint = Some(now);
+        self.move_candidate = None;
     }
 
-    /// Whether a resize license is currently armed (see [`Self::reflow_hint`]).
-    /// Host-side conformance reads this to prove the "one gesture, one streak"
-    /// law at the seam where the license is GRANTED, without reaching into the
-    /// spawn classifier that consumes it.
+    /// Explicit scripted preview/test provenance. Production hosts use a
+    /// correlated content/target method instead.
+    #[doc(hidden)]
+    pub fn note_synthetic_move(&mut self, now: Instant) {
+        self.clear_typed(now);
+        self.unsettle();
+        self.user_gesture_hint = Some(now);
+        self.arm_move_candidate(now, GlowMoveIntent::Synthetic);
+    }
+
+    /// Scripted typed-move twin for previews, examples and benchmarks that
+    /// deliberately exercise the typing classifier without a live terminal.
+    #[doc(hidden)]
+    pub fn note_synthetic_typed(&mut self, now: Instant, cells: u16) {
+        self.note_typed_cells(now, cells);
+        self.arm_move_candidate(now, GlowMoveIntent::SyntheticTyped);
+    }
+
+    /// Whether the bounded reflow classifier stamp is currently armed. This is
+    /// observability for lifecycle tests, not an admission licence.
     #[must_use]
     pub fn reflow_hint_armed(&self) -> bool {
         self.reflow_hint.is_some()
@@ -5131,6 +5298,16 @@ impl CursorGlow {
             .filter(|(t, _)| now.saturating_duration_since(*t).as_secs_f32() <= window)
             .map(|(_, c)| *c as usize)
             .sum()
+    }
+
+    /// Whether real committed typing was recently active. This is deliberately
+    /// separate from [`Self::typed_credits_within`]: activity can decorate a
+    /// later authored navigation landing, but it can never pay the cell budget
+    /// that admits a coalesced typing sweep.
+    fn typed_activity_within(&self, now: Instant, window: f32) -> bool {
+        self.rainbow
+            .last_committed_type
+            .is_some_and(|t| now.saturating_duration_since(t).as_secs_f32() <= window)
     }
 
     /// The plume LENGTH `row`'s live pops currently gauge — the wake
@@ -5202,6 +5379,82 @@ impl CursorGlow {
         }
     }
 
+    /// Retire committed-text ledger entries through one observed
+    /// non-coalesced echo boundary. Wrap/re-anchor geometry does not reveal
+    /// the commit's cell width (a two-cell CJK glyph can land one row away),
+    /// and [`Self::type_hint`] stores only the newest input timestamp. If two
+    /// presses are in flight and one cell appears, retaining the older credit
+    /// lets it combine with a later swallowed press even after its possible
+    /// echo was denied as cold. Fail closed by retiring every commitment no
+    /// newer than the consumed one-shot; genuinely future injected timestamps
+    /// remain intact. True coalesces first use [`Self::spend_typed_credits`] to
+    /// account for the swept cells, then cross this same high-water boundary:
+    /// the one-shot hint is gone, so no pre-hint remainder can be paired later.
+    fn retire_typed_commits_through(&mut self, at: Instant) {
+        for slot in &mut self.rainbow.type_press_ring {
+            if slot.is_some_and(|(t, _)| t <= at) {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Last honest visible source owned by this engine. Native and pipeline
+    /// hosts require the classic trail to report the same anchor before they
+    /// arm any candidate; a reset/unseeded pair cannot reconstruct a path.
+    #[must_use]
+    pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
+        self.last.or_else(|| self.last_visible.map(|(cell, _)| cell))
+    }
+
+    /// Whether one authored move is still awaiting its first observation.
+    #[must_use]
+    pub fn move_candidate_pending(&self) -> bool {
+        self.move_candidate.is_some()
+    }
+
+    fn arm_move_candidate(&mut self, at: Instant, intent: GlowMoveIntent) {
+        self.move_candidate = self.cursor_anchor().map(|origin| GlowMoveCandidate {
+            at,
+            origin,
+            intent,
+            target: None,
+            material: None,
+            baseline_row: None,
+            baseline_generation: None,
+            content_confirmed: false,
+        });
+    }
+
+    fn retire_move_candidate_at(&mut self, at: Instant) {
+        let retiring_delete = self.move_candidate.is_some_and(|candidate| {
+            candidate.at == at && matches!(candidate.intent, GlowMoveIntent::Delete)
+        });
+        if self.type_hint == Some(at) {
+            self.type_hint = None;
+            self.retire_typed_commits_through(at);
+        }
+        for hint in [
+            &mut self.quench_hint,
+            &mut self.nav_hint,
+            &mut self.return_hint,
+            &mut self.user_gesture_hint,
+            &mut self.reflow_hint,
+        ] {
+            if *hint == Some(at) {
+                *hint = None;
+            }
+        }
+        if self.move_candidate.is_some_and(|candidate| candidate.at == at) {
+            self.move_candidate = None;
+        }
+        if retiring_delete {
+            self.kill_hint = None;
+            self.bs_poof_hint = None;
+            self.bs_baseline = None;
+            self.confirmed_delete_span = None;
+        }
+    }
+
     /// REDUCED-MOTION arm for the FRESH-INK pop (see the `reduced_motion`
     /// field doc): when set, a pop is a brightness STEP-FADE only — no scale
     /// spring, no birth halo. State-only and idempotent; the host folds its
@@ -5214,10 +5467,9 @@ impl CursorGlow {
     /// HOST REPAINT-BLINK: the focused terminal's `repaint_blink_epoch`
     /// advanced — the attached app hid the cursor INSIDE a DEC-2026
     /// synchronized update, the per-keystroke full-redraw bracket (Claude
-    /// Code). Arms a short hint ([`Self::BLINK_HINT_FRESH`]) that licenses the
-    /// typed/backspace RE-ANCHOR on the alt screen; without it (vim/less —
-    /// they never hide inside sync) every hinted alt-screen jump keeps its
-    /// owner-mandated meteor/ZOOM. Never gates bytes.
+    /// Code). Arms a short classifier ([`Self::BLINK_HINT_FRESH`]) that selects
+    /// RE-ANCHOR morphology for an independently admitted typed/delete candidate
+    /// on the alt screen. The blink never admits movement and never gates bytes.
     pub fn note_repaint_blink(&mut self, now: Instant) {
         self.unsettle();
         self.blink_hint = Some(now);
@@ -5225,7 +5477,7 @@ impl CursorGlow {
 
     /// Drop the blink hint — a tab/pane switch re-pointed this window at a
     /// DIFFERENT terminal, and a blink carried from the old one must not
-    /// license a re-anchor (or, host-side, the probe) against the new one.
+    /// classify a candidate (or, host-side, the probe) against the new one.
     pub fn clear_blink(&mut self) {
         self.blink_hint = None;
     }
@@ -5249,17 +5501,14 @@ impl CursorGlow {
     ///   ≈ two deletes) and cools the standing heat/coal — killing a line
     ///   un-earns momentum and visibly douses the blaze at the same moment the
     ///   steam flashes;
-    /// - the NAV hint is armed so the paired echo move (Ctrl-U flings the
-    ///   cursor to the prompt — a same-row backward leap) is classified as
-    ///   navigation: no field-wide flare, no swept sparks; the fire meteor
-    ///   still flies (the documented [`Self::note_navigation`] choreography).
+    /// - moving-kill morphology retires older candidate classes. Without exact
+    ///   content/target proof its later caret relocation stays dark.
     ///
-    /// The `moves_cursor` flag says whether this kill's echo MOVES the caret:
-    /// Ctrl-U/W and word-backspaces leap backward — the nav hint classifies
-    /// that move so it lays no fire. A stationary kill (Ctrl-K, Alt-D, forward
-    /// Delete) must NOT arm the nav hint or the leaked hint eats the NEXT
-    /// typed glyph's wake, heat, and rainbow kitty momentum (adversarial-review
-    /// finding).
+    /// The `moves_cursor` flag says whether this kill normally relocates the
+    /// caret. Ctrl-U/W and word-backspaces arm the bounded navigation classifier,
+    /// but that timestamp is not provenance. A stationary kill (Ctrl-K, Alt-D,
+    /// forward Delete) must not leak the classifier into the next exact typed
+    /// candidate.
     pub fn note_kill(&mut self, now: Instant, moves_cursor: bool) {
         self.unsettle();
         self.kill_hint = Some(now);
@@ -5287,6 +5536,8 @@ impl CursorGlow {
             .map(|m| (m.row, m.fill));
         if moves_cursor {
             self.nav_hint = Some(now);
+        } else {
+            self.move_candidate = None;
         }
     }
 
@@ -5370,16 +5621,29 @@ impl CursorGlow {
     /// DISARM a dangling typed/backspace hint. Called when a key with its OWN
     /// move semantics arrives (Enter, Tab, nav, kill): a hint left over from a
     /// no-move echo (a password prompt swallowing the char, vim `x`/`r`) must
-    /// not re-anchor the NEXT legit jump — Enter's meteor is owner-mandated.
+    /// not re-anchor the next independently proven move.
     /// The BACKSPACE pairing hint (`quench_hint`) is cleared too, because
     /// `bs_pair` in `spawn` only PEEKS it: a quench hint left by a backspace
     /// whose echo never moved (start of line, or a TUI coalescing the erase into
     /// the next repaint) would otherwise survive into a following Ctrl-A/E press
-    /// and "re-anchor" that jump, eating its meteor. A real deletion echo
-    /// consumes the hint at the echo move, which precedes any later nav press —
-    /// so deletion-steam classification is unaffected.
+    /// and misclassify a later exact candidate. A content-confirmed deletion
+    /// consumes the hint at its own echo, before any later navigation press.
     pub fn clear_typed(&mut self, now: Instant) {
-        self.type_hint = None;
+        // Supersession closes the typed cohort just as decisively as an
+        // observed echo. If a swallowed glyph's one-shot is dropped while its
+        // cell credit survives, that historical credit can pool with a later
+        // swallowed key and admit a program-owned multi-cell sweep. Activity
+        // lives in `last_committed_type`, so retiring the unspent admission
+        // cohort does not erase the user's earned navigation reward.
+        if let Some(typed_at) = self.type_hint.take() {
+            self.retire_typed_commits_through(typed_at);
+        }
+        self.user_gesture_hint = None;
+        self.nav_hint = None;
+        self.return_hint = None;
+        self.reflow_hint = None;
+        self.newline_hint = None;
+        self.move_candidate = None;
         // The quench hint is dropped only once its OWN echo had a fair chance
         // to land (~2 frames): a fast backspace→Enter pair must not lose the
         // deletion steam to a disarm racing the echo.
@@ -5391,7 +5655,161 @@ impl CursorGlow {
         }
     }
 
-    /// DROP the row probe (both buffers + metas + the kill hint). Called when
+    /// Fail-closed input boundary for events with no correlatable terminal
+    /// landing (mouse reports, wheel, raw/direct payloads, asynchronous paste).
+    /// Unlike [`Self::clear_typed`], this has no grace-bearing successor class:
+    /// the exact candidate, every classifier, and the typed-credit cohort retire.
+    pub fn cancel_authored_move_candidate(&mut self) {
+        self.candidate_superseded |= self.move_candidate.is_some();
+        if let Some(typed_at) = self.type_hint.take() {
+            self.retire_typed_commits_through(typed_at);
+        }
+        self.quench_hint = None;
+        self.kill_hint = None;
+        self.bs_poof_hint = None;
+        self.bs_baseline = None;
+        self.confirmed_delete_span = None;
+        self.nav_hint = None;
+        self.return_hint = None;
+        self.user_gesture_hint = None;
+        self.reflow_hint = None;
+        self.newline_hint = None;
+        self.move_candidate = None;
+    }
+
+    /// Discharge a supersession boundary whose triggering input was itself
+    /// declined by the host. The next independently submitted exact proof may
+    /// then arm normally; this never preserves or creates a candidate.
+    pub(crate) fn consume_declined_candidate_supersession(&mut self) {
+        debug_assert!(self.move_candidate.is_none());
+        self.candidate_superseded = false;
+    }
+
+    /// Fence resident light against an in-place PTY rewrite whose cursor does
+    /// not move. Without this, a status/title/spinner batch can replace a lit
+    /// cell while the old spark remains projected over its new glyph.
+    ///
+    /// `exact_candidate_confirmed` is reserved for the exact next-generation
+    /// content candidate confirmed this frame. A scroll without a parser batch
+    /// remains translatable; a parser batch that also scrolls fails closed.
+    /// The first observation silently establishes the baseline.
+    pub fn observe_content_generation(
+        &mut self,
+        generation: ContentGeneration,
+        exact_candidate_confirmed: bool,
+    ) -> bool {
+        let changed = self
+            .last_content_generation
+            .is_some_and(|previous| previous != generation);
+        self.last_content_generation = Some(generation);
+        if !changed {
+            return false;
+        }
+        self.unsettle();
+        if exact_candidate_confirmed {
+            // The exact proof may spawn fresh geometry below, but it does not
+            // certify any already-resident spark/particle on another cell or
+            // row in the same parser batch. Retire old visuals only; preserve
+            // the one-shot candidate, its Backspace span, and its key-time
+            // audio dedup credit for the imminent admitted spawn.
+            self.clear_visual_geometry();
+        } else {
+            self.clear_denied_move_visuals();
+        }
+        true
+    }
+
+    /// Revoke the movement candidate and classifier cohort armed by the input
+    /// dispatch at `at`. The host calls this when a key was queued behind a draining paste,
+    /// an inline write failed, or an asynchronous paste has no correlated
+    /// delivery completion. App input dispatch is one event-loop turn, so no
+    /// effect tick can observe the transient arm between note and revoke;
+    /// timestamp matching avoids cancelling a newer gesture if this API is
+    /// ever called from a delayed path.
+    pub fn revoke_input_hints_at(&mut self, at: Instant) {
+        let revoke_typed_cohort = self.type_hint == Some(at);
+        let clear = |slot: &mut Option<Instant>| {
+            if *slot == Some(at) {
+                *slot = None;
+            }
+        };
+        clear(&mut self.type_hint);
+        clear(&mut self.quench_hint);
+        clear(&mut self.nav_hint);
+        clear(&mut self.return_hint);
+        clear(&mut self.user_gesture_hint);
+        clear(&mut self.newline_hint);
+        clear(&mut self.reflow_hint);
+        clear(&mut self.kill_hint);
+        let revoke_bs = self.bs_poof_hint == Some(at);
+        clear(&mut self.bs_poof_hint);
+        if revoke_bs {
+            self.bs_baseline = None;
+            self.confirmed_delete_span = None;
+        }
+        if revoke_typed_cohort {
+            // `type_hint` is the sole/latest correlation witness. Revoking it
+            // makes every admission credit at or before this timestamp
+            // unspendable, including earlier presses batched behind the same
+            // queued/failed dispatch boundary. Removing only the exact slot
+            // lets an older swallowed credit pool with a later key.
+            self.retire_typed_commits_through(at);
+        }
+        if self.rainbow.last_committed_type == Some(at) {
+            self.rainbow.last_committed_type = None;
+        }
+        if self.move_candidate.is_some_and(|candidate| candidate.at == at) {
+            self.move_candidate = None;
+        }
+    }
+
+    /// Consume the candidate and every classifier at a completed hidden→visible
+    /// boundary where `spawn` did not consume them. This includes a same-cell
+    /// return: although no relocation occurred, the authored hide choreography
+    /// is complete and its one-shot must not fund a later PTY/CUP move.
+    fn retire_hidden_movement_provenance(&mut self) {
+        self.type_hint = None;
+        self.quench_hint = None;
+        self.nav_hint = None;
+        self.return_hint = None;
+        self.user_gesture_hint = None;
+        self.newline_hint = None;
+        self.move_candidate = None;
+        self.reflow_hint = None;
+        self.rainbow.type_press_ring.fill(None);
+        self.rainbow.type_press_head = 0;
+        self.rainbow.last_committed_type = None;
+    }
+
+    /// A hidden→visible cursor relocation that the bounded ConPTY bridge
+    /// declined never reaches `spawn`, so its one-shot classifiers would
+    /// otherwise remain armed for the next unrelated move. For Rainbow Kitty,
+    /// also begin the same graceful retirement as an unwitnessed visible warp:
+    /// absolute-cell ribbon light must not remain attached to the old cursor.
+    fn retire_declined_hidden_relocation(&mut self, now: Instant, rainbow_kitty: bool) {
+        self.retire_hidden_movement_provenance();
+        // The caret has crossed to a row the prior row-content sample did not
+        // observe. Retire kill/plain-Backspace proofs and both probe
+        // generations so a reused numeric row cannot synthesize a later poof.
+        self.drop_row_probe();
+        self.crown_until = None;
+        if rainbow_kitty {
+            self.rainbow.tail = [None; 3];
+            self.rainbow.retract = None;
+            self.rainbow.wake_fold_carry = None;
+            for spark in self.sparks.iter_mut().filter(|spark| spark.typing) {
+                spark.fade_at.get_or_insert(now);
+            }
+            self.rainbow.ink_pops.clear();
+            self.glide.vel = 0.0;
+            self.glide.run = 0;
+            self.glide.dir = (0, 0);
+            self.glide.head = None;
+            self.glide.land_at = None;
+        }
+    }
+
+    /// DROP the row probe (both buffers + metas + every poof proof). Called when
     /// the probed terminal is no longer the same content stream — a tab/pane
     /// switch re-pointing `ws.term`, or a scroll fence trip — so the diff can
     /// never compare two different terminals (or pre/post-scroll content) into
@@ -5403,6 +5821,17 @@ impl CursorGlow {
         self.row_prev_meta = None;
         self.clear_neighbor_rows();
         self.kill_hint = None;
+        self.bs_poof_hint = None;
+        self.bs_baseline = None;
+        self.confirmed_delete_span = None;
+        if let Some(candidate) = self.move_candidate.filter(|candidate| {
+            matches!(
+                candidate.intent,
+                GlowMoveIntent::Typed(_) | GlowMoveIntent::Delete
+            )
+        }) {
+            self.retire_move_candidate_at(candidate.at);
+        }
     }
 
     /// Clear the star-landing neighbor captures (both generations). Called
@@ -5431,15 +5860,50 @@ impl CursorGlow {
         if rows == 0 {
             return;
         }
+        // A plain-Backspace classifier, its exact deletion candidate/span, and
+        // its legacy `(row, fill)` baseline describe the pre-scroll content stream.
+        // Even before the host's companion `drop_row_probe` call lands, they
+        // must not survive this fence and compare against unrelated text that
+        // later occupies the same numeric row (a phantom erase poof/trail).
+        self.bs_poof_hint = None;
+        self.bs_baseline = None;
+        self.confirmed_delete_span = None;
+        self.quench_hint = None;
         // THE SCROLL SIGNAL (see [`Self::scroll_seen`]): the screen moved under
         // the light, so the next observed move's row change is the scroll's, not
         // a repaint's, and the TUI-relocation retirement must decline it.
         self.scroll_seen = true;
-        if let Some((r, c)) = self.last {
-            self.last = Some((r.saturating_sub(rows), c));
-        }
-        if let Some(((r, c), t)) = self.last_visible {
-            self.last_visible = Some(((r.saturating_sub(rows), c), t));
+        self.translate_scroll_state(rows, self.last_ch);
+    }
+
+    /// Move every live, position-bearing member with a PTY scroll.  `cell_h`
+    /// comes from the OUTERMOST engine because an outgoing style ghost may not
+    /// have ticked yet (and therefore may not have populated its own
+    /// [`Self::last_ch`]), even though its forged pixel geometry is already on
+    /// glass in this same coordinate space.
+    ///
+    /// This is deliberately one family operation rather than a list split
+    /// between [`Self::note_scroll`] and individual emitters.  A member added to
+    /// the transient-light family must either be translated here or be dropped
+    /// when its geometry is unknown/off-top; leaving it untouched strands the
+    /// previous frame's light over unrelated post-scroll cells.
+    fn translate_scroll_state(&mut self, rows: u16, cell_h: u16) {
+        // Classifier anchors obey the same retirement law as visible light.
+        // Clamping an anchor that scrolled off-screen to row 0 creates a false
+        // source for the next observed move: a later exact candidate could then
+        // be classified from a cursor position that never existed. Once
+        // off-top, there is no honest source cell, so the next tick starts
+        // cold from its newly observed cursor instead.
+        self.last = self
+            .last
+            .and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
+        self.last_visible = self
+            .last_visible
+            .and_then(|((row, col), at)| row.checked_sub(rows).map(|row| ((row, col), at)));
+        if let Some(candidate) = self.move_candidate.take() {
+            // Geometry can translate, but an input-time content proof cannot:
+            // the candidate crossed a content-generation boundary.
+            self.retire_move_candidate_at(candidate.at);
         }
         // STRAY RAINBOW (owner: "I still see stray pieces of rainbow"). The
         // anchors above were translated but the LIGHT was not. Every ribbon spark
@@ -5469,13 +5933,27 @@ impl CursorGlow {
                 }
                 None => false,
             });
+        // The ribbon's relight/exit memory is position-bearing too.  Moving the
+        // visible sparks without this array lets the next typed key re-lay the
+        // pre-scroll cells, resurrecting exactly the fragment the translation
+        // removed.  Off-top entries become holes, never row-0 clamps.
+        for cell in &mut self.rainbow.tail {
+            *cell = cell.and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
+        }
+        // The plume nozzle is cell-addressed (fractional only in X).  It can
+        // remain live while the cursor is hidden, so it cannot rely on the next
+        // visible tick to reseed its row.
+        self.rainbow.wake_head = self
+            .rainbow
+            .wake_head
+            .and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
         // THE PIXEL-ADDRESSED POOLS. The two above are addressed by grid cell,
         // so a row subtraction moves them. The starfield, the landing ring, the
-        // ZOOM streaks and the landing starbursts are addressed in WINDOW-
-        // ABSOLUTE PIXELS instead, and were left behind entirely: after a scroll
-        // they hung in place while the text slid out from under them, which is
-        // the "stray rainbow pieces" the owner still sees — detached dots and
-        // dashes sitting a row or two off the trail that earned them.
+        // ZOOM streaks, landing starbursts, fast-glide stars/landing anchor,
+        // fire meteors, vapor and bolt polylines are addressed in WINDOW-
+        // ABSOLUTE PIXELS instead. Leaving even one family behind lets it hang
+        // in place while the text slides out from under it; a saved glide head
+        // is worse, because it mints a NEW landing burst later at the stale Y.
         //
         // They need a pixel translation, and `note_scroll` is handed only a row
         // count, which is why the earlier sweep could not carry them. `last_ch`
@@ -5483,39 +5961,94 @@ impl CursorGlow {
         // every pool is DROPPED — fail closed, exactly as the cell-addressed
         // pools drop anything pushed past the top rather than clamping it into a
         // bar along row 0.
-        let dy = f32::from(rows) * f32::from(self.last_ch);
-        if self.last_ch == 0 {
+        let dy = f32::from(rows) * f32::from(cell_h);
+        if cell_h == 0 {
             self.particles.clear();
             self.ring = None;
             self.rainbow.jumps.clear();
             self.rainbow.bursts.clear();
-            return;
+            self.glide.stars.clear();
+            self.glide.head = None;
+            self.glide.land_at = None;
+            self.fire_meteors.clear();
+            self.vapor.clear();
+            self.bolts.clear();
+        } else {
+            // Dropped once past the window top, with ONE CELL of allowance —
+            // the starfield deliberately places light in the sky band just
+            // above row 0, so the cut cannot sit exactly at zero. Measured
+            // against the window, never against this scroll's distance: a pool
+            // that survived an earlier scroll must not be rescued by a later,
+            // larger one.
+            let top = -f32::from(cell_h);
+            // Analytic particles/vapor are translated at their birth origin;
+            // that moves their whole trajectory without rebasing the clock.
+            self.particles.retain_mut(|p| {
+                p.y0 -= dy;
+                p.y0 > top
+            });
+            self.ring = self.ring.take().and_then(|mut r| {
+                r.cy -= dy;
+                (r.cy > top).then_some(r)
+            });
+            self.rainbow.jumps.retain_mut(|j| {
+                j.y0 -= dy;
+                j.y1 -= dy;
+                j.y0.max(j.y1) > top
+            });
+            self.rainbow.bursts.retain_mut(|b| {
+                b.cy -= dy;
+                b.cy + b.reach > top
+            });
+            self.glide.stars.retain_mut(|star| {
+                star.y0 -= dy;
+                star.y1 -= dy;
+                star.y0.max(star.y1) > top
+            });
+            if let Some((x, mut y)) = self.glide.head {
+                y -= dy;
+                if y > top {
+                    self.glide.head = Some((x, y));
+                } else {
+                    // A landing is future light.  Once its anchor scrolls off,
+                    // keeping the timer would later create a burst at a place
+                    // that no longer belongs to the cursor run.
+                    self.glide.head = None;
+                    self.glide.land_at = None;
+                }
+            }
+            self.fire_meteors.retain_mut(|meteor| {
+                meteor.y0 -= dy;
+                meteor.y1 -= dy;
+                meteor.y0.max(meteor.y1) > top
+            });
+            self.vapor.retain_mut(|puff| {
+                puff.y0 -= dy;
+                puff.y0 > top
+            });
+            self.bolts.retain_mut(|bolt| {
+                for (_, y) in &mut bolt.pts {
+                    *y -= dy;
+                }
+                bolt.pts.iter().any(|&(_, y)| y > top)
+            });
         }
-        // Dropped once past the window top, with ONE CELL of allowance — the
-        // starfield deliberately places light in the sky band just above row 0,
-        // so the cut cannot sit exactly at zero. Measured against the window,
-        // never against this scroll's distance: a pool that survived an earlier
-        // scroll must not be rescued by a later, larger one.
-        let top = -f32::from(self.last_ch);
-        // A particle is advanced ANALYTICALLY from `born`, so translating its
-        // birth origin translates its whole trajectory.
-        self.particles.retain_mut(|p| {
-            p.y0 -= dy;
-            p.y0 > top
-        });
-        self.ring = self.ring.take().and_then(|mut r| {
-            r.cy -= dy;
-            (r.cy > top).then_some(r)
-        });
-        self.rainbow.jumps.retain_mut(|j| {
-            j.y0 -= dy;
-            j.y1 -= dy;
-            j.y0.max(j.y1) > top
-        });
-        self.rainbow.bursts.retain_mut(|b| {
-            b.cy -= dy;
-            b.cy + b.reach > top
-        });
+
+        // OUTGOING STYLE GHOSTS paint into the same frame and can outlive the
+        // switch by 250 ms.  Recursing with the outer row height covers both a
+        // normally ticked ghost and the one-frame seam where it owns forged
+        // geometry but has not populated its own `last_ch` yet.  The frozen
+        // anchor uses checked subtraction: unlike the live classifier anchor,
+        // it is visible geometry, so clamping an off-top cursor to row 0 would
+        // manufacture a crown there.
+        for fade in &mut self.fading {
+            fade.engine.translate_scroll_state(rows, cell_h);
+            fade.anchor = fade
+                .anchor
+                .and_then(|(row, col)| row.checked_sub(rows).map(|row| (row, col)));
+            fade.engine.last = fade.anchor;
+            fade.engine.last_ch = cell_h;
+        }
     }
 
     /// PER-FRAME ROW PROBE: hand the engine the cursor row's content as
@@ -5587,6 +6120,156 @@ impl CursorGlow {
             }
             None => NbrProbe::OffGrid,
         };
+    }
+
+    /// Confirm the pending content-bound candidate against the input-time row
+    /// snapshot supplied by the host and this coherent render snapshot. Typed
+    /// input must materialize the exact committed cells while every cell it did
+    /// not own stays identical. A deletion must be one exact end-of-line blank
+    /// with every survivor identical. A timestamp or matching landing alone is
+    /// never evidence.
+    pub fn confirm_content_candidate(
+        &mut self,
+        current_cursor: Option<(u16, u16)>,
+        now: Instant,
+        current_generation: ContentGeneration,
+    ) -> Option<ContentCandidateDecision> {
+        let candidate = self.move_candidate?;
+        if now.saturating_duration_since(candidate.at).as_secs_f32() > Self::TYPE_HINT_FRESH {
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
+        if !matches!(candidate.intent, GlowMoveIntent::Typed(_) | GlowMoveIntent::Delete) {
+            return None;
+        }
+        let Some(baseline_generation) = candidate.baseline_generation else {
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        };
+        if current_generation == baseline_generation {
+            // No PTY batch has landed yet. A byte-identical present may precede
+            // a delayed echo, so keep the one-shot pending.
+            return None;
+        }
+        if current_generation.terminal_id != baseline_generation.terminal_id
+            || current_generation.alternate_screen != baseline_generation.alternate_screen
+            || current_generation.process_sequence
+                != baseline_generation.process_sequence.wrapping_add(1)
+        {
+            // More than one batch crossed the input boundary. Even if the row
+            // now happens to match, causality is no longer attributable.
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
+        let Some(current_meta) = self.row_cur_meta else {
+            // This is already the sole next processing generation. A host
+            // that cannot supply its coherent row cannot defer the proof to a
+            // later frame and still attribute it to this input.
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        };
+        if candidate.at > current_meta.at {
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
+        let (confirmed, row_changed) = match candidate.intent {
+            GlowMoveIntent::Typed(expected) => {
+                let material = candidate.material?;
+                let current = captured_probe_row(
+                    current_meta,
+                    &self.row_cur,
+                    &self.row_above_cur,
+                    &self.row_below_cur,
+                    material.0,
+                )?;
+                let start = usize::from(material.1);
+                let expected = expected.as_slice();
+                let end = start.saturating_add(expected.len());
+                let baseline_row = candidate.baseline_row?;
+                let baseline = baseline_row.as_slice();
+                let changed = baseline != current;
+                let exact = baseline.len() == current.len()
+                    && end <= current.len()
+                    && current.get(start..end) == Some(expected)
+                    && baseline.get(start..end) != Some(expected)
+                    && baseline[..start] == current[..start]
+                    && baseline[end..] == current[end..];
+                (exact, changed)
+            }
+            GlowMoveIntent::Delete => {
+                let current = captured_probe_row(
+                    current_meta,
+                    &self.row_cur,
+                    &self.row_above_cur,
+                    &self.row_below_cur,
+                    candidate.origin.0,
+                )?;
+                let target = candidate.target?;
+                let col = usize::from(target.1);
+                let baseline_row = candidate.baseline_row?;
+                let baseline = baseline_row.as_slice();
+                let changed = baseline != current;
+                let exact = target.0 == candidate.origin.0
+                    && baseline.len() == current.len()
+                    && col < current.len()
+                    && baseline[col] != ' '
+                    && current[col] == ' '
+                    && baseline[..col] == current[..col]
+                    && baseline[col.saturating_add(1)..]
+                        == current[col.saturating_add(1)..];
+                (exact, changed)
+            }
+            _ => (false, false),
+        };
+        if !confirmed {
+            // The first post-input processing batch completed without the exact
+            // owned diff. This is a mismatch even when another row/title was
+            // the only visible mutation; a later batch may not borrow it.
+            let _ = row_changed;
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
+        if current_cursor == Some(candidate.origin) {
+            // The authored bytes changed content but produced no path. This is
+            // a completed no-move boundary, not a delayed echo: consume its
+            // proof dark so the next unrelated CUP cannot borrow it.
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.content_confirmed = true;
+        }
+        if matches!(candidate.intent, GlowMoveIntent::Delete)
+            && let Some((row, col)) = candidate.target
+        {
+            self.confirmed_delete_span = Some((candidate.at, row, col));
+        }
+        Some(ContentCandidateDecision::Confirmed {
+            at: candidate.at,
+            origin: candidate.origin,
+            target: candidate.target?,
+        })
     }
 
     /// STAR-LANDING CLEARANCE: what this frame's presented probe truth knows
@@ -5744,19 +6427,14 @@ impl CursorGlow {
             || self.poof_hint_pending().is_some()
     }
 
-    /// THE PENDING POOF LICENCE — the earlier of the two hints that can still
-    /// fire an erase poof ([`Self::kill_hint`], [`Self::bs_poof_hint`]).
+    /// THE PENDING POOF WAKE — the earlier of the kill license or plain-
+    /// Backspace classifier that still needs detector service.
     ///
-    /// WHY THIS EXISTS. `poof_scan` treats the two hints identically — it ORs
-    /// them into one `fresh_kill` gate — but the two SCHEDULING seams
-    /// ([`Self::is_active`] and [`Self::next_change_deadline`]) named
-    /// `kill_hint` alone. A kill chord therefore kept the engine awake long
-    /// enough for the row probe to witness the shrink, while a plain Backspace
-    /// did not: from a QUIET screen the host had no reason to tick, no probe
-    /// ever arrived, and the hint expired unconsumed. The poof was intact and
-    /// unreachable — which is why deleting single characters looked like it had
-    /// lost its sparkle while a held delete run (whose own particles keep the
-    /// frame train alive) still puffed.
+    /// WHY THIS EXISTS. Both paths need a detector tick, but they prove the
+    /// erasure differently: a kill uses its legacy row-diff/fallback license;
+    /// plain Backspace waits for an exact confirmed span. Naming only
+    /// `kill_hint` at the scheduling seams would strand the latter proof on a
+    /// quiet screen.
     ///
     /// One accessor, so a third licence cannot repeat the omission.
     fn poof_hint_pending(&self) -> Option<Instant> {
@@ -5769,13 +6447,9 @@ impl CursorGlow {
     /// THE ERASE IS ALREADY ON GLASS: this frame's probe shows the caret's row
     /// SHORTER than the row stamped at the erase key ([`Self::bs_baseline`]).
     ///
-    /// Two readers, one law. It is the strong arm of the plain-Backspace
-    /// witness (did that Backspace erase anything at all?) and it is the caret
-    /// fallback's EARLY RELEASE from [`Self::POOF_FALLBACK_GRACE`] (has the
-    /// precise span branch already had its shot?). Both questions have the same
-    /// answer for the same reason: a row that has shrunk since the key is a row
-    /// whose erase has landed, and a landed erase is one the span branch has
-    /// seen — it diffs the very probe this reads.
+    /// This is the legacy kill fallback's EARLY RELEASE from
+    /// [`Self::POOF_FALLBACK_GRACE`]. Plain Backspace uses the exact candidate
+    /// snapshot and [`Self::confirmed_delete_span`] instead.
     ///
     /// `None` baseline (the host had no probe at the key) is deliberately NOT a
     /// witness in either direction: it is the "was not composing" case, so the
@@ -5871,7 +6545,7 @@ impl CursorGlow {
     /// Wipe every piece of TRANSIENT state: the in-flight light (sparks,
     /// particles, streaks, bursts, the whole glide-star family, meteors,
     /// vapor, bolts, ring, crossfades), the pending sound + keyed-click
-    /// credits, ALL EIGHT input hints, the row probes, and the rainbow kitty
+    /// credits, ALL input hints, the row probes, and the rainbow kitty
     /// tail/pop/wake machinery. The ONE teardown all three dark/reset paths
     /// compose from — never hand-maintained lists at the call sites, which drift
     /// and leave a disabled engine reporting live light or a stale hint alive to
@@ -5882,20 +6556,10 @@ impl CursorGlow {
     /// `last_visible` / `last_move`), and `ctx_alt` stay with the callers —
     /// the three paths deliberately differ there.
     fn clear_transient_state(&mut self) {
-        self.fading.clear();
-        self.ramp_in_at = None;
+        self.clear_visual_geometry();
+        self.rainbow.clear_admission();
         self.sound_cues.clear();
         self.clear_keyed_clicks();
-        self.sparks.clear();
-        self.particles.clear();
-        self.rainbow.clear_transient();
-        self.glide.clear();
-        self.fire_meteors.clear();
-        self.vapor.clear();
-        self.last_smoke = None;
-        self.bolts.clear();
-        self.ring = None;
-        self.crown_until = None;
         self.quench_hint = None;
         self.nav_hint = None;
         self.type_hint = None;
@@ -5903,15 +6567,58 @@ impl CursorGlow {
         self.blink_hint = None;
         self.reflow_hint = None;
         self.return_hint = None;
+        self.user_gesture_hint = None;
         self.newline_hint = None;
+        self.move_candidate = None;
+        self.candidate_superseded = false;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
+        self.confirmed_delete_span = None;
         self.last_poof = None;
         self.row_cur.clear();
         self.row_prev.clear();
         self.row_cur_meta = None;
         self.row_prev_meta = None;
         self.clear_neighbor_rows();
+    }
+
+    /// Clear output-bearing geometry and the per-frame accessor caches, while
+    /// leaving classifier/candidate/audio state untouched. This is the exact
+    /// seam used when a next-generation content proof succeeds: old light is
+    /// no longer attributable, but the confirmed one-shot still has to spawn.
+    fn clear_visual_geometry(&mut self) {
+        self.fading.clear();
+        self.ramp_in_at = None;
+        self.sparks.clear();
+        self.particles.clear();
+        self.rainbow.clear_visual_geometry();
+        self.glide.clear();
+        self.fire_meteors.clear();
+        self.vapor.clear();
+        self.last_smoke = None;
+        self.bolts.clear();
+        self.ring = None;
+        self.crown_until = None;
+        // These are cached per-frame accessor planes rather than resident
+        // emitter state, but a reset can happen after a tick and before the
+        // host projects them. Clear them here so a torn snapshot cannot copy
+        // the just-invalidated frame over newer terminal content.
+        self.halo_out.clear();
+        self.patch_out.clear();
+        self.under_out.clear();
+        self.char_out.clear();
+        self.fire_halo_out.clear();
+    }
+
+    /// Retire every visual trail family at a denied relocation while
+    /// preserving independently earned, already-queued key-time audio. The
+    /// echo-dedup ledger is one-shot correlation state: once the first observed
+    /// delta is denied it cannot honestly pair with that old key and must retire, or
+    /// it can mute the next genuine key.
+    fn clear_denied_move_visuals(&mut self) {
+        let sound_cues = std::mem::take(&mut self.sound_cues);
+        self.clear_transient_state();
+        self.sound_cues = sound_cues;
     }
 
     /// Zero the THERMAL integrators (heat / flare / coal / quench, the eased
@@ -5944,9 +6651,8 @@ impl CursorGlow {
     /// hint, a thermal kick, a row probe, freshly spawned light — so the next
     /// disabled tick must run the FULL wipe once more instead of trusting the
     /// latch. Idempotent and ~free; invoked from every externally reachable
-    /// mutation of wiped state, so the latch can never hold a freshly armed
-    /// hint alive across a dark frame (exactly the "stale hint fires on
-    /// re-enable" drift [`Self::clear_transient_state`]'s doc warns about).
+    /// mutation of wiped state, so the latch cannot hold a fresh candidate or
+    /// classifier cohort across a dark frame.
     #[inline]
     fn unsettle(&mut self) {
         self.dark_settled = false;
@@ -5974,6 +6680,8 @@ impl CursorGlow {
         self.last_move = None;
         self.crown_window_ms = Self::CROWN_MS;
         self.ctx_alt = false;
+        self.candidate_superseded = false;
+        self.last_content_generation = None;
     }
 
     /// Advance one frame: observe the cursor at `cur` (`Some(row,col)` visible,
@@ -6233,8 +6941,8 @@ impl CursorGlow {
         // cools to EXACTLY zero over that same lazy decay, so `is_active` disarms
         // and no perpetual wake leaks (idle-zero holds). Only `reset()` — called
         // on a real layout/space change — wipes the momentum outright. The visible
-        // MOVING light and the transient hints are dropped (nothing presents while
-        // dark, and a stale hint must not survive to fire on refocus); the cursor
+        // MOVING light and the transient candidate/classifier cohort are dropped
+        // (nothing presents while dark); the cursor
         // position is tracked so refocus spawns no phantom comet.
         if cfg.intensity <= 0.0 {
             // The crossfade residue and the pops are MOVING light exactly like
@@ -6280,14 +6988,14 @@ impl CursorGlow {
             let ((r, c), seen) = self.last_visible?;
             let fresh = now.saturating_duration_since(seen).as_millis() as u64
                 <= crate::cursor_trail::HIDE_BRIDGE_MS;
-            // A fresh typed hint widens the plausible reach (PEEKED — `spawn`
-            // still owns consumption): batched echoes hop farther than 2 cells
+            // A fresh typed classifier widens the plausible bridge reach (PEEKED
+            // — `spawn` still owns candidate consumption): batched echoes hop farther than 2 cells
             // inside one hide window, and dropping them left the trail with a
             // hole on every fast burst. TYPE hint ONLY — the trail engine's
             // twin has no quench hint and their clear_typed semantics differ,
             // so keying on quench here would let the two engines disagree on
-            // the same bridged move (the lockstep contract). Unhinted moves
-            // keep the classic 2-cell law byte-identically.
+            // the same bridged move (the lockstep contract). This only selects
+            // geometry; the universal candidate gate still decides admission.
             let typed_fresh = self.type_hint.is_some_and(|t| {
                 now.saturating_duration_since(t).as_secs_f32() <= Self::TYPE_HINT_FRESH
             });
@@ -6295,6 +7003,14 @@ impl CursorGlow {
             let plausible = cur.is_some_and(|(cr, cc)| cr.abs_diff(r).max(cc.abs_diff(c)) <= reach);
             (fresh && plausible).then_some((r, c))
         });
+        let declined_hidden_relocation = spawn_from.is_none()
+            && self.last.is_none()
+            && cur
+                .zip(self.last_visible.map(|(cell, _)| cell))
+                .is_some_and(|(current, previous)| current != previous);
+        let completed_hidden_reappearance =
+            self.last.is_none() && cur.is_some() && self.last_visible.is_some();
+        let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
         if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
             && (pr != cr || pc != cc)
         {
@@ -6317,9 +7033,29 @@ impl CursorGlow {
             } else {
                 Self::CROWN_MS
             };
-            self.spawn(pr, pc, cr, cc, now, cfg, geom);
+            let admitted = self.spawn(pr, pc, cr, cc, now, cfg, geom);
             self.last_move = Some(now);
-            self.crown_until = Some(now + Duration::from_millis(self.crown_window_ms));
+            if admitted {
+                self.crown_until = Some(now + Duration::from_millis(self.crown_window_ms));
+            } else {
+                // The crown is cursor-relative, so carrying an older one across
+                // an unadmitted program warp would teleport legitimate light to
+                // the new cursor and turn the silent move back into a stray.
+                self.crown_until = None;
+            }
+        } else if declined_hidden_relocation {
+            self.retire_declined_hidden_relocation(
+                now,
+                matches!(cfg.style, GlowStyle::RainbowKitty),
+            );
+        } else if completed_hidden_reappearance {
+            self.retire_hidden_movement_provenance();
+        } else if unseeded_visible {
+            // A fresh/reset engine has no truthful source cell for this
+            // landing. Seed the anchor but consume the candidate and every
+            // classifier dark, otherwise the next unrelated CUP can borrow a
+            // correlation that completed before first draw.
+            self.retire_hidden_movement_provenance();
         }
         self.last = cur;
         if let Some(c) = cur {
@@ -7075,11 +7811,69 @@ impl CursorGlow {
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
-    ) {
+    ) -> bool {
         // Direct-drive seam (tests call `spawn` without a tick): sparks and
         // thermals are wiped state, so the latch must not survive a spawn.
         self.unsettle();
-        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom);
+        // Consume the sole candidate on the first observed delta, matched or
+        // not. A swallowed/ignored input can therefore never be retried against
+        // a later program CUP within the freshness window.
+        let admitted_intent = self
+            .move_candidate
+            .take()
+            .filter(|candidate| {
+                candidate.admits((pr, pc), (cr, cc), now, Self::TYPE_HINT_FRESH)
+            })
+            .map(|candidate| candidate.intent);
+        let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, admitted_intent);
+        // Rainbow-kitty morphology is computed only after candidate admission:
+        // row changes and large same-row skips can then select a linear ZOOM
+        // streak instead of disconnected per-cell sparks.
+        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
+        // Legacy classifier stamps are consumed on the first observed delta but
+        // cannot admit it. Exact or explicit synthetic candidates are the sole
+        // provenance for every style; these booleans remain false so Return and
+        // reflow timestamps cannot bypass the universal gate.
+        let _ = self
+            .reflow_hint
+            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH);
+        let reflow_licensed = false;
+        // Consume Return once even though it cannot admit; it must not survive
+        // as stale morphology for a later exact candidate.
+        let _ = self.return_hint.take_if(|t| {
+            now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
+        });
+        let return_licensed = false;
+        // Consume Tab/paste once even though the timestamp cannot prove which
+        // later PTY movement, if any, the child authored.
+        let _ = self.user_gesture_hint.take();
+
+        // COLD PROGRAM MOVEMENT IS NOT A TRAIL EVENT.  The old anti-stray gate
+        // covered only the ZOOM/starburst branch.  When that branch declined a
+        // cold, unhinted warp, control fell through to the generic comet path,
+        // which still laid ribbon sparks and a landing ring; `tick` then armed
+        // the cursor crown unconditionally.  A one-cell PTY advance was worse:
+        // geometry alone classified it as `typing`, so one output cell per
+        // frame could leave isolated rainbow segments without a single key.
+        //
+        // Admit every built-in style and Trail Pack only after the shared exact
+        // candidate gate has paired this delta with proven typed/delete content
+        // or an explicit synthetic preview. The legacy timestamps below remain
+        // morphology inputs only; Return/navigation/Tab/paste/reflow without a
+        // candidate stay dark. Historical momentum is amplitude, never
+        // provenance. Fail closed before thermals/sound/births so program output
+        // cannot pollute heat, glide velocity, or a future landing anchor.
+        let move_witnessed = admitted_intent.is_some();
+        if !move_witnessed {
+            // A denied relocation changes the coordinate owner for EVERY
+            // style, including Trail Packs. Retire the common transient state
+            // in one exhaustive teardown: leaving even a non-typing spark,
+            // beam/bolt/water endpoint, meteor, vapor wisp, ring, or outgoing
+            // crossfade alive would strand it over unrelated content.
+            self.clear_denied_move_visuals();
+            return false;
+        }
+
         let gap = self.update_typing_thermals(&mv);
         self.retire_abandoned_light(&mv);
         self.cue_move_sound(&mv);
@@ -7095,27 +7889,6 @@ impl CursorGlow {
         } else {
             0.07
         };
-        // Rainbow kitty JUMP classification: any row change (wrap / Enter / a vertical
-        // move) or a big same-row skip gets the linear ZOOM streak — one clean
-        // beam along the jump vector — instead of per-cell sparks (which read as
-        // disjoint row segments).
-        let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
-        // THE RESIZE LICENSE, consumed ONCE per spawn for EVERY style (owner,
-        // 2026-07-28: "all get"). `spawn` runs only on an observed move, and the
-        // first move after a settled resize IS the relayout relocation, so this
-        // pairs with the right one; one gesture therefore licenses exactly one
-        // streak no matter which style is drawing it.
-        //
-        // Two arms read it, because two styles refuse a cold relayout leap for
-        // their own reasons: the rainbow kitty's ZOOM is momentum-gated (the anti-stray law)
-        // and Phaser CLEARS its swept path on any row change ("the band belongs
-        // to typed letters only"). Every other style's jump path is already
-        // ungated and needs no license. It also suppresses the landing payload —
-        // a resize gets the BEAM ONLY.
-        let reflow_licensed = self
-            .reflow_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH)
-            .is_some();
         self.track_glide_run(&mv);
         // FADE AS ONE: a spark's chained life is a BET that the rhythm that
         // granted it continues. Rainbow kitty: a lone key after a long pause bets on a
@@ -7144,14 +7917,10 @@ impl CursorGlow {
                 s.life = s.life.min(age + spark_life);
             }
         }
-        // FIRE METEOR classification: any row change (Enter, wrap, vim motions)
-        // or a long same-row skip — INCLUDING a navigation jump (Ctrl-A/E,
-        // Home/End; see `note_navigation`) — flies ONE pixel-space streak along
-        // the true jump vector, and spawns NO per-cell sparks, so no curtain
-        // column, beam segment, or ember bed ever anchors to cells the cursor
-        // never visited (pinned by the regression law test). Navigation still
-        // earns NO heat and never slams the field-wide flare: the meteor + its
-        // landing strike are the whole show.
+        // FIRE METEOR classification for an admitted non-typing move: a row
+        // change or long same-row skip flies one pixel-space streak along the
+        // true vector and spawns no per-cell sparks. A navigation timestamp alone
+        // never reaches this point.
         let fire_meteor =
             mv.fire && !mv.typing && (mv.dr_abs >= 1 || mv.dc_abs >= Self::METEOR_MIN_COLS);
         let hue_advances = self.spawn_move_light(
@@ -7162,6 +7931,7 @@ impl CursorGlow {
             hue_step,
             fire_meteor,
             reflow_licensed,
+            return_licensed,
         );
         self.scatter_terminus_at_margin(&mv);
         // Advance the rolling rainbow hue a little each move. Phaser cycles at
@@ -7179,13 +7949,13 @@ impl CursorGlow {
             let drop = self.particles.len() - Self::MAX_PARTICLES;
             self.particles.drain(0..drop);
         }
+        true
     }
 
-    /// Classify one observed cursor move — typing vs. jump, with the wrap /
-    /// re-anchor / coalesced-echo collapses and the deletion / navigation hint
-    /// pairings — and feed the fast-glide velocity spine. Consumes the typed /
-    /// quench / nav hints exactly as the classification always did (one hint =
-    /// one echo), and applies the deletion's fresh-ink kill.
+    /// Classify one candidate-admitted cursor move — typing vs. jump, with the
+    /// wrap/re-anchor/coalesced-echo collapses and bounded classifier hints — and
+    /// feed the fast-glide velocity spine. Timestamp hints tune morphology only;
+    /// `admitted_intent` already carries the causal proof.
     #[allow(
         clippy::too_many_arguments,
         reason = "from/to cursor cells + clock + config + geometry; packing them into a struct would only obscure a single internal call site"
@@ -7199,6 +7969,7 @@ impl CursorGlow {
         now: Instant,
         cfg: &'a GlowConfig,
         geom: Geom,
+        admitted_intent: Option<GlowMoveIntent>,
     ) -> MoveCtx<'a> {
         // A single-cell advance is TYPING; a multi-cell delta is a real cursor JUMP.
         // The jump distance drives BOTH the comet lifetime and the ring/particle burst.
@@ -7243,8 +8014,8 @@ impl CursorGlow {
         // can only match the original tight arm; a LIVE typing rhythm (`last_type`
         // within the chain window) — mid-burst only, so a cold-start jump that
         // happens to match the shape keeps its owner-mandated drama; and the MAIN
-        // screen — on the alt screen the blink discriminator below stays the sole
-        // re-anchor authority (vim's hinted motions keep their jumps).
+        // screen — on the alt screen the blink discriminator below selects
+        // re-anchor morphology only after candidate admission.
         let wrap_echo_rhythm = self.last_type.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::PHASER_CHAIN_GAP_MAX
         });
@@ -7254,12 +8025,10 @@ impl CursorGlow {
                     && (pc as usize) + 4 >= geom.cols
                     && wrap_echo_rhythm
                     && !self.ctx_alt));
-        // TYPED RE-ANCHOR: a fresh typed-glyph/backspace hint paired with a one-row
-        // move beyond the typed advance is a TUI repaint re-anchor (Ink/Claude Code
-        // rewraps its whole INSET input box per keystroke, so the wrap launches from
-        // the interior right edge and lands right of column 1 — the bare-terminal
-        // SHAPE test above misses on both conditions): the caret never travelled
-        // through the interpolated cells, so it must not meteor/ZOOM/bolt/sweep them.
+        // TYPED RE-ANCHOR: after exact/synthetic admission, a fresh typed or
+        // Backspace classifier can collapse a one-row move beyond the typed
+        // advance into TUI repaint morphology. The caret never travelled through
+        // the interpolated cells, so it must not meteor/ZOOM/bolt/sweep them.
         // `dr_abs <= 1` covers wrap-down (typed glyph), wrap-back-up
         // (backspace joining the previous visual line), AND the BOX-GROWTH wrap
         // (live-verified in Claude Code: its bottom-anchored input box grows a
@@ -7270,37 +8039,37 @@ impl CursorGlow {
         // the owner-mandated meteor path;
         // `raw_dist > 2.0` keeps every possible ConPTY hide-bridged move (chebyshev
         // ≤ HIDE_BRIDGE_MAX_DIST = 2) byte-identical — the bridge law holds exactly.
-        // Consume the typed hint on any paired move (bounded state, one hint = one
-        // echo); PEEK the quench hint — the deletion classifier below still owns
-        // its consumption.
-        let typed_pair = self
+        // Consume the typed classifier once; candidate intent independently
+        // decides whether it may pair. Peek the quench classifier because the
+        // exact deletion arm below owns its consumption.
+        let typed_at = self
             .type_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::TYPE_HINT_FRESH)
-            .is_some();
+            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::TYPE_HINT_FRESH);
+        let typed_pair = typed_at.is_some()
+            && matches!(
+                admitted_intent,
+                Some(GlowMoveIntent::Typed(_) | GlowMoveIntent::SyntheticTyped)
+            );
         let bs_pair = self.quench_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::QUENCH_HINT_FRESH
         });
-        // ALT-SCREEN blink requirement: on the alt screen the hint pairing
-        // alone is not proof of a repaint re-anchor — the REPAINT BLINK is the
-        // discriminator between a full-redraw TUI and vim/less-style deliberate
-        // jumps; main screen keeps the conjunct vacuously true. Contract +
-        // deliberate main-screen deltas: the field doc on `blink_hint`.
+        // ALT-SCREEN blink classifier: once candidate admission is established,
+        // the repaint blink distinguishes a full-redraw TUI re-anchor from other
+        // scripted morphology. It is never causal proof itself.
         let blink_fresh = self.blink_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::BLINK_HINT_FRESH
         });
-        // A fresh NAV hint VETOES the re-anchor (peeked — the navigation
-        // classifier below still owns consumption): Ctrl-A/E/Home/End are
-        // deliberate jumps whose meteor is owner-mandated, and with dr == 0 now
-        // accepted (the box-growth wrap) a same-row nav leap right after typing
-        // would otherwise pair with the dying typed hint. Defense in depth —
-        // the host also disarms typed hints on nav presses.
+        // A fresh NAV timestamp vetoes a dying typed re-anchor class. It cannot
+        // admit its own relocation, but it must still prevent an older exact
+        // typed candidate from being reinterpreted after supersession.
         let nav_paired = self.nav_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::NAV_HINT_FRESH
         });
         // ECHO RUN — TYPING CONTINUATION: a fast burst's echo can advance the
         // cursor 2-3 cells between two observed frames (coalesced PTY echo — at
         // robotic cadence routinely, at human cadence whenever a frame slips).
-        // Paired with a fresh typed hint it is CONTINUED TYPING, not a jump:
+        // Paired with a fresh typed classifier and admitted candidate it is
+        // CONTINUED TYPING, not a jump:
         // classifying it as a jump slams the flare, fires the ring, and lays
         // long-lived jump sparks between short-lived typing sparks — a "picket
         // fence" burst trail. The swept cells are laid as
@@ -7330,15 +8099,15 @@ impl CursorGlow {
             && (!self.ctx_alt || blink_fresh);
         let wrap = shape_wrap || re_anchor;
         // RAINBOW KITTY TYPED-COALESCE: a same-row FORWARD hop of 2..=RAINBOW_TYPED_SWEEP_MAX
-        // cells backed by a fresh typed echo is CONTINUED TYPING observed late —
+        // cells backed by an admitted typed candidate is CONTINUED TYPING observed late —
         // PTY batching / frame quantization delivers several echoed glyphs as one
         // observed move — not a jump. It collapses `dist` exactly like a wrap, so
         // it classifies as typing (the swept cells laid by `row_sweep_cells`
         // below join the ribbon's chained-life system instead of leaving a hole)
         // AND no jump choreography — landing ring, particle burst — fires on a
         // move that is just letters arriving. The alt screen keeps the blink
-        // discriminator: vim's hinted word-hops are deliberate jumps, only a
-        // repaint-blinking app (Claude Code) coalesces. Other styles keep their
+        // discriminator: only an admitted repaint-blinking app preview
+        // coalesces. Other styles keep their
         // shipped classification byte-identically.
         let rainbow_coalesce = matches!(cfg.style, GlowStyle::RainbowKitty)
             && typed_pair
@@ -7360,10 +8129,20 @@ impl CursorGlow {
             // user only skimmed.
             && self.typed_credits_within(now, Self::RAINBOW_COALESCE_PRESS_WINDOW)
                 >= dc_abs as usize;
-        // An admitted coalesce SPENDS what funded it: the same pool can never
-        // pay for a second stray multi-cell echo inside the window.
+        // Every OBSERVED typed echo spends the credits it owns, not only the
+        // multi-cell coalesce.  Otherwise ordinary one-cell echoes leave their
+        // already-used credits in the ring; one later swallowed key can then
+        // pair its still-fresh hint with those historical credits and fund a
+        // program-owned multi-cell hop.  A coalesce spends every swept cell
+        // oldest-first, preserving genuinely pending cells in a batched run.
+        // A non-coalesced echo/wrap/re-anchor retires every commit through its
+        // consumed hint: cursor geometry cannot price a wide/ZWJ commit after
+        // a wrap or distinguish partial echoes from older in-flight presses.
         if rainbow_coalesce {
             self.spend_typed_credits(now, dc_abs as usize);
+        }
+        if let Some(typed_at) = typed_at {
+            self.retire_typed_commits_through(typed_at);
         }
         // WAKE FOLD CARRY: a positively classified typed WRAP stashes the old
         // row's plume length so the underline hands its energy across the
@@ -7393,8 +8172,8 @@ impl CursorGlow {
             self.rainbow.wake_fold_carry = None;
         }
         let fire = matches!(cfg.style, GlowStyle::Fire);
-        // EMBERFORGE momentum direction: only a FORWARD advance (one column
-        // right on the same row — a typed glyph's echo) earns heat/coal.
+        // EMBERFORGE momentum direction: only an admitted FORWARD advance (one
+        // column right on the same row — a typed glyph's echo) earns heat/coal.
         // Backward, vertical, and diagonal single-cell moves still spawn their
         // wake (visual continuity) but add no momentum — scrubbing around a
         // file is navigation, not writing. A DELETION echo is the move paired
@@ -7407,7 +8186,8 @@ impl CursorGlow {
                 .take_if(|t| {
                     now.saturating_duration_since(*t).as_secs_f32() <= Self::QUENCH_HINT_FRESH
                 })
-                .is_some();
+                .is_some()
+            && matches!(admitted_intent, Some(GlowMoveIntent::Delete));
         // FRESH-INK KILL: a backspace-classified retreat ERASED the glyph at
         // the landing cell (and, for a coalesced multi-backspace echo, every
         // cell from the landing to the old caret) — a pop must die WITH its
@@ -7418,24 +8198,16 @@ impl CursorGlow {
         if deletion && !self.rainbow.ink_pops.is_empty() {
             self.rainbow.ink_pops.retain(|p| p.row != cr || p.col < cc);
         }
-        // NAVIGATION classification (responsiveness): a same-row cursor move
-        // paired with a fresh navigation key-hint ([`Self::note_navigation`] —
-        // Ctrl-A/E, Home/End, held Left/Right arrows) is scrubbing, not writing.
-        // It earns NO heat and (below) spawns NO meteor and never slams the
-        // arrival flare, so jumping to line start/end can't erupt a full-width
-        // white-hot blaze. The hint — not move shape — is the classifier, so a
-        // typed glyph, Enter, or wrap (which never arm the hint) still ignite
-        // normally. Consume the hint on any paired move to keep the state bounded.
-        // The hint pairs with the move in ANY direction: Up/Down/PageUp/PageDown
-        // arm the very same hint (app_input's `navigation_key`), so a held
-        // vertical arrow is scrubbing exactly like a held horizontal one. Do NOT
-        // add a `cr == pr` conjunct: it would consume the hint on a vertical
-        // move yet classify it as typing, and held Up/Down would max the heat
-        // into the 1.2× sprint overdrive.
+        // NAVIGATION morphology remains bounded behind causal admission. The
+        // timestamp itself is consumed here but cannot make `navigation` true;
+        // only a separately admitted compatible intent could reach this legacy
+        // classifier. Thus raw Ctrl-A/E, Home/End and arrow timestamps stay dark
+        // in every direction instead of heating or birthing light.
         let navigation = self
             .nav_hint
             .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
-            .is_some();
+            .is_some()
+            && matches!(admitted_intent, Some(GlowMoveIntent::Delete));
         MoveCtx {
             pr,
             pc,
@@ -7847,7 +8619,7 @@ impl CursorGlow {
         // ENTER IS A GESTURE, NOT A REPAINT. A bare Return from column 0 or 1 is
         // a chebyshev-1 row change that would otherwise match this arm exactly,
         // and the line it leaves still holds the command you just typed. Peeked,
-        // never consumed — the un-hinted jump arm owns the return license.
+        // never consumed as retirement morphology; it is not movement admission.
         //
         let returned = self.return_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::RETURN_HINT_FRESH
@@ -7858,8 +8630,8 @@ impl CursorGlow {
         // An agent composer binds Shift+Enter to "insert a line break without
         // submitting". That is a REAL user-authored break: the row it leaves
         // holds the words the user just typed, and the ribbon over them is the
-        // trail of typing them. But the host arms the TYPED hint on that chord
-        // (the box repaints, so the move must re-anchor rather than meteor), and
+        // trail of typing them. With an admitted typed candidate on that chord,
+        // the box repaint classifies as a re-anchor, and
         // the observed move — one row down, back to the box's left inset — is
         // pixel-for-pixel the reflow relocation this arm exists to catch. The
         // classifier above cannot separate them: `(3,20) → (4,4)` is a composer
@@ -7868,7 +8640,7 @@ impl CursorGlow {
         //
         // So the host says which ([`Self::note_newline_break`]). PEEKED, never
         // consumed: a composer repaints over several observed frames and the
-        // first one must not spend the license the rest need. It is not folded
+        // first one must not spend the classifier the rest need. It is not folded
         // into `fold` because it is not a fold — a fold's previous row ran out of
         // room, this one was ENDED — and the two want different evidence.
         let newline_break = self.newline_hint.is_some_and(|t| {
@@ -7955,13 +8727,10 @@ impl CursorGlow {
         // cue's blaze matches what this frame will look like). Kill cues fire
         // at the poof site instead — a kill's echo may not move the caret.
         //
-        // A hinted CURSOR MOVE sings IN the melody rather than sounding a flat
-        // "Navigation" whisper. A single-cell scrub GLIDES one in-key step;
-        // a fast or coalesced run (Ctrl-A/E, word motion, a batched held
-        // arrow) SWEEPS a short scale run — both carrying the travel DIRECTION
-        // so the cursor sound sits in the same key as the tune. Direction is
-        // the column sign when the move is horizontal, else the row sign
-        // (moving UP the screen reads as brighter/up).
+        // An admitted navigation-classified move sings in the melody. A short
+        // scrub GLIDES one in-key step; a fast/coalesced run SWEEPS a short scale
+        // run, both carrying travel direction. Raw key timestamps never reach
+        // this cue path because sound shares the visual candidate gate.
         //
         // ONE KEYPRESS, ONE CLICK — DEBITED ONLY BY THE ARMS A PRINTABLE KEY'S ECHO
         // CAN LAND ON (`typing` and the `else` Jump), never by `deletion` or
@@ -8263,12 +9032,13 @@ impl CursorGlow {
         // (excluded by `!(dr_abs>=1 || dc_abs>=RAINBOW_JUMP_MIN)` — a jump is a single
         // large delta, this is sustained same-row speed), NOT a typing advance
         // (`!typing`, so coalesced typed sweeps are excluded), NOT a delete run
-        // (`!deletion` — that has its own poof). USER-driven only (`navigation`:
-        // a held arrow / word motion / Ctrl-nav armed the nav hint), so a bare
-        // PROGRAM cursor warp — which arms no hint — never mints a stray streak
-        // (the anti-stray contract). It fires REPEATEDLY along the glide, rate-
-        // limited by GLIDE_STAR_MIN_GAP and GLIDE_STAR_CAP-capped so a flung
-        // cursor can't saturate. Additive to whatever the emit chain below lays.
+        // (`!deletion` — that has its own poof). Causally admitted navigation
+        // only (`navigation`): a raw arrow/word-motion/Ctrl-nav timestamp cannot
+        // reach this arm, and a bare PROGRAM cursor warp has no candidate either,
+        // so neither can mint a stray streak. It fires REPEATEDLY along an
+        // admitted glide, rate-limited by GLIDE_STAR_MIN_GAP and
+        // GLIDE_STAR_CAP-capped so a flung cursor can't saturate. Additive to
+        // whatever the emit chain below lays.
         // STRAIGHT-LINE RUN tracker (owner: "when the cursor moves quickly in a
         // straight line"). One axis, one direction, N consecutive observed
         // moves. Tracked on EVERY rainbow-kitty move so a flip or a diagonal breaks the
@@ -8298,10 +9068,11 @@ impl CursorGlow {
         // per-frame-distance-shaped is required.
         //
         // ANTI-PHANTOM PROOF (this must never resurrect `ink_wrap_line_fill_repro`):
-        //   1. `navigation` is REQUIRED and is armed ONLY by `note_navigation`,
-        //      i.e. a real key. A TUI repaint arms no hint, and that repro
-        //      harness arms only `note_typed` — so this arm is structurally
-        //      unreachable there. That alone preserves the fix.
+        //   1. `navigation` is REQUIRED and can become true only after causal
+        //      candidate admission plus compatible morphology. `note_navigation`
+        //      alone is a classifier timestamp, never provenance. A TUI repaint
+        //      and the repro's raw `note_typed` stamp therefore cannot reach this
+        //      arm. That alone preserves the fix.
         //   2. Independently, on SHAPE: the Ink wrap (`dr=+1, dc=-73`) is
         //      DIAGONAL, so axis-purity refuses it and the run resets to 0; the
         //      box-growth wrap (`dr=0, dc=+73`) has `raw_dist >= RAINBOW_JUMP_MIN`,
@@ -8369,6 +9140,7 @@ impl CursorGlow {
         hue_step: f32,
         fire_meteor: bool,
         reflow_licensed: bool,
+        return_licensed: bool,
     ) -> f32 {
         let &MoveCtx {
             pr,
@@ -8452,29 +9224,13 @@ impl CursorGlow {
             && !navigation
             && (dr_abs >= 1 || dc_abs >= Self::RAINBOW_JUMP_MIN)
             && (self.rainbow.disp >= Self::RAINBOW_JUMP_MIN_DISP
-                || self
-                    .return_hint
-                    .take_if(|t| {
-                        now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
-                    })
-                    .is_some()
+                || return_licensed
                 || reflow_licensed)
         {
-            // (`!navigation`: a Ctrl-A/E / Home/End scrub must NOT throw the
-            // rainbow ZOOM across the line it skims — a bare Ctrl-E would
-            // repaint a fresh saturated ribbon over the whole cursor path even
-            // after seconds of idle. Nav-paired moves fall through to the
-            // no-wake navigation arm below; a real Enter/wrap/TUI jump still
-            // zooms WHILE TYPING MOMENTUM IS WARM (`RAINBOW_JUMP_MIN_DISP`) — a
-            // COLD program-driven warp (a spinner's CUP loop, a background
-            // TUI repaint, hours of idle output) mints nothing, which is the
-            // anti-stray contract: no keystroke, no trail.
-            //
-            // A settled RESIZE ([`Self::reflow_hint`]) is the third license,
-            // alongside the warm spine and the bare Enter: the hand dragged the
-            // window edge, so the relayout leap is a gesture the user made and
-            // earns its streak even from cold. It is a HINT, never move shape —
-            // the cold program-driven warp above arms nothing and stays mute.)
+            // This is generic admitted jump morphology. The shared candidate
+            // gate has already excluded bare Enter, navigation, reflow and
+            // program-owned CUP relocations; momentum now controls only whether
+            // an admitted rainbow preview has enough live ribbon to zoom.
             let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
             let (oxf, oyf) = (geom.origin_x as f32, geom.origin_y as f32);
             // CROSS-GEOMETRY ORIGIN CLAMP. `(pr, pc)` is the cell the cursor
@@ -8494,11 +9250,10 @@ impl CursorGlow {
             // LANDING PAYLOAD (Features A + B) — the celebratory STARBURST at
             // the landing and the graceful dissolve of the abandoned ribbon
             // TERMINUS at the pre-jump head. Split into `emit_rainbow_jump_landing`
-            // so the navigation arm below can fire the SAME payload for a
-            // Ctrl-A/E/Home/End leap (finding 1) — a big jump is a big jump —
-            // while this ZOOM wake streak stays `!navigation`-gated. Inside the
+            // so any future separately admitted navigation intent can reuse the
+            // same morphology while this ZOOM wake stays `!navigation`-gated. Inside the
             // helper the burst is fast-jump-gated + [`Self::RAINBOW_BURST_CAP`]-
-            // capped (a Ctrl-A/E mash stays bounded), the terminus is ribbon-
+            // capped (a scripted jump mash stays bounded), the terminus is ribbon-
             // gated (finding 3), and both honour reduced-motion (finding 2).
             let landing = (oxf + (cc as f32 + 0.5) * cwf, oyf + (cr as f32 + 0.5) * chf);
             let terminus = (
@@ -8520,35 +9275,10 @@ impl CursorGlow {
             // The hue still advances and the landing ring/particles below still
             // fire; only the per-cell spark path is skipped.
         } else if navigation {
-            // NAVIGATION (Ctrl-A/E, Home/End, held arrows): scrubbing lays NO
-            // saturated ribbon WAKE — no meteor (gated above), no comet, no
-            // per-cell sparks, no ZOOM streak, and (via the `!navigation` guards
-            // below) no landing ring or ember fountain. Navigating to line
-            // start/end stays wake-free; a real typed glyph/Enter/wrap (which
-            // never arm the nav hint) still ignites normally.
-            //
-            // FINDING 1 — but a LARGE navigation jump is STILL a big jump. The
-            // literal Ctrl-A/E/Home/End gestures the owner named ("AND when
-            // jumping the cursor eg ctrl-a") arm this hint, so before the fix
-            // they fell through to a pure no-op and fired NEITHER the landing
-            // starburst NOR the terminus dissolve — the exact hard-cut the owner
-            // reported. Only the ZOOM ribbon WAKE is navigation-excluded (a bare
-            // Ctrl-E must not repaint a saturated rainbow over the line it skims
-            // — the preserved design at the `!navigation` gate above); the
-            // celebratory landing payload is NOT. So a qualifying large nav jump
-            // fires the SAME `emit_rainbow_jump_landing` — starburst + graceful
-            // terminus — as an un-hinted jump. The helper's burst cap keeps a
-            // Ctrl-A/E mash (which now actually reaches this code) bounded.
-            //
-            // 2026-07-29 — AND THE ZOOM STREAK, which used to be the one piece
-            // withheld here (owner: "I STILL don't see rainbow streaks when I do
-            // control-a control-e"). See [`Self::RAINBOW_STREAK_MIN_DIST`]: the old
-            // gate conflated the transient BEAM with the persistent per-cell
-            // RIBBON. Only the ribbon was ever the defect, and the ribbon is laid
-            // by the spark path further down — which this arm still skips
-            // entirely. So zipping the cursor across the line now draws its
-            // rainbow line, and a bare Ctrl-E still repaints no saturated ribbon
-            // over the row it skims.
+            // Separately admitted navigation morphology: no saturated per-cell
+            // ribbon, meteor, comet, landing ring or ember fountain. A qualifying
+            // large admitted jump may reuse the transient streak/landing payload.
+            // Raw Ctrl-A/E/Home/End/arrow timestamps never reach this arm.
             if rainbow_kitty && !typing && (dr_abs >= 1 || dc_abs >= Self::RAINBOW_JUMP_MIN) {
                 let cwf = geom.cw as f32;
                 let chf = geom.ch as f32;
@@ -8580,8 +9310,9 @@ impl CursorGlow {
             // in `emit_particles` — the poof's one 4-point plus is its HERO grain
             // (the sparkle rebalance: sparks are the body, '+' the accent). Repeated
             // backspaces lay a train of poofs chasing the cursor leftward.
-            // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-rainbow kitty styles
-            // fall through to the comet path, so their deletion read is unchanged.
+            // Deterministic via `frand`; MAX_PARTICLES-bounded. Non-rainbow-kitty
+            // styles use their ordinary deletion path only after the same exact
+            // content candidate has passed the universal gate.
             //
             // ONE POOF, ONE LAW: this echo path used to hand-roll its own
             // 6-10 omnidirectional cloud while the span detector
@@ -8673,8 +9404,8 @@ impl CursorGlow {
             } else if re_anchor {
                 // TUI RE-ANCHOR (non-rainbow-kitty): the caret never travelled the
                 // interpolated cells — the repaint relocated it — so only the
-                // landing gets a wake. (A bare-terminal fold that ALSO pairs with
-                // the typed hint takes the wrap-run arm above: its cells really
+                // landing gets a wake. (A bare-terminal fold that also carries
+                // admitted typed intent takes the wrap-run arm above: its cells really
                 // were typed.)
                 self.path_scratch.push((cr as i32, cc as i32));
             } else {
@@ -8998,15 +9729,13 @@ impl CursorGlow {
                 // FRESH-INK POP BIRTHS — the typed GLYPH cells of this move.
                 // Gates, in order of what they prove:
                 //   * `rainbow_kitty` — the pop is rainbow-kitty-only;
-                //   * `typed_pair` — a fresh committed-press hint PAIRED this
-                //     move (the host's app_input seam is the only `note_typed`
-                //     caller), so PTY echo alone can NEVER pop: a program
-                //     printing text moves the cursor identically but carries
-                //     no hint;
+                //   * `typed_pair` — an exact content-confirmed typed candidate
+                //     (or explicit synthetic twin) paired this move, so a press
+                //     timestamp or PTY output alone can NEVER pop;
                 //   * `!deletion && !navigation` — erasing and scrubbing are
                 //     not writing (the kill above already ran for deletions);
                 //   * glyph-SHAPED — same-row forward advance or a typing
-                //     wrap fold: a hinted vertical move (Shift+Enter insert)
+                //     wrap fold: an admitted vertical move (Shift+Enter insert)
                 //     lays no glyph in its vacated cell, so it must not pop
                 //     it. (A TUI re-anchor's relocated caret is likewise
                 //     conservative: no provable glyph cell, no pop.)
@@ -10231,14 +10960,12 @@ impl CursorGlow {
         {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
+            self.confirmed_delete_span = None;
         }
-        // A poof is licensed by EITHER a kill chord (`kill_hint`) OR a plain
-        // Backspace (`bs_poof_hint`): both mean "text is vanishing, puff the
-        // vacated span". They share the whole downstream span/fallback machinery
-        // and the `POOF_MIN_GAP` rate gate; only their arming semantics differ.
+        // Kill chords retain the legacy row-diff/fallback license. Plain
+        // Backspace reaches only the exact confirmed-span branch below; its
+        // timestamp cannot enter `fresh_kill`.
         let fresh_kill = self.kill_hint.is_some_and(|t| {
-            now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
-        }) || self.bs_poof_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
         });
         let gap_ok = self
@@ -10247,8 +10974,30 @@ impl CursorGlow {
         // `poofed` tracks whether the precise span branch answered this frame;
         // the caret-anchored fallback below covers everything it cannot.
         let mut poofed = false;
+        // A plain Backspace with an exact candidate owns one cell and ONLY one
+        // cell. Do not diff against `row_prev`: it may be an older presented
+        // row whose suffix disappeared before the key, which would inflate the
+        // poof over unrelated program-cleared text.
+        if gap_ok
+            && let Some((at, row, col)) = self.confirmed_delete_span.take()
+            && self.bs_poof_hint == Some(at)
+        {
+            // The admitted cursor move already emitted the Backspace cue. The
+            // exact one-cell poof is its visual twin, not a second Kill sound.
+            self.spawn_poof(row, col, col.saturating_add(1), 1, now, cfg, geom, false);
+            if !self.rainbow.ink_pops.is_empty() {
+                self.rainbow
+                    .ink_pops
+                    .retain(|pop| pop.row != row || pop.col != col);
+            }
+            self.last_poof = Some(now);
+            self.bs_poof_hint = None;
+            self.bs_baseline = None;
+            poofed = true;
+        }
         if fresh_kill
             && gap_ok
+            && !poofed
             && let (Some(prev), Some(cur)) = (self.row_prev_meta, self.row_cur_meta)
             && prev.row == cur.row
             && cur.fill < prev.fill
@@ -10295,7 +11044,7 @@ impl CursorGlow {
                 let c0 = p.min(prev.caret as usize).min(cur_fill) as u16;
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
                 let n = (prev.fill - cur.fill).max(1);
-                self.spawn_poof(prev.row, c0, c1, n, now, cfg, geom);
+                self.spawn_poof(prev.row, c0, c1, n, now, cfg, geom, true);
                 // FRESH-INK KILL (span twin of the backspace retreat retain in
                 // `spawn`): a Ctrl-U/K/W span kill erased every glyph in
                 // `[c0..c1)` of `prev.row`, so any fresh-ink pop over those cells
@@ -10326,39 +11075,23 @@ impl CursorGlow {
         // reads as honest feedback. Requires a probe this frame (headless /
         // scrolled-back frames stay quiet) and respects the rate gate (a held
         // kill key poofs at most once per POOF_MIN_GAP).
-        // The grace timer keys off WHICHEVER hint licensed this poof (kill chord
-        // or plain Backspace): the span branch above gets first crack for the
-        // first `POOF_FALLBACK_GRACE`, then the caret fallback answers.
+        // The kill-chord grace gives the precise span branch first crack for
+        // `POOF_FALLBACK_GRACE`, then the caret fallback answers.
         let poof_hint_at = match (self.kill_hint, self.bs_poof_hint) {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        // A plain Backspace must PROVE it erased something before the caret
-        // fallback answers. The kill-CHORD fallback stays permissive — its hint
-        // is proof a kill KEY was pressed, and "a kill with nothing to kill
-        // still reads as honest feedback" (the reflowing-TUI case the fallback
-        // exists for). But an ordinary Backspace at column 0 / on an empty row
-        // erases NO cell, so when the ONLY licensing hint is `bs_poof_hint`
-        // (kill hint absent) we demand real-shrink evidence.
-        //
-        // TWO WITNESSES, because one of them is blind exactly when it matters.
-        // `erasure_proven` is the live frame-to-frame diff; it only exists while
-        // frames are flowing, and a lone correction after a pause is by
-        // definition the case where they are not (see [`Self::bs_baseline`]).
-        // `bs_erased` asks the same question against the row stamped AT THE KEY,
-        // which is the only observation that predates the erase in that case.
+        // This fallback is kill-chord-only: `fresh_kill` above excludes plain
+        // Backspace, whose exact confirmed span already had its sole branch.
+        // Keep the older Backspace-shaped predicates defensive if the outer gate
+        // is ever widened, but do not mistake them for present-day admission.
         let bs_only = self.kill_hint.is_none();
         let erasure_proven = self
             .row_prev_meta
             .zip(self.row_cur_meta)
             .is_some_and(|(prev, cur)| prev.row == cur.row && cur.fill < prev.fill);
-        // …and the same question asked against the row as it stood AT THE KEY
-        // ([`Self::bs_baseline`]), which survives the frame gap the live diff
-        // cannot. With no baseline stamped the host simply was not composing,
-        // so "no shrink observed" proves nothing; fall back to the honest
-        // weaker witness — the caret is off column 0, so a Backspace here COULD
-        // have erased. A no-op Backspace at the left margin (and its autorepeat
-        // there) still stays silent, which is the case this gate exists for.
+        // Legacy row witnesses remain part of that defensive inner predicate;
+        // they never replace `confirmed_delete_span` for a plain Backspace.
         let erase_on_glass = self.poof_erase_witnessed();
         let bs_erased = erase_on_glass
             || matches!(
@@ -10396,7 +11129,7 @@ impl CursorGlow {
             && let Some(cur) = self.row_cur_meta
         {
             let c0 = cur.caret;
-            self.spawn_poof(cur.row, c0, c0 + 3, 3, now, cfg, geom);
+            self.spawn_poof(cur.row, c0, c0 + 3, 3, now, cfg, geom, true);
             self.last_poof = Some(now);
             self.kill_hint = None;
             self.bs_poof_hint = None;
@@ -10435,7 +11168,7 @@ impl CursorGlow {
     /// - COMET: ice glints — shattered frost.
     #[allow(
         clippy::too_many_arguments,
-        reason = "span + clock + config + geometry; one internal call site (poof_scan)"
+        reason = "span + clock + config + geometry + cue ownership; kept explicit at the three poof_scan branches"
     )]
     fn spawn_poof(
         &mut self,
@@ -10446,10 +11179,15 @@ impl CursorGlow {
         now: Instant,
         cfg: &GlowConfig,
         geom: Geom,
+        cue_kill: bool,
     ) {
-        // SOUND: the kill's erase puff is the one visual a kill always earns —
-        // its cue rides the same edge (and the same POOF_MIN_GAP rate limit).
-        self.cue_sound(crate::trail_sound::SoundKind::Kill, c0);
+        // SOUND: a kill chord's erase puff is the one visual it always earns,
+        // so its cue rides this edge (and the same POOF_MIN_GAP rate limit).
+        // Plain Backspace already spoke on its admitted cursor retreat; its
+        // exact poof is visual-only so one physical key never clicks twice.
+        if cue_kill {
+            self.cue_sound(crate::trail_sound::SoundKind::Kill, c0);
+        }
         let cell = geom.ch as f32;
         let cwf = geom.cw as f32;
         let span_x0 = geom.origin_x as f32 + c0 as f32 * cwf;
@@ -11507,6 +12245,10 @@ impl CursorGlow {
         if p.crown.enabled
             && cfg.dark_theme
             && matches!(p.channels.halo, HaloChannel::Add | HaloChannel::Over)
+            // `last_move` is also the fast-glide clock and therefore is not an
+            // emission licence.  The one explicit crown arm is authoritative:
+            // clearing it on a denied/reset move must make this channel dark.
+            && self.crown_until.is_some_and(|until| now < until)
             && let Some((cr, cc)) = cur
             && (cr as usize) < geom.rows
             && (cc as usize) < geom.cols
@@ -12316,20 +13058,17 @@ impl CursorGlow {
         }
     }
 
-    /// FEATURES A + B — the LANDING PAYLOAD a large kitty cursor jump earns,
-    /// emitted SEPARATELY from the ZOOM wake streak so it can fire on BOTH an
-    /// un-hinted jump (Enter, a folding wrap, a TUI/vim leap) AND a NAVIGATION-
-    /// hinted one (Ctrl-A/E, Home/End — the literal gestures the owner named).
-    /// The ZOOM ribbon wake stays `!navigation`-gated at the caller (a bare
-    /// Ctrl-E must not repaint a saturated rainbow over the line it skims); this
-    /// celebratory payload is the ONLY part that crosses the navigation line.
+    /// FEATURES A + B — the LANDING PAYLOAD for a large, candidate-admitted
+    /// kitty jump. It is emitted separately from the ZOOM wake so generic and
+    /// separately admitted navigation morphology can share one implementation.
+    /// Timestamp-only Enter/navigation/reflow relocations never reach this helper.
     /// Two payloads, each gated on its own condition:
     ///
     /// * the FAST-JUMP STARBURST: a radial ray spray AT THE LANDING, only for a
     ///   genuinely fast jump (`dist >= RAINBOW_BURST_MIN_DIST`). A short one-row
     ///   wrap keeps only the streak; a real fling earns the celebration.
-    ///   [`Self::RAINBOW_BURST_CAP`]-capped so a Ctrl-A/E MASH — which reaches this
-    ///   code on the navigation path — stays bounded. The reach scales with the
+    ///   [`Self::RAINBOW_BURST_CAP`]-capped so a scripted jump mash stays bounded.
+    ///   The reach scales with the
     ///   jump distance, floored so a just-past-threshold fling still bursts and
     ///   capped so a screen-crossing leap can't fling rays into the padding.
     ///   Reduced-motion still SPAWNS one — [`Self::emit_rainbow_starburst`] renders
@@ -12343,10 +13082,9 @@ impl CursorGlow {
     ///   never laid a ribbon, so there is no edge to dissolve. The scatter itself
     ///   is reduced-motion-safe (finding 2 — see [`Self::scatter_rainbow_terminus`]).
     ///
-    /// Push ONE transient rainbow ZOOM beam from `from` to `to`. Shared by the
-    /// un-hinted jump branch and the NAVIGATION arm so a Ctrl-A/E leap and an
-    /// Enter/wrap leap draw the identical streak — one implementation, no second
-    /// copy to drift.
+    /// Push ONE transient rainbow ZOOM beam from `from` to `to`, after universal
+    /// candidate admission. Generic and navigation morphology share this one
+    /// implementation; raw timestamps cannot call it through `spawn`.
     ///
     /// The origin is clamped into the LIVE grid: `from` is the cell the cursor
     /// occupied under the PREVIOUS geometry, but the pixel conversion runs on this
@@ -12364,9 +13102,8 @@ impl CursorGlow {
     ///
     /// Called EXACTLY ONCE per observed jump, in the caller, and handed to
     /// both [`Self::push_jump_streak`] and [`Self::emit_rainbow_jump_landing`]
-    /// rather than re-rolled inside each: the two are separate calls on two
-    /// different branches (an un-hinted jump and a navigation one), and a
-    /// second draw would let a supernova landing arrive under an ordinary
+    /// rather than re-rolled inside each. A second draw would let a supernova
+    /// landing arrive under an ordinary
     /// streak — the one pairing the request rules out ("glitter supernova on
     /// landing impact WITH a big bright rainbow cursor path jump streak").
     ///
@@ -12437,15 +13174,12 @@ impl CursorGlow {
         // has no way to render them still — the same argument
         // `scatter_rainbow_terminus` makes), and an ACTIVITY WITNESS.
         //
-        // The witness is the same one the landing burst takes: a recent
-        // committed TYPED press. Without it, every arrow-key history recall and
-        // idle Ctrl-A/E at a cold prompt would strew glitter down a line the
-        // user has not touched — which is precisely the "spurious sparkle on a
-        // cold Ctrl-A" the terminus gate already exists to prevent
-        // (`cold_cursor_jump_scatters_no_terminus`). The BEAM still draws
-        // cold; only its debris is earned.
+        // This secondary amplitude witness is a recent committed TYPED press;
+        // universal candidate admission has already run. Without both, a cold
+        // relocation could strew glitter down untouched text — the family pinned
+        // by `cold_navigation_timestamp_scatters_nothing`.
         if self.reduced_motion
-            || self.typed_credits_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) == 0
+            || !self.typed_activity_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW)
         {
             return;
         }
@@ -12512,7 +13246,7 @@ impl CursorGlow {
         // jump) and drops the case where nothing has been typed at all.
         // Navigation keys are not typed presses, so idle recall is silent.
         if dist >= Self::RAINBOW_BURST_MIN_DIST
-            && self.typed_credits_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW) > 0
+            && self.typed_activity_within(now, Self::RAINBOW_BURST_ACTIVE_WINDOW)
         {
             if self.rainbow.bursts.len() >= Self::RAINBOW_BURST_CAP {
                 self.rainbow.bursts.remove(0);
@@ -15449,8 +16183,7 @@ impl CursorGlow {
                     // The column's colour and its luma compensation, folded
                     // into the coverage BEFORE the shared-headroom ledger so
                     // the composite-cap accounting stays exact per pixel.
-                    let (band_rgb, comp) =
-                        rainbow_wake_band_at(&bands, colx, self.rainbow.phase);
+                    let (band_rgb, comp) = rainbow_wake_band_at(&bands, colx, self.rainbow.phase);
                     let cov = (cov * comp).min(255.0);
                     // Independent edge rounding: the top and bottom edges
                     // each round to their own pixel, so a breathing thickness
@@ -15650,6 +16383,14 @@ impl CursorGlow {
         halos: &mut Vec<RainHalo>,
     ) {
         if cfg.radius <= 0.0 {
+            return;
+        }
+        // `last_move` also feeds movement timing and can be stamped by a move
+        // that deliberately declined visual admission.  `crown_until` is the
+        // bounded emission arm; without this guard, clearing that arm changed
+        // scheduler state but the crown still painted until `last_move` aged
+        // out — two stray halos with no live effect owning them.
+        if !self.crown_until.is_some_and(|until| now < until) {
             return;
         }
         let Some((cr, cc)) = cur else { return };
@@ -17601,6 +18342,7 @@ fn rainbow_slab_at(bands: &[u32; 6], t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cursor_trail::{CursorTrail, TrailConfig};
 
     #[test]
     fn swept_path_retains_only_the_bounded_landing_suffix() {
@@ -17640,6 +18382,43 @@ mod tests {
             born: now,
             fade_at: None,
         });
+    }
+
+    /// Test-only exact one-cell EOL deletion proof. Morphology fixtures use
+    /// this instead of treating a Backspace timestamp as movement provenance.
+    /// The caller must seed `origin` first, exactly as the real host does.
+    fn arm_exact_backspace(
+        glow: &mut CursorGlow,
+        now: Instant,
+        origin: (u16, u16),
+        target: (u16, u16),
+    ) {
+        assert_eq!(origin.0, target.0);
+        assert_eq!(origin.1, target.1.saturating_add(1));
+        let mut baseline = [' '; 40];
+        baseline[..usize::from(origin.1)].fill('x');
+        let snapshot = ExpectedRowSnapshot::from_slice(&baseline).unwrap();
+        let before = ContentGeneration {
+            process_sequence: 7,
+            terminal_id: 11,
+            alternate_screen: false,
+        };
+        glow.note_backspace(now);
+        glow.note_delete_candidate(now, target, snapshot, before);
+        let mut current = baseline;
+        current[usize::from(target.1)] = ' ';
+        glow.observe_row(target.0, target.1, &current, now);
+        assert!(matches!(
+            glow.confirm_content_candidate(
+                Some(target),
+                now,
+                ContentGeneration {
+                    process_sequence: before.process_sequence + 1,
+                    ..before
+                },
+            ),
+            Some(ContentCandidateDecision::Confirmed { .. })
+        ));
     }
 
     fn geom() -> Geom {
@@ -17822,7 +18601,7 @@ mod tests {
     /// Sound cues ride the spawn edge with the spawn's own classification,
     /// and the disable path drops them (proven-inert covers sound too).
     #[test]
-    fn sound_cues_mirror_spawn_classification() {
+    fn sound_cues_mirror_admitted_spawn_classification() {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
@@ -17832,44 +18611,38 @@ mod tests {
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed: no move, no cue
         assert_eq!(glow.drain_sound_cues().count(), 0);
 
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((2, 1)), t0, &c, g, &mut out); // typed step
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Typed);
         assert_eq!(cues[0].col, 1);
 
+        glow.note_synthetic_move(t0);
         glow.tick(Some((4, 30)), t0, &c, g, &mut out); // multi-cell jump
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Jump);
 
-        glow.note_backspace(t0);
+        arm_exact_backspace(&mut glow, t0, (4, 30), (4, 29));
         glow.tick(Some((4, 29)), t0, &c, g, &mut out); // deletion echo
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Backspace);
 
-        // A hinted MULTI-CELL nav (Ctrl-A to line start: col 29 → 0) is a fast
-        // run — the SWEEP gesture, leftward (dir = -1), no flare-slamming jump.
+        // A navigation timestamp is morphology only. Without a causal
+        // candidate, neither a multi-cell nor a single-cell relocation may
+        // birth light or sound.
         glow.note_navigation(t0);
         glow.tick(Some((4, 0)), t0, &c, g, &mut out);
-        let cues: Vec<_> = glow.drain_sound_cues().collect();
-        assert_eq!(cues.len(), 1);
-        assert_eq!(cues[0].kind, SoundKind::Sweep { dir: -1 });
-        assert_eq!(cues[0].dir, -1, "the sweep carries its travel direction");
+        assert_eq!(glow.drain_sound_cues().count(), 0);
 
-        // A hinted SINGLE-CELL nav (col 0 → 1) is a small scrub — the GLIDE
-        // gesture, rightward (dir = +1).
         glow.note_navigation(t0);
         glow.tick(Some((4, 1)), t0, &c, g, &mut out);
-        let cues: Vec<_> = glow.drain_sound_cues().collect();
-        assert_eq!(cues.len(), 1);
-        assert_eq!(cues[0].kind, SoundKind::Glide { dir: 1 });
-        assert_eq!(cues[0].dir, 1, "the glide carries its travel direction");
+        assert_eq!(glow.drain_sound_cues().count(), 0);
 
         // Disabled ⇒ any pending cues are dropped, none accrue.
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((4, 2)), t0, &c, g, &mut out);
         glow.tick(Some((4, 3)), t0, &cfg(GlowStyle::Water, false), g, &mut out);
         assert_eq!(glow.drain_sound_cues().count(), 0);
@@ -17906,7 +18679,7 @@ mod tests {
         // The echo, 40 ms later (a loaded flood frame): light spawns, sound
         // does not — the credit is spent instead.
         let echo = t0 + Duration::from_millis(41);
-        glow.note_typed(echo);
+        glow.note_synthetic_typed(echo, 1);
         glow.tick(Some((2, 1)), echo, &c, g, &mut out);
         assert_eq!(
             glow.drain_sound_cues().count(),
@@ -17917,7 +18690,7 @@ mod tests {
         // The NEXT advance has no credit behind it — it clicks at the echo,
         // byte-identically to the pre-seam behaviour.
         let out_echo = t0 + Duration::from_millis(60);
-        glow.note_typed(out_echo);
+        glow.note_synthetic_typed(out_echo, 1);
         glow.tick(Some((2, 2)), out_echo, &c, g, &mut out);
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
@@ -17942,7 +18715,7 @@ mod tests {
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
         // An ECHO-born cue the render drain already owns, left undrained.
         let echo = t0 + Duration::from_millis(1);
-        glow.note_typed(echo);
+        glow.note_synthetic_typed(echo, 1);
         glow.tick(Some((2, 1)), echo, &c, g, &mut out);
         assert_eq!(
             glow.sound_cues.len(),
@@ -17967,7 +18740,7 @@ mod tests {
 
         // The ledger is untouched: this character's echo stays silent.
         let key_echo = t0 + Duration::from_millis(45);
-        glow.note_typed(key_echo);
+        glow.note_synthetic_typed(key_echo, 1);
         glow.tick(Some((2, 2)), key_echo, &c, g, &mut out);
         let drained: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(
@@ -18012,10 +18785,12 @@ mod tests {
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Typed);
 
-        // Its echo is a multi-cell JUMP (e.g. `w` in vim): no `note_typed`, and the
-        // cursor lands far away, so `spawn` takes the Jump arm — which must find the
-        // credit and stay silent rather than speak a second time for one keypress.
+        // Its echo is a multi-cell JUMP (e.g. `w` in vim). The host still arms
+        // the committed printable-key witness even though the geometry is not
+        // typing; that witness admits the move, which must find the credit and
+        // stay silent rather than speak a second time for one keypress.
         let echo = t0 + Duration::from_millis(40);
+        glow.note_synthetic_typed(key, 1);
         glow.tick(Some((6, 9)), echo, &c, g, &mut out);
         assert_eq!(
             glow.drain_sound_cues().count(),
@@ -18025,15 +18800,15 @@ mod tests {
 
         // ...and the credit is GONE, so a later genuine typing advance is not muted.
         let later = t0 + Duration::from_millis(80);
-        glow.note_typed(later);
+        glow.note_synthetic_typed(later, 1);
         glow.tick(Some((6, 10)), later, &c, g, &mut out);
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1, "the Jump must not leak the credit forward");
         assert_eq!(cues[0].kind, SoundKind::Typed);
     }
 
-    /// REGRESSION: EVERY spawn arm must settle an outstanding key-time credit —
-    /// not just `typing` and the `else` Jump.
+    /// REGRESSION: every causally admitted spawn arm handles an outstanding
+    /// key-time credit without producing a duplicate printable-key click.
     ///
     /// The orphan is reachable: a printable key clicks at the press and arms a
     /// credit, then its echo is swallowed (a start-of-line Backspace erases
@@ -18049,7 +18824,7 @@ mod tests {
     /// Each row asserts BOTH halves plus the un-muted follow-up click, so the
     /// test cannot be satisfied by simply muting the arm.
     #[test]
-    fn every_spawn_arm_settles_the_key_time_ledger() {
+    fn admitted_spawn_arms_handle_the_key_time_ledger() {
         use crate::trail_sound::SoundKind;
         // (arm name, hint to arm before the echo, the echo's landing cell, the
         // gesture that echo must STILL speak — `None` for the arms a printable
@@ -18060,21 +18835,25 @@ mod tests {
             (u16, u16),
             Option<SoundKind>,
         );
-        let arms: [Arm; 4] = [
+        let arms: [Arm; 3] = [
             (
                 "deletion",
-                |gl, t| gl.note_backspace(t),
+                |gl, t| arm_exact_backspace(gl, t, (2, 5), (2, 4)),
                 (2, 4),
                 Some(SoundKind::Backspace),
             ),
             (
-                "navigation",
-                |gl, t| gl.note_navigation(t),
-                (2, 0),
-                Some(SoundKind::Sweep { dir: -1 }),
+                "typing",
+                |gl, t| gl.note_synthetic_typed(t, 1),
+                (2, 6),
+                None,
             ),
-            ("typing", |gl, t| gl.note_typed(t), (2, 6), None),
-            ("jump", |_, _| {}, (5, 30), None),
+            (
+                "jump",
+                |gl, t| gl.note_synthetic_move(t),
+                (5, 30),
+                None,
+            ),
         ];
         for (name, arm_hint, land, expect) in arms {
             let mut glow = CursorGlow::default();
@@ -18106,12 +18885,9 @@ mod tests {
                     "{name}: a printable key's own echo must not speak twice"
                 ),
             }
-            // ONLY the two arms a printable key's echo can land on settle the
-            // credit. `deletion` and `navigation` deliberately leave it standing:
-            // they are hint-only and can MISCLASSIFY a printable echo that the next
-            // key's hint overtook, and retiring it there makes that key's real echo
-            // fall through to `typing` with an empty ledger and cue a spurious letter
-            // click on a Backspace or arrow (see the race test below).
+            // Only the two arms a printable key's echo can land on settle the
+            // credit. An exact deletion is a different physical key and leaves
+            // the outstanding printable credit standing.
             let settles = matches!(name, "typing" | "jump");
             assert_eq!(
                 glow.keyed_clicks,
@@ -18119,16 +18895,11 @@ mod tests {
                 "{name}: wrong ledger disposition for this arm"
             );
 
-            // The COST of that disposition, stated rather than hidden. On the two
-            // settling arms a later genuine keystroke clicks normally. On the
-            // hint-only arms the standing credit is spent by the next typing
-            // advance, so one later click is swallowed — the orphan is real. It is
-            // the accepted side of the trade: it self-clears at KEYED_CLICK_FRESH,
-            // whereas retiring the credit here produces an immediate WRONG sound
-            // (a letter click on a Backspace), and a missing sound later is milder
-            // than a wrong sound now.
+            // The accepted cost is pinned too: the exact deletion leaves the
+            // printable credit to mute one later admitted typing echo, while the
+            // typing and jump arms already spent it.
             let later = echo + Duration::from_millis(120);
-            glow.note_typed(later);
+            glow.note_synthetic_typed(later, 1);
             let (lr, lc) = land;
             glow.tick(Some((lr, lc + 1)), later, &c, g, &mut out);
             let cues: Vec<_> = glow.drain_sound_cues().collect();
@@ -18139,27 +18910,18 @@ mod tests {
                 assert_eq!(
                     cues.len(),
                     0,
-                    "{name}: documents the accepted orphan — the standing credit \
+                    "{name}: the standing credit \
                      silences exactly one later click, then expires"
                 );
             }
         }
     }
 
-    /// REGRESSION (adversarial review): a letter followed quickly by Backspace or
-    /// an arrow must produce TWO sounds for TWO physical keys — never three.
-    ///
-    /// `deletion` and `navigation` are hint-only: `deletion` is direction-blind (a
-    /// forward +1 move satisfies it) and `navigation` tests no shape at all. So the
-    /// second key's hint can arrive before the FIRST key's echo does, and the
-    /// letter's echo then misclassifies into that arm. An earlier fix retired the
-    /// key-time credit ahead of the whole chain to make the ledger "exhaustive";
-    /// that made the letter's real echo fall through to `typing` with an empty
-    /// ledger and cue a spurious LETTER click on a Backspace — three sounds for two
-    /// keys. The synth only hides it when the two echoes land inside MIN_GAP, i.e.
-    /// it survives exactly on the laggy per-character links this seam exists for.
+    /// A later Backspace/navigation timestamp cannot claim an earlier printable
+    /// echo. With no exact candidate both observed moves are dark and silent;
+    /// the already-issued key-time click is preserved as the sole sound.
     #[test]
-    fn a_letter_then_backspace_race_speaks_twice_not_three_times() {
+    fn a_later_timestamp_cannot_claim_an_earlier_key_echo() {
         use crate::trail_sound::SoundKind;
         for (name, hint, land, second) in [
             (
@@ -18194,8 +18956,8 @@ mod tests {
             // KEY 2 arrives before key 1's echo does, and stamps its hint.
             hint(&mut glow, t0 + Duration::from_millis(10));
 
-            // Key 1's echo lands while key 2's hint is still fresh, so it takes the
-            // hint-only arm rather than `typing`.
+            // Key 1's echo lands while key 2's timestamp is fresh. A timestamp
+            // is not provenance, so the relocation is denied.
             glow.tick(Some(land), t0 + Duration::from_millis(20), &c, g, &mut out);
             spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
 
@@ -18209,22 +18971,11 @@ mod tests {
             );
             spoken.extend(glow.drain_sound_cues().map(|c| c.kind));
 
-            assert_eq!(
-                spoken.len(),
-                2,
-                "{name}: two physical keys produced {} sounds: {spoken:?}",
-                spoken.len()
-            );
+            assert_eq!(spoken.len(), 1, "{name}: timestamp forged a cue: {spoken:?}");
             assert_eq!(
                 spoken[0],
                 SoundKind::Typed,
                 "{name}: key 1 clicks at the press"
-            );
-            assert_ne!(
-                spoken[1],
-                SoundKind::Typed,
-                "{name}: the second sound is key 2's own gesture, not a spurious \
-                 letter click"
             );
         }
     }
@@ -18269,7 +19020,7 @@ mod tests {
             assert_eq!(keyed_cue.len(), 1);
             let hot = keyed_cue[0].heat;
 
-            keyed.note_typed(echo);
+            keyed.note_synthetic_typed(echo, 1);
             keyed.tick(Some((2, i as u16)), echo, &c, g, &mut out);
             assert_eq!(
                 keyed.drain_sound_cues().count(),
@@ -18277,7 +19028,7 @@ mod tests {
                 "the echo spends the credit"
             );
 
-            echo_only.note_typed(echo);
+            echo_only.note_synthetic_typed(echo, 1);
             echo_only.tick(Some((2, i as u16)), echo, &c, g, &mut out);
             let ref_cue: Vec<_> = echo_only.drain_sound_cues().collect();
             assert_eq!(ref_cue.len(), 1);
@@ -18308,32 +19059,33 @@ mod tests {
         assert_eq!(charged, 5, "the ramp legs must actually have run");
     }
 
-    /// The A/B twin of the test above, on the IDENTICAL cursor transition: with no
-    /// key-time credit behind it, that same (2,0) -> (6,9) move DOES cue a Jump.
-    ///
-    /// The pair is what makes the regression test non-vacuous. Alone, "0 cues at the
-    /// echo" could equally mean the Jump arm was never reached; together they show the
-    /// arm IS reached for this transition and that spending the credit is precisely
-    /// what silences it. It also pins the untouched case — a program repositioning the
-    /// cursor with no keypress behind it still speaks exactly as it did pre-seam.
+    /// The A/B twin of the test above, on the identical cursor transition. An
+    /// explicit synthetic preview has causal provenance and speaks; a bare
+    /// Tab/paste timestamp does not and stays dark and silent.
     #[test]
-    fn an_unkeyed_jump_still_speaks() {
+    fn a_synthetic_gesture_jump_speaks_but_a_timestamp_alone_is_dark() {
         use crate::trail_sound::SoundKind;
-        let mut glow = CursorGlow::default();
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
-        glow.tick(Some((2, 0)), t0, &c, g, &mut out);
-        let _ = glow.drain_sound_cues().count();
 
-        // Same destination and same elapsed time as the regression test, minus the
-        // `cue_keystroke` — the ONLY difference between the two runs.
         let jump = t0 + Duration::from_millis(40);
-        glow.tick(Some((6, 9)), jump, &c, g, &mut out);
-        let cues: Vec<_> = glow.drain_sound_cues().collect();
-        assert_eq!(cues.len(), 1, "an unkeyed jump is still a Jump");
+        let mut preview = CursorGlow::default();
+        preview.tick(Some((2, 0)), t0, &c, g, &mut out);
+        let _ = preview.drain_sound_cues().count();
+        preview.note_synthetic_move(jump);
+        preview.tick(Some((6, 9)), jump, &c, g, &mut out);
+        let cues: Vec<_> = preview.drain_sound_cues().collect();
+        assert_eq!(cues.len(), 1, "a synthetic preview is still a Jump");
         assert_eq!(cues[0].kind, SoundKind::Jump);
+
+        let mut timestamp = CursorGlow::default();
+        timestamp.tick(Some((2, 0)), t0, &c, g, &mut out);
+        timestamp.note_user_gesture(jump);
+        timestamp.tick(Some((6, 9)), jump, &c, g, &mut out);
+        assert_eq!(timestamp.drain_sound_cues().count(), 0);
+        assert!(!frame_has_output(&out, &timestamp));
     }
 
     /// A BATCHED echo run spends ONE credit (one spawn, one cue), and the
@@ -18360,15 +19112,20 @@ mod tests {
         // credit and stays silent. (The other two are still owed against
         // echoes that were folded into this frame.)
         let echo = t0 + Duration::from_millis(20);
-        glow.note_typed(echo);
+        glow.note_synthetic_typed(echo, 3);
         glow.tick(Some((2, 3)), echo, &c, g, &mut out);
         assert_eq!(glow.drain_sound_cues().count(), 0);
 
-        // Past the window, the owed credits are abandoned: a PURE-OUTPUT
-        // advance (no key behind it) clicks normally again.
+        // Past the window, the owed credits are abandoned. A timestamp-only
+        // advance is still dark; an explicit preview immediately after it
+        // demonstrates that admitted echo audio is live again.
         let late = echo + Duration::from_secs_f32(CursorGlow::KEYED_CLICK_FRESH + 0.1);
         glow.note_typed(late);
         glow.tick(Some((2, 4)), late, &c, g, &mut out);
+        assert_eq!(glow.drain_sound_cues().count(), 0);
+        let preview = late + Duration::from_millis(1);
+        glow.note_synthetic_typed(preview, 1);
+        glow.tick(Some((2, 5)), preview, &c, g, &mut out);
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].kind, SoundKind::Typed);
@@ -18421,7 +19178,8 @@ mod tests {
         assert_eq!(glow.drain_sound_cues().count(), 0);
     }
 
-    /// THE BRRRRING'S FEED, pinned — the exact cue path of rapid new lines.
+    /// THE BRRRRING'S PREVIEW FEED, pinned — the exact cue morphology of rapid
+    /// synthetic new lines. A Return timestamp alone is separately pinned dark.
     /// Two shapes exist and BOTH are load-bearing:
     /// - Enter after a typed command (one row down, column snapped left,
     ///   chebyshev > 1, no key hint armed) is the JUMP gesture — and Jumps
@@ -18437,7 +19195,7 @@ mod tests {
     /// the flourishes bit-identical to v0.56; this half guarantees the cue
     /// path that feeds them can never silently reclassify.
     #[test]
-    fn rapid_line_feeds_cue_jump_and_typed_gestures() {
+    fn rapid_synthetic_line_feeds_cue_jump_and_typed_gestures() {
         use crate::trail_sound::SoundKind;
         let mut glow = CursorGlow::default();
         let g = geom();
@@ -18448,6 +19206,7 @@ mod tests {
         assert_eq!(glow.drain_sound_cues().count(), 0);
         // Enter after a command: (0,12) → (1,0) — the flourish voice.
         let t1 = t0 + Duration::from_millis(60);
+        glow.note_synthetic_move(t1);
         glow.tick(Some((1, 0)), t1, &c, g, &mut out);
         let cues: Vec<_> = glow.drain_sound_cues().collect();
         assert_eq!(cues.len(), 1, "the line feed must cue exactly once");
@@ -18461,6 +19220,7 @@ mod tests {
         // pluck stream between flourishes.
         for i in 2..=5u16 {
             let t = t0 + Duration::from_millis(60 * u64::from(i));
+            glow.note_synthetic_move(t);
             glow.tick(Some((i, 0)), t, &c, g, &mut out);
             let cues: Vec<_> = glow.drain_sound_cues().collect();
             assert_eq!(cues.len(), 1, "line feed {i} must cue exactly once");
@@ -18470,6 +19230,13 @@ mod tests {
                 "a same-column line feed is the Typed pluck between flourishes"
             );
         }
+
+        let mut timestamp = CursorGlow::default();
+        timestamp.tick(Some((0, 12)), t0, &c, g, &mut out);
+        timestamp.note_return(t1);
+        timestamp.tick(Some((1, 0)), t1, &c, g, &mut out);
+        assert_eq!(timestamp.drain_sound_cues().count(), 0);
+        assert!(!frame_has_output(&out, &timestamp));
     }
 
     #[test]
@@ -18499,6 +19266,7 @@ mod tests {
         let c = cfg(GlowStyle::Lumen, true);
         let g = geom();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed
+        glow.note_synthetic_move(t0);
         let fp = glow.tick(Some((2, 30)), t0, &c, g, &mut out); // jump
         assert_ne!(fp, 0);
         assert!(!out.is_empty());
@@ -18532,9 +19300,11 @@ mod tests {
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed position
         // Three keystroke advances 300ms apart (keys at +0.3s, +0.6s, +0.9s).
         for k in 1..=3u64 {
+            let at = t0 + Duration::from_millis(300 * k);
+            glow.note_synthetic_typed(at, 1);
             glow.tick(
                 Some((2, k as u16)),
-                t0 + Duration::from_millis(300 * k),
+                at,
                 &c,
                 g,
                 &mut out,
@@ -18575,6 +19345,7 @@ mod tests {
         // ConPTY echo choreography: a ~30ms HIDDEN frame presents…
         glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out);
         // …then the cursor reappears one cell right (the echoed character).
+        glow.note_synthetic_typed(t0 + Duration::from_millis(30), 1);
         let fp = glow.tick(
             Some((2, 6)),
             t0 + Duration::from_millis(45),
@@ -18635,6 +19406,7 @@ mod tests {
         let c = cfg(GlowStyle::Lumen, true);
         let g = geom();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed
+        glow.note_synthetic_typed(t0 + Duration::from_millis(10), 1);
         glow.tick(
             Some((2, 1)),
             t0 + Duration::from_millis(10),
@@ -18672,6 +19444,7 @@ mod tests {
             let c = cfg(style, true);
             glow.tick(Some((3, 5)), t0, &c, g, &mut out);
             // A big multi-row jump exercises comet + crown + ring + particles.
+            glow.note_synthetic_move(t0);
             glow.tick(Some((1, 38)), t0, &c, g, &mut out);
             assert!(!out.is_empty(), "{style:?}: expected light on a jump");
             assert_invariants(&out, g);
@@ -18700,6 +19473,7 @@ mod tests {
         let t0 = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out); // seed
+        glow.note_synthetic_move(t0);
         glow.tick(Some((3, 30)), t0, &c, g, &mut out); // a real jump
         // ARRIVAL-TIME FLARE (P2): launch flies a meteor, the eruption fires
         // when its head STRIKES the landing — not at launch.
@@ -18749,6 +19523,7 @@ mod tests {
         // A TYPING WRAP: last column → next row's start. No meteor, no smear.
         let mut wrapper = CursorGlow::default();
         wrapper.tick(Some((4, 39)), t0, &c, g, &mut out); // typing at the last column
+        wrapper.note_synthetic_typed(t0, 1);
         wrapper.tick(Some((5, 0)), t0, &c, g, &mut out); // WRAP to the next row
         assert!(
             wrapper.fire_meteors.is_empty(),
@@ -18782,16 +19557,17 @@ mod tests {
         assert_eq!(right_lum, 0, "landing row right of the cursor is quiet");
         assert_invariants(&out, g);
 
-        // POSITIVE CONTROL: a DELIBERATE Enter from a SHORT column (not a wrap shape —
-        // the cursor wasn't at the line's end) still flies its inter-line meteor, and
-        // still anchors no per-cell fire.
+        // POSITIVE CONTROL for the morphology: an explicitly scripted jump
+        // from a short column still flies its inter-line meteor. A raw Enter
+        // timestamp is deliberately not movement provenance.
         let mut enterer = CursorGlow::default();
         enterer.tick(Some((2, 5)), t0, &c, g, &mut out); // cursor mid-line
-        enterer.tick(Some((3, 0)), t0, &c, g, &mut out); // Enter: new row, col 0
+        enterer.note_synthetic_move(t0);
+        enterer.tick(Some((3, 0)), t0, &c, g, &mut out);
         assert_eq!(
             enterer.fire_meteors.len(),
             1,
-            "a deliberate Enter from a short line still flies a meteor"
+            "a synthetic short-line jump still flies a meteor"
         );
         assert!(
             enterer.sparks.is_empty(),
@@ -18799,19 +19575,19 @@ mod tests {
         );
     }
 
-    /// MULTI-HOP COALESCING (P2): shell repaint choreography — several jumps
-    /// within a frame or two where each hop starts at the previous landing —
-    /// retargets ONE live meteor instead of spraying one per hop (the audit's
-    /// Ctrl-A smear).
+    /// ONE-SHOT CAUSALITY: a scripted jump may fly one meteor, but an
+    /// unproven second repaint hop retires it instead of retargeting detached
+    /// light across content the candidate did not own.
     #[test]
-    fn fire_meteor_retargets_shell_repaint_choreography() {
+    fn fire_meteor_is_retired_by_an_unproven_second_hop() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((6, 11)), t0, &c, g, &mut out); // end of wrapped input
-        // Hop 1: CR parks the cursor at col 0 (one observed move)…
+        // Hop 1 is the sole explicitly scripted move.
+        glow.note_synthetic_move(t0 + Duration::from_millis(10));
         glow.tick(
             Some((6, 0)),
             t0 + Duration::from_millis(10),
@@ -18819,7 +19595,8 @@ mod tests {
             g,
             &mut out,
         );
-        // …hop 2: the prompt reprint lands it at (5, 44) 20 ms later.
+        assert_eq!(glow.fire_meteors.len(), 1, "the admitted hop flies once");
+        // Hop 2 has no candidate and must clear the resident episode.
         glow.tick(
             Some((5, 44)),
             t0 + Duration::from_millis(30),
@@ -18827,15 +19604,9 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(
-            glow.fire_meteors.len(),
-            1,
-            "the choreography coalesces into one meteor"
-        );
-        let m = &glow.fire_meteors[0];
         assert!(
-            (m.x1 - (44.5 * g.cw as f32)).abs() < 1.0 && (m.y1 - (5.5 * g.ch as f32)).abs() < 1.0,
-            "…retargeted to the final landing"
+            glow.fire_meteors.is_empty(),
+            "an unproven repaint cannot retarget admitted light"
         );
     }
 
@@ -18852,6 +19623,7 @@ mod tests {
         // Cold: two advances 500 ms apart — no heat accumulates.
         let mut cold = CursorGlow::default();
         cold.tick(Some((2, 0)), t0, &c, g, &mut out);
+        cold.note_synthetic_typed(t0 + Duration::from_millis(500), 1);
         cold.tick(
             Some((2, 1)),
             t0 + Duration::from_millis(500),
@@ -18868,6 +19640,7 @@ mod tests {
         hot.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=14u16 {
             t += Duration::from_millis(40);
+            hot.note_synthetic_typed(t, 1);
             hot.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let hot_lum = lum(&out);
@@ -18905,6 +19678,7 @@ mod tests {
         glow.tick(Some((0, 0)), t, &c, g, &mut out);
         for i in 1..=14u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((0, i)), t, &c, g, &mut out);
         }
         assert!(!glow.patches().is_empty(), "a row-0 blaze emits fire");
@@ -18973,6 +19747,7 @@ mod tests {
         glow.tick(Some((0, 0)), t, &c, g, &mut out);
         for i in 1..=14u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((0, i)), t, &c, g, &mut out);
         }
         assert!(!glow.patches().is_empty(), "a row-0 blaze emits fire");
@@ -19034,6 +19809,7 @@ mod tests {
         let tier = |d: f32| ((d / 0.25) as i64).min(3);
 
         let mut t = t0;
+        let mut row = 2u16;
         let mut col = 0u16;
         let prev_tier = std::cell::Cell::new(0i64);
         let check = |glow: &CursorGlow, state: &mut aterm_spec::interp::State| {
@@ -19055,11 +19831,16 @@ mod tests {
         };
 
         // Stoke: 60 forward keys at 40 ms with a tick per frame (16 ms grid).
-        glow.tick(Some((2, col)), t, &c, g, &mut out);
+        glow.tick(Some((row, col)), t, &c, g, &mut out);
         for _ in 0..60 {
             t += Duration::from_millis(40);
             col += 1;
-            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            if col > 30 {
+                row += 1;
+                col = 1;
+            }
+            glow.note_synthetic_typed(t, 1);
+            glow.tick(Some((row, col)), t, &c, g, &mut out);
             check(&glow, &mut state);
         }
         assert!(
@@ -19067,19 +19848,19 @@ mod tests {
             "a sustained burst reaches HOT+ ({})",
             prev_tier.get()
         );
-        // Quench: 8 backspaces (hint + leftward echo) at 60 ms.
+        // Quench: 8 causally proven one-cell deletes at 60 ms.
         for _ in 0..8 {
             t += Duration::from_millis(60);
-            glow.note_backspace(t);
+            arm_exact_backspace(&mut glow, t, (row, col), (row, col - 1));
             col -= 1;
-            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            glow.tick(Some((row, col)), t, &c, g, &mut out);
             check(&glow, &mut state);
         }
         // Idle: frame ticks with no moves until fully cold (the coal bed's
         // 6 s τ needs ~30 s to fall under the snap threshold).
         for _ in 0..2000 {
             t += Duration::from_millis(16);
-            glow.tick(Some((2, col)), t, &c, g, &mut out);
+            glow.tick(Some((row, col)), t, &c, g, &mut out);
             check(&glow, &mut state);
         }
         assert_eq!(prev_tier.get(), 0, "idle returns to COLD");
@@ -19102,6 +19883,7 @@ mod tests {
             glow.tick(Some((2, 0)), t, &c, g, &mut out);
             for i in 1..=keys {
                 t += Duration::from_millis(gap_ms);
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((2, i as u16)), t, &c, g, &mut out);
             }
             glow.disp_t
@@ -19138,6 +19920,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=30u16 {
             t += Duration::from_millis(320);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(
@@ -19173,24 +19956,25 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=30u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let peak = glow.disp_t;
         assert!(peak > 0.5, "burst warmed up ({peak})");
 
-        // Delete run: hint + leftward echo, 60 ms cadence.
+        // Delete run: exact one-cell evidence + leftward echo, 60 ms cadence.
         let mut col = 30u16;
         let mut prev = peak;
         let q1 = {
             t += Duration::from_millis(60);
-            glow.note_backspace(t);
+            arm_exact_backspace(&mut glow, t, (2, col), (2, col - 1));
             col -= 1;
             glow.tick(Some((2, col)), t, &c, g, &mut out);
             glow.quench
         };
         for _ in 0..5 {
             t += Duration::from_millis(60);
-            glow.note_backspace(t);
+            arm_exact_backspace(&mut glow, t, (2, col), (2, col - 1));
             col -= 1;
             glow.tick(Some((2, col)), t, &c, g, &mut out);
             assert!(
@@ -19221,14 +20005,11 @@ mod tests {
         assert!(nav.disp_t < 0.05, "backward navigation stays cold");
     }
 
-    /// NAVIGATION JUMPS FLY THE METEOR (owner, v0.43: "when I move from the
-    /// front of the line to the end (control a and control e) the cursor trail
-    /// looks delayed and I don't see the meteor streak"): a nav-hinted long
-    /// same-row jump flies the fire meteor along the vector — while still
-    /// earning ZERO heat and never slamming the field-wide flare (the v0.32
-    /// responsiveness law both halves intact).
+    /// A navigation timestamp is a classifier, not causal movement evidence.
+    /// A later CUP-shaped jump therefore stays completely dark and earns no
+    /// heat, even while the timestamp is fresh.
     #[test]
-    fn navigation_jump_flies_the_meteor_without_heat_or_flare() {
+    fn navigation_timestamp_alone_keeps_a_jump_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
@@ -19244,11 +20025,8 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(
-            glow.fire_meteors.len(),
-            1,
-            "Ctrl-A flies exactly one meteor along the jump"
-        );
+        assert!(glow.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &glow));
         assert_eq!(glow.heat, 0.0, "navigation still earns no heat");
         assert!(
             glow.flare < 0.05,
@@ -19284,8 +20062,9 @@ mod tests {
             let mut glow = CursorGlow::default();
             let mut out = Vec::new();
             glow.tick(Some((4, 36)), t0, &c, g, &mut out); // caret at the box's right edge
-            // The GUI arms the typed hint on the plain glyph key…
-            glow.note_typed(t0 + Duration::from_millis(5));
+            // A scripted typed candidate exercises the post-admission
+            // re-anchor morphology without treating its timestamp as proof.
+            glow.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
             // …and the Ink repaint re-anchors the caret one row down, LEFT of
             // its launch column (dr=1, dc=-33 — the shape detector misses).
             glow.tick(
@@ -19358,20 +20137,16 @@ mod tests {
         }
     }
 
-    /// THE OWNER-MANDATED JUMPS KEEP THEIR DRAMA: Enter (never hint-armed by
-    /// the host), a nav-hinted Ctrl-A/E leap, and a STALE typed hint all still
-    /// fly the meteor — the re-anchor is strictly hint-paired and one-echo
-    /// fresh, so nothing about deliberate jump choreography changes.
+    /// Enter, navigation and stale typed timestamps are all insufficient
+    /// provenance. Their identical program-owned cursor deltas stay dark.
     #[test]
-    fn enter_and_nav_and_stale_hint_still_meteor() {
+    fn enter_nav_and_stale_timestamps_stay_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
-        // Enter from a short column: the host never arms note_typed for Enter,
-        // so the deliberate row change keeps its meteor (the wrap law test's
-        // positive control, restated against the generalized classifier).
+        // A bare row change has no correlated input/content proof.
         let mut enterer = CursorGlow::default();
         enterer.tick(Some((2, 5)), t0, &c, g, &mut out);
         enterer.tick(
@@ -19381,11 +20156,10 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(enterer.fire_meteors.len(), 1, "Enter still flies a meteor");
+        assert!(enterer.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &enterer));
 
-        // Ctrl-A with a typed hint ALSO armed (fast typing then a nav chord):
-        // the same-row leap is dr_abs == 0, outside the re-anchor's one-row
-        // window — the nav meteor flies exactly as the v0.43 law pins.
+        // A newer navigation class cancels the unproved typed cohort.
         let mut nav = CursorGlow::default();
         nav.tick(Some((2, 35)), t0, &c, g, &mut out);
         nav.note_typed(t0 + Duration::from_millis(5));
@@ -19397,11 +20171,11 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(nav.fire_meteors.len(), 1, "Ctrl-A still flies its meteor");
+        assert!(nav.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &nav));
         assert_eq!(nav.heat, 0.0, "…still earning no heat");
 
-        // A STALE typed hint (older than TYPE_HINT_FRESH) pairs with nothing:
-        // the same inset-wrap-shaped move is a real jump again.
+        // A stale typed timestamp proves nothing too.
         let mut stale = CursorGlow::default();
         stale.tick(Some((4, 36)), t0, &c, g, &mut out);
         stale.note_typed(t0);
@@ -19412,28 +20186,20 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(
-            stale.fire_meteors.len(),
-            1,
-            "a stale hint no longer re-anchors — the meteor flies"
-        );
+        assert!(stale.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &stale));
     }
 
-    /// RAINBOW RETURN: plain Enter is intentionally NOT armed as a typed
-    /// re-anchor. Its row change gets one short rainbow ZOOM snap into the new
-    /// cursor row; ordinary typed wraps remain covered by the separate quiet
-    /// wrap law. This pins the user-discovered gesture as a supported feature.
+    /// Plain Enter has no exact content/target proof, so its timestamp cannot
+    /// license a rainbow snap from a later cursor relocation.
     #[test]
-    fn rainbow_plain_enter_fires_the_official_rainbow_return_snap() {
+    fn rainbow_plain_enter_timestamp_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 7)), t0, &c, g, &mut out);
-        // The host arms the RETURN license on a real main-screen Enter press
-        // (app_input's enter_like arm) — the anti-stray momentum gate then
-        // admits this one paired move even at an idle prompt.
         glow.note_return(t0 + Duration::from_millis(5));
         glow.tick(
             Some((3, 0)),
@@ -19442,21 +20208,13 @@ mod tests {
             g,
             &mut out,
         );
-        assert_eq!(
-            glow.rainbow.jumps.len(),
-            1,
-            "plain Enter creates exactly one Rainbow Return snap"
-        );
-        assert!(
-            !glow.under_quads().is_empty(),
-            "the snap renders in the legible under-ink rainbow stream"
-        );
+        assert!(glow.rainbow.jumps.is_empty());
+        assert!(!frame_has_output(&out, &glow));
     }
 
-    /// HIDE-BRIDGE LAW, restated against the typed hint: a ConPTY-bridged move
-    /// is chebyshev ≤ 2 by construction, and the re-anchor's `raw_dist > 2`
-    /// guard keeps every such move BYTE-IDENTICAL with or without a fresh
-    /// typed hint — fingerprints compare equal frame for frame.
+    /// HIDE-BRIDGE LAW under explicit candidates: a ConPTY-bridged move is
+    /// chebyshev ≤ 2, and the re-anchor's `raw_dist > 2` guard keeps generic and
+    /// typed synthetic morphology byte-identical frame for frame.
     #[test]
     fn bridged_two_cell_move_is_byte_identical_with_hint() {
         let g = geom();
@@ -19469,8 +20227,11 @@ mod tests {
             fps.push(glow.tick(Some((2, 5)), t0, &c, g, &mut out));
             // ConPTY echo choreography: a hidden frame presents…
             fps.push(glow.tick(None, t0 + Duration::from_millis(15), &c, g, &mut out));
+            let armed = t0 + Duration::from_millis(20);
             if hint {
-                glow.note_typed(t0 + Duration::from_millis(20));
+                glow.note_synthetic_typed(armed, 1);
+            } else {
+                glow.note_synthetic_move(armed);
             }
             // …then the cursor reappears a bridgeable (dr=1, dc=2) hop away.
             for ms in [45u64, 61, 77, 200] {
@@ -19491,13 +20252,10 @@ mod tests {
         );
     }
 
-    /// BACKSPACE WRAP-BACK RE-ANCHOR (fire): deleting at an Ink wrap boundary
-    /// re-anchors the caret UP a row to the interior right edge. The fresh
-    /// backspace hint pairs the move — no meteor, single landing spark — and
-    /// the deletion classifier (now typing-true) flashes QUENCH STEAM at the
-    /// doused cell exactly like a plain backspace echo.
+    /// A cross-row Backspace repaint is outside the exact one-cell EOL proof.
+    /// Its timestamp alone must not emit steam, a meteor, or a swept wake.
     #[test]
-    fn backspace_wrap_back_reanchors_with_steam() {
+    fn backspace_wrap_back_without_exact_proof_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
@@ -19518,8 +20276,8 @@ mod tests {
             "a backspace wrap-back flies no meteor"
         );
         assert!(
-            glow.vapor.iter().any(|v| v.kind == VaporKind::Steam),
-            "the deletion echo flashes quench steam at the doused cell"
+            glow.vapor.is_empty(),
+            "an unproved deletion cannot flash steam"
         );
         assert!(
             !glow.sparks.iter().any(|s| s.row == 4 && s.col < 38),
@@ -19528,33 +20286,25 @@ mod tests {
         assert_eq!(glow.heat, 0.0, "deleting earns no heat");
     }
 
-    /// THE KITTY→BLINK SWAP, vim half: on the ALT SCREEN a typed hint alone no
-    /// longer licenses the re-anchor — the hints now arm for EVERY plain key
-    /// (Claude Code negotiates NO kitty flags, so the old kitty gate never
-    /// armed them there), and vim's safety moved into the engine: without a
-    /// fresh REPAINT BLINK (vim/less never hide inside DEC-2026) a hinted
-    /// dr==1 big-dc move is a real jump — the fire meteor flies and the rainbow kitty
-    /// ZOOM streaks. WITH the blink (Claude Code's per-keystroke bracket) the
-    /// same move re-anchors exactly as the wrap law pins.
-    /// BOX-GROWTH WRAP (live-verified in Claude Code): the bottom-anchored
-    /// input box grows a row UP when text wraps, so the caret's terminal row
-    /// stays CONSTANT — dr == 0 with a huge column delta. With a typed hint +
-    /// a fresh blink that move must RE-ANCHOR (no meteor, no flare); a fresh
-    /// NAV hint vetoes the re-anchor (Ctrl-A's same-row leap keeps its meteor
-    /// even inside Claude Code).
+    /// BOX-GROWTH WRAP morphology (live-verified in Claude Code): the
+    /// bottom-anchored input box grows a row up, so the caret's terminal row
+    /// stays constant while its column jumps. An explicitly admitted typed
+    /// preview plus repaint blink re-anchors without a meteor. A newer raw
+    /// navigation timestamp cancels that candidate and the relocation stays
+    /// wholly dark; timestamps never substitute for provenance.
     #[test]
-    fn box_growth_wrap_reanchors_but_nav_veto_keeps_the_meteor() {
+    fn box_growth_preview_reanchors_but_nav_timestamp_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
 
-        // Typed-paired dr==0 wrap under alt+blink: re-anchor.
+        // An explicitly scripted typed dr==0 wrap under alt+blink re-anchors.
         let mut glow = CursorGlow::default();
         glow.note_context(true);
         glow.tick(Some((5, 36)), t0, &c, g, &mut out);
         glow.note_repaint_blink(t0 + Duration::from_millis(10));
-        glow.note_typed(t0 + Duration::from_millis(10));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(10), 1);
         let t1 = t0 + Duration::from_millis(26);
         glow.tick(Some((5, 3)), t1, &c, g, &mut out);
         assert!(
@@ -19563,32 +20313,29 @@ mod tests {
         );
         assert!(glow.flare < 0.5, "no flare slam on the wrap");
 
-        // Same geometry with a fresh NAV hint: the meteor is owner-mandated.
+        // A fresh NAV timestamp cancels that unproved candidate and stays dark.
         let mut nav = CursorGlow::default();
         nav.note_context(true);
         nav.tick(Some((5, 36)), t0, &c, g, &mut out);
         nav.note_repaint_blink(t0 + Duration::from_millis(10));
-        nav.note_typed(t0 + Duration::from_millis(10));
+        nav.note_synthetic_typed(t0 + Duration::from_millis(10), 1);
         nav.note_navigation(t0 + Duration::from_millis(12));
         nav.tick(Some((5, 3)), t1, &c, g, &mut out);
-        assert_eq!(
-            nav.fire_meteors.len(),
-            1,
-            "a nav-hinted same-row leap flies its meteor even mid-blink"
-        );
+        assert!(nav.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &nav));
     }
 
     #[test]
-    fn alt_without_blink_keeps_the_jump() {
+    fn synthetic_alt_without_blink_keeps_the_jump() {
         let g = geom();
         let t0 = Instant::now();
         let mut out = Vec::new();
 
-        // vim (alt, hint armed, NO blink): the jump keeps its drama.
+        // Explicit alt-screen preview, no blink: the jump keeps its drama.
         let mut fire = CursorGlow::default();
         fire.note_context(true);
         fire.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);
-        fire.note_typed(t0 + Duration::from_millis(5));
+        fire.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
         fire.note_context(true);
         fire.tick(
             Some((5, 3)),
@@ -19600,7 +20347,7 @@ mod tests {
         assert_eq!(
             fire.fire_meteors.len(),
             1,
-            "alt screen + typed hint + NO blink: the fire meteor still flies"
+            "admitted alt-screen preview + no blink: the fire meteor still flies"
         );
 
         // Rainbow kitty, COLD (anti-stray): one press hopping the caret across
@@ -19616,7 +20363,7 @@ mod tests {
             g,
             &mut out,
         );
-        cold.note_typed(t0 + Duration::from_millis(5));
+        cold.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
         cold.note_context(true);
         cold.tick(
             Some((5, 3)),
@@ -19627,12 +20374,11 @@ mod tests {
         );
         assert!(
             cold.rainbow.jumps.is_empty(),
-            "alt screen + typed hint, COLD: the rainbow ZOOM stays sheathed (anti-stray)"
+            "cold admitted alt-screen preview: the rainbow ZOOM stays sheathed (anti-stray)"
         );
 
-        // Rainbow kitty, WARM (the preserved drama): the same hinted no-blink hop off
-        // live typing momentum still streaks — an actively-editing vim user
-        // keeps the owner-mandated ZOOM.
+        // Rainbow kitty, WARM: the same admitted no-blink preview off live
+        // typing momentum still streaks.
         let mut warm = CursorGlow::default();
         let cn = cfg(GlowStyle::RainbowKitty, true);
         let mut tw = t0;
@@ -19640,14 +20386,14 @@ mod tests {
         warm.tick(Some((4, 20)), tw, &cn, g, &mut out);
         for col in 21..=30u16 {
             tw += Duration::from_millis(15);
-            warm.note_typed(tw);
+            warm.note_synthetic_typed(tw, 1);
             // (No blink: single-cell forward echoes classify as typing by
             // distance alone, and the final hop must be blink-free — a fresh
             // blink would re-anchor it instead of jumping.)
             warm.tick(Some((4, col)), tw, &cn, g, &mut out);
         }
         tw += Duration::from_millis(20);
-        warm.note_typed(tw);
+        warm.note_synthetic_typed(tw, 1);
         warm.note_context(true);
         warm.tick(
             Some((5, 3)),
@@ -19659,14 +20405,14 @@ mod tests {
         assert_eq!(
             warm.rainbow.jumps.len(),
             1,
-            "alt screen + typed hint + NO blink, WARM: the Nyan ZOOM still streaks"
+            "warm admitted alt-screen preview + no blink: the Nyan ZOOM still streaks"
         );
 
-        // Claude Code (alt, hint armed, FRESH blink): the same move re-anchors.
+        // Claude Code preview (typed candidate + fresh blink): re-anchor.
         let mut cc = CursorGlow::default();
         cc.note_context(true);
         cc.tick(Some((4, 36)), t0, &cfg(GlowStyle::Fire, true), g, &mut out);
-        cc.note_typed(t0 + Duration::from_millis(5));
+        cc.note_synthetic_typed(t0 + Duration::from_millis(5), 1);
         cc.note_repaint_blink(t0 + Duration::from_millis(8));
         cc.note_context(true);
         cc.tick(
@@ -19678,20 +20424,16 @@ mod tests {
         );
         assert!(
             cc.fire_meteors.is_empty(),
-            "alt screen + typed hint + fresh blink: the Ink wrap re-anchors"
+            "typed candidate + fresh blink: the Ink wrap re-anchors"
         );
     }
 
-    /// THE METEOR EATER: a Backspace whose echo never moved the caret
-    /// (start of line; a TUI coalescing the erase) leaves a dangling
-    /// quench hint, and `bs_pair` only PEEKS it — so a following Ctrl-A/E's
-    /// dr==1 big-dc echo on a wrapped input box would "re-anchor" and eat
-    /// the owner-mandated meteor. The nav press path calls `clear_typed`,
-    /// which must disarm the quench hint too, so the meteor flies. Pinned in the
-    /// live full-redraw-TUI state (alt + fresh blink), where the re-anchor
-    /// conjunct is otherwise fully licensed.
+    /// A swallowed Backspace leaves a dangling quench classifier. A newer
+    /// navigation timestamp must clear it and cancel every unproved candidate;
+    /// the later wrapped-box relocation is dark instead of borrowing either
+    /// timestamp to re-anchor, sweep, or launch a meteor.
     #[test]
-    fn backspace_then_nav_still_flies_the_meteor() {
+    fn backspace_then_navigation_timestamps_stay_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Fire, true);
         let t0 = Instant::now();
@@ -19701,9 +20443,8 @@ mod tests {
         glow.tick(Some((5, 10)), t0, &c, g, &mut out); // caret mid-wrapped-line
         // Backspace at a no-move echo: the quench hint dangles…
         glow.note_backspace(t0 + Duration::from_millis(20));
-        // …then Ctrl-A arrives: the app_input press path disarms typed hints
-        // (clear_typed — which must also drop the dangling quench hint) and
-        // arms the nav hint; the repaint burst blinks.
+        // …then Ctrl-A arrives: the app_input path drops the dangling quench
+        // classifier and records navigation morphology, but no candidate.
         glow.clear_typed(t0 + Duration::from_millis(200));
         glow.note_navigation(t0 + Duration::from_millis(60));
         glow.note_repaint_blink(t0 + Duration::from_millis(60));
@@ -19721,11 +20462,8 @@ mod tests {
             glow.quench_hint.is_none(),
             "the nav-path clear_typed disarmed the dangling backspace pairing"
         );
-        assert_eq!(
-            glow.fire_meteors.len(),
-            1,
-            "Ctrl-A after a no-move backspace still flies the owner-mandated meteor"
-        );
+        assert!(glow.fire_meteors.is_empty());
+        assert!(!frame_has_output(&out, &glow));
         assert_eq!(glow.heat, 0.0, "…still a navigation move: no heat");
     }
 
@@ -19839,7 +20577,7 @@ mod tests {
         glow.note_typed(t0);
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
         let moved = t0 + frame;
-        glow.note_typed(moved);
+        glow.note_synthetic_typed(moved, 1);
         glow.tick(Some((2, 3)), moved, &c, g, &mut out);
         assert!(glow.needs_frame_cadence(), "a visible Nyan spark is brisk");
         assert_eq!(
@@ -20056,16 +20794,15 @@ mod tests {
         assert!(!glow.is_active());
     }
 
-    /// PLAIN BACKSPACE ALWAYS POOFS (the owner's "I don't see any delete
-    /// effect"): an ORDINARY single Backspace — NOT a kill chord — now licenses
-    /// the erase poof via `bs_poof_hint`, so a same-row shrink puffs the vanished
-    /// cell. CAT-INDEPENDENT by construction: `poof_scan` runs unconditionally
+    /// A causally confirmed plain Backspace poofs. The timestamp schedules and
+    /// classifies the gesture, while the exact one-cell row proof identifies the
+    /// vanished cell. CAT-INDEPENDENT by construction: `poof_scan` runs unconditionally
     /// and never consults the cursor cat (there is no cat in a `CursorGlow` at
     /// all), so the burst fires whether or not the cat is flying. On rainbow kitty/dark
     /// the poof is the momentum-independent GLITTER burst — round sparks with
     /// one hero '+' since the sparkle rebalance.
     #[test]
-    fn plain_backspace_always_poofs_cat_independent() {
+    fn exact_plain_backspace_poofs_cat_independent() {
         let g = geom(); // cols 40, cw 8
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -20079,13 +20816,18 @@ mod tests {
         // "hello", caret at col 5; then a PLAIN Backspace shrinks it to "hell".
         glow.observe_row(2, 5, &row("hello"), t0);
         glow.tick(Some((2, 5)), t0, &c, g, &mut out);
-        glow.note_backspace(t0 + Duration::from_millis(30));
+        arm_exact_backspace(
+            &mut glow,
+            t0 + Duration::from_millis(30),
+            (2, 5),
+            (2, 4),
+        );
         let t1 = t0 + Duration::from_millis(46);
         glow.observe_row(2, 4, &row("hell"), t1);
         glow.tick(Some((2, 4)), t1, &c, g, &mut out);
         assert!(
             glow.last_poof.is_some(),
-            "a PLAIN backspace licensed the erase poof (was silent before)"
+            "an exact plain Backspace proof licensed the erase poof"
         );
         assert!(
             !glow.particles.is_empty(),
@@ -20117,7 +20859,12 @@ mod tests {
         };
         glow.observe_row(2, 5, &row("world"), t0);
         glow.tick(Some((2, 5)), t0, &c, g, &mut out);
-        glow.note_backspace(t0 + Duration::from_millis(30));
+        arm_exact_backspace(
+            &mut glow,
+            t0 + Duration::from_millis(30),
+            (2, 5),
+            (2, 4),
+        );
         let t1 = t0 + Duration::from_millis(46);
         glow.observe_row(2, 4, &row("worl"), t1);
         glow.tick(Some((2, 4)), t1, &c, g, &mut out);
@@ -20259,7 +21006,12 @@ mod tests {
         let mut real = CursorGlow::default();
         real.observe_row(2, 3, &row("abc"), t0);
         real.tick(Some((2, 3)), t0, &c, g, &mut out);
-        real.note_backspace(t0 + Duration::from_millis(10));
+        arm_exact_backspace(
+            &mut real,
+            t0 + Duration::from_millis(10),
+            (2, 3),
+            (2, 2),
+        );
         let t1 = t0 + Duration::from_millis(90);
         real.observe_row(2, 2, &row("ab"), t1);
         real.tick(Some((2, 2)), t1, &c, g, &mut out);
@@ -20267,6 +21019,53 @@ mod tests {
             real.last_poof.is_some(),
             "a real backspace over a char still poofs the vanished cell"
         );
+    }
+
+    /// A scroll fence invalidates the row identity captured at a plain
+    /// Backspace. Reusing the same numeric row for shorter unrelated content
+    /// must not satisfy that old `(row, fill)` witness and mint a phantom poof.
+    #[test]
+    fn scroll_fence_retires_plain_backspace_poof_provenance() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+
+        let mut glow = CursorGlow::default();
+        glow.observe_row(2, 5, &row("hello"), t0);
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        glow.note_backspace(t0 + Duration::from_millis(10));
+        assert_eq!(glow.bs_baseline, Some((2, 5)));
+        assert!(glow.bs_poof_hint.is_some());
+
+        glow.note_scroll(1);
+        assert!(
+            glow.bs_baseline.is_none() && glow.bs_poof_hint.is_none() && glow.quench_hint.is_none(),
+            "the scroll edge itself retires the old proof"
+        );
+        glow.drop_row_probe();
+        let t1 = t0 + Duration::from_millis(90);
+        glow.observe_row(2, 1, &row("x"), t1);
+        glow.tick(Some((2, 1)), t1, &c, g, &mut out);
+        assert!(glow.last_poof.is_none());
+        assert!(
+            glow.particles.is_empty() && glow.vapor.is_empty(),
+            "unrelated post-scroll text cannot spend the old Backspace"
+        );
+
+        // Tab/pane content replacement uses `drop_row_probe` without a scroll;
+        // it owns the identical provenance fence.
+        let mut switched = CursorGlow::default();
+        switched.observe_row(2, 5, &row("hello"), t0);
+        switched.tick(Some((2, 5)), t0, &c, g, &mut out);
+        switched.note_backspace(t0 + Duration::from_millis(10));
+        switched.drop_row_probe();
+        assert!(switched.bs_baseline.is_none() && switched.bs_poof_hint.is_none());
     }
 
     /// FALSE-POSITIVE FAMILY 1: repaints. An Ink repaint that rewrites the
@@ -20341,14 +21140,11 @@ mod tests {
         );
     }
 
-    /// KILL FEEDBACK CONTRACT: every kill keypress earns exactly one poof —
-    /// span-refined when the row shrank in place, CARET-anchored otherwise.
-    /// Both reflow shapes observed live in Claude Code (its bottom-anchored
-    /// Ink box REPLACES and RE-ROWS the survivor line on a kill) resolve to
-    /// the caret fallback: the hint proves a kill key was pressed, so a small
-    /// wisp at the cursor is right in the reflow case and benign in the rare
-    /// kill+scroll race. Hint-less replacements (every repaint/scroll storm)
-    /// stay silent — see `reflow_kill_poofs_at_the_caret`'s control.
+    /// KILL FEEDBACK CONTRACT: an observed stable-row shrink earns a precise
+    /// poof, and a stationary echo-less kill may use the bounded caret fallback.
+    /// A row replacement that also relocates the cursor is not causally tied to
+    /// the key, however: the universal move gate consumes it dark, so a
+    /// kill+scroll/reflow race cannot paint over unrelated content.
     #[test]
     fn scroll_with_fresh_hint_is_silent() {
         let g = geom();
@@ -20361,8 +21157,9 @@ mod tests {
             v
         };
         // Row identity broken (Claude Code's bottom-anchored reflow, or a
-        // scroll racing the hint): the caret fallback answers AT THE NEW
-        // CARET — never a span billow over content the kill didn't touch.
+        // scroll racing the hint): the unproven relocation retires the hint.
+        // It cannot answer at the new caret because that would let a swallowed
+        // kill timestamp decorate unrelated content.
         let mut moved = CursorGlow::default();
         moved.observe_row(2, 7, &row("$ hello world"), t0);
         moved.tick(Some((2, 7)), t0, &c, g, &mut out);
@@ -20374,20 +21171,12 @@ mod tests {
         moved.observe_row(3, 2, &row("$ he"), t);
         moved.tick(Some((3, 2)), t, &c, g, &mut out);
         assert!(
-            !moved.vapor.is_empty(),
-            "re-rowed survivor + fresh hint: the caret poof answers the kill"
+            moved.vapor.is_empty(),
+            "re-rowed survivor + timestamp-only hint must stay silent"
         );
-        for v in &moved.vapor {
-            assert!(
-                v.x0 >= 8.0 && v.x0 <= (6 * 8) as f32,
-                "puff at x={} strays from the new caret (col 2)",
-                v.x0
-            );
-        }
 
         // Same row + fresh hint, content REPLACED (reflow-or-scroll): the
-        // modest caret-anchored fallback fires — confined to the caret, never
-        // the vanished-span billow.
+        // unproven cursor relocation is the same fail-closed boundary.
         let mut replaced = CursorGlow::default();
         replaced.observe_row(5, 13, &row("$ hello world"), t0);
         replaced.tick(Some((5, 13)), t0, &c, g, &mut out);
@@ -20398,16 +21187,9 @@ mod tests {
         replaced.observe_row(5, 2, &row("% "), t);
         replaced.tick(Some((5, 2)), t, &c, g, &mut out);
         assert!(
-            !replaced.vapor.is_empty(),
-            "replaced row + fresh hint: the modest caret poof"
+            replaced.vapor.is_empty(),
+            "replaced row + timestamp-only hint must stay silent"
         );
-        for v in &replaced.vapor {
-            assert!(
-                v.x0 <= (8 * 8) as f32,
-                "fallback puff at x={} strays from the caret",
-                v.x0
-            );
-        }
     }
 
     /// STYLE DISPATCH: a rainbow kitty kill sheds star-power SPARKLES across the span
@@ -20522,6 +21304,7 @@ mod tests {
             t += Duration::from_millis(16);
             if i % 3 == 0 {
                 col += 1; // a keystroke every ~48 ms
+                glow.note_synthetic_typed(t, 1);
             }
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
@@ -20590,6 +21373,7 @@ mod tests {
             glow.tick(Some((2, 0)), t, &c, g, &mut out);
             for i in 1..=25u16 {
                 t += Duration::from_millis(40);
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((2, i)), t, &c, g, &mut out);
                 fps.push(glow.tick(Some((2, i)), t, &c, g, &mut out));
             }
@@ -20621,9 +21405,11 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=60u16 {
             t += Duration::from_millis(30);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         t += Duration::from_millis(30);
+        glow.note_synthetic_move(t);
         glow.tick(Some((30, 10)), t, &c, g, &mut out); // monster jump mid-blaze
         t += Duration::from_millis(120);
         glow.tick(Some((30, 10)), t, &c, g, &mut out); // strike frame
@@ -20655,9 +21441,11 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=60u16 {
             t += Duration::from_millis(30);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         t += Duration::from_millis(30);
+        glow.note_synthetic_move(t);
         glow.tick(Some((30, 10)), t, &c, g, &mut out); // monster jump mid-blaze
         t += Duration::from_millis(120);
         glow.tick(Some((30, 10)), t, &c, g, &mut out); // strike frame
@@ -20687,6 +21475,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=12u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(
@@ -20708,6 +21497,7 @@ mod tests {
         }
         // A jump's strike flashes a halo at the landing (the ring conversion).
         t += Duration::from_millis(300);
+        glow.note_synthetic_move(t);
         glow.tick(Some((5, 30)), t, &c, g, &mut out);
         let m_life = glow.fire_meteors[0].life;
         t += Duration::from_secs_f32(m_life * 0.8);
@@ -20736,6 +21526,7 @@ mod tests {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((2, 1)), t0, &c, g, &mut out);
         let fp1 = glow.tick(
             Some((2, 1)),
@@ -20768,11 +21559,12 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=20u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         // One delete: a subtle hiss.
         t += Duration::from_millis(60);
-        glow.note_backspace(t);
+        arm_exact_backspace(&mut glow, t, (2, 20), (2, 19));
         glow.tick(Some((2, 19)), t, &c, g, &mut out);
         let after_one = glow.vapor.len();
         assert!(after_one >= 1, "a delete flashes steam");
@@ -20780,7 +21572,7 @@ mod tests {
         let mut col = 19u16;
         for _ in 0..6 {
             t += Duration::from_millis(60);
-            glow.note_backspace(t);
+            arm_exact_backspace(&mut glow, t, (2, col), (2, col - 1));
             col -= 1;
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
@@ -20820,8 +21612,10 @@ mod tests {
             t += Duration::from_millis(16);
             if i % 3 == 0 && col < 38 {
                 col += 1;
+                glow.note_synthetic_typed(t, 1);
             } else if i % 60 == 0 {
                 col = 2; // wrap back to keep moves flowing
+                glow.note_synthetic_move(t);
             }
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
@@ -20864,6 +21658,7 @@ mod tests {
         glow.tick(Some((4, 0)), t, &c, g, &mut out);
         for i in 1..=39u16 {
             t += Duration::from_millis(30);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((4, i)), t, &c, g, &mut out);
         }
         assert!(
@@ -20924,6 +21719,7 @@ mod tests {
         // multi-cell engulfment takes a real run, exactly as on glass.
         for i in 1..=34u16 {
             t += Duration::from_millis(33);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((0, i)), t, &c, g, &mut out);
         }
         let cells = glow.halo_cells();
@@ -20977,6 +21773,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=20u16 {
             t += Duration::from_millis(30);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(!glow.patches().is_empty(), "light-theme fire still emits");
@@ -21035,6 +21832,7 @@ mod tests {
                 if let Some(s) = probe {
                     glow.observe_row(2, col, &row(s), t);
                 }
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((2, col)), t, &c, g, &mut out);
             }
             glow.halos()
@@ -21077,6 +21875,7 @@ mod tests {
             glow.tick(Some((2, 0)), t, &c, g, &mut out);
             for i in 1..=10u16 {
                 t += Duration::from_millis(30);
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((2, i)), t, &c, g, &mut out);
             }
             glow.halos()
@@ -21129,6 +21928,7 @@ mod tests {
         for col in 5..=12u16 {
             t += Duration::from_millis(350);
             glow.rainbow.momentum.set_value(t, 0.5);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -21161,14 +21961,16 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=12u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(
             glow.sparks.iter().any(|s| s.row == 2),
             "the typed row is burning before the line change"
         );
-        // Enter: down a row, back to column 0.
+        // A scripted line change retires the old row and owns the landing.
         t += Duration::from_millis(60);
+        glow.note_synthetic_move(t);
         glow.tick(Some((3, 0)), t, &c, g, &mut out);
         // Within ~a quarter second the old row's flames have guttered out.
         t += Duration::from_millis(250);
@@ -21202,6 +22004,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=12u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         // The three letters behind the head are all still alive (continuous bar).
@@ -21218,6 +22021,7 @@ mod tests {
         // A 2 s thinking pause, then ONE key: it must take the short base life
         // (well under a second), never a pause-scaled chained one.
         t += Duration::from_secs(2);
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, 13)), t, &c, g, &mut out);
         // (The typing spark lays at the just-typed ORIGIN cell — col 12.)
         let head = glow
@@ -21234,7 +22038,7 @@ mod tests {
     }
 
     /// ECHO-RUN LAW: a coalesced typing echo (2-3 cells forward on one row,
-    /// paired with a fresh typed hint mid-rhythm) is CONTINUED TYPING — every
+    /// backed by an admitted typed candidate mid-rhythm) is CONTINUED TYPING — every
     /// swept cell gets its own typing spark in its own successive laid hue, no
     /// flare slams, no landing ring. (Classified as a jump, it laid long-lived
     /// jump sparks between short typing sparks — the audited picket-fence burst.)
@@ -21247,9 +22051,9 @@ mod tests {
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 4)), t0, &c, g, &mut out);
         // Two sequential echoes establish the rhythm…
-        glow.note_typed(t0 + Duration::from_millis(6));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
         glow.tick(Some((2, 5)), t0 + Duration::from_millis(8), &c, g, &mut out);
-        glow.note_typed(t0 + Duration::from_millis(14));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(14), 1);
         glow.tick(
             Some((2, 6)),
             t0 + Duration::from_millis(16),
@@ -21258,7 +22062,7 @@ mod tests {
             &mut out,
         );
         // …then two keys echo in ONE observed move (frame coalescing).
-        glow.note_typed(t0 + Duration::from_millis(22));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(22), 2);
         glow.tick(
             Some((2, 8)),
             t0 + Duration::from_millis(24),
@@ -21299,10 +22103,10 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 4)), t0, &c, g, &mut out);
-        glow.note_typed(t0 + Duration::from_millis(6));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
         glow.tick(Some((2, 5)), t0 + Duration::from_millis(8), &c, g, &mut out);
         // Six keys echo in ONE observed move (a frame slip under load).
-        glow.note_typed(t0 + Duration::from_millis(14));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(14), 6);
         glow.tick(
             Some((2, 11)),
             t0 + Duration::from_millis(16),
@@ -21339,7 +22143,7 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 36)), t0, &c, g, &mut out);
-        glow.note_typed(t0 + Duration::from_millis(6));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(6), 1);
         glow.tick(
             Some((2, 37)),
             t0 + Duration::from_millis(8),
@@ -21348,7 +22152,7 @@ mod tests {
             &mut out,
         );
         // The coalesced fold echo: (2,37) → (3,2) in one observed move.
-        glow.note_typed(t0 + Duration::from_millis(14));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(14), 5);
         glow.tick(
             Some((3, 2)),
             t0 + Duration::from_millis(16),
@@ -21385,13 +22189,11 @@ mod tests {
         );
     }
 
-    /// VERTICAL-NAV LAW: Up/Down arrows arm the SAME nav hint as Ctrl-A/E —
-    /// a hint-paired one-row move is scrubbing in ANY direction: no heat, no
-    /// wake. (The old `cr == pr` conjunct consumed the hint yet classified the
-    /// move as typing — a held vertical arrow maxed the heat to the 1.2×
-    /// sprint overdrive.)
+    /// VERTICAL-NAV LAW: Up/Down timestamps are classifier signals, not causal
+    /// evidence. Repeated one-row child relocations therefore stay dark in every
+    /// direction and cannot build heat or a wake.
     #[test]
-    fn vertical_nav_hint_suppresses_heat_and_wake() {
+    fn vertical_navigation_timestamps_stay_dark() {
         let g = geom();
         let c = cfg(GlowStyle::Lumen, true);
         let t0 = Instant::now();
@@ -21430,12 +22232,14 @@ mod tests {
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
         // First key after an idle window: the lone-key base life (~0.4-0.75s).
         let mut t = t0 + Duration::from_millis(5);
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, 1)), t, &c, g, &mut out);
         let first_life = glow.sparks.iter().find(|s| s.col == 0).unwrap().life;
         assert!(first_life >= 0.40, "a lone first key keeps the base life");
         // A fast burst follows: 8 ms cadence.
         for col in 2..=8u16 {
             t += Duration::from_millis(8);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         let origin = glow
@@ -21468,6 +22272,7 @@ mod tests {
         let mut t = t0;
         for col in 5..=8u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -21602,6 +22407,7 @@ mod tests {
         slow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=10u16 {
             t += Duration::from_millis(500);
+            slow.note_synthetic_typed(t, 1);
             slow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let slow_lum = lum(&out);
@@ -21613,6 +22419,7 @@ mod tests {
         fast.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=10u16 {
             t += Duration::from_millis(50);
+            fast.note_synthetic_typed(t, 1);
             fast.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let fast_lum = lum(&out);
@@ -21634,6 +22441,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=10u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         assert!(
@@ -21656,6 +22464,7 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((3, 5)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((1, 38)), t0, &c, g, &mut out); // a real jump = a strike
         assert!(
             glow.bolts.len() >= 3,
@@ -21722,6 +22531,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=14u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
             let head_x = (i as f32 + 0.5) * g.cw as f32;
             if glow
@@ -21785,8 +22595,10 @@ mod tests {
         let mut glow = CursorGlow::default();
         glow.tick(Some((3, 5)), t0, &c, g, &mut out);
         // A big jump exercises comet + crown + ring; then typing advances.
+        glow.note_synthetic_move(t0);
         glow.tick(Some((1, 38)), t0, &c, g, &mut out);
         let mut all: Vec<GlowQuad> = out.clone();
+        glow.note_synthetic_typed(t0 + Duration::from_millis(60), 1);
         glow.tick(
             Some((1, 39)),
             t0 + Duration::from_millis(60),
@@ -21811,16 +22623,16 @@ mod tests {
         }
     }
 
-    /// LASER navigation is calm: a nav-hinted jump (Ctrl-A/Home) forges NO
-    /// lightning strike — the bolts stay empty, matching the flare/ring nav gates —
-    /// while the SAME jump without the nav hint still strikes (the payoff survives).
+    /// A raw Ctrl-A/Home timestamp forges no LASER strike because it is not
+    /// movement provenance. The same geometry under an explicit synthetic
+    /// candidate still exercises the strike morphology.
     #[test]
     fn laser_navigation_forges_no_strike() {
         let g = geom();
         let c = cfg(GlowStyle::Laser, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
-        // A nav-hinted jump: no strike, no flare slam.
+        // A timestamp-only relocation: no strike, no flare slam.
         let mut nav = CursorGlow::default();
         nav.tick(Some((2, 35)), t0, &c, g, &mut out);
         nav.note_navigation(t0 + Duration::from_millis(5));
@@ -21841,9 +22653,10 @@ mod tests {
             "and never slams the flare ({})",
             nav.flare
         );
-        // The same jump WITHOUT the nav hint still strikes.
+        // The same explicitly scripted jump still strikes.
         let mut jump = CursorGlow::default();
         jump.tick(Some((2, 35)), t0, &c, g, &mut out);
+        jump.note_synthetic_move(t0 + Duration::from_millis(5));
         jump.tick(
             Some((2, 0)),
             t0 + Duration::from_millis(10),
@@ -21853,7 +22666,7 @@ mod tests {
         );
         assert!(
             !jump.bolts.is_empty(),
-            "a non-navigation jump still strikes lightning"
+            "a synthetic preview jump still strikes lightning"
         );
     }
 
@@ -21885,6 +22698,935 @@ mod tests {
             || !glow.halo_cells().is_empty()
     }
 
+    /// Tier-1 bind for `cursor_move_candidate_model`: the genuine Glow and
+    /// classic engines arm from one seeded source, consume one exact row-diff /
+    /// target proof, and every selectable style (including a data-defined pack)
+    /// births only on that admitted transition. The following cold relocation
+    /// is denied and retires every output stream immediately.
+    #[test]
+    fn cursor_move_candidate_real_engines_and_all_styles_conform() {
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut captured = source.clone();
+        assert!(model.fire("ArmTyped", &mut captured));
+        let mut armed = captured.clone();
+        assert!(model.fire("DeliverStable", &mut armed));
+        let mut confirmed = armed.clone();
+        assert!(model.fire("ConfirmTypedNext", &mut confirmed));
+        let mut consumed = confirmed.clone();
+        assert!(model.fire("ObserveMove", &mut consumed));
+        let mut projected = consumed.clone();
+        assert!(model.fire("FinalExtractSame", &mut projected));
+        assert_eq!(consumed["admitted"], 1);
+        assert_eq!(consumed["birth"], 1);
+        assert_eq!(projected["projection"], 1);
+        for (from, to, action, label) in [
+            (&source, &captured, "ArmTyped", "real baseline capture"),
+            (&captured, &armed, "DeliverStable", "real stable inline delivery"),
+            (&armed, &confirmed, "ConfirmTypedNext", "real exact row proof"),
+            (&confirmed, &consumed, "ObserveMove", "real admitted move"),
+            (&consumed, &projected, "FinalExtractSame", "real coherent projection"),
+        ] {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                from,
+                to,
+                Some(action),
+                label,
+            );
+            assert!(ok, "{label} rejected: {why}");
+        }
+
+        // The exact historical mutant is non-vacuous at Tier 1 too: claiming a
+        // birth from the fresh arm without the real content-confirmation step is
+        // not a legal healthy ObserveMove transition.
+        let mut forged = armed.clone();
+        forged.insert("phase", 4);
+        forged.insert("admitted", 1);
+        forged.insert("birth", 1);
+        forged.insert("observations", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &forged,
+            Some("ObserveMove"),
+            "timestamp-only forged birth",
+        );
+        assert!(!ok, "fresh timestamp without exact evidence must be rejected");
+
+        // Real negative control for that model edge: both genuine engines have
+        // a fresh, exact-target candidate, but no next-generation row proof.
+        // The first matching delta consumes it dark; this is not a hand-forged
+        // projection of the expected answer.
+        let g = geom();
+        let t0 = Instant::now();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let armed_generation = ContentGeneration {
+            process_sequence: 7,
+            terminal_id: 11,
+            alternate_screen: false,
+        };
+        let baseline_cells = [' '; 12];
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.7,
+            warmth: 0.0,
+        };
+        let mut unproved_glow = CursorGlow::default();
+        let mut unproved_trail = CursorTrail::default();
+        let mut unproved_glow_out = Vec::new();
+        let mut unproved_trail_out = Vec::new();
+        let lumen = cfg(GlowStyle::Lumen, true);
+        unproved_glow.tick(Some((2, 2)), t0, &lumen, g, &mut unproved_glow_out);
+        unproved_trail.tick(
+            Some((2, 2)),
+            t0,
+            &trail_cfg,
+            &mut unproved_trail_out,
+        );
+        unproved_glow.note_typed_expected(
+            t0 + Duration::from_millis(1),
+            expected,
+            (2, 3),
+            (2, 2),
+            baseline,
+            armed_generation,
+        );
+        unproved_trail.note_typed_expected(
+            t0 + Duration::from_millis(1),
+            expected,
+            (2, 3),
+            (2, 2),
+        );
+        unproved_glow.tick(
+            Some((2, 3)),
+            t0 + Duration::from_millis(2),
+            &lumen,
+            g,
+            &mut unproved_glow_out,
+        );
+        unproved_trail.tick(
+            Some((2, 3)),
+            t0 + Duration::from_millis(2),
+            &trail_cfg,
+            &mut unproved_trail_out,
+        );
+        assert!(!frame_has_output(&unproved_glow_out, &unproved_glow));
+        assert!(unproved_trail_out.is_empty());
+        let mut real_timestamp_only = armed.clone();
+        assert!(model.fire("ObserveMove", &mut real_timestamp_only));
+        assert_eq!(real_timestamp_only["admitted"], 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &real_timestamp_only,
+            Some("ObserveMove"),
+            "real fresh candidate without content evidence",
+        );
+        assert!(ok, "real timestamp-only denial rejected: {why}");
+
+        let observed_generation = ContentGeneration {
+            process_sequence: 8,
+            ..armed_generation
+        };
+        let mut current = baseline_cells;
+        current[2] = 'x';
+        let styles = [
+            GlowStyle::Lumen,
+            GlowStyle::Phaser,
+            GlowStyle::RainbowKitty,
+            GlowStyle::Sparkle,
+            GlowStyle::Fire,
+            GlowStyle::Laser,
+            GlowStyle::Beam,
+            GlowStyle::Water,
+            GlowStyle::Comet,
+            GlowStyle::Custom,
+        ];
+        for (style_index, style) in styles.into_iter().enumerate() {
+            let mut c = cfg(style, true);
+            if style == GlowStyle::Custom {
+                c.pack = Some(TrailParams::defaults());
+            }
+            let mut glow = CursorGlow::default();
+            let mut trail = CursorTrail::default();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            glow.tick(Some((2, 2)), t0, &c, g, &mut glow_out);
+            trail.tick(Some((2, 2)), t0, &trail_cfg, &mut trail_out);
+            glow.note_typed_expected(
+                t0 + Duration::from_millis(1),
+                expected,
+                (2, 3),
+                (2, 2),
+                baseline,
+                armed_generation,
+            );
+            trail.note_typed_expected(
+                t0 + Duration::from_millis(1),
+                expected,
+                (2, 3),
+                (2, 2),
+            );
+            glow.observe_row(
+                2,
+                3,
+                &current,
+                t0 + Duration::from_millis(2),
+            );
+            let decision = glow.confirm_content_candidate(
+                Some((2, 3)),
+                t0 + Duration::from_millis(2),
+                observed_generation,
+            );
+            let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+                panic!("{style:?}: exact candidate did not confirm: {decision:?}");
+            };
+            trail.confirm_content_candidate(at, origin, target);
+            glow.tick(
+                Some((2, 3)),
+                t0 + Duration::from_millis(2),
+                &c,
+                g,
+                &mut glow_out,
+            );
+            trail.tick(
+                Some((2, 3)),
+                t0 + Duration::from_millis(2),
+                &trail_cfg,
+                &mut trail_out,
+            );
+            assert!(frame_has_output(&glow_out, &glow), "{style:?}: admitted glow is dark");
+            assert!(!trail_out.is_empty(), "{style:?}: admitted classic trail is dark");
+
+            // Bind the universal selector dimensions to both genuine engines,
+            // not merely to a hand-advanced abstract counter. Each style's
+            // observed visible birth is projected through the same candidate
+            // action with engine=Glow and engine=classic respectively.
+            for (engine_index, real_birth) in [
+                (0i64, frame_has_output(&glow_out, &glow)),
+                (1i64, !trail_out.is_empty()),
+            ] {
+                assert!(real_birth, "{style:?}/engine {engine_index}: real birth missing");
+                let mut selected = model.init_state();
+                for _ in 0..style_index {
+                    assert!(model.fire("NextStyle", &mut selected));
+                }
+                if engine_index == 1 {
+                    assert!(model.fire("NextEngine", &mut selected));
+                }
+                assert_eq!(selected["style"], style_index as i64);
+                assert_eq!(selected["engine"], engine_index);
+                for action in ["ArmTyped", "DeliverStable", "ConfirmTypedNext"] {
+                    assert!(model.fire(action, &mut selected));
+                }
+                let before_birth = selected.clone();
+                assert!(model.fire("ObserveMove", &mut selected));
+                assert_eq!(selected["birth"], 1);
+                assert_eq!(selected["birth_style"], style_index as i64);
+                assert_eq!(selected["birth_engine"], engine_index);
+                assert_eq!(selected["birth_host"], 0);
+                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &before_birth,
+                    &selected,
+                    Some("ObserveMove"),
+                    &format!("real {style:?} engine selector {engine_index}"),
+                );
+                assert!(ok, "{style:?}/engine {engine_index} rejected: {why}");
+            }
+
+            glow.tick(
+                Some((2, 4)),
+                t0 + Duration::from_millis(3),
+                &c,
+                g,
+                &mut glow_out,
+            );
+            trail.tick(
+                Some((2, 4)),
+                t0 + Duration::from_millis(3),
+                &trail_cfg,
+                &mut trail_out,
+            );
+            assert!(
+                !frame_has_output(&glow_out, &glow),
+                "{style:?}: denied relocation left detached style output"
+            );
+            assert!(trail_out.is_empty(), "{style:?}: denied classic move left sparks");
+        }
+        assert_eq!(styles.len(), 10, "model style selector covers every built-in/custom style");
+    }
+
+    /// A canceled cohort converges after its first cold observation; both real
+    /// engines can then enter a fresh candidate epoch and admit a later exact
+    /// edit. This binds the model's recovery action, not only its deny side.
+    #[test]
+    fn glow_and_classic_begin_a_fresh_candidate_epoch_after_dark_consumption() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.6,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let baseline_cells = [' '; 12];
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 91,
+            alternate_screen: false,
+        };
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.tick(Some((1, 1)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((1, 1)), t0, &trail_cfg, &mut trail_out);
+
+        let first = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(
+            first,
+            expected,
+            (1, 2),
+            (1, 1),
+            baseline,
+            generation(20),
+        );
+        trail.note_typed_expected(first, expected, (1, 2), (1, 1));
+        glow.cancel_authored_move_candidate();
+        trail.cancel_authored_move_candidate();
+        glow.tick(Some((1, 2)), first, &c, g, &mut glow_out);
+        trail.tick(Some((1, 2)), first, &trail_cfg, &mut trail_out);
+        assert!(!frame_has_output(&glow_out, &glow));
+        assert!(trail_out.is_empty());
+
+        let second = first + Duration::from_millis(1);
+        glow.note_typed_expected(
+            second,
+            expected,
+            (1, 3),
+            (1, 2),
+            baseline,
+            generation(20),
+        );
+        trail.note_typed_expected(second, expected, (1, 3), (1, 2));
+        assert!(glow.move_candidate_pending() && trail.move_candidate_pending());
+        let mut current = baseline_cells;
+        current[2] = 'x';
+        glow.observe_row(1, 3, &current, second);
+        let decision = glow.confirm_content_candidate(Some((1, 3)), second, generation(21));
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("fresh exact cohort failed to confirm: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        glow.tick(Some(target), second, &c, g, &mut glow_out);
+        trail.tick(Some(target), second, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow));
+        assert!(!trail_out.is_empty());
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut pending = model.init_state();
+        assert!(model.fire("ArmTyped", &mut pending));
+        assert!(model.fire("DeliverStable", &mut pending));
+        assert!(model.fire("UnsupportedInput", &mut pending));
+        let consumed = pending.clone();
+        assert!(model.fire("BeginCandidateEpoch", &mut pending));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &consumed,
+            &pending,
+            Some("BeginCandidateEpoch"),
+            "real Glow/classic candidate recovery boundary",
+        );
+        assert!(ok, "candidate recovery epoch rejected: {why}");
+        for action in [
+            "ArmTyped",
+            "DeliverStable",
+            "ConfirmTypedNext",
+            "ObserveMove",
+        ] {
+            assert!(model.fire(action, &mut pending));
+        }
+        assert_eq!(pending["birth"], 1);
+    }
+
+    /// Backspace evidence is the exact one-cell EOL diff captured at input,
+    /// not a possibly older presented-row shrink. The stale probe below still
+    /// contains an unrelated suffix that disappeared before the key; the
+    /// confirmed delete must emit only the two-puff weight-1 Lumen poof.
+    #[test]
+    fn exact_backspace_candidate_uses_its_input_baseline_and_model_action() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        let mut old_presented = [' '; 16];
+        old_presented[..13].fill('o');
+        glow.observe_row(2, 9, &old_presented, t0);
+        glow.tick(Some((2, 9)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 9)), t0, &trail_cfg, &mut trail_out);
+
+        // Program output cleared the old suffix before the key but no present
+        // occurred. This is the actual input-time baseline: fill exactly at
+        // the caret, so plain EOL Backspace owns only column 8.
+        let mut baseline_cells = [' '; 16];
+        baseline_cells[..9].fill('b');
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let armed_generation = ContentGeneration {
+            process_sequence: 40,
+            terminal_id: 9,
+            alternate_screen: false,
+        };
+        let at = t0 + Duration::from_millis(1);
+        glow.note_backspace(at);
+        glow.note_delete_candidate(at, (2, 8), baseline, armed_generation);
+        trail.note_delete_expected(at, (2, 8));
+
+        let mut current = baseline_cells;
+        current[8] = ' ';
+        let observed_at = at + Duration::from_millis(1);
+        glow.observe_row(2, 8, &current, observed_at);
+        let decision = glow.confirm_content_candidate(
+            Some((2, 8)),
+            observed_at,
+            ContentGeneration {
+                process_sequence: 41,
+                ..armed_generation
+            },
+        );
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("exact EOL Backspace did not confirm: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        glow.tick(Some(target), observed_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), observed_at, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.vapor
+                .iter()
+                .filter(|vapor| matches!(vapor.kind, VaporKind::Poof))
+                .count(),
+            2,
+            "weight-one exact Backspace cannot inherit the stale suffix span"
+        );
+        assert!(!trail_out.is_empty(), "confirmed Backspace admits classic trail");
+        assert!(glow.confirmed_delete_span.is_none(), "exact span is one-shot");
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut captured = source.clone();
+        assert!(model.fire("ArmBackspace", &mut captured));
+        let mut armed = captured.clone();
+        assert!(model.fire("DeliverStable", &mut armed));
+        let mut confirmed = armed.clone();
+        assert!(model.fire("ConfirmBackspaceNext", &mut confirmed));
+        let mut consumed = confirmed.clone();
+        assert!(model.fire("ObserveMove", &mut consumed));
+        assert_eq!(consumed["birth"], 1);
+        for (from, to, action) in [
+            (&source, &captured, "ArmBackspace"),
+            (&captured, &armed, "DeliverStable"),
+            (&armed, &confirmed, "ConfirmBackspaceNext"),
+            (&confirmed, &consumed, "ObserveMove"),
+        ] {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                from,
+                to,
+                Some(action),
+                "real exact Backspace candidate",
+            );
+            assert!(ok, "{action} rejected: {why}");
+        }
+
+        let mut synthetic_glow = CursorGlow::default();
+        let mut synthetic_trail = CursorTrail::default();
+        synthetic_glow.tick(Some((1, 1)), t0, &c, g, &mut glow_out);
+        synthetic_trail.tick(Some((1, 1)), t0, &trail_cfg, &mut trail_out);
+        synthetic_glow.note_synthetic_move(at);
+        synthetic_trail.note_synthetic_move(at);
+        synthetic_glow.tick(Some((1, 4)), at, &c, g, &mut glow_out);
+        synthetic_trail.tick(Some((1, 4)), at, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &synthetic_glow));
+        assert!(!trail_out.is_empty());
+        let mut synthetic = source;
+        assert!(model.fire("ArmSynthetic", &mut synthetic));
+        let before = synthetic.clone();
+        assert!(model.fire("ObserveMove", &mut synthetic));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before,
+            &synthetic,
+            Some("ObserveMove"),
+            "real synthetic preview candidate",
+        );
+        assert!(ok, "synthetic candidate rejected: {why}");
+    }
+
+    /// A plain Backspace classifier is not an erase proof. If the host cannot
+    /// arm the exact EOL one-cell candidate (blank/column-zero/wide/failed or
+    /// raced delivery), a later unrelated shrink and retreat must not borrow
+    /// its poof hint or create either engine's movement light.
+    #[test]
+    fn backspace_without_exact_candidate_cannot_borrow_a_later_row_shrink() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.6,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        let mut before = [' '; 16];
+        before[..10].fill('q');
+        glow.observe_row(2, 10, &before, t0);
+        glow.tick(Some((2, 10)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 10)), t0, &trail_cfg, &mut trail_out);
+
+        let at = t0 + Duration::from_millis(1);
+        glow.note_backspace(at);
+        trail.cancel_authored_move_candidate();
+        assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
+
+        // This shrink/CUP is program-owned. The old implementation ORed the
+        // plain-Backspace timestamp into the generic shrink detector and
+        // emitted a phantom poof here.
+        let mut after = before;
+        after[6..].fill(' ');
+        let observed = at + Duration::from_millis(1);
+        glow.observe_row(2, 6, &after, observed);
+        glow.tick(Some((2, 6)), observed, &c, g, &mut glow_out);
+        trail.tick(
+            Some((2, 6)),
+            observed,
+            &trail_cfg,
+            &mut trail_out,
+        );
+        assert!(!frame_has_output(&glow_out, &glow));
+        assert!(trail_out.is_empty());
+        assert!(
+            glow.vapor
+                .iter()
+                .all(|vapor| !matches!(vapor.kind, VaporKind::Poof)),
+            "timestamp-only Backspace may not poof an unrelated shrink"
+        );
+        assert!(glow.confirmed_delete_span.is_none());
+
+        glow.bs_poof_hint = Some(observed);
+        glow.confirmed_delete_span = Some((observed, 2, 5));
+        let expired = observed
+            + Duration::from_secs_f32(CursorGlow::KILL_HINT_FRESH + 0.01);
+        glow.tick(Some((2, 6)), expired, &c, g, &mut glow_out);
+        assert!(glow.confirmed_delete_span.is_none(), "expiry retires exact marker");
+
+        glow.bs_poof_hint = Some(expired);
+        glow.confirmed_delete_span = Some((expired, 2, 5));
+        glow.note_scroll(1);
+        assert!(glow.confirmed_delete_span.is_none(), "scroll fence retires marker");
+    }
+
+    /// A denied program relocation retires only movement-owned click-dedup
+    /// credit. The already-earned key-time sound remains queued, while the next
+    /// genuine admitted key can establish and spend a fresh credit normally.
+    #[test]
+    fn denied_move_preserves_queued_sound_but_retires_stale_keyed_credit() {
+        let g = geom();
+        let c = cfg(GlowStyle::Water, true);
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+
+        let first = t0 + Duration::from_millis(1);
+        assert!(glow.cue_keystroke(first));
+        glow.note_typed(first);
+        assert_eq!(glow.sound_cues.len(), 1);
+        assert_eq!(glow.keyed_clicks, 1);
+
+        // No exact candidate: this CUP is dark and consumes the uncorrelated
+        // classifier. It must not erase the sound already earned at key time.
+        glow.tick(
+            Some((2, 3)),
+            first + Duration::from_millis(1),
+            &c,
+            g,
+            &mut out,
+        );
+        assert_eq!(glow.sound_cues.len(), 1, "earned sound survives visual denial");
+        assert_eq!(glow.keyed_clicks, 0, "stale echo-dedup credit retires");
+
+        let second = first + Duration::from_millis(20);
+        assert!(glow.cue_keystroke(second), "the next genuine key is not muted");
+        assert_eq!(glow.sound_cues.len(), 2);
+        assert_eq!(glow.keyed_clicks, 1);
+        glow.note_synthetic_typed(second, 1);
+        glow.tick(Some((2, 4)), second, &c, g, &mut out);
+        assert_eq!(glow.keyed_clicks, 0, "the new exact echo spends its own credit");
+        assert_eq!(glow.sound_cues.len(), 2, "echo adds no duplicate click");
+    }
+
+    #[test]
+    fn first_mismatched_or_skipped_generation_consumes_exact_candidate_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.6,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let baseline_cells = [' '; 12];
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 77,
+            alternate_screen: false,
+        };
+
+        let prepare = || {
+            let mut glow = CursorGlow::default();
+            let mut trail = CursorTrail::default();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            glow.tick(Some((2, 2)), t0, &c, g, &mut glow_out);
+            trail.tick(
+                Some((2, 2)),
+                t0,
+                &trail_cfg,
+                &mut trail_out,
+            );
+            let at = t0 + Duration::from_millis(1);
+            glow.note_typed_expected(
+                at,
+                expected,
+                (2, 3),
+                (2, 2),
+                baseline,
+                generation(10),
+            );
+            trail.note_typed_expected(at, expected, (2, 3), (2, 2));
+            (glow, trail, glow_out, trail_out, at)
+        };
+
+        // N+1 arrived, but its row diff was not the authored scalar. That is
+        // the sole attributable batch; a later exact-looking N+2 may not retry.
+        let (mut mismatch_glow, mut mismatch_trail, mut glow_out, mut trail_out, at) = prepare();
+        let mut wrong = baseline_cells;
+        wrong[2] = 'y';
+        mismatch_glow.observe_row(2, 3, &wrong, at + Duration::from_millis(1));
+        let retired = mismatch_glow.confirm_content_candidate(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            generation(11),
+        );
+        let Some(ContentCandidateDecision::Retired { at, origin }) = retired else {
+            panic!("first mismatched generation did not retire: {retired:?}");
+        };
+        mismatch_trail.retire_content_candidate(at, origin);
+        let mut exact_late = baseline_cells;
+        exact_late[2] = 'x';
+        mismatch_glow.observe_row(2, 3, &exact_late, at + Duration::from_millis(2));
+        assert!(
+            mismatch_glow
+                .confirm_content_candidate(
+                    Some((2, 3)),
+                    at + Duration::from_millis(2),
+                    generation(12),
+                )
+                .is_none(),
+            "N+2 cannot resurrect the consumed candidate"
+        );
+        mismatch_glow.tick(
+            Some((2, 3)),
+            at + Duration::from_millis(2),
+            &c,
+            g,
+            &mut glow_out,
+        );
+        mismatch_trail.tick(
+            Some((2, 3)),
+            at + Duration::from_millis(2),
+            &trail_cfg,
+            &mut trail_out,
+        );
+        assert!(!frame_has_output(&glow_out, &mismatch_glow));
+        assert!(trail_out.is_empty());
+
+        // If the first observed snapshot already skipped N+1, even an exact
+        // target/material row is uncorrelatable and retires immediately.
+        let (mut skipped_glow, mut skipped_trail, mut glow_out, mut trail_out, at) = prepare();
+        skipped_glow.observe_row(2, 3, &exact_late, at + Duration::from_millis(1));
+        let retired = skipped_glow.confirm_content_candidate(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            generation(12),
+        );
+        let Some(ContentCandidateDecision::Retired { at, origin }) = retired else {
+            panic!("skipped exact-looking generation did not retire: {retired:?}");
+        };
+        skipped_trail.retire_content_candidate(at, origin);
+        skipped_glow.tick(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            &c,
+            g,
+            &mut glow_out,
+        );
+        skipped_trail.tick(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            &trail_cfg,
+            &mut trail_out,
+        );
+        assert!(!frame_has_output(&glow_out, &skipped_glow));
+        assert!(trail_out.is_empty());
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut armed = model.init_state();
+        assert!(model.fire("ArmTyped", &mut armed));
+        assert!(model.fire("DeliverStable", &mut armed));
+        for (action, label) in [
+            ("NextGenerationMismatch", "real N+1 exact-diff mismatch"),
+            ("SkippedGeneration", "real N+2 exact-looking skip"),
+        ] {
+            let mut dark = armed.clone();
+            assert!(model.fire(action, &mut dark));
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                &armed,
+                &dark,
+                Some(action),
+                label,
+            );
+            assert!(ok, "{label} rejected: {why}");
+            let mut forged = dark;
+            forged.insert("phase", 3);
+            forged.insert("evidence_exact", 1);
+            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                &armed,
+                &forged,
+                Some(action),
+                "forged retained exact candidate",
+            );
+            assert!(!ok, "{action} must consume the candidate dark");
+        }
+    }
+
+    /// A parser batch can rewrite a lit cell without moving the cursor. Every
+    /// resident style pool must therefore be generation-bound: same-generation
+    /// animation may decay normally, an unowned generation change clears it,
+    /// and an exact candidate clears old geometry before forging only its fresh
+    /// admitted move.
+    #[test]
+    fn content_generation_retires_old_light_but_exact_next_edit_spawns_fresh() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 55,
+            alternate_screen: false,
+        };
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.tick(Some((2, 1)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 1)), t0, &trail_cfg, &mut trail_out);
+        assert!(!glow.observe_content_generation(generation(10), false));
+        assert!(!trail.observe_content_generation(generation(10), false));
+
+        // Charge genuinely resident light in generation 10.
+        let charged_at = t0 + Duration::from_millis(1);
+        glow.note_synthetic_move(charged_at);
+        trail.note_synthetic_move(charged_at);
+        glow.tick(Some((2, 2)), charged_at, &c, g, &mut glow_out);
+        trail.tick(Some((2, 2)), charged_at, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow));
+        assert!(!trail_out.is_empty());
+
+        // The exact next batch owns only column 2 and target (2,3). It may
+        // spawn fresh geometry, but every older resident pool is cleared first
+        // because the same parser batch could also have rewritten another row.
+        let baseline_cells = [' '; 12];
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let typed_at = t0 + Duration::from_millis(2);
+        glow.note_typed_expected(
+            typed_at,
+            expected,
+            (2, 3),
+            (2, 2),
+            baseline,
+            generation(10),
+        );
+        trail.note_typed_expected(typed_at, expected, (2, 3), (2, 2));
+        let mut current = baseline_cells;
+        current[2] = 'x';
+        glow.observe_row(2, 3, &current, typed_at);
+        let decision = glow.confirm_content_candidate(Some((2, 3)), typed_at, generation(11));
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("exact next-generation edit did not confirm: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        assert!(glow.observe_content_generation(generation(11), true));
+        assert!(trail.observe_content_generation(generation(11), true));
+        assert!(
+            !frame_has_output(&[], &glow) && !trail.is_active(),
+            "exact evidence retires every pre-existing visual before fresh spawn"
+        );
+        assert!(glow.move_candidate_pending() && trail.move_candidate_pending());
+        glow.tick(Some(target), typed_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), typed_at, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow));
+        assert!(!trail_out.is_empty());
+
+        // Animation within the same terminal generation remains live.
+        let settle = typed_at + Duration::from_millis(20);
+        assert!(!glow.observe_content_generation(generation(11), false));
+        assert!(!trail.observe_content_generation(generation(11), false));
+        glow.tick(Some(target), settle, &c, g, &mut glow_out);
+        trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow));
+        assert!(!trail_out.is_empty());
+
+        // A same-cursor status/title/spinner batch is not owned by any input
+        // proof. It clears the old light immediately, before another cell can
+        // inherit the segment.
+        assert!(glow.observe_content_generation(generation(12), false));
+        assert!(trail.observe_content_generation(generation(12), false));
+        glow.tick(Some(target), settle, &c, g, &mut glow_out);
+        trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
+        assert!(!frame_has_output(&glow_out, &glow));
+        assert!(trail_out.is_empty());
+
+        // A parser batch that also reports a scroll still fails closed: the
+        // coordinate translation is not proof that the glyph beneath each
+        // resident spark survived the batch.
+        glow.note_synthetic_move(settle);
+        trail.note_synthetic_move(settle);
+        glow.tick(Some((3, 4)), settle, &c, g, &mut glow_out);
+        trail.tick(Some((3, 4)), settle, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow) && !trail_out.is_empty());
+        glow.note_scroll(1);
+        trail.note_scroll(1);
+        assert!(glow.observe_content_generation(generation(13), false));
+        assert!(trail.observe_content_generation(generation(13), false));
+        glow.tick(Some((2, 4)), settle, &c, g, &mut glow_out);
+        trail.tick(Some((2, 4)), settle, &trail_cfg, &mut trail_out);
+        assert!(!frame_has_output(&glow_out, &glow) && trail_out.is_empty());
+
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut charged = source.clone();
+        assert!(model.fire("ChargeResident", &mut charged));
+        let mut projected = charged.clone();
+        assert!(model.fire("FinalExtractSame", &mut projected));
+        let mut rewritten = projected.clone();
+        assert!(model.fire("UnownedContentRewrite", &mut rewritten));
+        assert_eq!(rewritten["resident_charged"], 0);
+        assert_eq!(rewritten["resident_projection"], 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &projected,
+            &rewritten,
+            Some("UnownedContentRewrite"),
+            "real same-cursor unowned content rewrite",
+        );
+        assert!(ok, "unowned rewrite rejected: {why}");
+        let mut stranded = rewritten;
+        stranded.insert("resident_charged", 1);
+        stranded.insert("resident_projection", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &projected,
+            &stranded,
+            Some("UnownedContentRewrite"),
+            "forged resident light after content rewrite",
+        );
+        assert!(!ok, "unowned rewrite may not retain old light");
+
+        // Tier-1 fresh-birth lifecycle: this test's exact candidate produced
+        // new geometry, the coherent extraction promoted it to resident, and
+        // generation 12 retired that newly resident light.
+        let mut fresh = source;
+        for action in [
+            "ArmTyped",
+            "DeliverStable",
+            "ConfirmTypedNext",
+            "ObserveMove",
+            "FinalExtractSame",
+            "PromoteProjectedBirth",
+        ] {
+            assert!(model.fire(action, &mut fresh), "fresh runtime projection: {action}");
+        }
+        let resident = fresh.clone();
+        assert_eq!(resident["resident_charged"], 1);
+        let mut retired = resident.clone();
+        assert!(model.fire("UnownedContentRewrite", &mut retired));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &resident,
+            &retired,
+            Some("UnownedContentRewrite"),
+            "fresh admitted light retired by next unowned generation",
+        );
+        assert!(ok, "fresh resident retirement rejected: {why}");
+        assert_eq!(retired["resident_charged"], 0);
+    }
+
     /// STYLE SWITCH mid-animation CROSSFADES the foreign light instead of hard-
     /// cutting to black: the old style's in-flight state moves into an outgoing
     /// fade that keeps emitting under its OLD config with a DECREASING
@@ -21903,9 +23645,11 @@ mod tests {
         glow.tick(Some((2, 0)), t, &laser, g, &mut out);
         for i in 1..=8u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &laser, g, &mut out);
         }
         t += Duration::from_millis(40);
+        glow.note_synthetic_move(t);
         glow.tick(Some((0, 30)), t, &laser, g, &mut out); // a jump forges bolts + sparks
         assert!(!glow.bolts.is_empty(), "the laser jump forged live bolts");
         assert!(!glow.sparks.is_empty(), "the laser run left live sparks");
@@ -21975,11 +23719,13 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=8u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
             assert!(glow.fading.is_empty(), "no switch -> no outgoing fade");
             assert!(glow.ramp_in_at.is_none(), "no switch -> no ramp-in scale");
         }
         t += Duration::from_millis(40);
+        glow.note_synthetic_move(t);
         glow.tick(Some((0, 30)), t, &c, g, &mut out); // jump: still the same style
         assert!(glow.fading.is_empty() && glow.ramp_in_at.is_none());
     }
@@ -22001,9 +23747,11 @@ mod tests {
         glow.tick(Some((2, 0)), t, &phaser, g, &mut out);
         for i in 1..=8u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &phaser, g, &mut out);
         }
         t += Duration::from_millis(40);
+        glow.note_synthetic_move(t);
         glow.tick(Some((0, 30)), t, &phaser, g, &mut out);
         // Three switches ~60 ms apart — well inside one 250 ms envelope.
         for style in [GlowStyle::Sparkle, GlowStyle::Comet, GlowStyle::Lumen] {
@@ -22053,7 +23801,7 @@ mod tests {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &water, g, &mut out); // seed
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((2, 1)), t0, &water, g, &mut out); // typed step -> cue recorded
         assert_eq!(glow.sound_cues.len(), 1, "the typed move recorded its cue");
         // Switch to fire on the next tick WITHOUT draining (a stalled host):
@@ -22067,7 +23815,7 @@ mod tests {
             "cues forged under the old style are dropped at the switch edge"
         );
         // A fresh typed move under the NEW style records exactly its own cue.
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         let t2 = t1 + Duration::from_millis(40);
         glow.tick(Some((2, 2)), t2, &fire, g, &mut out);
         let cues: Vec<_> = glow.drain_sound_cues().collect();
@@ -22099,6 +23847,7 @@ mod tests {
             glow.tick(Some((3, 5)), t, &c, g, &mut out);
             for i in 6..=12u16 {
                 t += Duration::from_millis(35);
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((3, i)), t, &c, g, &mut out);
             }
             assert!(
@@ -22147,6 +23896,7 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((2, 30)), t0, &c, g, &mut out); // a same-row tractor leap
         assert!(!out.is_empty(), "the rod is lit at spawn");
         assert_invariants(&out, g);
@@ -22201,6 +23951,7 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((2, 30)), t0, &c, g, &mut out);
         // Lit vertical extent of quads covering the rod's midpoint column.
         let extent_at = |out: &[GlowQuad]| -> i32 {
@@ -22262,6 +24013,7 @@ mod tests {
                 );
             }
             t += Duration::from_millis(150);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
     }
@@ -22279,8 +24031,10 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((3, 5)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((1, 38)), t0, &c, g, &mut out);
         let mut all: Vec<GlowQuad> = out.clone();
+        glow.note_synthetic_typed(t0 + Duration::from_millis(120), 1);
         glow.tick(
             Some((1, 39)),
             t0 + Duration::from_millis(120),
@@ -22307,6 +24061,7 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((3, 5)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((1, 38)), t0, &c, g, &mut out); // jump: comet + crown + ring + droplets
         let mut all: Vec<GlowQuad> = out.clone();
         for ms in [40u64, 120, 240] {
@@ -22346,6 +24101,7 @@ mod tests {
         slow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=12u16 {
             t += Duration::from_millis(500);
+            slow.note_synthetic_typed(t, 1);
             slow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let (slow_quads, slow_lum) = (out.len(), lum(&out));
@@ -22357,6 +24113,7 @@ mod tests {
         fast.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=12u16 {
             t += Duration::from_millis(50);
+            fast.note_synthetic_typed(t, 1);
             fast.tick(Some((2, i)), t, &c, g, &mut out);
         }
         let (fast_quads, fast_lum) = (out.len(), lum(&out));
@@ -22384,6 +24141,7 @@ mod tests {
         glow.tick(Some((2, 0)), t, &c, g, &mut out);
         for i in 1..=4u16 {
             t += Duration::from_millis(600);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
         glow.tick(
@@ -22419,6 +24177,7 @@ mod tests {
         glow.tick(Some((2, 1)), t, &c, g, &mut out);
         for col in 2..=18u16 {
             t += Duration::from_millis(20);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat > 0.9, "fast run reaches torpedo momentum");
@@ -22479,6 +24238,8 @@ mod tests {
         let t = Instant::now();
         for i in 0..1_000u16 {
             let (from, to) = if i.is_multiple_of(2) { (1, 2) } else { (2, 1) };
+            glow.last = Some((2, from));
+            glow.note_synthetic_move(t);
             glow.spawn(2, from, 2, to, t, &c, g);
             assert!(glow.sparks.len() <= CursorGlow::MAX_SPARKS);
             assert!(glow.particles.len() <= CursorGlow::MAX_PARTICLES);
@@ -22533,6 +24294,8 @@ mod tests {
             } else {
                 (2, 1)
             };
+            glow.last = Some((2, from));
+            glow.note_synthetic_move(now);
             glow.spawn(2, from, 2, to, now, &c, g);
         }
         assert_eq!(glow.heat, 1.0, "warm-up must reach maximum Water burst");
@@ -22547,6 +24310,8 @@ mod tests {
                 (2, 1)
             };
             let previous = state.clone();
+            glow.last = Some((2, from));
+            glow.note_synthetic_move(now);
             glow.spawn(2, from, 2, to, now, &c, g);
             assert!(model.fire("Spawn", &mut state));
             assert_eq!(
@@ -23230,6 +24995,7 @@ mod tests {
         let mut out = Vec::new();
         // Seed the previous position, then a 4-cell horizontal move lays a ribbon.
         glow.tick(Some((2, 2)), t, &c, g, &mut out);
+        glow.note_synthetic_typed(t, 4);
         glow.tick(Some((2, 6)), t, &c, g, &mut out);
         // Observe one beat later: the feathered-ends retune eases every cell
         // in from EXACTLY zero over its birth window, so the frame that LAYS
@@ -23302,6 +25068,7 @@ mod tests {
         glow.tick(Some((3, 5)), t, &c, g, &mut out);
         for col in 6..=18u16 {
             t += Duration::from_millis(20); // sustained fast typing → heat → max born_cov
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat > 0.9, "test must exercise the hot coverage cap");
@@ -23348,6 +25115,7 @@ mod tests {
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..=20u16 {
             t += Duration::from_millis(18);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat > 0.9);
@@ -23410,6 +25178,7 @@ mod tests {
         for col in 1..200u16 {
             t += Duration::from_millis(12);
             glow.rainbow.momentum.set_value(t, 1.0);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((1, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat > 0.9, "fixture must reach full momentum");
@@ -23476,6 +25245,7 @@ mod tests {
             for col in 3..=14u16 {
                 t += Duration::from_millis(350);
                 glow.rainbow.momentum.set_value(t, 0.5);
+                glow.note_synthetic_typed(t, 1);
                 if let Some(s) = probe {
                     glow.observe_row(3, col, &row(s), t);
                 }
@@ -23528,13 +25298,9 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         cold.tick(Some((3, 2)), t0, &c, g, &mut out);
-        cold.tick(
-            Some((3, 3)),
-            t0 + Duration::from_millis(16),
-            &c,
-            g,
-            &mut out,
-        );
+        let t1 = t0 + Duration::from_millis(16);
+        cold.note_synthetic_typed(t1, 1);
+        cold.tick(Some((3, 3)), t1, &c, g, &mut out);
         out.extend_from_slice(cold.under_quads()); // ribbon rides the under-ink stream
         let cold_ink = band_ink(&mut cold, &out);
         // HOT: a sustained fast run of single-cell advances builds heat.
@@ -23543,6 +25309,7 @@ mod tests {
         hot.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..14u16 {
             t += Duration::from_millis(18); // ~55 cps → heat ramps
+            hot.note_synthetic_typed(t, 1);
             hot.tick(Some((3, col)), t, &c, g, &mut out);
         }
         out.extend_from_slice(hot.under_quads()); // ribbon rides the under-ink stream
@@ -23566,6 +25333,7 @@ mod tests {
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..=10u16 {
             t += Duration::from_millis(400); // slow, thoughtful typing
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         assert!(glow.heat < 0.05, "a 400ms cadence must stay cold");
@@ -23589,6 +25357,7 @@ mod tests {
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..=9u16 {
             t += Duration::from_millis(1800); // hunt-and-peck
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         out.extend_from_slice(glow.under_quads()); // ribbon rides the under-ink stream
@@ -23613,10 +25382,12 @@ mod tests {
         // Brisk start…
         for col in 3..=6u16 {
             t += Duration::from_millis(200);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         // …then the very next key comes slowly (thinking pause mid-word).
         t += Duration::from_millis(1500);
+        glow.note_synthetic_typed(t, 1);
         glow.tick(Some((3, 7)), t, &c, g, &mut out);
         // Observe one beat later: the feathered birth ease keeps the newest
         // cell near-zero on the frame it is laid; the four-letter SPAN promise
@@ -23652,7 +25423,7 @@ mod tests {
         // presses back it (the anti-stray press budget: N cells need ≥N
         // presses; a single press hopping 4 cells is a vim motion, not text).
         for i in 0..4u64 {
-            glow.note_typed(t + Duration::from_millis(5 + i));
+            glow.note_synthetic_typed(t + Duration::from_millis(5 + i), 1);
         }
         glow.tick(Some((3, 6)), t + Duration::from_millis(20), &c, g, &mut out);
         // Observe one beat later: the feathered birth ease means the batch's
@@ -23711,7 +25482,7 @@ mod tests {
         let mut out = Vec::new();
         let t = Instant::now();
         glow.tick(Some((3, 4)), t, &c, g, &mut out);
-        glow.note_typed_cells(t + Duration::from_millis(5), 2);
+        glow.note_synthetic_typed(t + Duration::from_millis(5), 2);
         glow.tick(Some((3, 6)), t + Duration::from_millis(20), &c, g, &mut out);
         let live: Vec<u16> = glow
             .sparks
@@ -23728,7 +25499,10 @@ mod tests {
         // nothing to pay with — refused, no typing sparks laid past it.
         glow.tick(Some((3, 8)), t + Duration::from_millis(40), &c, g, &mut out);
         assert!(
-            !glow.sparks.iter().any(|s| s.typing && s.row == 3 && s.col == 7),
+            !glow
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 3 && s.col == 7),
             "spent credits must not fund a second multi-cell echo"
         );
         // THE CONTROL: the same 2-cell hop on a single 1-cell credit is a
@@ -23739,10 +25513,315 @@ mod tests {
         let t2 = Instant::now();
         skim.tick(Some((3, 4)), t2, &c, g, &mut out2);
         skim.note_typed(t2 + Duration::from_millis(5));
-        skim.tick(Some((3, 6)), t2 + Duration::from_millis(20), &c, g, &mut out2);
+        skim.tick(
+            Some((3, 6)),
+            t2 + Duration::from_millis(20),
+            &c,
+            g,
+            &mut out2,
+        );
         assert!(
-            !skim.sparks.iter().any(|s| s.typing && s.row == 3 && s.col == 5),
+            !skim
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 3 && s.col == 5),
             "one 1-cell credit must not paint a skimmed continuation cell"
+        );
+    }
+
+    /// USED CREDIT IS NOT HISTORY.  Three ordinary echoes used to leave three
+    /// credits parked in the ring.  One later swallowed key then contributed a
+    /// fourth, letting an unrelated four-column PTY hop pass the coalesce
+    /// budget and paint every intervening cell.  Each observed echo must spend
+    /// its own credit; the one genuinely pending key is intentionally retained,
+    /// but it is insufficient to turn the later hop into a typed sweep.
+    #[test]
+    fn observed_single_cell_echoes_cannot_fund_a_later_program_sweep() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 0)), t0, &c, g, &mut out);
+
+        for col in 1..=3u16 {
+            let now = t0 + Duration::from_millis(u64::from(col) * 20);
+            glow.note_synthetic_typed(now, 1);
+            glow.tick(Some((3, col)), now, &c, g, &mut out);
+            assert_eq!(
+                glow.typed_credits_within(now, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+                0,
+                "the observed echo at column {col} spends its credit"
+            );
+        }
+
+        // This key has not echoed yet, so its one credit remains legitimate.
+        let swallowed = t0 + Duration::from_millis(80);
+        glow.note_typed(swallowed);
+        glow.tick(Some((3, 3)), swallowed, &c, g, &mut out);
+        assert_eq!(
+            glow.typed_credits_within(swallowed, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            1
+        );
+
+        // A four-cell program relocation consumes the unproved cohort dark; it
+        // cannot borrow already-observed presses to paint a typing trail.
+        let program = swallowed + Duration::from_millis(20);
+        glow.tick(Some((3, 7)), program, &c, g, &mut out);
+        assert!(
+            !(4..=6).any(|col| glow
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 3 && s.col == col)),
+            "used credits must not sweep program-owned intermediate cells"
+        );
+        assert_eq!(
+            glow.typed_credits_within(program, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "the observed relocation consumes the remaining one-shot credit"
+        );
+
+        // PARTIAL REMOTE ECHO: two inputs can be in flight before a frame
+        // observes only one cursor cell. The one-slot type hint cannot identify
+        // which press produced that cell, so this non-coalesced boundary must
+        // retire both prior commitments fail-closed. Otherwise one leftover
+        // joins a later swallowed press and buys a false two-cell sweep.
+        let mut partial = CursorGlow::default();
+        let mut partial_out = Vec::new();
+        let p0 = t0 + Duration::from_secs(1);
+        partial.tick(Some((4, 0)), p0, &c, g, &mut partial_out);
+        let p1 = p0 + Duration::from_millis(5);
+        let p2 = p0 + Duration::from_millis(10);
+        partial.note_typed(p1);
+        partial.note_typed(p2);
+        partial.tick(
+            Some((4, 1)),
+            p2 + Duration::from_millis(5),
+            &c,
+            g,
+            &mut partial_out,
+        );
+        assert_eq!(
+            partial.typed_credits_within(
+                p2 + Duration::from_millis(5),
+                CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW
+            ),
+            0,
+            "a partial non-coalesced boundary retires all earlier in-flight credits"
+        );
+        let p3 = p2 + Duration::from_millis(20);
+        partial.note_typed(p3);
+        partial.tick(Some((4, 1)), p3, &c, g, &mut partial_out);
+        partial.tick(
+            Some((4, 3)),
+            p3 + Duration::from_millis(20),
+            &c,
+            g,
+            &mut partial_out,
+        );
+        assert!(
+            !partial
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 4 && s.col == 2),
+            "an older partial-echo credit plus a swallowed key cannot fund a cold +2 sweep"
+        );
+
+        // COALESCED PARTIAL BATCH: three inputs back an admitted +2 sweep, but
+        // that move consumes the sole/latest candidate. The unused third credit
+        // has no remaining provenance and must cross the same high-water
+        // retirement boundary before a later swallowed key arrives.
+        let mut coalesced = CursorGlow::default();
+        let mut coalesced_out = Vec::new();
+        let c0 = t0 + Duration::from_secs(2);
+        coalesced.tick(Some((5, 0)), c0, &c, g, &mut coalesced_out);
+        for millis in [5u64, 10] {
+            coalesced.note_typed(c0 + Duration::from_millis(millis));
+        }
+        coalesced.note_synthetic_typed(c0 + Duration::from_millis(15), 1);
+        let c1 = c0 + Duration::from_millis(20);
+        coalesced.tick(Some((5, 2)), c1, &c, g, &mut coalesced_out);
+        assert_eq!(
+            coalesced.typed_credits_within(c1, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "a coalesced partial batch retires its residual pre-hint credit"
+        );
+        let c2 = c1 + Duration::from_millis(20);
+        coalesced.note_typed(c2);
+        coalesced.tick(Some((5, 2)), c2, &c, g, &mut coalesced_out);
+        coalesced.tick(
+            Some((5, 4)),
+            c2 + Duration::from_millis(20),
+            &c,
+            g,
+            &mut coalesced_out,
+        );
+        assert!(
+            !coalesced
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 5 && s.col == 3),
+            "a coalesced residual plus swallowed key cannot fund a cold +2 sweep"
+        );
+
+        // SUPERSESSION is another cohort boundary. Enter/Tab/navigation call
+        // `clear_typed` before establishing their own class; if the swallowed
+        // hint dies but its credit survives, that old cell can pool with a
+        // later swallowed key. Drive the navigation spelling through a real
+        // observed move, then prove the next +2 cannot sweep an intermediate.
+        let mut superseded = CursorGlow::default();
+        let mut superseded_out = Vec::new();
+        let s0 = t0 + Duration::from_secs(3);
+        superseded.tick(Some((1, 0)), s0, &c, g, &mut superseded_out);
+        let s1 = s0 + Duration::from_millis(5);
+        superseded.note_typed(s1); // swallowed: no cursor move
+        let s2 = s1 + Duration::from_millis(5);
+        superseded.clear_typed(s2);
+        assert_eq!(
+            superseded.typed_credits_within(s2, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "supersession retires the swallowed typed cohort"
+        );
+        superseded.note_navigation(s2);
+        superseded.tick(Some((1, 10)), s2, &c, g, &mut superseded_out);
+        let s3 = s2 + Duration::from_millis(20);
+        superseded.note_typed(s3); // a new swallowed cohort
+        superseded.tick(Some((1, 10)), s3, &c, g, &mut superseded_out);
+        superseded.tick(
+            Some((1, 12)),
+            s3 + Duration::from_millis(20),
+            &c,
+            g,
+            &mut superseded_out,
+        );
+        assert!(
+            !superseded
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 1 && s.col == 11),
+            "a superseded cohort plus new swallowed key cannot fund a cold +2 sweep"
+        );
+
+        // Plain Backspace establishes deletion provenance directly rather
+        // than passing through the App's generic clear block. It must invoke
+        // the same supersession boundary itself, including when both the
+        // preceding glyph and the Backspace echo are swallowed.
+        let mut backspaced = CursorGlow::default();
+        let mut backspace_out = Vec::new();
+        let d0 = t0 + Duration::from_secs(4);
+        backspaced.tick(Some((2, 8)), d0, &c, g, &mut backspace_out);
+        let d1 = d0 + Duration::from_millis(5);
+        backspaced.note_typed(d1); // swallowed glyph
+        let d2 = d1 + Duration::from_millis(5);
+        backspaced.note_backspace(d2); // swallowed deletion
+        backspaced.tick(Some((2, 8)), d2, &c, g, &mut backspace_out);
+        assert_eq!(
+            backspaced.typed_credits_within(d2, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "Backspace supersedes the prior swallowed typed cohort"
+        );
+        let d3 = d2 + Duration::from_millis(20);
+        backspaced.note_typed(d3); // new swallowed glyph
+        backspaced.tick(Some((2, 8)), d3, &c, g, &mut backspace_out);
+        backspaced.tick(
+            Some((2, 10)),
+            d3 + Duration::from_millis(20),
+            &c,
+            g,
+            &mut backspace_out,
+        );
+        assert!(
+            !backspaced
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 2 && s.col == 9),
+            "a Backspace-superseded credit plus new swallowed key cannot fund +2"
+        );
+    }
+
+    /// A new key after the one-shot hint expired starts a new admission
+    /// generation. The older swallowed credit still lies inside the wider
+    /// batching window, but without a live correlation hint it cannot combine
+    /// with the new key to paint a cold two-cell relocation.
+    #[test]
+    fn expired_typed_cohort_cannot_pool_with_a_rearmed_key() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 0)), t0, &c, g, &mut out);
+
+        let old = t0 + Duration::from_millis(1);
+        glow.note_typed(old);
+        let rearmed = t0 + Duration::from_millis(301);
+        glow.note_typed(rearmed);
+        assert_eq!(
+            glow.typed_credits_within(rearmed, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            1,
+            "re-arm retires the expired cohort before adding the new credit"
+        );
+
+        glow.tick(
+            Some((3, 2)),
+            rearmed + Duration::from_millis(1),
+            &c,
+            g,
+            &mut out,
+        );
+        assert!(
+            !glow
+                .sparks
+                .iter()
+                .any(|spark| spark.typing && spark.row == 3 && spark.col == 1),
+            "an expired swallowed credit must not subsidize the cold intermediate cell"
+        );
+    }
+
+    /// Revoking the newest/sole typed hint is a cohort high-water, not an
+    /// exact-slot deletion. Earlier in-flight presses have no remaining
+    /// correlation witness once that latest hint is withdrawn, so none may
+    /// pool with a later swallowed key.
+    #[test]
+    fn revoked_latest_dispatch_retires_the_complete_typed_cohort() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 0)), t0, &c, g, &mut out);
+
+        let first = t0 + Duration::from_millis(1);
+        let revoked = t0 + Duration::from_millis(2);
+        glow.note_typed(first);
+        glow.note_typed(revoked);
+        assert_eq!(
+            glow.typed_credits_within(revoked, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            2
+        );
+        glow.revoke_input_hints_at(revoked);
+        assert_eq!(
+            glow.typed_credits_within(revoked, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "revoking the sole/latest hint retires all earlier cohort credits"
+        );
+
+        let next = t0 + Duration::from_millis(3);
+        glow.note_typed(next);
+        glow.tick(Some((3, 0)), next, &c, g, &mut out); // swallowed/no move
+        glow.tick(
+            Some((3, 2)),
+            next + Duration::from_millis(1),
+            &c,
+            g,
+            &mut out,
+        );
+        assert!(
+            !glow
+                .sparks
+                .iter()
+                .any(|spark| spark.typing && spark.row == 3 && spark.col == 1),
+            "revoked history plus one new credit cannot fund a cold two-cell sweep"
         );
     }
 
@@ -23764,7 +25843,10 @@ mod tests {
             // Each hop models `hop` batched echoes — arm one press per glyph
             // (the anti-stray press budget).
             for k in 0..u64::from(hop) {
-                glow.note_typed(t - Duration::from_millis(2) - Duration::from_millis(k));
+                glow.note_synthetic_typed(
+                    t - Duration::from_millis(2) - Duration::from_millis(k),
+                    1,
+                );
             }
             glow.tick(Some((3, col)), t, &c, g, &mut out);
             let mut cols: Vec<u16> = glow
@@ -23793,8 +25875,10 @@ mod tests {
         let t = Instant::now();
         glow.tick(Some((3, 38)), t, &c, g, &mut out);
         // The wrap SHAPE: from the second-to-last column (a wide-glyph wrap)
-        // down one row to column 1 — pure geometry, no hint needed.
-        glow.tick(Some((4, 1)), t + Duration::from_millis(30), &c, g, &mut out);
+        // down one row to column 1, backed by the committed wide glyph.
+        let wrapped = t + Duration::from_millis(30);
+        glow.note_synthetic_typed(wrapped, 2);
+        glow.tick(Some((4, 1)), wrapped, &c, g, &mut out);
         // Observe one beat later: the feathered birth ease keeps the folded
         // cells near-zero on the frame the fold is laid.
         glow.tick(
@@ -23820,13 +25904,33 @@ mod tests {
             !old_row.contains(&20) && !new_row.contains(&20),
             "no mid-row cells were invented by the fold"
         );
+
+        // The two-cell commit has now been fully observed even though wrap
+        // geometry collapsed it to one logical move.  No half-credit may
+        // survive to join a later swallowed key and buy a program sweep.
+        assert_eq!(
+            glow.typed_credits_within(wrapped, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "a non-coalesced wide wrap retires its complete commit"
+        );
+        let swallowed = wrapped + Duration::from_millis(20);
+        glow.note_typed(swallowed);
+        glow.tick(Some((4, 1)), swallowed, &c, g, &mut out);
+        let program = swallowed + Duration::from_millis(20);
+        glow.tick(Some((4, 3)), program, &c, g, &mut out);
+        assert!(
+            !glow
+                .sparks
+                .iter()
+                .any(|s| s.typing && s.row == 4 && s.col == 2),
+            "a spent wide-wrap credit plus one swallowed key cannot fund a cold +2 sweep"
+        );
     }
 
     /// CONTINUITY (typed hide-bridge): a keystroke whose echo hides the cursor
     /// and reappears several columns on (ConPTY / batched echoes) still lays
-    /// its swept wake — the typed hint widens the bridge's plausible reach.
-    /// The SAME choreography without the hint stays byte-inert (the pinned
-    /// unhinted bridge law).
+    /// its swept wake — typed candidate morphology widens the bridge's plausible
+    /// reach. The same choreography with no candidate stays byte-inert.
     #[test]
     fn rainbow_typed_hide_bridge_spans_the_batch() {
         let g = geom();
@@ -23841,7 +25945,7 @@ mod tests {
             if hint {
                 // The batch is 4 echoed glyphs: 4 presses (anti-stray budget).
                 for i in 0..4u64 {
-                    glow.note_typed(t + Duration::from_millis(15 + i));
+                    glow.note_synthetic_typed(t + Duration::from_millis(15 + i), 1);
                 }
             }
             glow.tick(Some((3, 6)), t + Duration::from_millis(30), &c, g, &mut out);
@@ -23885,6 +25989,7 @@ mod tests {
         let t0 = Instant::now();
         glow.tick(Some((3, 8)), t0, &c, g, &mut out);
         // Two quick keys, then the finger lifts.
+        glow.note_synthetic_typed(t0 + Duration::from_millis(150), 1);
         glow.tick(
             Some((3, 9)),
             t0 + Duration::from_millis(150),
@@ -23893,6 +25998,7 @@ mod tests {
             &mut out,
         );
         let t_last = t0 + Duration::from_millis(300);
+        glow.note_synthetic_typed(t_last, 1);
         glow.tick(Some((3, 10)), t_last, &c, g, &mut out);
         let cw = g.cw as u16;
         let lit = |glow: &CursorGlow| -> std::collections::BTreeSet<u16> {
@@ -23961,7 +26067,7 @@ mod tests {
         let head = col_peak(&glow, 10);
         let tail = col_peak(&glow, 7);
         assert!(
-            head > 0 && tail * 2 < head,
+            head > 0 && tail * 3 < head * 2,
             "mid-retract the TAIL is draining while the head survives \
              (head {head}, tail {tail})"
         );
@@ -24004,6 +26110,7 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         glow.tick(Some((3, 8)), t0, &c, g, &mut out);
+        glow.note_synthetic_typed(t0 + Duration::from_millis(100), 1);
         glow.tick(
             Some((3, 9)),
             t0 + Duration::from_millis(100),
@@ -24012,6 +26119,7 @@ mod tests {
             &mut out,
         );
         let t_last = t0 + Duration::from_millis(200);
+        glow.note_synthetic_typed(t_last, 1);
         glow.tick(Some((3, 10)), t_last, &c, g, &mut out);
         assert!(glow.sparks.iter().any(|s| s.typing));
 
@@ -24055,6 +26163,7 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         glow.tick(Some((3, 8)), t0, &c, g, &mut out);
+        glow.note_synthetic_typed(t0 + Duration::from_millis(100), 1);
         glow.tick(
             Some((3, 9)),
             t0 + Duration::from_millis(100),
@@ -24063,6 +26172,7 @@ mod tests {
             &mut out,
         );
         let t_last = t0 + Duration::from_millis(200);
+        glow.note_synthetic_typed(t_last, 1);
         glow.tick(Some((3, 10)), t_last, &c, g, &mut out);
 
         let lift_at = t_last + Duration::from_secs_f32(CursorGlow::RAINBOW_LIFT_GRACE);
@@ -24105,6 +26215,7 @@ mod tests {
         let mut t = t0;
         for col in 3..=10u16 {
             t += Duration::from_millis(120);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
 
@@ -24121,7 +26232,7 @@ mod tests {
             "the live prose ribbon keeps its body across the pause"
         );
 
-        glow.note_typed(resume);
+        glow.note_synthetic_typed(resume, 1);
         glow.tick(
             Some((3, 11)),
             resume + Duration::from_millis(1),
@@ -24174,16 +26285,19 @@ mod tests {
         let mut t = t0;
         for col in 3..=12u16 {
             t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         // …Ctrl-A back to line start (a jump resets the tail; the old ribbon
         // cells survive AHEAD of the cursor)…
         t += Duration::from_millis(200);
+        glow.note_synthetic_move(t);
         glow.tick(Some((3, 0)), t, &c, g, &mut out);
         // …then a few keys forward from the start: the head is now col 3 with a
         // long stretch of ribbon lying to its RIGHT (cols 4-12).
         for col in 1..=head as u16 {
             t += Duration::from_millis(60);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let t_last = t;
@@ -24311,14 +26425,17 @@ mod tests {
         };
         let t0 = Instant::now();
         glow.tick(Some((3, 1)), t0, &c, g, &mut out);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((3, 2)), t0, &c, g, &mut out); // establish the rhythm clock
         // A 3s pause, then ONE lone key (its inter-key gap is a full 3s).
         let t_orphan = t0 + Duration::from_millis(3000);
+        glow.note_synthetic_typed(t_orphan, 1);
         glow.tick(Some((3, 3)), t_orphan, &c, g, &mut out);
         // Then a fast 20-key burst establishes a much faster rhythm.
         let mut t = t_orphan;
         for k in 1..=20u16 {
             t += Duration::from_millis(50);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, 3 + k)), t, &c, g, &mut out);
         }
         // The finger lifts to navigate elsewhere (a jump resets the tail, so the
@@ -24326,6 +26443,7 @@ mod tests {
         // condition under which the live audit saw the stuck glow). The whole
         // ribbon must now fade on its own within a beat or two.
         t += Duration::from_millis(50);
+        glow.note_synthetic_move(t);
         glow.tick(Some((0, 5)), t, &c, g, &mut out);
         let t_last = t;
         let orphan = (3u16, 3u16);
@@ -24369,6 +26487,7 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((2, 2)), t, &c, g, &mut out);
+        glow.note_synthetic_move(t);
         glow.tick(Some((2, 8)), t, &c, g, &mut out);
         assert!(!out.is_empty(), "ribbon present right after a move");
         // Long after the comet duration, no move: everything decays away.
@@ -24391,15 +26510,22 @@ mod tests {
         let mut glow = CursorGlow::default();
         let t = Instant::now();
         let mut out = Vec::new();
-        glow.tick(Some((0, 2)), t, &c, g, &mut out);
-        // A big diagonal jump: 5 rows down, 30 cols right — licensed by a
-        // real Enter press (the host's return license; a cold PROGRAM warp
-        // of the same shape mints nothing, pinned by
-        // `cold_program_warp_mints_no_rainbow_choreography`).
-        glow.note_return(t + Duration::from_millis(10));
+        glow.tick(Some((0, 0)), t, &c, g, &mut out);
+        // Warm a genuine scripted typing ribbon first: candidate admission is
+        // necessary for a jump, while earned momentum controls its amplitude.
+        let mut moved_at = t;
+        for col in 1..=8u16 {
+            moved_at += Duration::from_millis(15);
+            glow.note_synthetic_typed(moved_at, 1);
+            glow.tick(Some((0, col)), moved_at, &c, g, &mut out);
+        }
+        // A big diagonal jump: 5 rows down, 24 cols right. Explicit preview
+        // provenance exercises the morphology; a raw Enter timestamp is dark.
+        moved_at += Duration::from_millis(16);
+        glow.note_synthetic_move(moved_at);
         glow.tick(
             Some((5, 32)),
-            t + Duration::from_millis(16),
+            moved_at,
             &c,
             g,
             &mut out,
@@ -24453,7 +26579,9 @@ mod tests {
             let t = Instant::now();
             let mut out = Vec::new();
             glow.tick(Some(from), t, &c, g, &mut out);
-            glow.tick(Some(to), t + Duration::from_millis(16), &c, g, &mut out);
+            let landed = t + Duration::from_millis(16);
+            glow.note_synthetic_move(landed);
+            glow.tick(Some(to), landed, &c, g, &mut out);
             out.extend_from_slice(glow.under_quads()); // zooms ride the under-ink stream
             let red_y = mean_y(&out, true);
             let violet_y = mean_y(&out, false);
@@ -24483,10 +26611,11 @@ mod tests {
         glow.tick(Some((0, 2)), t, &c, g, &mut out);
         for col in 3..=10u16 {
             t += Duration::from_millis(15);
-            glow.note_typed(t - Duration::from_millis(2));
+            glow.note_synthetic_typed(t - Duration::from_millis(2), 1);
             glow.tick(Some((0, col)), t, &c, g, &mut out);
         }
         t += Duration::from_millis(15);
+        glow.note_synthetic_move(t);
         glow.tick(Some((5, 32)), t, &c, g, &mut out);
         // Saturated SPECTRUM with a near-zero channel: matches both the ZOOM
         // bands and the ribbon gradient while excluding the white / warm-gold
@@ -25234,11 +27363,13 @@ mod tests {
         let mut out = Vec::new();
         let mut lumen = CursorGlow::default();
         lumen.tick(Some((2, 0)), t0, &cfg(GlowStyle::Lumen, true), g, &mut out);
+        lumen.note_synthetic_move(t0);
         lumen.tick(Some((2, 30)), t0, &cfg(GlowStyle::Lumen, true), g, &mut out);
         assert!(lumen.particles.is_empty(), "lumen stays debris-free");
 
         let mut comet = CursorGlow::default();
         comet.tick(Some((2, 0)), t0, &cfg(GlowStyle::Comet, true), g, &mut out);
+        comet.note_synthetic_move(t0);
         comet.tick(Some((2, 30)), t0, &cfg(GlowStyle::Comet, true), g, &mut out);
         assert!(
             !comet.particles.is_empty(),
@@ -25300,6 +27431,7 @@ mod tests {
         glow.tick(Some((2, 10)), t, &c, g, &mut out);
         for col in 11..=14u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         // Re-emit the beam stream alone (no crown/ring/particle quads).
@@ -25341,6 +27473,7 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((0, 2)), t, &c, g, &mut out);
+        glow.note_synthetic_move(t + Duration::from_millis(16));
         glow.tick(
             Some((5, 20)),
             t + Duration::from_millis(16),
@@ -25369,6 +27502,7 @@ mod tests {
         glow.tick(Some((2, 10)), t, &c, g, &mut out);
         for col in 11..=16u16 {
             t += Duration::from_millis(40);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         let cell = g.ch as f32;
@@ -25395,6 +27529,7 @@ mod tests {
         let t = Instant::now();
         let mut out = Vec::new();
         glow.tick(Some((0, 2)), t, &c, g, &mut out);
+        glow.note_synthetic_move(t + Duration::from_millis(16));
         glow.tick(
             Some((5, 20)),
             t + Duration::from_millis(16),
@@ -25447,6 +27582,7 @@ mod tests {
         glow.tick(Some((2, 10)), t, &c, g, &mut out);
         for col in 11..=16u16 {
             t += Duration::from_millis(30);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         let oy = 2.5 * g.ch as f32;
@@ -25476,6 +27612,7 @@ mod tests {
         let mut glow = CursorGlow::default();
         let t2 = Instant::now();
         glow.tick(Some((0, 2)), t2, &c, g, &mut out);
+        glow.note_synthetic_move(t2 + Duration::from_millis(16));
         glow.tick(
             Some((5, 20)),
             t2 + Duration::from_millis(16),
@@ -25512,6 +27649,7 @@ mod tests {
         let mut glow = CursorGlow::default();
         let t3 = Instant::now();
         glow.tick(Some((0, 2)), t3, &cl, g, &mut out);
+        glow.note_synthetic_move(t3 + Duration::from_millis(16));
         glow.tick(
             Some((5, 32)),
             t3 + Duration::from_millis(16),
@@ -25607,7 +27745,7 @@ mod tests {
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..=8u16 {
             t += Duration::from_millis(15);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let heat_peak = glow.heat;
@@ -25990,7 +28128,7 @@ mod tests {
         warm.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..=14u16 {
             t += Duration::from_millis(15);
-            warm.note_typed(t); // real typing arms the correlated advance (M1)
+            warm.note_synthetic_typed(t, 1);
             warm.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let p0 = warm.rainbow.phase;
@@ -26094,10 +28232,12 @@ mod tests {
     ///
     /// `d256e9f5` translated the two CELL-addressed pools (ribbon sparks, fresh-
     /// ink pops) so the trail could not detach from the text that earned it. The
-    /// starfield, the landing ring, the ZOOM streaks and the landing starbursts
-    /// are addressed in window-absolute PIXELS and were not carried at all: they
-    /// hung exactly where they were while the text slid out from under them,
-    /// which is the detached dots-and-dashes population still on screen.
+    /// starfield, the landing ring, ZOOM/glide/meteor streaks, vapor, bolt
+    /// polylines and outgoing style ghosts are addressed in window-absolute
+    /// PIXELS and were not all carried: any omitted family hangs exactly where
+    /// it was while the text slides out from under it.  The glide head is a
+    /// second-order failure: after the stale streak, its timer later mints a
+    /// landing burst at the old Y.
     ///
     /// They could not be carried before because `note_scroll` receives a ROW
     /// count and no geometry; the engine now remembers the last tick's cell
@@ -26113,6 +28253,24 @@ mod tests {
         glow.tick(Some((3, 4)), now, &c, g, &mut out);
 
         let y0 = 10.0 * g.ch as f32;
+        glow.sparks.push(Spark {
+            row: 10,
+            col: 4,
+            born_cov: 100,
+            pos: 1.0,
+            life: 5.0,
+            typing: true,
+            hue: 0.0,
+            born: now,
+            fade_at: None,
+        });
+        glow.rainbow.ink_pops.push(InkPop {
+            row: 10,
+            col: 4,
+            seed: 1,
+            mom: 0.5,
+            born: now,
+        });
         glow.particles.push(Particle {
             x0: 40.0,
             y0,
@@ -26130,9 +28288,119 @@ mod tests {
             born: now,
             life: 5.0,
         });
+        glow.rainbow.jumps.push(JumpStreak {
+            x0: 10.0,
+            y0,
+            x1: 50.0,
+            y1: y0 + 4.0,
+            born: now,
+            life: 5.0,
+            mom: 0.5,
+            grade: 0.5,
+            nova: false,
+        });
+        glow.rainbow.bursts.push(Starburst {
+            cx: 40.0,
+            cy: y0,
+            born: now,
+            life: 5.0,
+            reach: 12.0,
+            seed: 0.25,
+            stars: 2,
+            sparkles: 2,
+            nova: false,
+        });
+        glow.glide.stars.push(GlideStar {
+            x0: 10.0,
+            y0,
+            x1: 50.0,
+            y1: y0 + 4.0,
+            born: now,
+            life: 5.0,
+            vel: 40.0,
+            seed: 0.5,
+        });
+        glow.glide.head = Some((50.0, y0 + 4.0));
+        glow.glide.land_at = Some(now);
+        glow.fire_meteors.push(Meteor {
+            x0: 10.0,
+            y0,
+            x1: 50.0,
+            y1: y0 + 4.0,
+            born: now,
+            life: 5.0,
+            mom: 0.5,
+            arrived: false,
+        });
+        glow.vapor.push(Vapor {
+            x0: 40.0,
+            y0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            seed: 0.5,
+            kind: VaporKind::Poof,
+            born: now,
+        });
+        glow.bolts.push(Bolt {
+            pts: vec![(10.0, y0), (50.0, y0 + 4.0)],
+            born: now,
+            life: 5.0,
+            seed: 0.5,
+            branch: false,
+        });
+        glow.rainbow.tail = [Some((10, 1)), Some((1, 2)), Some((12, 3))];
+        glow.rainbow.wake_head = Some((10, 4.5));
+        glow.bs_poof_hint = Some(now);
+        glow.bs_baseline = Some((10, 5));
+        glow.quench_hint = Some(now);
+
+        // A just-created style ghost has forged geometry but has not ticked,
+        // so its own `last_ch` is still zero.  The outer engine's remembered
+        // height must carry it rather than taking the unknown-geometry drop.
+        let mut ghost = Box::<CursorGlow>::default();
+        ghost.last = Some((10, 4));
+        ghost.particles.push(Particle {
+            x0: 40.0,
+            y0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.0,
+            cov_scale: 1.0,
+            born: now,
+        });
+        ghost.glide.head = Some((50.0, y0));
+        ghost.glide.land_at = Some(now);
+        ghost.rainbow.tail = [Some((10, 4)), None, None];
+        glow.fading.push(OutgoingFade {
+            engine: ghost,
+            cfg: c,
+            anchor: Some((10, 4)),
+            started: now,
+            level0: 1.0,
+        });
 
         glow.note_scroll(2);
         let dy = 2.0 * g.ch as f32;
+        assert_eq!(glow.last, Some((1, 4)), "cursor classifier anchor");
+        assert_eq!(
+            glow.last_visible.map(|(cell, _)| cell),
+            Some((1, 4)),
+            "visible hide-bridge anchor"
+        );
+        assert_eq!(
+            glow.sparks.first().map(|spark| spark.row),
+            Some(8),
+            "cell-addressed ribbon"
+        );
+        assert_eq!(
+            glow.rainbow.ink_pops.first().map(|pop| pop.row),
+            Some(8),
+            "cell-addressed fresh-ink pop"
+        );
         assert_eq!(
             glow.particles.first().map(|p| p.y0),
             Some(y0 - dy),
@@ -26143,13 +28411,155 @@ mod tests {
             Some(y0 - dy),
             "the landing ring must ride the scroll too"
         );
+        assert_eq!(glow.rainbow.jumps[0].y0, y0 - dy, "ZOOM tail");
+        assert_eq!(glow.rainbow.bursts[0].cy, y0 - dy, "landing burst");
+        assert_eq!(glow.glide.stars[0].y0, y0 - dy, "glide streak");
+        assert_eq!(
+            glow.glide.head,
+            Some((50.0, y0 + 4.0 - dy)),
+            "future glide landing anchor"
+        );
+        assert_eq!(glow.fire_meteors[0].y0, y0 - dy, "fire meteor");
+        assert_eq!(glow.vapor[0].y0, y0 - dy, "vapor trajectory");
+        assert_eq!(glow.bolts[0].pts[0].1, y0 - dy, "bolt polyline");
+        assert_eq!(
+            glow.rainbow.tail,
+            [Some((8, 1)), None, Some((10, 3))],
+            "the relight memory follows the ribbon and drops off-top cells"
+        );
+        assert_eq!(
+            glow.rainbow.wake_head,
+            Some((8, 4.5)),
+            "a hidden-cursor plume nozzle follows the scroll"
+        );
+        assert!(
+            glow.bs_poof_hint.is_none() && glow.bs_baseline.is_none() && glow.quench_hint.is_none(),
+            "scroll-scoped Backspace proof retires with its old row identity"
+        );
+        let fade = &glow.fading[0];
+        assert_eq!(fade.anchor, Some((8, 4)), "outgoing cursor anchor");
+        assert_eq!(
+            fade.engine.last,
+            Some((8, 4)),
+            "outgoing classifier anchor follows its frozen cursor"
+        );
+        assert_eq!(
+            fade.engine.particles[0].y0,
+            y0 - dy,
+            "outgoing forged light uses the outer row height"
+        );
+        assert_eq!(
+            fade.engine.glide.head,
+            Some((50.0, y0 - dy)),
+            "outgoing future landing follows too"
+        );
+        assert_eq!(
+            fade.engine.rainbow.tail,
+            [Some((8, 4)), None, None],
+            "outgoing relight memory follows too"
+        );
+
+        // Tier 1: project this genuine shipping transition onto the derived
+        // scroll model.  The exhaustive exact assertions above are the family
+        // bind; the representative surviving Y and off-top tail cell carry
+        // those two decisions into the model transition.
+        let base_model = aterm_spec::derive::cursor_effect_scroll_model();
+        let overrides = [("StartY", 10), ("Delta", 2)];
+        let model = aterm_spec::interp::with_consts(&base_model, &overrides);
+        let mut source = model.init_state();
+        source.insert("survivor_y", 10);
+        let mut projected = source.clone();
+        projected.insert("survivor_y", i64::from(glow.sparks[0].row));
+        projected.insert("off_top_alive", i64::from(glow.rainbow.tail[1].is_some()));
+        projected.insert(
+            "stale_proof_alive",
+            i64::from(
+                glow.bs_poof_hint.is_some()
+                    || glow.bs_baseline.is_some()
+                    || glow.quench_hint.is_some(),
+            ),
+        );
+        projected.insert("scrolled", 1);
+        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &projected,
+            Some("Scroll"),
+            "CursorGlow all-family scroll translation",
+        );
+        assert!(admitted, "real scroll transition rejected: {why}");
+
+        // Tier-1 negative controls: either old failure shape — a survivor left
+        // at its old Y or an off-top member retained/clamped — is rejected.
+        let mut stranded = projected.clone();
+        stranded.insert("survivor_y", 10);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &stranded,
+            Some("Scroll"),
+            "CursorGlow stranded-scroll negative control",
+        );
+        assert!(!admitted, "an untranslated survivor must be rejected");
+        let mut clamped = projected.clone();
+        clamped.insert("off_top_alive", 1);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &clamped,
+            Some("Scroll"),
+            "CursorGlow off-top-retention negative control",
+        );
+        assert!(!admitted, "an off-top survivor must be rejected");
+        let mut stale_proof = projected;
+        stale_proof.insert("stale_proof_alive", 1);
+        let (admitted, _) = aterm_spec::verify::validate_transition_tiered(
+            &base_model,
+            &overrides,
+            &source,
+            &stale_proof,
+            Some("Scroll"),
+            "CursorGlow stale scroll-proof negative control",
+        );
+        assert!(!admitted, "a pre-scroll input proof must be rejected");
 
         // Scrolled clean off the top: DROPPED, never clamped into a bar on row 0
         // (the same discipline the cell-addressed pools already follow).
         glow.note_scroll(40);
         assert!(
-            glow.particles.is_empty() && glow.ring.is_none(),
-            "light scrolled off the top is dropped"
+            glow.last.is_none() && glow.last_visible.is_none(),
+            "off-top classifier anchors retire instead of forging a row-0 source"
+        );
+        assert!(
+            glow.particles.is_empty()
+                && glow.sparks.is_empty()
+                && glow.rainbow.ink_pops.is_empty()
+                && glow.ring.is_none()
+                && glow.rainbow.jumps.is_empty()
+                && glow.rainbow.bursts.is_empty()
+                && glow.glide.stars.is_empty()
+                && glow.glide.head.is_none()
+                && glow.glide.land_at.is_none()
+                && glow.fire_meteors.is_empty()
+                && glow.vapor.is_empty()
+                && glow.bolts.is_empty(),
+            "every live pixel family scrolled off the top is dropped"
+        );
+        assert!(
+            glow.rainbow.tail.iter().all(Option::is_none) && glow.rainbow.wake_head.is_none(),
+            "position memory scrolled off the top is dropped"
+        );
+        let fade = &glow.fading[0];
+        assert!(
+            fade.anchor.is_none()
+                && fade.engine.particles.is_empty()
+                && fade.engine.glide.head.is_none()
+                && fade.engine.glide.land_at.is_none()
+                && fade.engine.rainbow.tail.iter().all(Option::is_none),
+            "outgoing ghosts obey the same off-top retirement"
         );
 
         // Fail closed: a scroll before any tick has established a cell height
@@ -26166,10 +28576,56 @@ mod tests {
             cov_scale: 1.0,
             born: now,
         });
+        fresh.glide.stars.push(GlideStar {
+            x0: 0.0,
+            y0: 1.0,
+            x1: 2.0,
+            y1: 3.0,
+            born: now,
+            life: 5.0,
+            vel: 40.0,
+            seed: 0.5,
+        });
+        fresh.glide.head = Some((2.0, 3.0));
+        fresh.glide.land_at = Some(now);
+        fresh.fire_meteors.push(Meteor {
+            x0: 0.0,
+            y0: 1.0,
+            x1: 2.0,
+            y1: 3.0,
+            born: now,
+            life: 5.0,
+            mom: 0.5,
+            arrived: false,
+        });
+        fresh.vapor.push(Vapor {
+            x0: 1.0,
+            y0: 1.0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            seed: 0.5,
+            kind: VaporKind::Poof,
+            born: now,
+        });
+        fresh.bolts.push(Bolt {
+            pts: vec![(0.0, 1.0), (2.0, 3.0)],
+            born: now,
+            life: 5.0,
+            seed: 0.5,
+            branch: false,
+        });
         fresh.note_scroll(1);
         assert!(
-            fresh.particles.is_empty(),
-            "with no observed geometry the pools drop rather than strand"
+            fresh.particles.is_empty()
+                && fresh.glide.stars.is_empty()
+                && fresh.glide.head.is_none()
+                && fresh.glide.land_at.is_none()
+                && fresh.fire_meteors.is_empty()
+                && fresh.vapor.is_empty()
+                && fresh.bolts.is_empty(),
+            "with no observed geometry every pixel pool drops rather than strands"
         );
     }
 
@@ -26206,7 +28662,7 @@ mod tests {
         InsetFold,
         /// CONTROL: an agent composer's Shift+Enter — a user-authored line
         /// break. Geometrically indistinguishable from the reflows (one row
-        /// down, back to the box's left inset, typed hint armed because the box
+        /// down, back to the box's left inset, typed candidate armed because the box
         /// repaints), and the exact OPPOSITE case: the row it leaves holds the
         /// words the user just typed, so its ribbon is over its own text.
         /// `true` arms the host's composer-newline signal; `false` is the same
@@ -26267,7 +28723,7 @@ mod tests {
         };
         glow.tick(Some((row, c0)), t0, &c, g, &mut out);
         for k in 1..=4u16 {
-            glow.note_typed(at(20 * u64::from(k)));
+            glow.note_synthetic_typed(at(20 * u64::from(k)), 1);
             glow.tick(Some((row, c0 + k)), at(20 * u64::from(k)), &c, g, &mut out);
         }
         let laid = glow
@@ -26300,37 +28756,40 @@ mod tests {
                 // Typewriter fold: the fifth glyph does not fit, so the terminal
                 // wraps it to column 0 of the next row. Row 3 still holds the
                 // four glyphs the ribbon decorates.
-                glow.note_typed(at(100));
+                glow.note_synthetic_typed(at(100), 1);
                 (row, row + 1, 0)
             }
             // TUI REPAINT RELOCATION: the host redraws and moves its whole input
             // line down one row. No keystroke, no scroll (scrollback did not
             // grow, so `note_scroll` never runs), and the caret keeps its
             // column — chebyshev 1, which classifies as plain TYPING.
-            Reloc::SameColumn | Reloc::NoBlink => (row, row + 1, c0 + 4),
+            Reloc::SameColumn | Reloc::NoBlink => {
+                glow.note_synthetic_typed(at(100), 1);
+                (row, row + 1, c0 + 4)
+            }
             // …the same repaint with the box REFLOWED: (3,20) -> (4,10). The
-            // typed hint pairs with a one-row move of ten columns, which is the
+            // synthetic typed candidate pairs with a one-row move of ten columns, the
             // `re_anchor` signature — and `re_anchor` used to be accepted as a
             // FOLD on its own, which is precisely why this shape kept its
             // stranded fragment.
             Reloc::ColumnShift(lc) => {
-                glow.note_typed(at(100));
+                glow.note_synthetic_typed(at(100), 1);
                 (row, row + 1, lc)
             }
             // The Ink inset fold: off the box's right inset (column 35) and back
-            // to its left one (column 4). Same hint, same blink, same one-row
+            // to its left one (column 4). Same candidate, same blink, same one-row
             // step as the reflows — only the LAUNCH differs.
             Reloc::InsetFold => {
-                glow.note_typed(at(100));
+                glow.note_synthetic_typed(at(100), 1);
                 (row, row + 1, 4)
             }
-            // Shift+Enter in a composer: the host arms the typed hint (the box
-            // repaints, so the move must re-anchor rather than meteor) and — when
+            // Shift+Enter in a composer: the scripted arm supplies typed
+            // provenance (so the repaint re-anchors) and — when
             // `armed` — the composer-newline signal beside it. The caret leaves
             // column 14 with half the row unused, so no fold evidence exists and
             // the geometry is a reflow's exactly.
             Reloc::ComposerNewline(armed) => {
-                glow.note_typed(at(100));
+                glow.note_synthetic_typed(at(100), 1);
                 if armed {
                     glow.note_newline_break(at(100));
                 }
@@ -26342,7 +28801,7 @@ mod tests {
             // relocation. Retiring here would snuff a correctly placed trail.
             Reloc::Scroll => {
                 glow.note_scroll(1);
-                glow.note_typed(at(100));
+                glow.note_synthetic_typed(at(100), 1);
                 (row - 1, row, c0 + 5)
             }
         };
@@ -26397,7 +28856,7 @@ mod tests {
         // both bounds; putting it any later would make this test silently
         // vacuous by testing a tail that had already flushed itself.
         for (k, ms) in [(1u16, 300u64), (2, 340)] {
-            glow.note_typed(at(ms));
+            glow.note_synthetic_typed(at(ms), 1);
             glow.tick(Some((land, lc + k)), at(ms), &c, g, &mut out);
         }
         // Settle past the retirement's own fade-out ([`RAINBOW_RETRACT_FADE`],
@@ -26505,8 +28964,8 @@ mod tests {
     ///
     /// A TUI that repaints its input line does not always put the caret back in
     /// the same column: reflow the box (a resize, a wrapped token, a mode line
-    /// appearing) and the prompt lands at (4,10) having left (3,20). That pairs a
-    /// fresh typed hint with a one-row move of ten columns, which is exactly the
+    /// appearing) and the prompt lands at (4,10) having left (3,20). The fixture
+    /// pairs an explicit typed candidate with a one-row move of ten columns, exactly the
     /// `re_anchor` signature — and `re_anchor` alone used to be accepted as proof
     /// of a typewriter FOLD, so the arm skipped the move and the old row kept its
     /// fragment. (The re-anchor arm above cannot cover it either: that one cleans
@@ -26534,7 +28993,7 @@ mod tests {
 
     /// …AT EVERY LANDING COLUMN, which is the half the first fix got wrong.
     ///
-    /// The fold exemption was rewritten as "a hinted one-row-down move landing at
+    /// The fold exemption was rewritten as "an admitted one-row-down move landing at
     /// column <= [`CursorGlow::RAINBOW_FOLD_LANDING_MAX`] is a fold", and the
     /// fixture that blessed it asked for landing column 10 — one cell outside the
     /// bound. So the predicate was never exercised on the side that mattered:
@@ -26576,14 +29035,14 @@ mod tests {
     /// Agent composers bind Shift+Enter to "insert a line break without
     /// submitting". The user authored that break; the row it leaves still holds
     /// the words they just typed, and the ribbon over them is the trail of typing
-    /// them. But the host arms the TYPED hint on that chord (the composer
-    /// repaints its box, so the move has to re-anchor rather than meteor), and
+    /// them. The fixture arms an explicit TYPED candidate on that chord (the
+    /// composer repaints its box, so the move re-anchors), and
     /// the observed move is one row down and back to the box's left inset —
     /// pixel-for-pixel a reflow relocation. The retirement therefore snuffed it,
     /// and the module wrote that down as an accepted residual.
     ///
     /// GEOMETRY CANNOT SEPARATE THEM, and this test is the proof: BOTH arms drive
-    /// the identical move, the identical hint, the identical cadence. The only
+    /// the identical move, the identical candidate, the identical cadence. The only
     /// difference is whether the host said which key it was
     /// ([`CursorGlow::note_newline_break`]) — so the unarmed arm is also the
     /// standing statement that the host signal is load-bearing, not decorative.
@@ -26601,7 +29060,7 @@ mod tests {
             "a composer newline must not RETIRE the row it wrote — {stamped} \
              sparks were stamped"
         );
-        // THE SIGNAL IS THE WHOLE DIFFERENCE. Same move, same typed hint, same
+        // THE SIGNAL IS THE WHOLE DIFFERENCE. Same move, same typed candidate, same
         // blink, same cadence — with the host silent it is indistinguishable from
         // a reflow and is retired, which is both the residual this closes and the
         // proof that the exemption is not passing everything through.
@@ -26889,6 +29348,7 @@ mod tests {
         let mut out = Vec::new();
         let t0 = Instant::now();
         cold.tick(Some((3, 2)), t0, &c, g, &mut out);
+        cold.note_synthetic_typed(t0 + Duration::from_millis(16), 1);
         cold.tick(
             Some((3, 3)),
             t0 + Duration::from_millis(16),
@@ -26908,6 +29368,7 @@ mod tests {
         for col in 3..=18u16 {
             t += Duration::from_millis(12);
             hot.rainbow.momentum.set_value(t, 1.0);
+            hot.note_synthetic_typed(t, 1);
             hot.tick(Some((3, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -26946,7 +29407,9 @@ mod tests {
             },
             ..CursorGlow::default()
         };
-        cold.spawn(3, 5, 3, 6, now, &c, g);
+        cold.last = Some((3, 5));
+        cold.note_synthetic_typed(now, 1);
+        assert!(cold.spawn(3, 5, 3, 6, now, &c, g));
         assert!(
             !cold.particles.iter().any(|p| p.cov_scale > 1.25),
             "low momentum flings no shooting stars"
@@ -26959,7 +29422,9 @@ mod tests {
             },
             ..CursorGlow::default()
         };
-        hot.spawn(3, 5, 3, 6, now, &c, g);
+        hot.last = Some((3, 5));
+        hot.note_synthetic_typed(now, 1);
+        assert!(hot.spawn(3, 5, 3, 6, now, &c, g));
         let shooters: Vec<&Particle> = hot
             .particles
             .iter()
@@ -27010,7 +29475,7 @@ mod tests {
         // stays under the star onset, not that output builds nothing.
         for col in 1..=12u16 {
             t += Duration::from_millis(60);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         // The onset-gated quadratic density floors to ZERO whole stars for
@@ -27041,7 +29506,7 @@ mod tests {
             } else {
                 col += 1;
             }
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((row, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -27071,7 +29536,7 @@ mod tests {
         for col in 1..=10u16 {
             t += Duration::from_millis(60);
             cat.on_key(t, true);
-            glow.note_typed(t); // the committed-press hint the ink pop requires
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
             assert!(
                 (glow.typing_momentum(t) - cat.momentum(t)).abs() < 1e-6,
@@ -27103,7 +29568,7 @@ mod tests {
         t += Duration::from_millis(80);
         let before = glow.typing_momentum(t);
         cat.on_key(t, false);
-        glow.note_backspace(t);
+        arm_exact_backspace(&mut glow, t, (3, 10), (3, 9));
         glow.tick(Some((3, 9)), t, &c, g, &mut out);
         assert!(
             (glow.typing_momentum(t) - cat.momentum(t)).abs() < 1e-6,
@@ -27134,7 +29599,7 @@ mod tests {
             // advance now REQUIRES (M1): forward/wrap echoes credit momentum
             // only when paired with it, so a program printing the same cells
             // would build nothing here.
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((row, col)), t, &c, g, &mut out);
             assert!(
                 (glow.typing_momentum(t) - cat.momentum(t)).abs() < 1e-6,
@@ -27154,9 +29619,9 @@ mod tests {
 
     /// EARNED BY REAL TYPING ONLY (M1): a program printing one glyph per frame
     /// walks the caret forward +1 col every tick — the exact `forward` shape —
-    /// yet arms NO committed-press hint, so the correlated advance never fires:
+    /// yet arms NO exact/synthetic candidate, so the correlated advance never fires:
     /// the metric stays flat at zero and no momentum pulse is ever offered to
-    /// the cat. The same forward moves WITH the typed hint build normally, so
+    /// the cat. The same forward moves WITH a synthetic typed candidate build normally, so
     /// this is the correlation gate, not a dead advance.
     #[test]
     fn program_output_alone_builds_no_momentum() {
@@ -27181,14 +29646,14 @@ mod tests {
             0.0,
             "program output alone earns zero momentum"
         );
-        // Flip on the correlation: the identical forward shape, now behind a
-        // real keystroke, builds — proving the gate is the HINT, not the shape.
+        // Flip on explicit correlation: the identical forward shape now
+        // builds, proving the gate is provenance, not geometry.
         let mut typed = CursorGlow::default();
         let mut t2 = Instant::now();
         typed.tick(Some((3, 0)), t2, &c, g, &mut out);
         for col in 1..=20u16 {
             t2 += Duration::from_millis(40);
-            typed.note_typed(t2);
+            typed.note_synthetic_typed(t2, 1);
             typed.tick(Some((3, col)), t2, &c, g, &mut out);
             assert!(
                 typed.take_momentum_pulse() == Some(t2),
@@ -27806,7 +30271,7 @@ mod tests {
         let t0 = Instant::now();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(16);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((3, 3)), t1, &c, g, &mut out);
         assert!(!glow.rainbow.ink_pops.is_empty(), "the fixture did pop");
         assert!(
@@ -27827,7 +30292,7 @@ mod tests {
         glow.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..9u16 {
             t += Duration::from_millis(40);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let tinted = glow.charred().to_vec();
@@ -28297,10 +30762,11 @@ mod tests {
             glow.tick(Some((5, 0)), t, &c, g, &mut scratch);
             for col in 1..=8u16 {
                 t += Duration::from_millis(15);
-                glow.note_typed(t);
+                glow.note_synthetic_typed(t, 1);
                 glow.tick(Some((5, col)), t, &c, g, &mut scratch);
             }
             t += Duration::from_millis(30);
+            glow.note_synthetic_move(t);
             glow.tick(Some((cr, cc)), t, &c, g, &mut scratch);
             glow
         };
@@ -28359,49 +30825,426 @@ mod tests {
     }
 
     /// ANTI-STRAY (owner: "a stray piece of trail appear without text"): a
-    /// COLD cursor delta — the shape of a program-driven warp (a spinner's
-    /// CUP loop, a background TUI repaint), with zero typed presses anywhere
-    /// near it — mints NO jump choreography: no ZOOM streak, no starburst,
-    /// no terminus glitter. The momentum gate (`RAINBOW_JUMP_MIN_DISP`) is the
-    /// "was this text?" witness; program output can never warm it.
+    /// COLD cursor delta — both the one-cell shape of streaming program output
+    /// and the large warp of a spinner/TUI repaint — emits NO rainbow light in
+    /// any channel.  This asserts actual presented output, not merely the ZOOM
+    /// pools: the old gate declined jumps, then fell through to generic ribbon
+    /// sparks, a landing ring and a cursor crown anyway.
     #[test]
-    fn cold_program_warp_mints_no_rainbow_choreography() {
+    fn cold_program_motion_emits_no_rainbow_light() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
-        glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-        // A cold spinner: repeated large warps, no keystroke ever.
+        assert_eq!(glow.tick(Some((0, 0)), t0, &c, g, &mut out), 0);
+        assert!(!frame_has_output(&out, &glow));
+        // A one-cell output stream followed by repeated cold spinner warps; no
+        // committed key, Return or reflow gesture ever licenses any of them.
         let mut t = t0;
-        for &(cr, cc) in &[(3u16, 30u16), (0, 5), (4, 35), (1, 12), (5, 20)] {
+        for &(cr, cc) in &[(0u16, 1u16), (3, 30), (0, 5), (4, 35), (1, 12), (5, 20)] {
             t += Duration::from_millis(120);
-            glow.tick(Some((cr, cc)), t, &c, g, &mut out);
+            let fingerprint = glow.tick(Some((cr, cc)), t, &c, g, &mut out);
+            assert!(
+                !frame_has_output(&out, &glow),
+                "unwitnessed program move to ({cr},{cc}) emitted visible light: \
+                 fp={fingerprint:#x}, quads={}, halos={}, under={}, patches={}, \
+                 chars={}, halo_cells={}",
+                out.len(),
+                glow.halos().len(),
+                glow.under_quads().len(),
+                glow.patches().len(),
+                glow.charred().len(),
+                glow.halo_cells().len(),
+            );
+            assert_eq!(
+                fingerprint, 0,
+                "unwitnessed program move to ({cr},{cc}) changed the frame"
+            );
+            assert!(
+                glow.sparks.is_empty()
+                    && glow.particles.is_empty()
+                    && glow.ring.is_none()
+                    && glow.crown_until.is_none()
+                    && glow.rainbow.jumps.is_empty()
+                    && glow.rainbow.bursts.is_empty()
+                    && glow.glide.stars.is_empty()
+                    && glow.glide.head.is_none()
+                    && glow.glide.land_at.is_none(),
+                "unwitnessed motion retained future or resident light"
+            );
+            assert!(!glow.is_active(), "a dark program move must stay idle");
         }
-        assert!(
-            glow.rainbow.jumps.is_empty(),
-            "a cold program warp must not throw the ZOOM streak"
+        assert_eq!(
+            glow.drain_sound_cues().count(),
+            0,
+            "a visually declined move is silent too"
         );
-        assert!(
-            glow.rainbow.bursts.is_empty(),
-            "a cold program warp must not bloom a starburst"
+        assert!(glow.last_type.is_none(), "program output earns no cadence");
+
+        // Historical warmth is an amplitude, never provenance. Output often
+        // arrives just after a command while the eased spine is still high;
+        // accepting that state as a witness is the intermittent version of
+        // the same stray-segment bug.
+        let mut warm = CursorGlow {
+            rainbow: RainbowState {
+                disp: 1.0,
+                ..RainbowState::default()
+            },
+            ..CursorGlow::default()
+        };
+        assert_eq!(warm.tick(Some((0, 0)), t0, &c, g, &mut out), 0);
+        let warm_move = t0 + Duration::from_millis(16);
+        assert_eq!(
+            warm.tick(Some((0, 1)), warm_move, &c, g, &mut out),
+            0,
+            "warm-but-unhinted program output remains dark"
         );
-        assert!(
-            glow.particles.is_empty(),
-            "a cold program warp must not scatter terminus glitter"
+        assert!(!frame_has_output(&out, &warm));
+        assert!(warm.sparks.is_empty() && warm.crown_until.is_none());
+        assert_eq!(warm.drain_sound_cues().count(), 0);
+
+        // A far hidden→visible relocation is outside the bounded ConPTY
+        // bridge, so `spawn` never runs. Its declined Return/Tab-paste licence
+        // must still be consumed at that decision boundary; otherwise the next
+        // one-cell program update can borrow it and create the reported stray.
+        for arm in [
+            CursorGlow::note_typed as fn(&mut CursorGlow, Instant),
+            CursorGlow::note_return as fn(&mut CursorGlow, Instant),
+            CursorGlow::note_user_gesture,
+        ] {
+            let mut hidden = CursorGlow::default();
+            hidden.tick(Some((0, 0)), t0, &c, g, &mut out);
+            hidden.tick(None, t0 + Duration::from_millis(1), &c, g, &mut out);
+            hidden.kill_hint = Some(t0);
+            hidden.bs_poof_hint = Some(t0);
+            hidden.bs_baseline = Some((0, 4));
+            arm(&mut hidden, t0 + Duration::from_millis(2));
+            let declined = hidden.tick(
+                Some((0, 20)),
+                t0 + Duration::from_millis(3),
+                &c,
+                g,
+                &mut out,
+            );
+            assert_eq!(declined, 0);
+            assert!(!frame_has_output(&out, &hidden));
+            assert!(
+                hidden.type_hint.is_none()
+                    && hidden.quench_hint.is_none()
+                    && hidden.nav_hint.is_none()
+                    && hidden.return_hint.is_none()
+                    && hidden.user_gesture_hint.is_none()
+                    && hidden.reflow_hint.is_none()
+                    && hidden.kill_hint.is_none()
+                    && hidden.bs_poof_hint.is_none()
+                    && hidden.bs_baseline.is_none(),
+                "a declined hidden relocation consumes movement and row-bound proof"
+            );
+            let next = hidden.tick(
+                Some((0, 21)),
+                t0 + Duration::from_millis(4),
+                &c,
+                g,
+                &mut out,
+            );
+            assert_eq!(next, 0, "the next cold move cannot borrow the hint");
+            assert!(!frame_has_output(&out, &hidden));
+        }
+
+        // SAME-CELL hidden completion never enters `spawn` and is not a
+        // declined relocation, but it still closes the authored hide/echo
+        // choreography. Consume typed, Return and Tab/paste at that boundary
+        // so the following cold CUP move cannot borrow them.
+        for arm in [
+            CursorGlow::note_typed as fn(&mut CursorGlow, Instant),
+            CursorGlow::note_return as fn(&mut CursorGlow, Instant),
+            CursorGlow::note_user_gesture,
+        ] {
+            let mut hidden = CursorGlow::default();
+            hidden.tick(Some((2, 4)), t0, &c, g, &mut out);
+            hidden.tick(None, t0 + Duration::from_millis(1), &c, g, &mut out);
+            arm(&mut hidden, t0 + Duration::from_millis(2));
+            let same = hidden.tick(Some((2, 4)), t0 + Duration::from_millis(3), &c, g, &mut out);
+            assert_eq!(same, 0);
+            assert!(!frame_has_output(&out, &hidden));
+            assert!(
+                hidden.type_hint.is_none()
+                    && hidden.quench_hint.is_none()
+                    && hidden.nav_hint.is_none()
+                    && hidden.return_hint.is_none()
+                    && hidden.user_gesture_hint.is_none()
+                    && hidden.newline_hint.is_none()
+                    && hidden.reflow_hint.is_none()
+                    && hidden.rainbow.type_press_ring.iter().all(Option::is_none),
+                "same-cell hidden completion consumes every movement class"
+            );
+            let next = hidden.tick(Some((2, 5)), t0 + Duration::from_millis(4), &c, g, &mut out);
+            assert_eq!(next, 0, "cold move cannot borrow same-cell hide provenance");
+            assert!(!frame_has_output(&out, &hidden));
+        }
+
+        // A fresh/reset engine cannot draw an authored landing that completed
+        // before its first visible sample because it has no honest source
+        // anchor. The seed tick consumes every class dark; otherwise the next
+        // cold CUP can borrow that already-completed input/reflow witness.
+        for reset_first in [false, true] {
+            for arm in [
+                CursorGlow::note_typed as fn(&mut CursorGlow, Instant),
+                CursorGlow::note_backspace,
+                CursorGlow::note_navigation,
+                CursorGlow::note_return,
+                CursorGlow::note_user_gesture,
+                CursorGlow::note_newline_break,
+                CursorGlow::note_reflow,
+            ] {
+                let mut unseeded = CursorGlow::default();
+                if reset_first {
+                    unseeded.tick(Some((4, 4)), t0, &c, g, &mut out);
+                    unseeded.reset();
+                }
+                arm(&mut unseeded, t0 + Duration::from_millis(1));
+                let seed = unseeded.tick(
+                    Some((4, 10)),
+                    t0 + Duration::from_millis(2),
+                    &c,
+                    g,
+                    &mut out,
+                );
+                assert_eq!(seed, 0, "a source-less seed changes no frame");
+                assert!(!frame_has_output(&out, &unseeded));
+                assert!(
+                    unseeded.type_hint.is_none()
+                        && unseeded.quench_hint.is_none()
+                        && unseeded.nav_hint.is_none()
+                        && unseeded.return_hint.is_none()
+                        && unseeded.user_gesture_hint.is_none()
+                        && unseeded.newline_hint.is_none()
+                        && unseeded.reflow_hint.is_none()
+                        && unseeded.rainbow.type_press_ring.iter().all(Option::is_none),
+                    "a source-less seed consumes every movement class"
+                );
+                let next = unseeded.tick(
+                    Some((4, 11)),
+                    t0 + Duration::from_millis(3),
+                    &c,
+                    g,
+                    &mut out,
+                );
+                assert_eq!(next, 0, "cold CUP cannot borrow a pre-seed class");
+                assert!(!frame_has_output(&out, &unseeded));
+            }
+        }
+        let hidden_model = aterm_spec::derive::rainbow_move_admission_model();
+        let mut hidden_source = hidden_model.init_state();
+        hidden_source.insert("gesture_hint", 1);
+        hidden_source.insert("gesture_arms", 1);
+        let mut hidden_projected = hidden_source.clone();
+        hidden_projected.insert("gesture_hint", 0);
+        hidden_projected.insert("hidden_declined", 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &hidden_model,
+            &[],
+            &hidden_source,
+            &hidden_projected,
+            Some("DeclineHidden"),
+            "CursorGlow declined hidden relocation",
         );
+        assert!(ok, "real hidden-decline transition rejected: {why}");
+        let mut sticky_hidden = hidden_projected;
+        sticky_hidden.insert("gesture_hint", 1);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &hidden_model,
+            &[],
+            &hidden_source,
+            &sticky_hidden,
+            Some("DeclineHidden"),
+            "CursorGlow declined-hidden negative control",
+        );
+        assert!(!ok, "a declined hidden glow hint must not survive");
     }
 
-    /// RESIZE STREAK (owner: "when I resize the window, the cursor moves, and
-    /// I'm expecting to see a smooth rainbow streak"): a settled resize arms
-    /// [`CursorGlow::note_reflow`], and the relayout leap that follows throws
-    /// the ZOOM streak even though typing momentum is stone cold — the hand
-    /// dragged the window edge, so the gesture is witnessed. This is the exact
-    /// counterpart of `cold_program_warp_mints_no_rainbow_choreography`: same cold
-    /// spine, same move shape, opposite verdict, and the ONLY difference is the
-    /// hint.
+    /// Tier 1 for [`aterm_spec::derive::rainbow_move_admission_model`]: drive the real spawn
+    /// classifier through the cold denial and every witness family.  The model
+    /// deliberately abstracts witness kind, but each real route must project to
+    /// the same admitted decision.
     #[test]
-    fn a_hinted_reflow_throws_the_zoom_streak_from_cold() {
+    fn rainbow_move_admission_real_code_conforms_to_model() {
+        let model = aterm_spec::derive::rainbow_move_admission_model();
+        let source = model.init_state();
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let now = Instant::now();
+
+        // Cold movement and a fresh legacy gesture timestamp are both dark.
+        // The old model now covers classifier/credit bookkeeping only; causal
+        // movement proof is the separate CursorMoveCandidate machine.
+        let mut cold = CursorGlow::default();
+        assert!(!cold.spawn(3, 5, 3, 6, now, &c, g));
+        let mut cold_projected = source.clone();
+        assert!(model.fire("UnwitnessedMove", &mut cold_projected));
+        assert_eq!(cold_projected["admitted"], 0);
+
+        let mut gesture = CursorGlow::default();
+        gesture.note_user_gesture(now);
+        assert!(!gesture.spawn(3, 5, 3, 6, now, &c, g));
+        let mut gesture_armed = source.clone();
+        assert!(model.fire("ArmGesture", &mut gesture_armed));
+        let mut gesture_denied = gesture_armed.clone();
+        assert!(model.fire("GestureMove", &mut gesture_denied));
+        assert_eq!(gesture_denied["admitted"], 0);
+        for (from, to, action, label) in [
+            (&source, &gesture_armed, "ArmGesture", "legacy gesture classifier"),
+            (
+                &gesture_armed,
+                &gesture_denied,
+                "GestureMove",
+                "gesture timestamp alone stays dark",
+            ),
+        ] {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                from,
+                to,
+                Some(action),
+                label,
+            );
+            assert!(ok, "{label} rejected: {why}");
+        }
+
+        // An explicit synthetic candidate is a genuine admitted decision. It
+        // exercises post-candidate morphology without claiming a timestamp was
+        // provenance.
+        let mut synthetic = CursorGlow::default();
+        let mut out = Vec::new();
+        synthetic.tick(Some((3, 5)), now, &c, g, &mut out);
+        synthetic.note_synthetic_move(now);
+        assert!(synthetic.spawn(3, 5, 3, 6, now, &c, g));
+        let mut candidate = source.clone();
+        assert!(model.fire("AdmitCandidate", &mut candidate));
+        let mut witnessed = candidate.clone();
+        assert!(model.fire("WitnessedMove", &mut witnessed));
+        assert_eq!(witnessed["admitted"], 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &candidate,
+            &witnessed,
+            Some("WitnessedMove"),
+            "post-candidate morphology admission",
+        );
+        assert!(ok, "real synthetic candidate rejected: {why}");
+
+        // The bounded credit ledger remains a separate classifier budget. A
+        // text-blind note can charge activity, but its observed delta is dark
+        // and retires the complete unspent cohort.
+        let mut credit = CursorGlow::default();
+        credit.note_typed(now);
+        assert_eq!(
+            credit.typed_credits_within(now, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            1
+        );
+        assert!(!credit.spawn(3, 5, 3, 6, now, &c, g));
+        assert_eq!(
+            credit.typed_credits_within(now, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0
+        );
+        assert!(
+            !credit.typed_activity_within(now, CursorGlow::RAINBOW_BURST_ACTIVE_WINDOW),
+            "a denied relocation retires activity that could decorate a later move"
+        );
+        let mut credit_armed = source.clone();
+        assert!(model.fire("ArmTypedCredit", &mut credit_armed));
+        let mut credit_spent = credit_armed.clone();
+        assert!(model.fire("ObserveTypedEcho", &mut credit_spent));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &credit_armed,
+            &credit_spent,
+            Some("ObserveTypedEcho"),
+            "real typed-credit retirement",
+        );
+        assert!(ok, "typed-credit retirement rejected: {why}");
+
+        // Non-vacuity: the exact historical timestamp-only projection has no
+        // healthy action in either real code or the derived classifier model.
+        let mut forged = gesture_denied;
+        forged.insert("admitted", 1);
+        forged.insert("witnessed", 0);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &gesture_armed,
+            &forged,
+            Some("GestureMove"),
+            "timestamp-only forged admission",
+        );
+        assert!(!ok, "a gesture timestamp must not forge movement admission");
+    }
+    /// Positive visible-output controls for explicit preview candidates, plus
+    /// dark controls for every legacy timestamp-only classifier.
+    #[test]
+    fn synthetic_rainbow_moves_are_visible_and_legacy_timestamps_stay_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        for (label, typed, target) in [
+            ("synthetic typed", true, (0, 1)),
+            ("synthetic move", false, (3, 30)),
+        ] {
+            let t0 = Instant::now();
+            let t1 = t0 + Duration::from_millis(16);
+            let sample = t1 + Duration::from_millis(16);
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            glow.tick(Some((0, 0)), t0, &c, g, &mut out);
+            if typed {
+                glow.note_synthetic_typed(t1, 1);
+            } else {
+                glow.note_synthetic_move(t1);
+            }
+            glow.tick(Some(target), t1, &c, g, &mut out);
+            let fingerprint = glow.tick(Some(target), sample, &c, g, &mut out);
+            assert_ne!(fingerprint, 0, "{label} move must change the frame");
+            assert!(
+                frame_has_output(&out, &glow),
+                "{label} move must present visible output"
+            );
+            assert!(
+                glow.crown_until.is_some(),
+                "{label} admission keeps the cursor crown"
+            );
+            assert!(glow.is_active(), "{label} light keeps animation armed");
+            assert!(!glow.sparks.is_empty(), "{label} lays visible trail light");
+        }
+
+        type Arm = fn(&mut CursorGlow, Instant);
+        let timestamps: [(&str, Arm); 6] = [
+            ("typed", CursorGlow::note_typed),
+            ("Backspace", CursorGlow::note_backspace),
+            ("navigation", CursorGlow::note_navigation),
+            ("Return", CursorGlow::note_return),
+            ("Tab/paste", CursorGlow::note_user_gesture),
+            ("reflow", CursorGlow::note_reflow),
+        ];
+        for (label, arm) in timestamps {
+            let t0 = Instant::now();
+            let t1 = t0 + Duration::from_millis(16);
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            glow.tick(Some((0, 4)), t0, &c, g, &mut out);
+            arm(&mut glow, t1);
+            glow.tick(Some((3, 30)), t1, &c, g, &mut out);
+            assert!(!frame_has_output(&out, &glow), "{label} timestamp forged light");
+            assert!(glow.crown_until.is_none(), "{label} timestamp forged a crown");
+        }
+    }
+
+    /// A settled-resize timestamp is a coordinate-space classifier, not causal
+    /// movement proof. Even an immediate relayout-shaped leap stays dark.
+    #[test]
+    fn a_reflow_timestamp_alone_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -28412,19 +31255,11 @@ mod tests {
             glow.rainbow.disp, 0.0,
             "the spine must be cold for this law"
         );
-        // The host committed a settled resize, then the reflow relocated the caret.
         let t1 = t0 + Duration::from_millis(120);
         glow.note_reflow(t1);
         glow.tick(Some((3, 30)), t1, &c, g, &mut out);
-        assert_eq!(
-            glow.rainbow.jumps.len(),
-            1,
-            "a reflow-hinted relayout leap must throw exactly one ZOOM streak"
-        );
-        assert!(
-            glow.rainbow.bursts.is_empty(),
-            "a resize gets the BEAM ONLY — no landing starburst"
-        );
+        assert!(glow.rainbow.jumps.is_empty());
+        assert!(!frame_has_output(&out, &glow));
     }
 
     /// NO STARBURST ON A RESIZE (owner, 2026-07-28: "no starburst"), and the
@@ -28433,7 +31268,7 @@ mod tests {
     /// momentum did. What was asked for is a streak following the cursor to its
     /// new home, not a firework on every window drag.
     #[test]
-    fn a_resize_streak_carries_no_starburst_but_a_warm_jump_still_does() {
+    fn a_warm_synthetic_jump_bursts_but_a_reflow_timestamp_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -28453,6 +31288,7 @@ mod tests {
         // is about the reflow suppression, not the activity gate.
         arm_rainbow_witnesses(&mut warm, t0, 0, 0);
         let t1 = t0 + Duration::from_millis(120);
+        warm.note_synthetic_move(t1);
         warm.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert_eq!(warm.rainbow.jumps.len(), 1, "a warm jump still zooms");
         assert!(
@@ -28460,26 +31296,19 @@ mod tests {
             "a warm jump still bursts — the suppression must not leak to ordinary jumps"
         );
 
-        // COLD spine + reflow license: same leap, streak only.
+        // Cold spine + reflow timestamp: same leap, no candidate, no light.
         let mut cold = CursorGlow::default();
         cold.tick(Some((0, 0)), t0, &c, g, &mut out);
         cold.note_reflow(t1);
         cold.tick(Some((3, 30)), t1, &c, g, &mut out);
-        assert_eq!(cold.rainbow.jumps.len(), 1, "the resize still zooms");
-        assert!(
-            cold.rainbow.bursts.is_empty(),
-            "a reflow-licensed zoom must not burst"
-        );
+        assert!(cold.rainbow.jumps.is_empty());
+        assert!(!frame_has_output(&out, &cold));
     }
 
-    /// "ALL GET" (owner, 2026-07-28): the resize streak is not a rainbow kitty privilege.
-    /// Rainbow kitty needed an explicit reflow LICENSE only because its ZOOM is the one
-    /// arm gated on typing momentum (the anti-stray law); every other style's
-    /// jump path is ungated, so a cold relayout leap already lays that style's
-    /// own streak. This pins the property for the whole built-in set, so a future
-    /// momentum gate on another style cannot silently make resize go dark there.
+    /// The universal candidate gate is style-blind: a reflow timestamp cannot
+    /// birth a streak in any built-in style.
     #[test]
-    fn every_style_lays_its_own_streak_on_a_cold_relayout_leap() {
+    fn every_style_keeps_a_timestamp_only_relayout_dark() {
         let g = geom();
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_millis(120);
@@ -28498,24 +31327,21 @@ mod tests {
             let mut out = Vec::new();
             let mut glow = CursorGlow::default();
             glow.tick(Some((0, 0)), t0, &c, g, &mut out);
-            // The host arms the license for EVERY style (`apply_term_resize` is
-            // style-blind); only the rainbow kitty's gate reads it.
             glow.note_reflow(t1);
             glow.tick(Some((3, 30)), t1, &c, g, &mut out);
             let laid = !glow.sparks.is_empty()
                 || !glow.rainbow.jumps.is_empty()
                 || !glow.fire_meteors.is_empty()
                 || !glow.particles.is_empty();
-            assert!(laid, "{style:?}: a cold relayout leap must lay a streak");
+            assert!(!laid, "{style:?}: reflow timestamp forged a streak");
+            assert!(!frame_has_output(&out, &glow), "{style:?}: must stay dark");
         }
     }
 
-    /// …and the license is ONE gesture, ONE streak: the hint is consumed by the
-    /// move it pairs with, so a resize storm (or a mid-drag reflow train that
-    /// somehow reached the engine) can never surf a single stale hint into a
-    /// rainbow scribble.
+    /// One reflow timestamp produces no streaks, including across a relocation
+    /// train that follows it.
     #[test]
-    fn one_reflow_hint_licenses_exactly_one_streak() {
+    fn one_reflow_timestamp_produces_no_streaks() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -28524,24 +31350,22 @@ mod tests {
         glow.tick(Some((0, 0)), t0, &c, g, &mut out);
         let mut t = t0 + Duration::from_millis(60);
         glow.note_reflow(t);
-        // Five relayout-shaped leaps, ONE hint between them.
+        // Five relayout-shaped leaps, one timestamp between them.
         for &(cr, cc) in &[(3u16, 30u16), (0, 5), (4, 35), (1, 12), (5, 20)] {
             t += Duration::from_millis(60);
             glow.tick(Some((cr, cc)), t, &c, g, &mut out);
         }
         assert_eq!(
             glow.rainbow.jumps.len(),
-            1,
-            "one reflow hint must license exactly one streak, not one per reflow"
+            0,
+            "one reflow timestamp must produce no streaks"
         );
     }
 
-    /// A STALE reflow hint is no license: the reflow's caret relocation is
-    /// observed on the next redraw, so the window is generous
-    /// ([`CursorGlow::REFLOW_HINT_FRESH`]) — but a hint older than that has
-    /// missed its move and must not license a later, unrelated warp.
+    /// The stale-timestamp twin stays dark too; freshness cannot upgrade a
+    /// classifier into provenance.
     #[test]
-    fn a_stale_reflow_hint_licenses_nothing() {
+    fn a_stale_reflow_timestamp_stays_dark() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -28553,8 +31377,9 @@ mod tests {
         glow.tick(Some((3, 30)), t1, &c, g, &mut out);
         assert!(
             glow.rainbow.jumps.is_empty(),
-            "a reflow hint past its freshness window must license no streak"
+            "a stale reflow timestamp must produce no streak"
         );
+        assert!(!frame_has_output(&out, &glow));
     }
 
     /// CROSS-GEOMETRY ORIGIN CLAMP: on a SHRINK the pre-reflow cell can sit
@@ -28562,7 +31387,7 @@ mod tests {
     /// tick's geometry. Both endpoints must land inside the effects box, or
     /// `beam_clip` truncates the swoosh and it starts mid-air.
     #[test]
-    fn a_reflow_streak_from_a_shrunk_grid_stays_inside_the_effects_box() {
+    fn a_synthetic_shrink_preview_stays_inside_the_effects_box() {
         let big = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -28571,6 +31396,7 @@ mod tests {
         // Sit near the far corner of the LARGE grid.
         let (far_r, far_c) = ((big.rows - 1) as u16, (big.cols - 1) as u16);
         glow.tick(Some((far_r, far_c)), t0, &c, big, &mut out);
+        glow.rainbow.disp = 0.9;
         // The window shrank hard; the caret was clamped to the new last row.
         let small = Geom {
             rows: 3,
@@ -28578,13 +31404,13 @@ mod tests {
             ..big
         };
         let t1 = t0 + Duration::from_millis(120);
-        glow.note_reflow(t1);
+        glow.note_synthetic_move(t1);
         glow.tick(Some((2, 4)), t1, &c, small, &mut out);
         let s = glow
             .rainbow
             .jumps
             .first()
-            .expect("the shrink's relayout leap must still throw its streak");
+            .expect("the synthetic shrink preview must throw its streak");
         let (l, r) = (small.fx_left() as f32, small.fx_right() as f32);
         let (top, bot) = (small.fx_top() as f32, small.fx_bot() as f32);
         for (label, x, y) in [("launch", s.x0, s.y0), ("landing", s.x1, s.y1)] {
@@ -28620,7 +31446,7 @@ mod tests {
         glow.tick(Some((2, 4)), t, &c, g, &mut out);
         for i in 1..=10u16 {
             t += Duration::from_millis(90);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, 4 + i)), t, &c, g, &mut out);
         }
 
@@ -28673,11 +31499,11 @@ mod tests {
         let mut out = Vec::new();
         let mut glow = CursorGlow::default();
         glow.tick(Some((1, 4)), t0, &c, g, &mut out);
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((1, 5)), t0, &c, g, &mut out);
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((5, 5)), t0, &c, g, &mut out);
-        glow.note_typed(t0);
+        glow.note_synthetic_typed(t0, 1);
         glow.tick(Some((5, 6)), t0, &c, g, &mut out);
 
         let mut before: Vec<u16> = glow.sparks.iter().map(|s| s.row).collect();
@@ -28776,7 +31602,7 @@ mod tests {
         let mut vim = CursorGlow::default();
         vim.tick(Some((2, 0)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(30);
-        vim.note_typed(t1);
+        vim.note_synthetic_typed(t1, 1);
         vim.tick(Some((2, 5)), t1, &c, g, &mut out);
         let swept: Vec<(u16, u16)> = vim
             .sparks
@@ -28794,9 +31620,13 @@ mod tests {
         let mut batch = CursorGlow::default();
         batch.tick(Some((2, 0)), t0, &c, g, &mut out);
         let mut t = t0;
-        for _ in 0..5 {
+        for i in 0..5 {
             t += Duration::from_millis(10);
-            batch.note_typed(t);
+            if i == 4 {
+                batch.note_synthetic_typed(t, 1);
+            } else {
+                batch.note_typed(t);
+            }
         }
         batch.tick(Some((2, 5)), t, &c, g, &mut out);
         assert!(
@@ -28831,6 +31661,7 @@ mod tests {
         let landings = [(3, 30), (0, 5), (4, 35), (1, 12), (5, 20), (2, 38), (0, 0)];
         for _ in 0..6 {
             for &(cr, cc) in &landings {
+                glow.note_synthetic_move(t0);
                 glow.tick(Some((cr, cc)), t0, &c, g, &mut out);
             }
         }
@@ -29107,19 +31938,15 @@ mod tests {
         );
     }
 
-    /// TASK 4 — the FAST-GLIDE rainbow shooting star fires on SUSTAINED FAST
-    /// cursor motion (a high eased `glide.vel`), and NOT on a slow move (under
-    /// the velocity floor) or a single big jump (the discrete-jump case, excluded
-    /// structurally regardless of the frame velocity).
+    /// Navigation timestamps cannot mint the old fast-glide shooting star.
+    /// Even a sustained, high-speed straight run stays dark without a causal
+    /// movement candidate.
     #[test]
-    fn glide_star_fires_on_sustained_fast_motion_not_slow_or_jump() {
+    fn navigation_timestamps_never_fire_glide_stars() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let mut out = Vec::new();
 
-        // SUSTAINED FAST GLIDE: a run of same-row nav-hinted 3-cell hops at
-        // ~16 ms cadence (~187 cells/s) ramps `glide.vel` past the floor and
-        // fires the directional streak.
         let mut fast = CursorGlow::default();
         let mut t = Instant::now();
         fast.tick(Some((2, 0)), t, &c, g, &mut out);
@@ -29131,41 +31958,11 @@ mod tests {
             fast.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
-            !fast.glide.stars.is_empty(),
-            "sustained fast same-row nav motion fires a glide star (glide.vel={})",
+            fast.glide.stars.is_empty(),
+            "timestamp-only navigation forged a glide star (glide.vel={})",
             fast.glide.vel
         );
-
-        // SLOW MOVE: after a clock-establishing hop, one 3-cell nav hop over
-        // 500 ms (~6 cells/s) stays far under the floor — no streak.
-        let mut slow = CursorGlow::default();
-        let t0 = Instant::now();
-        slow.tick(Some((2, 0)), t0, &c, g, &mut out);
-        let t1 = t0 + Duration::from_millis(16);
-        slow.note_navigation(t1);
-        slow.tick(Some((2, 3)), t1, &c, g, &mut out);
-        let t2 = t1 + Duration::from_millis(500);
-        slow.note_navigation(t2);
-        slow.tick(Some((2, 6)), t2, &c, g, &mut out);
-        assert!(
-            slow.glide.stars.is_empty(),
-            "a slow move stays under the velocity floor: no streak (glide.vel={})",
-            slow.glide.vel
-        );
-
-        // SINGLE BIG JUMP: one Ctrl-A-style leap (dc_abs ≥ RAINBOW_JUMP_MIN) is the
-        // discrete-jump case — excluded from the glide arm even though its
-        // single-frame velocity is enormous.
-        let mut jump = CursorGlow::default();
-        let t0 = Instant::now();
-        jump.tick(Some((2, 30)), t0, &c, g, &mut out);
-        let t1 = t0 + Duration::from_millis(16);
-        jump.note_navigation(t1);
-        jump.tick(Some((2, 0)), t1, &c, g, &mut out);
-        assert!(
-            jump.glide.stars.is_empty(),
-            "a single big jump is the discrete-jump case, never a glide star"
-        );
+        assert!(!frame_has_output(&out, &fast));
     }
 
     /// TASK 4 — the fast-glide star is LIGHT-MODE FORKED: DARK draws an additive
@@ -29901,7 +32698,7 @@ mod tests {
         let text: Vec<char> = "typing a rainbow ribbon".chars().collect();
         for col in 3..=10u16 {
             t += Duration::from_millis(40);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.observe_row(2, col, &text, t);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
@@ -30054,9 +32851,10 @@ mod tests {
         // emitted are the terminus glitter — the momentum shower would
         // otherwise add non-glitter stars. (Without any momentum the cursor is
         // COLD and correctly scatters nothing — see
-        // `cold_cursor_jump_scatters_no_terminus`.)
+        // `cold_navigation_timestamp_scatters_nothing`.)
         arm_rainbow_witnesses(&mut glow, t0, 2, 20);
         glow.rainbow.disp = 0.3;
+        glow.note_synthetic_move(t0);
         glow.tick(Some((5, 0)), t0, &c, g, &mut out); // jump away
         // Rainbow kitty has no general jump particle burst (not in has_particles), so the
         // only particles are the terminus dissolve scatter.
@@ -30077,17 +32875,10 @@ mod tests {
         );
     }
 
-    /// FINDING 1 — the paradigm gesture the owner NAMED, exercised for real: a
-    /// Ctrl-A / Ctrl-E leap arms the navigation hint (`note_navigation`), so
-    /// `navigation == true`. Before the fix that dropped the whole jump into a
-    /// no-op arm and fired NEITHER the landing starburst NOR the terminus
-    /// dissolve — the hard-cut the owner reported. It must fire BOTH, and (since
-    /// 2026-07-29) the ZOOM BEAM as well: see [`Self::RAINBOW_STREAK_MIN_DIST`]. What
-    /// stays navigation-excluded is the per-cell RIBBON — a bare Ctrl-E must not
-    /// repaint a saturated rainbow over the line it skims, and that light is laid
-    /// by the spark path, which the navigation arm still skips entirely.
+    /// A navigation timestamp cannot borrow a warm ribbon or recent activity to
+    /// mint a starburst, terminus scatter, ZOOM beam, or persistent ribbon.
     #[test]
-    fn nav_hinted_jump_still_bursts_and_dissolves_the_terminus() {
+    fn navigation_timestamp_cannot_borrow_a_warm_ribbon() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -30099,64 +32890,69 @@ mod tests {
         // glitter is the only particle source (finding 3 gate open, no shower).
         arm_rainbow_witnesses(&mut glow, t0 - Duration::from_millis(200), 2, 30);
         glow.rainbow.disp = 0.3;
-        glow.note_navigation(t0); // the Ctrl-A key-hint — this is the real path
-        let ribbon_before = glow.sparks.iter().filter(|s| s.typing).count();
+        glow.note_navigation(t0);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A: leap to column 0
-
-        // FEATURE B fires even though navigation is hinted (finding 1).
-        assert_eq!(
-            glow.rainbow.bursts.len(),
-            1,
-            "a navigation-hinted fast jump STILL blooms a landing starburst"
-        );
-        // FEATURE A fires even though navigation is hinted (finding 1): the
-        // abandoned ribbon terminus dissolves as melt-out GLITTER twinkles.
         assert!(
-            !glow.particles.is_empty() && glow.particles.iter().all(|p| p.cov_scale < 0.9),
-            "a navigation-hinted jump STILL dissolves the terminus (melt-out twinkles)"
+            glow.rainbow.jumps.is_empty()
+                && glow.rainbow.bursts.is_empty()
+                && glow.particles.is_empty()
+                && glow.sparks.is_empty(),
+            "a navigation timestamp must clear old light and birth no payload"
         );
-        // 2026-07-29: the ZOOM BEAM now fires here too — this 30-cell Ctrl-A IS
-        // travelling, and drawing its rainbow line is the whole point of the
-        // gesture (`rainbow_navigation_jump_draws_the_rainbow_streak_both_ways`).
-        assert_eq!(
-            glow.rainbow.jumps.len(),
-            1,
-            "a large navigation leap draws its rainbow ZOOM beam"
-        );
-        // PRESERVED DESIGN: what stays navigation-excluded is the per-cell RIBBON.
-        // The beam is one transient line that self-expires; the ribbon is
-        // persistent light laid cell by cell by the spark path, and repainting it
-        // across a skimmed line was the actual defect the old gate was aimed at.
-        // Measured as a DELTA, because the fixture seeds one ribbon cell of its
-        // own to satisfy the terminus witness — what must stay zero is what the
-        // JUMP added, not what was already on glass.
-        assert_eq!(
-            glow.sparks.iter().filter(|s| s.typing).count(),
-            ribbon_before,
-            "no saturated per-cell ribbon is repainted across the skimmed line"
-        );
+        assert!(!frame_has_output(&out, &glow));
+    }
 
-        // CONTROL: the SAME large jump WITHOUT the nav hint also beams — the two
-        // gestures now agree, which is the fix. They still differ where it counts:
-        // neither lays a ribbon here, and only the hinted arm skips the spark path
-        // by construction.
-        let mut plain = CursorGlow::default();
-        plain.tick(Some((2, 30)), t0, &c, g, &mut out);
-        plain.rainbow.disp = 0.3;
-        plain.tick(Some((2, 0)), t0, &c, g, &mut out); // un-hinted leap
+    /// Recent typing activity remains distinct from admission credit, but it is
+    /// amplitude only: it cannot upgrade a later navigation timestamp into
+    /// movement provenance.
+    #[test]
+    fn spent_typing_credit_cannot_admit_a_later_navigation_timestamp() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let mut recent = CursorGlow::default();
+        recent.tick(Some((2, 4)), t0, &c, g, &mut out);
+        let typed = t0 + Duration::from_millis(20);
+        recent.note_synthetic_typed(typed, 1);
+        recent.tick(Some((2, 5)), typed, &c, g, &mut out);
+        assert_eq!(
+            recent.typed_credits_within(typed, CursorGlow::RAINBOW_COALESCE_PRESS_WINDOW),
+            0,
+            "the observed echo spends admission credit"
+        );
         assert!(
-            !plain.rainbow.jumps.is_empty(),
-            "an UN-hinted large jump lays the ZOOM streak too"
+            recent.typed_activity_within(typed, CursorGlow::RAINBOW_BURST_ACTIVE_WINDOW),
+            "the same echo preserves bounded recent-input activity"
+        );
+        recent.particles.clear();
+        recent.rainbow.bursts.clear();
+        let jumped = typed + Duration::from_millis(20);
+        recent.note_navigation(jumped);
+        recent.tick(Some((2, 30)), jumped, &c, g, &mut out);
+        assert!(
+            recent.rainbow.bursts.is_empty()
+                && recent.particles.is_empty()
+                && recent.rainbow.jumps.is_empty(),
+            "recent activity must not admit navigation light"
+        );
+        assert!(!frame_has_output(&out, &recent));
+
+        let mut cold = CursorGlow::default();
+        cold.tick(Some((2, 5)), t0, &c, g, &mut out);
+        cold.note_navigation(jumped);
+        cold.tick(Some((2, 30)), jumped, &c, g, &mut out);
+        assert!(
+            cold.rainbow.bursts.is_empty() && cold.particles.is_empty(),
+            "a cold navigation jump earns neither activity-gated payload"
         );
     }
 
-    /// FINDING 3 — a jump on a COLD/idle cursor (no ribbon ever laid,
-    /// `rainbow.disp ~ 0`) must NOT scatter a terminus: there is no hard leading
-    /// edge to dissolve, so sparkling there is light over nothing (the audited
-    /// spurious sparkle on a cold Ctrl-A). The LANDING starburst is unaffected —
-    /// it marks the jump itself, not a ribbon end.
+    /// A cold Ctrl-A timestamp is not a jump witness. With no candidate and no
+    /// ribbon, the relocation births neither terminus scatter nor a landing
+    /// starburst — the audited stray-rainbow family.
     #[test]
-    fn cold_cursor_jump_scatters_no_terminus() {
+    fn cold_navigation_timestamp_scatters_nothing() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let t0 = Instant::now();
@@ -30170,8 +32966,7 @@ mod tests {
             glow.particles.is_empty(),
             "a cold-cursor jump dissolves no phantom terminus (finding 3)"
         );
-        // The starburst still marks the fast landing — it is not ribbon-gated.
-        // …AND NEITHER DOES THE STARBURST. This used to assert the opposite,
+        // Neither does the starburst. This used to assert the opposite,
         // which is precisely the owner's "stray pieces of rainbow": at a 2-cell
         // floor every arrow-key history recall on an untouched prompt threw
         // stars and rang the chime. A jump celebrates WORK.
@@ -30199,9 +32994,9 @@ mod tests {
         // Warm ribbon backed by a fresh press, below the shower onset (0.45):
         // the terminus scatter is the ONLY particle source, so an empty pool
         // proves it was suppressed.
-        glow.note_typed(t0);
+        arm_rainbow_witnesses(&mut glow, t0, 2, 30);
         glow.rainbow.disp = 0.3;
-        glow.note_navigation(t0);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // Ctrl-A leap
         assert!(
             glow.particles.is_empty(),
@@ -30213,7 +33008,7 @@ mod tests {
         motion.tick(Some((2, 30)), t0, &c, g, &mut out);
         arm_rainbow_witnesses(&mut motion, t0, 2, 30);
         motion.rainbow.disp = 0.3;
-        motion.note_navigation(t0);
+        motion.note_synthetic_move(t0);
         motion.tick(Some((2, 0)), t0, &c, g, &mut out);
         assert!(
             !motion.particles.is_empty(),
@@ -30242,7 +33037,7 @@ mod tests {
         // Type into the penultimate → last column (a typing advance to the margin).
         let mut edge = CursorGlow::default();
         edge.tick(Some((0, 38)), t0, &c, g, &mut out); // seed near the end
-        edge.note_typed(t0);
+        edge.note_synthetic_typed(t0, 1);
         edge.tick(Some((0, 39)), t0, &c, g, &mut out); // advance onto the last column
         assert!(
             !edge.particles.is_empty(),
@@ -30252,7 +33047,7 @@ mod tests {
         // A mid-line typing advance leaves no terminus scatter.
         let mut mid = CursorGlow::default();
         mid.tick(Some((0, 5)), t0, &c, g, &mut out);
-        mid.note_typed(t0);
+        mid.note_synthetic_typed(t0, 1);
         mid.tick(Some((0, 6)), t0, &c, g, &mut out);
         assert!(
             mid.particles.is_empty(),
@@ -31695,6 +34490,8 @@ mod tests {
             },
             ..CursorGlow::default()
         };
+        hot.last = Some((3, 5));
+        hot.note_synthetic_typed(now, 1);
         hot.spawn(3, 5, 3, 6, now, &c, g);
         let cell = g.ch as f32;
         let oy = (3.0 + 0.5) * cell; // row 3 centre (identity geometry)
@@ -31807,9 +34604,10 @@ mod tests {
             born: now,
             fade_at: None,
         });
-        // Arm a backspace, then the paired backward echo (5 -> 4): the vacated
-        // cell is col 4.
-        glow.note_backspace(now);
+        // Arm an exact Backspace candidate, then the paired backward echo
+        // (5 -> 4): the vacated cell is col 4.
+        glow.last = Some((3, 5));
+        arm_exact_backspace(&mut glow, now, (3, 5), (3, 4));
         glow.spawn(3, 5, 3, 4, now, &c, g);
         // NO fresh ribbon spark at the vacated cell (nor the cursor's old cell).
         assert!(
@@ -31874,6 +34672,7 @@ mod tests {
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
+        glow.note_synthetic_move(t0);
         glow.tick(Some((2, 30)), t0, &c, g, &mut out);
         out.clear();
         let fp = glow.tick(
@@ -31910,9 +34709,12 @@ mod tests {
         GlowStyle::Lumen, // padding kept intentionally distinct in the fold order
     ];
 
-    /// Drive one fixed injected-clock script (idle → 6 typing keys → a jump →
-    /// two decay frames) and fold EVERY frame's whole-frame fingerprint into one
-    /// u64. Deterministic given the relative schedule (the engine is clockless).
+    /// Drive one fixed injected-clock script (idle → 6 adjacent moves → a jump
+    /// → two decay frames) and fold EVERY frame's whole-frame fingerprint into
+    /// one u64. Positive styles receive explicit synthetic provenance;
+    /// Rainbow Kitty deliberately remains the dark no-candidate control pinned
+    /// by its zero golden. Deterministic given the relative schedule (the engine
+    /// is clockless).
     fn run_script(cfg: &GlowConfig, g: Geom) -> u64 {
         let mut glow = CursorGlow::default();
         let t0 = Instant::now();
@@ -31921,17 +34723,25 @@ mod tests {
         let mut fold = |fp: u64| acc = fp_fold(acc, fp);
         fold(glow.tick(Some((2, 0)), t0, cfg, g, &mut out)); // seed
         for k in 1..=6u64 {
+            let now = t0 + Duration::from_millis(90 * k);
+            if !matches!(cfg.style, GlowStyle::RainbowKitty) {
+                glow.note_synthetic_move(now);
+            }
             fold(glow.tick(
                 Some((2, k as u16)),
-                t0 + Duration::from_millis(90 * k),
+                now,
                 cfg,
                 g,
                 &mut out,
             ));
         }
+        let jump = t0 + Duration::from_millis(700);
+        if !matches!(cfg.style, GlowStyle::RainbowKitty) {
+            glow.note_synthetic_move(jump);
+        }
         fold(glow.tick(
             Some((2, 30)),
-            t0 + Duration::from_millis(700),
+            jump,
             cfg,
             g,
             &mut out,
@@ -31970,11 +34780,11 @@ mod tests {
         // the index whose style you meant to change, and only after checking
         // that no other index drifted.
         //
-        // The script feeds NO row probe and lays NO committed-press hint
-        // (`note_typed`), so for rainbow kitty it is PROGRAM OUTPUT by definition: the
-        // momentum spine stays at zero, the wake and the spine-scaled
-        // clearance/taper/star-shower are provably inert, and displaced stars
-        // take the in-cell fallback because their landing rows are UNKNOWN.
+        // Rainbow Kitty alone receives no candidate, so its scripted relocation
+        // is PROGRAM OUTPUT by definition and remains wholly dark: no input
+        // witness owns a trail. Every positive built-in arm receives an explicit
+        // synthetic candidate; no arm relies on a classifier timestamp or cursor
+        // geometry as causal provenance.
         //
         // RECAPTURED at the STARDUST LAW's SECOND thinning (owner, 2026-08-09:
         // "many fewer of those cross sparkles" — [`STAR_ACCENT_DEN`] 8 → 16).
@@ -32052,7 +34862,7 @@ mod tests {
         const GOLDEN: [u64; 9] = [
             12269945233474433350,
             14737187400751729562,
-            13259144446454873362,
+            0,
             15428187357465854247,
             15099317426123974543,
             8477863368341368663,
@@ -32115,17 +34925,21 @@ mod tests {
         let before = CUSTOM_EMIT_CALLS.load(Ordering::Relaxed);
         glow.tick(Some((2, 0)), t0, &c, g, &mut out); // seed
         for k in 1..=6u64 {
+            let now = t0 + Duration::from_millis(90 * k);
+            glow.note_synthetic_typed(now, 1);
             glow.tick(
                 Some((2, k as u16)),
-                t0 + Duration::from_millis(90 * k),
+                now,
                 &c,
                 g,
                 &mut out,
             );
         }
+        let jump = t0 + Duration::from_millis(700);
+        glow.note_synthetic_move(jump);
         let fp = glow.tick(
             Some((2, 30)),
-            t0 + Duration::from_millis(700),
+            jump,
             &c,
             g,
             &mut out,
@@ -32165,9 +34979,11 @@ mod tests {
         // A hot run of adjacent typing keys (builds heat/boost to the ceiling).
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
         for k in 1..=12u64 {
+            let now = t0 + Duration::from_millis(35 * k);
+            glow.note_synthetic_typed(now, 1);
             glow.tick(
                 Some((2, k as u16)),
-                t0 + Duration::from_millis(35 * k),
+                now,
                 &c,
                 g,
                 &mut out,
@@ -32202,18 +35018,21 @@ mod tests {
         let mut out = Vec::new();
         glow.tick(Some((2, 0)), t0, &a, g, &mut out);
         for k in 1..=4u64 {
+            let now = t0 + Duration::from_millis(60 * k);
+            glow.note_synthetic_typed(now, 1);
             glow.tick(
                 Some((2, k as u16)),
-                t0 + Duration::from_millis(60 * k),
+                now,
                 &a,
                 g,
                 &mut out,
             );
         }
         assert!(!glow.sparks.is_empty(), "pack A laid sparks");
-        // Swap to pack B on the next frame: A's sparks must be dropped.
+        // Swap to pack B on the next frame without relocating: A's sparks must
+        // be dropped by the pack fingerprint edge alone.
         glow.tick(
-            Some((2, 5)),
+            Some((2, 4)),
             t0 + Duration::from_millis(300),
             &b,
             g,
@@ -32247,9 +35066,11 @@ mod tests {
             let mut acc = 0u64;
             let mut f = |fp: u64| acc = fp_fold(acc, fp);
             f(glow.tick(Some((2, 0)), t0, &c, g, &mut out));
+            let typed = t0 + Duration::from_millis(80);
+            glow.note_synthetic_typed(typed, 1);
             f(glow.tick(
                 Some((2, 1)),
-                t0 + Duration::from_millis(80),
+                typed,
                 &c,
                 g,
                 &mut out,
@@ -32573,9 +35394,9 @@ halo = "add"
 
     /// THE PROVENANCE LAW: pops are born ONLY from typed keys. A PTY echo
     /// alone — a program moving the cursor one cell exactly like a typed
-    /// glyph's echo, with no committed-press hint — lays ribbon light but
-    /// NEVER a pop; the hinted twin of the same move pops the vacated glyph
-    /// cell and renders it as over-ink radial light.
+    /// glyph's echo, with no committed-press hint — stays wholly dark; the
+    /// hinted twin pops the vacated glyph cell and renders it as over-ink
+    /// radial light.
     #[test]
     fn fresh_ink_pops_born_only_from_typed_keys() {
         let g = geom();
@@ -32597,10 +35418,8 @@ halo = "add"
             "PTY echo alone never pops"
         );
         assert!(pop_halos(&glow).is_empty(), "no pop light either");
-        // Observe one beat later: the feathered birth ease keeps the freshly
-        // laid ribbon cell near-zero on its landing frame, so the control
-        // ("the move WAS seen as ribbon light") is read once released. Still
-        // hint-free — no pop may be born of it.
+        // Observe one beat later too: denial is a lifecycle decision, not a
+        // zero-alpha first frame that can blossom after the program move.
         glow.tick(
             Some((2, 3)),
             t0 + Duration::from_millis(150),
@@ -32613,12 +35432,12 @@ halo = "add"
             "still no pop without a hint"
         );
         assert!(
-            !glow.under_quads().is_empty(),
-            "control: the same move DID lay ribbon light (the move was seen)"
+            !frame_has_output(&out, &glow),
+            "cold program motion must not blossom into delayed ribbon light"
         );
-        // The typed twin: committed-press hint + the paired echo.
+        // The typed twin: explicit typed preview candidate + paired echo.
         let t1 = t0 + Duration::from_millis(200);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((2, 4)), t1, &c, g, &mut out);
         assert_eq!(glow.rainbow.ink_pops.len(), 1, "one typed key = one pop");
         assert_eq!(
@@ -32657,7 +35476,7 @@ halo = "add"
         let mut cold = CursorGlow::default();
         let mut out = Vec::new();
         cold.tick(Some((2, 2)), t, &c, g, &mut out);
-        cold.note_typed(t);
+        cold.note_synthetic_typed(t, 1);
         cold.tick(Some((2, 3)), t, &c, g, &mut out);
         let cold_r = peak_r(&cold);
         // HOT: the same single keystroke off a fully-warmed spine.
@@ -32669,7 +35488,7 @@ halo = "add"
             ..Default::default()
         };
         hot.tick(Some((2, 2)), t, &c, g, &mut out);
-        hot.note_typed(t);
+        hot.note_synthetic_typed(t, 1);
         hot.tick(Some((2, 3)), t, &c, g, &mut out);
         let hot_r = peak_r(&hot);
         assert!(
@@ -32723,7 +35542,7 @@ halo = "add"
             };
             let mut out = Vec::new();
             glow.tick(Some((2, 2)), t, &c, g, &mut out);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, 3)), t, &c, g, &mut out); // u = 0: both core + flash live
             composite(&glow)
         };
@@ -32773,7 +35592,7 @@ halo = "add"
         glow.tick(Some((2, 2)), t, &c, g, &mut out);
         for col in 3..=8u16 {
             t += Duration::from_millis(40);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.observe_row(2, col, &row, t);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
@@ -32815,7 +35634,7 @@ halo = "add"
             // 10 ms/key: the whole 39-key run (390 ms) fits inside ONE pop
             // life, so the ring bound — not the decay — is what sheds.
             t += Duration::from_millis(10);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert!(
@@ -32839,7 +35658,7 @@ halo = "add"
         // Zero amplitude drops pops with the other moving light.
         let mut glow2 = CursorGlow::default();
         glow2.tick(Some((2, 0)), t, &c, g, &mut out);
-        glow2.note_typed(t);
+        glow2.note_synthetic_typed(t, 1);
         glow2.tick(Some((2, 1)), t, &c, g, &mut out);
         assert!(!glow2.rainbow.ink_pops.is_empty());
         let mut dark = c;
@@ -32899,7 +35718,7 @@ halo = "add"
         let mut now = start;
         glow.tick(Some((row, from)), now, c, g, &mut out);
         for k in 1..=keys {
-            glow.note_typed(now);
+            glow.note_synthetic_typed(now, 1);
             glow.tick(Some((row, from + k)), now, c, g, &mut out);
             for _ in 0..(gap_ms / 16) {
                 now += Duration::from_millis(16);
@@ -32934,8 +35753,8 @@ halo = "add"
         // One keystroke, then frames at 60 fps: the nozzle must pass THROUGH the
         // cell, not jump across it.
         let mut seen = Vec::new();
+        glow.note_synthetic_typed(t0, 1);
         for f in 1..=24u64 {
-            glow.note_typed(t0);
             glow.tick(
                 Some((2, 6)),
                 t0 + Duration::from_millis(16 * f),
@@ -33182,7 +36001,10 @@ halo = "add"
             assert!(comp.is_finite() && rgb <= 0x00FF_FFFF);
         }
         // The compensation table stays inside the composite budget.
-        let max_comp = RAINBOW_WAKE_LUMA_COMP.iter().copied().fold(0.0f32, f32::max);
+        let max_comp = RAINBOW_WAKE_LUMA_COMP
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
         assert!(
             max_comp * RAINBOW_WAKE_COV < RAINBOW_WAKE_COMPOSITE_CAP,
             "luma compensation must never out-price the composite ceiling"
@@ -33448,7 +36270,14 @@ halo = "add"
             t0,
         );
         let mut out = Vec::new();
-        hot.tick(Some((3, 1)), end + Duration::from_millis(25), &c, g, &mut out);
+        hot.note_synthetic_typed(end + Duration::from_millis(20), 1);
+        hot.tick(
+            Some((3, 1)),
+            end + Duration::from_millis(25),
+            &c,
+            g,
+            &mut out,
+        );
         let carried = hot.rainbow.wake_fold_carry;
         assert!(
             carried.is_some_and(|(_, l)| l > RAINBOW_WAKE_LEN_MIN),
@@ -33456,8 +36285,14 @@ halo = "add"
         );
         // The FIRST new-row keystroke — the exact moment the pre-carry wake
         // restarted as a nub — now draws at the carried length.
-        hot.note_typed(end + Duration::from_millis(40));
-        hot.tick(Some((3, 2)), end + Duration::from_millis(45), &c, g, &mut out);
+        hot.note_synthetic_typed(end + Duration::from_millis(40), 1);
+        hot.tick(
+            Some((3, 2)),
+            end + Duration::from_millis(45),
+            &c,
+            g,
+            &mut out,
+        );
         let (quads, _) = wake_of(&hot, end + Duration::from_millis(60), &c, g);
         assert!(!quads.is_empty(), "the folded wake survives the line end");
         // COLD: a lone keystroke's wrap carries nothing (resting is resting).
@@ -33465,7 +36300,7 @@ halo = "add"
         let t1 = Instant::now();
         let mut o1 = Vec::new();
         cold.tick(Some((2, 38)), t1, &c, g, &mut o1);
-        cold.note_typed(t1 + Duration::from_millis(5));
+        cold.note_synthetic_typed(t1 + Duration::from_millis(5), 1);
         cold.tick(Some((3, 1)), t1 + Duration::from_millis(30), &c, g, &mut o1);
         assert!(
             cold.rainbow
@@ -33489,20 +36324,27 @@ halo = "add"
             t2,
         );
         let mut o2 = Vec::new();
+        nav.note_synthetic_typed(e2 + Duration::from_millis(20), 1);
         nav.tick(Some((3, 1)), e2 + Duration::from_millis(25), &c, g, &mut o2);
         assert!(nav.rainbow.wake_fold_carry.is_some());
-        nav.tick(Some((7, 30)), e2 + Duration::from_millis(60), &c, g, &mut o2);
+        nav.note_navigation(e2 + Duration::from_millis(55));
+        nav.tick(
+            Some((7, 30)),
+            e2 + Duration::from_millis(60),
+            &c,
+            g,
+            &mut o2,
+        );
         assert!(
             nav.rainbow.wake_fold_carry.is_none(),
             "a jump must orphan the folded energy"
         );
     }
 
-    /// REAL-WORLD PAIRING: in production the committed-press hint and the PTY
-    /// ECHO that moves the caret do NOT arrive on the same tick — the key is
-    /// stamped immediately, the shell's echo comes back a frame or several
-    /// later. Every wake test that types "hint and move together" would pass
-    /// even if the pairing window were far too tight for a real shell, so pin
+    /// REAL-WORLD PAIRING: an exact typed candidate and its PTY echo need not
+    /// arrive on the same tick. This scripted twin arms the candidate while the
+    /// caret is stationary, then delays the matching move; same-tick fixtures
+    /// would miss an overly tight correlation window. Pin
     /// the LATENCY axis explicitly: across the whole plausible echo range, every
     /// keystroke must still produce its ring entry, and the plume must still
     /// measure a real speed off them.
@@ -33517,8 +36359,8 @@ halo = "add"
             let mut now = t0;
             glow.tick(Some((2, 4)), now, &c, g, &mut out);
             for k in 1..=4u16 {
-                // The key: hinted at once, caret still where it was.
-                glow.note_typed(now);
+                // The candidate is armed once while the caret is still stationary.
+                glow.note_synthetic_typed(now, 1);
                 glow.tick(Some((2, 4 + k - 1)), now, &c, g, &mut out);
                 // …then the echo lands `echo_ms` later and moves the caret.
                 now += Duration::from_millis(echo_ms);
@@ -33804,8 +36646,8 @@ halo = "add"
         }
     }
 
-    /// ORPHAN GATE: a navigation leap snaps the nozzle without clearing the
-    /// keystroke ring, so without a guard the old run's plume would be redrawn
+    /// ORPHAN GATE: an admitted synthetic jump snaps the nozzle without clearing
+    /// the keystroke ring, so without a guard the old run's plume would be redrawn
     /// streaking backward from the NEW cursor, across text nobody just typed.
     /// After a jump there is no wake at all until fresh keys land.
     #[test]
@@ -33838,7 +36680,7 @@ halo = "add"
         // regression test pass without ever exercising the guard.)
         let mut out = Vec::new();
         let jump = end + Duration::from_millis(16);
-        glow.note_navigation(jump);
+        glow.note_synthetic_move(jump);
         glow.tick(Some((2, 30)), jump, &c, g, &mut out);
         assert!(
             !glow.rainbow.ink_pops.is_empty(),
@@ -33851,22 +36693,15 @@ halo = "add"
         );
     }
 
-    /// THE OWNER'S GESTURE: Ctrl-A / Ctrl-E draws a rainbow ZOOM streak.
-    ///
-    /// Both spellings of "zip the cursor across the line" arm the navigation hint
-    /// ([`Self::note_navigation`], from `app_input`'s `navigation_key`, which
-    /// matches `ctrl+a|e`), and before this fix that hint was exactly what
-    /// suppressed the beam — so the one gesture the owner kept asking for was the
-    /// one that could never draw it. Pinned in BOTH directions, because Ctrl-A and
-    /// Ctrl-E are the same gesture mirrored and a fix that only worked leftward
-    /// would read as broken half the time.
+    /// A synthetic movement preview draws the rainbow ZOOM streak in both
+    /// directions. The timestamp-only navigation twin stays dark.
     ///
     /// Also pins the two things the beam must NOT bring back: a short hop draws no
     /// line ([`Self::RAINBOW_STREAK_MIN_DIST`] — ordinary arrow editing stays quiet),
     /// and no navigation jump lays a per-cell ribbon over the row it skims, which
     /// was the real defect the old blanket gate was aimed at.
     #[test]
-    fn rainbow_navigation_jump_draws_the_rainbow_streak_both_ways() {
+    fn synthetic_jump_draws_the_rainbow_streak_both_ways() {
         let g = geom();
         let c = rainbow_pop_cfg();
         let streaks_for = |from: u16, to: u16| {
@@ -33887,13 +36722,14 @@ halo = "add"
             let before = glow.sparks.len();
             let mut out = Vec::new();
             let jump = end + Duration::from_millis(16);
+            glow.note_synthetic_move(jump);
             glow.tick(Some((2, from)), jump, &c, g, &mut out);
             let ribbon_before = glow.sparks.len().max(before);
             // Count what the SETUP move already minted (it is itself a jump), so the
             // assertion measures only the navigation leap under test.
             let streaks_before = glow.rainbow.jumps.len();
             let jump = jump + Duration::from_millis(16);
-            glow.note_navigation(jump);
+            glow.note_synthetic_move(jump);
             glow.tick(Some((2, to)), jump, &c, g, &mut out);
             (
                 glow.rainbow.jumps.len() - streaks_before,
@@ -33902,21 +36738,30 @@ halo = "add"
             )
         };
 
-        // Ctrl-E: leap rightward to end-of-line.
+        // Rightward leap to end-of-line.
         let (streaks, sparks, ribbon_before) = streaks_for(6, 40);
-        assert_eq!(streaks, 1, "Ctrl-E draws exactly one rainbow beam");
+        assert_eq!(streaks, 1, "rightward preview draws exactly one rainbow beam");
         assert!(
             sparks <= ribbon_before,
             "…and lays NO new per-cell ribbon over the row it skims ({sparks} > {ribbon_before})"
         );
 
-        // Ctrl-A: the same gesture mirrored, leaping leftward to column 0.
+        // The same preview mirrored, leaping leftward to column 0.
         let (streaks, _, _) = streaks_for(40, 0);
-        assert_eq!(streaks, 1, "Ctrl-A draws exactly one rainbow beam");
+        assert_eq!(streaks, 1, "leftward preview draws exactly one rainbow beam");
 
         // A SHORT nav hop is not travelling: no beam (arrow-key editing stays quiet).
         let (streaks, _, _) = streaks_for(20, 21);
         assert_eq!(streaks, 0, "a one-cell nav hop draws no line");
+
+        let mut timestamp = CursorGlow::default();
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        timestamp.tick(Some((2, 30)), t0, &c, g, &mut out);
+        timestamp.note_navigation(t0);
+        timestamp.tick(Some((2, 0)), t0, &c, g, &mut out);
+        assert!(timestamp.rainbow.jumps.is_empty());
+        assert!(!frame_has_output(&out, &timestamp));
     }
 
     /// THE SPEEDOMETER: the plume's LENGTH rides the momentum spine, so a
@@ -34032,11 +36877,12 @@ halo = "add"
         );
     }
 
-    /// PROVENANCE: the wake is born ONLY of typed keys. A PTY echo alone — a
+    /// PROVENANCE: the wake needs a causal candidate. A PTY echo alone — a
     /// program moving the cursor one cell exactly like a typed glyph's echo,
-    /// with no committed-press hint — lays ribbon light but never a plume.
+    /// with only cursor geometry and no exact/synthetic candidate — stays dark
+    /// and never lays a plume.
     #[test]
-    fn rainbow_wake_is_born_only_from_typed_keys() {
+    fn rainbow_wake_needs_a_causal_candidate() {
         let g = geom();
         let c = rainbow_pop_cfg();
         let mut glow = CursorGlow::default();
@@ -34056,8 +36902,7 @@ halo = "add"
         );
         let (q, h) = wake_of(&glow, t0 + Duration::from_millis(30), &c, g);
         assert!(q.is_empty() && h.is_empty(), "and lays no plume");
-        // Read the control one beat later: the ribbon's own birth ease keeps a
-        // freshly laid cell near zero on its landing frame.
+        // Read the control one beat later too: denial cannot blossom later.
         glow.tick(
             Some((2, 3)),
             t0 + Duration::from_millis(150),
@@ -34067,14 +36912,14 @@ halo = "add"
         );
         assert!(
             glow.rainbow.ink_pops.is_empty(),
-            "still no pop without a hint"
+            "still no pop without a candidate"
         );
         assert!(
-            !glow.under_quads().is_empty(),
-            "control: the same move DID lay ribbon light"
+            !frame_has_output(&out, &glow),
+            "cold program motion must not blossom into delayed ribbon light"
         );
         let t1 = t0 + Duration::from_millis(200);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((2, 4)), t1, &c, g, &mut out);
         let (q, _) = wake_of(&glow, t1, &c, g);
         assert!(!q.is_empty(), "the typed twin lights the plume");
@@ -34100,7 +36945,7 @@ halo = "add"
         let mut cold = CursorGlow::default();
         let mut out = Vec::new();
         cold.tick(Some((2, 2)), t, &c, g, &mut out);
-        cold.note_typed(t);
+        cold.note_synthetic_typed(t, 1);
         cold.tick(Some((2, 3)), t, &c, g, &mut out);
         let cold_r = peak(&cold, t);
         let mut hot = CursorGlow {
@@ -34111,7 +36956,7 @@ halo = "add"
             ..Default::default()
         };
         hot.tick(Some((2, 2)), t, &c, g, &mut out);
-        hot.note_typed(t);
+        hot.note_synthetic_typed(t, 1);
         hot.tick(Some((2, 3)), t, &c, g, &mut out);
         let hot_r = peak(&hot, t);
         assert!(
@@ -34302,7 +37147,7 @@ halo = "add"
         assert!(bright(260) < bright(0), "a later step is dimmer");
         // The nozzle never leaves the cell grid under reduced motion.
         let mut out = Vec::new();
-        reduced.note_typed(end);
+        reduced.note_synthetic_typed(end, 1);
         reduced.tick(
             Some((2, 15)),
             end + Duration::from_millis(8),
@@ -34397,12 +37242,12 @@ halo = "add"
         glow.tick(Some((2, 2)), t, &c, g, &mut out);
         for col in 3..=5u16 {
             t += Duration::from_millis(40);
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.tick(Some((2, col)), t, &c, g, &mut out);
         }
         assert_eq!(glow.rainbow.ink_pops.len(), 3, "pops on cells 2, 3, 4");
         t += Duration::from_millis(40);
-        glow.note_backspace(t);
+        arm_exact_backspace(&mut glow, t, (2, 5), (2, 4));
         glow.tick(Some((2, 4)), t, &c, g, &mut out); // retreat 5 → 4 erases cell 4
         assert!(
             !glow.rainbow.ink_pops.iter().any(|p| p.col >= 4),
@@ -34439,7 +37284,7 @@ halo = "add"
         glow.tick(Some((2, 0)), t0, &c, g, &mut out);
         for i in 1..=text.len() as u16 {
             let t = t0 + Duration::from_millis(30 * u64::from(i));
-            glow.note_typed(t);
+            glow.note_synthetic_typed(t, 1);
             glow.observe_row(2, i, &row(&text[..i as usize]), t);
             glow.tick(Some((2, i)), t, &c, g, &mut out);
         }
@@ -34457,11 +37302,13 @@ halo = "add"
                 .map(|p| p.col)
                 .collect::<Vec<_>>()
         );
-        // Ctrl-K back to caret 3: "abcdefghij" -> "abc" (cols 3..10 vanish).
+        // Exercise the row-diff poof while the observer stays stationary. Cursor
+        // movement has its own causal-candidate tests; this fixture owns only the
+        // exact vanished-span morphology and preservation of prefix pops.
         let tk = t0 + Duration::from_millis(30 * (text.len() as u64 + 1));
         glow.note_kill(tk, false);
-        glow.observe_row(2, 3, &row("abc"), tk);
-        glow.tick(Some((2, 3)), tk, &c, g, &mut out);
+        glow.observe_row(2, 10, &row("abc"), tk);
+        glow.tick(Some((2, 10)), tk, &c, g, &mut out);
         assert_eq!(glow.last_poof, Some(tk), "the precise span poof fired");
         assert!(
             !glow
@@ -34494,13 +37341,14 @@ halo = "add"
         let t0 = Instant::now();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(40);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((2, 3)), t1, &c, g, &mut out);
         assert_eq!(glow.rainbow.ink_pops.len(), 1);
         assert_eq!(glow.rainbow.ink_pops[0].born, t1);
-        // The caret scrubs back onto the cell (navigation — no pop, no kill)…
+        // A causally admitted scripted scrub returns to the cell. It carries no
+        // typed pairing, so it births no pop and kills none.
         let t2 = t1 + Duration::from_millis(300);
-        glow.note_navigation(t2);
+        glow.note_synthetic_move(t2);
         glow.tick(Some((2, 2)), t2, &c, g, &mut out);
         assert_eq!(
             glow.rainbow.ink_pops.len(),
@@ -34513,7 +37361,7 @@ halo = "add"
         );
         // …and OVERWRITES the glyph: the pop is reborn, never duplicated.
         let t3 = t2 + Duration::from_millis(40);
-        glow.note_typed(t3);
+        glow.note_synthetic_typed(t3, 1);
         glow.tick(Some((2, 3)), t3, &c, g, &mut out);
         assert_eq!(
             glow.rainbow.ink_pops.len(),
@@ -34550,7 +37398,7 @@ halo = "add"
         let t0 = Instant::now();
         cold.tick(Some((3, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(16);
-        cold.note_typed(t1);
+        cold.note_synthetic_typed(t1, 1);
         cold.tick(Some((3, 3)), t1, &c, g, &mut out);
         let cold_mom = cold.rainbow.ink_pops[0].mom;
         let cold_bright = max_pop_chan(&cold);
@@ -34561,7 +37409,7 @@ halo = "add"
         hot.tick(Some((3, 2)), t, &c, g, &mut out);
         for col in 3..16u16 {
             t += Duration::from_millis(18);
-            hot.note_typed(t);
+            hot.note_synthetic_typed(t, 1);
             hot.tick(Some((3, col)), t, &c, g, &mut out);
         }
         let hot_mom = hot.rainbow.ink_pops.last().unwrap().mom;
@@ -34594,7 +37442,7 @@ halo = "add"
         let t0 = Instant::now();
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-        glow.note_typed(t0 + Duration::from_millis(16));
+        glow.note_synthetic_typed(t0 + Duration::from_millis(16), 1);
         glow.tick(
             Some((2, 3)),
             t0 + Duration::from_millis(16),
@@ -34652,7 +37500,7 @@ halo = "add"
         let t0 = Instant::now();
         let mut drive = |glow: &mut CursorGlow| {
             glow.tick(Some((2, 2)), t0, &c, g, &mut out);
-            glow.note_typed(t0 + Duration::from_millis(16));
+            glow.note_synthetic_typed(t0 + Duration::from_millis(16), 1);
             glow.tick(
                 Some((2, 3)),
                 t0 + Duration::from_millis(16),
@@ -34771,7 +37619,7 @@ halo = "add"
         let t0 = Instant::now();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(16);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((3, 3)), t1, &c, g, &mut out);
         assert_eq!(
             glow.rainbow.ink_pops.len(),
@@ -34868,7 +37716,7 @@ halo = "add"
         let t0 = Instant::now();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(16);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((3, 3)), t1, &c, g, &mut out); // birth frame, env == 1
         let veils = light_veil_halos(&glow);
         assert!(!veils.is_empty(), "the pop emits veils");
@@ -34924,7 +37772,7 @@ halo = "add"
         let t0 = Instant::now();
         glow.tick(Some((3, 2)), t0, &c, g, &mut out);
         let tb = t0 + Duration::from_millis(16);
-        glow.note_typed(tb);
+        glow.note_synthetic_typed(tb, 1);
         glow.tick(Some((3, 3)), tb, &c, g, &mut out);
         // Sample the live veils at normalized age `u` into the life.
         let mut sample = |glow: &mut CursorGlow, u: f32| -> Vec<RainHalo> {
@@ -34997,7 +37845,7 @@ halo = "add"
         glow.set_reduced_motion(true);
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
         let tb = t0 + Duration::from_millis(16);
-        glow.note_typed(tb);
+        glow.note_synthetic_typed(tb, 1);
         glow.tick(Some((2, 3)), tb, &c, g, &mut out);
         let mut sample = |glow: &mut CursorGlow, u: f32| {
             let at = tb + Duration::from_secs_f32(u * FRESH_INK_LIFE_S);
@@ -35040,7 +37888,7 @@ halo = "add"
         let t0 = Instant::now();
         glow.tick(Some((2, 2)), t0, &c, g, &mut out);
         let t1 = t0 + Duration::from_millis(16);
-        glow.note_typed(t1);
+        glow.note_synthetic_typed(t1, 1);
         glow.tick(Some((2, 3)), t1, &c, g, &mut out);
         assert!(
             !pop_halos(&glow).is_empty(),
@@ -35057,7 +37905,7 @@ halo = "add"
     }
 
     /// ZERO COST WHEN INACTIVE: an empty ring emits nothing, adds no frame
-    /// cadence, and a real JUMP (no typed hint) never pops — the feature is
+    /// cadence, and a raw jump with no candidate never pops — the feature is
     /// invisible until a key is typed.
     #[test]
     fn fresh_ink_is_inert_without_typing() {
@@ -35079,7 +37927,7 @@ halo = "add"
         // And pops keep the cadence armed only while live.
         let mut typed = CursorGlow::default();
         typed.tick(Some((1, 1)), t0, &c, g, &mut typed_scratch());
-        typed.note_typed(t0);
+        typed.note_synthetic_typed(t0, 1);
         typed.tick(Some((1, 2)), t0, &c, g, &mut typed_scratch());
         assert!(typed.needs_frame_cadence(), "a live pop is brisk light");
     }

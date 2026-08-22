@@ -666,6 +666,81 @@ fn front_door_completions_result(
     Ok(ExitCode::SUCCESS)
 }
 
+// ---------------------------------------------------------------------------
+// THE FRONT DOOR'S SINGLE-INSTANCE FORWARD (S12 / design §5)
+// ---------------------------------------------------------------------------
+//
+// `aterm new-tab` under `windowing_behavior = "attach"` has to answer two
+// questions this crate already answers for its own verbs: *which* instance, and
+// *is it alive*. Both are re-exported here rather than reimplemented in the
+// `aterm` crate, because a second copy of the resolution rule is exactly how a
+// front door ends up driving a different terminal than `aterm ctl` does.
+//
+// Why not just call [`main_entry`] with `["spawn", "cwd=…"]`? Because the front
+// door needs three things that client does not offer: a reachability probe
+// BEFORE it commits to a route (the routing decision is a pure function of it),
+// silence on success (`wt new-tab` prints nothing; `OK s-1a2b` on a shell prompt
+// is noise), and the server's own `ERR` text back as a value so the caller can
+// decide between reporting it and falling back. Everything below is a thin
+// composition of the same helpers `real_main` uses.
+
+/// The control socket of the instance a front-door request should be handed to,
+/// or `None` when nothing is reachable.
+///
+/// Resolution is the flagless `aterm-ctl` rule, unchanged and deterministic:
+/// `$ATERM_CONTROL_SOCK` when explicit (and `None` outright when it disables the
+/// socket), otherwise the instance HOSTING the calling terminal when the caller
+/// is inside an aterm session, otherwise the `latest` pointer at the newest
+/// instance. Then a LIVENESS probe — a connect, not an existence check, because
+/// a crashed instance leaves its socket file behind and `attach` must not route
+/// a tab into a corpse.
+#[must_use]
+pub fn front_door_instance() -> Option<String> {
+    let path = resolve_path(
+        None,
+        None,
+        env::var(SOCK_ENV).ok(),
+        env::var(NO_SOCK_ENV).ok(),
+        env::var(SELF_SID_ENV).ok(),
+    )
+    .ok()?;
+    if CtlStream::connect(&path).is_ok() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+/// Hand one request line to the instance at `path` and return its FIRST reply
+/// line, trimmed (`OK …` or `ERR …`).
+///
+/// `request` must already end in `\n` and contain no other line terminator —
+/// the caller frames it (`WindowRequest::control_request` refuses a cwd that
+/// cannot be framed). Authentication is the same transparent `AUTH <token>`
+/// line every other client path sends, read from the token file beside the
+/// socket.
+///
+/// A short deadline, not the client's 900 s default: a front-door forward is a
+/// launch, and a launch that hangs is worse than a launch that starts its own
+/// window. Ten seconds is generous for a main-thread hop and still bounded well
+/// under any human's patience.
+pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
+    const FORWARD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+    let stream = connect_stream(path)?;
+    stream.set_read_timeout(Some(FORWARD_DEADLINE))?;
+    stream.set_write_timeout(Some(FORWARD_DEADLINE))?;
+    send_request(&stream, read_token_for(path).as_deref(), request)?;
+    let mut reader = BufReader::new(&stream);
+    let mut reply = String::new();
+    if read_bounded_line(&mut reader, &mut reply)? == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "the running aterm closed the connection without replying",
+        ));
+    }
+    Ok(reply.trim_end_matches(['\r', '\n']).to_string())
+}
+
 /// Environment variable consulted for the socket path when `--sock`/`--pid`
 /// are absent. `0`/`off` mean the server runs without a socket.
 const SOCK_ENV: &str = "ATERM_CONTROL_SOCK";

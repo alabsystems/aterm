@@ -110,13 +110,30 @@ fn list_sessions(ctl: &str) -> Vec<Session> {
 /// scanner sleeps it in 100ms slices so a downstream close is observed promptly.
 const RESCAN_SECS: u64 = 1;
 
-/// FEDERATE: one `subscribe … events` per instance, merged to stdout as NDJSON.
+/// FEDERATE: ONE `subscribe @* events` per instance, merged to stdout as NDJSON.
 ///
-/// The fleet is NOT frozen at the startup snapshot: a background scanner re-lists
-/// the fleet every `RESCAN_SECS` and spawns a fresh subscribe for each instance's
-/// newly-appeared sids, so sessions (and whole instances) launched mid-run are
-/// federated too. Each sid is subscribed exactly once — the `seen` set gates it so
-/// a rescan never double-subscribes a session already streaming.
+/// The fleet is NOT frozen at the startup snapshot, and — since the control plane
+/// grew a LIVE target set (`@*`) — it no longer needs a new connection to notice a
+/// new session either. One subscription per INSTANCE covers every session that
+/// instance has now and every one it opens later; the server adopts each and acks
+/// it with a `sub <local> <sid>` line, which the reader below already handles
+/// wherever it appears in the stream.
+///
+/// WHAT THIS REPLACES, AND WHY IT WAS BROKEN. The scanner used to key on SIDS: it
+/// remembered every sid it had ever seen and spawned a fresh `aterm-ctl subscribe`
+/// child for each batch of not-yet-seen ones. Connections, child processes and
+/// server push threads therefore scaled with the number of DISCOVERY MOMENTS —
+/// i.e. with tab-opens over the whole run — not with the number of instances. The
+/// server admits `CONTROL_SUBSCRIPTION_WORKERS` (4) subscriptions; the fifth got
+/// `ERR subscription capacity busy`, which is neither an `EVENT` nor a `sub` line,
+/// so the child read it, dropped it, and exited. The sid was already in `seen`,
+/// permanently — so from the fifth staggered tab-open onward, sessions were simply
+/// never federated, silently and forever.
+///
+/// So the scanner now keys on INSTANCES, and it does not remember failures as if
+/// they were successes: a streamer that ends (peer gone, connection dropped, pool
+/// momentarily full) releases its pid, and the next rescan re-establishes it. That
+/// makes a busy pool a one-second delay instead of permanent blindness.
 fn federate() {
     let ctl = ctl_bin();
     eprintln!(
@@ -129,33 +146,50 @@ fn federate() {
     let (tx, rx) = mpsc::channel::<String>();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    // Scanner: periodically snapshot the fleet and spawn one subscribe per instance
-    // covering ONLY its not-yet-seen sids. Holding a `tx` clone keeps the writer alive
-    // across a momentarily-empty fleet, so a later-launched instance still lands.
+    // Scanner: periodically snapshot the fleet and hold ONE subscribe per instance.
+    // Holding a `tx` clone keeps the writer alive across a momentarily-empty fleet,
+    // so a later-launched instance still lands.
     let scan_stop = stop.clone();
     let scan_ctl = ctl.clone();
     let scan_tx = tx.clone();
+    // Pids with a streamer currently attached. A streamer REMOVES its own pid when
+    // it ends, so the next rescan re-establishes it — the retry the sid-keyed
+    // design never had.
+    let streaming: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
     let scanner = thread::spawn(move || {
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         while !scan_stop.load(std::sync::atomic::Ordering::Relaxed) {
-            // Group only the not-yet-subscribed sids by owning instance pid; one
-            // subscribe covers each instance's fresh sids.
-            let mut fresh: std::collections::BTreeMap<String, Vec<String>> =
+            // Group the live sids by owning instance pid. The sids are needed ONLY
+            // as the fallback selector list for a peer too old to know `@*`; on a
+            // current peer the list is never used.
+            let mut fleet: std::collections::BTreeMap<String, Vec<String>> =
                 std::collections::BTreeMap::new();
             for s in list_sessions(&scan_ctl) {
-                if seen.insert(s.sid.clone()) {
-                    fresh.entry(s.pid).or_default().push(s.sid);
-                }
+                fleet.entry(s.pid).or_default().push(s.sid);
             }
-            for (pid, sids) in fresh {
+            for (pid, sids) in fleet {
+                {
+                    let mut held = streaming.lock().unwrap_or_else(|p| p.into_inner());
+                    if !held.insert(pid.clone()) {
+                        continue; // already streaming this instance
+                    }
+                }
                 eprintln!(
-                    "aterm-fleet: federating instance {pid} — {} new sid(s): {}",
-                    sids.len(),
-                    sids.join(",")
+                    "aterm-fleet: federating instance {pid} — live target set (@*), {} session(s) now",
+                    sids.len()
                 );
                 let ctl = scan_ctl.clone();
                 let tx = scan_tx.clone();
-                thread::spawn(move || stream_instance(&ctl, &pid, &sids, &tx));
+                let held = streaming.clone();
+                let pid_owned = pid.clone();
+                thread::spawn(move || {
+                    stream_instance(&ctl, &pid_owned, &sids, &tx);
+                    // Released, so a dropped/refused subscription is retried on the
+                    // next rescan instead of being remembered as a success.
+                    held.lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&pid_owned);
+                });
             }
             // Sleep the cadence in 100ms slices so `stop` is observed within a slice.
             for _ in 0..RESCAN_SECS * 10 {
@@ -181,17 +215,46 @@ fn federate() {
     let _ = scanner.join();
 }
 
-/// Stream one instance's `events` and forward each as an NDJSON record. Reads the
-/// `sub <local> <sid>` ack map so the compact `<local>` frame tag is resolved back to
-/// the stable sid the record is addressed by.
+/// Stream one instance's `events` for the whole run, preferring the LIVE target
+/// set and degrading to the frozen list only for a peer that does not know it.
+///
+/// The compatibility test is behavioural, not a version handshake: a peer that
+/// rejects `@*` answers `ERR …`, which `aterm-ctl` reports on STDERR (discarded
+/// here) and which is neither an `EVENT` nor a `sub` line — so the child exits
+/// having ACKED NOTHING. "Acked at least one channel" is therefore the exact
+/// signal, and it is one this bridge can actually observe from the stdout stream
+/// it already parses.
 fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<String>) {
+    if stream_targets(ctl, pid, "@*", tx) {
+        return;
+    }
+    // LEGACY PEER: freeze the target list, exactly as this bridge used to. Sessions
+    // opened after this point are not covered until the streamer ends and the next
+    // rescan re-establishes it with a wider list — lossy, but it is the old
+    // behaviour, reached only against an old server.
     let targets = sids
         .iter()
         .map(|s| format!("@{s}"))
         .collect::<Vec<_>>()
         .join(",");
+    if targets.is_empty() {
+        return;
+    }
+    let _ = stream_targets(ctl, pid, &targets, tx);
+}
+
+/// Stream one `subscribe <targets> events` child, forwarding each event as an
+/// NDJSON record. Reads the `sub <local> <sid>` ack map so the compact `<local>`
+/// frame tag is resolved back to the stable sid the record is addressed by — and
+/// an ADOPTED channel arrives as exactly such a line, mid-stream, which this loop
+/// has always handled because the handshake ack was never guaranteed to arrive in
+/// one read.
+///
+/// Returns whether the server acked at least one channel (see [`stream_instance`]).
+fn stream_targets(ctl: &str, pid: &str, targets: &str, tx: &mpsc::Sender<String>) -> bool {
+    let mut acked = false;
     let mut child = match Command::new(ctl)
-        .args(["--pid", pid, "subscribe", &targets, "events"])
+        .args(["--pid", pid, "subscribe", targets, "events"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -199,11 +262,11 @@ fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<Stri
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(err_record(pid, &format!("spawn subscribe failed: {e}")));
-            return;
+            return false;
         }
     };
     let Some(out) = child.stdout.take() else {
-        return;
+        return false;
     };
     let mut chan_to_sid: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
@@ -213,6 +276,7 @@ fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<Stri
             let mut it = rest.split_whitespace();
             if let (Some(local), Some(sid)) = (it.next(), it.next()) {
                 chan_to_sid.insert(local.to_string(), sid.to_string());
+                acked = true;
             }
             continue;
         }
@@ -232,6 +296,7 @@ fn stream_instance(ctl: &str, pid: &str, sids: &[String], tx: &mpsc::Sender<Stri
         // (GAP frames and anything else are dropped — events is a lossy digest by design.)
     }
     let _ = child.wait();
+    acked
 }
 
 /// EXEC: dispatch command lines from stdin (`@<sid> <verb> [args…]`) to the fleet.

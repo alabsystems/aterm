@@ -1812,9 +1812,9 @@ impl AtlasKind {
 }
 
 /// A packed coverage atlas (R8) or colour atlas (RGBA8) + per-glyph placement,
-/// keyed by the CPU renderer's [`GlyphKey`] (face + class + char + style + size
-/// — the full rasterization identity, so e.g. a styled variant of the same char
-/// gets its own slot).
+/// keyed by the CPU renderer's [`GlyphKey`] (face + class + char + style +
+/// materialized cell span + size — the full rasterization identity, so e.g. a
+/// styled or 1-vs-2-cell variant of the same char gets its own slot).
 ///
 /// PERSISTENT across frames: the `data`/`map` and the shelf-packer cursor
 /// (`px`,`py`,`shelf_h`) survive so new glyphs can be APPENDED into free space
@@ -4911,6 +4911,17 @@ impl GpuRenderer {
         }
     }
 
+    /// Set the Linux grid-fitting mode (config `font_hinting` /
+    /// `ATERM_FONT_HINTING`, W13/R2) on the wrapped CPU face and drop the
+    /// resident atlas on a change (grid fitting bakes into the cached coverage
+    /// bytes the atlas holds). Inert on the targets without the hint seam,
+    /// exactly like the wrapped setter.
+    pub fn set_font_hinting(&mut self, mode: &str) {
+        if self.cpu.set_font_hinting(mode) {
+            self.invalidate_atlas();
+        }
+    }
+
     /// Replace just the fg/bg/cursor/selection theme live (host theme change) on both
     /// the GPU presentation state and the CPU face, so a pane re-themes without a
     /// device/face rebuild. Glyphs are coverage masks coloured at draw time, so no
@@ -5526,8 +5537,9 @@ impl GpuRenderer {
         &mut self,
         cluster: Option<&str>,
         cell: &aterm_core::terminal::RenderCell,
+        cell_span: u8,
     ) -> GlyphKey {
-        self.cpu.resolve_cell_key(cluster, cell)
+        self.cpu.resolve_cell_key_for_span(cluster, cell, cell_span)
     }
 
     /// Take ownership of a freshly packed `atlas`, create its GPU texture (sized
@@ -11409,9 +11421,11 @@ impl GpuRenderer {
                     aterm_render::ColumnGlyph::LigatedSlice { gid, k, .. } => self
                         .cpu
                         .ligature_slice_key(gid, k, aterm_render::cell_style(cell)),
-                    aterm_render::ColumnGlyph::PerCell => {
-                        self.cell_key(input.cluster_at(r, c), cell)
-                    }
+                    aterm_render::ColumnGlyph::PerCell => self.cell_key(
+                        input.cluster_at(r, c),
+                        cell,
+                        aterm_render::materialized_cell_span(cells, c),
+                    ),
                 };
                 // Shade dithers key on the cell's ABSOLUTE pixel parity
                 // (no-op otherwise) — identical fold to the CPU blit and
@@ -11841,6 +11855,46 @@ impl GpuRenderer {
                     }
                 }
             }
+            // C3 (the Windows WinUI-height tab band): with `top_extends_cells`,
+            // row 0's CELL background quads grow UP through the `[0, grid_top)`
+            // strip, so each column continues its own background and the raised
+            // active chip / hover wash / `+` fill the band to the window's top edge
+            // instead of floating at the bottom of it with a dead lip above. They
+            // land AFTER the flat strip quad the bleed block pushes just below (bg
+            // is REPLACE, instance order is rasterization order), so the gutters —
+            // which have no columns — keep the flat band tone and only
+            // `[pad, w-pad)` is per-column. The CPU twin reaches the identical
+            // pixels by copying row 0's first scanline upward. Only the RUN quads
+            // grow; the per-cell `instance` the kitty image-cover stream keeps
+            // below is still the cell's own rect.
+            //
+            // WITH THE BACKDROP MARGINS LIVE (`client=visual`: material configured at
+            // launch, GPU renderer, `hdr_glow` off) this is a REAL visual change to the
+            // lip, and an intended one. The bleed block below pushes its `[0, grid_top)`
+            // quad at the margin alpha, i.e. genuine Mica; these row-0 runs land after
+            // it and paint `[pad, w−pad)` OPAQUE at the band tone. So the lip stops
+            // being translucent material and becomes solid band — which is precisely
+            // what makes it read as one band with the strip row beneath it, whose cells
+            // have always been opaque for the same reason (their bg is not the frame
+            // default, so the transmittance byte never applied). The gutters keep the
+            // material either way, exactly as they do beside the strip row.
+            //
+            // AND THE PRECONDITION: the CPU twin reaches these pixels by copying row 0's
+            // scanline, whereas this path needs a QUAD per column — so the two agree
+            // only while every strip cell carries an explicit non-default background.
+            // The host guarantees that (`tab_bar::blank_cell`); see the
+            // `ChromeBleed::top_extends_cells` docs for what breaks if it stops.
+            let (bg_y, bg_h) = if r == 0
+                && grid_top > 0
+                && self
+                    .cpu
+                    .chrome_bleed()
+                    .is_some_and(|b| b.rows > 0 && b.top_extends_cells)
+            {
+                (0u16, sat_pos_u16(grid_top + ch))
+            } else {
+                (y0u, ch as u16)
+            };
             // CHROME BLEED — the GPU twin of the CPU `fill_chrome_bleed`, in the same
             // slot (after the row's background is established, before its cells) and
             // reading the same `Renderer::chrome_bleed`, so the two backends agree
@@ -11975,7 +12029,7 @@ impl GpuRenderer {
                 // and the image-cover stream below KEEPS it per-cell — that stream
                 // is empty on every ordinary frame and its z tier is per-cell by
                 // definition, so there is nothing to coalesce there.
-                push_bg_run(bg_inst, &mut bg_run, y0u, ch as u16, bx, bw, color);
+                push_bg_run(bg_inst, &mut bg_run, bg_y, bg_h, bx, bw, color);
                 // Kitty's deepest z tier sits below selected cells and cells
                 // carrying a non-default background, but above the default
                 // frame clear. Repaint only those covering backgrounds after
@@ -12058,7 +12112,7 @@ impl GpuRenderer {
                     // last materialized cell's simply widens that run across the
                     // prefix/tail seam (the tail starts at `materialized`, i.e.
                     // exactly where the prefix stopped, so the rects are contiguous).
-                    push_bg_run(bg_inst, &mut bg_run, y0u, ch as u16, bx, bw, color);
+                    push_bg_run(bg_inst, &mut bg_run, bg_y, bg_h, bx, bw, color);
                     if selected
                         && input.image_at(r, c).is_some_and(|image| {
                             aterm_render::kitty_image_is_below_non_default_bg(image.image.z_index)
@@ -12072,7 +12126,7 @@ impl GpuRenderer {
             // `bg_inst` between here and the next row's first cell, so this is the
             // last possible moment a merge could still be legal and the first at
             // which the run is complete.
-            flush_bg_run(bg_inst, &mut bg_run, y0u, ch as u16);
+            flush_bg_run(bg_inst, &mut bg_run, bg_y, bg_h);
             for (c, cell) in cells.iter().take(cols).enumerate() {
                 // Same per-column placement as the bg loop above (uniform rows keep
                 // `c · rcw`), so a cell's glyph lands on its own fill.
@@ -14710,7 +14764,7 @@ fn theme_color_alpha(c: u32, a: f64) -> wgpu::Color {
 
 #[cfg(test)]
 mod tests {
-    use aterm_render::GlowQuad;
+    use aterm_render::{FaceId, GlowQuad, GlyphClass, StyleBits};
 
     // The group -> view map under test is the PRODUCTION one (`super::GROUP_SRGB`,
     // the array `encode_frame` hands to the coalescer), never a copy: see its doc
@@ -15399,8 +15453,11 @@ mod tests {
     /// SACRED CONSTRAINT (rendering architecture): the GPU consumes the CPU
     /// renderer's EXACT glyph bytes. For every glyph of a representative frame
     /// (the parity-suite demo grid: red RR, blue bg, CJK 日本 via fallback,
-    /// inverse XX, plain ab, cursor), every texel the atlas holds for that
-    /// glyph must equal the CPU cache byte — exact, not within tolerance.
+    /// inverse XX, plain ab, cursor), plus regular/bold/italic warning-symbol
+    /// fallback masks, every texel the atlas holds for that glyph must equal
+    /// the CPU cache byte — exact, not within tolerance. The styled warning
+    /// variants pin that proportional fitting happens before this SHARED-image
+    /// seam: GPU atlas geometry and bytes are the CPU's final post-style fit.
     /// Pure CPU: `build_atlas` needs no GPU device, so this runs headless.
     #[test]
     fn atlas_texel_bytes_match_cpu_glyph_bytes_exactly() {
@@ -15431,6 +15488,42 @@ ab\r\n",
                 }
             }
         }
+        // U+26A0 is the real proportional-symbol regression. Settle the lazy
+        // slots, then add every synthetic style when this host serves it from a
+        // mono fallback face. (A primary font that owns it needs no fallback fit.)
+        cpu.debug_block_on_lazy_fallbacks();
+        let warning = cpu.glyph_key('\u{26A0}');
+        let mut fitted_warning_keys = Vec::new();
+        if matches!(
+            warning.source,
+            FaceId::Fallback
+                | FaceId::SymbolFallback
+                | FaceId::RuntimeFallback
+                | FaceId::DisplayMix
+        ) && warning.glyph_class == GlyphClass::Mono
+        {
+            let (cell_w, cell_h) = cpu.cell_size();
+            for style in [
+                StyleBits::REGULAR,
+                StyleBits::BOLD,
+                StyleBits::ITALIC,
+                StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
+            ] {
+                let key = cpu.glyph_key_styled('\u{26A0}', style);
+                assert_eq!(key.cell_span, 1);
+                let img = cpu.glyph_image(key);
+                assert!(
+                    img.xmin() >= 0 && img.xmin() + img.width() as i32 <= cell_w as i32,
+                    "{style:?} warning escaped its one-cell CPU mask before atlas packing"
+                );
+                assert!(img.height() <= cell_h);
+                assert_eq!(img.advance(), cell_w as f32);
+                fitted_warning_keys.push(key);
+            }
+            keys.extend(fitted_warning_keys.iter().copied());
+        } else {
+            eprintln!("SKIP warning atlas extension: no mono fallback warning ({warning:?})");
+        }
         keys.sort_unstable();
         keys.dedup();
         assert!(
@@ -15439,6 +15532,12 @@ ab\r\n",
         );
 
         let atlas = build_atlas(&mut cpu, &keys, u32::MAX);
+        for key in &fitted_warning_keys {
+            assert!(
+                atlas.map.contains_key(key),
+                "every fitted warning style reaches the shared GPU atlas"
+            );
+        }
         for &key in &keys {
             let slot = atlas
                 .map
@@ -15482,6 +15581,122 @@ ab\r\n",
                 }
             }
         }
+    }
+
+    /// Explicit VS15 must reach the GPU as the same one-cell mono image the CPU
+    /// uses, while the bare/default form of the same scalar remains a two-cell
+    /// colour image. Pure CPU atlas construction makes this non-vacuous even on a
+    /// headless test host: both cache identities must coexist and their exact bytes
+    /// must land in the appropriate atlas without width reinterpretation.
+    #[test]
+    fn vs15_text_and_default_emoji_pack_distinct_one_and_two_cell_atlas_entries() {
+        let Some(mut cpu) = Renderer::from_system(18.0, Theme::default()) else {
+            eprintln!("SKIP: no system monospace font");
+            return;
+        };
+        let grin = '\u{1F600}';
+        cpu.debug_block_on_lazy_fallbacks();
+        let default_key = cpu.glyph_key(grin);
+        if default_key.source != FaceId::ColorEmoji || default_key.glyph_class != GlyphClass::Rgba {
+            eprintln!("SKIP: a mono face outranks colour for 😀 on this host: {default_key:?}");
+            return;
+        }
+
+        let mut term = Terminal::new(1, 4);
+        term.process("😀\u{FE0E}\x1b[2GX".as_bytes());
+        let input = term.cell_frame(1, 4);
+        let cell = input.cells[0][0];
+        assert!(cell.text_presentation);
+        assert_eq!(aterm_render::materialized_cell_span(&input.cells[0], 0), 1);
+        let text_key = cpu.resolve_cell_key_for_span(None, &cell, 1);
+        assert_ne!(text_key, default_key);
+        assert_ne!(text_key.source, FaceId::ColorEmoji);
+        assert!(matches!(
+            text_key.glyph_class,
+            GlyphClass::Mono | GlyphClass::MonoGid
+        ));
+
+        let (cw, ch) = cpu.cell_size();
+        let text_img = cpu.glyph_image(text_key).clone();
+        let GlyphImage::Mono {
+            width,
+            height,
+            bytes,
+            ..
+        } = &text_img
+        else {
+            panic!("VS15 atlas input must be mono")
+        };
+        assert!(text_img.xmin() >= 0 && text_img.xmin() + *width as i32 <= cw as i32);
+        assert!(*height <= ch);
+        let mono = build_atlas(&mut cpu, &[text_key], u32::MAX);
+        let slot = mono
+            .map
+            .get(&text_key)
+            .expect("VS15 key reaches mono atlas");
+        assert_eq!((slot.gw as usize, slot.gh as usize), (*width, *height));
+        for j in 0..slot.gh {
+            for i in 0..slot.gw {
+                assert_eq!(
+                    mono.data[((slot.ay + j) * mono.width + slot.ax + i) as usize],
+                    bytes[(j * slot.gw + i) as usize],
+                    "VS15 mono atlas texel differs from CPU cache at ({i},{j})"
+                );
+            }
+        }
+
+        let default_img = cpu.glyph_image(default_key).clone();
+        assert_eq!(default_img.advance(), (2 * cw) as f32);
+        assert!(
+            default_img.xmin() >= 0
+                && default_img.xmin() + default_img.width() as i32 <= (2 * cw) as i32
+        );
+        let color = build_color_atlas(&mut cpu, &[default_key], u32::MAX);
+        let color_slot = color
+            .map
+            .get(&default_key)
+            .expect("default emoji key reaches colour atlas");
+        assert_eq!(
+            (color_slot.gw as usize, color_slot.gh as usize),
+            (default_img.width(), default_img.height())
+        );
+
+        // A configured primary can own an emoji-default scalar too (DejaVu's
+        // ⚡ is deterministic). Its bare and VS15 forms name the same face/gid,
+        // so prove the one-cell qualifier itself separates GPU atlas identities.
+        let primary_bytes = include_bytes!("../../aterm-render/assets/DejaVuSansMono.ttf");
+        let mut primary = Renderer::from_bytes(primary_bytes, 18.0, Theme::default())
+            .expect("fixture primary renderer");
+        let bolt = '\u{26A1}';
+        let bare_primary = primary.glyph_key(bolt);
+        assert_eq!(bare_primary.source, FaceId::Primary);
+        assert_eq!(bare_primary.glyph_class, GlyphClass::MonoGid);
+        assert_eq!(bare_primary.cell_span, 0);
+
+        let mut primary_term = Terminal::new(1, 3);
+        primary_term.process("⚡\u{FE0E}".as_bytes());
+        let primary_input = primary_term.cell_frame(1, 3);
+        let text_primary = primary.resolve_cell_key_for_span(None, &primary_input.cells[0][0], 1);
+        assert_eq!(text_primary.source, bare_primary.source);
+        assert_eq!(text_primary.glyph_class, bare_primary.glyph_class);
+        assert_eq!(text_primary.ch_or_id, bare_primary.ch_or_id);
+        assert_eq!(text_primary.cell_span, 1);
+        assert_ne!(text_primary, bare_primary);
+
+        let primary_atlas = build_atlas(&mut primary, &[bare_primary, text_primary], u32::MAX);
+        let bare_slot = primary_atlas
+            .map
+            .get(&bare_primary)
+            .expect("bare primary key reaches mono atlas");
+        let text_slot = primary_atlas
+            .map
+            .get(&text_primary)
+            .expect("VS15 primary key reaches mono atlas");
+        assert_ne!(
+            (bare_slot.ax, bare_slot.ay),
+            (text_slot.ax, text_slot.ay),
+            "bare and VS15 primary rasters must occupy distinct atlas entries"
+        );
     }
 
     /// REGRESSION (idx3): the shelf packer bounds the packed HEIGHT (rolled back /

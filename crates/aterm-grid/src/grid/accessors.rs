@@ -122,6 +122,107 @@ impl Grid {
     #[inline]
     pub fn force_selection_invalidation(&mut self) {
         self.storage.content_scroll_delta = i32::MAX;
+        self.storage.coordinates_invalidated = true;
+        // SELECTION CUSTODY Phase 4: also record it on the lattice. `All` is the
+        // honest answer for the callers that keep this: the whole coordinate space
+        // is gone (ED 3, `clear_scrollback`, RIS, a Kitty unscroll that renumbers
+        // history wholesale), so no band can describe the damage.
+        self.storage.selection_damage = self
+            .storage
+            .selection_damage
+            .union(crate::SelectionDamage::All);
+    }
+
+    /// SELECTION CUSTODY Phase 4: record the SCROLL REGION's rows as damaged.
+    ///
+    /// The shorthand for the line/column editing family — IL, DL, DECIC, DECDC, SL,
+    /// SR, DECBI, DECFI — every one of which is confined to the current scroll
+    /// region. Using the whole region rather than the exact sub-span each op touched
+    /// is deliberately CONSERVATIVE: it can over-clear a selection sitting in the
+    /// untouched part of the region, but it can never leave a stale highlight over
+    /// replaced content, and one uniform rule is far easier to audit than eight
+    /// hand-derived spans. The rows OUTSIDE the region — including all of
+    /// scrollback, which is what the user is actually reading — are spared, and that
+    /// is the whole point.
+    pub(crate) fn damage_selection_scroll_region(&mut self) {
+        // A line/column edit MOVES rows, so host coordinate caches must drop.
+        self.storage.coordinates_invalidated = true;
+        let (top, bottom) = (
+            self.storage.scroll_region.top,
+            self.storage.scroll_region.bottom,
+        );
+        self.damage_selection_visible_rows(top, bottom);
+    }
+
+    /// Drain this batch's accumulated selection damage (see [`SelectionDamage`]).
+    ///
+    /// [`SelectionDamage`]: crate::SelectionDamage
+    pub fn take_selection_damage(&mut self) -> crate::SelectionDamage {
+        self.storage.take_selection_damage()
+    }
+
+    /// Drain this batch's host-coordinate invalidation flag.
+    pub fn take_coordinates_invalidated(&mut self) -> bool {
+        self.storage.take_coordinates_invalidated()
+    }
+
+    /// Drain the most recent resize's revealed-history row shift (see
+    /// `last_resize_row_shift`). Read from the ACTIVE grid: `Terminal::resize`
+    /// resizes both the active and the saved grid, so each records its own.
+    pub fn take_last_resize_row_shift(&mut self) -> u16 {
+        self.storage.take_last_resize_row_shift()
+    }
+
+    /// SELECTION CUSTODY Phase 4: record that VISIBLE rows `top..=bottom` had their
+    /// content moved or rewritten, so a selection overlapping them — and ONLY one
+    /// overlapping them — must be cleared.
+    ///
+    /// Converts through [`Grid::visible_to_absolute`], which is
+    /// `absolute_row_counter - visible_rows + visible_row` and deliberately does NOT
+    /// read `display_offset`. That is what makes it sound to call MID-BATCH, while
+    /// the processing prologue has forced `display_offset` to 0 for VT row
+    /// arithmetic. `top_visible_absolute_row` DOES subtract `display_offset` and
+    /// would be the wrong primitive here.
+    /// `moves_coordinates` states whether this op also MOVED rows, which is a
+    /// separate question from content replacement and feeds the host-facing
+    /// `ContentScrollState::invalidation_epoch` (see `coordinates_invalidated`). A
+    /// scroll or line-edit moves rows; an erase or a rectangle op rewrites cells in
+    /// place and moves nothing.
+    pub fn damage_selection_visible_rows_ext(
+        &mut self,
+        top: u16,
+        bottom: u16,
+        moves_coordinates: bool,
+    ) {
+        if moves_coordinates {
+            self.storage.coordinates_invalidated = true;
+        }
+        self.damage_selection_visible_rows(top, bottom);
+    }
+
+    pub fn damage_selection_visible_rows(&mut self, top: u16, bottom: u16) {
+        let (top, bottom) = if top <= bottom {
+            (top, bottom)
+        } else {
+            (bottom, top)
+        };
+        // CLAMP to the visible screen before converting. Callers can legitimately
+        // hand in rows outside it: a crafted DECSTBM leaves a scroll region whose
+        // `bottom` outlives a later shrink, and `visible_to_absolute` would then
+        // compute a row ABOVE `absolute_row_counter` — a band naming content that
+        // does not exist. A band off the screen describes nothing, so clamping is
+        // both safe and the only meaningful reading. (Found by
+        // `fuzz_process_never_panics::process_crafted_escape_sequences_never_panics`,
+        // which is exactly the crafted-sequence surface this guards.)
+        let last = self.storage.visible_rows.saturating_sub(1);
+        let (top, bottom) = (top.min(last), bottom.min(last));
+        let lo_abs = self.visible_to_absolute(top);
+        let hi_abs = self.visible_to_absolute(bottom);
+        debug_assert!(lo_abs <= hi_abs);
+        self.storage.selection_damage = self
+            .storage
+            .selection_damage
+            .union(crate::SelectionDamage::Band { lo_abs, hi_abs });
     }
 
     // -------------------------------------------------------------------------

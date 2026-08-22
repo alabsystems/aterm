@@ -3564,13 +3564,43 @@ impl NativeAppModel for SettingsApp {
         out.push(Command {
             id: ActionId::new("settings/search"),
             title: "Settings: Search".to_string(),
-            shortcut: Some("Cmd-F".to_string()),
+            // AUDIT I9 — the advertised chord must be the one that WORKS here.
+            // Off macOS `find` is seeded to `ctrl+shift+f` (`PLATFORM_DEFAULT_
+            // PAIRS`) and `find_requested` focuses `settings/search` when Settings
+            // is frontmost, so Ctrl+Shift+F genuinely opens this — while the
+            // literal "Cmd-F" would mean WIN+F, which the shell owns. Named at
+            // the SOURCE rather than left to `platform_accel`'s blanking because
+            // a true chord is better than no chord.
+            shortcut: Some(
+                if cfg!(target_os = "macos") {
+                    "Cmd-F"
+                } else {
+                    "Ctrl-Shift-F"
+                }
+                .to_string(),
+            ),
             enabled: true,
         });
         out.push(Command {
             id: ActionId::new("settings/undo"),
             title: "Settings: Undo Last Change".to_string(),
-            shortcut: Some("Cmd-Z".to_string()),
+            // AUDIT I9 — CORRECTING THE AUDIT. The backlog listed this "Cmd-Z"
+            // as dead on macOS too; it is not. `app_native`'s key lowering has
+            // `Key::Character('z') if command` -> `TextInput(Undo)`, and this
+            // app's reducer turns that into `settings/undo` whenever no field is
+            // being edited and search has no focus — so ⌘Z genuinely undoes the
+            // last settings change. `command` is `SUPER | CTRL`, so the same arm
+            // makes **Ctrl+Z** live off macOS (nothing in the keybinding table
+            // claims `ctrl+z` first). The label was not a lie, it was a
+            // MISTRANSLATION: name the modifier this keyboard actually has.
+            shortcut: Some(
+                if cfg!(target_os = "macos") {
+                    "Cmd-Z"
+                } else {
+                    "Ctrl-Z"
+                }
+                .to_string(),
+            ),
             enabled: view.last_undo.is_some() && !view.config_patch_pending(),
         });
         out.push(Command {

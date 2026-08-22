@@ -154,8 +154,17 @@ pub enum InputEvent {
     /// line when tracking is on, else the viewport scrolls `lines`). `lines` is
     /// clamped to `>= 1` in the seam so a non-positive count can never produce a
     /// silent human/controller asymmetry.
+    ///
+    /// `dir` is the FOUR-way axis (audit I7), not the old `dir_up: bool`. The
+    /// bool could not express a tilt wheel or a horizontal trackpad swipe at
+    /// all, so `on_mouse_wheel` dropped those gestures at the door and no app
+    /// ever saw xterm's buttons 66/67 — on Windows OR macOS. The horizontal
+    /// half is REPORT-ONLY: aterm's own viewport has no horizontal axis, so the
+    /// seam turns a horizontal wheel into zero local motion (see the `Wheel`
+    /// arm of `seam_egress`), which keeps the tracking-OFF behaviour exactly
+    /// what the old early-return produced.
     Wheel {
-        dir_up: bool,
+        dir: aterm_types::mouse::WheelDir,
         lines: i32,
         row: u16,
         col: u16,
@@ -396,12 +405,20 @@ fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffset) -> (u16,
 
 /// Ceiling on the number of times ONE wheel event may write its encoded bytes.
 /// Both bursts the seam can produce are bounded by it: the per-line mouse reports
-/// under a tracking app (via the `mouse` verb's `lines=N` clamp, which IS this
-/// constant — `control_input::MAX_WHEEL_LINES`), and the DEC-1007 alt-scroll arrow
-/// presses, whose count is `lines` times the platform's lines-per-detent and so can
-/// exceed `lines` on its own (Windows' "One screen at a time" multiplies by the
-/// viewport height). 512 covers a large flick of many screens; past that a single
-/// event is flooding the PTY, not scrolling.
+/// under a tracking app, and the DEC-1007 alt-scroll arrow presses, whose count is
+/// `lines` times the platform's lines-per-detent and so can exceed `lines` on its
+/// own (Windows' "One screen at a time" multiplies by the viewport height). 512
+/// covers a large flick of many screens; past that a single event is flooding the
+/// PTY, not scrolling.
+///
+/// SOURCE-BLINDNESS. The report burst is clamped at the SEAM's `lines`
+/// normalization, not (only) at the `mouse` verb's `lines=N` parse — the verb's
+/// clamp is `control_input::MAX_WHEEL_LINES`, which IS this constant, so a
+/// controller was already bounded while a HUMAN gesture was not. That gap became
+/// live exposure with the horizontal axis (audit I7): a trackpad's pixel deltas
+/// are divided by the cell WIDTH, so one momentum event can bank far more notches
+/// sideways than the vertical twin ever did. Clamping where both sources converge
+/// makes the ceiling structural instead of a property of one caller.
 pub(crate) const MAX_WHEEL_BURST: i32 = 512;
 
 /// How far a wheel gesture of `notch_lines` DETENTS travels, in lines, once the
@@ -711,18 +728,21 @@ pub fn seam_egress(
             }
         }
         InputEvent::Wheel {
-            dir_up,
+            dir,
             lines,
             row,
             col,
             mods,
             px_off,
         } => {
-            // The invariant lives HERE: clamp `lines` to >= 1 so a non-positive
-            // count (a future verb/grammar bug) cannot silently emit zero reports
-            // for one source and N for another. on_mouse_wheel already guarantees
-            // >= 1; this makes it structural for every caller.
-            let lines = (*lines).max(1);
+            // The invariant lives HERE: clamp `lines` to `1..=MAX_WHEEL_BURST` so
+            // (low) a non-positive count (a future verb/grammar bug) cannot
+            // silently emit zero reports for one source and N for another, and
+            // (high) one event cannot flood the PTY with reports. `on_mouse_wheel`
+            // already guarantees >= 1 and the `mouse` verb already clamps its
+            // `lines=N` to the same ceiling; doing BOTH here makes the bound
+            // structural for every caller instead of a property of one of them.
+            let lines = (*lines).clamp(1, MAX_WHEEL_BURST);
             // Decide the wheel's egress under the SINGLE term_lock window. Three
             // source-blind outcomes (Human and Controller converge):
             //   Write     — emit the bytes `repeat` times: a mouse-wheel report ONCE
@@ -735,7 +755,9 @@ pub fn seam_egress(
             //               viewport must NOT move;
             //   Fallback  — tracking off and not alt-scroll, OR Shift held (the
             //               I12 bypass — see `wheel_route`): `App::input` scrolls
-            //               the local scrollback viewport (`Egress::TrackingOff`).
+            //               the local scrollback viewport (`Egress::TrackingOff`)
+            //               — by ZERO lines on the horizontal axis, which has no
+            //               viewport to move (audit I7, see the Fallback arm).
             enum WheelPlan {
                 Write { bytes: Vec<u8>, repeat: i32 },
                 Swallow,
@@ -757,7 +779,7 @@ pub fn seam_egress(
                 );
                 if route == WheelRoute::Report {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
-                    match t.encode_mouse_wheel(*dir_up, rx, ry, *mods) {
+                    match t.encode_mouse_wheel(*dir, rx, ry, *mods) {
                         // EXACTLY one report per line, NEVER scaled by the platform's
                         // lines-per-detent: the app grabbed the mouse and does its own
                         // notch->lines conversion (vim's `mousescroll`, default 3).
@@ -769,7 +791,9 @@ pub fn seam_egress(
                         },
                         None => WheelPlan::Swallow, // X10 (mode 9) is press-only
                     }
-                } else if route == WheelRoute::AltScroll {
+                } else if route == WheelRoute::AltScroll
+                    && let Some(up) = dir.vertical_up()
+                {
                     // Alternate scroll (DEC mode 1007, audit M5): the alt screen has no
                     // scrollback, so when the app did NOT grab the mouse the wheel
                     // becomes arrow-key PRESSES — how less/man/git-log scroll under a
@@ -787,7 +811,18 @@ pub fn seam_egress(
                     // the reason the `mouse` verb is: "One screen at a time"
                     // (WHEEL_PAGESCROLL) times a large flick would otherwise let one
                     // event flood the PTY.
-                    let arrow = if *dir_up {
+                    //
+                    // VERTICAL ONLY — the `vertical_up()` guard on this arm. REJECTED:
+                    // synthesizing Left/Right arrows for a horizontal flick. DEC 1007's
+                    // whole premise is that the alt screen has no scrollback, so the
+                    // wheel owes the PAGER the motion it would have made; a pager's
+                    // left/right arrows are not a horizontal scroll — in `less` they are
+                    // (by default) unbound-ish/positional, and in a shell's alt-screen
+                    // TUI an ArrowRight is a CURSOR MOVE or a menu entry. xterm does not
+                    // do it either: its alternateScroll only maps the vertical pair. A
+                    // horizontal flick over a non-tracking alt-screen app is therefore
+                    // nothing, which is exactly what it was before this widening.
+                    let arrow = if up {
                         NamedKey::ArrowUp
                     } else {
                         NamedKey::ArrowDown
@@ -824,9 +859,18 @@ pub fn seam_egress(
                     Egress::Reported(d)
                 }
                 WheelPlan::Swallow => Egress::Reported(Delivery::Full),
+                // The local-viewport fallback is VERTICAL-ONLY (audit I7). A grid
+                // has one axis: `display_offset` moves through scrollback and
+                // there is no horizontal viewport to pan, so a tilt notch or a
+                // horizontal trackpad swipe reports ZERO lines and `input_wheel`
+                // does nothing with it — byte-identical AND motion-identical to
+                // the old `on_mouse_wheel` early-return, which is the behaviour
+                // the audit explicitly ruled CORRECT with tracking off. Feeding
+                // `lines` through here instead would resurrect the phantom
+                // scroll-DOWN that guard was added to fix.
                 WheelPlan::Fallback => Egress::TrackingOff {
-                    wheel_lines: lines,
-                    wheel_up: *dir_up,
+                    wheel_lines: if dir.is_horizontal() { 0 } else { lines },
+                    wheel_up: dir.vertical_up().unwrap_or(false),
                 },
             }
         }
@@ -992,6 +1036,7 @@ pub(crate) fn paths_paste_insertion(paths: &[String]) -> String {
 mod tests {
     use super::*;
     use aterm_core::terminal::Terminal;
+    use aterm_types::mouse::WheelDir;
     #[cfg(unix)]
     use std::io::Read;
     #[cfg(unix)]
@@ -1154,10 +1199,9 @@ mod tests {
     }
 
     /// A wheel event at the cell origin (row 0, col 0), no modifiers.
-    #[cfg(unix)]
-    fn wheel(dir_up: bool, lines: i32) -> InputEvent {
+    fn wheel(dir: WheelDir, lines: i32) -> InputEvent {
         InputEvent::Wheel {
-            dir_up,
+            dir,
             lines,
             row: 0,
             col: 0,
@@ -1168,9 +1212,9 @@ mod tests {
 
     /// A wheel event carrying mouse modifier bits (see `App::mouse_modifiers`).
     #[cfg(unix)]
-    fn wheel_mods(dir_up: bool, lines: i32, mods: u8) -> InputEvent {
+    fn wheel_mods(dir: WheelDir, lines: i32, mods: u8) -> InputEvent {
         InputEvent::Wheel {
-            dir_up,
+            dir,
             lines,
             row: 0,
             col: 0,
@@ -1208,13 +1252,16 @@ mod tests {
         let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
         // Control: without the override the app owns the wheel.
         assert!(
-            matches!(egress_of(&term, &wheel(true, 1)), Egress::Reported(_)),
+            matches!(
+                egress_of(&term, &wheel(WheelDir::Up, 1)),
+                Egress::Reported(_)
+            ),
             "a tracking app still gets the plain wheel"
         );
         // With Option held the local viewport scrolls instead.
         assert!(
             matches!(
-                egress_of(&term, &wheel_mods(true, 1, ALT_MASK)),
+                egress_of(&term, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
                 Egress::TrackingOff { .. }
             ),
             "Option+wheel must reach the local scrollback"
@@ -1231,7 +1278,7 @@ mod tests {
         // Alt screen + DEC 1007: Option must NOT steal the arrows.
         let alt_scroll = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
         assert_eq!(
-            egress_bytes(&alt_scroll, &wheel_mods(true, 1, ALT_MASK)),
+            egress_bytes(&alt_scroll, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
             b"\x1b[A",
             "alternate scroll still converts the wheel to an arrow"
         );
@@ -1239,7 +1286,7 @@ mod tests {
         let tracking = term_with(&[b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"]);
         assert!(
             matches!(
-                egress_of(&tracking, &wheel_mods(true, 1, ALT_MASK)),
+                egress_of(&tracking, &wheel_mods(WheelDir::Up, 1, ALT_MASK)),
                 Egress::Reported(_)
             ),
             "a mouse-owning alt-screen app keeps the wheel"
@@ -1254,15 +1301,15 @@ mod tests {
     #[test]
     fn alt_screen_alternate_scroll_converts_wheel_to_arrows() {
         let term = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
-        assert_eq!(egress_bytes(&term, &wheel(true, 2)), b"\x1b[A\x1b[A");
-        assert_eq!(egress_bytes(&term, &wheel(false, 1)), b"\x1b[B");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 2)), b"\x1b[A\x1b[A");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Down, 1)), b"\x1b[B");
         // DECCKM (?1h): arrows switch to the SS3 form, proving the bytes come from
         // the live keyboard mode, not a hardcoded CSI.
         term.lock().unwrap().process(b"\x1b[?1h");
-        assert_eq!(egress_bytes(&term, &wheel(true, 1)), b"\x1bOA");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1bOA");
         // The wheel is consumed as a key report: the viewport must NOT scroll.
         assert!(matches!(
-            egress_of(&term, &wheel(true, 1)),
+            egress_of(&term, &wheel(WheelDir::Up, 1)),
             Egress::Reported(_)
         ));
     }
@@ -1278,7 +1325,7 @@ mod tests {
             b"\x1b[?1000h",
             b"\x1b[?1006h",
         ]);
-        assert_eq!(egress_bytes(&term, &wheel(true, 1)), b"\x1b[<64;1;1M");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1b[<64;1;1M");
     }
 
     /// I12 at the byte level: the SAME tracking + alt-scroll terminal as above,
@@ -1295,7 +1342,7 @@ mod tests {
             b"\x1b[?1006h",
         ]);
         let shifted = InputEvent::Wheel {
-            dir_up: true,
+            dir: WheelDir::Up,
             lines: 2,
             row: 0,
             col: 0,
@@ -1311,7 +1358,7 @@ mod tests {
         ));
         assert!(egress_bytes(&term, &shifted).is_empty());
         // Control: the unshifted twin still reports (the bypass is the ONLY change).
-        assert_eq!(egress_bytes(&term, &wheel(true, 1)), b"\x1b[<64;1;1M");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 1)), b"\x1b[<64;1;1M");
     }
 
     /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
@@ -1321,13 +1368,90 @@ mod tests {
     fn alternate_scroll_only_on_the_alt_screen() {
         let term = term_with(&[b"\x1b[?1007h"]);
         assert!(matches!(
-            egress_of(&term, &wheel(true, 1)),
+            egress_of(&term, &wheel(WheelDir::Up, 1)),
             Egress::TrackingOff {
                 wheel_lines: 1,
                 wheel_up: true
             }
         ));
-        assert!(egress_bytes(&term, &wheel(true, 1)).is_empty());
+        assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
+    }
+
+    /// Audit I7, THE WHOLE POINT, and cross-platform (no `cfg(unix)` — it asserts
+    /// the ROUTE, which needs no pipe): a horizontal wheel is REPORTED while an app
+    /// tracks the mouse, and produces ZERO local motion when nothing does.
+    ///
+    /// The tracking-OFF half is the regression fence for the guard this widening
+    /// replaced: `wheel_lines: 0` is the seam telling `input_wheel` "there is
+    /// nothing to scroll", so a tilt notch cannot become the phantom scroll-DOWN
+    /// the original early-return was added to kill.
+    #[test]
+    fn horizontal_wheel_reports_only_while_tracking() {
+        let sink = SinkWriter::new(-1);
+        for dir in [WheelDir::Left, WheelDir::Right] {
+            let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+            assert!(
+                matches!(
+                    seam_egress(&tracking, &sink, &wheel(dir, 2), EgressMode::Interactive),
+                    Egress::Reported(_)
+                ),
+                "{dir:?} must reach a tracking app"
+            );
+            let idle = term_with(&[]);
+            assert_eq!(
+                seam_egress(&idle, &sink, &wheel(dir, 2), EgressMode::Interactive),
+                Egress::TrackingOff {
+                    wheel_lines: 0,
+                    wheel_up: false
+                },
+                "{dir:?} must move nothing locally"
+            );
+            // …and the same with the alt screen + DEC 1007 armed: alternate scroll
+            // is a VERTICAL substitute (arrows), never a horizontal one.
+            let pager = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
+            assert_eq!(
+                seam_egress(&pager, &sink, &wheel(dir, 2), EgressMode::Interactive),
+                Egress::TrackingOff {
+                    wheel_lines: 0,
+                    wheel_up: false
+                },
+                "{dir:?} must not synthesize arrows for a pager"
+            );
+            // …and under the I12 Shift bypass, which asks aterm to take the
+            // gesture: aterm has no horizontal viewport, so it takes nothing.
+            let shifted = InputEvent::Wheel {
+                dir,
+                lines: 2,
+                row: 0,
+                col: 0,
+                mods: aterm_types::mouse::SHIFT_MASK,
+                px_off: PixelOffset::CELL_ORIGIN,
+            };
+            let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+            assert_eq!(
+                seam_egress(&tracking, &sink, &shifted, EgressMode::Interactive),
+                Egress::TrackingOff {
+                    wheel_lines: 0,
+                    wheel_up: false
+                },
+                "shift+{dir:?} bypasses to a viewport that cannot pan"
+            );
+        }
+        // CONTROL: the vertical twin is untouched — it still carries its lines to
+        // the viewport, which is the behaviour this change must not disturb.
+        let idle = term_with(&[]);
+        assert_eq!(
+            seam_egress(
+                &idle,
+                &sink,
+                &wheel(WheelDir::Up, 2),
+                EgressMode::Interactive
+            ),
+            Egress::TrackingOff {
+                wheel_lines: 2,
+                wheel_up: true
+            }
+        );
     }
 
     /// An app can turn alternate scroll OFF (?1007l): the wheel then falls back to
@@ -1337,10 +1461,10 @@ mod tests {
     fn alt_screen_with_1007_off_falls_back_to_viewport() {
         let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007l"]);
         assert!(matches!(
-            egress_of(&term, &wheel(true, 1)),
+            egress_of(&term, &wheel(WheelDir::Up, 1)),
             Egress::TrackingOff { .. }
         ));
-        assert!(egress_bytes(&term, &wheel(true, 1)).is_empty());
+        assert!(egress_bytes(&term, &wheel(WheelDir::Up, 1)).is_empty());
     }
 
     /// One arrow press is emitted PER accumulated wheel line — on a platform whose
@@ -1351,7 +1475,49 @@ mod tests {
     #[test]
     fn alternate_scroll_emits_one_arrow_per_line() {
         let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007h"]);
-        assert_eq!(egress_bytes(&term, &wheel(true, 3)), b"\x1b[A\x1b[A\x1b[A");
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 3)), b"\x1b[A\x1b[A\x1b[A");
+    }
+
+    /// The report burst is bounded at BOTH ends, for every source. A tracking app
+    /// gets exactly one report per line up to [`MAX_WHEEL_BURST`], and a
+    /// non-positive count (a future grammar bug) is floored at one rather than
+    /// silently emitting nothing for one source and N for another.
+    ///
+    /// The ceiling used to live only in the `mouse` verb's `lines=N` parse, so a
+    /// CONTROLLER was bounded and a human gesture was not — a divergence the seam
+    /// exists to make impossible, and live exposure once the horizontal axis
+    /// started dividing trackpad pixel deltas by the (small) cell WIDTH.
+    #[cfg(unix)]
+    #[test]
+    fn the_report_burst_is_clamped_at_both_ends_for_every_source() {
+        let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+        let one = b"\x1b[<64;1;1M";
+        // One report per line, unscaled, below the ceiling.
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, 3)).len(),
+            one.len() * 3
+        );
+        // At the ceiling, and clamped just above it. Deliberately only just
+        // above: `egress_bytes` reads its pipe AFTER the write, so an unclamped
+        // burst big enough to exceed the pipe buffer would DEADLOCK the test
+        // instead of failing it, and a hang is a much worse failure signal.
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, MAX_WHEEL_BURST)).len(),
+            one.len() * MAX_WHEEL_BURST as usize
+        );
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Up, MAX_WHEEL_BURST + 3)).len(),
+            one.len() * MAX_WHEEL_BURST as usize,
+            "one event cannot flood the PTY past the ceiling"
+        );
+        assert_eq!(
+            egress_bytes(&term, &wheel(WheelDir::Left, MAX_WHEEL_BURST + 3)).len(),
+            one.len() * MAX_WHEEL_BURST as usize,
+            "the horizontal axis takes the same ceiling"
+        );
+        // The floor: zero and negative counts still emit exactly one report.
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, 0)), one);
+        assert_eq!(egress_bytes(&term, &wheel(WheelDir::Up, -7)), one);
     }
 
     /// THE WHEEL MULTIPLY ITSELF (Windows). The live
@@ -1479,7 +1645,7 @@ mod tests {
                 px_off: PixelOffset::CELL_ORIGIN,
             },
             InputEvent::Wheel {
-                dir_up: true,
+                dir: WheelDir::Up,
                 lines: 3,
                 row: 2,
                 col: 4,
@@ -1487,11 +1653,60 @@ mod tests {
                 px_off: PixelOffset::CELL_ORIGIN,
             },
             InputEvent::Wheel {
-                dir_up: false,
+                dir: WheelDir::Down,
                 lines: 1,
                 row: 2,
                 col: 4,
                 mods: 0,
+                px_off: PixelOffset::CELL_ORIGIN,
+            },
+            // The HORIZONTAL axis (audit I7) is in the matrix for the same
+            // reason the vertical pair is: it produces PTY bytes under a
+            // tracking app, so a human tilt and a `mouse wheelleft` verb must
+            // agree byte-for-byte in every mouse mode — including the
+            // tracking-off column, where BOTH must write nothing.
+            InputEvent::Wheel {
+                dir: WheelDir::Left,
+                lines: 2,
+                row: 2,
+                col: 4,
+                mods: 0,
+                px_off: PixelOffset::CELL_ORIGIN,
+            },
+            InputEvent::Wheel {
+                dir: WheelDir::Right,
+                lines: 1,
+                row: 2,
+                col: 4,
+                mods: 0,
+                px_off: PixelOffset::CELL_ORIGIN,
+            },
+            // The THUMB pair (audit I8): xterm buttons 8/9, whose Cb base of
+            // 128 exercises a byte range no other event in this matrix reaches
+            // (the UTF-8 encoding's two-byte button code, and the legacy
+            // release substitution on a high button).
+            InputEvent::MouseButton {
+                button: MouseButton::Back,
+                pressed: true,
+                row: 5,
+                col: 9,
+                mods: 0,
+                click_count: 1,
+                side: SelectionSide::Left,
+                block: false,
+                suppress_copy_on_select: false,
+                px_off: PixelOffset::CELL_ORIGIN,
+            },
+            InputEvent::MouseButton {
+                button: MouseButton::Forward,
+                pressed: false,
+                row: 5,
+                col: 9,
+                mods: 0,
+                click_count: 1,
+                side: SelectionSide::Left,
+                block: false,
+                suppress_copy_on_select: false,
                 px_off: PixelOffset::CELL_ORIGIN,
             },
             InputEvent::Paste("rm -rf safe".to_string()),
@@ -1631,7 +1846,7 @@ mod tests {
         // --- "wheel up, 1 notch" ---------------------------------------------
         let ctrl_wheel = crate::control::parse_mouse("wheelup left 2 4").expect("wheelup parses");
         let human_wheel = InputEvent::Wheel {
-            dir_up: true,
+            dir: WheelDir::Up,
             lines: 1,
             row: 2,
             col: 4,
@@ -1714,7 +1929,7 @@ mod tests {
         let one = egress_bytes(
             &term,
             &InputEvent::Wheel {
-                dir_up: true,
+                dir: WheelDir::Up,
                 lines: 1,
                 row: 2,
                 col: 4,
@@ -1726,7 +1941,7 @@ mod tests {
             let got = egress_bytes(
                 &term,
                 &InputEvent::Wheel {
-                    dir_up: true,
+                    dir: WheelDir::Up,
                     lines: bad,
                     row: 2,
                     col: 4,

@@ -109,8 +109,10 @@ fn main() {
             glow.tick(Some((row, col)), now, &cfg, geom, &mut quads);
         }
         col += 1;
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((row, col)), now, &cfg, geom, &mut quads);
         if key == 15 {
+            assert!(!quads.is_empty(), "scripted Laser typing must emit light");
             shoot(&quads, &mut term, (row, col), "mid_run", &mut frames);
         }
         if key == 30 {

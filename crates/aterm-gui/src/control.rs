@@ -48,7 +48,7 @@ use crate::input::{
     Egress, EgressMode, InputEvent, InputOutcome, ScrollIntent, Source, seam_egress,
 };
 use crate::session_store::Store;
-use crate::subscribe::{self, InstanceStreams, PushOptions, Requested, Subscribers};
+use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
 use crate::{SessionCtx, Wake, term_lock};
 
 /// Read-only screen introspection serializers (the SACRED AI-reads-the-screen
@@ -727,9 +727,14 @@ fn update_is_owner_only_subcmd(rest: &str) -> bool {
 fn cached_installed_update_facts() -> Option<aterm_update::InstalledUpdateFacts> {
     const INSTALLED_FACTS_TTL: std::time::Duration = std::time::Duration::from_secs(20);
     static CACHE: std::sync::Mutex<
-        Option<(std::time::Instant, Option<aterm_update::InstalledUpdateFacts>)>,
+        Option<(
+            std::time::Instant,
+            Option<aterm_update::InstalledUpdateFacts>,
+        )>,
     > = std::sync::Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some((at, facts)) = guard.as_ref()
         && at.elapsed() < INSTALLED_FACTS_TTL
     {
@@ -3205,7 +3210,9 @@ fn serve_request_line(
     // applies paste semantics. Both authorize EXACTLY like `feed` (WriteInput) via
     // the normal `@<selector>` + op gate inside `run_feed_bin`.
     if let Some(bin_verb) = binary_frame_verb(&line) {
-        let mut dispatch_front_input = |event| post_input_reply(proxy, Op::WriteInput, vec![event]);
+        let mut dispatch_front_input =
+            |event, session| post_input_reply_to(proxy, Op::WriteInput, vec![event], session);
+        let mut cancel_candidate = |session| front_routed_candidate_cancel(proxy, session);
         if !run_feed_bin_routed(
             &line,
             bin_verb,
@@ -3216,6 +3223,7 @@ fn serve_request_line(
                 scope,
             },
             &mut dispatch_front_input,
+            &mut cancel_candidate,
             writer,
         ) {
             return Some(ServeDisposition::Close);
@@ -3365,7 +3373,7 @@ const MAX_FEED_BIN: usize = 256 * 1024;
 /// make that per-burst tee O(N) on the hot reader thread and reserve N queues. A
 /// legit client subscribes to at most a handful of sessions; 256 is generous
 /// headroom. Selectors are also de-duplicated by session, so repeats collapse.
-const MAX_SUBSCRIBE_TARGETS: usize = 256;
+pub(crate) const MAX_SUBSCRIBE_TARGETS: usize = 256;
 
 /// Whether a request line is the `feed-bin` verb (optionally `@<sel>`-prefixed),
 /// so [`serve`] reads its length-prefixed payload from the SAME stream BEFORE the
@@ -3387,6 +3395,23 @@ fn binary_frame_verb(line: &str) -> Option<&'static str> {
         Some("feed-bin") => Some("feed-bin"),
         Some("paste-bin") => Some("paste-bin"),
         _ => None,
+    }
+}
+
+/// Resolve only the target-bearing prefix of a binary input header.  This is
+/// deliberately independent of the length/trailing-argument parser: once an
+/// authenticated client has named a real write verb and target, even a malformed
+/// or over-cap attempt is a newer input boundary for that target's cursor proof.
+/// Unknown verbs return `None`, and authorization is still checked separately
+/// before the boundary is allowed to mutate visible state.
+fn binary_frame_attempt_selector(line: &str, verb: &str) -> Option<Option<Selector>> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let mut it = line.split_whitespace();
+    let first = it.next()?;
+    if let Some(body) = first.strip_prefix('@') {
+        (it.next()? == verb).then(|| Some(Selector::parse(body)))
+    } else {
+        (first == verb).then_some(None)
     }
 }
 
@@ -3480,7 +3505,14 @@ fn run_feed_bin<W: Write>(
     scope: Scope,
     writer: &mut W,
 ) -> bool {
-    let mut unavailable = |_event| Err("ERR input dispatch unavailable\n".to_string());
+    let mut dispatch = |event, _session| {
+        let Some((term, _, _, ctx)) = resolve_active(active) else {
+            return Err("ERR input dispatch unavailable\n".to_string());
+        };
+        seam_egress(&term, &ctx.sink, &event, EgressMode::Backpressured);
+        Ok(InputOutcome::Ok)
+    };
+    let mut cancel_candidate = |_session| "OK\n".to_string();
     run_feed_bin_routed(
         line,
         verb,
@@ -3490,7 +3522,8 @@ fn run_feed_bin<W: Write>(
             store,
             scope,
         },
-        &mut unavailable,
+        &mut dispatch,
+        &mut cancel_candidate,
         writer,
     )
 }
@@ -3502,21 +3535,54 @@ struct FeedBinRoute<'a> {
     scope: Scope,
 }
 
-fn run_feed_bin_routed<W: Write, F>(
+fn run_feed_bin_routed<W: Write, F, C>(
     line: &str,
     verb: &str,
     reader: &mut impl BufRead,
     route: FeedBinRoute<'_>,
     dispatch_front_input: &mut F,
+    cancel_candidate: &mut C,
     writer: &mut W,
 ) -> bool
 where
-    F: FnMut(InputEvent) -> Result<InputOutcome, String>,
+    F: FnMut(InputEvent, Option<u64>) -> Result<InputOutcome, String>,
+    C: FnMut(u64) -> String,
 {
     // `paste-bin` routes the payload through the PASTE seam (bracketing + sanitize +
     // LF->CR under the target's lock), `feed-bin` writes it RAW — otherwise the two
     // share the entire framing/auth/lease/floor path below.
     let paste = verb == "paste-bin";
+    // Resolve and authorize the target from the header PREFIX before waiting for
+    // its payload.  A client may legally trickle a bounded binary frame for much
+    // longer than the cursor-proof freshness window; leaving the old candidate
+    // armed until `read_exact` completed let unrelated child output borrow it.
+    // Malformed and over-cap attempts use this same prefix rule: a resolvable,
+    // authorized target is fenced; unknown/unauthorized targets never mutate UI
+    // state.  Framing behavior below remains unchanged.
+    let attempt_selector = binary_frame_attempt_selector(line, verb);
+    let header_active_target = resolve_active(route.active);
+    let header_target = attempt_selector.as_ref().and_then(|selector| match selector {
+        None | Some(Selector::SelfTok) => header_active_target.clone(),
+        Some(sel) => resolve_explicit(route.store, sel),
+    });
+    let header_authorized = header_target.as_ref().is_some_and(|(_, _, _, ctx)| {
+        matches!(route.scope, Scope::Owner)
+            || cross_session_authorized(route.scope, "feed", ctx)
+    });
+    if header_authorized
+        && let Some((_, _, session, _)) = header_target.as_ref()
+    {
+        let response = cancel_candidate(*session);
+        if !response.starts_with("OK") {
+            // Do not wait for a slow payload while the header target's old
+            // movement proof is still live. The main-thread fence failed, so
+            // this framed connection is no longer safe to continue.
+            let _ = writer.write_all(response.as_bytes());
+            let _ = writer.flush();
+            return false;
+        }
+    }
+
     let (selector, n) = match parse_feed_bin(line, verb) {
         FeedBinFrame::Ok(selector, n) => (selector, n),
         FeedBinFrame::Malformed => {
@@ -3548,11 +3614,26 @@ where
         return false;
     }
 
+    // The payload may have arrived long after the header. Re-resolve both the
+    // active target and its capability at the effect boundary: a tab switch,
+    // session replacement, or edge revocation during `read_exact` must not be
+    // authorized by the stale header snapshot. The early fence above exists
+    // only to retire the header target while the read can block.
+    let active_target = resolve_active(route.active);
+    let front_terminal_session = active_target.as_ref().map(|(_, _, session, _)| *session);
+    let target = match selector.as_ref() {
+        None | Some(Selector::SelfTok) => active_target.clone(),
+        Some(sel) => resolve_explicit(route.store, sel),
+    };
+    let authorized = target.as_ref().is_some_and(|(_, _, _, ctx)| {
+        matches!(route.scope, Scope::Owner)
+            || cross_session_authorized(route.scope, "feed", ctx)
+    });
+
     // The binary paste twin has the same hybrid target contract as inline
     // `paste`: explicit selectors stay terminal/session operations, while a
     // bare/self paste with native front content enters the main-thread input
     // seam. `feed-bin` remains raw PTY input and can never take this branch.
-    let active_target = resolve_active(route.active);
     if paste {
         let principal = if matches!(route.scope, Scope::Owner) {
             NativeControlPrincipal::Owner
@@ -3570,7 +3651,7 @@ where
             principal,
         ) {
             let response = match route {
-                Ok(event) => match dispatch_front_input(event) {
+                Ok(event) => match dispatch_front_input(event, None) {
                     Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
                     Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
                     Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
@@ -3588,10 +3669,6 @@ where
     // Resolve the target (self or `@<selector>`) and gate it like `feed` (WriteInput),
     // mirroring `handle()`'s self/cross split. The payload was already consumed, so
     // every path below replies AND keeps the stream framed.
-    let target = match &selector {
-        None | Some(Selector::SelfTok) => active_target,
-        Some(sel) => resolve_explicit(route.store, sel),
-    };
     // `paste-bin` needs the TARGET terminal (to run `format_paste` under its lock —
     // bracketing depends on the app's DECSET 2004 state); `feed-bin` uses the same
     // tuple so target resolution and authorization cannot drift between the two.
@@ -3613,8 +3690,6 @@ where
     // edge scoped to session B inject raw bytes into whatever tab became frontmost
     // after a tab/window switch (the global ActiveHandle retargets `@.`) — the same
     // confused-deputy authority escape `handle()`'s self gate closes.
-    let authorized =
-        matches!(route.scope, Scope::Owner) || cross_session_authorized(route.scope, "feed", &ctx);
     if !authorized {
         log_denial(
             AUDIT_SUBSYSTEM,
@@ -3625,6 +3700,17 @@ where
         let _ = writer.write_all(b"ERR denied\n");
         let _ = writer.flush();
         return true;
+    }
+
+    // The active/self selector can retarget while the payload is in flight, and
+    // a fresh local input can arm a new proof after the header fence. Fence the
+    // target selected by the post-payload snapshot as well, immediately before
+    // any direct egress. App-routed input repeats this boundary harmlessly.
+    let canceled = cancel_candidate(target_session);
+    if !canceled.starts_with("OK") {
+        let _ = writer.write_all(canceled.as_bytes());
+        let _ = writer.flush();
+        return false;
     }
 
     // TURN LEASE: `feed-bin` reaches the PTY HERE, bypassing the verb-dispatch
@@ -3655,6 +3741,35 @@ where
         let _ = writer.write_all(b"ERR rate (self-feed floor)\n");
         let _ = writer.flush();
         return true;
+    }
+
+    // A terminal tab currently on screen owns the same App input side effects
+    // as human/inline paste: cursor-movement provenance, viewport snap,
+    // selection clearing, and blink reset. This includes an explicit `@self`
+    // / `@<sid>` that resolves back to the visible tab. Pass the exact session
+    // target so a racing tab switch degrades to hidden-session delivery rather
+    // than pasting into whichever tab became front.
+    if front_terminal_session == Some(target_session) {
+        let event = if paste {
+            InputEvent::Paste(String::from_utf8_lossy(&payload).into_owned())
+        } else {
+            // Raw front-session input is uncorrelatable movement. It still
+            // enters App::input so that seam retires any older candidate before
+            // writing the exact bytes. The direct route below retains its
+            // background egress but runs an explicit session-wide fence first,
+            // because another window may still present that session.
+            InputEvent::KeySequence(payload.clone())
+        };
+        let response = match dispatch_front_input(event, Some(target_session)) {
+            Ok(InputOutcome::Ok) => format!("OK {n} bytes\n"),
+            Ok(InputOutcome::RangeRejected) => "ERR out of range\n".to_string(),
+            Ok(InputOutcome::WriteFailed) => "ERR write failed\n".to_string(),
+            Err(error) => error,
+        };
+        if writer.write_all(response.as_bytes()).is_err() {
+            return false;
+        }
+        return writer.flush().is_ok();
     }
 
     if paste {
@@ -3837,6 +3952,52 @@ fn run_subscribe<W: Write>(
     }
     let instance = InstanceStreams::authorize(req.instance, scope);
 
+    // `@*` — the LIVE INSTANCE TARGET SET. Everything the connection is allowed
+    // to watch, INCLUDING sessions that do not exist yet: the push loop adopts
+    // each new one and acks it with the same `sub <local> <sid>` line the
+    // handshake emits.
+    //
+    // WHY IT EXISTS. The target list used to be frozen here for the life of the
+    // connection, and the push loop never reads another request line, so a client
+    // that wanted a newly-opened tab had to open a WHOLE NEW subscription for it —
+    // a new process, a new socket, a new server push thread, once per tab-open.
+    // The pool admits `CONTROL_SUBSCRIPTION_WORKERS` of those; past that the
+    // answer is `ERR subscription capacity busy`, which a push-only client that
+    // has already recorded the session as seen never retries. So the fifth
+    // staggered tab-open stopped being federated, silently and permanently. One
+    // live target set is one connection per instance, and the pool goes back to
+    // bounding PEERS, which is what it was meant to bound.
+    //
+    // AUTHORITY. Owner-only, for exactly the reason the instance `sessions`
+    // stream is: it names sessions the subscriber could not have named itself, so
+    // it reveals the existence and opaque sid of siblings. Refused HARD rather
+    // than degraded to an empty stream — a push-only connection that never
+    // pushes is indistinguishable from a hang. `AdoptScope::authorize` re-applies
+    // the same rule as a type-level invariant, so this refusal cannot be lost by
+    // a future caller.
+    let adopt_all = sel_tok == "@*";
+    if adopt_all && !matches!(scope, Scope::Owner) {
+        log_denial(
+            AUDIT_SUBSYSTEM,
+            "subscribe -> @*",
+            aterm_containment::mode_or_containment(),
+            "the @* live target set is instance-wide; only Owner holds instance authority",
+        );
+        return write_err(writer, b"ERR denied\n");
+    }
+    // Resume anchors are per-SESSION watermarks (see the refusal below for the
+    // explicit-list case). A live target set is multi-target by definition — and
+    // becomes so at an unpredictable moment — so seeding one session's anchor
+    // into it is never meaningful. Refuse up front rather than let a `@*` that
+    // happens to start with one target slip past the count check.
+    if adopt_all && (since.is_some() || since_turn.is_some() || since_block.is_some()) {
+        return write_err(
+            writer,
+            b"ERR resume anchors (since=/since-turn=/since-block=) require a single target\n",
+        );
+    }
+    let adopt = subscribe::AdoptScope::authorize(adopt_all, scope);
+
     // The connection's own session tuple, resolved like every other request so a
     // self `subscribe` (`@.`) follows the active tab the same way a self read does.
     // Resolve + GATE every `@<sel>` in the comma list. Fail-closed: the FIRST bad
@@ -3848,7 +4009,27 @@ fn run_subscribe<W: Write>(
     // back to the sids it knows (the tmux-control-mode handshake pattern).
     let mut sub_map: Vec<(u64, String)> = Vec::new();
     let mut parsed = 0usize;
-    for raw in sel_tok.split(',').filter(|s| !s.is_empty()) {
+    // `@*` seeds from the CURRENT roster and then keeps adopting; every other
+    // form is the literal comma list. Expanding to real `@<sid>` selectors (a
+    // snapshot cloned out of the store, guard dropped immediately) means the
+    // seed targets go through the SAME resolve + `ReadScreen` gate + de-dup +
+    // cap loop as an explicit list — there is no second admission path to keep
+    // in sync, which is the only way this stays fail-closed.
+    let expanded: Vec<String> = if adopt_all {
+        store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .live_handles()
+            .map(|h| format!("@{}", h.sid.as_str()))
+            .collect()
+    } else {
+        sel_tok
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    for raw in expanded.iter().map(String::as_str) {
         // Bound the selector list so a duplicate-laden / oversized comma list cannot
         // fan out into thousands of ByteFanout slots (O(N) tee per output burst).
         parsed += 1;
@@ -3909,7 +4090,10 @@ fn run_subscribe<W: Write>(
             ctx.timeline.clone(),
         ));
     }
-    if targets.is_empty() {
+    // An EMPTY set is an error for an explicit list (the client named nothing
+    // resolvable) but perfectly normal for `@*`: an instance that momentarily has
+    // no sessions is exactly the case a live target set exists to survive.
+    if targets.is_empty() && !adopt_all {
         let _ = writer.write_all(b"ERR usage: at least one @<sel> target\n");
         let _ = writer.flush();
         return;
@@ -3947,8 +4131,11 @@ fn run_subscribe<W: Write>(
         subscribers,
         store,
         &targets,
-        req.targets,
-        instance,
+        PushScopes {
+            streams: req.targets,
+            instance,
+            adopt,
+        },
         PushOptions {
             since,
             since_turn,
@@ -4181,6 +4368,26 @@ const fn front_routed(is_cross: bool, front_active: Option<u64>, target: u64) ->
         }
 }
 
+/// Execution seam for the two input phases of the composite `turn` verb.
+/// Keeping this as one pure decision prevents paste and Return from drifting
+/// onto different paths when an explicit selector names the visible tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnInputRoute {
+    Front,
+    Background,
+    Local,
+}
+
+const fn turn_input_route(is_cross: bool, targets_front: bool) -> TurnInputRoute {
+    if is_cross && targets_front {
+        TurnInputRoute::Front
+    } else if is_cross {
+        TurnInputRoute::Background
+    } else {
+        TurnInputRoute::Local
+    }
+}
+
 /// The FRONT-ROUTED twin of [`cross_input`]: an explicit `@<sid>` whose target
 /// resolved to the tab currently on screen is not a background session at all, so
 /// its event goes through the App input seam (`Wake::Input` carrying the session)
@@ -4209,6 +4416,125 @@ fn front_routed_input(
         )),
         None => err.to_string(),
     }
+}
+
+/// Close any pending exact cursor-move proof before a visible-front control
+/// operation that does not otherwise pass through `App::input`. The dedicated
+/// main-thread wake clears only cursor provenance: unlike an empty synthetic
+/// key it cannot heat cadence/rain, stamp input latency, or write a PTY frame.
+/// The round trip completes before the direct operation below, so a signal
+/// cannot synchronously trigger output that borrows the older proof.
+fn front_routed_candidate_cancel(proxy: &EventLoopProxy<Wake>, session: u64) -> String {
+    candidate_cancel_reply(control_media::call_main(proxy, |reply| {
+        Wake::CursorCandidateCancel {
+            session,
+            reply,
+        }
+    }))
+}
+
+fn candidate_cancel_reply(result: Result<bool, &'static str>) -> String {
+    match result {
+        // `false` is a safe tab-switch race: the named target is no longer
+        // visible and therefore owns no window candidate, but the authorized
+        // direct operation still proceeds against that session.
+        Ok(_) => "OK\n".to_string(),
+        Err(error) => format!("ERR input dispatch failed: {error}\n"),
+    }
+}
+
+fn control_attempt_supersedes_cursor_candidate(verb: &str) -> bool {
+    matches!(
+        verb,
+        "send"
+            | "key"
+            | "ctrl"
+            | "feed"
+            | "signal"
+            | "mouse"
+            | "paste"
+            | "focus"
+            | "turn"
+            | "resize"
+            | "scroll"
+    )
+}
+
+fn front_routed_resize(
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    rest: &str,
+) -> String {
+    if let Some(px) = rest.trim().strip_prefix("px") {
+        let mut it = px.split_whitespace();
+        let (Some(ws), Some(hs)) = (it.next(), it.next()) else {
+            return "ERR usage: resize px <w> <h>\n".to_string();
+        };
+        let (Ok(width), Ok(height)) = (ws.parse::<u32>(), hs.parse::<u32>()) else {
+            return "ERR bad args\n".to_string();
+        };
+        return front_routed_input(
+            proxy,
+            session,
+            Some(InputEvent::ResizeWindowPx { width, height }),
+            "ERR\n",
+        );
+    }
+    let (rows, cols) = match control_input::parse_resize(rest) {
+        Ok(size) => size,
+        Err(error) => return error,
+    };
+    front_routed_input(
+        proxy,
+        session,
+        Some(InputEvent::Resize {
+            rows,
+            cols,
+            echo_to_window: true,
+        }),
+        "ERR\n",
+    )
+}
+
+fn parse_scroll_intent(rest: &str) -> Result<ScrollIntent, String> {
+    Ok(match rest.trim() {
+        "" => ScrollIntent::By(0),
+        "top" => ScrollIntent::Top,
+        "bottom" => ScrollIntent::Bottom,
+        "up" => ScrollIntent::Up,
+        "down" => ScrollIntent::Down,
+        "prev-prompt" => ScrollIntent::PrevPrompt,
+        "next-prompt" => ScrollIntent::NextPrompt,
+        n => ScrollIntent::By(n.parse::<i32>().map_err(|_| {
+            "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n".to_string()
+        })?),
+    })
+}
+
+fn front_routed_scroll(
+    term: &Arc<Mutex<Terminal>>,
+    proxy: &EventLoopProxy<Wake>,
+    session: u64,
+    rest: &str,
+) -> String {
+    let intent = match parse_scroll_intent(rest) {
+        Ok(intent) => intent,
+        Err(error) => return error,
+    };
+    if let Err(error) = post_input_reply_to(
+        proxy,
+        Op::ReadScreen,
+        vec![InputEvent::ScrollView(intent)],
+        Some(session),
+    ) {
+        return error;
+    }
+    let t = term_lock(term);
+    format!(
+        "OK {} {}\n",
+        t.grid().display_offset(),
+        t.grid().scrollback_lines()
+    )
 }
 
 /// Cross-session `mouse`: build the engine-neutral event via [`parse_mouse`] and
@@ -4330,9 +4656,8 @@ fn cross_resize(
                 // width matches — at most one extra pass once widths settle.
                 let mut next = term_lock(term).finish_resize_offload(reflowed);
                 while let Some(follow) = next {
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        follow.reflow()
-                    })) {
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| follow.reflow()))
+                    {
                         Ok(again) => next = term_lock(term).finish_resize_offload(again),
                         Err(_) => {
                             aterm_log::error!(
@@ -4379,21 +4704,9 @@ fn cross_resize(
 /// the next time it is shown it reads the new offset; `select` posts `Wake::Output`
 /// only because it must repaint a possibly-active selection.
 fn cross_scroll(term: &Arc<Mutex<Terminal>>, rest: &str) -> String {
-    let intent = match rest.trim() {
-        "" => ScrollIntent::By(0),
-        "top" => ScrollIntent::Top,
-        "bottom" => ScrollIntent::Bottom,
-        "up" => ScrollIntent::Up,
-        "down" => ScrollIntent::Down,
-        "prev-prompt" => ScrollIntent::PrevPrompt,
-        "next-prompt" => ScrollIntent::NextPrompt,
-        n => match n.parse::<i32>() {
-            Ok(d) => ScrollIntent::By(d),
-            Err(_) => {
-                return "ERR usage: scroll <up|down|top|bottom|prev-prompt|next-prompt|N>\n"
-                    .to_string();
-            }
-        },
+    let intent = match parse_scroll_intent(rest) {
+        Ok(intent) => intent,
+        Err(error) => return error,
     };
     let mut t = term_lock(term);
     apply_scroll_intent(&mut t, intent);
@@ -4690,6 +5003,20 @@ fn handle(
         }
     }
 
+    // Every AUTHORIZED control attempt that can inject bytes, signal the
+    // child, or mutate its cursor coordinate space is a newer provenance
+    // boundary — even when its arguments are malformed and dispatch later
+    // returns an error. Fence before parsing so a swallowed candidate cannot
+    // survive an ignored attempt and be borrowed by subsequent PTY output.
+    // Authorization has already completed above; denied callers cannot mutate
+    // visible-window effect state through this side channel.
+    if control_attempt_supersedes_cursor_candidate(verb) {
+        let canceled = front_routed_candidate_cancel(proxy, session);
+        if !canceled.starts_with("OK") {
+            return canceled;
+        }
+    }
+
     // D3: the un-bypassable SELF-FEED FLOOR. Every self-targeted input-injection
     // verb passes a per-session token bucket FIRST, so a raw client cannot drive
     // an output->observe->write feedback storm by looping `feed @.` (the L2
@@ -4788,7 +5115,36 @@ fn handle(
                 );
                 return "ERR denied\n".to_string();
             }
-            if is_cross {
+            if turn_input_route(is_cross, targets_front) == TurnInputRoute::Front {
+                // An explicit selector naming the visible tab is still a
+                // visible App drive. Route BOTH phases of the composite turn
+                // through the same targeted event-loop seam as plain
+                // paste/key, so paste/Return movement provenance, input
+                // ordering and every other host side effect stay intact.
+                let paste = |text: &str| {
+                    let _ = front_routed_input(
+                        proxy,
+                        session,
+                        Some(InputEvent::Paste(control_input::paste_text(text))),
+                        "ERR\n",
+                    );
+                };
+                let press = |name: &str| {
+                    front_routed_input(proxy, session, parse_key(name), "ERR\n").starts_with("OK")
+                };
+                control_session::cmd_turn(
+                    term,
+                    store,
+                    session,
+                    rest,
+                    subscribers,
+                    ctx,
+                    &control_session::TurnIo {
+                        paste: &paste,
+                        press: &press,
+                    },
+                )
+            } else if turn_input_route(is_cross, targets_front) == TurnInputRoute::Background {
                 let paste = |text: &str| {
                     let _ = cross_input(
                         term,
@@ -4830,6 +5186,12 @@ fn handle(
                 )
             }
         }
+        "send" if !is_cross || targets_front => front_routed_input(
+            proxy,
+            session,
+            Some(InputEvent::KeySequence(control_input::send_bytes(rest))),
+            "ERR\n",
+        ),
         "send" => control_input::cmd_send(&ctx.sink, rest),
         // Phase 0.5: the SELF (active-tab) path funnels `key`/`ctrl`/`mouse`/`paste`/
         // `focus`/`resize`/`scroll` through the source-blind `App::input` seam on the
@@ -4871,14 +5233,43 @@ fn handle(
             "ERR usage: ctrl <single-letter>\n",
         ),
         "ctrl" => control_input::cmd_ctrl(proxy, rest),
+        "feed" if !is_cross || targets_front => match control_input::feed_bytes(rest) {
+            Ok(bytes) => {
+                let n = bytes.len();
+                let response = front_routed_input(
+                    proxy,
+                    session,
+                    Some(InputEvent::KeySequence(bytes)),
+                    "ERR\n",
+                );
+                if response.starts_with("OK") {
+                    format!("OK {n} bytes\n")
+                } else {
+                    response
+                }
+            }
+            Err(error) => error.to_string(),
+        },
         "feed" => control_input::cmd_feed(&ctx.sink, rest),
         "signal" => control_input::cmd_signal(master, rest),
+        "mouse" if is_cross && targets_front => front_routed_input(
+            proxy,
+            session,
+            control_input::parse_mouse(rest).ok(),
+            "ERR usage: mouse <press|release|move|wheel-up|wheel-down> ...\n",
+        ),
         "mouse" if is_cross => cross_mouse(term, ctx, session, proxy, rest),
         // SELF (active-tab) mouse: pass `scope` so a NON-OWNER (scoped-edge) gesture
         // has its copy-on-select CLIPBOARD side-effect suppressed (the exfil fence);
         // Owner and human gestures are unaffected. The suppression is stamped on the
         // injected event, NOT a `Source` branch in the byte seam.
         "mouse" => control_input::cmd_mouse(proxy, scope, rest),
+        "paste" if is_cross && targets_front => front_routed_input(
+            proxy,
+            session,
+            Some(InputEvent::Paste(control_input::paste_text(rest))),
+            "ERR\n",
+        ),
         "paste" if is_cross => cross_input(
             term,
             ctx,
@@ -4886,6 +5277,15 @@ fn handle(
             "ERR\n",
         ),
         "paste" => control_input::cmd_paste(proxy, rest),
+        "focus" if is_cross && targets_front => match control_input::parse_focus(rest) {
+            Some(focused) => front_routed_input(
+                proxy,
+                session,
+                Some(InputEvent::Focus(focused)),
+                "ERR usage: focus <in|out>\n",
+            ),
+            None => "ERR usage: focus <in|out>\n".to_string(),
+        },
         "focus" if is_cross => match control_input::parse_focus(rest) {
             Some(focused) => cross_input(term, ctx, Some(InputEvent::Focus(focused)), "ERR\n"),
             None => "ERR usage: focus <in|out>\n".to_string(),
@@ -4982,6 +5382,7 @@ fn handle(
         // tab + the GPU swapchain). A background target has no window to echo to, so we
         // replicate ONLY the term+PTY pair (`echo_to_window: false` semantics) on the
         // TARGET, never the active window/framebuffer.
+        "resize" if is_cross && targets_front => front_routed_resize(proxy, session, rest),
         "resize" if is_cross => cross_resize(term, master, ctx, session, Some(proxy), rest),
         "resize" => control_input::cmd_resize(proxy, rest),
         // Cross-session `scroll` also bypasses the seam (`ScrollView` emits no bytes;
@@ -4989,6 +5390,9 @@ fn handle(
         // DIRECTLY to the TARGET term's viewport and reports `OK <offset> <max>` — the
         // SAME wire shape as the self path's `cmd_scroll`. `select` is already
         // cross-correct (mutates the target term + fires a repaint keyed by target id).
+        "scroll" if is_cross && targets_front => {
+            front_routed_scroll(term, proxy, session, rest)
+        }
         "scroll" if is_cross => cross_scroll(term, rest),
         "scroll" => control_input::cmd_scroll(term, proxy, rest),
         "dims" => control_query::cmd_dims(term, session, proxy),
@@ -5198,7 +5602,10 @@ mod tests {
     /// "no input attempts logged" to an AI that had driven the entire take.)
     #[test]
     fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
-        use super::front_routed;
+        use super::{
+            TurnInputRoute, candidate_cancel_reply, control_attempt_supersedes_cursor_candidate,
+            front_routed, turn_input_route,
+        };
         // Named the tab on screen -> the seam.
         assert!(front_routed(true, Some(7), 7));
         // Named a BACKGROUND tab -> the direct egress it exists for.
@@ -5210,6 +5617,39 @@ mod tests {
         // through this predicate, whatever the front tab happens to be.
         assert!(!front_routed(false, Some(7), 7));
         assert!(!front_routed(false, None, 7));
+
+        // `turn` is composite paste + Return, but both phases must make the
+        // identical routing decision. In particular, explicit `@self` (which
+        // arrives as a cross selector naming the visible sid) is FRONT, while
+        // a genuinely hidden target remains on the background sink.
+        assert_eq!(turn_input_route(true, true), TurnInputRoute::Front);
+        assert_eq!(turn_input_route(true, false), TurnInputRoute::Background);
+        assert_eq!(turn_input_route(false, false), TurnInputRoute::Local);
+        assert_eq!(turn_input_route(false, true), TurnInputRoute::Local);
+
+        // The reply distinguishes transport failure from a harmless race. A
+        // `false` main-thread result means the tab switched before the fence;
+        // the target is now background and its otherwise valid signal must not
+        // be dropped.
+        assert_eq!(candidate_cancel_reply(Ok(true)), "OK\n");
+        assert_eq!(candidate_cancel_reply(Ok(false)), "OK\n");
+        assert!(candidate_cancel_reply(Err("event loop gone")).starts_with("ERR "));
+
+        // Parsing happens only after this verb-level boundary, so malformed
+        // front and cross forms cancel exactly like valid ones. Read-only and
+        // unauthorized requests never reach this post-authorization predicate.
+        for verb in [
+            "send", "key", "ctrl", "feed", "signal", "mouse", "paste", "focus", "turn",
+            "resize", "scroll",
+        ] {
+            assert!(
+                control_attempt_supersedes_cursor_candidate(verb),
+                "authorized {verb} attempt must fence before argument parsing"
+            );
+        }
+        for verb in ["text", "screen", "cursor", "image", "metrics"] {
+            assert!(!control_attempt_supersedes_cursor_candidate(verb));
+        }
     }
 
     struct WireProbe {
@@ -6653,15 +7093,13 @@ mod tests {
         // "maybe live — never hijack", so under load the plan below can legitimately
         // return `Some` for reasons that are the environment's, not the code's.
         // Wait out that transient instead of reporting it as a proxy defect.
-        let refused = (0..50).any(|_| {
-            match aterm_uds::CtlStream::connect(&dead_sock) {
-                Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => true,
-                Err(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                    false
-                }
-                Ok(_) => panic!("nobody should be listening on the dead sibling socket"),
+        let refused = (0..50).any(|_| match aterm_uds::CtlStream::connect(&dead_sock) {
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => true,
+            Err(_) => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                false
             }
+            Ok(_) => panic!("nobody should be listening on the dead sibling socket"),
         });
         assert!(
             refused,
@@ -6863,7 +7301,7 @@ mod tests {
         assert_eq!(
             parse_mouse("wheelup left 2 4"),
             Ok(InputEvent::Wheel {
-                dir_up: true,
+                dir: aterm_types::mouse::WheelDir::Up,
                 lines: 1,
                 row: 2,
                 col: 4,
@@ -10861,6 +11299,362 @@ mod tests {
         ));
     }
 
+    /// A bounded binary header is itself the authoritative input boundary.  The
+    /// candidate fence must complete before the server can block waiting for a
+    /// slow payload; rejected/unauthorized headers may never mutate cursor state.
+    #[test]
+    #[cfg(unix)]
+    fn binary_input_header_fences_before_payload_and_only_after_authorization() {
+        struct FenceCheckedReader {
+            inner: std::io::Cursor<Vec<u8>>,
+            fenced: std::rc::Rc<std::cell::Cell<bool>>,
+        }
+
+        impl std::io::Read for FenceCheckedReader {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                assert!(
+                    self.fenced.get(),
+                    "payload read began before the authorized target fence"
+                );
+                self.inner.read(buf)
+            }
+        }
+
+        impl std::io::BufRead for FenceCheckedReader {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.inner.fill_buf()
+            }
+
+            fn consume(&mut self, amount: usize) {
+                self.inner.consume(amount);
+            }
+        }
+
+        let store = session_store::new_store();
+        let (front, front_rx) = pipe_session(1);
+        store.write().unwrap().register(front.clone());
+        let active = active_for_handle(&front);
+        let fenced = std::rc::Rc::new(std::cell::Cell::new(false));
+        let mut reader = FenceCheckedReader {
+            inner: std::io::Cursor::new(b"ABCafter\n".to_vec()),
+            fenced: fenced.clone(),
+        };
+        let mut dispatch = |_event, _session| Ok(InputOutcome::Ok);
+        let mut cancel = {
+            let fenced = fenced.clone();
+            move |session| {
+                assert_eq!(session, 1);
+                fenced.set(true);
+                "OK\n".to_string()
+            }
+        };
+        let mut out = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@1 feed-bin 3",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut out,
+        ));
+        assert!(fenced.get());
+        assert_eq!(String::from_utf8_lossy(&out), "OK 3 bytes\n");
+        assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
+        assert!(drain_pipe(&front_rx).is_empty());
+
+        // A rejected frame still consumes its bounded payload, but an
+        // unauthorized header cannot use the candidate fence as a UI side
+        // channel.
+        let cancel_count = std::cell::Cell::new(0usize);
+        let mut cancel = |_session| {
+            cancel_count.set(cancel_count.get() + 1);
+            "OK\n".to_string()
+        };
+        let mut reader = std::io::Cursor::new(b"XYZafter\n".to_vec());
+        let mut denied = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@1 feed-bin 3",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Edge(EdgeToken::generate()),
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut denied,
+        ));
+        assert_eq!(cancel_count.get(), 0, "denied header must not touch UI");
+        assert_eq!(String::from_utf8_lossy(&denied), "ERR denied\n");
+        assert_eq!(read_request_line(&mut reader).as_deref(), Some("after"));
+
+        // A syntactically targetable authorized attempt supersedes even when
+        // its length is malformed or over cap, matching ordinary control verbs'
+        // pre-argument-parse boundary. An unknown target remains side-effect free.
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let mut malformed = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@1 feed-bin nope",
+            "feed-bin",
+            &mut empty,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut malformed,
+        ));
+        assert_eq!(cancel_count.get(), 1);
+        let mut oversize = Vec::new();
+        assert!(!run_feed_bin_routed(
+            &format!("@1 feed-bin {}", MAX_FEED_BIN + 1),
+            "feed-bin",
+            &mut empty,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut oversize,
+        ));
+        assert_eq!(cancel_count.get(), 2);
+        let mut missing = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@999999 feed-bin nope",
+            "feed-bin",
+            &mut empty,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut missing,
+        ));
+        assert_eq!(cancel_count.get(), 2, "unknown target cannot fence a window");
+    }
+
+    /// The header fence is an early liveness boundary, not an authority cache.
+    /// Target selection and capability scope are sampled again after the payload:
+    /// a stalled `@.` frame follows the new active session, and a revoked edge can
+    /// no longer write. A failed early fence closes before touching payload bytes.
+    #[test]
+    #[cfg(unix)]
+    fn binary_input_revalidates_target_and_authority_after_payload() {
+        struct OnFirstRead<F> {
+            inner: std::io::Cursor<Vec<u8>>,
+            action: Option<F>,
+        }
+
+        impl<F: FnOnce()> std::io::Read for OnFirstRead<F> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(action) = self.action.take() {
+                    action();
+                }
+                self.inner.read(buf)
+            }
+        }
+
+        impl<F: FnOnce()> std::io::BufRead for OnFirstRead<F> {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                self.inner.fill_buf()
+            }
+
+            fn consume(&mut self, amount: usize) {
+                self.inner.consume(amount);
+            }
+        }
+
+        let store = session_store::new_store();
+        let (first, first_rx) = pipe_session(1);
+        let (second, second_rx) = pipe_session(2);
+        store.write().unwrap().register(first.clone());
+        store.write().unwrap().register(second.clone());
+        let active = active_for_handle(&first);
+
+        let switched_active = active.clone();
+        let switched_to = second.clone();
+        let mut reader = OnFirstRead {
+            inner: std::io::Cursor::new(b"X".to_vec()),
+            action: Some(move || {
+                *switched_active.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Some(ActiveSession {
+                        term: switched_to.term.clone(),
+                        master: switched_to.master,
+                        id: switched_to.local_id,
+                        ctx: switched_to.ctx.clone(),
+                    });
+            }),
+        };
+        let canceled = std::cell::RefCell::new(Vec::new());
+        let mut cancel = |session| {
+            canceled.borrow_mut().push(session);
+            "OK\n".to_string()
+        };
+        let routed = std::cell::RefCell::new(None);
+        let mut dispatch = |event, session| {
+            *routed.borrow_mut() = Some((event, session));
+            Ok(InputOutcome::Ok)
+        };
+        let mut out = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@. feed-bin 1",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut out,
+        ));
+        assert_eq!(&*canceled.borrow(), &[1, 2]);
+        assert!(matches!(
+            &*routed.borrow(),
+            Some((InputEvent::KeySequence(bytes), Some(2))) if bytes == b"X"
+        ));
+        assert_eq!(String::from_utf8_lossy(&out), "OK 1 bytes\n");
+        assert!(drain_pipe(&first_rx).is_empty());
+        assert!(drain_pipe(&second_rx).is_empty());
+
+        let (guarded, guarded_rx) = pipe_session(3);
+        store.write().unwrap().register(guarded.clone());
+        let scope = edge_granted(Op::WriteInput, &guarded.ctx);
+        let Scope::Edge(token) = scope else {
+            unreachable!("edge_granted always returns an edge scope");
+        };
+        let revoke_ctx = guarded.ctx.clone();
+        let mut reader = OnFirstRead {
+            inner: std::io::Cursor::new(b"Y".to_vec()),
+            action: Some(move || {
+                assert!(
+                    revoke_ctx
+                        .edges
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .revoke(&token),
+                    "the header-authorized edge was live before payload receipt",
+                );
+            }),
+        };
+        let mut cancel_count = 0usize;
+        let mut cancel = |_session| {
+            cancel_count += 1;
+            "OK\n".to_string()
+        };
+        let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
+            panic!("revoked payload reached the App input seam")
+        };
+        let mut denied = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@3 feed-bin 1",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut denied,
+        ));
+        assert_eq!(cancel_count, 1, "only the header fence ran before revocation");
+        assert_eq!(String::from_utf8_lossy(&denied), "ERR denied\n");
+        assert!(drain_pipe(&guarded_rx).is_empty());
+
+        // The inverse transition is safe too: a header that was not yet
+        // authorized performs no early UI mutation, but a grant made while its
+        // bounded payload arrives is rechecked and the actual target is fenced
+        // before direct egress.
+        let (granted_late, granted_late_rx) = pipe_session(4);
+        store.write().unwrap().register(granted_late.clone());
+        let token = EdgeToken::generate();
+        let late_scope = Scope::Edge(token);
+        let grant_ctx = granted_late.ctx.clone();
+        let mut reader = OnFirstRead {
+            inner: std::io::Cursor::new(b"W".to_vec()),
+            action: Some(move || {
+                let dst = grant_ctx.self_id.clone();
+                let nonce = grant_ctx.nonce;
+                assert!(grant_ctx
+                    .edges
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        token,
+                        SessionId::new("s-late-controller"),
+                        dst,
+                        Op::WriteInput,
+                        nonce,
+                    ));
+            }),
+        };
+        let canceled_late = std::cell::RefCell::new(Vec::new());
+        let mut cancel = |session| {
+            canceled_late.borrow_mut().push(session);
+            "OK\n".to_string()
+        };
+        let mut dispatch = |_event, _session| -> Result<InputOutcome, String> {
+            panic!("background explicit feed unexpectedly entered App input")
+        };
+        let mut accepted = Vec::new();
+        assert!(run_feed_bin_routed(
+            "@4 feed-bin 1",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: late_scope,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut accepted,
+        ));
+        assert_eq!(&*canceled_late.borrow(), &[4]);
+        assert_eq!(String::from_utf8_lossy(&accepted), "OK 1 bytes\n");
+        assert_eq!(drain_pipe(&granted_late_rx), b"W");
+
+        let mut reader = OnFirstRead {
+            inner: std::io::Cursor::new(b"Z".to_vec()),
+            action: Some(|| panic!("payload read despite a failed header fence")),
+        };
+        let mut cancel = |_session| "ERR candidate fence unavailable\n".to_string();
+        let mut dispatch = |_event, _session| Ok(InputOutcome::Ok);
+        let mut failed = Vec::new();
+        assert!(!run_feed_bin_routed(
+            "@2 feed-bin 1",
+            "feed-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel,
+            &mut failed,
+        ));
+        assert_eq!(
+            String::from_utf8_lossy(&failed),
+            "ERR candidate fence unavailable\n"
+        );
+    }
+
     /// `feed-bin <n>\n<bytes>` end-to-end: an Owner connection's length-prefixed
     /// payload lands the EXACT raw bytes on the resolved target's PTY (binary-clean,
     /// no hex), replies `OK <n> bytes`, and leaves the stream correctly framed for
@@ -10960,6 +11754,53 @@ mod tests {
         assert_eq!(next, "after", "stream stays framed past the paste payload");
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn explicit_front_paste_bin_routes_to_the_targeted_app_input_seam() {
+        let store = session_store::new_store();
+        let (front, front_rx) = pipe_session(1);
+        store.write().unwrap().register(front.clone());
+        let active = active_for_handle(&front);
+        let input = b"@1 paste-bin 7\n\xe4\xb8\xad\xf0\x9f\x99\x82after\n";
+        let mut reader = BufReader::new(std::io::Cursor::new(input));
+        let line = read_request_line(&mut reader).expect("paste-bin request line");
+        let mut reply = Vec::new();
+        let mut routed = None;
+        let mut dispatch = |event, session| {
+            routed = Some((event, session));
+            Ok(InputOutcome::Ok)
+        };
+        let mut cancel_candidate = |_session| "OK\n".to_string();
+        assert!(run_feed_bin_routed(
+            &line,
+            "paste-bin",
+            &mut reader,
+            FeedBinRoute {
+                active: &active,
+                store: &store,
+                scope: Scope::Owner,
+            },
+            &mut dispatch,
+            &mut cancel_candidate,
+            &mut reply,
+        ));
+        assert_eq!(String::from_utf8_lossy(&reply), "OK 7 bytes\n");
+        let Some((InputEvent::Paste(text), target)) = routed else {
+            panic!("visible explicit paste-bin bypassed the App input seam");
+        };
+        assert_eq!(text, "中🙂");
+        assert_eq!(target, Some(1), "the exact named session rides the wake");
+        assert!(
+            drain_pipe(&front_rx).is_empty(),
+            "front paste-bin is not double-written through background egress"
+        );
+        assert_eq!(
+            read_request_line(&mut reader).as_deref(),
+            Some("after"),
+            "the following request remains framed"
+        );
+    }
+
     /// The shipping binary-frame parser and native input dispatcher compose all
     /// the way through to the focused Editor minibuffer. This covers the
     /// `aterm-ctl paste --stdin` route, including exact payload framing, rather
@@ -11002,7 +11843,8 @@ mod tests {
         let line = read_request_line(&mut reader).expect("paste-bin request line");
         let mut out = Vec::new();
         let mut dispatch_front_input =
-            |event| Ok(app.input(wid, event, Source::Controller { op: Op::WriteInput }));
+            |event, _session| Ok(app.input(wid, event, Source::Controller { op: Op::WriteInput }));
+        let mut cancel_candidate = |_session| "OK\n".to_string();
         assert!(run_feed_bin_routed(
             &line,
             "paste-bin",
@@ -11013,6 +11855,7 @@ mod tests {
                 scope: Scope::Owner,
             },
             &mut dispatch_front_input,
+            &mut cancel_candidate,
             &mut out,
         ));
         assert_eq!(String::from_utf8_lossy(&out), "OK 6 bytes\n");

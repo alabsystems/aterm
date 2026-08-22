@@ -488,6 +488,45 @@ pub(crate) struct Config {
     /// Maps to [`RightClickGesture`] via [`Config::right_click_or_default`]; an
     /// unknown value warns and falls back to the platform default.
     pub(crate) right_click: Option<String>,
+    /// Which KEYBOARD chord pops a tab's context menu (Windows only; the strip's
+    /// right-click always does): `"on"` — the dedicated Menu/Application key AND
+    /// Shift+F10, the two spellings Windows has shipped since NT; `"menu_key"` —
+    /// the Menu key ONLY, handing Shift+F10 back to the terminal (it is a real
+    /// encodable chord, F20 in the xterm tradition); or `"off"` — neither, both
+    /// keys go to the application and the menu is pointer-only. ABSENT = `"on"`.
+    ///
+    /// This exists because the chord is deliberately NOT a rebindable
+    /// `[keybindings]` action (an OS convention, not an aterm command — and a
+    /// config typo must not be able to delete the only keyboard route to the
+    /// menu), which without a knob would leave a user no way to give the keys
+    /// back at all. A one-key ESCAPE HATCH is not the same hazard as a rebind
+    /// table: it cannot silently shadow the chord, it can only surrender it.
+    ///
+    /// Independent of the deference rule that always applies: a front terminal
+    /// whose app negotiated the kitty enhancement that makes the key reportable
+    /// keeps that key regardless of this setting (see
+    /// `App::front_defers_tab_menu_chord`). Maps to [`TabMenuChord`] via
+    /// [`Config::tab_menu_chord_or_default`]; an unknown value warns and falls
+    /// back to the default.
+    pub(crate) tab_menu_chord: Option<String>,
+    /// WHERE A NEW TERMINAL OPENS when one is already running: `"new_window"`
+    /// (the DEFAULT — every launch is its own window and its own process, which
+    /// is what aterm has always done) or `"attach"` (a launch joins the running
+    /// instance as a tab and exits; with nothing reachable it starts one, so the
+    /// first launch of the day is unchanged). Windows Terminal's own spellings
+    /// `useNew` / `useExisting` are accepted aliases.
+    ///
+    /// This key is read by the FRONT DOOR (`crates/aterm/src/main.rs`), not by
+    /// the window — the decision happens before a window exists — and by the
+    /// Windows jump list, which uses it to decide whether a "New Tab" taskbar
+    /// task would tell the truth. `aterm new-window` is never routed by it, so
+    /// there is always a way to get a separate window. Parsed by
+    /// `aterm_cli::WindowingBehavior` (that crate owns the front-door grammar
+    /// and this crate does not depend on it); an unrecognized value warns once
+    /// and falls back to `new_window` — a typo may not move where terminals open.
+    /// `$ATERM_WINDOWING_BEHAVIOR` overrides it, as every other key's env twin
+    /// does.
+    pub(crate) windowing_behavior: Option<String>,
     /// Show the subtle TOP-RIGHT build/version badge (`v{version} · {build}`) so the
     /// running build is answerable at a glance without opening About. Default OFF.
     /// Toggleable via the native Settings tab ▸ Window ▸ "Show build/version badge". See
@@ -519,6 +558,20 @@ pub(crate) struct Config {
     /// (toolbar.rs) now carries the New Tab affordance. Set `tab_strip_rows = 1` in
     /// config to bring the in-grid strip back. Clamped to [`MAX_TAB_STRIP_ROWS`].
     pub(crate) tab_strip_rows: Option<u16>,
+    /// C3 (Windows) — how TALL the in-grid tab band is: `"standard"` (the Windows
+    /// DEFAULT) sizes the whole band to [`TAB_BAND_STANDARD_LOGICAL_PX`] ≈ a WinUI
+    /// tab, `"compact"` keeps the pre-C3 height (exactly the strip's cell rows plus
+    /// the top pad). The extra pixels are a SYNTHETIC chrome `head` band — the same
+    /// mechanism macOS uses for chrome that overlaps the grid — so the resize law,
+    /// the pointer mapping, the chrome bleed and the pixel band's centring already
+    /// understand them; see `App::synthetic_strip_head_px`.
+    ///
+    /// OFF WINDOWS THIS KEY IS INERT (parsed, never consulted): macOS puts its tabs
+    /// in the native toolbar and Linux's in-grid strip is tuned to its own chrome.
+    /// It is also inert whenever the strip itself is off (`tab_strip_rows = 0`) —
+    /// a band with no strip in it would be dead space that shifts the grid down.
+    /// An unknown value warns and falls back to the platform default.
+    pub(crate) tab_band_height: Option<String>,
     /// SELECTED-TAB color override (`active_tab_color`, `#RRGGBB`): paints the
     /// ACTIVE tab's background with a user-picked color in BOTH tab renderers —
     /// the native macOS toolbar pill and the in-grid strip. The label ink flips
@@ -667,6 +720,17 @@ pub(crate) struct Config {
     /// env-over-config-over-default order). ABSENT = `1.0` (identity — the
     /// linear-light pipeline needs no correction). Hot-reloadable.
     pub(crate) stem_gamma: Option<f32>,
+    /// Linux glyph grid-fitting mode (W13/R2): `"full"` (the default — the
+    /// autohinter snaps stems in BOTH axes, the crispest grayscale result,
+    /// measured side-by-side against `light`/`native`/`off` in the R2
+    /// evidence), `"light"` (vertical-only — the desktop `hintslight` look),
+    /// `"native"` (the font's own bytecode when it has one), or `"off"` (no
+    /// grid fitting — the raw fontdue raster). The config alias of the
+    /// `ATERM_FONT_HINTING` env var, which still takes precedence. ABSENT (or
+    /// an unrecognized spelling) = `"full"`. Inert on macOS (CoreText applies
+    /// its own grid discipline) and Windows. Hot-reloadable (drops the glyph
+    /// atlas).
+    pub(crate) font_hinting: Option<String>,
     /// Line-height multiplier on the cell BOX (W5a): rows space out (or
     /// tighten) WITHOUT changing the glyph size. Clamped 0.8..=2.0; ABSENT =
     /// `1.0` (byte-identical). The added/removed leading splits half above /
@@ -4010,6 +4074,20 @@ impl Config {
         aterm_render::clamp_stem_gamma(g)
     }
 
+    /// EFFECTIVE Linux grid-fitting mode with the startup precedence every key
+    /// follows: `$ATERM_FONT_HINTING` (the historical env knob, now an alias)
+    /// wins over the `font_hinting` config key, which wins over `"full"`. The
+    /// renderer's own parser resolves unrecognized spellings to the default, so
+    /// this stays a plain string hand-off (the setter is the single source of
+    /// spelling truth).
+    pub(crate) fn font_hinting_or_default(&self) -> String {
+        std::env::var("ATERM_FONT_HINTING")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| self.font_hinting.clone())
+            .unwrap_or_else(|| "full".to_string())
+    }
+
     /// Line-height multiplier (W5a), default `1.0`, clamped to the sane
     /// 0.8..=2.0 (a typo can't collapse or explode the grid; the renderer
     /// additionally floors at 0.5). Non-finite values fall back to `1.0`.
@@ -4251,6 +4329,32 @@ impl Config {
         }
     }
 
+    /// Resolve the tab-context-menu KEYBOARD chord policy ([`TabMenuChord`])
+    /// from config `tab_menu_chord`. The DEFAULT when the key is absent is
+    /// [`TabMenuChord::On`] — both Windows spellings, which is what an unedited
+    /// config has always meant. An unknown / malformed value warns and falls
+    /// back to that default (the `right_click` fail-safe shape).
+    ///
+    /// Read only by the `#[cfg(windows)]` chord arms (`on_key`'s and the
+    /// convergence seam's) and by this file's own tests, so off Windows it is a
+    /// live-but-uncalled resolver rather than a missing one — the config key
+    /// still parses and validates everywhere, exactly like `right_click`'s.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(crate) fn tab_menu_chord_or_default(&self) -> TabMenuChord {
+        match self.tab_menu_chord.as_deref() {
+            None => TabMenuChord::On,
+            Some(s) => match TabMenuChord::parse(s) {
+                Some(g) => g,
+                None => {
+                    eprintln!(
+                        "aterm-gui: config tab_menu_chord: expected on|menu_key|off, got {s:?}; using on"
+                    );
+                    TabMenuChord::On
+                }
+            },
+        }
+    }
+
     /// Resolve the GPU-present colour-space tag ([`WindowColorspace`]) from config
     /// `window_colorspace`. The DEFAULT when the key is absent is
     /// [`WindowColorspace::Srgb`] — the colour-managed interpretation. An unknown /
@@ -4266,6 +4370,26 @@ impl Config {
                         "aterm-gui: config window_colorspace: expected srgb|display-p3, got {s:?}; using srgb"
                     );
                     WindowColorspace::Srgb
+                }
+            },
+        }
+    }
+
+    /// C3: resolve the in-grid tab band's height policy ([`TabBandHeight`]) from
+    /// config `tab_band_height`. The DEFAULT when the key is absent is PER-PLATFORM
+    /// ([`TabBandHeight::PLATFORM_DEFAULT`]): `standard` on Windows, `compact`
+    /// elsewhere. An unknown / malformed value warns and falls back to that same
+    /// platform default (the `window_theme` fail-safe shape).
+    pub(crate) fn tab_band_height_or_default(&self) -> TabBandHeight {
+        match self.tab_band_height.as_deref() {
+            None => TabBandHeight::PLATFORM_DEFAULT,
+            Some(s) => match TabBandHeight::parse(s) {
+                Some(h) => h,
+                None => {
+                    eprintln!(
+                        "aterm-gui: config tab_band_height: expected compact|standard, got {s:?}; using the platform default"
+                    );
+                    TabBandHeight::PLATFORM_DEFAULT
                 }
             },
         }
@@ -4803,6 +4927,16 @@ fn warn_background_opacity_unimplemented_once() {
              renders solid (use the GPU backend for real vibrancy; the raised contrast \
              floor still applies)"
         );
+        // The stderr line above is invisible to any windowed launch (a
+        // Finder-launched .app, a Start-Menu launch — the same reason
+        // `config_notice` exists at all), and this is a key the user deliberately
+        // set and can watch do nothing. Give it the in-window banner too.
+        crate::config_notice::queue_deferred(
+            "background_opacity has no effect on the CPU renderer — it has no translucent \
+             present path, so the window stays solid. Enable the GPU renderer for real \
+             transparency."
+                .to_string(),
+        );
     });
 }
 
@@ -4819,6 +4953,13 @@ fn warn_background_material_unimplemented_once() {
             "aterm-gui: background_material selects a window-level vibrancy blur \
              (NSVisualEffectView), but the CPU (softbuffer) renderer cannot composite \
              over it; the setting has no effect on the CPU backend (use the GPU backend)"
+        );
+        // Same reasoning as its opacity sibling above: a deliberately-set key
+        // doing nothing, explained only on a stream a windowed launch discards.
+        crate::config_notice::queue_deferred(
+            "background_material has no effect on the CPU renderer — it cannot composite \
+             over a window-level blur. Enable the GPU renderer to see the material."
+                .to_string(),
         );
     });
 }
@@ -4892,6 +5033,173 @@ impl RightClickGesture {
             _ => None,
         }
     }
+}
+
+/// Which KEYBOARD spellings of "show this tab's context menu" aterm CLAIMS.
+/// Resolved from config `tab_menu_chord` via
+/// [`Config::tab_menu_chord_or_default`], consumed by `app_input::tab_menu_chord`
+/// on both the winit and the control-seam route.
+///
+/// An open enum rather than an `Option<bool>` for the same reason
+/// [`RightClickGesture`] is: the interesting answer is not on/off but WHICH of
+/// the two spellings a user wants to keep, because their costs differ. The Menu
+/// key reaches an application ONLY under a kitty enhancement (and that case is
+/// already deferred unconditionally), so claiming it is nearly free; Shift+F10
+/// is a real legacy-encodable chord (`ESC[21;2~`, F20 in the xterm tradition)
+/// that claiming genuinely takes away.
+///
+/// Compiled everywhere so the config key parses and validates on every platform
+/// (`--validate-config` must not depend on the host), but only READ by the
+/// `#[cfg(windows)]` chord arms — hence the platform-scoped dead-code allowance
+/// rather than a `#[cfg]` on the type itself.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabMenuChord {
+    /// Both Windows spellings: the dedicated Menu/Application key AND Shift+F10.
+    On,
+    /// The Menu key only — Shift+F10 goes to the terminal application.
+    MenuKey,
+    /// Neither; the menu is pointer-only and both keys reach the application.
+    Off,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl TabMenuChord {
+    /// Parse a config `tab_menu_chord` value (case-insensitive, trimmed):
+    /// `on` / `both`, `menu_key` (aliases `menu-key`, `menu`), or `off`.
+    /// `None` on any other value (caller falls back to [`Self::On`]).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "on" | "both" => Some(Self::On),
+            "menu_key" | "menu-key" | "menu" => Some(Self::MenuKey),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// Whether this policy claims the dedicated Menu / Application key.
+    pub(crate) fn claims_menu_key(self) -> bool {
+        matches!(self, Self::On | Self::MenuKey)
+    }
+
+    /// Whether this policy claims Shift+F10.
+    pub(crate) fn claims_shift_f10(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+/// C3 — how tall the in-grid tab band is. Resolved from config `tab_band_height`
+/// via [`Config::tab_band_height_or_default`], consumed ONLY by the Windows
+/// synthetic-head derivation (`App::synthetic_strip_head_px`).
+///
+/// WHY AN ENUM AND NOT A PIXEL COUNT: the band is not one number the user should
+/// have to compute. Its height is `pad_top + head + strip_rows·cell_h`, and two of
+/// those three terms move with the font and the DPI. A named target ("as tall as a
+/// native tab") is the thing a person actually wants; the residue is arithmetic.
+/// A future `"tall"` (the 40 px Fluent touch target) joins without a config break.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TabBandHeight {
+    /// The pre-C3 height: no synthetic head at all, so the band is exactly the top
+    /// pad plus the strip's cell rows — 21 px at the Windows defaults, 96 dpi
+    /// (2 px top pad + one 19 px cell row at FONT_PX 16), as measured, not estimated.
+    /// The default off Windows, and the escape hatch for an owner who wants the
+    /// tightest possible chrome.
+    Compact,
+    /// Size the WHOLE band to [`TAB_BAND_STANDARD_LOGICAL_PX`] logical px — a real
+    /// WinUI tab — by reserving the difference as a synthetic chrome head.
+    Standard,
+}
+
+impl TabBandHeight {
+    /// The per-platform default when the key is absent: `Standard` on Windows (the
+    /// in-grid strip is the window's ONLY tab chrome there, and a 23 px band next
+    /// to a 32 px caption reads as a squashed toolbar), `Compact` everywhere else —
+    /// macOS carries tabs in the native toolbar and never paints this band at all,
+    /// and the Linux strip's geometry was tuned against its own chrome. A `cfg!`
+    /// const, not two `#[cfg]` items, so both arms stay type-checked everywhere.
+    pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(windows) {
+        Self::Standard
+    } else {
+        Self::Compact
+    };
+
+    /// Parse a config `tab_band_height` value (case-insensitive, trimmed):
+    /// `compact` or `standard`. `None` on any other value (caller falls back to
+    /// [`Self::PLATFORM_DEFAULT`]).
+    pub(crate) fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" => Some(Self::Compact),
+            "standard" => Some(Self::Standard),
+            _ => None,
+        }
+    }
+
+    /// The band height this policy targets, in LOGICAL px (1/96 in on Windows).
+    /// `0.0` for [`Self::Compact`] — which makes the whole synthetic-head law
+    /// collapse to `head = 0`, i.e. the byte-identical pre-C3 geometry.
+    pub(crate) fn target_logical_px(self) -> f32 {
+        match self {
+            Self::Compact => 0.0,
+            Self::Standard => TAB_BAND_STANDARD_LOGICAL_PX,
+        }
+    }
+}
+
+/// The `"standard"` band target in LOGICAL px. 32 is the Win11/WinUI tab strip
+/// height (Windows Terminal's own tab row measures 32-34 px at 100%), and it is
+/// also what the caption next to it is — so the two read as one chrome block
+/// rather than a full-height title bar over a squashed toolbar.
+pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 = 32.0;
+
+/// Sanity cap on the SYNTHETIC head, in device px, as a multiple of the cell
+/// height: a pathological config (huge `tab_band_height` target against a tiny
+/// font) must never be able to push the grid down by more than the band could
+/// plausibly need. Distinct from [`TITLEBAR_BAND_SANITY_CAP_PTS`], which guards a
+/// MEASURED AppKit value; this one guards arithmetic we control, so it only has to
+/// be a backstop.
+const SYNTHETIC_BAND_HEAD_CELL_CAP: usize = 4;
+
+/// THE C3 LAW, pure: the synthetic chrome-head band in DEVICE px for a strip of
+/// `strip_rows` rows of `cell_h` px sitting under `pad_top_px` of top padding, when
+/// the whole band should measure `target_logical` logical px at `scale`.
+///
+/// `head = clamp(round(target·scale) − pad_top − strip_rows·cell_h)`: the band the
+/// viewer sees is `head + pad_top + strip_rows·cell_h`, so this is simply "reserve
+/// the remainder". It is deliberately a SUBTRACTION rather than a fixed additive
+/// band: at a large font (or `tab_strip_rows = 2`) the cell rows already exceed the
+/// target, the remainder is zero, and the band stops growing instead of stacking a
+/// constant on top of an already-tall row. Every degenerate input (strip off, zero
+/// target, non-finite scale) returns 0 — the byte-identical pre-C3 geometry.
+pub(crate) fn synthetic_band_head_px(
+    target_logical: f32,
+    pad_top_px: usize,
+    strip_rows: u16,
+    cell_h: usize,
+    scale: f64,
+) -> usize {
+    // NOT `target_logical <= 0.0`: that is FALSE for NaN, and this guard must
+    // send NaN down the degenerate path the doc comment above promises. The
+    // `partial_cmp` form says the same thing as the negated `>` it replaces —
+    // proceed ONLY on a definite Greater — while satisfying
+    // `clippy::neg_cmp_op_on_partial_ord`.
+    let target_is_positive = matches!(
+        target_logical.partial_cmp(&0.0),
+        Some(std::cmp::Ordering::Greater)
+    );
+    if strip_rows == 0 || !target_is_positive {
+        return 0;
+    }
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let target_px = crate::logical_to_device_px(target_logical, scale);
+    let strip_px = (strip_rows as usize).saturating_mul(cell_h);
+    let head = target_px
+        .saturating_sub(pad_top_px)
+        .saturating_sub(strip_px);
+    head.min(cell_h.saturating_mul(SYNTHETIC_BAND_HEAD_CELL_CAP))
 }
 
 /// GPU-present colour-space TAG for the window's CAMetalLayer (M3 phase A),
@@ -5686,6 +5994,17 @@ pub(crate) fn active_environment_override(key: &str) -> Option<ActiveEnvironment
             .ok()
             .filter(|value| !value.is_empty())
             .map(|value| resolved("ATERM_SHELL", value)),
+        // Reported UNVALIDATED, deliberately: this resolver's contract is "what
+        // ambient value is in force", and the front door's own fallback for an
+        // unrecognized spelling is `new_window` with a warning. Filtering an
+        // invalid value out here would show the operator a config value that is
+        // NOT what the launch will use, which is the confusion this whole
+        // resolver exists to prevent.
+        "windowing_behavior" => std::env::var("ATERM_WINDOWING_BEHAVIOR")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| resolved("ATERM_WINDOWING_BEHAVIOR", value)),
         "net.listen" => std::env::var("ATERM_NET_LISTEN")
             .ok()
             .map(|value| resolved("ATERM_NET_LISTEN", value)),
@@ -6115,6 +6434,7 @@ struct ReloadRenderSnapshot {
     text_blending: aterm_render::TextBlending,
     font_thicken: bool,
     stem_gamma: f32,
+    font_hinting: String,
     font_variations: Vec<(u32, f32)>,
     font_weight_dark_nudge: f32,
     render_knobs: RenderKnobs,
@@ -6135,6 +6455,7 @@ impl ReloadRenderSnapshot {
             text_blending: app.text_blending,
             font_thicken: app.font_thicken,
             stem_gamma: app.stem_gamma,
+            font_hinting: app.font_hinting.clone(),
             font_variations: app.font_variations.clone(),
             font_weight_dark_nudge: app.font_weight_dark_nudge,
             render_knobs: app.render_knobs,
@@ -6158,6 +6479,7 @@ impl ReloadRenderSnapshot {
         app.text_blending = self.text_blending;
         app.font_thicken = self.font_thicken;
         app.stem_gamma = self.stem_gamma;
+        app.font_hinting = self.font_hinting;
         app.font_variations = self.font_variations;
         app.font_weight_dark_nudge = self.font_weight_dark_nudge;
         app.render_knobs = self.render_knobs;
@@ -6221,6 +6543,7 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
         font_weight,
         font_weight_dark_nudge,
         stem_gamma,
+        font_hinting,
         line_height,
         adjust_baseline,
         adjust_underline_position,
@@ -6653,6 +6976,66 @@ impl App {
                 }
             }
         }
+        // C3 (Windows): the SYNTHETIC tab-band head, re-derived. Unlike macOS's
+        // band this one is COMPUTED, not sampled — from the window's own cell box,
+        // the live strip row count and the configured target — so it has to be
+        // re-derived on the one event every input funnels through. And they do all
+        // funnel through here: a font zoom and a config reload both re-grid every
+        // window via `rebuild_backend` → `on_resize`; a `tab_strip_rows` edit calls
+        // `on_resize` explicitly; a per-monitor DPI move produces the `Resized`
+        // winit emits after `ScaleFactorChanged`. Must run BEFORE `grid_dims_for`,
+        // which reserves the head out of the height (same ordering rule as macOS).
+        //
+        // ATTACHED windows only, mirroring every other head derivation in the file
+        // (`refresh_all_window_metrics`, `on_scale_factor_changed`): a never-attached
+        // window has no chrome to make room for, its record carries the sealed boot
+        // band, and seeding a synthetic one would move the geometry every headless
+        // capture/snapshot pins.
+        //
+        // `if cfg!(windows)` and NOT `#[cfg(windows)]` — the same form the macOS band
+        // block twelve lines above uses, and for the same reason `TabBandHeight::
+        // PLATFORM_DEFAULT` is a `cfg!` const rather than two `#[cfg]` items: this is
+        // the ONE non-test call site of the whole C3 config chain
+        // (`synthetic_strip_head_px` → `tab_band_height_or_default` → `TabBandHeight`
+        // → `synthetic_band_head_px`), so an attribute here would make every link
+        // unreachable off Windows and hand the lint gate (`-D warnings`, tools/verify.sh)
+        // six `dead_code` findings plus "field `tab_band_height` is never read" on
+        // macOS and Linux. As a runtime `false` the body still type-checks on every
+        // platform and still costs nothing: off Windows `PLATFORM_DEFAULT` is
+        // `Compact`, so the law would return 0 even if the branch DID run, and the
+        // optimiser drops it whole. The two other call sites (attach, the L1 early
+        // reveal) can stay `#[cfg(windows)]` — one live root is enough.
+        if cfg!(windows) {
+            let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
+            let cell_h = self.win_cell_size(wid).1;
+            let head = self.synthetic_strip_head_px(scale, cell_h);
+            if let Some(ws) = self
+                .windows
+                .get_mut(&wid)
+                .filter(|ws| ws.os_window.is_some())
+                && ws.metrics.head != head
+            {
+                // Stored in POINTS beside the applied px, like the measured macOS
+                // band, so the two SHARED re-derivations that read `head_pts`
+                // (`on_scale_factor_changed`, `refresh_all_window_metrics`) can
+                // reproduce a band for this window without knowing this law.
+                //
+                // POINTS ARE A LOSSY CARRIER FOR A DERIVED BAND, deliberately. The law
+                // is `round(target·scale) − pad_top(scale) − rows·cell_h(scale)`, and
+                // only the first term is proportional to `scale`; `round(head_pts·s')`
+                // therefore reproduces the law at a NEW scale only while `pad_top` and
+                // `cell_h` happen to move with the DPI too. Under `font_px_explicit`
+                // (or `ATERM_FORCE_SCALE`) the font — and so `cell_h` — is pinned, and
+                // the interim band is off by the residue. That is accepted, not
+                // overlooked: `ScaleFactorChanged` is always followed by the `Resized`
+                // winit emits for the new size, which lands right back here and
+                // re-derives from the law, so the drift can survive at most one frame
+                // and never reaches a committed geometry.
+                ws.head_pts = head as f64 / if scale > 0.0 { scale } else { 1.0 };
+                ws.metrics.head = head;
+                self.backend.set_head(head);
+            }
+        }
         let (rows, cols) = self.grid_dims_for(wid, size);
         // Phase 0.5: route through the seam so the window-resize and the control
         // `resize` verb share the one clamp + apply path. `echo_to_window: false`
@@ -6820,6 +7203,8 @@ impl App {
         self.backend.set_text_blending(self.text_blending);
         self.backend.set_font_thicken(self.font_thicken);
         self.backend.set_stem_gamma(self.stem_gamma);
+        let hinting = self.font_hinting.clone();
+        self.backend.set_font_hinting(&hinting);
         self.backend.set_line_height(self.render_knobs.line_height);
         self.backend
             .set_minimum_contrast(self.render_knobs.minimum_contrast);
@@ -8324,19 +8709,24 @@ impl App {
         let new_shaping = config.text_shaping();
         let shaping_changed = new_shaping != self.text_shaping;
         self.text_shaping = new_shaping;
-        // W2 typography knobs (`text_blending` / `font_thicken` / `stem_gamma`):
-        // same source-of-truth-before-rebuild discipline. All three change glyph
-        // APPEARANCE but not cell CONTENT, so a knob-only edit rides the shaping
-        // branch below (backend push + per-window present-cache invalidation).
+        // W2 typography knobs (`text_blending` / `font_thicken` / `stem_gamma`
+        // / `font_hinting`): same source-of-truth-before-rebuild discipline.
+        // All four change glyph APPEARANCE but not cell CONTENT (hinting never
+        // moves the linear advances — the hinted-seam contract), so a
+        // knob-only edit rides the shaping branch below (backend push +
+        // per-window present-cache invalidation).
         let new_blending = config.text_blending_or_default();
         let new_thicken = config.font_thicken_or_default();
         let new_stem_gamma = config.stem_gamma_or_default();
+        let new_font_hinting = config.font_hinting_or_default();
         let typography_changed = new_blending != self.text_blending
             || new_thicken != self.font_thicken
-            || (new_stem_gamma - self.stem_gamma).abs() > f32::EPSILON;
+            || (new_stem_gamma - self.stem_gamma).abs() > f32::EPSILON
+            || new_font_hinting != self.font_hinting;
         self.text_blending = new_blending;
         self.font_thicken = new_thicken;
         self.stem_gamma = new_stem_gamma;
+        self.font_hinting = new_font_hinting;
         // W5 renderer knobs: PURE diff — one KnobChange per changed key, each
         // routed to exactly one renderer call (`apply_render_knob`). A
         // line_height change alters the CELL GEOMETRY (every window re-grids),
@@ -8473,6 +8863,8 @@ impl App {
                 self.backend.set_text_blending(self.text_blending);
                 self.backend.set_font_thicken(self.font_thicken);
                 self.backend.set_stem_gamma(self.stem_gamma);
+                let hinting = self.font_hinting.clone();
+                self.backend.set_font_hinting(&hinting);
             }
             // W5: each changed knob → exactly one renderer call (LineHeight is
             // unreachable here — it takes the rebuild branch above).
@@ -8495,6 +8887,8 @@ impl App {
             self.backend.set_text_blending(self.text_blending);
             self.backend.set_font_thicken(self.font_thicken);
             self.backend.set_stem_gamma(self.stem_gamma);
+            let hinting = self.font_hinting.clone();
+            self.backend.set_font_hinting(&hinting);
             // W5: each changed knob → exactly one renderer call (LineHeight is
             // unreachable here — it takes the rebuild branch above).
             for &change in &knob_changes {
@@ -8563,6 +8957,103 @@ impl App {
     pub(crate) fn cfg_pad_top_for_scale(&self, scale: f64) -> usize {
         crate::logical_to_device_px(self.config.window_padding_top_or_default(), scale)
             .min(self.cfg_pad_for_scale(scale))
+    }
+
+    /// C3 — THE SYNTHETIC TAB-BAND HEAD, in DEVICE px, for a window at `scale`
+    /// whose cell box is `cell_h` px tall. `0` off Windows, `0` with the strip off,
+    /// `0` under `tab_band_height = "compact"`, and `0` whenever the strip's cell
+    /// rows already reach the target — every one of which reproduces the pre-C3
+    /// geometry byte for byte.
+    ///
+    /// WHY A `head` BAND AND NOT A BIGGER `pad_top`. The Windows band measured 21 px
+    /// (2 px lip + one 19 px cell row at FONT_PX 16 / 96 dpi) where a WinUI tab is
+    /// 32-34. Two mechanisms could close that:
+    ///
+    ///   * raise the Windows `window_padding_top` default — but `pad_top` is
+    ///     interior padding of the GRID. It applies with the strip OFF too, so a
+    ///     `tab_strip_rows = 0` window would silently gain a dead 11 px gutter and
+    ///     every geometry proof (`pad_split`, the asymmetric-pad lattice, hundreds
+    ///     of `pad_top` call sites) would have to move with it. That is a blast
+    ///     radius out of all proportion to a chrome tweak.
+    ///
+    ///   * a synthetic `head` — the band aterm ALREADY has for "host chrome that
+    ///     overlaps the grid", which is exactly what this is. `head` is reserved
+    ///     out of the height before the rows are fitted (`grid_dims_for`), added
+    ///     back by `frame_size`, stripped by `pixel_to_term_cell` /
+    ///     `strip_col_for_pixel` (a click in the head band over the strip already
+    ///     maps to the strip — `gy` saturates to 0), filled edge-to-edge in the
+    ///     band tone by `fill_chrome_bleed`'s `[0, grid_top)` rule, and folded into
+    ///     the pixel band's optical centring through `band_top_px = pad_top + head`
+    ///     (and into its cache key, so a change re-rasters exactly once). Nothing
+    ///     new has to learn about it.
+    ///
+    /// It is gated on `tab_strip_rows > 0` for the same reason the first bullet is
+    /// rejected: a band with nothing in it is not chrome, it is a shifted grid.
+    ///
+    /// Takes `cell_h` rather than reading it, because the two callers that matter
+    /// hold a cell box the per-window `MetricsView` does not yet (attach, before
+    /// the record is written) or cannot (the L1 early reveal, whose whole premise
+    /// is CACHED metrics from a previous run).
+    ///
+    /// COMPILED ON EVERY PLATFORM, not `#[cfg(windows)]`. It is the one non-test
+    /// consumer of the C3 config chain (`Config::tab_band_height_or_default`,
+    /// [`TabBandHeight`], [`synthetic_band_head_px`], [`TAB_BAND_STANDARD_LOGICAL_PX`],
+    /// `SYNTHETIC_BAND_HEAD_CELL_CAP`), so gating it out would make all of them
+    /// unreachable off Windows and break the `-D warnings` gate on macOS and Linux
+    /// with a fan of `dead_code` findings. Off Windows it is not a stub either: the
+    /// law genuinely evaluates to 0 there, because [`TabBandHeight::PLATFORM_DEFAULT`]
+    /// is `Compact` and a `compact` target collapses the whole derivation. The `0`
+    /// promised in the first paragraph is therefore a RESULT, computed by the same
+    /// arithmetic Windows runs, not a platform special case — which is also what
+    /// keeps the chain type-checked and test-covered on the platforms that never
+    /// call it (see `tab_band_height_tests`).
+    pub(crate) fn synthetic_strip_head_px(&self, scale: f64, cell_h: usize) -> usize {
+        synthetic_band_head_px(
+            self.config.tab_band_height_or_default().target_logical_px(),
+            self.cfg_pad_top_for_scale(scale),
+            self.tab_strip_rows,
+            cell_h,
+            scale,
+        )
+    }
+
+    // NOTE: no non-Windows TWIN, deliberately — one function, one law, every
+    // platform. Off Windows the synthetic band does not exist (macOS's `head` is a
+    // MEASURED AppKit titlebar — see `AppRt::titlebar_band_pts` — and Linux's in-grid
+    // strip keeps its cell-row height), but that absence is expressed by
+    // `PLATFORM_DEFAULT = Compact` returning 0 through the shared arithmetic, not by
+    // a second `#[cfg]` body. The one Windows-shaped guard that DOES have to stay a
+    // guard is the CALL in `on_resize`, and it is a runtime `if cfg!(windows)` for
+    // the same reason: on macOS `ws.metrics.head` holds a real measured titlebar
+    // band, so letting the C3 write run there would clobber it with this law's 0.
+
+    /// THE HONESTY DRAIN. Move anything queued on the deferred notice lane
+    /// ([`crate::config_notice::queue_deferred`]) into the in-window banner — the
+    /// one surface a Start-Menu / Explorer launch actually has, since a
+    /// GUI-subsystem process's stderr is a closed handle there.
+    ///
+    /// Called from `about_to_wait`, i.e. on EVERY event-loop park, because the
+    /// queuing sites are spread across three contexts that cannot reach `App`: the
+    /// backend BUILD THREAD (GPU init failed → the backdrop is withdrawn), an
+    /// `AppRt` chrome call handed only a `&Window` (the material is styling the
+    /// caption only), and `run()` itself before `App` is constructed (hdr_glow and
+    /// the material are mutually exclusive). The check is one relaxed atomic load
+    /// when the lane is empty, which it is on every park but a handful per run.
+    ///
+    /// MERGES rather than replaces: the startup config banner may still be up, and
+    /// overwriting it would trade the user's typo'd keybinding warnings for one
+    /// chrome sentence.
+    pub(crate) fn drain_deferred_config_notices(&mut self) {
+        let lines = crate::config_notice::take_deferred();
+        if lines.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match self.config_notice.as_mut().filter(|n| !n.is_expired(now)) {
+            Some(live) => live.extend(lines, now),
+            None => self.config_notice = crate::config_notice::ConfigNotice::new(lines, now),
+        }
+        self.request_redraw_all_windows();
     }
 
     pub(crate) fn refresh_all_window_metrics(&mut self) {
@@ -11293,6 +11784,347 @@ mod window_theme_tests {
     }
 }
 
+/// C3 — the tab band's height policy and the synthetic-head arithmetic that
+/// realizes it. The law is pure, so the whole geometry is provable without a
+/// window; the ONE host-dependent fact (the real cell height of the shipped face)
+/// gets its own Windows test below.
+#[cfg(test)]
+mod tab_band_height_tests {
+    use super::{Config, TabBandHeight, synthetic_band_head_px};
+
+    fn cfg(toml: &str) -> Config {
+        toml::from_str(toml).expect("valid toml")
+    }
+
+    /// The absent-key default is PER-PLATFORM — `standard` only where the in-grid
+    /// band is the window's actual tab chrome. Asserted against `cfg!` so the same
+    /// test is honest on every host.
+    #[test]
+    fn tab_band_height_defaults_per_platform_when_absent() {
+        let expected = if cfg!(windows) {
+            TabBandHeight::Standard
+        } else {
+            TabBandHeight::Compact
+        };
+        assert_eq!(TabBandHeight::PLATFORM_DEFAULT, expected);
+        assert_eq!(Config::default().tab_band_height_or_default(), expected);
+        assert_eq!(cfg("font_px = 14.0").tab_band_height_or_default(), expected);
+    }
+
+    #[test]
+    fn tab_band_height_explicit_values_override_the_platform_default() {
+        assert_eq!(
+            cfg("tab_band_height = \"compact\"").tab_band_height_or_default(),
+            TabBandHeight::Compact
+        );
+        assert_eq!(
+            cfg("tab_band_height = \"standard\"").tab_band_height_or_default(),
+            TabBandHeight::Standard
+        );
+        // Trimmed + case-insensitive, like every other enum key.
+        assert_eq!(
+            cfg("tab_band_height = \"  STANDARD \"").tab_band_height_or_default(),
+            TabBandHeight::Standard
+        );
+    }
+
+    #[test]
+    fn tab_band_height_invalid_falls_back_to_platform_default() {
+        assert_eq!(
+            cfg("tab_band_height = \"huge\"").tab_band_height_or_default(),
+            TabBandHeight::PLATFORM_DEFAULT
+        );
+        assert_eq!(
+            cfg("tab_band_height = \"\"").tab_band_height_or_default(),
+            TabBandHeight::PLATFORM_DEFAULT
+        );
+        assert_eq!(TabBandHeight::parse("nope"), None);
+    }
+
+    /// THE DEFECT THIS BUNDLE EXISTS TO AVOID: with the strip OFF there is no band,
+    /// so there must be no head — otherwise the knob would push every grid down by
+    /// a gutter with nothing in it. Held for BOTH targets and every scale.
+    #[test]
+    fn no_strip_means_no_head_at_any_target_or_scale() {
+        for target in [0.0, 32.0, 40.0] {
+            for scale in [1.0, 1.25, 1.5, 2.0] {
+                assert_eq!(
+                    synthetic_band_head_px(target, 2, 0, 21, scale),
+                    0,
+                    "target {target} scale {scale}"
+                );
+            }
+        }
+    }
+
+    /// `compact` is the pre-C3 geometry, exactly: a zero target cannot produce a
+    /// head no matter what the rest of the band measures.
+    #[test]
+    fn compact_is_byte_identical_to_the_pre_c3_geometry() {
+        assert_eq!(TabBandHeight::Compact.target_logical_px(), 0.0);
+        for rows in 1..=4u16 {
+            for cell_h in [10, 14, 21, 28] {
+                assert_eq!(
+                    synthetic_band_head_px(
+                        TabBandHeight::Compact.target_logical_px(),
+                        2,
+                        rows,
+                        cell_h,
+                        1.5
+                    ),
+                    0
+                );
+            }
+        }
+    }
+
+    /// The whole point: `head + pad_top + strip_rows·cell_h` lands ON the target,
+    /// at 96 dpi and at 150%. These are the shipped Windows numbers — a 2 px top
+    /// pad and one strip row — with the cell heights the default face produces.
+    #[test]
+    fn standard_totals_the_target_band_at_96dpi_and_150_percent() {
+        let target = TabBandHeight::Standard.target_logical_px();
+        // 96 dpi: 32 px band = 2 pad + 21 row + 9 head.
+        let head = synthetic_band_head_px(target, 2, 1, 21, 1.0);
+        assert_eq!(head, 9);
+        assert_eq!(head + 2 + 21, 32, "the band the viewer sees IS the target");
+        // 150%: the target scales with the DPI (48 px), and so does everything it
+        // is measured against, so the residue is re-derived rather than scaled.
+        let head = synthetic_band_head_px(target, 3, 1, 28, 1.5);
+        assert_eq!(head, 48 - 3 - 28);
+        assert_eq!(head + 3 + 28, 48);
+    }
+
+    /// A SUBTRACTION, not an addition: once the strip's own rows reach the target
+    /// (a big font, or `tab_strip_rows = 2`), the band stops growing instead of
+    /// stacking a constant on top of an already-tall row.
+    #[test]
+    fn a_tall_strip_absorbs_the_target_and_the_head_collapses() {
+        let target = TabBandHeight::Standard.target_logical_px();
+        assert_eq!(synthetic_band_head_px(target, 2, 1, 30, 1.0), 0);
+        assert_eq!(synthetic_band_head_px(target, 2, 1, 64, 1.0), 0);
+        assert_eq!(synthetic_band_head_px(target, 2, 2, 21, 1.0), 0);
+    }
+
+    /// The backstop: even a pathological target cannot push the grid down by more
+    /// than [`super::SYNTHETIC_BAND_HEAD_CELL_CAP`] cells, and a non-finite or
+    /// non-positive scale is treated as 1.0 rather than producing a NaN band.
+    #[test]
+    fn the_head_is_capped_and_degenerate_scales_are_survivable() {
+        assert_eq!(
+            synthetic_band_head_px(4000.0, 0, 1, 10, 1.0),
+            10 * super::SYNTHETIC_BAND_HEAD_CELL_CAP
+        );
+        for scale in [f64::NAN, f64::INFINITY, 0.0, -2.0] {
+            assert_eq!(synthetic_band_head_px(32.0, 2, 1, 21, scale), 9);
+        }
+    }
+
+    /// A NON-FINITE TARGET is degenerate too, and the doc comment promises it
+    /// returns 0 — but only `scale` was covered above, so the guard that
+    /// implements it for `target_logical` was untested.
+    ///
+    /// It matters because the natural-looking rewrite is WRONG: the guard reads
+    /// `!(target > 0.0)` rather than `target <= 0.0` precisely because the
+    /// latter is FALSE for NaN and would let a NaN target through into the
+    /// pixel arithmetic. This pins the behaviour so the next author who tidies
+    /// that comparison finds out here instead of on a user's screen.
+    #[test]
+    fn a_non_finite_or_non_positive_target_yields_no_head() {
+        for target in [f32::NAN, f32::NEG_INFINITY, 0.0, -32.0] {
+            assert_eq!(
+                synthetic_band_head_px(target, 2, 1, 21, 1.0),
+                0,
+                "degenerate target {target} must collapse the head"
+            );
+        }
+        // POSITIVE INFINITY is deliberately NOT in that list: `inf > 0.0` is
+        // TRUE, so it passes the guard and is bounded by the cell cap like any
+        // other oversized target. The doc comment promises 0 for a non-finite
+        // SCALE, not for a non-finite target — writing this test is what
+        // established the difference, so it is pinned here rather than left to
+        // be rediscovered.
+        assert_eq!(
+            synthetic_band_head_px(f32::INFINITY, 0, 1, 10, 1.0),
+            10 * super::SYNTHETIC_BAND_HEAD_CELL_CAP
+        );
+        // The control: the SAME inputs with a finite positive target do produce
+        // a head, so the assertions above are not passing for some other reason.
+        assert_ne!(synthetic_band_head_px(32.0, 2, 1, 21, 1.0), 0);
+    }
+
+    /// The HOST-DEPENDENT half, Windows only: against the face aterm actually
+    /// ships with at the Windows `FONT_PX`, the standard band really does reach
+    /// the target (or, if this host's face is unusually tall, the head correctly
+    /// collapses to 0 — never a partial band that overshoots).
+    #[cfg(windows)]
+    #[test]
+    fn the_shipped_windows_face_reaches_the_standard_band() {
+        let Some(renderer) =
+            aterm_render::Renderer::from_system(crate::FONT_PX, aterm_render::Theme::default())
+        else {
+            eprintln!("SKIP: no system monospace font");
+            return;
+        };
+        let target = TabBandHeight::Standard.target_logical_px();
+        let pad_logical = Config::default().window_padding_top_or_default();
+        let mut renderer = renderer;
+        // Both DPI regimes a Windows laptop actually runs at. `hidpi_target_font_px`
+        // is the SAME derivation attach applies, so the 150% row is the real one.
+        for scale in [1.0_f64, 1.5] {
+            // `app_window::hidpi_target_font_px`'s auto-font arm, inlined: it is
+            // module-private, and the derivation IS this one line.
+            let px = if scale > 1.0 {
+                (crate::FONT_PX * scale as f32).round()
+            } else {
+                crate::FONT_PX
+            };
+            renderer.set_px(px);
+            let (_, cell_h) = renderer.cell_size();
+            let pad_top = crate::logical_to_device_px(pad_logical, scale);
+            let head = synthetic_band_head_px(target, pad_top, 1, cell_h, scale);
+            let band = head + pad_top + cell_h;
+            eprintln!(
+                "C3 band at scale {scale}: font_px={px} cell_h={cell_h} pad_top={pad_top} \
+                 before={} head={head} band={band}",
+                pad_top + cell_h
+            );
+            if head > 0 {
+                assert_eq!(
+                    band,
+                    crate::logical_to_device_px(target, scale),
+                    "the band lands ON the WinUI target at scale {scale}"
+                );
+            } else {
+                assert!(
+                    band >= crate::logical_to_device_px(target, scale),
+                    "a zero head is only correct when the strip already fills the band"
+                );
+            }
+        }
+    }
+
+    /// THE LINT-GATE GUARD, and the one proof in this module that a Windows host
+    /// cannot get from running the code.
+    ///
+    /// `App::synthetic_strip_head_px` is the ONLY non-test consumer of this entire
+    /// chain — `Config::tab_band_height_or_default` → [`TabBandHeight`] (+
+    /// `PLATFORM_DEFAULT`, `parse`, `target_logical_px`) → [`synthetic_band_head_px`]
+    /// → `TAB_BAND_STANDARD_LOGICAL_PX`, `SYNTHETIC_BAND_HEAD_CELL_CAP`, and the
+    /// `Config::tab_band_height` field itself. Gate that one function (or its one
+    /// mandatory call site) behind a `#[cfg(windows)]` ATTRIBUTE and every link goes
+    /// unreachable on macOS and Linux: half a dozen `dead_code` findings plus "field
+    /// `tab_band_height` is never read", against a workspace gate that is
+    /// `clippy --workspace --all-targets -- -D warnings`. Nothing on a Windows host
+    /// can observe that — `cargo check` here is green either way — so the invariant
+    /// is pinned in SOURCE, which every host can read.
+    ///
+    /// The fix it pins is not a suppression: `PLATFORM_DEFAULT` is `Compact` off
+    /// Windows, so the law genuinely evaluates to 0 there. A runtime `if cfg!(windows)`
+    /// keeps the body compiled and type-checked on every platform while still never
+    /// executing off Windows — which matters, because on macOS `ws.metrics.head`
+    /// holds a real MEASURED titlebar band that this law's 0 would clobber.
+    #[test]
+    fn the_c3_chain_keeps_a_call_site_compiled_on_every_platform() {
+        let src = include_str!("app_config.rs");
+
+        // (a) The definition itself carries no `cfg` gate. Walk back over the doc
+        //     block to the first real line: an attribute, if any, lives there.
+        let decl = "pub(crate) fn synthetic_strip_head_px(";
+        let at = src
+            .find(decl)
+            .expect("synthetic_strip_head_px is defined here");
+        let above = src[..at]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && !l.starts_with("//"))
+            .unwrap_or_default();
+        assert!(
+            !above.starts_with("#[cfg"),
+            "synthetic_strip_head_px must stay COMPILED on every platform (found {above:?} \
+             directly above it): it is the only non-test consumer of the tab_band_height \
+             chain, so gating it out hands macOS/Linux a fan of dead_code warnings against \
+             a `-D warnings` gate. Off Windows the law already returns 0 by itself \
+             (PLATFORM_DEFAULT = Compact) — there is nothing to gate."
+        );
+
+        // (b) …and its ONE mandatory call site gates at RUNTIME, so the call survives
+        //     into the non-Windows HIR and keeps the chain live.
+        let call = "let head = self.synthetic_strip_head_px(scale, cell_h);";
+        let at = src.find(call).expect("the on_resize C3 call site is here");
+        let gate = src[..at]
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|l| l.starts_with("#[cfg") || l.starts_with("if cfg!"))
+            .unwrap_or_default();
+        assert_eq!(
+            gate, "if cfg!(windows) {",
+            "the on_resize C3 block must gate with a runtime `if cfg!(windows)` (the form \
+             the macOS band block above it uses), not a `#[cfg]` attribute — an attribute \
+             deletes the only live call site off Windows and takes the whole chain with it"
+        );
+    }
+}
+
+/// THE HONESTY GAP — the deferred notice lane's App-side half. The queuing sites
+/// (the backend build thread, an `AppRt` chrome call, `run()` before `App` exists)
+/// cannot be driven from a unit test, but the drain they all feed can, and the
+/// drain is where the interesting policy lives.
+#[cfg(test)]
+mod deferred_config_notice_tests {
+    use crate::config_notice::{ConfigNotice, lane_test_guard, queue_deferred};
+
+    /// A late chrome explanation must not COST the user their config warnings.
+    /// The naive `self.config_notice = ConfigNotice::new(..)` (the shape every
+    /// other one-off notice site uses) would silently drop the startup banner's
+    /// contents to show one sentence about Mica.
+    #[test]
+    fn a_deferred_notice_merges_into_a_live_banner_instead_of_replacing_it() {
+        let _guard = lane_test_guard();
+        let _ = crate::config_notice::take_deferred();
+        let mut app = crate::App::headless_for_test();
+        app.config_notice = ConfigNotice::new(
+            vec!["config keybindings: dropped a bad chord".to_string()],
+            std::time::Instant::now(),
+        );
+        queue_deferred("background_material has no effect while hdr_glow is on".to_string());
+        app.drain_deferred_config_notices();
+        let notice = app.config_notice.as_ref().expect("banner still up");
+        assert!(
+            notice
+                .lines
+                .iter()
+                .any(|l| l.contains("dropped a bad chord")),
+            "the config warning survived: {:?}",
+            notice.lines
+        );
+        assert!(
+            notice.lines.iter().any(|l| l.contains("hdr_glow")),
+            "and the chrome explanation joined it: {:?}",
+            notice.lines
+        );
+    }
+
+    /// With NO banner up (the common case — the lane fires seconds after a clean
+    /// startup) the drain raises one, and an empty lane is a complete no-op so the
+    /// per-park cost is a single atomic load.
+    #[test]
+    fn the_drain_raises_a_banner_when_none_is_up_and_no_ops_when_the_lane_is_empty() {
+        let _guard = lane_test_guard();
+        let _ = crate::config_notice::take_deferred();
+        let mut app = crate::App::headless_for_test();
+        app.config_notice = None;
+        app.drain_deferred_config_notices();
+        assert!(app.config_notice.is_none(), "an empty lane raises nothing");
+        queue_deferred("the GPU was lost".to_string());
+        app.drain_deferred_config_notices();
+        let notice = app.config_notice.as_ref().expect("banner raised");
+        assert!(notice.lines.iter().any(|l| l.contains("GPU was lost")));
+    }
+}
+
 #[cfg(test)]
 mod right_click_tests {
     use super::{Config, RightClickGesture};
@@ -11356,6 +12188,76 @@ mod right_click_tests {
             RightClickGesture::parse("copy_paste"),
             Some(RightClickGesture::CopyPaste)
         );
+    }
+}
+
+/// C5 REMEDIATION — the tab-menu chord's ESCAPE HATCH. The chord is not in the
+/// rebindable `[keybindings]` table by design, so this knob is the ONLY way a
+/// user gives the keys back; it has to parse, default, and fail safe.
+#[cfg(test)]
+mod tab_menu_chord_tests {
+    use super::{Config, TabMenuChord};
+
+    fn cfg(toml: &str) -> Config {
+        toml::from_str(toml).expect("valid toml")
+    }
+
+    /// Absent ⇒ `On` — an unedited config keeps both Windows spellings, which
+    /// is what shipped.
+    #[test]
+    fn absent_claims_both_spellings() {
+        assert_eq!(
+            Config::default().tab_menu_chord_or_default(),
+            TabMenuChord::On
+        );
+        assert_eq!(
+            cfg("font_px = 14.0").tab_menu_chord_or_default(),
+            TabMenuChord::On
+        );
+        assert!(TabMenuChord::On.claims_menu_key());
+        assert!(TabMenuChord::On.claims_shift_f10());
+    }
+
+    /// The point of the middle value: hand ⇧F10 back (a real legacy-encodable
+    /// chord) while keeping the Menu key (which no legacy mode reports at all).
+    #[test]
+    fn menu_key_surrenders_shift_f10_and_off_surrenders_both() {
+        let only = cfg("tab_menu_chord = \"menu_key\"").tab_menu_chord_or_default();
+        assert_eq!(only, TabMenuChord::MenuKey);
+        assert!(only.claims_menu_key());
+        assert!(
+            !only.claims_shift_f10(),
+            "⇧F10 goes back to the application"
+        );
+
+        let off = cfg("tab_menu_chord = \"off\"").tab_menu_chord_or_default();
+        assert_eq!(off, TabMenuChord::Off);
+        assert!(!off.claims_menu_key());
+        assert!(!off.claims_shift_f10());
+    }
+
+    /// Case-insensitive, trimmed, dash alias — and an unknown value WARNS AND
+    /// DEFAULTS rather than failing the config or silently disabling the menu.
+    #[test]
+    fn parsing_is_forgiving_and_invalid_falls_back_to_on() {
+        assert_eq!(
+            cfg("tab_menu_chord = \" Menu-Key \"").tab_menu_chord_or_default(),
+            TabMenuChord::MenuKey
+        );
+        assert_eq!(
+            cfg("tab_menu_chord = \"BOTH\"").tab_menu_chord_or_default(),
+            TabMenuChord::On
+        );
+        assert_eq!(
+            cfg("tab_menu_chord = \"nope\"").tab_menu_chord_or_default(),
+            TabMenuChord::On
+        );
+        assert_eq!(
+            cfg("tab_menu_chord = \"\"").tab_menu_chord_or_default(),
+            TabMenuChord::On
+        );
+        assert_eq!(TabMenuChord::parse("nope"), None);
+        assert_eq!(TabMenuChord::parse("off"), Some(TabMenuChord::Off));
     }
 }
 

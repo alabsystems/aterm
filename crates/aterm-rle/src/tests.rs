@@ -17,27 +17,22 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
         run_total, rle.total_length,
         "sum of run lengths must match total_length at step {step}"
     );
-    assert_eq!(
-        rle.prefix_sums.len(),
-        rle.runs.len(),
-        "prefix_sums cache length mismatch at step {step}"
-    );
-
+    // The prefix-sum index this used to cross-check was deleted (it cost an
+    // allocation per constructed Rle and no production caller read it). The
+    // invariant it existed to protect — run starts accumulate exactly to
+    // `total_length`, with no zero-length run — is checked directly on `runs`,
+    // which is now the sole structure `find_run` walks.
     let mut expected_start = 0u32;
     for (run_idx, run) in rle.runs.iter().enumerate() {
         assert!(
             run.length > 0,
             "zero-length run at index {run_idx} (step {step})"
         );
-        assert_eq!(
-            rle.prefix_sums[run_idx], expected_start,
-            "prefix_sums[{run_idx}] mismatch at step {step}"
-        );
         expected_start += run.length;
     }
     assert_eq!(
         expected_start, rle.total_length,
-        "prefix_sums terminal offset mismatch at step {step}"
+        "run starts must accumulate to total_length at step {step}"
     );
 
     for (idx, expected) in model.iter().copied().enumerate() {
@@ -274,10 +269,17 @@ fn rle_set_range_linear_iterations() {
     );
 }
 
-/// Verify that `Rle::get` uses O(log n) binary search — iteration count
-/// is constant (1) regardless of run count when prefix sums are cached.
+/// Verify that `Rle::get` walks the runs linearly and lands EXACTLY on the run
+/// holding the index.
+///
+/// The prefix-sum index that made this a binary search was deleted: it cost one
+/// allocation on every constructed `Rle` (paid per materialized scrollback
+/// line, including the all-default lines whose `Rle` is discarded unread) and no
+/// production caller ever reached a reader that consulted it. What has to stay
+/// true is the walk's exactness, which is what this pins: reaching the LAST run
+/// costs exactly `run_count` steps, and the value is right.
 #[test]
-fn rle_get_uses_binary_search() {
+fn rle_get_walks_runs_linearly() {
     fn measure_get_last(run_count: u32) -> usize {
         let mut rle: Rle<u8> = Rle::new();
         for i in 0..run_count {
@@ -299,16 +301,18 @@ fn rle_get_uses_binary_search() {
     let small = measure_get_last(1_000);
     let large = measure_get_last(10_000);
 
-    // Binary search counts exactly 1 iteration per lookup.
-    // Both sizes should use the same number of iterations (O(1) counted).
-    assert_eq!(small, 1, "binary search should count 1 iteration (small)");
-    assert_eq!(large, 1, "binary search should count 1 iteration (large)");
+    // The walk visits one run per step and stops on the one that contains the
+    // index, so reaching the last of R runs is exactly R steps — and scaling
+    // with R is the honest signature of the linear walk.
+    assert_eq!(small, 1_000, "linear walk visits every run (small)");
+    assert_eq!(large, 10_000, "linear walk visits every run (large)");
 }
 
-/// Verify that first and last element lookups both use O(1) iterations
-/// with binary search (no asymmetry between first and last access).
+/// Verify that a FIRST-element lookup stops immediately while a last-element
+/// lookup walks to the end — the asymmetry that is inherent to the linear walk,
+/// pinned so an accidental off-by-one in the accumulator shows up as a count.
 #[test]
-fn rle_get_first_vs_last_both_constant() {
+fn rle_get_first_stops_at_one_iteration() {
     let mut rle: Rle<u8> = Rle::new();
     let n = 5_000u32;
     for i in 0..n {
@@ -325,22 +329,22 @@ fn rle_get_first_vs_last_both_constant() {
 
     assert_eq!(
         first_iters, 1,
-        "first-element lookup should use binary search (1 iter)"
+        "first-element lookup must stop on the first run"
     );
     assert_eq!(
-        last_iters, 1,
-        "last-element lookup should use binary search (1 iter)"
+        last_iters, n as usize,
+        "last-element lookup walks every run exactly once"
     );
 }
 
-/// Verify prefix-sum cache invariants across mixed mutation sequences.
+/// Verify the run-structure invariants across mixed mutation sequences.
 ///
-/// This directly checks the binary-search precondition:
-/// `prefix_sums[i] == sum(runs[0..i].length)` after each mutation.
+/// This is the `find_run` precondition: run lengths are non-zero and accumulate
+/// exactly to `total_length` after every mutation, so the linear walk lands on
+/// the right run for every in-bounds index.
 #[test]
-fn rle_prefix_sums_consistent_across_mutations() {
+fn rle_run_structure_consistent_across_mutations() {
     let mut rle = Rle::from_iter([0u8, 1, 1, 2, 2, 2, 3, 3]);
-    rle.rebuild_prefix_sums();
     let mut model: Vec<u8> = rle.iter().collect();
     assert_rle_matches_model(&rle, &model, 0);
 

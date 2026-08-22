@@ -39,13 +39,19 @@ aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel) — and, from v0.44.0, for Linux x86_64 as a tarball on the same
 releases — from the public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
-Every macOS release is the same app in two containers:
+Every macOS release is the same app in three containers (the Intel DMG joins
+with the first cut after 2026-08-22; older releases carry the first two):
 
-- **`aterm-X.Y.0.dmg` (~1.1 GB) — batteries included.** The app with the
-  whole published ALab toolchain sealed inside it, so the first launch
-  installs the compilers, solvers, and provers with no network at all. The
-  DMG is big for exactly one reason: about a gigabyte of it is that toolchain
-  seed, riding inside the signed app.
+- **`aterm-X.Y.0.dmg` (~1.1 GB) — batteries included, Apple silicon.** The app
+  with the published ALab toolchain sealed inside it, so the first launch
+  installs the compilers, solvers, and provers with no network at all. The DMG
+  is big for exactly one reason: about a gigabyte of it is that toolchain seed,
+  riding inside the signed app. From the first cut after 2026-08-22 the seed is
+  packed for THIS architecture only (~1.1 GB instead of the dual-arch 2.1 GB);
+  a release from before that date is the single dual-arch DMG.
+- **`aterm-X.Y.0-x86_64.dmg` (~0.96 GB) — batteries included, Intel.** The
+  identical signed, notarized universal app; the seed carries the x86_64
+  builds of every ALab program instead.
 - **`aterm-X.Y.0-mac.zip` (~26 MB) — the same signed, notarized app alone.**
   The toolchain installs on demand instead: `aterm pkg install --default-set`.
 

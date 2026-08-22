@@ -13,8 +13,64 @@ use super::Terminal;
 /// Maximum paste size in bytes (16 MiB). Pastes exceeding this are truncated
 /// at a char boundary to prevent unbounded memory allocation (#7379).
 const MAX_PASTE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum UTF-8 prefix inspected synchronously by the GUI's cursor-gesture
+/// admission probe. Formatting still consumes the full bounded paste off the
+/// event thread; admission is deliberately conservative beyond this prefix.
+const PASTE_GESTURE_PROBE_BYTES: usize = 4 * 1024;
+
+/// Return the prefix the paste formatter is permitted to inspect, ending on a
+/// UTF-8 boundary.  Keep the payload probe and formatter on this one boundary
+/// so text surviving only beyond the 16 MiB cap cannot arm an input gesture
+/// that no emitted byte can represent.
+#[inline]
+fn bounded_paste_text(text: &str) -> &str {
+    if text.len() <= MAX_PASTE_BYTES {
+        return text;
+    }
+    let mut end = MAX_PASTE_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Sanitizer policy shared by paste formatting and its allocation-free
+/// authored-payload probe.
+#[inline]
+fn paste_char_allowed(c: char) -> bool {
+    !(c.is_control() && c != '\t' && c != '\n' && c != '\r')
+}
+
+/// Whether one sanitizer-surviving character can advance/reposition a terminal
+/// cursor. Zero-width combining marks, variation selectors and joiners may
+/// legitimately egress as text, but cannot own a landing by themselves.
+#[inline]
+fn paste_char_can_move(c: char) -> bool {
+    paste_char_allowed(c) && (matches!(c, '\t' | '\n' | '\r') || aterm_grapheme::char_width(c) > 0)
+}
 
 impl Terminal {
+    /// Whether a paste contains at least one authored character that survives
+    /// the formatter's control-character sanitizer in a small bounded prefix.
+    ///
+    /// This deliberately ignores bracketed-paste wrapper bytes: an empty pair
+    /// of wrappers carries protocol framing but cannot author a cursor landing,
+    /// so it must not license a cursor-trail gesture. The scan allocates
+    /// nothing, stops at the first ordinary character (the typical path), and
+    /// examines at most [`PASTE_GESTURE_PROBE_BYTES`] bytes so an adversarial
+    /// 16 MiB control-only clipboard cannot stall the UI thread. A payload
+    /// hidden behind a larger control-only prefix still egresses normally but
+    /// conservatively receives no trail licence.
+    #[must_use]
+    pub fn paste_has_payload(text: &str) -> bool {
+        let text = bounded_paste_text(text);
+        let mut end = text.len().min(PASTE_GESTURE_PROBE_BYTES);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text[..end].chars().any(paste_char_can_move)
+    }
+
     /// Get a reference to the tiered scrollback storage, if attached.
     #[must_use]
     pub fn scrollback(&self) -> Option<&crate::scrollback::ScrollbackStorage> {
@@ -291,15 +347,7 @@ impl Terminal {
     #[must_use]
     pub fn format_paste(&self, text: &str) -> Vec<u8> {
         // Truncate at char boundary to prevent unbounded allocation (#7379).
-        let text = if text.len() > MAX_PASTE_BYTES {
-            let mut end = MAX_PASTE_BYTES;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            &text[..end]
-        } else {
-            text
-        };
+        let text = bounded_paste_text(text);
 
         if self.modes.bracketed_paste {
             // Strip every non-printable control char except TAB and the line breaks
@@ -307,10 +355,7 @@ impl Terminal {
             // \x1b[201~ to end the bracket region early), the C1 controls 0x80-0x9F
             // (0x9B C1 CSI can also terminate it: \x9B201~), DEL, and the C0 signals
             // (ETX/Ctrl-C, EOT, SUB, …) a hostile clipboard could otherwise smuggle in.
-            let sanitized: String = text
-                .chars()
-                .filter(|&c| !(c.is_control() && c != '\t' && c != '\n' && c != '\r'))
-                .collect();
+            let sanitized: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
             // Convert newlines to CR: terminals expect CR for line breaks in
             // pasted text; LF alone moves the cursor down without returning
             // to column 0 (#7773).
@@ -327,10 +372,7 @@ impl Terminal {
             // enabled, #7411), this also drops the C0 signal bytes (0x03 SIGINT, 0x04
             // EOF, 0x1a SUSP, …) a hostile clipboard could deliver to a non-bracketed
             // reader (REPL / `read` / cooked-mode app) to hijack the rest of the paste.
-            let cleaned: String = text
-                .chars()
-                .filter(|&c| !(c.is_control() && c != '\t' && c != '\n' && c != '\r'))
-                .collect();
+            let cleaned: String = text.chars().filter(|&c| paste_char_allowed(c)).collect();
             // Convert newlines to CR (#7773).
             cleaned
                 .replace("\r\n", "\r")
@@ -342,7 +384,7 @@ impl Terminal {
 
 #[cfg(test)]
 mod tests {
-    use super::Terminal;
+    use super::{MAX_PASTE_BYTES, PASTE_GESTURE_PROBE_BYTES, Terminal};
 
     fn write_lines(t: &mut Terminal, start: usize, n: usize) {
         for i in start..start + n {
@@ -481,6 +523,35 @@ mod tests {
     fn unbracketed_paste_strips_escape_and_c1() {
         let term = Terminal::new(24, 80);
         assert_eq!(term.format_paste("a\x1b[31mb\u{009D}c"), b"a[31mbc");
+    }
+
+    #[test]
+    fn paste_payload_probe_is_the_formatter_sanitizer_without_protocol_wrappers() {
+        assert!(!Terminal::paste_has_payload(""));
+        assert!(!Terminal::paste_has_payload("\x1b\x03\u{009b}\x7f"));
+        assert!(!Terminal::paste_has_payload("\u{0301}\u{fe0f}\u{200d}"));
+        assert!(Terminal::paste_has_payload("\t"));
+        assert!(Terminal::paste_has_payload("\n"));
+        assert!(Terminal::paste_has_payload("中文🙂"));
+
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?2004h");
+        assert_eq!(term.format_paste(""), b"\x1b[200~\x1b[201~");
+        assert!(
+            !Terminal::paste_has_payload(""),
+            "bracket wrappers are protocol framing, not authored movement"
+        );
+
+        let adversarial = "\x1b".repeat(MAX_PASTE_BYTES);
+        assert!(
+            !Terminal::paste_has_payload(&adversarial),
+            "a cap-sized control-only paste stays dark on the bounded probe"
+        );
+        let hidden = format!("{}x", "\x1b".repeat(PASTE_GESTURE_PROBE_BYTES));
+        assert!(
+            !Terminal::paste_has_payload(&hidden),
+            "content beyond the constant-cost prefix is conservatively unlicensed"
+        );
     }
 
     /// A hostile clipboard must not deliver C0 SIGNAL bytes (Ctrl-C 0x03, EOF 0x04,

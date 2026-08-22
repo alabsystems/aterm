@@ -145,17 +145,20 @@ define_terminal_handler! {
     // dispatcher bumps it on a DECTCEM hide processed inside DEC-2026 sync.
     repaint_blink_epoch: u64 => repaint_blink_epoch,
     absolute_row_revision: u64 => absolute_row_revision,
-    // OSC / escape-sequence policy engine (#7994, #7995, #7996). Hot-swappable
-    // at runtime via `Terminal::apply_policy_engine`. `None` when no policy is
-    // installed — in that case `send_response` and the OSC palette handlers fall
-    // back to the legacy `TransientState::response_rate_limiter` + inline
-    // per-sequence counter, and capability handlers read via
-    // `policy_bridge::engine_decision(self.policy_engine.as_deref(), ...)`
-    // falling back to `TerminalModes::allow_*` / per-capability `authorized`
-    // state. See `response_rate_limiter.rs` and `policy_bridge.rs` module docs,
-    // and designs/2026-04-19-osc-policy-engine.md §6.3 for the Release N
+    // OSC / escape-sequence policy (#7994, #7995, #7996): the installed engine
+    // plus the gate verdicts compiled from it. Hot-swappable at runtime via
+    // `Terminal::apply_policy_engine`, which recompiles the table in the same
+    // step. With no engine installed `send_response` and the OSC palette
+    // handlers fall back to the legacy `TransientState::response_rate_limiter` +
+    // inline per-sequence counter, and capability handlers read via
+    // `policy_bridge::engine_decision(self.policy.engine(), ...)` falling back to
+    // `TerminalModes::allow_*` / per-capability `authorized` state. Gates whose
+    // probe is a compile-time constant read `self.policy.gates()` instead — see
+    // `policy_gates.rs`. See also `response_rate_limiter.rs` and
+    // `policy_bridge.rs` module docs, and
+    // designs/2026-04-19-osc-policy-engine.md §6.3 for the Release N
     // deprecation-window semantics.
-    policy_engine: Option<aterm_policy::engine::PolicyEngine> => policy_engine,
+    policy: super::policy_gates::PolicyState => policy,
     current_working_directory: Option<String> => current_working_directory,
     // Platform flag: secure keyboard entry (reset by RIS, #7336)
     secure_keyboard_entry: bool => secure_keyboard_entry,
@@ -369,19 +372,21 @@ impl TerminalHandler<'_> {
         if !self.can_append_response_bytes(response.len()) {
             return;
         }
-        // Policy ALLOW gate (#7994): consult the engine once at the single
-        // response sink. A host that installs `response any = Drop` suppresses
-        // every DA/DSR/DECRQSS/XTGETTCAP reply here; an absent engine or a
-        // fall-through decision mints by default, so pre-policy behavior is
-        // unchanged. This is the runtime half of P4; the compile-time half is
+        // Policy ALLOW gate (#7994): a host that installs `response any = Drop`
+        // suppresses every DA/DSR/DECRQSS/XTGETTCAP reply here; an absent engine
+        // or a fall-through decision allows by default, so pre-policy behavior
+        // is unchanged. This is the runtime half of P4; the compile-time half is
         // the `_cap` ZST proof that the caller is inside a parser dispatch.
-        if super::response_capability::ResponseCapability::mint_for_dispatch_with_engine(
-            self.policy_engine.as_ref(),
-            aterm_policy::OriginTag::Pty,
-            super::response_capability::ProbeKind::response_sink(),
-        )
-        .is_none()
-        {
+        //
+        // The probe this gate consults (`ProbeKind::response_sink()`, the literal
+        // `Dcs { final_byte: 0 }`) and its origin are compile-time constants, so
+        // the verdict is a pure function of the installed policy and is resolved
+        // ONCE at install time (`policy_gates.rs`). This used to build the probe
+        // and walk the rule set on EVERY reply — two heap allocations plus three
+        // hash lookups per DA/DSR/CPR, paid BEFORE the rate-limit debit below, so
+        // a reply flood paid it at full parser rate even when every reply was
+        // then dropped.
+        if !self.policy.gates().response_sink().resolve(true) {
             return;
         }
         // Rate-limit gate: the policy engine's `"response"` bucket is the
@@ -389,10 +394,21 @@ impl TerminalHandler<'_> {
         // policy engine is present, fall back to the legacy in-transient
         // `ResponseRateLimiter` so hosts that haven't opted in see zero
         // behavioral change.
+        //
+        // The bucket is addressed by the slot `PolicyState` resolved when the
+        // engine was installed, not by the literal `"response"`: the id is a
+        // compile-time constant and its bucket can only move when a policy is
+        // installed, so hashing it per reply was the last constant this sink
+        // recomputed. The two documented fallbacks are unchanged — `None` here
+        // still means "no engine installed" and defers to the legacy limiter
+        // below, and a policy that declares no `"response"` bucket still
+        // resolves to `RateLimitSlot::UNDECLARED`, which allows.
         let bytes = response.len() as u64;
         let clock = aterm_policy::limits::SystemClock;
-        let permitted = if let Some(engine) = self.policy_engine.as_mut() {
-            engine.rate_limit_try_consume("response", bytes, &clock)
+        let permitted = if let Some(permitted) =
+            self.policy.response_rate_limit_try_consume(bytes, &clock)
+        {
+            permitted
         } else {
             let legacy_clock = super::response_rate_limiter::SystemTime;
             self.transient

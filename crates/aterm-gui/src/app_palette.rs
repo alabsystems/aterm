@@ -206,6 +206,7 @@ impl App {
             // Wheel fractions belong to one surface only. Drop any terminal/native
             // remainder before the palette begins consuming the shared device stream.
             ws.scroll_residual = 0.0;
+            ws.scroll_residual_x = 0.0;
             if let Some(w) = &ws.os_window {
                 w.request_redraw();
             }
@@ -260,6 +261,7 @@ impl App {
             .ok_or_else(|| "blocked native close window disappeared".to_string())?;
         window.overlay = Some(crate::overlay::Overlay::Palette(state));
         window.scroll_residual = 0.0;
+        window.scroll_residual_x = 0.0;
         if let Some(os_window) = &window.os_window {
             os_window.request_redraw();
         }
@@ -281,6 +283,7 @@ impl App {
             // A sub-line palette gesture must never drain into terminal/native scrolling
             // after the modal closes.
             ws.scroll_residual = 0.0;
+            ws.scroll_residual_x = 0.0;
             if let Some(w) = &ws.os_window {
                 w.request_redraw();
             }
@@ -711,10 +714,17 @@ mod tests {
 
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
         let closed = app.read_aux_controls(crate::app_introspect::AuxTarget::Menu);
+        // The advertised chord is PLATFORM-TRUE (audit I9): ⌘F on macOS, the
+        // seeded Ctrl+Shift+F off it — never a ⌘ glyph on a keyboard without one.
+        let accel = if cfg!(target_os = "macos") {
+            "accel=\"Cmd-F\""
+        } else {
+            "accel=\"Ctrl-Shift-F\""
+        };
         assert!(closed.iter().any(|line| {
             line.contains("section=\"Settings App\"")
                 && line.contains("action=settings/search")
-                && line.contains("accel=\"Cmd-F\"")
+                && line.contains(accel)
         }));
         app.palette_enter();
         assert_eq!(

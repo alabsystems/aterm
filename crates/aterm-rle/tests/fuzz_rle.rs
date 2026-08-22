@@ -34,7 +34,7 @@ impl Lcg {
     }
 
     /// A value biased toward the `u32::MAX` boundary so overflow-prone code
-    /// paths (run merging, prefix-sum accumulation) are hit hard.
+    /// paths (run merging, run-length accumulation) are hit hard.
     fn next_boundary_len(&mut self) -> u32 {
         match self.next_u32() % 8 {
             0 => 0,
@@ -145,7 +145,7 @@ fn fuzz_rle_mutators_never_panic() {
                 rle.resize_with(new_len, value);
             }
             9 => {
-                // Exercise read paths that walk runs / prefix sums.
+                // Exercise read paths that walk the runs.
                 let mut taken = 0u32;
                 for v in rle.iter() {
                     std::hint::black_box(v);
@@ -211,7 +211,7 @@ fn fuzz_rle_merge_overflow_never_panics() {
         rle.set_range(start, end, lcg.next_small_value());
         assert_invariant(&rle);
 
-        // resize larger then smaller exercises extend + truncate + prefix rebuild.
+        // resize larger then smaller exercises extend + truncate.
         rle.resize(lcg.next_boundary_len());
         assert_invariant(&rle);
         rle.resize_with(lcg.next_boundary_len(), lcg.next_small_value());

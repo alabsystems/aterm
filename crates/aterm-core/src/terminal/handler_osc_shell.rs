@@ -209,12 +209,9 @@ impl TerminalHandler<'_> {
         if !self.modes.require_shell_integration_nonce {
             return true;
         }
-        self.shell_integration_auth.verify_nonce_with_engine(
-            self.policy_engine.as_ref(),
-            aterm_policy::OriginTag::Pty,
-            command,
-            params,
-        )
+        let gate = self.policy.shell_integration_gate(command, params);
+        self.shell_integration_auth
+            .verify_nonce_with_engine(gate, params)
     }
 
     /// Handle OSC 133 - Shell integration (FinalTerm/Terminal protocol).

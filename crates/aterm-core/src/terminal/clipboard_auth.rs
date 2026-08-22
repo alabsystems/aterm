@@ -71,9 +71,10 @@
 //! effectively "allowed iff a clipboard callback is set."
 
 use super::callbacks::ClipboardCallback;
-use super::policy_bridge::{BridgeDecision, engine_decision_deny_by_default_capability};
+use super::policy_bridge::BridgeDecision;
+use super::policy_gates::PolicyGates;
 use super::types::{ClipboardOperation, ClipboardSelection};
-use aterm_policy::{OriginTag, engine::PolicyEngine, selector::DispatchedSequence};
+use aterm_policy::selector::DispatchedSequence;
 
 // ---------------------------------------------------------------------------
 // Public API selector for host-facing `authorize_*` / `revoke_*` methods.
@@ -274,8 +275,9 @@ impl ClipboardAuth {
     }
 
     /// Engine-consulting variant of [`Self::try_mint_write_capability`]
-    /// (#7994). Consults the [`PolicyEngine`] first with an `OSC 52 set`
-    /// probe at the given `origin`:
+    /// (#7994). Reads the compiled `OSC 52 set` gate verdict, which
+    /// [`super::policy_gates`] resolved from [`probe_osc52_set`] at
+    /// [`super::policy_gates::GATE_ORIGIN`] when the policy was installed:
     ///
     /// * Engine matches a sequence-specific rule whose response is
     ///   `Execute` → mint allowed.
@@ -289,20 +291,24 @@ impl ClipboardAuth {
     ///   → fall back to the legacy `write_authorized` bool. This is the
     ///   Release N backward-compat guarantee from design §6.2/§6.3.
     ///
-    /// When `engine` is `None` (host has not installed a policy) the
-    /// behavior is identical to [`Self::try_mint_write_capability`].
+    /// With no policy installed, `gates.osc52_set()` is
+    /// [`BridgeDecision::Fallback`] and the behavior is identical to
+    /// [`Self::try_mint_write_capability`].
     ///
-    /// See `terminal/policy_bridge.rs` for the decision tree.
+    /// # Why a compiled verdict and not an `evaluate` call
+    ///
+    /// [`probe_osc52_set`] is a literal and the production origin is the literal
+    /// `OriginTag::Pty`, so this gate's verdict is a pure function of the
+    /// installed policy. It used to be re-derived on every OSC 52 dispatch:
+    /// three heap allocations for the constant probe plus two bucket walks. It
+    /// is now resolved once per installed policy in [`super::policy_gates`],
+    /// which builds it from THIS module's probe constructor so the two cannot
+    /// drift. See `terminal/policy_bridge.rs` for the decision tree.
     pub(super) fn try_mint_write_capability_with_engine(
         &self,
-        engine: Option<&PolicyEngine>,
-        origin: OriginTag,
+        gates: PolicyGates,
     ) -> Option<ClipboardWriteCapability> {
-        let seq = probe_osc52_set();
-        if allow(
-            engine_decision_deny_by_default_capability(engine, &seq, origin),
-            self.write_authorized,
-        ) {
+        if allow(gates.osc52_set(), self.write_authorized) {
             Some(ClipboardWriteCapability { _seal: () })
         } else {
             None
@@ -316,14 +322,9 @@ impl ClipboardAuth {
     /// Wildcard `Execute` rules likewise fall back instead of overgranting.
     pub(super) fn try_mint_query_capability_with_engine(
         &self,
-        engine: Option<&PolicyEngine>,
-        origin: OriginTag,
+        gates: PolicyGates,
     ) -> Option<ClipboardQueryCapability> {
-        let seq = probe_osc52_query();
-        if allow(
-            engine_decision_deny_by_default_capability(engine, &seq, origin),
-            self.query_authorized,
-        ) {
+        if allow(gates.osc52_query(), self.query_authorized) {
             Some(ClipboardQueryCapability { _seal: () })
         } else {
             None
@@ -337,15 +338,23 @@ impl ClipboardAuth {
 /// payload for the `OSC 52 set` alias (anything that is not literal
 /// `?`). We use `SGVsbG8=` as the canonical representative — the exact
 /// content doesn't matter, only that the alias matches.
+///
+/// Every input is a literal, which is why [`super::policy_gates`] can resolve
+/// this gate once per installed policy instead of rebuilding the probe (three
+/// heap allocations) on every OSC 52 dispatch. It is `pub(super)` so the gate
+/// table compiles from THIS definition — a second, hand-copied probe could
+/// drift and answer the gate from the wrong rule bucket.
 #[inline]
-fn probe_osc52_set() -> DispatchedSequence {
+pub(super) fn probe_osc52_set() -> DispatchedSequence {
     DispatchedSequence::osc(52, [String::from("c"), String::from("SGVsbG8=")])
 }
 
 /// Probe sequence used by the OSC 52 **query** policy lookup. The second
 /// param is literal `?`, which selects the `OSC 52 query` alias bucket.
+///
+/// Constant, and `pub(super)`, for the same reason as [`probe_osc52_set`].
 #[inline]
-fn probe_osc52_query() -> DispatchedSequence {
+pub(super) fn probe_osc52_query() -> DispatchedSequence {
     DispatchedSequence::osc(52, [String::from("c"), String::from("?")])
 }
 
@@ -514,11 +523,11 @@ mod tests {
         let engine = PolicyEngine::new(profiles::standard());
 
         assert!(
-            auth.try_mint_write_capability_with_engine(Some(&engine), OriginTag::Pty)
+            auth.try_mint_write_capability_with_engine(PolicyGates::compile(Some(&engine)))
                 .is_none()
         );
         assert!(
-            auth.try_mint_query_capability_with_engine(Some(&engine), OriginTag::Pty)
+            auth.try_mint_query_capability_with_engine(PolicyGates::compile(Some(&engine)))
                 .is_none()
         );
     }
@@ -529,7 +538,7 @@ mod tests {
         let engine = PolicyEngine::new(policy_with_rule("OSC 52 set", Response::Execute));
 
         assert!(
-            auth.try_mint_write_capability_with_engine(Some(&engine), OriginTag::Pty)
+            auth.try_mint_write_capability_with_engine(PolicyGates::compile(Some(&engine)))
                 .is_some()
         );
     }
@@ -540,7 +549,7 @@ mod tests {
         let engine = PolicyEngine::new(policy_with_rule("OSC 52 query", Response::Execute));
 
         assert!(
-            auth.try_mint_query_capability_with_engine(Some(&engine), OriginTag::Pty)
+            auth.try_mint_query_capability_with_engine(PolicyGates::compile(Some(&engine)))
                 .is_some()
         );
     }

@@ -21,7 +21,7 @@ use aterm_render::Frame;
 use crate::WindowId;
 use crate::app_render::{
     OverlayGlow, apply_bell_invert, apply_drop_overlay, apply_host_chrome_at, apply_overlay_at,
-    composite_tray_quad_at, tray_quad_below_y,
+    composite_tray_quad_at, sync_cursor_effect_scroll, tray_quad_below_y,
 };
 use crate::control::{DimsSnapshot, ImageReq};
 use crate::platform::AppRt;
@@ -1748,12 +1748,16 @@ impl App {
         let companion_look = self.companion_verdict(wid, focus, now);
         let windowless = self.headless;
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
-        let focus_cursor = self.pool.get(focus).and_then(|s| {
+        let (focus_live_viewport, focus_cursor) = self.pool.get(focus).map_or(
+            (false, None),
+            |s| {
             let term = term_lock(&s.term);
-            (term.cursor_visible() && term.grid().display_offset() == 0).then(|| {
+            let live = term.grid().display_offset() == 0;
+            let cursor = (term.cursor_visible() && live).then(|| {
                 let cp = term.cursor();
                 (cp.row, cp.col)
-            })
+            });
+            (live, cursor)
         });
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
@@ -1761,7 +1765,8 @@ impl App {
         let (win_rows, win_cols) = (ws.rows, ws.cols);
         ws.cursor_cat.set_look(companion_look);
         // A capture is itself a presentation boundary (the single-pane arm's rule).
-        ws.cursor_cat.set_collection_presentable(now, true);
+        ws.cursor_cat
+            .set_collection_presentable(now, focus_live_viewport);
         let animate_cat = !windowless
             && ws.os_window.is_some()
             && ws.focused
@@ -1771,12 +1776,13 @@ impl App {
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let kitty_enabled = crate::app_render::cursor_cat_presentation_enabled(
-            animate_cat,
-            glow_cfg.enabled,
-            glow_cfg.style,
-            cat_frame.collection_hello,
-        );
+        let kitty_enabled = focus_live_viewport
+            && crate::app_render::cursor_cat_presentation_enabled(
+                animate_cat,
+                glow_cfg.enabled,
+                glow_cfg.style,
+                cat_frame.collection_hello,
+            );
         // The PET companion. A capture is a presentation boundary, so it
         // resolves the pet the same way the composed present does — otherwise
         // `aterm-ctl image` on a split window would be blind to the one
@@ -1961,6 +1967,23 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        let (rows, cols) = (ws.rows as usize, ws.cols as usize);
+        let mut term = term_lock(&front_terminal.term);
+        // Refill before resolving cursor-owned presentation. The exact
+        // `display_offset` stamped by this same extraction is the coordinate
+        // class for the cursor, trail, flying body and resident pet; a separate
+        // preflight read could race a viewport scroll and mix live companions
+        // with history cells.
+        term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+        let live_viewport = ws.input_scratch.display_offset == 0;
+        let default_bg = if term.modes().reverse_video() {
+            term.default_foreground()
+        } else {
+            term.default_background()
+        };
+        ws.input_scratch.default_bg =
+            aterm_render::rgb_to_u32([default_bg.r, default_bg.g, default_bg.b]);
+        ws.input_scratch.cursor_color = crate::app_render::terminal_cursor_color(&term);
         // Capture consumes the same admitted catalog Arc as application-present. Asset
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
@@ -1968,7 +1991,7 @@ impl App {
         // The capture itself is a presentation boundary. This resumes a hello
         // that was discovered after the preceding capture had already resolved
         // its frame and was therefore paused unseen below.
-        ws.cursor_cat.set_collection_presentable(now, true);
+        ws.cursor_cat.set_collection_presentable(now, live_viewport);
         // A CAPTURE IS A RENDERER, so it declares its session exactly like the
         // unsplit glass path does (`app_render::redraw_window`). This arm binds
         // no pane — `input_scratch` holds the FRONT terminal's whole grid — and
@@ -1992,12 +2015,13 @@ impl App {
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let kitty_enabled = crate::app_render::cursor_cat_presentation_enabled(
-            animate_cat,
-            glow_cfg.enabled,
-            glow_cfg.style,
-            cat_frame.collection_hello,
-        );
+        let kitty_enabled = live_viewport
+            && crate::app_render::cursor_cat_presentation_enabled(
+                animate_cat,
+                glow_cfg.enabled,
+                glow_cfg.style,
+                cat_frame.collection_hello,
+            );
         // The PET companion, resolved the same way the composed capture arm
         // does: a capture is a presentation boundary. `!pet_mode` folds into
         // `kitty_alpha` for the same reason the windowed present folds it —
@@ -2012,31 +2036,12 @@ impl App {
         } else {
             0
         };
-        let (rows, cols) = (ws.rows as usize, ws.cols as usize);
         let effect_geom = crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
             cell_h: cell_h as u16,
             rows: rows as u16,
             cols: cols as u16,
         };
-        let mut term = term_lock(&front_terminal.term);
-        // Refill under the SAME lock as the damage-epoch read + effect rescan.
-        // `render_image` takes an initial snapshot before entering this helper,
-        // but PTY output can land in that narrow gap.  A damage epoch is latched
-        // for the whole outstanding damage session, so comparing only the two
-        // epoch values cannot detect every such write.  Explicit captures are a
-        // cold path; one allocation-reusing grid refill here makes the cells,
-        // line sizes, cursor and epoch one coherent observation and prevents a
-        // fresh word from being consumed against a stale snapshot.
-        term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-        let default_bg = if term.modes().reverse_video() {
-            term.default_foreground()
-        } else {
-            term.default_background()
-        };
-        ws.input_scratch.default_bg =
-            aterm_render::rgb_to_u32([default_bg.r, default_bg.g, default_bg.b]);
-        ws.input_scratch.cursor_color = crate::app_render::terminal_cursor_color(&term);
         if (term.is_alternate_screen() && suppress_alt) || load_shed {
             // The capture cannot draw decorations after all. Undo the
             // presentation opportunity sampled above at the same instant, so
@@ -2111,7 +2116,7 @@ impl App {
         // never clobbers a focused window's armed blink one-shot, and a
         // headless/unfocused capture arms nothing).
         let cpos = term.cursor();
-        let cur = term.cursor_visible().then_some((cpos.row, cpos.col));
+        let cur = (live_viewport && term.cursor_visible()).then_some((cpos.row, cpos.col));
         // THE PET BRAIN TICKS on the capture too — the capture shares the
         // window's live effect state (the composed capture arm has always
         // ticked it), and the suppression below needs the animal's LIVE body,
@@ -2560,8 +2565,11 @@ impl App {
             // would (captures are sparse; the engine's probe-staleness cap
             // fences any long gap between them).
             let display_offset = term.grid().display_offset();
-            let scrollback_lines = term.grid().scrollback_lines();
+            let content_scroll_state = term.content_scroll_state();
             let is_alt = term.is_alternate_screen();
+            // Invalidation resets engine context; apply it before this exact
+            // capture re-feeds alt/blink state below.
+            let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
             // REPAINT-BLINK edge + context feed — the windowed LOCK A
             // detector's twin, so a headless capture classifies the same.
             let blink_epoch = term.repaint_blink_epoch();
@@ -2582,10 +2590,7 @@ impl App {
                 now.saturating_duration_since(t) <= crate::app_render::BLINK_RECENT_MAX
             });
             let probe_ok = !is_alt || blink_recent;
-            let row_probe = if probe_ok
-                && display_offset == 0
-                && ws.poof_scrollback == Some(scrollback_lines)
-            {
+            let row_probe = if probe_ok && display_offset == 0 && !scroll_change.changed() {
                 let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
                 // STAR-LANDING NEIGHBORS — the windowed LOCK A capture's
                 // twin, so a headless capture licenses (or forbids) the
@@ -2600,19 +2605,6 @@ impl App {
             } else {
                 None
             };
-            // Scroll translation + fenced-frame probe drop — the windowed
-            // path's twins (captures are sparse, so the delta may span many
-            // frames; the anchor translation still bounds at the grid height).
-            let scrolled = ws
-                .poof_scrollback
-                .map_or(0, |p| scrollback_lines.saturating_sub(p));
-            if scrolled > 0 {
-                let d = scrolled.min(rows).min(u16::MAX as usize) as u16;
-                ws.cursor_glow.note_scroll(d);
-                ws.cursor_trail.note_scroll(d);
-                ws.cursor_glow.drop_row_probe();
-            }
-            ws.poof_scrollback = Some(scrollback_lines);
             crate::app_render::CursorFxInputs {
                 now,
                 rows,
@@ -2621,6 +2613,7 @@ impl App {
                 // windowed path's twin (active-grid coords over scrollback rows
                 // would spawn light on unrelated history lines in the capture).
                 cur: (cursor_visible && display_offset == 0).then_some((cpos.row, cpos.col)),
+                live_viewport: display_offset == 0,
                 cursor_visible,
                 cursor_style: term.cursor_style(),
                 blink_phase: ws.blink_phase,
@@ -2635,6 +2628,11 @@ impl App {
                     crate::app_render::terminal_blank_cell(&term).fg,
                 ),
                 row_probe,
+                content_generation: aterm_effects::cursor_trail::ContentGeneration {
+                    process_sequence: term.pipeline_timestamps().process_sequence,
+                    terminal_id: term.render_identity(),
+                    alternate_screen: is_alt,
+                },
             }
         };
         let Some(fx) = self.tick_cursor_fx(wid, inputs) else {
@@ -2879,6 +2877,12 @@ impl App {
                 }
             }
             self.splice_config_notice(front);
+            // C5: the open tab context menu is the topmost chrome on the glass,
+            // so it must be the topmost chrome in the capture too — an
+            // introspection frame that omits it would tell a driving AI the
+            // menu is closed while a human is looking at it. Same last-of-all
+            // position as the presentation routes. A no-op with none open.
+            self.splice_tab_menu(front);
         }
         let cols = match self.windows.get(&front) {
             Some(ws) => ws.cols as usize,
@@ -3143,6 +3147,8 @@ impl App {
             // Native preparation leaves the semantic surface in the tray. Paint
             // diagnostic cells afterward, exactly like the application-present path.
             self.splice_config_notice(front);
+            // C5 — topmost chrome; see the `chrome`-capture route above.
+            self.splice_tab_menu(front);
         }
         let visuals = presented.as_ref().map_or_else(
             || self.host_visual_state(front, Instant::now()),
@@ -3418,7 +3424,7 @@ impl App {
     ) {
         use std::hash::Hash;
 
-        "terminal-render-model-v3".hash(hash);
+        "terminal-render-model-v4".hash(hash);
         input.rows.hash(hash);
         input.cols.hash(hash);
         for row in &input.cells {
@@ -3429,6 +3435,7 @@ impl App {
                 cell.bg.hash(hash);
                 cell.wide.hash(hash);
                 cell.emoji_presentation.hash(hash);
+                cell.text_presentation.hash(hash);
                 cell.bold.hash(hash);
                 cell.italic.hash(hash);
                 std::mem::discriminant(&cell.underline).hash(hash);
@@ -3763,6 +3770,8 @@ impl App {
             self.splice_notice(front);
             self.splice_level_up(front);
             self.splice_config_notice(front);
+            // C5 — topmost chrome; see the `chrome`-capture route above.
+            self.splice_tab_menu(front);
             capture_grid
         };
         // Always rasterize an owned explicit-capture snapshot. In particular,
@@ -9587,10 +9596,20 @@ mod headless_cursor_fx_tests {
         let t0 = Instant::now();
         // Capture 1: primes the engine's last-seen cursor cell (no motion yet).
         app.splice_cursor_fx(wid, t0);
-        // A keystroke echoes: the cursor advances one cell.
+        // This headless fixture deliberately scripts the next cursor move. A
+        // timestamp alone is not authored-movement evidence; use the engines'
+        // explicit preview/test licence before changing the terminal cursor.
+        {
+            let ws = app.windows.get_mut(&wid).expect("headless window 0");
+            ws.cursor_glow.note_synthetic_move(t0);
+            ws.cursor_trail.note_synthetic_move(t0);
+        }
+        // Advance the scripted cursor without minting a parser generation: a
+        // synthetic licence is for preview/test geometry, while parser output
+        // is admitted only through the separate exact-content proof path.
         {
             let terminal = app.front_terminal(wid).expect("front terminal");
-            term_lock(&terminal.term).process(b"x");
+            term_lock(&terminal.term).grid_mut().cursor_forward(1);
         }
         // Capture 2, one frame later: the observed move must spawn live fire.
         app.splice_cursor_fx(wid, t0 + Duration::from_millis(16));

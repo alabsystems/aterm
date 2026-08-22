@@ -261,6 +261,50 @@ impl TokenBucket {
 // RateLimiterSet
 // ---------------------------------------------------------------------------
 
+/// A rate-limit id resolved to its bucket, once.
+///
+/// Debiting a named bucket by string id costs a hash of that id on every
+/// call, and the ids production debits are compile-time literals: the
+/// response sink hands `"response"` to [`RateLimiterSet::try_consume`] on
+/// EVERY reply, so a `DSR`/`DA` flood re-hashes the same eight bytes at full
+/// parser rate. The answer can only change when a policy is installed, so a
+/// caller that holds a policy for many dispatches resolves the id once with
+/// [`RateLimiterSet::slot`] and then debits through
+/// [`RateLimiterSet::try_consume_slot`], which is an index.
+///
+/// # Undeclared ids
+///
+/// [`RateLimiterSet::slot`] answers [`Self::UNDECLARED`] for an id the active
+/// policy does not declare, and [`RateLimiterSet::try_consume_slot`] answers
+/// `true` for it — the same deliberate "unknown id ⇒ allow" branch
+/// [`RateLimiterSet::try_consume`] has (see its docs). Resolving early does
+/// not change which ids are unlimited.
+///
+/// # A slot belongs to the set that issued it
+///
+/// A slot indexes ONE set's bucket vector. Using a slot from set A against
+/// set B cannot be unsound — an index past the end answers `true`, exactly as
+/// an undeclared id does — but it can debit a different bucket than the id
+/// named, so a caller must re-resolve whenever it swaps policies. The
+/// terminal's `PolicyState` does that by construction: it recompiles every
+/// cached slot in the same statement that installs or clears the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RateLimitSlot(Option<usize>);
+
+impl RateLimitSlot {
+    /// The id is not declared by the active policy ⇒ unlimited.
+    ///
+    /// Also the [`Default`], so a host that has not resolved a slot yet is
+    /// unlimited rather than accidentally pointed at bucket 0.
+    pub const UNDECLARED: Self = Self(None);
+
+    /// `true` when the id this slot came from is declared by the policy.
+    #[must_use]
+    pub const fn is_declared(self) -> bool {
+        self.0.is_some()
+    }
+}
+
 /// Collection of named [`TokenBucket`]s, built from a [`Policy`]'s
 /// `rate_limits` table.
 ///
@@ -270,10 +314,20 @@ impl TokenBucket {
 /// lookup — the engine is still fail-closed overall because an unmatched
 /// sequence falls through to `defaults.unmatched`).
 ///
+/// The buckets live in a `Vec` and the ids index into it, so a hot call site
+/// can resolve its id to a [`RateLimitSlot`] once and pay an index instead of
+/// a string hash per dispatch. `try_consume(id)` is exactly
+/// `try_consume_slot(slot(id))` and keeps every documented semantic,
+/// including "unknown id ⇒ allow".
+///
 /// [pe]: crate::engine::PolicyEngine
 #[derive(Debug, Clone, Default)]
 pub struct RateLimiterSet {
-    buckets: HashMap<String, TokenBucket>,
+    /// One bucket per DISTINCT declared id, in first-declaration order.
+    buckets: Vec<TokenBucket>,
+    /// Declared id → its index in `buckets`. Consulted by the string-keyed
+    /// entry points and by [`Self::slot`]; never on a resolved-slot debit.
+    slots: HashMap<String, usize>,
 }
 
 impl RateLimiterSet {
@@ -288,19 +342,45 @@ impl RateLimiterSet {
     ///
     /// Duplicate ids in the policy are silently collapsed — the last
     /// occurrence wins. This matches TOML's own semantics for repeated
-    /// `[[rate_limits]]` tables and keeps the builder total.
+    /// `[[rate_limits]]` tables and keeps the builder total. A duplicate
+    /// OVERWRITES the first occurrence's bucket in place, so it neither adds
+    /// a slot nor moves any other id's slot.
     #[must_use]
     pub fn from_policy(policy: &Policy) -> Self {
-        // Capacity is only a pre-allocation hint (the map grows as needed), so
-        // clamping it bounds the up-front allocation the verifier must budget
-        // for without changing behavior — real policies declare a handful of
-        // rate limits, nowhere near the clamp.
+        // Capacity is only a pre-allocation hint (both containers grow as
+        // needed), so clamping it bounds the up-front allocation the verifier
+        // must budget for without changing behavior — real policies declare a
+        // handful of rate limits, nowhere near the clamp.
         let cap = policy.rate_limits.len().min(1024);
-        let mut buckets = HashMap::with_capacity(cap);
+        let mut buckets = Vec::with_capacity(cap);
+        let mut slots = HashMap::with_capacity(cap);
         for cfg in &policy.rate_limits {
-            buckets.insert(cfg.id.clone(), TokenBucket::from_config(cfg));
+            let bucket = TokenBucket::from_config(cfg);
+            match slots.get(&cfg.id) {
+                // Last occurrence wins, in the first occurrence's slot.
+                Some(&idx) => {
+                    if let Some(existing) = buckets.get_mut(idx) {
+                        *existing = bucket;
+                    }
+                }
+                None => {
+                    slots.insert(cfg.id.clone(), buckets.len());
+                    buckets.push(bucket);
+                }
+            }
         }
-        Self { buckets }
+        Self { buckets, slots }
+    }
+
+    /// Resolve a rate-limit id to its bucket slot, for call sites that debit
+    /// the same id many times under one policy.
+    ///
+    /// Returns [`RateLimitSlot::UNDECLARED`] when this policy declares no
+    /// bucket with that id; debiting that slot allows, exactly as passing the
+    /// unknown id to [`Self::try_consume`] would.
+    #[must_use]
+    pub fn slot(&self, id: &str) -> RateLimitSlot {
+        RateLimitSlot(self.slots.get(id).copied())
     }
 
     /// Attempt to debit `amount` tokens from the bucket named by `id`.
@@ -315,7 +395,27 @@ impl RateLimiterSet {
     /// fail-closed posture is enforced at rule-evaluation time via
     /// `defaults.unmatched`. Rate limits only narrow *matched* rules.
     pub fn try_consume<T: TimeSource>(&mut self, id: &str, amount: u64, clock: &T) -> bool {
-        match self.buckets.get_mut(id) {
+        let slot = self.slot(id);
+        self.try_consume_slot(slot, amount, clock)
+    }
+
+    /// Attempt to debit `amount` tokens from the bucket a [`RateLimitSlot`]
+    /// names — the string-hash-free form of [`Self::try_consume`].
+    ///
+    /// Same three outcomes, with [`RateLimitSlot::UNDECLARED`] standing in for
+    /// "unknown id ⇒ allow". A slot issued by a DIFFERENT set whose index is
+    /// past this set's buckets also allows, so the operation stays total (see
+    /// the [`RateLimitSlot`] docs on why a caller must not rely on that).
+    pub fn try_consume_slot<T: TimeSource>(
+        &mut self,
+        slot: RateLimitSlot,
+        amount: u64,
+        clock: &T,
+    ) -> bool {
+        let Some(idx) = slot.0 else {
+            return true;
+        };
+        match self.buckets.get_mut(idx) {
             Some(bucket) => bucket.try_consume(amount, clock),
             None => true,
         }
@@ -325,20 +425,21 @@ impl RateLimiterSet {
     /// when no bucket with that id has been declared by the policy.
     #[must_use]
     pub fn get(&self, id: &str) -> Option<&TokenBucket> {
-        self.buckets.get(id)
+        self.buckets.get(*self.slots.get(id)?)
     }
 
     /// Borrow a bucket mutably by id. Returns `None` when no bucket
     /// with that id has been declared. Intended for host-side
     /// reconfigure paths.
     pub fn get_mut(&mut self, id: &str) -> Option<&mut TokenBucket> {
-        self.buckets.get_mut(id)
+        let idx = *self.slots.get(id)?;
+        self.buckets.get_mut(idx)
     }
 
     /// `true` if a bucket with the given id exists.
     #[must_use]
     pub fn contains(&self, id: &str) -> bool {
-        self.buckets.contains_key(id)
+        self.slots.contains_key(id)
     }
 
     /// Number of buckets.
@@ -580,5 +681,92 @@ mod tests {
         let set = RateLimiterSet::from_policy(&policy);
         let bucket = set.get("x").expect("bucket x should exist");
         assert_eq!(bucket.capacity_bytes(), 100);
+        // The collapse must not have created a second slot: a duplicate
+        // overwrites the first occurrence's bucket rather than pushing.
+        assert_eq!(set.len(), 1);
+    }
+
+    // -----------------------------------------------------------------
+    // RateLimitSlot — the pre-resolved form of the same debit
+    // -----------------------------------------------------------------
+
+    fn two_bucket_policy() -> Policy {
+        Policy {
+            schema_version: crate::SCHEMA_VERSION,
+            profile: crate::Profile::Standard,
+            defaults: crate::Defaults {
+                unmatched: crate::Response::Drop,
+                shell_integration_require_nonce: true,
+            },
+            rules: vec![],
+            // Two buckets so a slot mix-up is observable: debiting the wrong
+            // one would leave the other's balance untouched.
+            rate_limits: vec![rl("response", 100, 1_000, 0), rl("palette", 10, 10, 0)],
+        }
+    }
+
+    #[test]
+    fn slot_debits_the_bucket_its_id_names() {
+        let mut set = RateLimiterSet::from_policy(&two_bucket_policy());
+        let clock = FakeClock::new();
+        let response = set.slot("response");
+        let palette = set.slot("palette");
+        assert!(response.is_declared());
+        assert!(palette.is_declared());
+        assert_ne!(response, palette);
+
+        assert!(set.try_consume_slot(response, 100, &clock));
+        // The "response" bucket is now empty and "palette" is untouched: a
+        // slot that pointed at the wrong bucket fails one of these.
+        assert!(!set.try_consume_slot(response, 1, &clock));
+        assert!(set.try_consume_slot(palette, 10, &clock));
+        assert!(!set.try_consume_slot(palette, 1, &clock));
+    }
+
+    #[test]
+    fn slot_and_id_forms_agree() {
+        let clock = FakeClock::new();
+        let mut by_id = RateLimiterSet::from_policy(&two_bucket_policy());
+        let mut by_slot = RateLimiterSet::from_policy(&two_bucket_policy());
+        let slot = by_slot.slot("response");
+        for amount in [40, 40, 40] {
+            assert_eq!(
+                by_id.try_consume("response", amount, &clock),
+                by_slot.try_consume_slot(slot, amount, &clock),
+                "the slot form must answer exactly as the id form does"
+            );
+        }
+    }
+
+    #[test]
+    fn undeclared_slot_allows_like_an_unknown_id() {
+        let mut set = RateLimiterSet::from_policy(&two_bucket_policy());
+        let clock = FakeClock::new();
+        let missing = set.slot("no-such-bucket");
+        assert!(!missing.is_declared());
+        assert_eq!(missing, RateLimitSlot::UNDECLARED);
+        // Same fail-open answer the string form gives, at any amount.
+        assert!(set.try_consume_slot(missing, 99_999, &clock));
+        assert!(set.try_consume("no-such-bucket", 99_999, &clock));
+        // The default slot is the undeclared one, not bucket 0.
+        assert_eq!(RateLimitSlot::default(), RateLimitSlot::UNDECLARED);
+    }
+
+    #[test]
+    fn slot_from_a_wider_set_stays_total() {
+        // A slot resolved against a set with more buckets is out of range
+        // here. It must allow (like an unknown id), never panic and never
+        // alias another bucket.
+        let wide = RateLimiterSet::from_policy(&two_bucket_policy());
+        let stale = wide.slot("palette");
+        let narrow_policy = Policy {
+            rate_limits: vec![rl("response", 100, 1_000, 0)],
+            ..two_bucket_policy()
+        };
+        let mut narrow = RateLimiterSet::from_policy(&narrow_policy);
+        let clock = FakeClock::new();
+        assert!(narrow.try_consume_slot(stale, 99_999, &clock));
+        // "response" is still full — the stale slot debited nothing.
+        assert!(narrow.try_consume("response", 100, &clock));
     }
 }

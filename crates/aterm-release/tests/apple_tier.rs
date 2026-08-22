@@ -304,6 +304,37 @@ impl publish::Packager for FakePackager {
             size_bytes: 900,
         })
     }
+    fn dmg_arch(
+        &self,
+        app: &Path,
+        _dist: &Path,
+        _version: &str,
+        triple: &str,
+        notarized: bool,
+    ) -> ledger::Result<dmg::Packaged> {
+        // Recorded WITH the triple and the notarization fact: the split lane's
+        // contract is that each per-arch restage is built from the
+        // already-stapled bundle and told so (its spctl gate is only decisive
+        // then), and that the canonical (arm64) image is built before the
+        // Intel variant.
+        record(
+            &self.log,
+            &format!(
+                "create_dmg_arch[{triple}{}]",
+                if notarized { ",notarized" } else { "" }
+            ),
+            app,
+        );
+        Ok(dmg::Packaged {
+            path: if triple == "aarch64-apple-darwin" {
+                dmg()
+            } else {
+                x86_dmg()
+            },
+            sha256: DMG_SHA_BEFORE.into(),
+            size_bytes: 1_000,
+        })
+    }
     fn sha256(&self, path: &Path) -> ledger::Result<String> {
         record(&self.log, "rehash", path);
         Ok(DMG_SHA_AFTER.into())
@@ -319,6 +350,9 @@ fn app() -> PathBuf {
 }
 fn dmg() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture/aterm.dmg")
+}
+fn x86_dmg() -> PathBuf {
+    PathBuf::from("/tmp/aterm-tier-fixture/aterm-x86_64.dmg")
 }
 fn dist() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture")
@@ -872,6 +906,7 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             log: Rc::clone(&log),
         },
         false,
+        false,
     )
     .expect("the active packaging path");
     assert_eq!(
@@ -907,6 +942,80 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
 }
 
 #[test]
+fn the_split_cut_builds_the_arm64_canonical_first_then_the_intel_variant() {
+    // The per-arch DMG pair (x86_split = true): the ORDER is the property, as
+    // everywhere in this seam. The bundle is stapled once; the CANONICAL
+    // (arm64-filtered, bare-named) DMG is built from it and hooked/re-hashed;
+    // only then is a second notarization wait spent on the Intel variant; the
+    // zip still comes last, from the already-stapled bundle. Each `dmg_arch`
+    // call is told the bundle is notarized — that is what makes the restage's
+    // Gatekeeper check decisive rather than advisory.
+    let alog = log();
+    let out = publish::notarize_and_package(
+        &app(),
+        &dist(),
+        "9.9.9",
+        &active_tier(),
+        &FakeTools::healthy(&alog),
+        &FakePackager {
+            log: Rc::clone(&alog),
+        },
+        true,
+        true,
+    )
+    .expect("the split packaging path");
+    assert_eq!(
+        entries(&alog),
+        vec![
+            "preflight:aterm.app",
+            "notarize:aterm.app",
+            "create_dmg_arch[aarch64-apple-darwin,notarized]:aterm.app",
+            "sign_dmg:aterm.dmg",
+            "preflight:aterm.dmg",
+            "notarize:aterm.dmg",
+            "rehash:aterm.dmg",
+            "resize:aterm.dmg",
+            "create_dmg_arch[x86_64-apple-darwin,notarized]:aterm.app",
+            "sign_dmg:aterm-x86_64.dmg",
+            "preflight:aterm-x86_64.dmg",
+            "notarize:aterm-x86_64.dmg",
+            "rehash:aterm-x86_64.dmg",
+            "resize:aterm-x86_64.dmg",
+            "create_zip(notarized):aterm.app",
+        ],
+        "canonical arm64 first, Intel variant second, zip last — each from the stapled bundle"
+    );
+    // Both manifest digests are the POST-hook reads, never the mint-time ones.
+    assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
+    let (x86, x86_sha, x86_size) = out.dmg_x86_64.expect("the split cut returns the pair");
+    assert_eq!(x86.path, x86_dmg());
+    assert_eq!(x86_sha, DMG_SHA_AFTER);
+    assert_eq!(x86_size, 2_000);
+
+    // And a non-split cut returns None — the single-DMG lane is untouched.
+    let log2 = log();
+    let out = publish::notarize_and_package(
+        &app(),
+        &dist(),
+        "9.9.9",
+        &AppleTier::Inactive,
+        &FakeTools::healthy(&log2),
+        &FakePackager {
+            log: Rc::clone(&log2),
+        },
+        false,
+        false,
+    )
+    .expect("the single-DMG path");
+    assert!(out.dmg_x86_64.is_none());
+    assert_eq!(
+        entries(&log2),
+        vec!["create_dmg:aterm.app", "create_zip:aterm.app"],
+        "no split, no arch lane: byte-for-byte the pipeline as it always ran"
+    );
+}
+
+#[test]
 fn the_inactive_build_packages_exactly_as_it_always_did() {
     // The other half of the same call site: with the shipped anchor, the hooks
     // must add NOTHING. No Apple tool, no re-hash, and the manifest keeps the
@@ -922,6 +1031,7 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
         false,
     )
     .expect("the inactive packaging path");
@@ -952,6 +1062,7 @@ fn a_failed_bundle_notarization_stops_the_cut_before_anything_is_packaged() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
         false,
     );
     assert!(
@@ -985,6 +1096,7 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
         &FakePackager {
             log: Rc::clone(&log),
         },
+        false,
         false,
     );
     assert!(

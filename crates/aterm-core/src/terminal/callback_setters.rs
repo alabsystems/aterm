@@ -195,9 +195,24 @@ impl Terminal {
         if cols_changed {
             self.text_selection.clear();
         } else {
+            // A rows-GROW that revealed retained history re-labelled the newest ring
+            // lines as the top of the viewport, so every pre-resize row — the
+            // selection's anchors included — now sits `revealed` rows FURTHER DOWN.
+            // `Grid::resize_with_reflow_mode` already follows that shift for the
+            // cursor and the saved cursor; the selection is compensated here, because
+            // it lives on the Terminal rather than the Grid.
+            //
+            // `adjust_for_scroll`'s delta is SUBTRACTED from each anchor row, so
+            // moving content DOWN by `revealed` is a delta of `-revealed`. Passing 0
+            // (as this did when the narrowing first landed) leaves the anchors above
+            // their content: the highlight covers different text and a copy returns
+            // something the user never selected. Read from the ACTIVE grid — `resize`
+            // resizes both grids and each records its own shift.
+            let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
-            self.text_selection.adjust_for_scroll(0, max_rows, floor);
+            self.text_selection
+                .adjust_for_scroll(-revealed, max_rows, floor);
         }
         // DEC mode 2048: emit an in-band size report on every resize so a
         // subscribed app (neovim 0.10+) learns the new geometry without an ioctl.

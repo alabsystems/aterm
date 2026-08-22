@@ -52,8 +52,9 @@
 
 use aterm_render::{
     CJK_SCALE_MAX, CJK_SCALE_MIN, CONDENSE_MAX_RATIO, XHEIGHT_SCALE_MAX, XHEIGHT_SCALE_MIN,
-    clamp_to_col_band, clamp_to_row_band, condense_coverage, condense_ink_w, fallback_cjk_scale,
-    fallback_weight_rank, fallback_xheight_scale, wide_center_offset,
+    clamp_to_col_band, clamp_to_row_band, condense_coverage, condense_ink_w, fallback_cell_count,
+    fallback_cjk_scale, fallback_fit_scale, fallback_weight_rank,
+    fallback_xheight_scale, materialized_cell_span, wide_center_offset,
 };
 
 // ---- (1) normalization clamps ----
@@ -175,6 +176,221 @@ fn wide_center_offset_balances_margins_exhaustively() {
     }
     // Non-vacuity: the offset genuinely moves glyphs (not identically zero).
     assert!(nonzero_offsets > 0);
+}
+
+/// The fit policy contains the complete proportional bitmap AND its advance
+/// after centring, while never enlarging an already-fitting glyph. The real
+/// warning-sign metrics that exposed the bug (30px mask / 27.5px advance in a
+/// 10px cell) therefore request a roughly one-third UNIFORM scale, not a crop.
+#[test]
+fn fallback_fit_scale_contains_ink_and_preserves_aspect() {
+    let warning = fallback_fit_scale(10, 20, 30, 27, -1, 27.501_354);
+    assert!(
+        (0.30..0.35).contains(&warning),
+        "warning must shrink uniformly instead of clipping: scale={warning}"
+    );
+
+    let mut shrunk = 0usize;
+    for box_w in 1..=32usize {
+        for box_h in 1..=40usize {
+            for width in 1..=48usize {
+                for height in [1usize, 7, 19, 41] {
+                    for xmin in [-8i32, -1, 0, 3, 11] {
+                        for advance in [1.0f32, 8.5, 20.0, 55.25] {
+                            let scale =
+                                fallback_fit_scale(box_w, box_h, width, height, xmin, advance);
+                            assert!(scale.is_finite() && scale > 0.0 && scale <= 1.0);
+                            let centre = advance * 0.5;
+                            let radius = (xmin as f32 - centre)
+                                .abs()
+                                .max((xmin as f32 + width as f32 - centre).abs())
+                                .max(centre);
+                            assert!(
+                                2.0 * radius * scale <= box_w as f32 + 1e-4,
+                                "centred horizontal extent escaped: box={box_w} width={width} \
+                                 xmin={xmin} advance={advance} scale={scale}"
+                            );
+                            assert!(height as f32 * scale <= box_h as f32 + 1e-4);
+                            shrunk += usize::from(scale < 1.0);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(shrunk > 0, "the oversize arm must be exercised");
+}
+
+/// Cell allocation is Unicode-width/config driven, never inferred from a
+/// fallback font's proportional advance. This is the CJK/combining guard for
+/// the warning-sign fix.
+#[test]
+fn fallback_cell_count_matches_terminal_cjk_policy() {
+    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+
+    let single = TextShapingConfig::default();
+    let double = TextShapingConfig {
+        ambiguous_width: AmbiguousWidth::Double,
+        ..TextShapingConfig::default()
+    };
+    assert_eq!(
+        fallback_cell_count('\u{26A0}', &single),
+        1,
+        "bare ⚠ is narrow"
+    );
+    assert_eq!(
+        fallback_cell_count('\u{26A0}', &double),
+        1,
+        "⚠ is not EAW ambiguous"
+    );
+    assert_eq!(fallback_cell_count('中', &single), 2, "CJK stays two cells");
+    assert_eq!(fallback_cell_count('中', &double), 2, "CJK stays two cells");
+    assert_eq!(
+        fallback_cell_count('\u{0301}', &single),
+        0,
+        "combining stays zero-width"
+    );
+    assert_eq!(
+        fallback_cell_count('\u{00B7}', &single),
+        1,
+        "middle dot is narrow by default"
+    );
+    assert_eq!(
+        fallback_cell_count('\u{00B7}', &double),
+        2,
+        "EAW ambiguous widens in CJK mode"
+    );
+}
+
+/// Non-vacuous engine -> `RenderInput` -> CPU raster-cache bind for the two
+/// config-sensitive edge classes. The same EAW-A scalar is first received wide,
+/// then the policy reloads narrow without reflowing the old cell, so both spans
+/// coexist in one materialized row and must reach distinct fitted raster keys.
+/// A zero-width combining overlay on the narrow instance stays span 0.
+#[test]
+fn materialized_ambiguous_spans_coexist_and_combining_stays_zero_width() {
+    use aterm_core::config::TerminalConfig;
+    use aterm_core::terminal::Terminal;
+    use aterm_render::{FaceId, Renderer, Theme, display_face_bytes, embedded_font};
+
+    let primary_bytes = display_face_bytes("pixel").expect("bundled primary");
+    let fallback_bytes = embedded_font();
+    let primary_face = ttf_parser::Face::parse(primary_bytes, 0).expect("primary parses");
+    let fallback_face = ttf_parser::Face::parse(fallback_bytes, 0).expect("fallback parses");
+    let covered_only_by_fallback = |ch: char| {
+        primary_face.glyph_index(ch).is_none() && fallback_face.glyph_index(ch).is_some()
+    };
+    let ambiguous = (0..=0xFFFFu32)
+        .filter_map(char::from_u32)
+        .find(|&ch| {
+            aterm_grapheme::is_ambiguous_width(ch)
+                && aterm_grapheme::char_width(ch) == 1
+                && aterm_grapheme::char_width_cjk(ch) == 2
+                && covered_only_by_fallback(ch)
+        })
+        .expect("fixture pair must expose an EAW-A fallback glyph");
+    let combining = (0x0300..=0x036Fu32)
+        .filter_map(char::from_u32)
+        .find(|&ch| aterm_grapheme::char_width(ch) == 0 && covered_only_by_fallback(ch))
+        .expect("fixture pair must expose a combining fallback glyph");
+
+    let mut r = Renderer::from_bytes(primary_bytes, 16.0, Theme::default()).expect("renderer");
+    r.set_fallback_bytes(fallback_bytes)
+        .expect("fallback installs");
+    let (cell_w, _) = r.cell_size();
+
+    let mut term = Terminal::new(1, 6);
+    term.process(b"\x1b[?25l");
+    let mut config = TerminalConfig {
+        ambiguous_width_double: true,
+        ..TerminalConfig::default()
+    };
+    term.apply_config(&config);
+    term.process(ambiguous.to_string().as_bytes());
+    config.ambiguous_width_double = false;
+    term.apply_config(&config);
+    term.process(ambiguous.to_string().as_bytes());
+    term.process(combining.to_string().as_bytes());
+    let input = term.cell_frame(1, 6);
+    let row = &input.cells[0];
+    assert_eq!(row[0].ch, ambiguous);
+    assert!(
+        row[1].wide,
+        "the first scalar keeps its stored continuation"
+    );
+    assert_eq!(row[2].ch, ambiguous);
+    assert!(
+        row.get(3).is_none_or(|cell| !cell.wide),
+        "the post-reload scalar stays one cell"
+    );
+    assert_eq!(materialized_cell_span(row, 0), 2);
+    assert_eq!(materialized_cell_span(row, 2), 1);
+
+    let wide_key = r.resolve_cell_key_for_span(
+        input.cluster_at(0, 0),
+        &row[0],
+        materialized_cell_span(row, 0),
+    );
+    let narrow_key = r.resolve_cell_key_for_span(
+        input.cluster_at(0, 2),
+        &row[2],
+        materialized_cell_span(row, 2),
+    );
+    assert_eq!(wide_key.source, FaceId::Fallback);
+    assert_eq!(narrow_key.source, FaceId::Fallback);
+    assert_eq!(wide_key.cell_span, 2);
+    assert_eq!(narrow_key.cell_span, 1);
+    assert_ne!(wide_key, narrow_key, "span is load-bearing cache identity");
+
+    let combining_key = r.glyph_key(combining);
+    assert_eq!(combining_key.source, FaceId::Fallback);
+    assert_eq!(combining_key.cell_span, 0);
+
+    assert!(!r.glyph_cache_contains(wide_key));
+    assert!(!r.glyph_cache_contains(narrow_key));
+    assert!(!r.glyph_cache_contains(combining_key));
+    let _ = r.render_input(&input);
+    assert!(
+        r.glyph_cache_contains(wide_key),
+        "shipping frame path must rasterize the stored two-cell variant"
+    );
+    assert!(
+        r.glyph_cache_contains(narrow_key),
+        "shipping frame path must rasterize the stored one-cell variant"
+    );
+    assert!(
+        r.glyph_cache_contains(combining_key),
+        "shipping frame path must rasterize the zero-width overlay"
+    );
+
+    let wide = r.glyph_image(wide_key).clone();
+    assert_eq!(wide.advance(), (2 * cell_w) as f32);
+    assert!(wide.xmin() >= 0 && wide.xmin() + wide.width() as i32 <= (2 * cell_w) as i32);
+    let narrow = r.glyph_image(narrow_key).clone();
+    assert_eq!(narrow.advance(), cell_w as f32);
+    assert!(narrow.xmin() >= 0 && narrow.xmin() + narrow.width() as i32 <= cell_w as i32);
+    assert_ne!(
+        (
+            wide.width(),
+            wide.xmin(),
+            wide.advance().to_bits(),
+            wide.bytes()
+        ),
+        (
+            narrow.width(),
+            narrow.xmin(),
+            narrow.advance().to_bits(),
+            narrow.bytes()
+        ),
+        "the two materialized spans must produce genuinely distinct geometry"
+    );
+    let combining_img = r.glyph_image(combining_key);
+    assert_ne!(
+        combining_img.width(),
+        0,
+        "combining coverage is non-vacuous"
+    );
+    assert_ne!(combining_img.bytes().iter().copied().max(), Some(0));
 }
 
 // ---- (4) row-band clip ----
@@ -548,6 +764,7 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
             eprintln!("SKIP: no wide ideograph served by the fallback chain on this host");
             return;
         };
+        assert_eq!(key.cell_span, 2, "a true CJK scalar defaults to two cells");
         let baseline = r.baseline();
         let (cell_w, _) = r.cell_size();
         let img = r.glyph_image(key);
@@ -588,6 +805,112 @@ fn cjk_fallback_glyph_is_banded_and_wide() {
             img.width()
         );
     }
+}
+
+/// A bare warning sign is text-presentation and occupies one terminal cell.
+/// Proportional fallback faces must not let its square symbol ink spill into
+/// the following cell (the visible `⚠ MCP` kerning regression).
+#[test]
+fn narrow_fallback_symbol_is_bounded_to_one_cell() {
+    use aterm_render::{FaceId, GlyphClass, Renderer, StyleBits, Theme};
+    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
+        eprintln!("SKIP: no system mono font found");
+        return;
+    };
+    r.debug_block_on_lazy_fallbacks();
+    let key = r.glyph_key('\u{26A0}');
+    if !matches!(
+        key.source,
+        FaceId::Fallback | FaceId::SymbolFallback | FaceId::RuntimeFallback
+    ) || key.glyph_class != GlyphClass::Mono
+    {
+        eprintln!("SKIP: warning sign is not served by a mono fallback face: {key:?}");
+        return;
+    }
+    assert_eq!(key.cell_span, 1, "bare U+26A0 must stay one cell");
+    let (cell_w_usize, cell_h) = r.cell_size();
+    let cell_w = cell_w_usize as i32;
+    let styles = [
+        StyleBits::REGULAR,
+        StyleBits::BOLD,
+        StyleBits::ITALIC,
+        StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0),
+    ];
+    let mut variants = Vec::new();
+    for style in styles {
+        let styled_key = r.glyph_key_styled('\u{26A0}', style);
+        assert_eq!(styled_key.source, key.source);
+        assert_eq!(styled_key.glyph_class, GlyphClass::Mono);
+        assert_eq!(styled_key.cell_span, 1);
+        assert_eq!(
+            styled_key.style, style,
+            "fallback style stays in cache identity"
+        );
+        let styled = r.glyph_image(styled_key).clone();
+        assert!(
+            styled.xmin() >= 0 && styled.xmin() + styled.width() as i32 <= cell_w,
+            "{style:?} one-cell warning ink escaped: xmin={} width={} cell_w={cell_w}",
+            styled.xmin(),
+            styled.width()
+        );
+        assert_eq!(
+            styled.advance(),
+            cell_w as f32,
+            "{style:?} warning owns exactly one cell"
+        );
+        assert!(
+            styled.height() <= cell_h,
+            "{style:?} warning mask must stay in its row band"
+        );
+        variants.push(styled);
+    }
+    // Non-vacuity: the synthetic style ran BEFORE the final fit; the fitted
+    // masks are contained but not silently collapsed back to regular.
+    for (name, styled) in [("bold", &variants[1]), ("italic", &variants[2])] {
+        assert!(
+            styled.bytes() != variants[0].bytes()
+                || (
+                    styled.width(),
+                    styled.height(),
+                    styled.xmin(),
+                    styled.ymin()
+                ) != (
+                    variants[0].width(),
+                    variants[0].height(),
+                    variants[0].xmin(),
+                    variants[0].ymin(),
+                ),
+            "{name} warning must exercise a distinct post-style mask"
+        );
+    }
+
+    let img = &variants[0];
+
+    // Shape-preservation pin: a fitted warning triangle remains roughly square
+    // and carries ink on BOTH sides of centre. A horizontal crop of the old
+    // 30px mask to 10px would leave a tall central slice instead.
+    let (w, h) = (img.width(), img.height());
+    assert!(w > 0 && h > 0 && img.bytes().iter().any(|&a| a > 0));
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = h;
+    let mut max_y = 0usize;
+    for y in 0..h {
+        for x in 0..w {
+            if img.bytes()[y * w + x] > 0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    let (ink_w, ink_h) = (max_x - min_x + 1, max_y - min_y + 1);
+    assert!(min_x < w / 2 && max_x >= w / 2, "triangle lost one side");
+    assert!(
+        ink_w * 2 >= ink_h && ink_h * 2 >= ink_w,
+        "fitted warning must preserve its roughly-square silhouette: ink={ink_w}x{ink_h}"
+    );
 }
 
 /// macOS native-CJK routing (W8): with the stock candidate list, the chain

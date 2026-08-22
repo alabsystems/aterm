@@ -756,13 +756,15 @@ impl Terminal {
     /// engine changes behavior — it ADDS enforcement on top of the legacy
     /// `authorize_*` bits, never widening it.
     pub fn apply_policy_engine(&mut self, engine: aterm_policy::engine::PolicyEngine) {
-        self.policy_engine = Some(engine);
+        // `install` recompiles the constant-probe gate table in the same step,
+        // so no gate can answer from the policy this call replaced.
+        self.policy.install(engine);
     }
 
     /// Borrow the currently installed policy engine, if any (#7996).
     #[must_use]
     pub fn policy_engine(&self) -> Option<&aterm_policy::engine::PolicyEngine> {
-        self.policy_engine.as_ref()
+        self.policy.engine()
     }
 
     /// Clear the installed policy engine (#7996).
@@ -771,7 +773,9 @@ impl Terminal {
     /// behavior. Primarily useful for tests and checkpoint restore
     /// (#7997 will serialize the engine so this path stays explicit).
     pub fn clear_policy_engine(&mut self) {
-        self.policy_engine = None;
+        // `clear` recompiles the gate table back to the legacy posture in the
+        // same step — see `apply_policy_engine`.
+        self.policy.clear();
     }
 
     /// Enable or disable CSI t XTWINOPS window manipulation (#7139).
@@ -938,6 +942,15 @@ impl Terminal {
     #[inline]
     pub fn pipeline_timestamps(&self) -> &PipelineTimestamps {
         &self.transient.pipeline_timestamps
+    }
+
+    /// Process-unique identity stamped into every engine-filled RenderInput.
+    /// Cursor-effect input witnesses use the same nonce to prove that an arm
+    /// and its later content observation belong to one Terminal instance.
+    #[must_use]
+    #[inline]
+    pub fn render_identity(&self) -> u64 {
+        self.extract_identity
     }
 }
 

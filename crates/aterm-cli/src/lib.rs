@@ -51,6 +51,18 @@ mod manual;
 // agent reads once it knows to run `aterm help`; `primer` is how it learns to.
 mod primer;
 
+// The wt-shaped WINDOWING grammar (`new-tab` / `new-window` / `split-pane`) and
+// the `windowing_behavior` routing policy behind them. Pure parse + pure
+// decision, kept out of the front door's `main` so both are unit-testable
+// without a socket, a window, or a config file.
+mod windowing;
+
+pub use windowing::{
+    LaunchEnv, LaunchIntent, SplitOrientation, WindowRequest, WindowRoute, WindowingBehavior,
+    parse_window_request, plain_launch_dir_operand, plain_launch_is_policy_eligible, route_launch,
+    window_verb_usage,
+};
+
 /// Polished `--help` text: synopsis, description, OPTIONS, ENVIRONMENT, EXAMPLES.
 /// Mirrors `aterm-gui`'s `parse_cli()` help in tone and layout, scoped to what the
 /// daily-driver CLI actually does (transparent passthrough of `$SHELL`).
@@ -146,6 +158,12 @@ pub enum Verb {
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
+    /// `aterm new-tab` — a tab, routed by `windowing_behavior` (S12 / design §5).
+    NewTab,
+    /// `aterm new-window` — a window, unconditionally (the `attach` escape hatch).
+    NewWindow,
+    /// `aterm split-pane` — a pane beside the focused one.
+    SplitPane,
 }
 
 impl Verb {
@@ -158,6 +176,9 @@ impl Verb {
         Verb::Ship,
         Verb::Update,
         Verb::Agents,
+        Verb::NewTab,
+        Verb::NewWindow,
+        Verb::SplitPane,
     ];
 
     /// The operand that selects this verb.
@@ -170,6 +191,11 @@ impl Verb {
             Verb::Ship => "ship",
             Verb::Update => "update",
             Verb::Agents => "agents",
+            // Hyphenated, exactly like Windows Terminal's — the whole value of a
+            // familiar grammar is that the words are the SAME words.
+            Verb::NewTab => "new-tab",
+            Verb::NewWindow => "new-window",
+            Verb::SplitPane => "split-pane",
         }
     }
 
@@ -184,7 +210,40 @@ impl Verb {
             Verb::Pkg => Some("atpkg"),
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
-            Verb::Ship | Verb::Update | Verb::Agents => None,
+            // The windowing verbs never were sibling binaries, and never should
+            // be: `new-tab` on PATH would shadow nothing of aterm's but would be
+            // a wildly generic name to install into a user's `$PATH`.
+            Verb::Ship
+            | Verb::Update
+            | Verb::Agents
+            | Verb::NewTab
+            | Verb::NewWindow
+            | Verb::SplitPane => None,
+        }
+    }
+
+    /// Whether this verb is one of the WINDOWING verbs — the three
+    /// [`parse_window_request`] parses and [`route_launch`] routes.
+    ///
+    /// The roster owns the classification so the front door's alias dispatch and
+    /// its exhaustive verb match cannot disagree about which words open a
+    /// terminal. That matters concretely on Windows: the shipped install is
+    /// several IDENTICAL copies of this one binary under the sibling names, the
+    /// Start-Menu shortcut targets `aterm-gui.exe`, and the taskbar jump list is
+    /// committed by whichever copy is running — so a windowing verb genuinely
+    /// arrives under an argv0 ALIAS, where it must be routed rather than handed
+    /// to the window's own flag parser as an unknown option.
+    #[must_use]
+    pub const fn is_windowing(self) -> bool {
+        match self {
+            Verb::NewTab | Verb::NewWindow | Verb::SplitPane => true,
+            Verb::Ctl
+            | Verb::Pkg
+            | Verb::Fleet
+            | Verb::Drive
+            | Verb::Ship
+            | Verb::Update
+            | Verb::Agents => false,
         }
     }
 
@@ -198,6 +257,14 @@ impl Verb {
             Verb::Ship => "aterm ship <args>",
             Verb::Update => "aterm update [<cmd>]",
             Verb::Agents => "aterm agents [<cmd>]",
+            // The synopsis column is 26 wide (VERB_BLURB_COLUMN - 4) and the
+            // rendering test pins the blurb to exactly column 30, so these read
+            // `[-d dir]` rather than the `[-d <dir>]` the usage lines use: the
+            // angle brackets would push `new-window`/`split-pane` to 27 and
+            // break the one-column alignment of the whole VERBS table.
+            Verb::NewTab => "aterm new-tab [-d dir]",
+            Verb::NewWindow => "aterm new-window [-d dir]",
+            Verb::SplitPane => "aterm split-pane [-d dir]",
         }
     }
 
@@ -225,6 +292,19 @@ impl Verb {
                 "Make coding agents aterm-aware: manage the 3-line aterm",
                 "primer in their global context files (status | install |",
                 "remove | primer). Run once per machine.",
+            ],
+            Verb::NewTab => &[
+                "Open a terminal tab. Where it opens is the",
+                "`windowing_behavior` config key: a new window",
+                "(the default) or a tab in the running aterm.",
+            ],
+            Verb::NewWindow => &[
+                "Open a NEW window, always — never routed into a",
+                "running instance whatever windowing_behavior says.",
+            ],
+            Verb::SplitPane => &[
+                "Split the focused pane in the running aterm",
+                "(-H stacked, -V side-by-side, the default).",
             ],
         }
     }
@@ -1042,6 +1122,31 @@ mod tests {
             cmd: cmd.to_string(),
             arg: arg.map(str::to_string),
         }
+    }
+
+    /// [`Verb::is_windowing`] is the roster's own answer to "does this word open
+    /// a terminal", and it must be EXACTLY the set the windowing grammar parses —
+    /// not a hand-kept second list. The front door's argv0-alias dispatch keys on
+    /// it, so a verb that drifted out of this set would silently stop working
+    /// under `aterm-gui.exe` (the name the shipped Windows shortcut and the
+    /// taskbar jump list actually launch) while still working under `aterm.exe`.
+    #[test]
+    fn the_windowing_verbs_are_exactly_the_ones_the_grammar_parses() {
+        for verb in Verb::ALL {
+            let parses = super::parse_window_request(verb.name(), &[], |raw| Ok(raw.to_string()))
+                .is_ok();
+            assert_eq!(
+                verb.is_windowing(),
+                parses,
+                "`{}`: is_windowing() must agree with parse_window_request",
+                verb.name()
+            );
+        }
+        assert_eq!(
+            Verb::ALL.iter().filter(|v| v.is_windowing()).count(),
+            3,
+            "new-tab, new-window, split-pane"
+        );
     }
 
     #[test]

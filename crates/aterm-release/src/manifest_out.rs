@@ -61,6 +61,19 @@ pub struct ManifestInputs<'a> {
     pub zip_name: &'a str,
     /// Lowercase-hex SHA-256 of the zip bytes (computed in-process, dmg.rs).
     pub zip_sha256: &'a str,
+    /// Exact INTEL batteries-included DMG asset name in the same release, e.g.
+    /// "aterm-0.47.0-x86_64.dmg" — emitted only when the cut sealed a seed
+    /// covering `x86_64-apple-darwin` and packaged the per-arch DMG pair.
+    /// `None` (a seedless or deliberately arm64-only cut) omits BOTH wire keys,
+    /// which is byte-for-byte the pre-pair manifest — the compatibility story
+    /// for the whole feature (see `aterm_update_core::Manifest::dmg_x86_64`).
+    pub dmg_x86_64_name: Option<&'a str>,
+    /// Lowercase-hex SHA-256 of the Intel DMG bytes, post-notarization-hook
+    /// (same re-hash rule as the canonical DMG's). Must be `Some` exactly when
+    /// `dmg_x86_64_name` is — `build` refuses nothing here because the emitter's
+    /// round-trip and the draft asset gate both fail closed on a name without a
+    /// digest.
+    pub dmg_x86_64_sha256: Option<&'a str>,
     /// "owner/repo" for the `url` field — this must be the **public update
     /// channel** (`[workspace.metadata.aterm] update_channel`) whenever one is
     /// configured, NOT the private publish repo.
@@ -115,6 +128,8 @@ pub fn build(i: &ManifestInputs<'_>) -> Manifest {
         )),
         zip: Some(i.zip_name.to_string()),
         zip_sha256: Some(i.zip_sha256.to_string()),
+        dmg_x86_64: i.dmg_x86_64_name.map(str::to_string),
+        dmg_x86_64_sha256: i.dmg_x86_64_sha256.map(str::to_string),
         min_os: Some(i.min_os.to_string()),
         team_id: Some(i.team_id.to_string()),
         pub_date: Some(i.pub_date.to_string()),

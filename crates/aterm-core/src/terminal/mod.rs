@@ -56,6 +56,7 @@ mod mouse;
 /// `content_seq`. Ephemeral, surface-non-mutating, checkpoint-excluded.
 mod observe;
 mod policy_bridge;
+mod policy_gates;
 mod processing;
 mod render_cells;
 mod reset;
@@ -145,7 +146,7 @@ pub use aterm_types::{WindowOperation, WindowResponse};
 pub use clipboard_auth::ClipboardAccess;
 pub use render_cells::{RenderCell, UnderlineStyle};
 pub use search_budgeted::{BudgetedSearchError, BudgetedSearchStep};
-pub use state::Terminal;
+pub use state::{ContentScrollState, Terminal};
 use types::{SgrPushMask, SgrStackEntry, TaskbarProgress};
 
 use crate::grid::Cursor;

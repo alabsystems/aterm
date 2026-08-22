@@ -114,7 +114,11 @@ impl Grid {
         // (unreachable per #4638): a spurious rebuild is harmless; a missed
         // one is silently stale search results.
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: a Kitty unscroll renumbers history WHOLESALE
+        // (see the `history_renumber_epoch` bump just above), so absolute row
+        // numbers shift under every anchor and no band can describe the damage.
+        // `All` is the honest answer.
+        self.force_selection_invalidation();
         // Only the scroll region rows changed — mark them, not the full screen.
         let top_u16 = self.storage.scroll_region.top;
         let bottom_u16 = self.storage.scroll_region.bottom;

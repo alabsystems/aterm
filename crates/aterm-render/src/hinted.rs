@@ -72,20 +72,37 @@ pub(crate) enum HintMode {
 }
 
 impl HintMode {
+    /// Parse one mode spelling — shared by the env read ([`Self::from_env`])
+    /// and the config key (`font_hinting`, via `Renderer::set_font_hinting`).
+    /// Unrecognized = the default ([`HintMode::Full`]), the same forgiving
+    /// shape the env always had; explicit disable spellings match the
+    /// workspace's usual off/0/none family.
+    pub(crate) fn parse(s: &str) -> Self {
+        match s.trim() {
+            "light" => Self::Light,
+            "native" => Self::Native,
+            "off" | "0" | "none" | "false" => Self::Off,
+            _ => Self::Full,
+        }
+    }
+
+    /// Whether `ATERM_RASTERIZER=fontdue` — the byte-stable portable path the
+    /// golden/parity tests export — is pinning the raster backend. It forces
+    /// `Off` at construction AND wins over the `font_hinting` config setter,
+    /// so those tests keep the exact fontdue bytes they were written against.
+    pub(crate) fn fontdue_forced() -> bool {
+        std::env::var("ATERM_RASTERIZER").ok().as_deref() == Some("fontdue")
+    }
+
     /// Parse `ATERM_FONT_HINTING`. Unset or unrecognized = the default
-    /// ([`HintMode::Full`]); explicit disable spellings match the workspace's
-    /// usual off/0/none family. `ATERM_RASTERIZER=fontdue` — the byte-stable
-    /// portable path the golden/parity tests export — forces `Off`, so those
-    /// tests keep the exact fontdue bytes they were written against.
+    /// ([`HintMode::Full`]); [`Self::fontdue_forced`] forces `Off`.
     pub(crate) fn from_env() -> Self {
-        if std::env::var("ATERM_RASTERIZER").ok().as_deref() == Some("fontdue") {
+        if Self::fontdue_forced() {
             return Self::Off;
         }
         match std::env::var("ATERM_FONT_HINTING").ok().as_deref() {
-            Some("light") => Self::Light,
-            Some("native") => Self::Native,
-            Some("off" | "0" | "none" | "false") => Self::Off,
-            _ => Self::Full,
+            Some(s) => Self::parse(s),
+            None => Self::Full,
         }
     }
 

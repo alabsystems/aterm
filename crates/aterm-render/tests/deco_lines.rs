@@ -492,6 +492,60 @@ fn ink_skip_is_coverage_monotone_end_to_end() {
     );
 }
 
+/// Baseline bottoms are NOT descenders (TYPOGRAPHY R2): at the live desktop
+/// 12px the resolved underline band starts within 1px of the baseline, and the
+/// probe's 1px vertical dilation used to reach the bottom row of EVERY letter
+/// — chopping a continuous underline (and the tab strip's accent rule, which
+/// is drawn as a cell underline) into dashes. The probe is now clamped to the
+/// baseline row: only true descender ink (rows at/below the baseline) skips.
+/// Guarded HERE at the tight geometry — the 18px fixture of the test above
+/// leaves a row of air under the letters, so it never caught this.
+#[test]
+fn baseline_bottoms_keep_the_underline_at_12px() {
+    let Some(bytes) = embedded_font_bytes() else {
+        eprintln!("SKIP: embedded font unavailable");
+        return;
+    };
+    let Ok(mut r) = Renderer::from_bytes(&bytes, 12.0, Theme::default()) else {
+        eprintln!("SKIP: 12px renderer failed to build");
+        return;
+    };
+    // Descender-free letters, underlined: skip on == skip off, byte for byte —
+    // the underline must survive continuously under baseline-sitting bottoms.
+    let flat_txt = b"\x1b[4mnnaeuu\x1b[0m";
+    r.set_underline_skip_descenders(false);
+    let off = render(&mut r, flat_txt);
+    r.set_underline_skip_descenders(true);
+    let on = render(&mut r, flat_txt);
+    assert_eq!(
+        off.pixels, on.pixels,
+        "baseline-sitting letter bottoms must not chop the 12px underline"
+    );
+    // Control (non-vacuity at this size): real descenders still erase.
+    let deco_txt = b"\x1b[4mgyjpqy\x1b[0m";
+    r.set_underline_skip_descenders(false);
+    let a = render(&mut r, deco_txt);
+    r.set_underline_skip_descenders(true);
+    let b = render(&mut r, deco_txt);
+    assert_ne!(
+        a.pixels, b.pixels,
+        "g/y descenders must still erase underline coverage at 12px"
+    );
+}
+
+/// The embedded DejaVu Sans Mono, via the public accessor when the (default)
+/// `embedded-font` feature is on; `None` (skip) on a --no-default-features run.
+fn embedded_font_bytes() -> Option<Vec<u8>> {
+    #[cfg(feature = "embedded-font")]
+    {
+        Some(aterm_render::embedded_font().to_vec())
+    }
+    #[cfg(not(feature = "embedded-font"))]
+    {
+        None
+    }
+}
+
 /// The undercurl band derivation agrees with the resolved metrics for every
 /// style, and `Curly` emits NO rects on mask-supported sizes (the tile draws
 /// instead) but real square-wave rects when the mask is unsupported.

@@ -307,6 +307,51 @@ impl EventLog {
     pub fn live(&self) -> impl Iterator<Item = &Event> {
         self.ring.iter()
     }
+
+    /// The OLDEST live event (the ring's low-water), or `None` when nothing is
+    /// retained. O(1).
+    ///
+    /// It is the reachability oracle for a handle held OUTSIDE the ring. The
+    /// ring only ever pushes to the back and pops from the front, so the live
+    /// seqs are the contiguous range `[oldest.seq, head]` — which means
+    /// `seq >= oldest_live().seq` is EXACTLY "this event is still on the spine".
+    /// A keyframe store that outlives the ring window (temporal recording keeps
+    /// its checkpoints in a separate bounded deque) has to answer that question
+    /// before it may seed a replay from one, or it would fold a forward chain
+    /// whose head has already been evicted and hand back a silently wrong
+    /// engine.
+    pub fn oldest_live(&self) -> Option<&Event> {
+        self.ring.front()
+    }
+
+    /// The NEWEST live event, or `None` when nothing is retained. O(1).
+    ///
+    /// Callers that record with [`append_at`](Self::append_at) from one
+    /// monotone clock get a nondecreasing `ts` down the ring, so this is also
+    /// the LATEST RECORDED INSTANT — a `max` fold over `live()` is the same
+    /// answer at `MAX_LOG_EVENTS` times the cost.
+    pub fn newest_live(&self) -> Option<&Event> {
+        self.ring.back()
+    }
+
+    /// Live events with `seq > after`, oldest-first — the same suffix
+    /// `live().filter(|e| e.seq > after)` yields, reached by an O(1) SEEK
+    /// instead of a walk over the whole retained ring.
+    ///
+    /// Sound because the live seqs are contiguous and ascending (push-back /
+    /// pop-front only, one seq per append): the first event past `after` sits at
+    /// offset `after + 1 - oldest.seq`, clamped into `[0, len]` so a watermark
+    /// below the low-water yields EVERYTHING (not a panic) and one at or above
+    /// the head yields nothing.
+    pub fn live_after(&self, after: Seq) -> impl Iterator<Item = &Event> {
+        let start = match self.ring.front() {
+            None => 0,
+            Some(first) => usize::try_from(after.0.saturating_add(1).saturating_sub(first.seq.0))
+                .unwrap_or(usize::MAX)
+                .min(self.ring.len()),
+        };
+        self.ring.range(start..)
+    }
 }
 
 /// A Surface: the addressing root holding committed lines + the event-log spine
@@ -840,6 +885,68 @@ mod tests {
             max_cap_seen,
             MAX_LOG_EVENTS + 1
         );
+    }
+
+    /// DIFFERENTIAL: the O(1) seek in `live_after` yields exactly what the
+    /// linear `live().filter(|e| e.seq > after)` yields, at every watermark
+    /// around a ring that HAS evicted — below the low-water (everything), on
+    /// the low-water, in the middle, at the head, and past it (nothing). Plus
+    /// the two O(1) ends: `oldest_live`/`newest_live` are the ring's low/high,
+    /// and `newest_live().ts` is the `max` fold over a monotone-`ts` recording.
+    #[test]
+    fn live_after_seek_matches_the_filter_and_the_ends_are_the_extremes() {
+        let mut log = EventLog::default();
+        // Past the cap so the front has been evicted, with a nondecreasing ts —
+        // the shape a temporal recorder produces from one monotone clock.
+        for i in 0..(MAX_LOG_EVENTS + 32) {
+            let (_seq, _evicted) =
+                log.append_at(Op::Resize { rows: 0, cols: 0 }, Ticks((i as u64) / 3));
+        }
+        let low = log.oldest_live().expect("non-empty").seq;
+        let high = log.newest_live().expect("non-empty").seq;
+        assert!(
+            low.0 > 1,
+            "the fixture must have evicted, or the below-low arm is vacuous"
+        );
+        assert_eq!(high, log.head(), "newest live seq is the spine head");
+        assert_eq!(
+            log.newest_live().map(|e| e.ts),
+            log.live().map(|e| e.ts).max(),
+            "back() is the max tick when ts is monotone nondecreasing"
+        );
+
+        let reference = |after: Seq| -> Vec<u64> {
+            log.live()
+                .filter(|e| e.seq > after)
+                .map(|e| e.seq.0)
+                .collect()
+        };
+        let observed =
+            |after: Seq| -> Vec<u64> { log.live_after(after).map(|e| e.seq.0).collect() };
+        for after in [
+            Seq(0),
+            Seq(1),
+            Seq(low.0 - 1),
+            low,
+            Seq(low.0 + 1),
+            Seq(low.0 + 977),
+            Seq(high.0 - 1),
+            high,
+            Seq(high.0 + 1),
+            Seq(u64::MAX),
+        ] {
+            assert_eq!(
+                observed(after),
+                reference(after),
+                "live_after({after:?}) diverged"
+            );
+        }
+        assert_eq!(
+            observed(Seq(low.0 - 1)).len(),
+            MAX_LOG_EVENTS,
+            "below low-water = all live"
+        );
+        assert!(observed(high).is_empty(), "at the head = nothing after");
     }
 
     #[test]

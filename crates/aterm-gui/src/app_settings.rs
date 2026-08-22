@@ -1722,6 +1722,10 @@ impl App {
     #[cfg(feature = "a11y-accesskit")]
     fn on_accessibility_action(&mut self, wid: crate::WindowId, req: accesskit::ActionRequest) {
         use crate::overlay::OverlayKind;
+        // Screen-reader actions bypass keyboard/pointer ingress. Even an
+        // ignored/stale request is a newer external-input boundary and must
+        // retire a swallowed cursor-move proof before any local early return.
+        self.cancel_cursor_move_candidate(wid);
         let kind = self
             .windows
             .get(&wid)
@@ -1967,6 +1971,10 @@ mod tests {
                 };
                 let mut cells = Vec::new();
                 ws.cursor_trail.tick(Some((2, 1)), now, &cfg, &mut cells);
+                // The scripted three-cell preview hop is a deliberate generic
+                // gesture, not a one-glyph echo (which correctly takes the
+                // large-delta re-anchor path).
+                ws.cursor_trail.note_synthetic_move(now);
                 ws.cursor_trail.tick(cur, now, &cfg, &mut cells);
                 assert!(ws.cursor_trail.is_active());
             }
@@ -2718,7 +2726,10 @@ mod tests {
         assert!(captured_typed(&mut app).is_empty(), "serious mode");
         app.serious_mode = false;
         app.audition_typing_sound(SoundVoice::Typewriter);
-        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Typewriter, 0.4)]);
+        assert_eq!(
+            captured_typed(&mut app),
+            vec![(SoundVoice::Typewriter, 0.4)]
+        );
         // An inert host (no audio backend / headless): silent.
         app.trail_audio = crate::trail_audio::TrailAudio::new(false);
         app.audition_typing_sound(SoundVoice::Mech);
@@ -2758,7 +2769,10 @@ mod tests {
         );
         // Clearing the key back to auto from a file edit auditions auto once.
         next.trail_sound_style = None;
-        assert_eq!(app.typing_sound_to_audition_on_swap(&next), Some(SoundVoice::Style));
+        assert_eq!(
+            app.typing_sound_to_audition_on_swap(&next),
+            Some(SoundVoice::Style)
+        );
     }
 
     /// PERF/CONTRACT: `push_a11y_tree` builds the whole visible-screen tree eagerly and only
@@ -2794,5 +2808,81 @@ mod tests {
             !app.windows[&wid].a11y_active,
             "the client detached; a re-attach re-fires InitialTreeRequested"
         );
+    }
+
+    /// Accessibility actions bypass keyboard and pointer ingress. Even a stale
+    /// or unsupported request is a newer external-input boundary, so it must
+    /// retire an older exact cursor candidate before native/overlay routing can
+    /// return without consuming it.
+    #[cfg(feature = "a11y-accesskit")]
+    #[test]
+    fn accessibility_action_supersedes_pending_cursor_candidate() {
+        use accesskit::{Action, ActionRequest, NodeId, TreeId};
+
+        let mut app = App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("lumen".to_string());
+        let glow_cfg = app.glow_config();
+        let trail_cfg = crate::cursor_trail::TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let geom = crate::cursor_glow::Geom {
+            cw: 8,
+            ch: 16,
+            rows: 6,
+            cols: 40,
+            origin_x: 0,
+            origin_y: 0,
+            win_w: 320,
+            win_h: 96,
+            head: 0,
+        };
+        let now = Instant::now();
+        let mut glow = Vec::new();
+        let mut trail = Vec::new();
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.cursor_glow
+                .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow);
+            ws.cursor_trail
+                .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
+            ws.cursor_glow.note_synthetic_move(now);
+            ws.cursor_trail.note_synthetic_move(now);
+            assert!(ws.cursor_glow.move_candidate_pending());
+            assert!(ws.cursor_trail.move_candidate_pending());
+        }
+
+        let winit_id = winit::window::WindowId::from(17u64);
+        app.winit_to_window.insert(winit_id, wid);
+        app.on_accessibility_event(accesskit_winit::Event {
+            window_id: winit_id,
+            window_event: accesskit_winit::WindowEvent::ActionRequested(ActionRequest {
+                action: Action::Focus,
+                target_tree: TreeId::ROOT,
+                target_node: NodeId(999_999),
+                data: None,
+            }),
+        });
+        let ws = app.windows.get_mut(&wid).unwrap();
+        assert!(!ws.cursor_glow.move_candidate_pending());
+        assert!(!ws.cursor_trail.move_candidate_pending());
+        let moved = now + Duration::from_millis(1);
+        assert_eq!(
+            ws.cursor_glow
+                .tick(Some((0, 1)), moved, &glow_cfg, geom, &mut glow),
+            0
+        );
+        assert_eq!(
+            ws.cursor_trail
+                .tick(Some((0, 1)), moved, &trail_cfg, &mut trail),
+            0
+        );
+        assert!(glow.is_empty() && trail.is_empty());
     }
 }

@@ -160,28 +160,27 @@ impl ShellIntegrationAuth {
     /// * Engine absent / falls through → defer entirely to the nonce
     ///   check (Release N backward-compat; design §6.3).
     ///
-    /// `command` should be `133` or `633` to match the caller's dispatch
-    /// family. The probe's subcommand byte is left wildcard — the engine
-    /// can express `OSC 133` or `OSC 633` at the major-only granularity.
-    pub(crate) fn verify_nonce_with_engine(
+    /// `gate` is the caller-resolved policy verdict for this dispatch —
+    /// [`super::policy_gates::PolicyState::shell_integration_gate`], which
+    /// resolves it from [`probe_shell_integration`] once per installed policy
+    /// for the subcommand letters shell integration actually uses, and evaluates
+    /// live for anything else.
+    ///
+    /// # Note on the probe's subcommand
+    ///
+    /// The probe is NOT subcommand-wildcard, despite what this doc said before
+    /// (#7994): [`probe_subcommand`] fills `params[1]` in and substitutes `"A"`
+    /// when it is absent or not UTF-8, so a bare `ESC ] 133 BEL` is probed as if
+    /// it were an `A` mark. That is unobservable under the built-in profiles
+    /// (none carries an OSC 133/633 rule) but it IS expressible in a policy
+    /// (`"OSC 133;C"` parses), which is exactly why the compiled table is keyed
+    /// on the subcommand rather than on the major alone.
+    pub(super) fn verify_nonce_with_engine(
         &mut self,
-        engine: Option<&aterm_policy::engine::PolicyEngine>,
-        origin: aterm_policy::OriginTag,
-        command: u32,
+        gate: super::policy_bridge::BridgeDecision,
         params: &[&[u8]],
     ) -> bool {
-        // Build a minimal OSC probe. The first param is the subcommand
-        // glyph (e.g. "A"); we use "A" as a representative — the engine's
-        // OSC 133/633 rules normally match at the major level in the
-        // standard profile.
-        let subcommand = params
-            .get(1)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("A")
-            .to_owned();
-        let seq = aterm_policy::selector::DispatchedSequence::osc(command, [subcommand]);
-        let decision = super::policy_bridge::engine_decision(engine, &seq, origin);
-        match decision {
+        match gate {
             super::policy_bridge::BridgeDecision::Deny => {
                 self.dropped_count = self.dropped_count.saturating_add(1);
                 false
@@ -215,6 +214,34 @@ impl ShellIntegrationAuth {
         let _ = &self.nonce;
         aterm_provenance::HostAuthorizationToken::__new_for_capability_only()
     }
+}
+
+/// The subcommand glyph the OSC 133/633 policy probe uses.
+///
+/// `params[1]` when it is valid UTF-8, `"A"` otherwise — including when the
+/// sequence carried no subcommand at all. The single definition, shared with
+/// [`super::policy_gates`] so the compiled table is keyed on exactly the value
+/// the probe would have carried.
+#[must_use]
+pub(super) fn probe_subcommand<'a>(params: &'a [&'a [u8]]) -> &'a str {
+    params
+        .get(1)
+        .and_then(|b| std::str::from_utf8(b).ok())
+        .unwrap_or("A")
+}
+
+/// Probe sequence used by the OSC 133 / OSC 633 policy lookup.
+///
+/// `command` is `133` or `633`; `subcommand` comes from [`probe_subcommand`].
+/// This is the one place the probe's shape is defined, so the compiled gate
+/// table and its live fallback cannot disagree about which bucket a mark lands
+/// in.
+#[must_use]
+pub(super) fn probe_shell_integration(
+    command: u32,
+    subcommand: &str,
+) -> aterm_policy::selector::DispatchedSequence {
+    aterm_policy::selector::DispatchedSequence::osc(command, [subcommand.to_owned()])
 }
 
 /// Scan OSC parameters from index 2 onward for an `id=<hex>` tag and

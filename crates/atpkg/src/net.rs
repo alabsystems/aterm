@@ -273,6 +273,45 @@ fn index_pair_urls(releases: &[Release]) -> Vec<CandidateUrls<'_>> {
     out
 }
 
+/// The IDENTITY of one candidate: an opaque fingerprint that changes if and only if the
+/// four assets behind it change — the cheap question
+/// [`crate::flow::Fetcher::index_identities`] exists to answer.
+///
+/// # Why the listing already knows this
+///
+/// `Asset.url` IS `https://api.github.com/repos/<owner>/<repo>/releases/assets/<id>`, and
+/// that id is minted per UPLOAD. GitHub has no edit-in-place for asset bytes: replacing
+/// `index.toml` on a release means deleting the asset and uploading a new one, which
+/// mints a new id and therefore a new URL. So the listing response — one request, which
+/// the resolve had to make anyway — already carries a per-asset change token for all four
+/// blobs. The old code parsed those URLs, downloaded through them once, and threw them
+/// away, then spent sixteen more round-trips next pass rediscovering that nothing moved.
+///
+/// # This is a CHANGE DETECTOR, not a security primitive
+///
+/// Nothing downstream trusts it. A match only permits reusing bytes that are then handed
+/// to `select_index` and face the identical master-signed roster admission, machine
+/// signature, durable floor, roster ratchet and `valid_until` window (see the
+/// [`crate::cache`] module doc). A mismatch costs a download. So the worst a frozen,
+/// forged or colliding fingerprint can buy an adversary is SUPPRESSION — serving an older
+/// already-published, already-verified index — which whoever serves the assets could
+/// always do by simply not serving the new ones, and which the freshness window bounds.
+///
+/// The tag is folded in beside the URLs so that a release RETAGGED onto the same assets
+/// is still a different candidate: `label` is what the cache entry, the diagnostics and
+/// `Candidate::label` carry, and an identity that ignored it would let two publication
+/// states share one fingerprint. NUL separators keep the concatenation unambiguous —
+/// neither a git tag nor a URL can contain a NUL byte.
+fn candidate_identity(u: &CandidateUrls<'_>) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for part in [u.label, u.index, u.index_sig, u.roster, u.roster_sig] {
+        h.update(part.as_bytes());
+        h.update([0u8]);
+    }
+    crate::tree::hex(&h.finalize())
+}
+
 /// The `(slug, program, build)` triple that fully determines which asset pair a
 /// memoized manifest was downloaded from.
 type ManifestKey = (String, String, u64);
@@ -495,6 +534,31 @@ impl crate::flow::Fetcher for GithubFetcher {
             *memo = Some(std::sync::Arc::clone(&out));
         }
         Ok((*out).clone())
+    }
+
+    fn index_identities(&self) -> Option<Vec<String>> {
+        // ONE request, and it is the request `index_candidates` was going to make anyway:
+        // `releases_at` memoizes per process, so whichever of the two runs first pays the
+        // listing and the other is free. That is what makes this probe honest — it cannot
+        // ADD a round-trip, only remove sixteen.
+        //
+        // Derived from the SAME `index_pair_urls` walk the download loop runs, over the
+        // same memoized listing, so the identities are in the same order and of the same
+        // length as the candidates that loop would produce — the pairing contract
+        // `Fetcher::index_identities` states. (The download loop `?`-propagates any asset
+        // failure, so a partial candidate set never reaches the cache to be stamped.)
+        //
+        // A listing failure yields `None`, not an error: the caller then takes the
+        // historical path, where the real fetch surfaces the real reason (and, failing
+        // that, the §14 fallback answers). This probe must never be the thing that turns
+        // an offline machine's diagnosis into "no signature-valid index".
+        let releases = self.releases(&crate::discovery::index_repo()).ok()?;
+        Some(
+            index_pair_urls(&releases)
+                .iter()
+                .map(candidate_identity)
+                .collect(),
+        )
     }
 
     fn pkg_manifest(
@@ -1164,6 +1228,40 @@ mod tests {
             capped[0].label, "idx-0",
             "the NEWEST carrying releases are kept"
         );
+    }
+
+    /// The identity moves when — and only when — one of the four assets behind the
+    /// candidate moves. Both directions, because only the pair is load-bearing: stable
+    /// under a repeat listing is what makes the cache a hit path, and unstable under a
+    /// re-upload is what stops it being a downgrade oracle.
+    #[test]
+    fn candidate_identity_is_stable_and_moves_with_any_asset() {
+        let base = vec![quad("idx-6")];
+        let id = candidate_identity(&index_pair_urls(&base)[0]);
+        assert_eq!(id.len(), 64, "a sha256 hex digest");
+        let again = vec![quad("idx-6")];
+        assert_eq!(
+            id,
+            candidate_identity(&index_pair_urls(&again)[0]),
+            "an unchanged release listing fingerprints identically"
+        );
+
+        // Re-uploading ANY of the four mints a new asset id, i.e. a new URL.
+        for i in 0..4 {
+            let mut one = quad("idx-6");
+            one.assets[i].url.push_str("-reuploaded");
+            let moved = vec![one];
+            assert_ne!(
+                id,
+                candidate_identity(&index_pair_urls(&moved)[0]),
+                "asset {i} moved but the identity did not"
+            );
+        }
+        // A retag onto the same four assets is a different publication state.
+        let mut rel = quad("idx-6");
+        rel.tag_name = "idx-6-rc2".into();
+        let retagged = vec![rel];
+        assert_ne!(id, candidate_identity(&index_pair_urls(&retagged)[0]));
     }
 
     /// NO ROSTER, NO CANDIDATE. A release with a perfectly good signed index but no

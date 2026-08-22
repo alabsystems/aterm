@@ -1667,8 +1667,8 @@ impl SettingsPreviewSpec {
         for step in 0..=WARMUP_STEPS.saturating_add(phase_steps) {
             let cursor = scripted_cursor(grid, step);
             if step > 0 {
-                glow.note_typed(base);
-                trail.note_typed(base);
+                glow.note_synthetic_typed(base, 1);
+                trail.note_synthetic_typed(base);
             }
             let _ = glow.tick(Some(cursor), base, &glow_config, geometry, &mut frame.glow);
             let _ = trail.tick(Some(cursor), base, &trail_config, &mut frame.trail);

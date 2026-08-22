@@ -276,6 +276,10 @@ unsafe extern "system" {
         dwProcessId: u32,
     ) -> HANDLE;
     pub(crate) fn GetCurrentProcessId() -> u32;
+    /// The pid behind a process HANDLE — the DefTerm adoption path's only way to
+    /// learn the client's pid, since a handoff hands over a handle and never a
+    /// pid. Returns 0 on failure (documented as a tolerated miss by the caller).
+    pub(crate) fn GetProcessId(hProcess: HANDLE) -> u32;
     pub(crate) fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
     pub(crate) fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> i32;
     pub(crate) fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> i32;

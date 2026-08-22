@@ -72,8 +72,17 @@ pub struct TemporalRecorder {
     log: EventLog,
     /// Bulk payloads for `RawIn`/`Reply`, keyed by `BlobId`, oldest first.
     blobs: VecDeque<Blob>,
-    /// Keyframes (serialized checkpoints), keyed by `KeyframeId`, oldest first.
-    keyframes: VecDeque<(KeyframeId, TerminalCheckpoint)>,
+    /// Keyframes (serialized checkpoints), oldest first, at most
+    /// [`MAX_KEYFRAMES`] retained.
+    ///
+    /// Each entry carries the SPINE COORDINATES its `Op::Keyframe` event was
+    /// appended at — `(seq, ts)` — not just the checkpoint. That is what lets
+    /// `replay_at` pick its base by looking at this four-entry deque instead of
+    /// re-deriving it by scanning up to `MAX_LOG_EVENTS` = 65,536 spine events
+    /// for the last `Op::Keyframe`. The coordinates cannot drift from the spine
+    /// because they are the exact values `append` returned when that very event
+    /// was recorded.
+    keyframes: VecDeque<RetainedKeyframe>,
     /// Warm tier: events evicted from the live ring (spill-not-forget). In a full
     /// deployment an off-lock task drains these to the cold/disk tier.
     spilled: VecDeque<Event>,
@@ -135,14 +144,18 @@ impl TemporalRecorder {
 
     /// Append `op` at `ts`, moving any evicted event to the warm tier (spill-not-
     /// forget), then enforce the byte budget (drop-oldest warm-tier events, counted).
-    fn append(&mut self, op: Op, ts: Ticks) {
-        let (_seq, evicted) = self.log.append_at(op, ts);
+    /// Returns the spine `Seq` the event was assigned — `record_keyframe` retains
+    /// it beside the checkpoint so the base-keyframe lookup is a four-entry scan
+    /// rather than a walk of the whole spine.
+    fn append(&mut self, op: Op, ts: Ticks) -> Seq {
+        let (seq, evicted) = self.log.append_at(op, ts);
         if let Some(ev) = evicted {
             // SPILL: tier the evicted event instead of dropping it (B.8.2).
             self.spilled.push_back(ev);
             self.used += SPILLED_EVENT_CHARGE;
         }
         self.enforce_budget();
+        seq
     }
 
     /// Record a raw PTY-input burst fed to `process()` (the `RawIn` event). The
@@ -199,8 +212,16 @@ impl TemporalRecorder {
         self.next_keyframe += 1;
         // A keyframe is large; charge its grid bytes against the budget.
         self.used += checkpoint.grid.len() + checkpoint.alt_grid.as_ref().map_or(0, Vec::len);
-        self.keyframes.push_back((id, checkpoint));
-        self.append(Op::Keyframe(id), ts);
+        // APPEND FIRST, then retain — the spine assigns the `Seq` and it is the
+        // coordinate `replay_at` seeks by, so the retained entry is built from
+        // the append's own return value and cannot disagree with the spine.
+        let seq = self.append(Op::Keyframe(id), ts);
+        self.keyframes.push_back(RetainedKeyframe {
+            id,
+            seq,
+            ts,
+            checkpoint,
+        });
         // This keyframe is the fresh base: the forward chain restarts from here.
         self.bytes_since_keyframe = 0;
         // Cap the retained keyframes: without this, periodic re-keyframing lets
@@ -210,9 +231,8 @@ impl TemporalRecorder {
         // few bounds keyframe budget use, leaving room for the chain; older instants
         // age out honestly (bounded retention). The newest keyframe is always kept.
         while self.keyframes.len() > MAX_KEYFRAMES {
-            if let Some((_id, kf)) = self.keyframes.pop_front() {
-                let cost = kf.grid.len() + kf.alt_grid.as_ref().map_or(0, Vec::len);
-                self.used = self.used.saturating_sub(cost);
+            if let Some(kf) = self.keyframes.pop_front() {
+                self.used = self.used.saturating_sub(kf.charge());
             }
         }
         self.enforce_budget();
@@ -302,9 +322,8 @@ impl TemporalRecorder {
                 self.dropped_events += 1;
                 continue;
             }
-            if let Some((_id, kf)) = self.keyframes.pop_front() {
-                let cost = kf.grid.len() + kf.alt_grid.as_ref().map_or(0, Vec::len);
-                self.used = self.used.saturating_sub(cost);
+            if let Some(kf) = self.keyframes.pop_front() {
+                self.used = self.used.saturating_sub(kf.charge());
                 continue;
             }
             break; // nothing left to reclaim
@@ -343,9 +362,21 @@ impl TemporalRecorder {
 
     /// The latest recorded instant on the live spine (the default replay target),
     /// or `Ticks(0)` before any event.
+    ///
+    /// O(1): the newest live event's tick, not a `max` fold over the ring.
+    /// SOUND because this recorder's spine is monotone in `ts` BY
+    /// CONSTRUCTION — every append (`RawIn`, `Reply`, `Resize`, `Keyframe`)
+    /// stamps `self.now()`, which is `epoch.elapsed()` off ONE `Instant`, and
+    /// every append is serialized on the single temporal writer thread (the
+    /// reader hands bursts over a FIFO, and `Resize` is enqueued on that SAME
+    /// FIFO under `term_lock` precisely so the ordering holds). A monotone
+    /// clock read in append order gives a nondecreasing `ts` down the ring, so
+    /// `back()` IS the max — and it was being paid for with a walk over up to
+    /// `MAX_LOG_EVENTS` = 65,536 events, on the default replay target, from
+    /// inside the re-keyframe path that runs every 2 MiB of recorded input.
     #[must_use]
     pub fn latest_tick(&self) -> Ticks {
-        self.log.live().map(|e| e.ts).max().unwrap_or_default()
+        self.log.newest_live().map(|e| e.ts).unwrap_or_default()
     }
 
     /// Resolve a `RawIn`/`Reply` handle to its retained bytes, or `None` if the
@@ -360,13 +391,41 @@ impl TemporalRecorder {
         self.blobs.get(idx).map(|b| &*b.bytes)
     }
 
-    /// Resolve a keyframe handle to its retained checkpoint (bounded, tiny scan;
-    /// keyframes keep their id in-band). `None` once the keyframe is evicted.
-    fn keyframe_checkpoint(&self, id: KeyframeId) -> Option<&TerminalCheckpoint> {
+    /// The base keyframe for a replay to instant `at`: the greatest-`seq`
+    /// keyframe that is BOTH retained here AND still live on the spine, with
+    /// `ts <= at`. `None` when no such keyframe exists (bounded retention won —
+    /// the honest, lossy answer `replay_at` already contracts for).
+    ///
+    /// WHY THIS IS THE SAME ANSWER the old spine scan produced, in O(1) instead
+    /// of O(`MAX_LOG_EVENTS`). The old code walked every live event, kept the
+    /// last `Op::Keyframe` with `ts <= at`, and then REQUIRED that one to still
+    /// be retained here (`?` on the checkpoint lookup) — it never fell back to
+    /// an older one. Take `k0` = that event. Two cases, and they agree:
+    ///
+    ///  * `k0` is retained ⇒ it is in this deque, live, and `ts <= at`; and no
+    ///    retained keyframe newer than `k0` can qualify, because a newer
+    ///    keyframe is also live (the ring evicts oldest-first, so anything newer
+    ///    than a live event is live) and `k0` was the greatest live qualifier —
+    ///    so the newer ones all have `ts > at`. Same pick.
+    ///  * `k0` is NOT retained ⇒ `k0` is older than every entry here (this deque
+    ///    keeps the newest [`MAX_KEYFRAMES`]), so every entry here is live and,
+    ///    by the same maximality argument, has `ts > at`. This search finds
+    ///    nothing and returns `None` — which is exactly what the `?` on the old
+    ///    checkpoint lookup did.
+    ///
+    /// LIVENESS IS NOT OPTIONAL. A keyframe can outlive its own spine event: the
+    /// deque holds four, the ring holds 65,536 events, so a long enough run
+    /// evicts the `Op::Keyframe` while the checkpoint is still here. Seeding a
+    /// replay from such a keyframe would fold a forward chain missing everything
+    /// between it and the ring's low-water and hand back a SILENTLY WRONG
+    /// engine, so the liveness test (`seq >= oldest_live().seq`, sound because
+    /// live seqs are contiguous) is a correctness guard, not an optimization.
+    fn base_keyframe(&self, at: Ticks) -> Option<&RetainedKeyframe> {
+        let floor = self.log.oldest_live()?.seq;
         self.keyframes
             .iter()
-            .find(|(kid, _)| *kid == id)
-            .map(|(_, cp)| cp)
+            .rev()
+            .find(|kf| kf.ts <= at && kf.seq >= floor)
     }
 
     /// Reconstruct the engine state at logical instant `at` (default: the latest
@@ -385,25 +444,24 @@ impl TemporalRecorder {
     #[must_use]
     pub fn replay_at(&self, host: HostBindings, at: Option<Ticks>) -> Option<Terminal> {
         let at = at.unwrap_or_else(|| self.latest_tick());
-        // Base keyframe: the greatest-seq live keyframe with ts <= at (the nearest
-        // retained seed at/under the target). `live()` is oldest-first, so the last
-        // qualifying keyframe wins; no reliance on ts being strictly monotone.
-        let mut base: Option<(Seq, KeyframeId)> = None;
-        for ev in self.log.live() {
-            if ev.ts > at {
-                continue;
-            }
-            if let Op::Keyframe(kid) = ev.op {
-                base = Some((ev.seq, kid));
-            }
-        }
-        let (base_seq, base_kid) = base?;
-        let cp = self.keyframe_checkpoint(base_kid)?;
-        let mut term = Terminal::from_checkpoint(cp, host);
+        // Base keyframe: O(MAX_KEYFRAMES) over the retained deque (which carries
+        // each keyframe's own spine coordinates) instead of a full walk of the
+        // spine looking for the last `Op::Keyframe` — see `base_keyframe` for
+        // why the two pick the same entry.
+        let base = self.base_keyframe(at)?;
+        let mut term = Terminal::from_checkpoint(&base.checkpoint, host);
         // Fold every live event AFTER the seed with ts <= at, in seq order.
-        for ev in self.log.live() {
-            if ev.seq <= base_seq || ev.ts > at {
-                continue;
+        //
+        // TWO SCANS DELETED. The seek (`live_after`) starts at the base instead
+        // of re-walking the ~65k events BEFORE it — and the base is by design a
+        // RECENT keyframe, so that prefix was almost the whole ring. The tail
+        // then BREAKS rather than `continue`s on `ts > at`: identical set of
+        // folded events, because `ts` is nondecreasing down this recorder's
+        // spine (one monotone clock, one serialized writer — see `latest_tick`),
+        // so the first event past `at` proves every later one is too.
+        for ev in self.log.live_after(base.seq) {
+            if ev.ts > at {
+                break;
             }
             match ev.op {
                 Op::RawIn(id) => term.process(self.blob_bytes(id)?),
@@ -412,6 +470,35 @@ impl TemporalRecorder {
             }
         }
         Some(term)
+    }
+}
+
+/// One retained keyframe: the serialized checkpoint PLUS the spine coordinates
+/// of the `Op::Keyframe` event that announced it.
+///
+/// Keeping `(seq, ts)` here is what turns the base-keyframe lookup from a walk
+/// of the whole 65k-event spine into a four-entry scan, and it costs 16 bytes
+/// against a checkpoint that carries a whole serialized grid.
+struct RetainedKeyframe {
+    /// The spine handle this checkpoint is referenced by.
+    #[allow(dead_code)] // the spine's own `Op::Keyframe(id)` is the wire form
+    id: KeyframeId,
+    /// The `Seq` its `Op::Keyframe` event was appended at — the fold's start
+    /// cursor AND the liveness coordinate (`seq >= oldest_live().seq`).
+    seq: Seq,
+    /// The tick it was recorded at — compared against the replay target.
+    ts: Ticks,
+    /// The serialized engine state.
+    checkpoint: TerminalCheckpoint,
+}
+
+impl RetainedKeyframe {
+    /// The retained-byte charge this keyframe carries against the budget: its
+    /// grid plus any alt grid. One definition, used by BOTH eviction paths (the
+    /// `MAX_KEYFRAMES` trim and `enforce_budget`), which previously each
+    /// open-coded the same sum and could have drifted.
+    fn charge(&self) -> usize {
+        self.checkpoint.grid.len() + self.checkpoint.alt_grid.as_ref().map_or(0, Vec::len)
     }
 }
 
@@ -473,6 +560,134 @@ mod tests {
 
         assert_eq!(r.keyframe_count(), 1);
         assert_eq!(r.total_events(), 2, "Keyframe event + RawIn event");
+    }
+
+    /// DIFFERENTIAL for the whole `replay_at` seek. The reference here is the
+    /// EXACT pre-change body — full spine scan for the base, full spine scan for
+    /// the fold, `continue` (not `break`) on `ts > at` — run against the same
+    /// recorder, at every interesting instant: before the first keyframe, on and
+    /// between recorded ticks, at the latest tick, and past it. The two must
+    /// agree on reachability AND on the reconstructed screen text.
+    ///
+    /// It also pins the two invariants the seek rests on, so a future change
+    /// that broke either would fail HERE rather than silently hand back a
+    /// wrong-state engine: the spine's ticks are nondecreasing, and the retained
+    /// keyframes' `(seq, ts)` coordinates agree with the spine events that
+    /// announced them.
+    #[test]
+    fn replay_at_seek_matches_the_full_spine_scan() {
+        let mut t = aterm_core::terminal::Terminal::new(6, 20);
+        t.process(b"seed\r\n");
+        let mut r = TemporalRecorder::new();
+        r.record_keyframe(t.checkpoint());
+        for i in 0..40u32 {
+            r.record_raw_in(format!("line{i}\r\n").as_bytes());
+            if i % 9 == 0 {
+                r.record_resize(6, 20 + (i % 3) as u16);
+                let mut t2 = aterm_core::terminal::Terminal::new(6, 20);
+                t2.process(format!("kf{i}\r\n").as_bytes());
+                r.record_keyframe(t2.checkpoint());
+            }
+        }
+        assert!(
+            r.keyframe_count() > 1,
+            "REACH: the fixture must mint several keyframes"
+        );
+
+        // INVARIANT 1: nondecreasing ticks down the live spine (what turns the
+        // `max` fold into `back()` and the `continue` into a `break`).
+        let ticks: Vec<u64> = r.log.live().map(|e| e.ts.0).collect();
+        assert!(
+            ticks.windows(2).all(|w| w[1] >= w[0]),
+            "spine ticks must be nondecreasing"
+        );
+        assert_eq!(
+            r.latest_tick(),
+            r.log.live().map(|e| e.ts).max().unwrap_or_default(),
+            "latest_tick must equal the max fold it replaced"
+        );
+
+        // INVARIANT 2: retained keyframe coordinates agree with the spine.
+        for kf in &r.keyframes {
+            if let Some(ev) = r.log.live().find(|e| e.seq == kf.seq) {
+                assert_eq!(
+                    ev.op,
+                    Op::Keyframe(kf.id),
+                    "seq {:?} is not this keyframe",
+                    kf.seq
+                );
+                assert_eq!(ev.ts, kf.ts, "retained ts disagrees with the spine");
+            }
+        }
+
+        // The pre-change body, verbatim, as the oracle.
+        let reference = |at: Ticks| -> Option<Vec<String>> {
+            let mut base: Option<(Seq, KeyframeId)> = None;
+            for ev in r.log.live() {
+                if ev.ts > at {
+                    continue;
+                }
+                if let Op::Keyframe(kid) = ev.op {
+                    base = Some((ev.seq, kid));
+                }
+            }
+            let (base_seq, base_kid) = base?;
+            let cp = r
+                .keyframes
+                .iter()
+                .find(|kf| kf.id == base_kid)
+                .map(|kf| &kf.checkpoint)?;
+            let mut term = Terminal::from_checkpoint(cp, HostBindings::none());
+            for ev in r.log.live() {
+                if ev.seq <= base_seq || ev.ts > at {
+                    continue;
+                }
+                match ev.op {
+                    Op::RawIn(id) => term.process(r.blob_bytes(id)?),
+                    Op::Resize { rows, cols } => term.resize(rows, cols),
+                    _ => {}
+                }
+            }
+            Some(screen_of(&term))
+        };
+        let observed = |at: Ticks| -> Option<Vec<String>> {
+            r.replay_at(HostBindings::none(), Some(at))
+                .map(|t| screen_of(&t))
+        };
+
+        let latest = r.latest_tick();
+        let mut probes: Vec<Ticks> =
+            vec![Ticks(0), Ticks(latest.0 / 2), latest, Ticks(latest.0 + 1)];
+        probes.extend(r.log.live().map(|e| e.ts));
+        probes.extend(r.log.live().map(|e| Ticks(e.ts.0.saturating_sub(1))));
+        let mut reached = 0usize;
+        for at in probes {
+            let (a, b) = (observed(at), reference(at));
+            assert_eq!(a, b, "replay_at({at:?}) diverged from the full-spine scan");
+            if a.is_some() {
+                reached += 1;
+            }
+        }
+        assert!(
+            reached > 0,
+            "REACH: every probe was unreachable — the differential proved nothing"
+        );
+        // And the default target (`None`) still lands on the latest instant.
+        assert_eq!(
+            r.replay_at(HostBindings::none(), None)
+                .map(|t| screen_of(&t)),
+            reference(latest),
+            "the default replay target must still be the latest recorded instant"
+        );
+    }
+
+    /// The visible screen text of a reconstructed engine, for differential
+    /// comparison (a `Terminal` is not `PartialEq`). Same row reader the
+    /// control-plane `screen` verb and the subscribe push loop use.
+    fn screen_of(t: &Terminal) -> Vec<String> {
+        (0..t.rows() as usize)
+            .map(|r| crate::control::visible_row(t, r))
+            .collect()
     }
 
     #[test]

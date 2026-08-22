@@ -125,5 +125,9 @@ criterion = "0.5"
 name = "image_diff"
 harness = false
 
+[[bench]]
+name = "image_blit"
+harness = false
+
 [lints]
 workspace = true

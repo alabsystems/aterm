@@ -32,8 +32,12 @@
 //! * **A size-aware face LOD.** The cat bakes at reveal/gallery sizes where
 //!   the whole authored face survives; the pet ships at a couple of text rows,
 //!   where it measurably does not. Below [`FACE_DETAIL_MIN_H`] the bake culls
-//!   the sub-pixel charm ink (whiskers, catch-light, blush, tabby pattern) and
-//!   collapses the eye stack to one solid dot per eye; below
+//!   the sub-pixel charm ink (whiskers, the authored catch-light, blush, tabby
+//!   pattern) and collapses the eye stack to one strong dot per eye. Open eyes
+//!   then get a size-aware glossy reflection painted into that dot: a bright
+//!   upper glint, plus a tiny lower echo only when the footprint can afford it.
+//!   This keeps the eyes dark and legible without making the shipping pet look
+//!   flat; below
 //!   [`MOUTH_DETAIL_MIN_H`] the mouth goes too. Size is already a cache-key
 //!   axis (`w`/`h`), so LOD needs no new key — one size never serves another
 //!   size's tile. See the LOD const block for the design-review numbers.
@@ -62,7 +66,8 @@ use aterm_scene::vector::{FIXED_ONE, PathSeg};
 use aterm_scene::{PathTransform, Tile, fill_path_fixed};
 
 use crate::cat_baker::{
-    CatColorKey, MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS, ResolvedFills, resolve_layer,
+    CatColorKey, MAX_ATLAS_BYTES, MAX_BAKES_PER_FRAME, MAX_SLOTS, ResolvedFills,
+    paint_dark_masked_disc, resolve_layer,
 };
 use crate::cat_glyphs_gen::{GlyphRole, Layer};
 use crate::pet_glyphs_gen::{PET_GLYPHS, PetGlyphId};
@@ -71,14 +76,17 @@ use crate::pet_glyphs_gen::{PET_GLYPHS, PetGlyphId};
 //
 // The chibi rig pass grew the AUTHORED face; these thresholds make the BAKE
 // stop painting detail the canvas cannot hold. At ship size (cell_h 14 ⇒ a
-// ~40×24 px tile at 1×, ~59×36 at 1.5× HiDPI) a whisker, a catch-light, a
-// blush oval, a tabby stripe or the iris ring each cover well under one device
-// pixel, and the 4×4-supersampled filler dutifully AVERAGES them into whatever
-// they cross. The review measured what that does to the face's one
+// ~40×24 px tile at 1×, ~59×36 at 1.5× HiDPI) a whisker, the AUTHORED
+// catch-light, a blush oval, a tabby stripe or the iris ring each cover well
+// under one device pixel, and the 4×4-supersampled filler dutifully AVERAGES
+// them into whatever they cross. The review measured what that does to the face's one
 // load-bearing feature: a single-pixel eye of rgb(144,144,135) on a
 // rgb(223,199,132) coat — the eye grayed out of existence by its own charm.
-// Below these heights the face is drawn FOR the size: the charm ink is culled
-// and the whole eye stack collapses to one solid dot of the authored eye ink.
+// Below these heights the face is drawn FOR the size: the authored charm stack
+// is culled and the eye collapses to a strong dot of the authored eye ink. A
+// new reflection is then built in DEVICE pixels inside each open dot, after
+// growth: it is large enough to survive the rasterizer, clipped by construction
+// to the eye footprint, and never added to a happy/closed lid.
 //
 // Both thresholds are tile HEIGHTS in px — the axis the emitter derives from
 // `cell_h`, and (the roster sharing one viewbox) the axis every facial
@@ -280,6 +288,27 @@ pub const EYE_DOT_GAP_PX: f32 = 1.3;
 /// aspect.
 pub const EYE_DOT_ROUND_ASPECT_MAX: f32 = 1.4;
 
+/// Smallest grown open-eye diameter that can carry a reflection without the
+/// reflection becoming the eye. At the 34–36 px shipping bake the compressed
+/// far eye is about 3 px wide and clears this floor; truly tiny 1× footprints
+/// keep the strong dark dot instead of receiving a gray anti-aliased speck.
+pub const EYE_REFLECTION_MIN_PX: f32 = 2.4;
+
+/// Primary glossy catch-light radius as a fraction of the grown eye's smaller
+/// diameter, with device-pixel bounds. The lower bound survives 4×4 coverage at
+/// shipping size; the upper bound stops a large LOD tile growing a headlamp.
+pub const EYE_REFLECTION_PRIMARY_FRAC: f32 = 0.13;
+pub const EYE_REFLECTION_PRIMARY_MIN_PX: f32 = 0.55;
+pub const EYE_REFLECTION_PRIMARY_MAX_PX: f32 = 0.82;
+
+/// A second, quiet lower-right reflection makes a sufficiently large eye read
+/// glossy rather than punched-out. It is withheld below this diameter: one
+/// crisp highlight is cute; two sub-pixel gray flecks are noise.
+pub const EYE_REFLECTION_ECHO_MIN_PX: f32 = 5.0;
+pub const EYE_REFLECTION_ECHO_FRAC: f32 = 0.08;
+pub const EYE_REFLECTION_ECHO_MIN_RADIUS_PX: f32 = 0.35;
+pub const EYE_REFLECTION_ECHO_MAX_RADIUS_PX: f32 = 0.52;
+
 /// Bounding box of one fixed-point subpath in the glyph's normalized 0..1
 /// frame, `(x0, y0, x1, y1)` — control points included, the same generous
 /// reading the cat baker's eye-line probe uses (a Bézier never escapes its
@@ -322,6 +351,53 @@ fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathT
     }
 }
 
+/// Paint the resolution-aware glossy finish for one grown, OPEN LOD eye.
+///
+/// Coordinates and dimensions are already in device pixels. The offsets and
+/// radii are deliberately fractions of the final grown footprint, rather than
+/// the authored pre-LOD eye: the compressed far eye and the full near eye each
+/// receive a glint that fits what was actually painted. With the primary at
+/// `(-0.22w, -0.23h)` and radius at most `0.13·min(w,h)`, its circle stays
+/// inside an elliptical eye (normalized centre distance ≈0.64 plus normalized
+/// radius ≤0.26). The lower echo has still more clearance. That geometric
+/// containment matters: a catch-light which leaks onto the coat reads as a
+/// random white trail fleck, worse than the flat dot this replaces.
+fn paint_eye_reflections(tile: &mut Tile, eye_mask: &Tile, cx: f32, cy: f32, w: f32, h: f32) {
+    let minor = w.min(h);
+    if minor < EYE_REFLECTION_MIN_PX {
+        return;
+    }
+    let primary_r = (minor * EYE_REFLECTION_PRIMARY_FRAC)
+        .clamp(EYE_REFLECTION_PRIMARY_MIN_PX, EYE_REFLECTION_PRIMARY_MAX_PX);
+    paint_dark_masked_disc(
+        tile,
+        eye_mask,
+        cx - 0.22 * w,
+        cy - 0.23 * h,
+        primary_r,
+        (1.0, 1.0, 1.0),
+        1.0,
+    );
+
+    if minor >= EYE_REFLECTION_ECHO_MIN_PX {
+        let echo_r = (minor * EYE_REFLECTION_ECHO_FRAC).clamp(
+            EYE_REFLECTION_ECHO_MIN_RADIUS_PX,
+            EYE_REFLECTION_ECHO_MAX_RADIUS_PX,
+        );
+        // Warm-white and translucent: this is a reflection echo, not a second
+        // pupil. The primary remains the one high-contrast attention point.
+        paint_dark_masked_disc(
+            tile,
+            eye_mask,
+            cx + 0.19 * w,
+            cy + 0.20 * h,
+            echo_r,
+            (1.0, 0.95, 0.98),
+            0.72,
+        );
+    }
+}
+
 /// The LOD eye pass: each subpath of the `Eye` layer — one authored eye — is
 /// refilled solid as its own dot, grown about its own centre ([`zoom_about`],
 /// so neither eye drifts) toward the legibility target for its SHAPE:
@@ -343,16 +419,37 @@ fn zoom_about(xform: PathTransform, cx: f32, cy: f32, kx: f32, ky: f32) -> PathT
 /// solid [`EYE_DASH_CORE_PX`] plug at its centre, clamped inside its own
 /// footprint and outside the pair's daylight, so the ≥2×2 dark core is a
 /// guarantee instead of a phase accident. Painted with the layer's own
-/// resolved ink: the iris ring, pupil and catch-light above it were culled,
-/// so what remains IS the solid dot-per-eye the review asked for — at the
-/// artist's proportion, per the owner's eyes-too-big call.
+/// resolved ink, this preserves the small, dark dot-per-eye treatment and its
+/// authored proportions. Finally, a non-shallow (open) dot receives the
+/// device-sized glossy treatment from [`paint_eye_reflections`]. Happy arcs,
+/// lids, and closed eyes stay pure ink so their expression cannot turn into a
+/// pair of floating white flecks.
 fn paint_eye_dots(
     tile: &mut Tile,
     layer: &Layer,
     col: (f32, f32, f32),
     alpha: f32,
     xform: PathTransform,
+    reflections: bool,
 ) {
+    paint_eye_dots_with_mask_observer(tile, layer, col, alpha, xform, reflections, |_, _| {});
+}
+
+/// The LOD painter with an exact, per-authored-eye raster-mask observer. The
+/// production wrapper above supplies a no-op observer; differential tests use
+/// the same path to assign reflection texels to one grown eye without relying
+/// on overlapping padded bounding boxes.
+fn paint_eye_dots_with_mask_observer<F>(
+    tile: &mut Tile,
+    layer: &Layer,
+    col: (f32, f32, f32),
+    alpha: f32,
+    xform: PathTransform,
+    reflections: bool,
+    mut observe: F,
+) where
+    F: FnMut(bool, &Tile),
+{
     let bounds: Vec<Option<(f32, f32, f32, f32)>> =
         layer.paths.iter().map(|p| subpath_bounds(p)).collect();
     let width = |b: &Option<(f32, f32, f32, f32)>| b.map_or(0.0, |(x0, _, x1, _)| x1 - x0);
@@ -472,12 +569,15 @@ fn paint_eye_dots(
         } else {
             (kx, cx)
         };
+        let dot_xform = zoom_about(xform, anchor_x, cy, kx, ky);
+        let mut eye_mask = Tile::new(tile.width(), tile.height());
+        fill_path_fixed(tile, std::slice::from_ref(path), col, alpha, dot_xform);
         fill_path_fixed(
-            tile,
+            &mut eye_mask,
             std::slice::from_ref(path),
-            col,
-            alpha,
-            zoom_about(xform, anchor_x, cy, kx, ky),
+            (0.0, 0.0, 0.0),
+            1.0,
+            dot_xform,
         );
         // Where the dot's centre landed after the zoom — identical to `cx`
         // for a centre-anchored dot, shifted outward by the sub-pixel the
@@ -534,6 +634,18 @@ fn paint_eye_dots(
                 PathSeg::Close,
             ];
             fill_path_fixed(tile, &[&plug[..]], col, alpha, xform);
+            fill_path_fixed(&mut eye_mask, &[&plug[..]], (0.0, 0.0, 0.0), 1.0, xform);
+        }
+        observe(shallow, &eye_mask);
+        if reflections && !shallow {
+            paint_eye_reflections(
+                tile,
+                &eye_mask,
+                xform.dx + gx * xform.scale_x,
+                xform.dy + cy * xform.scale_y,
+                w_px * kx,
+                h_px * ky,
+            );
         }
     }
 }
@@ -635,16 +747,28 @@ impl PetBakeKey {
 /// costs four extra fills on a cache miss and nothing at all in steady state.
 ///
 /// Below [`FACE_DETAIL_MIN_H`] the walk applies the face LOD (see the const
-/// block): the whisker, catch-light, blush, pattern, iris and pupil layers —
-/// identified by their authored ROLES, never by drawlist position — are
-/// skipped outright, and each `Eye` subpath is refilled as one solid grown dot
-/// ([`paint_eye_dots`]; the 3/4 rig's foreshortened far eye survives as a
+/// block): the whisker, authored catch-light, blush, pattern, iris and pupil
+/// layers — identified by their authored ROLES, never by drawlist position —
+/// are skipped outright, and each `Eye` subpath is refilled as one strong grown
+/// dot ([`paint_eye_dots`]; the 3/4 rig's foreshortened far eye survives as a
 /// compressed narrow core, see [`EYE_DOT_FAR_COMPRESS_RATIO`] — every pose
-/// that authors two eyes renders two). Below [`MOUTH_DETAIL_MIN_H`] the mouth is culled
-/// (see that const for why thickening lost). All of it is keyed off `h` and
-/// `w` alone, both already in the cache key, so determinism is untouched.
+/// that authors two eyes renders two). Open dots then receive the bounded
+/// device-pixel reflections from [`paint_eye_reflections`]. Below
+/// [`MOUTH_DETAIL_MIN_H`] the mouth is culled (see that const for why
+/// thickening lost). All of it is keyed off `h` and `w` alone, both already in
+/// the cache key, so determinism is untouched.
 #[must_use]
 pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Tile {
+    bake_pose_with_reflections(pose, fills, w, h, true)
+}
+
+fn bake_pose_with_reflections(
+    pose: PetGlyphId,
+    fills: &ResolvedFills,
+    w: u32,
+    h: u32,
+    reflections: bool,
+) -> Tile {
     let mut tile = Tile::new(w, h);
     if w == 0 || h == 0 {
         return tile;
@@ -653,8 +777,8 @@ pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Til
     let face_lod = h < FACE_DETAIL_MIN_H;
     for layer in PET_GLYPHS[pose as usize].layers {
         // The review's cull list, by authored role: whisker/blush/pattern are
-        // sub-pixel charm at LOD sizes, and iris/catch-light/pupil are the eye
-        // stack the solid dot replaces.
+        // sub-pixel charm at LOD sizes, and iris/authored-catch-light/pupil are
+        // the eye stack the strong dot + device-sized reflection replaces.
         if face_lod
             && matches!(
                 layer.role,
@@ -670,7 +794,7 @@ pub fn bake_pose(pose: PetGlyphId, fills: &ResolvedFills, w: u32, h: u32) -> Til
         }
         let (col, alpha) = resolve_layer(layer, fills);
         if face_lod && layer.role == GlyphRole::Eye {
-            paint_eye_dots(&mut tile, layer, col, alpha, xform);
+            paint_eye_dots(&mut tile, layer, col, alpha, xform, reflections);
             continue;
         }
         if h < MOUTH_DETAIL_MIN_H && layer.role == GlyphRole::Mouth {
@@ -1338,14 +1462,125 @@ mod tests {
         );
     }
 
-    /// The LOD deletes the charm ink rather than merely shrinking it: at ship
-    /// size the baked walk tile contains not one fully-covered texel of
-    /// catch-light white, blush pink or tabby-pattern brown, while a
-    /// desk-size bake (above [`FACE_DETAIL_MIN_H`]) keeps all three. The iris
-    /// ring and pupil need no separate probe — the core test above proves the
-    /// dot they collapse into is PURE eye ink.
+    /// Differential proof for the shipping reflection pass. An otherwise
+    /// byte-identical no-reflection bake is the negative control; every changed
+    /// texel must have been dark and owned by exactly one per-path grown-eye
+    /// mask, every open authored eye must gain its own visibly pale texel, and shallow
+    /// happy/closed/lidded paths must gain none. The separate dark-core test
+    /// above proves the same reflected output still retains a 2×2 pupil/core.
     #[test]
-    fn face_lod_culls_charm_ink_at_ship_size() {
+    fn face_lod_reflections_are_contained_and_expression_aware() {
+        const H: u32 = 36;
+        let mut failures: Vec<String> = Vec::new();
+        let mut exercised = 0usize;
+        for &id in PET_GLYPH_IDS {
+            let def = &PET_GLYPHS[id as usize];
+            let w = (H as f32 * PetBaker::aspect(id)).round() as u32;
+            let xform = PathTransform::fit(w, H);
+            for dark_bg in [false, true] {
+                let fills = ResolvedFills::from_indices(9, 4, dark_bg);
+                let plain = bake_pose_with_reflections(id, &fills, w, H, false);
+                let glossy = bake_pose_with_reflections(id, &fills, w, H, true);
+                let mut eye_ink = Tile::new(w, H);
+                let mut eye_masks: Vec<(bool, Vec<u8>)> = Vec::new();
+                for layer in def.layers {
+                    if layer.role != GlyphRole::Eye {
+                        continue;
+                    }
+                    paint_eye_dots_with_mask_observer(
+                        &mut eye_ink,
+                        layer,
+                        (0.0, 0.0, 0.0),
+                        1.0,
+                        xform,
+                        false,
+                        |shallow, mask| eye_masks.push((shallow, mask.pixels().to_vec())),
+                    );
+                }
+
+                let changed: Vec<usize> = plain
+                    .pixels()
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(glossy.pixels().as_chunks::<4>().0)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, _)| i)
+                    .collect();
+                for &pixel in &changed {
+                    let i = pixel * 4;
+                    let x = pixel % w as usize;
+                    let y = pixel / w as usize;
+                    let before = &plain.pixels()[i..i + 4];
+                    let owners: Vec<usize> = eye_masks
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(eye, (_, mask))| (mask[i + 3] != 0).then_some(eye))
+                        .collect();
+                    if owners.len() != 1 || before[3] != 255 || !before[..3].iter().all(|&c| c < 96)
+                    {
+                        failures.push(format!(
+                            "{} (dark_bg={dark_bg}): reflection texel ({x},{y}) \
+                             has owners={owners:?}, before={before:?}",
+                            def.id
+                        ));
+                    }
+                }
+
+                for (eye, (shallow, mask)) in eye_masks.iter().enumerate() {
+                    let local: Vec<usize> = changed
+                        .iter()
+                        .copied()
+                        .filter(|&pixel| mask[pixel * 4 + 3] != 0)
+                        .collect();
+                    if *shallow {
+                        if !local.is_empty() {
+                            failures.push(format!(
+                                "{} (dark_bg={dark_bg}): shallow eye {eye} \
+                                 gained reflection pixels {local:?}",
+                                def.id
+                            ));
+                        }
+                    } else {
+                        exercised += 1;
+                        if local.is_empty() {
+                            failures.push(format!(
+                                "{} (dark_bg={dark_bg}): open eye {eye} gained \
+                                 no shipping-size reflection",
+                                def.id
+                            ));
+                        } else if !local.iter().any(|&pixel| {
+                            let i = pixel * 4;
+                            glossy.pixels()[i..i + 3].iter().all(|&c| c >= 160)
+                        }) {
+                            failures.push(format!(
+                                "{} (dark_bg={dark_bg}): open eye {eye} never \
+                                 becomes visibly pale",
+                                def.id
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(exercised > 0, "the roster probe must exercise open eyes");
+        assert!(
+            failures.is_empty(),
+            "the reflection LOD regressed:\n  {}",
+            failures.join("\n  ")
+        );
+    }
+
+    /// The LOD deletes the authored charm stack rather than merely shrinking
+    /// it, then rebuilds only the detail the shipping pixels can carry: at
+    /// 36 px the walk keeps crisp catch-light white from the device-sized eye
+    /// reflections, but contains no fully-covered blush pink or tabby-pattern
+    /// brown. A desk-size bake (above [`FACE_DETAIL_MIN_H`]) keeps the authored
+    /// versions of all three. The iris ring and pupil need no separate probe —
+    /// the core test above proves their dark foundation remains intact.
+    #[test]
+    fn face_lod_rebuilds_reflections_but_culls_other_charm_ink() {
         let p = pose("walk_0");
         let fills = ResolvedFills::from_indices(9, 4, false);
         let bake_at = |h: u32| {
@@ -1361,14 +1596,30 @@ mod tests {
                 .iter()
                 .any(|px| px[3] == 255 && px[..3] == ink)
         };
-        for role in [GlyphRole::CatchLight, GlyphRole::Blush, GlyphRole::Pattern] {
+        let catch = PET_GLYPHS[p as usize]
+            .layers
+            .iter()
+            .find(|l| l.role == GlyphRole::CatchLight)
+            .expect("walk pose authors catch-lights");
+        let (catch_col, _) = resolve_layer(catch, &fills);
+        let byte = |c: f32| (c * 255.0 + 0.5) as u8;
+        let catch_ink = [byte(catch_col.0), byte(catch_col.1), byte(catch_col.2)];
+        assert!(
+            has(&small, catch_ink),
+            "the LOD must rebuild a crisp catch-light at shipping size"
+        );
+        assert!(
+            has(&large, catch_ink),
+            "the authored catch-light is missing above the LOD threshold"
+        );
+
+        for role in [GlyphRole::Blush, GlyphRole::Pattern] {
             let layer = PET_GLYPHS[p as usize]
                 .layers
                 .iter()
                 .find(|l| l.role == role)
-                .expect("walk pose authors all three charm layers");
+                .expect("walk pose authors both culled charm layers");
             let (col, _) = resolve_layer(layer, &fills);
-            let byte = |c: f32| (c * 255.0 + 0.5) as u8;
             let ink = [byte(col.0), byte(col.1), byte(col.2)];
             assert!(
                 !has(&small, ink),
@@ -1591,9 +1842,13 @@ mod tests {
         let (col, _) = resolve_layer(catch_light, &fills);
         let byte = |c: f32| (c * 255.0 + 0.5) as u8;
         let ink = [byte(col.0), byte(col.1), byte(col.2)];
-        let has_ink = |h: u32| {
+        // Disable the replacement LOD gloss for this boundary probe. Its
+        // primary reflection intentionally reuses the authored catch-light's
+        // white ink, so a colour-only search could otherwise mistake the new
+        // small-eye detail for the full-face layer this test is pinning.
+        let has_authored_catch_light = |h: u32| {
             let w = (h as f32 * PetBaker::aspect(p)).round() as u32;
-            bake_pose(p, &fills, w, h)
+            bake_pose_with_reflections(p, &fills, w, h, false)
                 .pixels()
                 .as_chunks::<4>()
                 .0
@@ -1601,17 +1856,17 @@ mod tests {
                 .any(|px| px[3] == 255 && px[..3] == ink)
         };
         assert!(
-            has_ink(72),
+            has_authored_catch_light(72),
             "a 72 px bake (the 2x Retina default) must paint the full \
              authored face, catch-light included"
         );
         assert!(
-            has_ink(FACE_DETAIL_MIN_H),
+            has_authored_catch_light(FACE_DETAIL_MIN_H),
             "the first full-face height lost its catch-light — the LOD \
              leaked above its threshold"
         );
         assert!(
-            !has_ink(FACE_DETAIL_MIN_H - 1),
+            !has_authored_catch_light(FACE_DETAIL_MIN_H - 1),
             "one pixel under the threshold must still bake the LOD face"
         );
     }

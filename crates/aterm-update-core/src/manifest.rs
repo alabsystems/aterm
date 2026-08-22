@@ -112,6 +112,32 @@ pub struct Manifest {
     /// downloaded bytes against, so the client falls back to the DMG.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zip_sha256: Option<String>,
+    /// The INTEL batteries-included DMG's asset name within the same release,
+    /// e.g. `"aterm-0.47.0-x86_64.dmg"` — the same signed, notarized universal
+    /// app with the toolchain seed filtered to `x86_64-apple-darwin` artifacts.
+    /// Present only on releases whose seed covers that triple (atpkg index ≥ 14).
+    /// Absent ⇒ None: the release predates the per-arch DMG pair (or was cut
+    /// deliberately arm64-only), and Intel installs take the lean zip as before.
+    ///
+    /// WHY A SECOND DMG: the dual-arch fat DMG measured 2,090,384,004 bytes on
+    /// v0.46.0 — 97.3% of [`crate::RELEASE_ASSET_DOWNLOAD_BOUND`] — and every
+    /// download carried ~0.9–1.1 GB of seed tarballs the receiving CPU can never
+    /// execute. Splitting per arch is the only durable headroom under that bound.
+    ///
+    /// The bare `aterm-<version>.dmg` stays the canonical (arm64-seeded) asset,
+    /// because the deployed fleet binds that exact spelling
+    /// (`aterm-update/src/github.rs` `authoritative_dmg_index`, and
+    /// `tools/install.sh`'s identity bind) — this field is ADDITIVE, riding the
+    /// frozen parser's deliberate unknown-key tolerance (see the module doc).
+    /// NO updater ever downloads it: updates stage from the lean zip; only
+    /// `tools/install.sh`'s Intel first-install lane elects it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dmg_x86_64: Option<String>,
+    /// SHA-256 (lowercase hex) of [`Self::dmg_x86_64`]'s bytes. Absent ⇒ None.
+    /// A name without a digest is never installed from (nothing to check the
+    /// download against) — the same doctrine as [`Self::zip_sha256`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dmg_x86_64_sha256: Option<String>,
     /// Minimum macOS version the bundle declares (`LSMinimumSystemVersion`),
     /// e.g. `"11.0"`. Display/tooling only. Absent ⇒ None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,6 +305,8 @@ mod tests {
             zip_sha256: Some(
                 "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08".into(),
             ),
+            dmg_x86_64: None,
+            dmg_x86_64_sha256: None,
             min_os: Some("11.0".into()),
             team_id: Some(String::new()),
             pub_date: Some("2026-07-06T21:29:44Z".into()),
@@ -372,6 +400,8 @@ mod tests {
             url: None,
             zip: None,
             zip_sha256: None,
+            dmg_x86_64: None,
+            dmg_x86_64_sha256: None,
             min_os: None,
             team_id: None,
             pub_date: None,
@@ -387,6 +417,8 @@ mod tests {
             "url",
             "zip",
             "zip_sha256",
+            "dmg_x86_64",
+            "dmg_x86_64_sha256",
             "min_os",
             "team_id",
             "pub_date",
@@ -438,6 +470,38 @@ mod tests {
         assert!(!text.contains("zip"), "got:\n{text}");
         let back = Manifest::parse(&text).unwrap();
         assert_eq!(back, dmg_only);
+        assert_eq!(back.dmg, "aterm-0.26.dmg");
+    }
+
+    /// The Intel DMG pair is OPTIONAL on the wire in both directions, exactly
+    /// like the zip: a manifest that names one must round-trip the name/digest
+    /// pair byte-exactly, and a manifest without it must stay valid and emit
+    /// NEITHER key — that absence is what keeps every already-published release
+    /// (and any deliberately arm64-only cut) parsing unchanged on the frozen
+    /// v0.25 fleet, whose unknown-key tolerance is the entire compatibility
+    /// story for these fields.
+    #[test]
+    fn x86_64_dmg_pair_round_trips_and_stays_optional() {
+        let mut m = full();
+        m.dmg_x86_64 = Some("aterm-0.47.0-x86_64.dmg".into());
+        m.dmg_x86_64_sha256 =
+            Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into());
+        let text = m.to_toml().unwrap();
+        assert!(
+            text.contains("dmg_x86_64 = \"aterm-0.47.0-x86_64.dmg\"")
+                && text.contains("dmg_x86_64_sha256 = "),
+            "the Intel DMG name/digest pair must be emitted, got:\n{text}"
+        );
+        let back = Manifest::parse(&text).unwrap();
+        assert_eq!(back.dmg_x86_64, m.dmg_x86_64);
+        assert_eq!(back.dmg_x86_64_sha256, m.dmg_x86_64_sha256);
+
+        // Absent pair: valid manifest, neither key emitted, canonical DMG untouched.
+        let plain = full();
+        let text = plain.to_toml().unwrap();
+        assert!(!text.contains("dmg_x86_64"), "got:\n{text}");
+        let back = Manifest::parse(&text).unwrap();
+        assert_eq!(back, plain);
         assert_eq!(back.dmg, "aterm-0.26.dmg");
     }
 

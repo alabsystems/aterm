@@ -183,28 +183,46 @@ impl WindowMintAuthority {
     ///   legacy `allow_window_ops` bool. This is the design-§6.3 Release N
     ///   backward-compat guarantee.
     ///
-    /// When `engine` is `None`, behavior is identical to [`Self::try_mint`].
+    /// With no policy installed, `gate` is [`super::policy_bridge::BridgeDecision::Fallback`]
+    /// and behavior is identical to [`Self::try_mint`].
+    ///
+    /// # Why the caller passes a decision instead of an engine
+    ///
+    /// The probe is [`probe_xtwinops`], whose only variable is `ps`, and the
+    /// production origin is the literal `OriginTag::Pty`. The verdict for every
+    /// `ps` xterm defines is therefore resolved once per installed policy by
+    /// [`super::policy_gates::PolicyState::xtwinops_gate`], which builds it from
+    /// THIS module's probe constructor. That kills a `char::to_string()` heap
+    /// allocation and two bucket walks per `CSI t` dispatch — a cost the old
+    /// code paid unconditionally, before even testing whether an engine was
+    /// installed and before the `allow_window_ops` bool that drops ps 1..=21 on
+    /// the floor in the shipping default configuration.
     ///
     /// See `terminal/policy_bridge.rs` for the decision tree.
     #[inline]
     #[must_use]
     pub(super) fn try_mint_with_engine(
         &self,
-        engine: Option<&aterm_policy::engine::PolicyEngine>,
-        origin: aterm_policy::OriginTag,
-        ps: u16,
+        gate: super::policy_bridge::BridgeDecision,
         allow_window_ops: bool,
     ) -> Option<WindowOpsCapability> {
         let _ = self;
-        let seq = aterm_policy::selector::DispatchedSequence::csi(Some(u32::from(ps)), 't', []);
-        let decision =
-            super::policy_bridge::engine_decision_deny_by_default_capability(engine, &seq, origin);
-        if decision.resolve(allow_window_ops) {
+        if gate.resolve(allow_window_ops) {
             Some(WindowOpsCapability { _seal: () })
         } else {
             None
         }
     }
+}
+
+/// Probe sequence used by the XTWINOPS (`CSI Ps t`) policy lookup.
+///
+/// The single definition, shared by the compiled gate table in
+/// [`super::policy_gates`] and by its out-of-range live fallback, so the two
+/// cannot disagree about which rule bucket a `Ps` lands in.
+#[must_use]
+pub(super) fn probe_xtwinops(ps: u16) -> aterm_policy::selector::DispatchedSequence {
+    aterm_policy::selector::DispatchedSequence::csi(Some(u32::from(ps)), 't', [])
 }
 
 #[cfg(test)]
@@ -285,8 +303,11 @@ mod tests {
         let engine = PolicyEngine::new(profiles::standard());
 
         assert!(
-            auth.try_mint_with_engine(Some(&engine), OriginTag::Pty, 21, false)
-                .is_none()
+            auth.try_mint_with_engine(
+                super::super::policy_gates::xtwinops_verdict(Some(&engine), 21),
+                false
+            )
+            .is_none()
         );
     }
 
@@ -296,8 +317,11 @@ mod tests {
         let engine = PolicyEngine::new(policy_with_rule("CSI 21 t", Response::Execute));
 
         assert!(
-            auth.try_mint_with_engine(Some(&engine), OriginTag::Pty, 21, false)
-                .is_some()
+            auth.try_mint_with_engine(
+                super::super::policy_gates::xtwinops_verdict(Some(&engine), 21),
+                false
+            )
+            .is_some()
         );
     }
 

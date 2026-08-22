@@ -100,7 +100,21 @@ impl Terminal {
     ///
     /// This returns an iterator over all blocks (completed + current).
     /// Useful for displaying or navigating all commands.
-    pub fn all_blocks(&self) -> impl Iterator<Item = &OutputBlock> {
+    ///
+    /// DOUBLE-ENDED, deliberately. The concrete iterator already was (a
+    /// `VecDeque::Iter` chained with an `Option::Iter`, both double-ended) —
+    /// only the opaque return type hid it, exactly as
+    /// `SessionTimeline::since` hid its own. Widening the bound is additive
+    /// (`DoubleEndedIterator: Iterator`, so every existing caller compiles
+    /// unchanged) and it is what lets a WATERMARKED consumer walk the tail
+    /// backwards and stop at the watermark instead of filtering the whole
+    /// retained history: `all_blocks()` yields ids in strictly increasing
+    /// order (`next_block_id` is bumped per created block and blocks are
+    /// pushed to the back, with `current_block` last), so a reverse walk that
+    /// breaks at `id <= watermark` visits EXACTLY the un-reported suffix.
+    /// The subscribe `events` digest is that consumer; before this it re-read
+    /// up to `OUTPUT_BLOCKS_MAX` blocks per watched target per 250 ms tick.
+    pub fn all_blocks(&self) -> impl DoubleEndedIterator<Item = &OutputBlock> {
         self.shell
             .output_blocks
             .iter()

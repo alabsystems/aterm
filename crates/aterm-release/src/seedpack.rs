@@ -26,7 +26,7 @@
 //! Artifact bytes are NOT re-hashed here — every client re-verifies sha256 +
 //! `tree_root` at install; the cut checks presence + exact size.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use atpkg::flow::Fetcher as _;
@@ -67,6 +67,13 @@ pub struct SeedStat {
     pub roster_seq: u64,
     /// The channel-pinned `(program, build)` set the seed can install.
     pub programs: Vec<(String, u64)>,
+    /// The target triples the seed's PRESENT artifacts serve — recorded from
+    /// signed `[[artifact]]` rows whose tarball actually travelled, never from
+    /// rows alone (a row naming a triple whose tarball is absent proves
+    /// nothing). This is what tells the cut whether a per-arch DMG variant is
+    /// PRODUCIBLE: `publish.rs` emits the `aterm-<v>-x86_64.dmg` pair exactly
+    /// when this set contains `x86_64-apple-darwin`.
+    pub targets: BTreeSet<String>,
     /// Non-fatal findings, for the CALLER to place.
     ///
     /// `validate` used to `println!` these itself, and a pure validator that prints
@@ -94,12 +101,57 @@ pub fn resolve(dist: &Path) -> Option<PathBuf> {
     conventional.is_dir().then_some(conventional)
 }
 
+/// What architecture surface a seed directory is being validated AS.
+///
+/// `Universal` is the cut's staging gate, unchanged: the full dual-arch seed a
+/// universal .app seals, with the aarch64 hard-refusal and the x86_64 warning
+/// (gate 2b). `Only(triple)` exists for the per-arch DMG restage: the filtered
+/// `.lproj` must serve EXACTLY that one triple — an artifact of any other arch
+/// in it means the filter leaked (the whole point of the split was not shipping
+/// those bytes), and no artifact of the named arch means the filter gutted the
+/// seed (batteries advertised, batteries absent). Both refuse the cut, at cut
+/// time, before hdiutil ever runs — never a broken DMG in a user's hands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchScope<'a> {
+    /// The dual-arch seed sealed into the signed universal app (all existing
+    /// callers, including tests/seedpack_real.rs).
+    Universal,
+    /// A per-arch DMG restage filtered to exactly this target triple.
+    Only(&'a str),
+}
+
 /// Validate `dir` as a shippable seed by running the SHIPPED CLIENT'S first-run
 /// resolution over it: `DirFetcher` candidates → paper-master roster admission →
 /// index selection (no durable floors — exactly a fresh install's posture) →
 /// per-pkg release delegation. Any failure is a hard error — a cut must never
 /// seal a seed its own client would refuse.
 pub fn validate(dir: &Path) -> Result<SeedStat, String> {
+    validate_scoped(dir, ArchScope::Universal)
+}
+
+/// [`validate`] under an explicit [`ArchScope`] — the Only-scope caller is the
+/// per-arch DMG restage (`dmg::create_arch_filtered`), which re-proves each
+/// filtered `.lproj` through this same client chain before it is imaged.
+pub fn validate_scoped(dir: &Path, scope: ArchScope<'_>) -> Result<SeedStat, String> {
+    validate_inner(dir, scope).map(|(stat, _)| stat)
+}
+
+/// The triple → present-artifact-name map of a VALIDATED seed, derived from
+/// the signed `[[artifact]]` target rows (never from filename conventions —
+/// every byte-selection decision stays anchored in attested data). This is
+/// what drives the per-arch DMG's keep-set: `dmg::create_arch_filtered` keeps
+/// exactly `assets_by_triple(seed)[triple]` plus every signed manifest.
+///
+/// Runs the full Universal validation first: only a seed the shipped client
+/// would accept may have its rows drive which bytes ship.
+pub fn assets_by_triple(dir: &Path) -> Result<BTreeMap<String, BTreeSet<String>>, String> {
+    validate_inner(dir, ArchScope::Universal).map(|(_, map)| map)
+}
+
+fn validate_inner(
+    dir: &Path,
+    scope: ArchScope<'_>,
+) -> Result<(SeedStat, BTreeMap<String, BTreeSet<String>>), String> {
     // ---- 0. flat, regular, no surprises ---------------------------------
     let mut names: BTreeSet<String> = BTreeSet::new();
     let mut bytes: u64 = 0;
@@ -240,6 +292,7 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
 
     // ---- 2. every pinned program: signed pkg manifest + present artifact --
     let mut seen_targets: BTreeSet<String> = BTreeSet::new();
+    let mut assets_by_target: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut accounted: BTreeSet<String> = [
         "index.toml",
         "index.toml.sig",
@@ -292,7 +345,24 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
         let mut present = 0usize;
         for row in &pkg.artifacts {
             if !names.contains(&row.asset) {
-                continue; // other-triple artifact not carried by this seed — fine
+                // Other-triple artifact not carried by this seed — fine under
+                // Universal scope (the published registry is bigger than any
+                // one seal). Under Only scope ONE absence is NOT fine: a row
+                // naming the scoped triple whose tarball is missing means the
+                // per-arch filter dropped a byte the signed manifest promises
+                // this arch, and the DMG would offer the program and then fail
+                // offline — refuse the cut, not the user.
+                if let ArchScope::Only(triple) = scope
+                    && row.target == triple
+                {
+                    return Err(format!(
+                        "{pkg_name}: the {triple}-filtered seed is missing {} — the \
+                         per-arch filter dropped an artifact the signed manifest \
+                         promises this architecture",
+                        row.asset
+                    ));
+                }
+                continue;
             }
             // Which target triples this seed can actually serve — the arch
             // coverage gate below reads it. Recorded from the artifacts that
@@ -310,9 +380,18 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
                 ));
             }
             accounted.insert(row.asset.clone());
+            assets_by_target
+                .entry(row.target.clone())
+                .or_default()
+                .insert(row.asset.clone());
             present += 1;
         }
-        if present == 0 {
+        // Universal scope only: a pinned program with NO artifact at all is a
+        // broken seal. Under Only scope, zero-present is legal exactly when the
+        // manifest carries no row for the scoped triple (the client clean-skips
+        // that pin on this arch — the loop above already refused the other
+        // case, a promised row whose tarball the filter dropped).
+        if present == 0 && scope == ArchScope::Universal {
             return Err(format!(
                 "pinned {program}@{build} has no artifact present in the seed — it would be \
                  offered and then fail offline"
@@ -323,10 +402,11 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     // ---- 2b. arch coverage, the macOS twin of build.ps1's gate -----------
     // The .app is UNIVERSAL (arm64 + x86_64) and the registry is packed
     // per-triple, so a seed serves exactly the slices its artifacts name. Since
-    // atpkg index build 12 the published registry carries x86_64-apple-darwin
-    // artifacts alongside aarch64 for six programs (ay, clean, nn, ny, ty,
-    // trust-mc); the rustc coherence group (trust, trust-ir, trust-cg,
-    // trust-vc) is still aarch64-only. Sealing an arm64-only stage into a
+    // atpkg index build 12 the published registry has carried x86_64-apple-darwin
+    // artifacts beside aarch64, and since index build 14 EVERY pinned program
+    // does — the rustc coherence group included (pkg-trust-6808.toml carries an
+    // x86_64-apple-darwin [[artifact]] row; the old "rustc_private is absent
+    // cross-host" limit was cleared). Sealing an arm64-only stage into a
     // universal DMG ships hundreds of MB from which atpkg on an Intel Mac can
     // install exactly nothing: every pin clean-skips on triple
     // (`artifact_for`), so the batteries are silently absent on a machine that
@@ -343,11 +423,13 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
     //    button used to cover this case too, which meant one env var could ship the
     //    one seal that is never right.
     //  * NO x86_64 artifacts is a PARTIAL cut, not an impossible one. It used to be
-    //    unavoidable; it no longer is for most of the toolset, so an arm64-only
+    //    unavoidable; it no longer is for any of the toolset, so an arm64-only
     //    stage is now usually a stale `INDEX_BUILD` rather than a fact about the
     //    world. It warns, and the ack silences THAT and only that, because a
     //    deliberately arm64-only seal is the one an operator can honestly
-    //    acknowledge.
+    //    acknowledge. (An acknowledged arm64-only seal also cuts NO x86_64 DMG
+    //    variant and omits the manifest's `dmg_x86_64` keys — Intel installs
+    //    keep taking the lean zip, exactly the pre-pair behaviour.)
     //
     // The gate is also not sufficient on its own: `validate`'s present-artifact
     // check counts an artifact of ANY triple, so a seal could satisfy it while
@@ -360,50 +442,65 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
             covered.iter().copied().collect::<Vec<_>>().join(", ")
         }
     };
-    if !covered.contains("aarch64-apple-darwin") {
-        return Err(format!(
-            "the seed carries NO aarch64-apple-darwin artifacts (targets: {}) — that is the \
-             architecture of essentially every Mac this will install on, so the seal would \
-             cost every downloader ~600 MB and install nothing for almost all of them. \
-             Restage from a registry packed for this triple \
-             (`tools/atpkg-seed-from-published.sh`), or cut deliberately seedless with \
-             ATERM_SEEDLESS=1. This one is not acknowledgeable.",
-            listed()
-        ));
-    }
-    // Headline, then the ACT, then the facts one per line. Every fact that was in the
-    // 120-word run-on paragraph is still here: no x86 artifacts, which targets ARE
-    // covered, that an Intel Mac installs nothing, that there is no network fallback, the
-    // client's exact marker, the upstream root cause, where the evidence is, and the ack.
-    //
-    // What MOVED is the acknowledgement, from word 91 to line 2. Skimming stopped at "the
-    // seed carries NO x86_64", which reads as a refusal — so the operator went looking for
-    // what had failed, rather than for the one word that lets a warning proceed.
     let mut warnings = Vec::new();
-    if !covered.contains("x86_64-apple-darwin")
-        && !std::env::var("ATERM_SEED_ARCH_ACK").is_ok_and(|v| v.trim() == "1")
-    {
-        warnings.push(format!(
-            "WARNING — no x86_64-apple-darwin artifacts in the seal (targets: {})\n\
-             since atpkg index build 12 this is usually a STALE STAGE, not an upstream \
-             limit — restage from a current index: INDEX_BUILD=<N> \
-             tools/atpkg-seed-from-published.sh (N >= 12); acknowledge a deliberately \
-             arm64-only seal with ATERM_SEED_ARCH_ACK=1 (a warning-mute, not a gate: \
-             the cut proceeds either way)\n\
-             · an Intel Mac installs NOTHING from this seal — the client says so and \
-             discards it (`seed-unusable: no build for this Mac's architecture`)\n\
-             · the published registry carries x86_64-apple-darwin artifacts for six \
-             programs (ay, clean, nn, ny, ty, trust-mc), so restaging puts that slice \
-             in the seal\n\
-             · what stays aarch64-only is the rustc coherence group (trust, trust-ir, \
-             trust-cg, trust-vc), and the reason is NARROWER than \"no std\": Trust's \
-             x86_64-apple-darwin sysroot DOES carry std — it is `rustc_private` (the \
-             rustc-dev component) that is absent cross-host, so the `trust` bundle \
-             alone cannot yet be produced for that triple\n\
-             · the group moves together: an x86_64 row on a sibling while `trust` \
-             lacks one aborts the whole group on every Intel client",
-            listed()
-        ));
+    match scope {
+        // A per-arch restage must serve EXACTLY its one triple: any other
+        // covered triple means the filter leaked foreign-arch tarballs back
+        // into a DMG whose whole reason to exist is not carrying them, and an
+        // empty coverage means it filtered the seed into uselessness. Either
+        // way the filter is wrong — refuse the cut, at cut time.
+        ArchScope::Only(triple) => {
+            if !(covered.len() == 1 && covered.contains(triple)) {
+                return Err(format!(
+                    "the {triple}-filtered seed covers [{}] — a per-arch DMG must carry \
+                     exactly its own architecture's artifacts, no more (the filter leaked) \
+                     and no less (the filter gutted the seed)",
+                    listed()
+                ));
+            }
+        }
+        ArchScope::Universal => {
+            if !covered.contains("aarch64-apple-darwin") {
+                return Err(format!(
+                    "the seed carries NO aarch64-apple-darwin artifacts (targets: {}) — that is the \
+                     architecture of essentially every Mac this will install on, so the seal would \
+                     cost every downloader ~600 MB and install nothing for almost all of them. \
+                     Restage from a registry packed for this triple \
+                     (`tools/atpkg-seed-from-published.sh`), or cut deliberately seedless with \
+                     ATERM_SEEDLESS=1. This one is not acknowledgeable.",
+                    listed()
+                ));
+            }
+            // Headline, then the ACT, then the facts one per line. Every fact that was in the
+            // 120-word run-on paragraph is still here: no x86 artifacts, which targets ARE
+            // covered, that an Intel Mac installs nothing from the seal, the client's exact
+            // marker, the upstream state, and the ack.
+            //
+            // What MOVED is the acknowledgement, from word 91 to line 2. Skimming stopped at "the
+            // seed carries NO x86_64", which reads as a refusal — so the operator went looking for
+            // what had failed, rather than for the one word that lets a warning proceed.
+            if !covered.contains("x86_64-apple-darwin")
+                && !std::env::var("ATERM_SEED_ARCH_ACK").is_ok_and(|v| v.trim() == "1")
+            {
+                warnings.push(format!(
+                    "WARNING — no x86_64-apple-darwin artifacts in the seal (targets: {})\n\
+                     since atpkg index build 14 this is a STALE STAGE, not an upstream \
+                     limit — restage from a current index: INDEX_BUILD=<N> \
+                     tools/atpkg-seed-from-published.sh (N >= 14); acknowledge a deliberately \
+                     arm64-only seal with ATERM_SEED_ARCH_ACK=1 (a warning-mute, not a gate: \
+                     the cut proceeds either way)\n\
+                     · an Intel Mac installs NOTHING from this seal — the client says so and \
+                     discards it (`seed-unusable: no build for this Mac's architecture`)\n\
+                     · the published registry carries x86_64-apple-darwin artifacts for EVERY \
+                     pinned program since index 14 (the rustc coherence group included — \
+                     pkg-trust-6808.toml carries the row), so restaging puts that slice in \
+                     the seal\n\
+                     · an arm64-only seal also cuts no aterm-<v>-x86_64.dmg and omits the \
+                     manifest's dmg_x86_64 keys — Intel installs quietly keep the lean zip",
+                    listed()
+                ));
+            }
+        }
     }
 
     // ---- 3. nothing unaccounted rides the seal ---------------------------
@@ -420,16 +517,20 @@ pub fn validate(dir: &Path) -> Result<SeedStat, String> {
         ));
     }
 
-    Ok(SeedStat {
-        dir: dir.to_path_buf(),
-        files: names.len(),
-        bytes,
-        index_build: index.index_build,
-        valid_until: effective_valid_until,
-        roster_seq: index.roster_seq(),
-        programs: pins,
-        warnings,
-    })
+    Ok((
+        SeedStat {
+            dir: dir.to_path_buf(),
+            files: names.len(),
+            bytes,
+            index_build: index.index_build,
+            valid_until: effective_valid_until,
+            roster_seq: index.roster_seq(),
+            programs: pins,
+            targets: seen_targets,
+            warnings,
+        },
+        assets_by_target,
+    ))
 }
 
 /// The minimum shelf life a sealed seed must still have at cut time, in

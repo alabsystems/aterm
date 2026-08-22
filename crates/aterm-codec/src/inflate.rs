@@ -157,6 +157,39 @@ impl<'a> BitReader<'a> {
         Ok(v)
     }
 
+    /// Look at the next `want` bits WITHOUT consuming them.
+    ///
+    /// Returns `(bits, avail)` where `avail = min(want, bits actually available)`
+    /// and `bits` is the low `avail` bits of the accumulator, LSB-first — i.e.
+    /// bit `i` of `bits` is the `i`-th bit `read_bit` would return next.
+    ///
+    /// `avail` is what keeps the root-table decode honest at end-of-input: the
+    /// accumulator is never zero-padded past the last real byte (`refill` only
+    /// pulls bytes that exist), so a caller that finds a table entry longer than
+    /// `avail` must NOT trust it — the bits that would have selected it do not
+    /// exist. Every caller checks that.
+    fn peek_bits(&mut self, want: u32) -> (u32, u32) {
+        if self.bits_in_buffer < want {
+            self.refill();
+        }
+        let avail = want.min(self.bits_in_buffer);
+        // `avail <= want <= ROOT_BITS <= 32`, so the shift is in range for u64
+        // and the mask is exact.
+        let mask = (1u64 << avail.min(32)) - 1;
+        ((self.bit_buffer & mask) as u32, avail)
+    }
+
+    /// Drop `n` bits that a preceding [`peek_bits`](Self::peek_bits) already
+    /// validated as present. Clamped to what is actually buffered, so it is
+    /// total for any `n`.
+    fn consume_bits(&mut self, n: u32) {
+        let n = n.min(self.bits_in_buffer);
+        // `n <= bits_in_buffer <= 64`; `wrapping_shr` masks the amount, which is
+        // a no-op under that bound and removes the shift-overflow panic path.
+        self.bit_buffer = self.bit_buffer.wrapping_shr(n);
+        self.bits_in_buffer = self.bits_in_buffer.saturating_sub(n);
+    }
+
     /// Discard bits up to the next byte boundary (for stored blocks). The low
     /// `bits_in_buffer % 8` bits are the remainder of the current partial byte;
     /// dropping them realigns the accumulator without touching `data`.
@@ -199,10 +232,148 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Canonical Huffman decode table (count/symbol form, RFC 1951 / `puff.c`).
+/// Bits consulted by the flat root lookup table. Nine covers the whole fixed
+/// literal/length alphabet (its longest code is 9 bits) and, in a typical
+/// dynamic block, the overwhelming majority of literals. Codes longer than this
+/// fall back to the bit-at-a-time walk, so the table is a pure accelerator: it
+/// never has to represent the long tail, which is what lets it stay one flat
+/// level with no secondary tables and no new error paths.
+const ROOT_BITS: u32 = 9;
+/// Entries in the root table: one per distinct `ROOT_BITS`-bit prefix.
+const ROOT_SIZE: usize = 1 << ROOT_BITS;
+/// Shift of the code-length field inside a packed root entry. The low 12 bits
+/// hold the symbol (alphabets top out at 287), the high 4 hold the code length
+/// (1..=`ROOT_BITS`); a whole entry of 0 means "no code of length <= ROOT_BITS
+/// starts with this prefix", which routes to the bit-at-a-time walk.
+const ROOT_LEN_SHIFT: u32 = 12;
+/// Mask selecting the symbol out of a packed root entry.
+const ROOT_SYM_MASK: u16 = (1 << ROOT_LEN_SHIFT) - 1;
+/// Symbols a BLOCK must decode before its literal/length and distance tables
+/// are built.
+///
+/// The table is not free: filling `ROOT_SIZE` entries measured ~200 ns per
+/// table on the development machine, while the table SAVES ~0.3 ns per decoded
+/// symbol, so break-even is around 600 symbols. A DEFLATE stream hands out
+/// THREE tables per dynamic block — literal/length, distance, and the throwaway
+/// code-length meta-code that only ever decodes ~316 symbols — so building them
+/// all eagerly turns a stream of small dynamic blocks into a table-build
+/// benchmark: measured +14.2% on a 400-block corpus before this deferral,
+/// against -17.1% and -40.4% on the megabyte lanes.
+///
+/// Deferring past 1024 symbols is roughly 1.6x break-even, so a table is
+/// comfortably paid for by the time it is built. Small blocks stay on exactly
+/// the code they had before, and the code-length meta-code never builds a table
+/// at all (its alphabet cannot drive more than 316 decodes).
+///
+/// The counter lives in `inflate_block`'s frame, NOT in `Huffman`: as a struct
+/// field it was a store to memory on every warm-up symbol, which measured as a
+/// +10% regression on the tiny-block corpus all by itself.
+const ROOT_BUILD_AFTER: u32 = 1024;
+
+/// Reverse the low `len` bits of `code`.
+///
+/// DEFLATE transmits Huffman codes most-significant-bit first while the bit
+/// stream itself is read least-significant-bit first, so the value the reader
+/// peeks is the code with its bits reversed. Reversing here — once per symbol at
+/// table-build time — is what lets the decoder index a flat table with the raw
+/// peeked bits instead of re-assembling the code bit by bit per symbol.
+///
+/// `len` is clamped to `ROOT_BITS`, so every shift below is in range and the
+/// result is `< ROOT_SIZE`.
+fn reverse_code(code: u32, len: u32) -> u32 {
+    let len = len.min(ROOT_BITS);
+    let mut src = code;
+    let mut out = 0u32;
+    for _ in 0..len {
+        out = (out << 1) | (src & 1);
+        src >>= 1;
+    }
+    out
+}
+
+/// Build the flat root lookup table from the canonical `count`/`symbol` form.
+///
+/// Walks the same first-code recurrence the bit-at-a-time decoder walks —
+/// `code` starts at 0, and after each length the running code is advanced past
+/// that length's `count` codes and shifted left one bit — so the code assigned
+/// to `symbol[i]` here is byte-for-byte the code the walk resolves. Only lengths
+/// up to `ROOT_BITS` are entered; longer codes are left as zero entries and the
+/// decoder falls back.
+///
+/// A code of length `len` occupies every table slot whose low `len` bits equal
+/// the reversed code, i.e. `2^(ROOT_BITS - len)` slots strided by `2^len`.
+fn build_root_table(count: &[u16; MAXBITS + 1], symbol: &[u16]) -> Vec<u16> {
+    let mut root = vec![0u16; ROOT_SIZE];
+    let mut code: u32 = 0;
+    let mut index: usize = 0;
+    for (len, &cnt) in count.iter().enumerate().skip(1) {
+        let cnt = cnt as usize;
+        // `len` indexes a 16-element array here, so `len <= MAXBITS`; the cast
+        // is lossless and the comparison below is the only gate on entry.
+        let len_u32 = len as u32;
+        if len_u32 <= ROOT_BITS {
+            let step = 1usize << len_u32;
+            for k in 0..cnt {
+                // `index + k` walks `symbol` in canonical order; a set that is
+                // internally inconsistent (only reachable if construction was
+                // clamped) simply leaves those slots at 0 and falls back.
+                let Some(&sym) = symbol.get(index.saturating_add(k)) else {
+                    break;
+                };
+                // `sym <= 287 < ROOT_SYM_MASK` and `len_u32 <= ROOT_BITS < 16`,
+                // so the packed entry is lossless and never zero.
+                let entry = ((len_u32 as u16) << ROOT_LEN_SHIFT) | (sym & ROOT_SYM_MASK);
+                let mut slot = reverse_code(code.saturating_add(k as u32), len_u32) as usize;
+                while let Some(cell) = root.get_mut(slot) {
+                    *cell = entry;
+                    slot = slot.saturating_add(step);
+                }
+            }
+        }
+        index = index.saturating_add(cnt);
+        // Canonical recurrence. `code` stays below `2^15` on any code set that
+        // passed the Kraft check in `Huffman::new`; the saturating/wrapping
+        // forms only discharge the (unreachable) overflow obligations.
+        code = code.saturating_add(cnt as u32).wrapping_shl(1);
+    }
+    root
+}
+
+/// Test-only switch that forces every decode down the bit-at-a-time walk, so a
+/// differential test can run the SAME `inflate` twice — once table-driven, once
+/// exactly as the pre-table decoder behaved — and compare the two `Result`s.
+/// Compiled out entirely in release builds.
+#[cfg(test)]
+mod oracle {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FORCE_BITWISE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn force_bitwise() -> bool {
+        FORCE_BITWISE.with(Cell::get)
+    }
+
+    /// Run `f` with the root table disabled.
+    pub(super) fn without_root_table<T>(f: impl FnOnce() -> T) -> T {
+        FORCE_BITWISE.with(|c| c.set(true));
+        let out = f();
+        FORCE_BITWISE.with(|c| c.set(false));
+        out
+    }
+}
+
+/// Canonical Huffman decode table (count/symbol form, RFC 1951 / `puff.c`),
+/// plus a flat root lookup table that resolves short codes in one step.
 struct Huffman {
     count: [u16; MAXBITS + 1],
     symbol: Vec<u16>,
+    /// `ROOT_SIZE` packed `(length, symbol)` entries indexed by the next
+    /// `ROOT_BITS` bits of the stream, LSB-first. EMPTY until this alphabet has
+    /// decoded `ROOT_BUILD_AFTER` symbols — see that constant for why the build
+    /// is deferred rather than done in the constructor.
+    root: Vec<u16>,
 }
 
 impl Huffman {
@@ -295,11 +466,77 @@ impl Huffman {
                 }
             }
         }
-        Ok((Self { count, symbol }, left))
+        Ok((
+            Self {
+                count,
+                symbol,
+                // Deferred: see `ROOT_BUILD_AFTER`.
+                root: Vec::new(),
+            },
+            left,
+        ))
+    }
+
+    /// Decode one symbol.
+    ///
+    /// One flat table probe resolves any code of `ROOT_BITS` bits or fewer —
+    /// which, for the fixed literal/length alphabet, is EVERY code, and for a
+    /// typical dynamic block is the overwhelming majority of literals. Anything
+    /// else falls through to [`decode_bitwise`](Self::decode_bitwise), the
+    /// original `puff.c` walk, unchanged.
+    ///
+    /// The two paths are observationally identical by construction, not by
+    /// coincidence: `build_root_table` assigns codes with the same canonical
+    /// first-code recurrence the walk implements, over the same `count`/`symbol`
+    /// arrays, so a hit returns the symbol the walk would have returned after
+    /// consuming the same number of bits. Every case the table cannot answer —
+    /// an unused prefix, a code longer than `ROOT_BITS`, or fewer than `len`
+    /// bits actually left in the stream — takes the walk and therefore keeps the
+    /// walk's exact error (`BadSymbol` / `Truncated`) at the exact same point.
+    /// Called only on an ARMED alphabet (see `block_loop`), so there is no
+    /// "is there a table?" test on this path — an unarmed table would simply
+    /// miss in `get` and fall through, which is also correct.
+    fn decode(&self, br: &mut BitReader) -> Result<u16, InflateError> {
+        #[cfg(test)]
+        if oracle::force_bitwise() {
+            return self.decode_bitwise(br);
+        }
+        let (peeked, avail) = br.peek_bits(ROOT_BITS);
+        // `peeked < 2^avail <= 2^ROOT_BITS == ROOT_SIZE`, so this is in bounds
+        // whenever the table exists at all; `get` keeps that local.
+        if let Some(&entry) = self.root.get(peeked as usize) {
+            let len = u32::from(entry >> ROOT_LEN_SHIFT);
+            // `len == 0` is "no short code here"; `len > avail` means the bits
+            // that would select this entry run past end-of-input and the table
+            // must not be trusted (the accumulator is never zero-padded).
+            if len != 0 && len <= avail {
+                br.consume_bits(len);
+                return Ok(entry & ROOT_SYM_MASK);
+            }
+        }
+        self.decode_bitwise(br)
+    }
+
+    /// Build this alphabet's root table if it does not have one yet.
+    ///
+    /// Called once per block, from `inflate_block`, the moment the block has
+    /// decoded `ROOT_BUILD_AFTER` symbols. Kept out of line so it cannot add an
+    /// instruction to the per-symbol path.
+    #[cold]
+    #[inline(never)]
+    fn arm_root(&mut self) {
+        if self.root.is_empty() {
+            self.root = build_root_table(&self.count, &self.symbol);
+        }
     }
 
     /// Decode one symbol, reading one bit at a time (MSB-accumulated code).
-    fn decode(&self, br: &mut BitReader) -> Result<u16, InflateError> {
+    ///
+    /// `#[inline]` matters: this is `decode`'s only tail call, and an alphabet
+    /// that never earns a root table must end up running exactly this code with
+    /// no call layer around it (see `decode`).
+    #[inline]
+    fn decode_bitwise(&self, br: &mut BitReader) -> Result<u16, InflateError> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
@@ -355,6 +592,7 @@ fn fixed_lit() -> Huffman {
         .unwrap_or(Huffman {
             count: [0; MAXBITS + 1],
             symbol: Vec::new(),
+            root: Vec::new(),
         })
 }
 
@@ -368,6 +606,7 @@ fn fixed_dist() -> Huffman {
         .unwrap_or(Huffman {
             count: [0; MAXBITS + 1],
             symbol: Vec::new(),
+            root: Vec::new(),
         })
 }
 
@@ -405,7 +644,10 @@ fn read_dynamic_tables(br: &mut BitReader) -> Result<(Huffman, Huffman), Inflate
     // re-checked before every write, so the addition never actually
     // saturates — it only removes the (unreachable) overflow path.
     while i < lengths.len() {
-        let sym = cl_huff.decode(br)?;
+        // The meta-code decodes at most 316 symbols and is then thrown away,
+        // which is far below `ROOT_BUILD_AFTER`; it is never armed, so call the
+        // walk directly rather than paying a table test that can never pay off.
+        let sym = cl_huff.decode_bitwise(br)?;
         match sym {
             0..=15 => {
                 // `i < lengths.len()` from the `while` head; `get_mut` keeps
@@ -518,22 +760,75 @@ fn inflate_stored(
     Ok(())
 }
 
+/// Why a [`block_loop`] returned.
+#[derive(PartialEq, Eq)]
+enum BlockStop {
+    /// The end-of-block symbol was decoded; the block is finished.
+    EndOfBlock,
+    /// The warm-up budget ran out and the block is still going.
+    BudgetSpent,
+}
+
+/// Decode one DEFLATE block in TWO phases, so neither phase carries the other's
+/// overhead.
+///
+/// Phase 1 runs `ROOT_BUILD_AFTER` symbols on the original bit-at-a-time walk.
+/// A short block — and a stream of hundreds of tiny dynamic blocks is the
+/// adversarial case — finishes inside phase 1 and therefore runs EXACTLY the
+/// code it ran before this change: no table is built, and no per-symbol "is
+/// there a table?" test exists to pay for. That test is not free at this scale:
+/// with it in the per-symbol path the 400-block corpus measured +8 to +9%.
+///
+/// Phase 2 arms both tables once and then decodes with no warm-up counter and no
+/// table test, which is where the megabyte streams collect their win.
 fn inflate_block(
+    br: &mut BitReader,
+    out: &mut Vec<u8>,
+    max_output: usize,
+    lit: &mut Huffman,
+    dist: &mut Huffman,
+) -> Result<(), InflateError> {
+    if block_loop::<false>(br, out, max_output, lit, dist, ROOT_BUILD_AFTER)?
+        == BlockStop::EndOfBlock
+    {
+        return Ok(());
+    }
+    lit.arm_root();
+    dist.arm_root();
+    block_loop::<true>(br, out, max_output, lit, dist, 0).map(|_| ())
+}
+
+/// The literal/match loop. `TABLE` selects the armed root-table decoder over the
+/// bit-at-a-time walk; it is a const parameter so each phase compiles to a loop
+/// with only its own decoder and only its own bookkeeping in it.
+fn block_loop<const TABLE: bool>(
     br: &mut BitReader,
     out: &mut Vec<u8>,
     max_output: usize,
     lit: &Huffman,
     dist: &Huffman,
-) -> Result<(), InflateError> {
+    budget: u32,
+) -> Result<BlockStop, InflateError> {
+    let mut left = budget;
     loop {
-        let sym = lit.decode(br)?;
+        if !TABLE {
+            if left == 0 {
+                return Ok(BlockStop::BudgetSpent);
+            }
+            left = left.saturating_sub(1);
+        }
+        let sym = if TABLE {
+            lit.decode(br)?
+        } else {
+            lit.decode_bitwise(br)?
+        };
         if sym < 256 {
             if out.len() >= max_output {
                 return Err(InflateError::OutputTooLarge);
             }
             out.push(sym as u8);
         } else if sym == 256 {
-            return Ok(()); // end of block
+            return Ok(BlockStop::EndOfBlock);
         } else {
             // `sym >= 257` in this branch (`< 256` and `== 256` are handled
             // above), so the subtraction never actually saturates; the
@@ -551,7 +846,11 @@ fn inflate_block(
             // at 258. The clamps are no-ops on every real path — they bound
             // `length` for the reservation below.
             let length = (base as usize + (br.read_bits(extra)?.min(31)) as usize).min(258);
-            let dsym = dist.decode(br)? as usize;
+            let dsym = if TABLE {
+                dist.decode(br)? as usize
+            } else {
+                dist.decode_bitwise(br)? as usize
+            };
             let (dbase, dextra) = match (DIST_BASE.get(dsym), DIST_EXTRA.get(dsym)) {
                 (Some(&b), Some(&e)) => (b, e),
                 _ => return Err(InflateError::BadDistance),
@@ -612,15 +911,17 @@ pub fn inflate(input: &[u8], max_output: usize) -> Result<Vec<u8>, InflateError>
         match btype {
             0 => inflate_stored(&mut br, &mut out, max_output)?,
             1 => {
-                // `&*` reborrows the `&mut (Huffman, Huffman)` from
-                // `get_or_insert_with` as a shared ref; match ergonomics then bind
-                // `lit`/`dist` as `&Huffman` for `inflate_block`'s signature.
-                let (lit, dist) = &*fixed.get_or_insert_with(|| (fixed_lit(), fixed_dist()));
+                // `&mut *` reborrows the pair from `get_or_insert_with`;
+                // `inflate_block` needs `&mut` because a table arms its root
+                // lookup lazily (see `ROOT_BUILD_AFTER`). Keeping the pair in
+                // `fixed` across blocks is also what lets a stream of many fixed
+                // blocks share one already-armed table.
+                let (lit, dist) = &mut *fixed.get_or_insert_with(|| (fixed_lit(), fixed_dist()));
                 inflate_block(&mut br, &mut out, max_output, lit, dist)?;
             }
             2 => {
-                let (lit, dist) = read_dynamic_tables(&mut br)?;
-                inflate_block(&mut br, &mut out, max_output, &lit, &dist)?;
+                let (mut lit, mut dist) = read_dynamic_tables(&mut br)?;
+                inflate_block(&mut br, &mut out, max_output, &mut lit, &mut dist)?;
             }
             _ => return Err(InflateError::BadBlockType),
         }
@@ -841,6 +1142,223 @@ mod tests {
     fn adler32_known_value() {
         // Adler-32("hello, world") cross-checked against zlib.
         assert_eq!(adler32(b"hello, world"), 0x1d54_0489);
+    }
+
+    // =====================================================================
+    // Root lookup table: differential oracle against the bit-at-a-time walk
+    // =====================================================================
+
+    /// The attacker-crafted incomplete-literal-code stream, hoisted to a const so
+    /// the differential corpus can include a malformed dynamic block.
+    const INCOMPLETE_STREAM: &[u8] = &[
+        0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0x6d, 0xfd, 0x3f, 0x25,
+        0x01, 0x00, 0x42, 0x00, 0x42,
+    ];
+
+    /// Every zlib fixture in this file, including the deliberately malformed
+    /// one, so the oracle below covers stored, fixed and dynamic blocks plus a
+    /// rejected table.
+    const CORPUS: &[&[u8]] = &[EMPTY, HELLO, STORED, BACKREFS, DYNAMIC, INCOMPLETE_STREAM];
+
+    /// The root table must resolve the ENTIRE fixed literal/length alphabet: its
+    /// longest code is 9 bits, which is exactly `ROOT_BITS`, so a complete code
+    /// fills all `ROOT_SIZE` slots and no fixed-block literal ever takes the
+    /// fallback. This is the positive half of the reach evidence — without it,
+    /// "the tests pass" would be equally true of a table that is never hit.
+    #[test]
+    fn root_table_resolves_every_fixed_literal_code() {
+        let mut lit = fixed_lit();
+        // The table is armed lazily (see `ROOT_BUILD_AFTER`); arm it here the
+        // way a megabyte-scale stream does after its first 1024 symbols.
+        lit.arm_root();
+        assert_eq!(lit.root.len(), ROOT_SIZE, "the root table must be built");
+        assert!(
+            lit.root.iter().all(|&e| e != 0),
+            "a COMPLETE code whose longest word is ROOT_BITS must leave no empty \
+             slot — an empty slot would silently route a fixed-block literal to \
+             the fallback, and the table would be accelerating nothing"
+        );
+        // And the two paths must agree symbol-for-symbol over the whole
+        // alphabet, decoded out of a real bit stream, consuming the same bits.
+        for sym in 0u16..288 {
+            let (code, len) = fixed_lit_code(sym);
+            let bytes = bits_to_bytes(code, len);
+            let mut via_table_reader = BitReader::new(&bytes);
+            let mut via_walk_reader = BitReader::new(&bytes);
+            let via_table = lit.decode(&mut via_table_reader);
+            let via_walk = lit.decode_bitwise(&mut via_walk_reader);
+            assert_eq!(via_table, Ok(sym), "table decode wrong for symbol {sym}");
+            assert_eq!(via_table, via_walk, "paths disagree on symbol {sym}");
+            assert_eq!(
+                via_table_reader.bits_in_buffer, via_walk_reader.bits_in_buffer,
+                "paths consumed a different number of bits for symbol {sym}"
+            );
+        }
+    }
+
+    /// NEGATIVE half of the reach evidence: a code with words longer than
+    /// `ROOT_BITS` must leave empty table slots and still decode, through the
+    /// fallback, identically.
+    #[test]
+    fn root_table_falls_back_for_codes_longer_than_root_bits() {
+        // A staircase code: symbol i has length i for i in 1..=11, plus TWO
+        // length-12 codes. Kraft sum = (1/2 + 1/4 + ... + 1/2^11) + 2/2^12 == 1
+        // exactly, so the set is complete.
+        let mut lengths = [0u16; 14];
+        for (i, slot) in lengths.iter_mut().enumerate().take(12).skip(1) {
+            *slot = u16::try_from(i).unwrap_or(0);
+        }
+        lengths[12] = 12;
+        lengths[13] = 12;
+        let (mut h, left) = Huffman::new(&lengths).expect("staircase code is valid");
+        assert_eq!(left, 0, "staircase must be a complete code");
+        h.arm_root();
+        assert!(
+            h.root.contains(&0),
+            "a code with words longer than ROOT_BITS must leave empty slots"
+        );
+        // The two deepest symbols have 12-bit codes, so they can only come back
+        // through the fallback — and they must come back identically.
+        for want in [12usize, 13] {
+            let (code, len) = canonical_code_of(&lengths, want);
+            assert!(len > ROOT_BITS, "symbol {want} must be a long code");
+            let bytes = bits_to_bytes(code, len);
+            let mut via_table_reader = BitReader::new(&bytes);
+            let mut via_walk_reader = BitReader::new(&bytes);
+            let want16 = u16::try_from(want).unwrap_or(0);
+            assert_eq!(h.decode(&mut via_table_reader), Ok(want16));
+            assert_eq!(h.decode_bitwise(&mut via_walk_reader), Ok(want16));
+            assert_eq!(
+                via_table_reader.bits_in_buffer, via_walk_reader.bits_in_buffer
+            );
+        }
+    }
+
+    /// THE DIFFERENTIAL ORACLE. For every fixture, every prefix of it, and every
+    /// single-byte mutation of it, `inflate`/`zlib_decompress` must return the
+    /// EXACT same `Result` with the table as without it — same bytes on success,
+    /// same `InflateError` variant on failure. The mutations are what make this
+    /// cover the malformed space: a flipped bit inside a dynamic block's code
+    /// lengths lands on `BadSymbol`, inside a distance on `BadDistance`, and a
+    /// truncation lands on `Truncated`.
+    #[test]
+    fn table_and_bitwise_decoders_agree_on_corpus_prefixes_and_mutations() {
+        let mut checked = 0usize;
+        let mut ok_seen = 0usize;
+        let mut err_kinds = std::collections::BTreeSet::new();
+
+        let mut compare = |input: &[u8], what: &str| {
+            let raw: &[u8] = if input.len() > 6 {
+                &input[2..input.len() - 4]
+            } else {
+                input
+            };
+            let table_z = zlib_decompress(input, 1 << 20);
+            let walk_z = oracle::without_root_table(|| zlib_decompress(input, 1 << 20));
+            assert_eq!(table_z, walk_z, "zlib_decompress diverged on {what}");
+            let table_r = inflate(raw, 1 << 20);
+            let walk_r = oracle::without_root_table(|| inflate(raw, 1 << 20));
+            assert_eq!(table_r, walk_r, "inflate diverged on {what}");
+            match &table_z {
+                Ok(_) => ok_seen += 1,
+                Err(e) => {
+                    err_kinds.insert(format!("{e:?}"));
+                }
+            }
+            if let Err(e) = &table_r {
+                err_kinds.insert(format!("{e:?}"));
+            }
+            checked += 1;
+        };
+
+        for (ci, corpus) in CORPUS.iter().enumerate() {
+            compare(corpus, &format!("corpus[{ci}] whole"));
+            for cut in 0..corpus.len() {
+                compare(&corpus[..cut], &format!("corpus[{ci}] prefix {cut}"));
+            }
+            for pos in 0..corpus.len() {
+                for mask in [0x01u8, 0x40, 0x80, 0xff] {
+                    let mut m = corpus.to_vec();
+                    m[pos] ^= mask;
+                    compare(&m, &format!("corpus[{ci}] byte {pos} ^ {mask:#04x}"));
+                }
+            }
+        }
+
+        assert!(
+            checked > 1000,
+            "the oracle must actually cover a wide space, only {checked} cases"
+        );
+        assert!(ok_seen > 0, "no case decoded successfully — corpus is broken");
+        // Two-sided: the malformed half must really have produced the error
+        // classes the table could plausibly get wrong.
+        for want in ["BadSymbol", "Truncated"] {
+            assert!(
+                err_kinds.contains(want),
+                "the mutation space never produced {want}; it is not exercising \
+                 the paths the root table could diverge on. Saw: {err_kinds:?}"
+            );
+        }
+    }
+
+    // --- test helpers -------------------------------------------------------
+
+    /// RFC 1951 3.2.6 fixed literal/length code word for `sym`, MSB-first.
+    fn fixed_lit_code(sym: u16) -> (u32, u32) {
+        let mut lengths = [0u16; 288];
+        for (i, len) in lengths.iter_mut().enumerate() {
+            *len = match i {
+                0..=143 => 8,
+                144..=255 => 9,
+                256..=279 => 7,
+                _ => 8,
+            };
+        }
+        canonical_code_of(&lengths, sym as usize)
+    }
+
+    /// The canonical code word assigned to `want` under `lengths`, MSB-first,
+    /// computed by the textbook first-code recurrence. Written independently of
+    /// the code under test, so agreement is a cross-check rather than a
+    /// restatement of the same arithmetic.
+    fn canonical_code_of(lengths: &[u16], want: usize) -> (u32, u32) {
+        let mut count = [0u32; MAXBITS + 2];
+        for &l in lengths {
+            if l != 0 {
+                count[l as usize] += 1;
+            }
+        }
+        let mut next = [0u32; MAXBITS + 2];
+        let mut code = 0u32;
+        for len in 1..=MAXBITS {
+            code = (code + count[len - 1]) << 1;
+            next[len] = code;
+        }
+        let mut cursor = next;
+        for (sym, &l) in lengths.iter().enumerate() {
+            if l == 0 {
+                continue;
+            }
+            let c = cursor[l as usize];
+            cursor[l as usize] += 1;
+            if sym == want {
+                return (c, u32::from(l));
+            }
+        }
+        (0, 0)
+    }
+
+    /// Pack an MSB-first code word into DEFLATE's LSB-first byte order, padded
+    /// with enough trailing bytes that the reader never hits end-of-input.
+    fn bits_to_bytes(code: u32, len: u32) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        for i in 0..len {
+            // The i-th bit READ must be the MSB of the code word.
+            let bit = (code >> (len - 1 - i)) & 1;
+            let idx = (i / 8) as usize;
+            out[idx] |= u8::try_from(bit).unwrap_or(0) << (i % 8);
+        }
+        out
     }
 
     /// One step of a deterministic LCG (same constants as the engine fuzz), so any

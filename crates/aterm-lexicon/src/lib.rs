@@ -344,6 +344,33 @@ pub struct Lexicon {
     cjk_exceptions: FxHashSet<String>,
     /// Longest CJK key (chars), bounding the maximal-run search window.
     max_cjk: usize,
+    /// FIRST character of every [`Self::cjk_forms`] key and every
+    /// [`Self::cjk_exceptions`] member → the length in CHARS of the longest
+    /// surface starting with it. Built once, from the finished tables, by
+    /// [`note_cjk_head`].
+    ///
+    /// This is the prefilter [`Self::scan_cjk_run`] consults before it touches
+    /// its window. `fold::is_no_space_script` admits tens of thousands of
+    /// codepoints (all of Hiragana/Katakana, CJK Unified + Ext A/B, Hangul,
+    /// Thai, Lao, Khmer) while the shipped data holds only a few hundred
+    /// surfaces over a few hundred distinct first characters, so at almost
+    /// every position in real CJK prose NOTHING can match — and without this
+    /// map the scanner learned that by building a `max_cjk`-character window
+    /// and probing it at every length, twice per length.
+    ///
+    /// Two properties make consulting it exactly equivalent to not consulting
+    /// it, and both are structural rather than tuned:
+    ///
+    /// * a surface that matches at position `p` starts with `chars[p]`, so an
+    ///   absent key proves no length can match;
+    /// * the stored length is the MAXIMUM over surfaces sharing that first
+    ///   character, so clamping the window to it removes only lengths at which
+    ///   no surface of that shape exists.
+    ///
+    /// Lengths are `usize`, not a byte: a config/override lexicon may declare a
+    /// surface longer than 255 characters, and a saturating byte would silently
+    /// stop the probe short of a real match.
+    cjk_heads: FxHashMap<char, usize>,
     /// Interned language codes, in first-appearance TOML order ([`LangId`] `i`
     /// ⇔ `langs[i]`). The reserved [`UNKNOWN_LANG`] slot is never stored here;
     /// [`Self::lang_code`] renders it as `"unknown"`.
@@ -749,11 +776,26 @@ impl Lexicon {
         let spaced = finalize_hits(spaced, &mut next_form_id);
         let cjk_forms = finalize_hits(cjk_forms, &mut next_form_id);
 
+        // First-character prefilter for the maximal-run scan. Derived from the
+        // FINISHED tables (after cross-class precedence has dropped whatever it
+        // drops), so it describes the surfaces that can actually match — never a
+        // superset that would let a probe through, never a subset that would
+        // suppress one. Every key here has length <= `max_cjk`, since both
+        // tables raised `max_cjk` as they were filled.
+        let mut cjk_heads: FxHashMap<char, usize> = FxHashMap::default();
+        for key in cjk_forms.keys() {
+            note_cjk_head(&mut cjk_heads, key);
+        }
+        for key in &cjk_exceptions {
+            note_cjk_head(&mut cjk_heads, key);
+        }
+
         Lexicon {
             spaced,
             cjk_forms,
             cjk_exceptions,
             max_cjk,
+            cjk_heads,
             langs: lang_table,
             species: species_table,
             conflicts,
@@ -1093,9 +1135,35 @@ impl Lexicon {
         let end = if end < chars.len() { end } else { chars.len() };
         let mut p = start;
         while p < end {
+            // FIRST-CHARACTER PREFILTER. Every surface that could match here
+            // starts with `chars[p]`, so a first character no surface starts
+            // with settles the whole position: advance by one with no window
+            // build and no probe. That is the dominant case — the no-space
+            // script ranges span tens of thousands of codepoints and the data
+            // holds a few hundred surfaces — and it used to cost a
+            // `max_cjk`-character window plus two hash lookups per length.
+            //
+            // `head_max` is the longest surface starting with this character,
+            // so probing beyond it can only miss; clamping to it also shrinks
+            // the HIT path, where the per-character maximum is 2-3 rather than
+            // the global `max_cjk`.
+            let Some(&head_max) = self.cjk_heads.get(&chars[p]) else {
+                // `p < end` makes the plain `+ 1` overflow-free; same value.
+                p = p.saturating_add(1);
+                continue;
+            };
             let remaining = end - p;
-            let max_l = if self.max_cjk < remaining {
+            // Clamped against `max_cjk` as well as `head_max`: `head_max` is
+            // <= `max_cjk` by construction (see `cjk_heads`), and spelling both
+            // keeps the window bound enforced HERE rather than inherited from
+            // the builder.
+            let head_max = if head_max < self.max_cjk {
+                head_max
+            } else {
                 self.max_cjk
+            };
+            let max_l = if head_max < remaining {
+                head_max
             } else {
                 remaining
             };
@@ -1248,6 +1316,29 @@ type PendingHit = (Class, LangSet, bool, Option<SpeciesId>);
 /// the winner's species, a same-class union keeps the FIRST claimant's species
 /// (TOML order is the tiebreak; the data discipline is one surface → one
 /// species, pinned by `animal_surface_species_are_unique`).
+/// Record `surface`'s first character in the CJK prefilter, keeping the LONGEST
+/// surface length (in chars) seen for that character.
+///
+/// The maximum — not the minimum, and not a mere presence bit — is what makes
+/// the clamp in [`Lexicon::scan_cjk_run`] lossless: probing is longest-first, so
+/// the window must still be long enough for the longest surface that starts
+/// here, while every length above that provably matches nothing.
+///
+/// An empty surface contributes nothing: it has no first character, and the
+/// builder already skips empty keys.
+fn note_cjk_head(heads: &mut FxHashMap<char, usize>, surface: &str) {
+    let mut it = surface.chars();
+    let Some(first) = it.next() else {
+        return;
+    };
+    // `1 + rest` rather than a second full `chars().count()` pass.
+    let len = it.count().saturating_add(1);
+    let slot = heads.entry(first).or_insert(0);
+    if *slot < len {
+        *slot = len;
+    }
+}
+
 fn insert_class(
     map: &mut FxHashMap<String, PendingHit>,
     key: String,
@@ -1467,6 +1558,63 @@ mod tests {
 
     fn lex() -> Lexicon {
         Lexicon::with_languages(&["all"])
+    }
+
+    /// The invariant the CJK first-character prefilter's equivalence rests on:
+    /// EVERY surface the maximal-run scan can match is reachable through
+    /// `cjk_heads`, at a stored length no shorter than its own.
+    ///
+    /// A missing first character, or a stored maximum that is too small, would
+    /// make `scan_cjk_run` skip a probe that used to hit — a silent matching
+    /// regression that no timing would catch. Checked over BOTH tables and over
+    /// every language configuration that changes which entries load.
+    #[test]
+    fn cjk_prefilter_admits_every_surface_it_gates() {
+        for langs in [&["en"][..], &["all"][..], &["ja", "th"][..]] {
+            let lx = Lexicon::with_languages(langs);
+            let surfaces = lx
+                .cjk_forms
+                .keys()
+                .chain(lx.cjk_exceptions.iter())
+                .map(String::as_str);
+            for surface in surfaces {
+                let first = surface
+                    .chars()
+                    .next()
+                    .expect("builder skips empty CJK surfaces");
+                let len = surface.chars().count();
+                let head_max = lx.cjk_heads.get(&first).copied().unwrap_or(0);
+                assert!(
+                    head_max >= len,
+                    "{langs:?}: surface {surface:?} ({len} chars) is gated behind \
+                     first character {first:?} whose stored maximum is {head_max} \
+                     — the scan would clamp its window below this surface and \
+                     never probe it"
+                );
+                // ... and the clamp must itself stay inside the global window
+                // bound, or the window build could run past `max_cjk`.
+                assert!(
+                    head_max <= lx.max_cjk,
+                    "{langs:?}: first character {first:?} stores {head_max}, \
+                     above max_cjk {}",
+                    lx.max_cjk
+                );
+            }
+            // The prefilter must be a genuine filter, not a table that admits
+            // everything: no-space script ranges span tens of thousands of
+            // codepoints and the data holds a few hundred first characters.
+            assert!(
+                lx.cjk_heads.len() < 5_000,
+                "{langs:?}: {} distinct first characters — this is no longer a \
+                 selective prefilter",
+                lx.cjk_heads.len()
+            );
+            assert!(
+                lx.cjk_heads.len() > 50,
+                "{langs:?}: only {} first characters; the CJK data has collapsed",
+                lx.cjk_heads.len()
+            );
+        }
     }
 
     #[test]

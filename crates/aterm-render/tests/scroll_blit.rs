@@ -136,8 +136,10 @@ fn scroll_toward_bottom_blits_the_other_direction() {
     );
 }
 
-/// A single-row scroll blits with |delta| == 1 (the tightest exposed strip) and
-/// stays byte-exact — the boundary the strip arithmetic is most likely to slip.
+/// A single-row history scroll blits with |delta| == 1 (the tightest exposed
+/// strip) and stays byte-exact in both directions. Entering/leaving history flips
+/// the raw cursor's visibility, so those two boundary frames deliberately repaint
+/// in full rather than shifting stale cursor pixels into/out of the viewport.
 #[test]
 fn single_row_scroll_is_byte_exact() {
     let Some(mut warm) = renderer() else {
@@ -151,7 +153,23 @@ fn single_row_scroll_is_byte_exact() {
         term.process(format!("l{i}\r\n").as_bytes());
     }
     render_both(&mut warm, &mut wc, &mut term, rows, cols, "warmup");
-    for step in 0..10 {
+
+    term.scroll_display(1);
+    let entering = render_both(
+        &mut warm,
+        &mut wc,
+        &mut term,
+        rows,
+        cols,
+        "one[live-to-history]",
+    );
+    assert_eq!(
+        entering,
+        DamageOutcome::Full,
+        "hiding the live cursor must reject scroll rescue"
+    );
+
+    for step in 1..10 {
         term.scroll_display(1);
         let outcome = render_both(
             &mut warm,
@@ -166,6 +184,37 @@ fn single_row_scroll_is_byte_exact() {
             "a one-row scroll must take the blit @ step {step} (got {outcome:?})"
         );
     }
+
+    for step in 1..10 {
+        term.scroll_display(-1);
+        let outcome = render_both(
+            &mut warm,
+            &mut wc,
+            &mut term,
+            rows,
+            cols,
+            &format!("one-back[{step}]"),
+        );
+        assert!(
+            matches!(outcome, DamageOutcome::Scroll { delta_rows: 1 }),
+            "a one-row history-to-history scroll must blit @ step {step} (got {outcome:?})"
+        );
+    }
+
+    term.scroll_display(-1);
+    let leaving = render_both(
+        &mut warm,
+        &mut wc,
+        &mut term,
+        rows,
+        cols,
+        "one[history-to-live]",
+    );
+    assert_eq!(
+        leaving,
+        DamageOutcome::Full,
+        "revealing the live cursor must reject scroll rescue"
+    );
 }
 
 // ---- FRAME-EQUALITY DIFFERENTIAL over the E7 review's REFUTING cases ----

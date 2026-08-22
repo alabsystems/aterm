@@ -330,7 +330,7 @@ fn arm_typing(f: &mut Fixture) {
     f.n += 1;
     f.now += f.dt;
     f.cad.on_keystroke(f.now);
-    f.trail.note_typed(f.now);
+    f.trail.note_synthetic_typed(f.now);
     f.trail.note_context(false);
     if f.col + 1 >= TYPING_COLS {
         f.col = 0;
@@ -341,10 +341,10 @@ fn arm_typing(f: &mut Fixture) {
     stamp(f);
 }
 
-/// An app-driven caret walk: J columns per frame along the serpentine, NO
-/// hints armed — the audit's flood shape (a TUI repositioning its caret every
-/// frame; only nav-hinted and typed-re-anchor moves are suppressed, and this
-/// is neither). J is recovered from `base.max_len`, which every serpentine
+/// An explicitly authored synthetic caret walk: J columns per frame along the
+/// serpentine. Arm the same positive movement witness as a coalesced typed
+/// host so the benchmark prices the spawn/dedup path rather than the cold
+/// program-motion denial gate. J is recovered from `base.max_len`, which every serpentine
 /// fixture sets to its jump length — for `jump_24cell` that is the SHIPPED
 /// default 24, so every frame allocates 25 tuples and keeps 24 (the
 /// realistic heavy-TUI caret walk the CF-2 mechanism cites: 24 x 17 gens =
@@ -352,6 +352,7 @@ fn arm_typing(f: &mut Fixture) {
 fn arm_serp(f: &mut Fixture) {
     f.n += 1;
     f.now += f.dt;
+    f.trail.note_synthetic_move(f.now);
     f.trail.note_context(false);
     let j = f.base.max_len as u64;
     let steps_per_row = SERP_COLS / j;
@@ -360,10 +361,11 @@ fn arm_serp(f: &mut Fixture) {
     stamp(f);
 }
 
-/// The full-width ping-pong: a 200-column unhinted move every frame.
+/// The full-width ping-pong: a 200-column witnessed synthetic move every frame.
 fn arm_pingpong(f: &mut Fixture) {
     f.n += 1;
     f.now += f.dt;
+    f.trail.note_synthetic_move(f.now);
     f.trail.note_context(false);
     f.col = if f.n.is_multiple_of(2) {
         PONG_LO
@@ -380,6 +382,7 @@ fn arm_pingpong(f: &mut Fixture) {
 fn arm_dedup(f: &mut Fixture) {
     f.n += 1;
     f.now += f.dt;
+    f.trail.note_synthetic_move(f.now);
     f.trail.note_context(false);
     let j = DEDUP_J as u64;
     let steps_per_row = SERP_COLS / j;

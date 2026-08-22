@@ -29,6 +29,60 @@ pub enum AbsoluteRowUpdate {
     Invalidate,
 }
 
+/// SELECTION CUSTODY Phase 4 — WHERE this batch damaged content, in ABSOLUTE rows.
+///
+/// The thing it replaces: `content_scroll_delta = i32::MAX`, a sentinel meaning
+/// "some region op happened, kill the selection". It was applied backwards. A status
+/// bar scrolling rows 18-23 destroyed a highlight anchored at row -40 in scrollback,
+/// content it never touched — while a `\r` + EL progress bar rewrote the row UNDER a
+/// live highlight and left it in place, so a copy returned text the user never
+/// selected. Damage is a QUESTION ABOUT OVERLAP, and the sentinel could not express
+/// one.
+///
+/// Absolute rows are frame-invariant, so bands recorded at different points in one
+/// parser batch compose by hull-union with no ordering reasoning — that is what makes
+/// the composition sound. The lattice is `None ⊑ Band ⊑ All`, and `union` is monotone.
+///
+/// KNOWN IMPRECISION, deliberate: two disjoint bands in one batch hull-union into a
+/// band covering the gap between them, over-clearing a selection sitting strictly
+/// inside it. A set of bands is unbounded state on a hot path. This fails SAFE —
+/// over-clear, never a stale highlight over changed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionDamage {
+    /// Nothing in this batch replaced content a selection could be sitting on.
+    #[default]
+    None,
+    /// Absolute rows `lo_abs..=hi_abs` were moved or rewritten.
+    Band { lo_abs: u64, hi_abs: u64 },
+    /// The whole coordinate space is gone (ED 3, `clear_scrollback`, RIS, a Kitty
+    /// unscroll that renumbers history wholesale). No band can describe it.
+    All,
+}
+
+impl SelectionDamage {
+    /// Join on the lattice: hull for two bands, `All` absorbs, `None` is the unit.
+    #[must_use]
+    pub fn union(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::All, _) | (_, Self::All) => Self::All,
+            (Self::None, x) | (x, Self::None) => x,
+            (
+                Self::Band {
+                    lo_abs: a_lo,
+                    hi_abs: a_hi,
+                },
+                Self::Band {
+                    lo_abs: b_lo,
+                    hi_abs: b_hi,
+                },
+            ) => Self::Band {
+                lo_abs: a_lo.min(b_lo),
+                hi_abs: a_hi.max(b_hi),
+            },
+        }
+    }
+}
+
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct GridPresentationState {
@@ -46,6 +100,30 @@ pub struct GridPresentationState {
     /// Positive = content scrolled up by this many lines.
     /// `i32::MAX` = region scroll (forces selection clear).
     pub content_scroll_delta: i32,
+    /// SELECTION CUSTODY Phase 4: where this batch damaged content, in absolute
+    /// rows. Accumulated by `union` at each grid site, drained once per batch by
+    /// `take_selection_damage()`.
+    pub selection_damage: SelectionDamage,
+    /// Rows of downward shift the most recent resize applied to the viewport by
+    /// REVEALING retained history (a rows-grow). One-shot; drained by
+    /// `Terminal::finalize_resize`.
+    ///
+    /// `Grid::resize_with_reflow_mode` already follows this shift for the cursor and
+    /// the saved cursor — "every pre-resize viewport row now sits `revealed` rows
+    /// further down". The SELECTION needs the same compensation, and until Phase 3
+    /// narrowed `finalize_resize` it did not notice: the unconditional clear masked
+    /// it. With the clear gone, uncompensated anchors sit `revealed` rows above their
+    /// content, which is a WRONG-COPY path, not a cosmetic drift.
+    pub last_resize_row_shift: u16,
+    /// SELECTION CUSTODY Phase 4: whether this batch moved rows in a way that makes a
+    /// HOST's cached grid coordinates untranslatable.
+    ///
+    /// This was the `content_scroll_delta = i32::MAX` sentinel's SECOND job, and it is
+    /// a different question from the selection lattice above. The epoch asks "did
+    /// coordinates MOVE?"; the lattice asks "was CONTENT replaced?". A region scroll
+    /// is both. An EL or a DECERA is only the latter — it rewrites cells without
+    /// moving any row — which is why the two cannot be derived from one another.
+    pub coordinates_invalidated: bool,
     /// Pending logical-row insertion for durable absolute-row metadata.
     pub pending_absolute_row_update: Option<AbsoluteRowUpdate>,
     /// Independent copy retained until terminal post-processing remaps the
@@ -84,6 +162,9 @@ impl GridPresentationState {
             extras: CellExtras::new(),
             styles: StyleTable::kani_stub(),
             content_scroll_delta: 0,
+            selection_damage: SelectionDamage::None,
+            last_resize_row_shift: 0,
+            coordinates_invalidated: false,
             pending_absolute_row_update: None,
             pending_selection_row_update: None,
         }
@@ -94,6 +175,24 @@ impl GridPresentationState {
         let delta = self.content_scroll_delta;
         self.content_scroll_delta = 0;
         delta
+    }
+
+    /// Drain this batch's accumulated selection damage.
+    #[inline]
+    pub(crate) fn take_selection_damage(&mut self) -> SelectionDamage {
+        std::mem::take(&mut self.selection_damage)
+    }
+
+    /// Drain this batch's host-coordinate invalidation flag.
+    #[inline]
+    pub(crate) fn take_coordinates_invalidated(&mut self) -> bool {
+        std::mem::take(&mut self.coordinates_invalidated)
+    }
+
+    /// Drain the most recent resize's revealed-history row shift.
+    #[inline]
+    pub(crate) fn take_last_resize_row_shift(&mut self) -> u16 {
+        std::mem::take(&mut self.last_resize_row_shift)
     }
 
     /// Record a logical-row insertion, coalescing the consecutive form emitted

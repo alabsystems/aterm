@@ -231,6 +231,18 @@ pub(crate) trait AppRt {
     /// height) and after (content view height minus `contentLayoutRect` height,
     /// which correctly collapses to 0 in fullscreen). `0.0` off macOS and for
     /// chromeless windows.
+    ///
+    /// THIS SEAM IS THE *MEASURED* OS BAND, and stays that way. C3 gives Windows a
+    /// real WinUI-height tab band through the same `head` MECHANISM, but it is
+    /// deliberately NOT plumbed through here: the synthetic band's height is
+    /// `target − pad_top − tab_strip_rows·cell_h`, i.e. a function of the live
+    /// config and the window's cell box, and an `AppRt` has neither — it would have
+    /// to be handed the answer through a side channel and then hand it back, which
+    /// is a mailbox pretending to be a measurement. `App` derives it instead
+    /// (`App::synthetic_strip_head_px`) and writes the SAME
+    /// `WindowState::head_pts` this measurement writes, so everything downstream —
+    /// the resize law, the pointer mapping, the chrome bleed, the pixel band — sees
+    /// one band and cannot tell the two apart.
     fn titlebar_band_pts(&self, _window: &Window) -> f64 {
         0.0
     }

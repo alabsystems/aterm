@@ -4744,6 +4744,15 @@ pub fn validate_draft_asset_set(
     // to verify the download against.
     let dmg_sidecar = mirror::sha256_sidecar_name(&manifest.dmg);
     let zip_sidecar = manifest.zip.as_deref().map(mirror::sha256_sidecar_name);
+    // The Intel DMG rides on the manifest's say-so, exactly like the zip: a
+    // manifest naming a `dmg_x86_64` the draft does not carry would publish a
+    // head install.sh elects and then fails to download, and a draft carrying
+    // one the manifest never named would ship an asset no install can verify a
+    // digest for.
+    let x86_sidecar = manifest
+        .dmg_x86_64
+        .as_deref()
+        .map(mirror::sha256_sidecar_name);
     let mut exact_counts = vec![
         (manifest_out::MANIFEST_ASSET, 1usize),
         (
@@ -4762,6 +4771,12 @@ pub fn validate_draft_asset_set(
     if let Some(sidecar) = zip_sidecar.as_deref() {
         exact_counts.push((sidecar, 1usize));
     }
+    if let Some(x86) = manifest.dmg_x86_64.as_deref() {
+        exact_counts.push((x86, 1usize));
+    }
+    if let Some(sidecar) = x86_sidecar.as_deref() {
+        exact_counts.push((sidecar, 1usize));
+    }
     for (name, expected) in exact_counts {
         let observed = count(name);
         if observed != expected {
@@ -4770,15 +4785,20 @@ pub fn validate_draft_asset_set(
             )));
         }
     }
-    let dmgs: Vec<&str> = names
+    let mut dmgs: Vec<&str> = names
         .iter()
         .filter(|name| name.ends_with(".dmg"))
         .map(String::as_str)
         .collect();
-    if dmgs != [manifest.dmg.as_str()] {
+    dmgs.sort_unstable();
+    let mut expected_dmgs: Vec<&str> = std::iter::once(manifest.dmg.as_str())
+        .chain(manifest.dmg_x86_64.as_deref())
+        .collect();
+    expected_dmgs.sort_unstable();
+    if dmgs != expected_dmgs {
         return Err(Error::new(format!(
-            "draft artifact set has non-canonical DMG names {dmgs:?}; expected exactly {:?}",
-            manifest.dmg
+            "draft artifact set has non-canonical DMG names {dmgs:?}; expected exactly \
+             {expected_dmgs:?}"
         )));
     }
     let mut allowed = vec![
@@ -4791,6 +4811,12 @@ pub fn validate_draft_asset_set(
         allowed.push(zip);
     }
     if let Some(sidecar) = zip_sidecar.as_deref() {
+        allowed.push(sidecar);
+    }
+    if let Some(x86) = manifest.dmg_x86_64.as_deref() {
+        allowed.push(x86);
+    }
+    if let Some(sidecar) = x86_sidecar.as_deref() {
         allowed.push(sidecar);
     }
     if signature_required {
@@ -5517,6 +5543,17 @@ pub fn validate_live_release_identity(
             "published manifest names zip {zip:?}, expected exact {expected_zip:?}"
         )));
     }
+    // Same contract for the optional Intel DMG: a manifest that names one must
+    // name the canonical spelling — install.sh derives this exact string from
+    // the manifest's own `version` and refuses anything else.
+    let expected_x86 = mirror::dmg_x86_64_asset_name(expected.version);
+    if let Some(x86) = manifest.dmg_x86_64.as_deref()
+        && x86 != expected_x86
+    {
+        return Err(Error::new(format!(
+            "published manifest names Intel DMG {x86:?}, expected exact {expected_x86:?}"
+        )));
+    }
     match (signature_required, live_signature, signature_pubkey) {
         (true, Some(signature), Some(pubkey)) => {
             if local_signature != Some(signature) {
@@ -5738,6 +5775,34 @@ impl CutCtx {
                 &self.version,
             )))
     }
+    /// The Intel DMG variant in dist/ (`aterm-<v>-x86_64.dmg`) — exists only
+    /// on a per-arch split cut; every consumer asks the STAGED MANIFEST first
+    /// ([`Self::staged_manifest_dmg_x86_64`]) rather than probing the disk.
+    fn dmg_x86_64_path(&self) -> PathBuf {
+        self.dist.join(mirror::dmg_x86_64_asset_name(&self.version))
+    }
+    fn dmg_x86_64_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::dmg_x86_64_asset_name(
+                &self.version,
+            )))
+    }
+    /// Whether THIS cut carries an Intel DMG, read from the staged appcast in
+    /// dist/ — the manifest is the single authority for the asset set (the
+    /// draft "is judged by what it says about itself"), and reading it back
+    /// keeps resume and recovery consistent without a second journaled copy
+    /// that could drift.
+    ///
+    /// Best-effort by design: `None` when no manifest is staged yet (pre-build,
+    /// or a fixture ctx) or when it does not parse. That cannot ship a wrong
+    /// set silently — the remote exact-set gates (`validate_draft_asset_set`,
+    /// `validate_mirror_asset_set`) re-derive the requirement from the manifest
+    /// BYTES actually published and fail closed on any disagreement; this
+    /// helper only decides what the local lanes stage and demand.
+    fn staged_manifest_dmg_x86_64(&self) -> Option<String> {
+        let text = fs::read_to_string(self.manifest_path()).ok()?;
+        Manifest::parse(&text).ok()?.dmg_x86_64
+    }
     fn manifest_path(&self) -> PathBuf {
         self.dist.join(manifest_out::MANIFEST_ASSET)
     }
@@ -5946,6 +6011,7 @@ impl CutCtx {
             &self.version,
             self.signature_required,
             self.attaches_roster(),
+            self.staged_manifest_dmg_x86_64().is_some(),
         )
         .into_iter()
         .map(|name| self.dist.join(name))
@@ -5990,6 +6056,13 @@ impl CutCtx {
             self.manifest_path(),
             self.provenance_path(),
         ];
+        // The Intel DMG pair travels exactly when the staged manifest names it
+        // — same authority the draft gate judges the upload against, so the two
+        // cannot disagree about membership.
+        if self.staged_manifest_dmg_x86_64().is_some() {
+            files.push(self.dmg_x86_64_path());
+            files.push(self.dmg_x86_64_sha256_path());
+        }
         files.extend(self.roster_asset_paths());
         files
     }
@@ -6009,6 +6082,10 @@ impl CutCtx {
             self.zip_sha256_path(),
             self.provenance_path(),
         ];
+        if self.staged_manifest_dmg_x86_64().is_some() {
+            files.push(self.dmg_x86_64_path());
+            files.push(self.dmg_x86_64_sha256_path());
+        }
         if self.signature_required {
             files.push(self.manifest_path().with_extension("toml.sig"));
         }
@@ -7267,14 +7344,53 @@ fn recover_published_cut(
         &recovered_zip_sha256,
         &dist.join(&recovered_zip),
     )?;
+    // The Intel DMG, whenever the manifest names one — same digest-verified
+    // lane as the canonical DMG, so a recovered dist/ can satisfy
+    // required_asset_names() on a per-arch release. A name without a digest is
+    // a malformed release this cutter never produces: refuse rather than
+    // reconstruct an asset nothing can verify.
+    let recovered_x86 = match (
+        manifest.dmg_x86_64.as_deref(),
+        manifest.dmg_x86_64_sha256.as_deref(),
+    ) {
+        (Some(name), Some(sha)) => {
+            if !exact_asset_present(&names, name)? {
+                return Err(Error::new(format!(
+                    "published recovery release has no exact Intel DMG {name} its own \
+                     manifest names"
+                )));
+            }
+            verify_release_asset_digest_for_release_id_to(
+                slug,
+                release_object.id,
+                &tag,
+                name,
+                sha,
+                &dist.join(name),
+            )?;
+            Some((name.to_string(), sha.to_string()))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Error::new(
+                "published recovery release names an Intel DMG without its digest (or the \
+                 digest without the name); this cutter never produces that pair — finish \
+                 or retire it by hand",
+            ));
+        }
+    };
     // The `.sha256` sidecars are pure functions of the manifest digests just
     // proved against the downloaded bytes, so a recovery REGENERATES them
     // rather than downloading — the mirror step demands them from dist/ and a
     // release published before sidecars existed can still be recovered.
-    for (name, sha) in [
+    let mut sidecar_records = vec![
         (manifest.dmg.as_str(), manifest.sha256.as_str()),
         (recovered_zip.as_str(), recovered_zip_sha256.as_str()),
-    ] {
+    ];
+    if let Some((name, sha)) = &recovered_x86 {
+        sidecar_records.push((name.as_str(), sha.as_str()));
+    }
+    for (name, sha) in sidecar_records {
         let sidecar = mirror::sha256_sidecar_name(name);
         fs::write(
             dist.join(&sidecar),
@@ -8518,6 +8634,20 @@ pub trait Packager {
         notarized: bool,
         seeded: bool,
     ) -> Result<dmg::Packaged>;
+    /// The per-arch DMG lane (`dmg::create_arch_filtered`): restage the ONE
+    /// signed+notarized universal app with its sealed seed filtered to
+    /// `triple`'s artifacts, re-prove the filtered seed through the client
+    /// chain (`seedpack::ArchScope::Only`) and the codesign/Gatekeeper seal,
+    /// then image it. `notarized` decides whether the restage's spctl gate is
+    /// FATAL (notarized tier) or advisory (ad-hoc), exactly as for `zip`.
+    fn dmg_arch(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        triple: &str,
+        notarized: bool,
+    ) -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
 }
@@ -8539,6 +8669,16 @@ impl Packager for RealPackager {
     ) -> Result<dmg::Packaged> {
         dmg::create_zip(app, dist, version, notarized, seeded).map_err(Error::new)
     }
+    fn dmg_arch(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        triple: &str,
+        notarized: bool,
+    ) -> Result<dmg::Packaged> {
+        dmg::create_arch_filtered(app, dist, version, triple, notarized).map_err(Error::new)
+    }
     fn sha256(&self, path: &Path) -> Result<String> {
         dmg::sha256_file(path).map_err(Error::new)
     }
@@ -8557,6 +8697,12 @@ pub struct PackagedCut {
     /// The DMG size AFTER the hook, for the same reason.
     pub dmg_size: u64,
     pub zip: dmg::Packaged,
+    /// The INTEL DMG variant (`aterm-<v>-x86_64.dmg`) with its post-hook
+    /// digest and size — `Some` exactly when the cut's seed covers
+    /// `x86_64-apple-darwin` (the per-arch split lane). `None` reproduces
+    /// today's single-DMG behaviour byte-for-byte: a seedless or acknowledged
+    /// arm64-only cut emits one DMG and no `dmg_x86_64` manifest keys.
+    pub dmg_x86_64: Option<(dmg::Packaged, String, u64)>,
 }
 
 /// Notarize the bundle, build both containers around it, notarize the DMG, and
@@ -8583,6 +8729,11 @@ pub struct PackagedCut {
 /// On the inactive tier (the shipped one) both hooks do nothing, no re-hash
 /// happens, and this is `dmg::create` + `dmg::create_zip` with the digests they
 /// minted — byte-for-byte the pipeline as it has always run.
+// One extracted unit by design (the doc above: every line is sequenced against
+// a failure that produces a green cut and a broken artifact) — the two seed
+// facts pushed it to 8 parameters, and splitting it to satisfy the arity lint
+// would scatter exactly the ordering this function exists to hold together.
+#[allow(clippy::too_many_arguments)]
 pub fn notarize_and_package(
     app: &Path,
     dist: &Path,
@@ -8591,6 +8742,7 @@ pub fn notarize_and_package(
     tools: &dyn sign::AppleTools,
     pack: &dyn Packager,
     seeded: bool,
+    x86_split: bool,
 ) -> Result<PackagedCut> {
     // Said BEFORE the two notarization waits, and said HERE rather than in `sign.rs`,
     // which deliberately references nothing else in the crate so `tests/signconf.rs` can
@@ -8628,7 +8780,18 @@ pub fn notarize_and_package(
         );
     }
 
-    let dmg_out = pack.dmg(app, dist, version)?;
+    // THE CANONICAL DMG. On a per-arch split cut (`x86_split`, decided by the
+    // seed's own signed [[artifact]] coverage) the bare-named DMG is the
+    // ARM64-seeded restage — same signed app, seed filtered to the majority
+    // arch — because the deployed fleet binds the bare `aterm-<v>.dmg`
+    // spelling and the arm64 slice is what essentially every downloader runs.
+    // Otherwise it is `dmg::create`'s image of the app exactly as sealed:
+    // byte-for-byte today's pipeline.
+    let dmg_out = if x86_split {
+        pack.dmg_arch(app, dist, version, "aarch64-apple-darwin", notarized_app)?
+    } else {
+        pack.dmg(app, dist, version)?
+    };
     // THE hook. Inactive: returns false having done nothing. Active: Dev-ID
     // signs, preflights, notarizes and staples the DMG — and any failure in that
     // sequence propagates here and aborts the cut, because the manifest stamps
@@ -8649,6 +8812,22 @@ pub fn notarize_and_package(
     } else {
         (dmg_out.sha256.clone(), dmg_out.size_bytes)
     };
+    // THE INTEL DMG VARIANT — additive, same one-notarized-app restage lane,
+    // same hook, same re-hash rule. Built after the canonical DMG's hook so a
+    // failure there stops the cut before a second notarization wait is spent.
+    let dmg_x86_64 = if x86_split {
+        let x86_out = pack.dmg_arch(app, dist, version, "x86_64-apple-darwin", notarized_app)?;
+        let x86_notarized =
+            sign::sign_and_notarize_dmg(&x86_out.path, tier, tools).map_err(Error::new)?;
+        let (sha, size) = if x86_notarized {
+            (pack.sha256(&x86_out.path)?, pack.size(&x86_out.path)?)
+        } else {
+            (x86_out.sha256.clone(), x86_out.size_bytes)
+        };
+        Some((x86_out, sha, size))
+    } else {
+        None
+    };
     // The updater container, from the SAME signed — and, on the active tier,
     // already stapled — .app. It is built from the bundle rather than from the
     // DMG because `ditto` must archive the bundle directly to preserve its seal,
@@ -8664,6 +8843,7 @@ pub fn notarize_and_package(
         dmg_sha256,
         dmg_size,
         zip,
+        dmg_x86_64,
     })
 }
 
@@ -8819,11 +8999,22 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // load-bearing and none of it is observable from a green cut. See
     // `notarize_and_package`; its ordering and its fail-closed propagation are
     // proved offline in tests/apple_tier.rs.
+    // Per-arch DMG split iff the SEALED seed's signed [[artifact]] rows cover
+    // x86_64-apple-darwin (SeedStat.targets — derived from PRESENT artifacts,
+    // never from rows alone). A seedless cut or an acknowledged arm64-only
+    // seal (`ATERM_SEED_ARCH_ACK=1`, which implies no x86 coverage) takes the
+    // single-DMG lane, byte-for-byte today's behaviour, and emits no
+    // `dmg_x86_64` manifest keys.
+    let x86_split = spec
+        .seed
+        .as_ref()
+        .is_some_and(|s| s.targets.contains("x86_64-apple-darwin"));
     let PackagedCut {
         dmg: dout,
         dmg_sha256: dmg_sha,
         dmg_size,
         zip: zout,
+        dmg_x86_64,
     } = notarize_and_package(
         &app,
         &ctx.dist,
@@ -8832,12 +9023,27 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         &sign::RealAppleTools,
         &RealPackager,
         spec.seed.is_some(),
+        x86_split,
     )?;
+    // BOTH DMGs must clear the client's own download bound before anything is
+    // hashed into a manifest: the fat dual-arch DMG reached 97.3% of the 2 GiB
+    // `RELEASE_ASSET_DOWNLOAD_BOUND` on v0.46.0, and a cut that seals past it
+    // publishes a release no client can download. (The split itself is the
+    // durable headroom — the arm64 DMG measured 54.1% of the bound.)
+    validate_release_asset_download_size(dmg_size)?;
+    if let Some((_, _, x86_size)) = &dmg_x86_64 {
+        validate_release_asset_download_size(*x86_size)?;
+    }
     // The stable download twin (`aterm.dmg`) is copied only HERE, after
     // `notarize_and_package` has produced the FINAL DMG bytes (codesign/staple
     // rewrites included), so the twin is byte-identical to the bytes dmg_sha
     // covers. required_asset_names() lists it, so the mirror uploads it and
-    // refuses a channel head without it.
+    // refuses a channel head without it. On a per-arch cut the twin stays a
+    // byte copy of manifest.dmg — the CANONICAL (arm64, majority-arch) DMG —
+    // so the alab.systems Download button and every printed/bookmarked
+    // `releases/latest/download/aterm.dmg` link keep working unchanged; an
+    // Intel visitor is routed by install.sh (or the release notes), never by
+    // this URL.
     let stable_dmg = ctx.dist.join(mirror::stable_dmg_asset_name());
     fs::copy(&dout.path, &stable_dmg).map_err(|e| {
         Error::new(format!(
@@ -8883,6 +9089,18 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             &dmg_sha[..12.min(dmg_sha.len())]
         ),
     );
+    if let Some((x86_out, x86_sha, x86_size)) = &dmg_x86_64 {
+        step(
+            "",
+            &format!(
+                "{} ({:.1} MB)  sha256 {}… — Intel batteries-included variant \
+                 (x86_64-filtered seed, same notarized app)",
+                x86_out.path.display(),
+                *x86_size as f64 / 1_000_000.0,
+                &x86_sha[..12.min(x86_sha.len())]
+            ),
+        );
+    }
     step(
         "zip",
         &format!(
@@ -8897,7 +9115,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // Linux tarball's. The DMG is the manual download and its digest otherwise
     // lives only inside the appcast TOML no human opens; these two ~99-byte
     // assets are what the release notes' verify instruction points at.
-    for (path, sha, name) in [
+    let mut sidecars = vec![
         (
             ctx.dmg_sha256_path(),
             dmg_sha.as_str(),
@@ -8908,7 +9126,15 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             zout.sha256.as_str(),
             mirror::zip_asset_name(&ctx.version),
         ),
-    ] {
+    ];
+    if let Some((_, x86_sha, _)) = &dmg_x86_64 {
+        sidecars.push((
+            ctx.dmg_x86_64_sha256_path(),
+            x86_sha.as_str(),
+            mirror::dmg_x86_64_asset_name(&ctx.version),
+        ));
+    }
+    for (path, sha, name) in sidecars {
         fs::write(&path, mirror::sha256_sidecar_contents(sha, &name))
             .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     }
@@ -8923,7 +9149,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // address a machine that already runs aterm.
     fs::write(
         ctx.notes_path(),
-        changelog::release_notes_document(&ctx.version, &body),
+        changelog::release_notes_document(&ctx.version, &body, dmg_x86_64.is_some()),
     )
     .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
 
@@ -8931,6 +9157,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
     let min_os = manifest_out::plist_string(&plist_text, "LSMinimumSystemVersion")
         .unwrap_or_else(|| "11.0".to_string());
+    let x86_name = mirror::dmg_x86_64_asset_name(&ctx.version);
     let inputs = manifest_out::ManifestInputs {
         version: &ctx.version,
         build_number: ctx.build,
@@ -8943,6 +9170,12 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         // `create_zip` runs AFTER the staple and hashes the bytes it writes, so
         // this digest already covers them.
         zip_sha256: &zout.sha256,
+        // Present exactly when the seed's signed rows cover x86_64-apple-darwin
+        // (the split above): the manifest is the single authority every later
+        // gate (draft asset set, mirror set, recovery, install.sh's election)
+        // derives the pair from. Absent keys = the pre-pair wire bytes.
+        dmg_x86_64_name: dmg_x86_64.as_ref().map(|_| x86_name.as_str()),
+        dmg_x86_64_sha256: dmg_x86_64.as_ref().map(|(_, sha, _)| sha.as_str()),
         // The manifest's `url` must name the repository a reader can actually
         // fetch from. These same bytes ride BOTH the private release and the
         // mirrored public one, and only the public channel is readable without
@@ -9271,6 +9504,41 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         }
     };
 
+    // The Intel DMG, when this cut's manifest names one: same in-process
+    // re-hash proof as the canonical DMG — a per-arch release must never ship a
+    // variant whose digest record and bytes disagree. The name is bound to the
+    // canonical spelling here (install.sh re-derives it from `version` and
+    // refuses anything else), and a named-but-missing file is a hard stop: the
+    // manifest is a promise about this draft's asset set.
+    let x86_pair = match (
+        manifest.dmg_x86_64.as_deref(),
+        manifest.dmg_x86_64_sha256.as_deref(),
+    ) {
+        (Some(name), Some(expected)) => {
+            let canonical = mirror::dmg_x86_64_asset_name(&ctx.version);
+            if name != canonical {
+                return Err(Error::new(format!(
+                    "self-check failed: manifest names Intel DMG {name:?}, expected \
+                     {canonical:?}"
+                )));
+            }
+            let sha = dmg::sha256_file(&ctx.dmg_x86_64_path())?;
+            if !sha.eq_ignore_ascii_case(expected) {
+                return Err(Error::new(format!(
+                    "self-check failed: Intel DMG sha256 {sha} != manifest {expected}"
+                )));
+            }
+            Some((canonical, expected.to_string()))
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Error::new(
+                "self-check failed: manifest carries an Intel DMG name without its digest \
+                 (or the digest without the name) — the pair ships together or not at all",
+            ));
+        }
+    };
+
     // The `.sha256` sidecars on disk must state EXACTLY the digests the manifest
     // does — dist/ is mutable and a resume skips `step_build`, so a stale sidecar
     // from an earlier attempt would ship a verification record that fails against
@@ -9282,14 +9550,18 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     // of digests the manifest already binds, so they are regenerated here the
     // same way `recover_published_cut` reconstructs them for old releases —
     // refusing would strand every journal written before sidecars existed.
-    for (path, sha, name) in [
+    let mut sidecar_checks = vec![
         (
             ctx.dmg_sha256_path(),
             manifest.sha256.as_str(),
             manifest.dmg.as_str(),
         ),
         (ctx.zip_sha256_path(), zip_sha256.as_str(), zip_name.as_str()),
-    ] {
+    ];
+    if let Some((name, sha)) = &x86_pair {
+        sidecar_checks.push((ctx.dmg_x86_64_sha256_path(), sha.as_str(), name.as_str()));
+    }
+    for (path, sha, name) in sidecar_checks {
         let expected = mirror::sha256_sidecar_contents(sha, name);
         if !path.exists() {
             fs::write(&path, &expected)
@@ -10729,9 +11001,12 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         .chars()
         .filter(|c| !c.is_whitespace())
         .collect();
-    for name in
-        mirror::required_asset_names(&ctx.version, ctx.signature_required, ctx.attaches_roster())
-    {
+    for name in mirror::required_asset_names(
+        &ctx.version,
+        ctx.signature_required,
+        ctx.attaches_roster(),
+        ctx.staged_manifest_dmg_x86_64().is_some(),
+    ) {
         if !body.contains(&format!("\"name\":\"{name}\"")) {
             return Err(Error::new(format!(
                 "the anonymous view of {slug} {} does not list the required asset \
@@ -10909,6 +11184,7 @@ fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
+        ctx.staged_manifest_dmg_x86_64().is_some(),
     )?;
     for file in ctx.mirror_asset_paths() {
         let name = file
@@ -10947,6 +11223,7 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         &ctx.version,
         ctx.signature_required,
         ctx.attaches_roster(),
+        ctx.staged_manifest_dmg_x86_64().is_some(),
     )?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
@@ -11417,6 +11694,8 @@ mod roster_wiring_tests {
             dmg_sha256: &"ab".repeat(32),
             zip_name: "aterm-0.5.0-mac.zip",
             zip_sha256: &"cd".repeat(32),
+            dmg_x86_64_name: None,
+            dmg_x86_64_sha256: None,
             repo_slug: "owner/repo",
             min_os: "11.0",
             team_id: "",
@@ -11513,6 +11792,8 @@ mod roster_wiring_tests {
             dmg_sha256: &"ab".repeat(32),
             zip_name: "aterm-0.5.0-mac.zip",
             zip_sha256: &"cd".repeat(32),
+            dmg_x86_64_name: None,
+            dmg_x86_64_sha256: None,
             repo_slug: "owner/repo",
             min_os: "11.0",
             team_id: "",

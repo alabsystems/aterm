@@ -533,12 +533,96 @@ pub const EYE_RAMP: [u32; 16] = [
 
 const CATCH_LIGHT: u32 = 0x00FF_FFFF;
 
+// Cursor-head reflection LOD. The authored catch-light remains the primary art
+// direction; these device-sized passes make it survive the ~31 px settings/
+// shipping bake and add one quiet lower echo. Large heads stay restrained by
+// the radius ceilings, while truly tiny word cats keep their authored pixels.
+const OPEN_EYE_REFLECTION_MIN_PX: f32 = 3.0;
+/// Authored eyes flatter than this are arcs/lids, not open pupils. Keep their
+/// existing catch-light art, but never synthesize a glossy pupil pass over it.
+const OPEN_EYE_SHALLOW_ASPECT: f32 = 0.6;
+const OPEN_EYE_PRIMARY_FRAC: f32 = 0.17;
+const OPEN_EYE_PRIMARY_MIN_RADIUS_PX: f32 = 0.62;
+const OPEN_EYE_PRIMARY_MAX_RADIUS_PX: f32 = 1.08;
+const OPEN_EYE_ECHO_MIN_PX: f32 = 4.5;
+const OPEN_EYE_ECHO_FRAC: f32 = 0.075;
+// A pixel-centred 4x4 sample's far corner is ~0.53 px away. Clearing that
+// distance gives the echo one genuinely pale centre texel instead of four
+// weak gray flecks, while the ceiling keeps it subordinate at large sizes.
+const OPEN_EYE_ECHO_MIN_RADIUS_PX: f32 = 0.55;
+const OPEN_EYE_ECHO_MAX_RADIUS_PX: f32 = 0.72;
+
 fn rgb(hex: u32) -> (f32, f32, f32) {
     (
         ((hex >> 16) & 0xff) as f32 / 255.0,
         ((hex >> 8) & 0xff) as f32 / 255.0,
         (hex & 0xff) as f32 / 255.0,
     )
+}
+
+/// Paint a supersampled reflection disc, but only over an already-opaque dark
+/// eye texel covered by `eye_mask`. This is the hard containment seam shared by
+/// the flying head and resident pet: a reflection can replace dark eye/pupil
+/// ink, never a dark coat or outline merely because it happens to share the
+/// same colour range. The differential tests independently rasterize the eye
+/// geometry and prove every changed texel has coverage, including anti-aliased
+/// boundary texels.
+pub(crate) fn paint_dark_masked_disc(
+    tile: &mut Tile,
+    eye_mask: &Tile,
+    cx: f32,
+    cy: f32,
+    r: f32,
+    col: (f32, f32, f32),
+    alpha: f32,
+) {
+    if r <= 0.0 || alpha <= 0.0 {
+        return;
+    }
+    debug_assert_eq!(tile.width(), eye_mask.width());
+    debug_assert_eq!(tile.height(), eye_mask.height());
+    // Catch-lights this small are visual punctuation, not soft shading. Snap
+    // their centre to a device pixel so the 4x4 coverage pass leaves one crisp
+    // high point instead of distributing the same energy over four gray
+    // pixels. The dark-eye destination mask below still provides the hard
+    // silhouette boundary.
+    let cx = cx.floor() + 0.5;
+    let cy = cy.floor() + 0.5;
+    let rr = r * r;
+    let x0 = ((cx - r) as i32).saturating_sub(1).max(0);
+    let y0 = ((cy - r) as i32).saturating_sub(1).max(0);
+    let x1 = ((cx + r) as i32).saturating_add(2).min(tile.width() as i32);
+    let y1 = ((cy + r) as i32)
+        .saturating_add(2)
+        .min(tile.height() as i32);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let i = ((y as u32 * tile.width() + x as u32) * 4) as usize;
+            let covered_by_eye = eye_mask.pixels().get(i..i + 4).is_some_and(|p| p[3] != 0);
+            let dark_eye = covered_by_eye
+                && tile
+                    .pixels()
+                    .get(i..i + 4)
+                    .is_some_and(|p| p[3] == 255 && p[..3].iter().all(|&c| c < 96));
+            if !dark_eye {
+                continue;
+            }
+            let mut hit = 0u32;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let fx = x as f32 + (sx as f32 + 0.5) * 0.25;
+                    let fy = y as f32 + (sy as f32 + 0.5) * 0.25;
+                    let (dx, dy) = (fx - cx, fy - cy);
+                    if dx * dx + dy * dy <= rr {
+                        hit = hit.saturating_add(1);
+                    }
+                }
+            }
+            if hit > 0 {
+                tile.over(x, y, col, alpha * hit as f32 / 16.0);
+            }
+        }
+    }
 }
 
 // ═══════════════════════════ cat-art v4 bake path ═══════════════════════════
@@ -902,8 +986,9 @@ fn accessory_transform(acc: CatGlyphId, w: u32, h: u32) -> PathTransform {
 /// v4 §2 blink/expression bake axis: the eye state baked into a cursor-cat tile.
 /// A pure frame-selection input (not per-pixel work) — the animating cursor cat
 /// ([`crate::kitty_cursor::CursorCat`]) blinks and squints by selecting a distinct
-/// `eyes` value, which bakes a distinct (but cache-cheap) tile. `Open` is the
-/// authored art verbatim, so every existing bake and word-cat stays byte-exact.
+/// `eyes` value, which bakes a distinct (but cache-cheap) tile. `Open` keeps the
+/// authored eye geometry and primary catch-light, then adds a resolution-aware
+/// glossy finish at shipping sizes; expression geometry stays authored.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum EyesFrame {
     /// Eyes as authored (round button eyes / open arcs).
@@ -957,6 +1042,134 @@ fn layer_eye_line(layer: &Layer) -> Option<f32> {
     seen.then(|| (f32::from(lo) + f32::from(hi)) * 0.5 / f32::from(FIXED_ONE))
 }
 
+/// Normalized control-hull bounds of one authored path. Bézier curves remain
+/// inside their control hull, so this can overestimate an eye by a fraction but
+/// can never put a reflection outside geometry the path could occupy.
+fn path_bounds(path: &[PathSeg]) -> Option<(f32, f32, f32, f32)> {
+    let (mut x0, mut y0, mut x1, mut y1) = (u16::MAX, u16::MAX, 0u16, 0u16);
+    let mut seen = false;
+    let mut take = |x: u16, y: u16| {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+        seen = true;
+    };
+    for seg in path {
+        match *seg {
+            PathSeg::Move(x, y) | PathSeg::Line(x, y) => take(x, y),
+            PathSeg::Cubic(ax, ay, bx, by, x, y) => {
+                take(ax, ay);
+                take(bx, by);
+                take(x, y);
+            }
+            PathSeg::Close => {}
+        }
+    }
+    let norm = |v: u16| f32::from(v) / f32::from(FIXED_ONE);
+    seen.then(|| (norm(x0), norm(y0), norm(x1), norm(y1)))
+}
+
+/// Pair one authored catch-light centre with its closest authored eye path.
+/// Returning the path index lets the roster-wide differential test use the
+/// exact same ownership decision as the production painter.
+fn closest_eye_path(eyes: &Layer, pcx: f32, pcy: f32) -> Option<(usize, (f32, f32, f32, f32))> {
+    eyes.paths
+        .iter()
+        .enumerate()
+        .filter_map(|(index, eye)| path_bounds(eye).map(|bounds| (index, bounds)))
+        .min_by(|(_, a), (_, b)| {
+            let distance = |bounds: &(f32, f32, f32, f32)| {
+                let (x0, y0, x1, y1) = *bounds;
+                let (x, y) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+                (x - pcx).mul_add(x - pcx, (y - pcy) * (y - pcy))
+            };
+            distance(a).total_cmp(&distance(b))
+        })
+}
+
+fn open_eye_reflection_eligible(bounds: (f32, f32, f32, f32), xform: PathTransform) -> bool {
+    let (ex0, ey0, ex1, ey1) = bounds;
+    let eye_w = (ex1 - ex0) * xform.scale_x;
+    let eye_h = (ey1 - ey0) * xform.scale_y;
+    eye_w.min(eye_h) >= OPEN_EYE_REFLECTION_MIN_PX
+        && !(eye_w > 0.0 && eye_h < OPEN_EYE_SHALLOW_ASPECT * eye_w)
+}
+
+/// Reinforce the authored upper catch-light and add a smaller lower-right echo
+/// to each genuinely open eye. Each catch-light is paired to the nearest eye,
+/// so asymmetric/winking heads do not depend on two independently-authored path
+/// lists having identical ordering. A head without authored catch-lights opts
+/// out: its blank/closed expression stays exactly as the artist drew it.
+fn paint_open_eye_reflections(tile: &mut Tile, layers: &[Layer], xform: PathTransform) {
+    let Some(eyes) = layers.iter().find(|layer| layer.role == GlyphRole::Eye) else {
+        return;
+    };
+    let Some(catch_lights) = layers
+        .iter()
+        .find(|layer| layer.role == GlyphRole::CatchLight)
+    else {
+        return;
+    };
+    let mut eye_mask = Tile::new(tile.width(), tile.height());
+    fill_path_fixed(&mut eye_mask, eyes.paths, (0.0, 0.0, 0.0), 1.0, xform);
+
+    for catch_light in catch_lights.paths {
+        let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_light) else {
+            continue;
+        };
+        let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
+        let Some((_, eye_bounds)) = closest_eye_path(eyes, pcx, pcy) else {
+            continue;
+        };
+        if !open_eye_reflection_eligible(eye_bounds, xform) {
+            continue;
+        }
+        let (ex0, ey0, ex1, ey1) = eye_bounds;
+        let eye_w = (ex1 - ex0) * xform.scale_x;
+        let eye_h = (ey1 - ey0) * xform.scale_y;
+        let minor = eye_w.min(eye_h);
+
+        // Keep the primary exactly where the authored catch-light put it, but
+        // give it a device-pixel floor so 4×4 coverage cannot gray it away.
+        let primary_r = (minor * OPEN_EYE_PRIMARY_FRAC).clamp(
+            OPEN_EYE_PRIMARY_MIN_RADIUS_PX,
+            OPEN_EYE_PRIMARY_MAX_RADIUS_PX,
+        );
+        paint_dark_masked_disc(
+            tile,
+            &eye_mask,
+            xform.dx + pcx * xform.scale_x,
+            xform.dy + pcy * xform.scale_y,
+            primary_r,
+            rgb(CATCH_LIGHT),
+            1.0,
+        );
+
+        if minor >= OPEN_EYE_ECHO_MIN_PX {
+            let echo_r = (minor * OPEN_EYE_ECHO_FRAC)
+                .clamp(OPEN_EYE_ECHO_MIN_RADIUS_PX, OPEN_EYE_ECHO_MAX_RADIUS_PX);
+            let (ecx, ecy) = ((ex0 + ex1) * 0.5, (ey0 + ey1) * 0.5);
+            // Continue the authored primary→eye-centre ray just past the
+            // centre. This lands in the lower pupil, unlike a percentage of
+            // the whole aperture (which can land out in the coloured iris).
+            let echo_x = (pcx + 1.55 * (ecx - pcx))
+                .clamp(ex0 + 0.25 * (ex1 - ex0), ex1 - 0.25 * (ex1 - ex0));
+            let echo_y = (pcy + 1.55 * (ecy - pcy))
+                .clamp(ey0 + 0.25 * (ey1 - ey0), ey1 - 0.25 * (ey1 - ey0));
+            paint_dark_masked_disc(
+                tile,
+                &eye_mask,
+                xform.dx + echo_x * xform.scale_x,
+                xform.dy + echo_y * xform.scale_y,
+                echo_r,
+                (1.0, 0.95, 0.98),
+                0.72,
+            );
+        }
+    }
+}
+
 /// Fill every layer of `GLYPHS[id]` in painter order through `xform`, resolving each
 /// layer's colour with [`resolve_layer`]. `eyes` selects a blink/squint frame: the
 /// eye family is squashed toward the shared eye line, and a full blink drops the
@@ -967,6 +1180,7 @@ fn paint_glyph(
     fills: &ResolvedFills,
     xform: PathTransform,
     eyes: EyesFrame,
+    reflections: bool,
 ) {
     let def = &GLYPHS[id as usize];
     let coat_recolored = def
@@ -1035,6 +1249,9 @@ fn paint_glyph(
         }
         fill_path_fixed(tile, layer.paths, col, alpha, lxform);
     }
+    if reflections && matches!(eyes, EyesFrame::Open) {
+        paint_open_eye_reflections(tile, def.layers, xform);
+    }
 }
 
 /// v4 §2: bake one authored glyph variant to an exact-size RGBA [`Tile`]. The glyph's
@@ -1066,7 +1283,7 @@ pub fn bake_variant_with(
         return tile;
     }
     // Base variant: its 0..1 frame fills the w×h art box at the tile origin.
-    paint_glyph(&mut tile, id, fills, PathTransform::fit(w, h), eyes);
+    paint_glyph(&mut tile, id, fills, PathTransform::fit(w, h), eyes, true);
     // Overlay accessory: map its own frame into a scaled box centred on the attach
     // point (its centre 0.5,0.5 lands on (cx·w, cy·h)) while preserving the
     // accessory's authored viewbox aspect. An accessory carries no eye family, so
@@ -1078,6 +1295,7 @@ pub fn bake_variant_with(
             fills,
             accessory_transform(acc, w, h),
             EyesFrame::Open,
+            true,
         );
     }
     // §2 gaze catch-light: a small white dot baked into the reserved PATCH_STRIP at
@@ -1221,6 +1439,7 @@ impl CatBakerV4 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cat_glyphs_gen::GLYPH_IDS;
 
     // ───────────── CatBaker LRU / atlas structural tests (v4 keys) ─────────────
 
@@ -1493,6 +1712,33 @@ mod tests {
 
     fn fills(coat: u8, iris: u8, dark: bool) -> ResolvedFills {
         ResolvedFills::from_indices(coat, iris, dark)
+    }
+
+    /// Test-only negative-control bake: identical art + patch-strip path, with
+    /// the new reflection pass selectable so a pixel diff isolates that pass.
+    fn bake_reflection_control(
+        id: CatGlyphId,
+        fills: &ResolvedFills,
+        w: u32,
+        h: u32,
+        eyes: EyesFrame,
+        reflections: bool,
+    ) -> Tile {
+        let mut tile = Tile::new(w + u32::from(PATCH_STRIP), h);
+        if w == 0 || h == 0 {
+            return tile;
+        }
+        paint_glyph(
+            &mut tile,
+            id,
+            fills,
+            PathTransform::fit(w, h),
+            eyes,
+            reflections,
+        );
+        let r = f32::from(PATCH_STRIP) * 0.5;
+        tile.disc(w as f32 + r, r, r.max(1.0), rgb(CATCH_LIGHT), 1.0);
+        tile
     }
 
     /// v4 §7: same key ⇒ byte-identical bake, across independent calls and a fresh
@@ -1947,9 +2193,9 @@ mod tests {
     }
 
     /// The blink/squint axis bakes distinct tiles (open ≠ happy ≠ blink) while
-    /// `Open` is byte-identical to the plain authored bake, and each `eyes` value
-    /// is a distinct BakeKeyV4 (its own cache slot) so a live blink never aliases
-    /// the open cat.
+    /// `Open` is byte-identical to the default open bake (authored geometry plus
+    /// its bounded glossy finish), and each `eyes` value is a distinct BakeKeyV4
+    /// (its own cache slot) so a live blink never aliases the open cat.
     #[test]
     fn eyes_frame_bakes_distinct_but_open_is_authored() {
         let f = fills(5, 3, false);
@@ -1957,7 +2203,7 @@ mod tests {
         let happy = bake_variant_with(CatGlyphId::S100, None, &f, 96, 64, EyesFrame::Happy);
         let blink = bake_variant_with(CatGlyphId::S100, None, &f, 96, 64, EyesFrame::Blink);
         let plain = bake_variant(CatGlyphId::S100, &f, 96, 64);
-        assert_eq!(open.pixels(), plain.pixels(), "Open == authored art");
+        assert_eq!(open.pixels(), plain.pixels(), "Open == default open bake");
         assert_ne!(open.pixels(), happy.pixels(), "a squint changes texels");
         assert_ne!(open.pixels(), blink.pixels(), "a blink changes texels");
         assert_ne!(happy.pixels(), blink.pixels(), "squint and blink differ");
@@ -1983,6 +2229,298 @@ mod tests {
         cache.begin_frame();
         cache.get(&winking).expect("bake blink");
         assert_eq!(cache.len(), 2, "open and blink occupy distinct slots");
+    }
+
+    /// Exact settings-preview size (18 px cell × 1.70 rows ≈ 31 px): the
+    /// glossy pass must visibly change the default flying head, and every one
+    /// of those changes must replace a fully-opaque dark texel inside the
+    /// authored eye silhouette. Most of the original dark eye/pupil pixels must
+    /// remain. Happy, blink, and an authored shallow-eye head are byte-identical
+    /// with the pass toggled, proving no floating reflections land on closures.
+    #[test]
+    fn flying_cursor_reflections_are_contained_and_expression_aware() {
+        const W: u32 = 38;
+        const H: u32 = 31;
+        let fills = fills(8, 4, false);
+        let plain = bake_reflection_control(CatGlyphId::S100, &fills, W, H, EyesFrame::Open, false);
+        let glossy = bake_reflection_control(CatGlyphId::S100, &fills, W, H, EyesFrame::Open, true);
+        let eye_layer = GLYPHS[CatGlyphId::S100 as usize]
+            .layers
+            .iter()
+            .find(|layer| layer.role == GlyphRole::Eye)
+            .expect("default head authors eyes");
+        let xform = PathTransform::fit(W, H);
+        let mut eye_mask = Tile::new(W, H);
+        fill_path_fixed(&mut eye_mask, eye_layer.paths, (0.0, 0.0, 0.0), 1.0, xform);
+
+        let changed: Vec<(usize, &[u8; 4], &[u8; 4])> = plain
+            .pixels()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(glossy.pixels().as_chunks::<4>().0)
+            .enumerate()
+            .filter_map(|(i, (a, b))| {
+                (i % (plain.width() as usize) < W as usize && a != b).then_some((i, a, b))
+            })
+            .collect();
+        assert!(
+            !changed.is_empty(),
+            "the exact settings-preview bake must gain visible reflection texels"
+        );
+        assert!(
+            changed
+                .iter()
+                .any(|(_, _, after)| after[..3].iter().all(|&c| c >= 160)),
+            "the reflection diff must contain a visibly pale texel"
+        );
+        for &(i, before, _) in &changed {
+            let x = i % plain.width() as usize;
+            let y = i / plain.width() as usize;
+            let mi = (y * W as usize + x) * 4;
+            let mask = &eye_mask.pixels()[mi..mi + 4];
+            assert_ne!(
+                mask[3], 0,
+                "changed texel ({x},{y}) left the authored eye footprint"
+            );
+            assert!(
+                before[3] == 255 && before[..3].iter().all(|&c| c < 96),
+                "changed texel ({x},{y}) was not dark eye/pupil ink: {before:?}"
+            );
+        }
+
+        for path in eye_layer.paths {
+            let (x0, y0, x1, y1) = path_bounds(path).expect("eye path has bounds");
+            let x0 = (x0 * W as f32).floor().max(0.0) as usize;
+            let y0 = (y0 * H as f32).floor().max(0.0) as usize;
+            let x1 = (x1 * W as f32).ceil().min(W as f32) as usize;
+            let y1 = (y1 * H as f32).ceil().min(H as f32) as usize;
+            let dark_count = |tile: &Tile| {
+                (y0..y1)
+                    .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        let i = (y * tile.width() as usize + x) * 4;
+                        let p = &tile.pixels()[i..i + 4];
+                        p[3] == 255 && p[..3].iter().all(|&c| c < 96)
+                    })
+                    .count()
+            };
+            let before = dark_count(&plain);
+            let after = dark_count(&glossy);
+            assert!(before >= 4, "fixture eye has too little dark ink: {before}");
+            assert!(
+                after >= 2 && after * 2 >= before,
+                "reflection consumed the eye core: before={before}, after={after}"
+            );
+        }
+
+        for state in [EyesFrame::Happy, EyesFrame::Blink] {
+            let without = bake_reflection_control(CatGlyphId::S100, &fills, W, H, state, false);
+            let with = bake_reflection_control(CatGlyphId::S100, &fills, W, H, state, true);
+            assert_eq!(
+                without.pixels(),
+                with.pixels(),
+                "{state:?} must never receive open-eye reflections"
+            );
+        }
+        // Use a large bake so the shallow-expression assertion exercises the
+        // aspect gate itself, rather than passing incidentally through the
+        // tiny-eye size floor.
+        const SHALLOW_H: u32 = 120;
+        let shallow_w =
+            (f32::from(GLYPHS[CatGlyphId::S101 as usize].aspect_x1000) * SHALLOW_H as f32 / 1000.0)
+                .round() as u32;
+        let shallow_plain = bake_reflection_control(
+            CatGlyphId::S101,
+            &fills,
+            shallow_w,
+            SHALLOW_H,
+            EyesFrame::Open,
+            false,
+        );
+        let shallow_glossy = bake_reflection_control(
+            CatGlyphId::S101,
+            &fills,
+            shallow_w,
+            SHALLOW_H,
+            EyesFrame::Open,
+            true,
+        );
+        assert_eq!(
+            shallow_plain.pixels(),
+            shallow_glossy.pixels(),
+            "authored shallow eyes must not gain reflections"
+        );
+    }
+
+    /// The glossy pass sits in the generic v4 baker, so its safety proof must
+    /// cover the generic authored roster rather than only the default S100
+    /// preview. Sweep tiny word-cat, settings-preview, enlarged cursor and
+    /// reference-art sizes on both grounds. Every changed texel must belong to
+    /// the exact authored path production paired with a catch-light, every eye
+    /// the pass actually affects is checked independently, and at least half
+    /// of its dark pupil/core must remain. Glyphs with no eligible open eye
+    /// must remain byte-identical when the pass is toggled. Non-vacuity is
+    /// pinned to both the settings-preview head and the live cursor's authored
+    /// tongue-out/oops expression; several authored heads already paint the entire
+    /// candidate glint area white and are intentionally byte-identical under
+    /// reinforcement.
+    #[test]
+    fn flying_reflection_roster_is_contained_and_nonvacuous() {
+        let mut failures = Vec::new();
+        let mut eligible = 0usize;
+        let mut exercised = 0usize;
+        let mut preview_exercised = false;
+        let mut live_expression_exercised = false;
+        for &id in GLYPH_IDS {
+            let def = &GLYPHS[id as usize];
+            for h in [16u32, 26, 31, 48, 120] {
+                let w = (h as f32 * f32::from(def.aspect_x1000) / 1000.0)
+                    .round()
+                    .max(1.0) as u32;
+                let xform = PathTransform::fit(w, h);
+                let mut eligible_indices = Vec::new();
+                if let (Some(eyes), Some(catch_lights)) = (
+                    def.layers.iter().find(|layer| layer.role == GlyphRole::Eye),
+                    def.layers
+                        .iter()
+                        .find(|layer| layer.role == GlyphRole::CatchLight),
+                ) {
+                    for catch_light in catch_lights.paths {
+                        let Some((cx0, cy0, cx1, cy1)) = path_bounds(catch_light) else {
+                            continue;
+                        };
+                        let (pcx, pcy) = ((cx0 + cx1) * 0.5, (cy0 + cy1) * 0.5);
+                        let Some((eye, bounds)) = closest_eye_path(eyes, pcx, pcy) else {
+                            continue;
+                        };
+                        if open_eye_reflection_eligible(bounds, xform)
+                            && !eligible_indices.contains(&eye)
+                        {
+                            eligible_indices.push(eye);
+                        }
+                    }
+                }
+
+                let mut eligible_masks = Vec::new();
+                if let Some(eyes) = def.layers.iter().find(|layer| layer.role == GlyphRole::Eye) {
+                    for &eye in &eligible_indices {
+                        let mut mask = Tile::new(w, h);
+                        fill_path_fixed(
+                            &mut mask,
+                            std::slice::from_ref(&eyes.paths[eye]),
+                            (0.0, 0.0, 0.0),
+                            1.0,
+                            xform,
+                        );
+                        eligible_masks.push((eye, mask));
+                    }
+                }
+
+                for dark_bg in [false, true] {
+                    let fills = fills(8, 4, dark_bg);
+                    let plain = bake_reflection_control(id, &fills, w, h, EyesFrame::Open, false);
+                    let glossy = bake_reflection_control(id, &fills, w, h, EyesFrame::Open, true);
+                    let tile_w = plain.width() as usize;
+                    let changed: Vec<usize> = plain
+                        .pixels()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(glossy.pixels().as_chunks::<4>().0)
+                        .enumerate()
+                        .filter(|(pixel, (a, b))| pixel % tile_w < w as usize && a != b)
+                        .map(|(pixel, _)| pixel)
+                        .collect();
+
+                    if eligible_masks.is_empty() && !changed.is_empty() {
+                        failures.push(format!(
+                            "{} h={h} dark_bg={dark_bg}: ineligible glyph changed at {:?}",
+                            def.id, changed
+                        ));
+                    }
+                    for &pixel in &changed {
+                        let x = pixel % tile_w;
+                        let y = pixel / tile_w;
+                        let mi = (y * w as usize + x) * 4;
+                        let owners: Vec<usize> = eligible_masks
+                            .iter()
+                            .filter_map(|(eye, mask)| (mask.pixels()[mi + 3] != 0).then_some(*eye))
+                            .collect();
+                        let before = &plain.pixels()[pixel * 4..pixel * 4 + 4];
+                        if owners.is_empty()
+                            || before[3] != 255
+                            || !before[..3].iter().all(|&c| c < 96)
+                        {
+                            failures.push(format!(
+                                "{} h={h} dark_bg={dark_bg}: changed ({x},{y}) \
+                                 owners={owners:?}, before={before:?}",
+                                def.id
+                            ));
+                        }
+                    }
+
+                    for (eye, mask) in &eligible_masks {
+                        eligible += 1;
+                        let local: Vec<usize> = changed
+                            .iter()
+                            .copied()
+                            .filter(|pixel| {
+                                let x = pixel % tile_w;
+                                let y = pixel / tile_w;
+                                mask.pixels()[(y * w as usize + x) * 4 + 3] != 0
+                            })
+                            .collect();
+                        if local.is_empty() {
+                            continue;
+                        }
+                        exercised += 1;
+                        preview_exercised |= id == CatGlyphId::S100 && h == 31;
+                        live_expression_exercised |= id == CatGlyphId::S121 && h == 31;
+                        let dark_count = |tile: &Tile| {
+                            mask.pixels()
+                                .as_chunks::<4>()
+                                .0
+                                .iter()
+                                .enumerate()
+                                .filter(|(pixel, mask_px)| {
+                                    if mask_px[3] == 0 {
+                                        return false;
+                                    }
+                                    let x = pixel % w as usize;
+                                    let y = pixel / w as usize;
+                                    let i = (y * tile_w + x) * 4;
+                                    let px = &tile.pixels()[i..i + 4];
+                                    px[3] == 255 && px[..3].iter().all(|&c| c < 96)
+                                })
+                                .count()
+                        };
+                        let before = dark_count(&plain);
+                        let after = dark_count(&glossy);
+                        if after == 0 || after * 2 < before {
+                            failures.push(format!(
+                                "{} h={h} dark_bg={dark_bg}: eye {eye} lost its \
+                                 dark core, before={before}, after={after}",
+                                def.id
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            eligible > 0,
+            "the roster sweep must find eligible open eyes"
+        );
+        assert!(
+            exercised > 0 && preview_exercised && live_expression_exercised,
+            "the roster sweep must affect both S100 preview and live S121 cursor heads"
+        );
+        assert!(
+            failures.is_empty(),
+            "the generic flying reflection pass regressed:\n  {}",
+            failures.join("\n  ")
+        );
     }
 
     #[test]

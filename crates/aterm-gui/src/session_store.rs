@@ -25,7 +25,7 @@
 //! held across a `Terminal` lock, so two agents driving each other (A→B, B→A)
 //! cannot deadlock on the registry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use aterm_core::terminal::Terminal;
@@ -352,13 +352,75 @@ pub struct SessionHandle {
     pub ctx: Arc<SessionCtx>,
 }
 
+/// How many roster lifecycle records the store retains. Drop-oldest past this,
+/// exactly like [`crate::turn_ledger::LEDGER_CAP`] and
+/// [`crate::session_timeline::TIMELINE_CAP`] — a journal that grew without
+/// bound would be a leak, and a consumer that falls further behind than this
+/// has a documented, exact recovery path (see [`SessionStore::roster_since`]).
+/// 512 membership changes is many hundreds of tab open/closes; a 4 Hz consumer
+/// would have to miss ~2 minutes of continuous churn to fall out of it.
+pub(crate) const ROSTER_JOURNAL_CAP: usize = 512;
+
+/// A change to the registry's MEMBERSHIP — the only two things that can move
+/// the live-session set. Deliberately NOT a state change: `Spawning → Alive →
+/// Exited` all leave the session registered and readable, and the roster the
+/// `sessions` stream reports is membership, not state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RosterChange {
+    /// The sid entered the registry (first registration; a replace is not one).
+    Created,
+    /// The sid left the registry (`deregister_local`).
+    Exited,
+}
+
+/// One entry on the roster lifecycle journal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RosterRecord {
+    /// Store-monotonic, gap-free, starting at 1. `0` is the "nothing has ever
+    /// happened" watermark a fresh consumer can seed to safely.
+    pub seq: u64,
+    /// The stable sid that entered or left.
+    pub sid: String,
+    /// Which way it moved.
+    pub change: RosterChange,
+}
+
 /// The process-wide registry. Keyed canonically by [`SessionId`]; a second index
 /// bridges the GUI's `u64` ids to those sids. Both key spaces are mutated under
 /// the one outer `RwLock`, so a register/deregister is atomic across them.
+///
+/// ## The roster journal (why the third field exists)
+///
+/// The registry had NO monotonic lifecycle log, so every consumer of "which
+/// sessions appeared or disappeared" had to REBUILD the whole live set and diff
+/// it against its own copy. The `subscribe … sessions` push loop did that on
+/// every 250 ms wake — a fresh `HashSet<String>` (one allocation per live
+/// session, plus hashing) and two `difference` passes, per subscriber, forever,
+/// whether or not anything had changed.
+///
+/// That is not only wasteful, it is LOSSY, and the push loop said so in its own
+/// doc comment: a sibling that both spawns AND exits inside one 250 ms window
+/// appears in neither snapshot and emits neither event. A snapshot diff can only
+/// ever report the NET change between two instants; the events that cancelled
+/// out are unrecoverable because nothing wrote them down.
+///
+/// So write them down. `roster` is a bounded, drop-oldest, strictly-increasing
+/// journal appended under the SAME `&mut self` (hence the same write lock) that
+/// mutates `by_id`, so a session can never be registered without its record or
+/// vice versa. A consumer keeps a `u64` watermark: one compare against
+/// [`roster_seq`](Self::roster_seq) answers "did anything change?" in O(1), and
+/// [`roster_since`](Self::roster_since) yields exactly the records it has not
+/// seen — including both halves of a spawn/exit pair that landed inside one
+/// tick.
 #[derive(Default)]
 pub struct SessionStore {
     by_id: HashMap<SessionId, SessionHandle>,
     by_local: HashMap<u64, SessionId>,
+    /// The bounded roster lifecycle journal, oldest-first (see the type doc).
+    roster: VecDeque<RosterRecord>,
+    /// Monotone source of journal seqs. Keeps counting past eviction, so a
+    /// consumer's watermark stays meaningful even after the ring has rolled.
+    roster_seq: u64,
 }
 
 /// Shared handle to the registry, cloned into the control thread alongside the
@@ -377,7 +439,8 @@ impl SessionStore {
     /// A FIRST registration records the `spawned` event on the session's timeline
     /// (a replace does not — the session already lived; its birth is on record).
     pub fn register(&mut self, handle: SessionHandle) {
-        if !self.by_id.contains_key(&handle.sid) {
+        let first = !self.by_id.contains_key(&handle.sid);
+        if first {
             handle
                 .ctx
                 .timeline
@@ -385,8 +448,32 @@ impl SessionStore {
                 .unwrap_or_else(|p| p.into_inner())
                 .record("spawned", format!("state={}", handle.state.as_str()));
         }
+        // JOURNAL the membership change under the SAME `&mut self` (== the same
+        // write lock) that mutates the two indexes, so no reader can ever observe
+        // a registry and a journal that disagree. A REPLACE is not a membership
+        // change and records nothing — which is precisely the rule the old
+        // set-diff enforced implicitly by comparing sets of sids.
+        let journal = first.then(|| handle.sid.as_str().to_string());
         self.by_local.insert(handle.local_id, handle.sid.clone());
         self.by_id.insert(handle.sid.clone(), handle);
+        if let Some(sid) = journal {
+            self.record_roster(sid, RosterChange::Created);
+        }
+    }
+
+    /// Append one roster lifecycle record, evicting the oldest past
+    /// [`ROSTER_JOURNAL_CAP`]. Private and `&mut self`, so the ONLY way to reach
+    /// it is through a mutator that already holds the store's write lock.
+    fn record_roster(&mut self, sid: String, change: RosterChange) {
+        self.roster_seq += 1;
+        if self.roster.len() == ROSTER_JOURNAL_CAP {
+            self.roster.pop_front();
+        }
+        self.roster.push_back(RosterRecord {
+            seq: self.roster_seq,
+            sid,
+            change,
+        });
     }
 
     /// Deregister the session with process-local id `local_id`, removing it from
@@ -407,6 +494,11 @@ impl SessionStore {
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
                         .record("state-change", "state=closed".to_string());
+                    // Journalled ONLY when the handle was really there, so the
+                    // journal records exactly the set transitions `by_id`
+                    // performed — a late/duplicate deregister writes nothing,
+                    // matching the `None` arm below.
+                    self.record_roster(sid.as_str().to_string(), RosterChange::Exited);
                 }
                 Some(sid)
             }
@@ -528,13 +620,112 @@ impl SessionStore {
             .map(|h| h.sid.as_str().to_string())
             .collect()
     }
+
+    /// The roster journal's HIGH-WATER: the seq of the newest membership change,
+    /// or `0` when the registry has never gained or lost a session.
+    ///
+    /// This is the whole point of the journal for an idle consumer: one integer
+    /// compare against its own watermark replaces building a `HashSet<String>`
+    /// of every live sid and running two set differences over it — per
+    /// subscriber, per 250 ms wake, forever.
+    #[must_use]
+    pub fn roster_seq(&self) -> u64 {
+        self.roster_seq
+    }
+
+    /// The LOWEST retained journal seq, or `None` when nothing is retained.
+    ///
+    /// A consumer whose watermark `w` satisfies `w + 1 < low_seq` has fallen
+    /// past the drop-oldest window: records it never saw are gone, so a delta
+    /// replay would silently skip them. That consumer must REBUILD — and the
+    /// recovery path is the whole-set diff this journal replaced, which is still
+    /// exactly right for the job, just no longer paid on every tick.
+    #[must_use]
+    pub fn roster_low_seq(&self) -> Option<u64> {
+        self.roster.front().map(|r| r.seq)
+    }
+
+    /// Journal records with `seq > after`, oldest-first.
+    ///
+    /// Seqs are minted by one counter under the write lock and pushed to the
+    /// back, so they are strictly increasing across the deque and
+    /// `partition_point` seeks to the first unseen record in O(log n); the walk
+    /// that follows is O(records the caller actually missed). A watermark below
+    /// the retained low-water yields everything retained — callers must test
+    /// [`roster_low_seq`](Self::roster_low_seq) first if they need to know that
+    /// the prefix was lossy (see its doc).
+    pub fn roster_since(&self, after: u64) -> impl Iterator<Item = &RosterRecord> {
+        let start = self.roster.partition_point(|r| r.seq <= after);
+        self.roster.range(start..)
+    }
+
+    /// Every registered handle, BY REFERENCE and in no particular order.
+    ///
+    /// The zero-allocation read: unlike [`snapshot`](Self::snapshot) it clones
+    /// nothing and does not sort, so a caller that only wants to pick out the
+    /// handles matching a predicate (a `@*` subscription adopting the sessions
+    /// it is not yet watching) pays for what it takes and nothing else. Order is
+    /// unspecified BECAUSE it is `HashMap` order — a caller that needs a stable
+    /// listing wants `snapshot`, and saying so here keeps the two from being
+    /// confused.
+    pub fn live_handles(&self) -> impl Iterator<Item = &SessionHandle> {
+        self.by_id.values()
+    }
+}
+
+/// A fully-formed, `Alive` [`SessionHandle`] with a fresh sid, a headless
+/// engine and a real (fd-less) [`SessionCtx`] — TEST ONLY.
+///
+/// Hoisted out of this file's `mod tests` so the SUBSCRIBE tests can build a
+/// genuinely registered session and drive the roster journal through the real
+/// `register`/`deregister_local` mutators. A hand-rolled second fixture over
+/// there would be a copy of this one that could silently drift from the real
+/// handle shape, which is the failure mode a lifecycle test can least afford.
+#[cfg(test)]
+pub(crate) fn test_handle(local_id: u64) -> SessionHandle {
+    handle_alive(local_id, None)
+}
+
+#[cfg(test)]
+fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
+    use aterm_session::EdgeTable;
+    use aterm_session::sink::SinkWriter;
+    let sid = SessionId::generate();
+    let nonce = LaunchNonce::generate();
+    let ctx = Arc::new(SessionCtx {
+        sink: Arc::new(SinkWriter::new(-1)),
+        edges: Mutex::new(EdgeTable::new()),
+        self_id: sid.clone(),
+        nonce,
+        turn_lease: Mutex::new(None),
+        cast: Arc::new(Mutex::new(crate::cast::CastRecorder::new(80, 24))),
+        temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
+        byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
+        turns: Arc::new(std::sync::Mutex::new(
+            crate::turn_ledger::TurnLedger::default(),
+        )),
+        meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
+        app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
+        timeline: Arc::new(std::sync::Mutex::new(
+            crate::session_timeline::SessionTimeline::default(),
+        )),
+    });
+    SessionHandle {
+        sid,
+        nonce,
+        local_id,
+        parent,
+        state: SessionState::Alive,
+        title: format!("tab-{local_id}"),
+        term: Arc::new(Mutex::new(Terminal::new(24, 80))),
+        master: -1,
+        ctx,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aterm_session::EdgeTable;
-    use aterm_session::sink::SinkWriter;
 
     fn handle(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
         handle_in_state(local_id, parent, SessionState::Alive)
@@ -548,40 +739,6 @@ mod tests {
         let mut h = handle_alive(local_id, parent);
         h.state = state;
         h
-    }
-
-    fn handle_alive(local_id: u64, parent: Option<SessionId>) -> SessionHandle {
-        let sid = SessionId::generate();
-        let nonce = LaunchNonce::generate();
-        let ctx = Arc::new(SessionCtx {
-            sink: Arc::new(SinkWriter::new(-1)),
-            edges: Mutex::new(EdgeTable::new()),
-            self_id: sid.clone(),
-            nonce,
-            turn_lease: Mutex::new(None),
-            cast: Arc::new(Mutex::new(crate::cast::CastRecorder::new(80, 24))),
-            temporal: Arc::new(Mutex::new(crate::temporal::TemporalRecorder::new())),
-            byte_fanout: Arc::new(crate::cast::ByteFanout::new()),
-            turns: Arc::new(std::sync::Mutex::new(
-                crate::turn_ledger::TurnLedger::default(),
-            )),
-            meta: std::sync::Mutex::new(crate::session_timeline::SessionMeta::default()),
-            app_kitty: std::sync::Mutex::new(crate::app_kitty::AppKittySlot::default()),
-            timeline: Arc::new(std::sync::Mutex::new(
-                crate::session_timeline::SessionTimeline::default(),
-            )),
-        });
-        SessionHandle {
-            sid,
-            nonce,
-            local_id,
-            parent,
-            state: SessionState::Alive,
-            title: format!("tab-{local_id}"),
-            term: Arc::new(Mutex::new(Terminal::new(24, 80))),
-            master: -1,
-            ctx,
-        }
     }
 
     #[test]
@@ -815,6 +972,112 @@ mod tests {
                 (5, "state-change", "state=closed"),
             ],
             "one ordered, monotonic-id event per ACTUAL lifecycle change"
+        );
+    }
+
+    /// The journal records exactly the MEMBERSHIP transitions `by_id` performs —
+    /// one `Created` per FIRST registration (never a replace), one `Exited` per
+    /// registration that was really removed (never a late/duplicate deregister)
+    /// — with gap-free, strictly increasing seqs.
+    ///
+    /// The differential half is the load-bearing one: replaying the journal from
+    /// seq 0 must reconstruct the SAME live set `live_sids()` reports. That is
+    /// what makes a delta-driven consumer equivalent to the whole-set diff it
+    /// replaces, and it is checked after every step, not just at the end.
+    #[test]
+    fn roster_journal_mirrors_membership_exactly() {
+        let mut store = SessionStore::default();
+        assert_eq!(store.roster_seq(), 0, "a virgin store has no history");
+        assert_eq!(store.roster_low_seq(), None);
+        assert_eq!(store.roster_since(0).count(), 0);
+
+        let replay = |st: &SessionStore| -> std::collections::HashSet<String> {
+            let mut set = std::collections::HashSet::new();
+            for r in st.roster_since(0) {
+                match r.change {
+                    RosterChange::Created => {
+                        set.insert(r.sid.clone());
+                    }
+                    RosterChange::Exited => {
+                        set.remove(&r.sid);
+                    }
+                }
+            }
+            set
+        };
+
+        let a = handle(1, None);
+        let b = handle(2, None);
+        let (sid_a, sid_b) = (a.sid.as_str().to_string(), b.sid.as_str().to_string());
+        store.register(a.clone());
+        assert_eq!(replay(&store), store.live_sids());
+        // A REPLACE of the same sid is not a membership change.
+        store.register(a);
+        assert_eq!(store.roster_seq(), 1, "a replace journals nothing");
+        store.register(b);
+        assert_eq!(replay(&store), store.live_sids());
+        // A late/duplicate deregister journals nothing either.
+        store.deregister_local(1);
+        assert_eq!(store.deregister_local(1), None);
+        assert_eq!(
+            store.roster_seq(),
+            3,
+            "the duplicate deregister journalled nothing"
+        );
+        assert_eq!(replay(&store), store.live_sids());
+
+        let got: Vec<(u64, &str, RosterChange)> = store
+            .roster_since(0)
+            .map(|r| (r.seq, r.sid.as_str(), r.change))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, sid_a.as_str(), RosterChange::Created),
+                (2, sid_b.as_str(), RosterChange::Created),
+                (3, sid_a.as_str(), RosterChange::Exited),
+            ]
+        );
+        // `since` is a suffix keyed on the watermark, at every position.
+        assert_eq!(store.roster_since(1).count(), 2);
+        assert_eq!(store.roster_since(3).count(), 0);
+        assert_eq!(store.roster_since(99).count(), 0, "past the high = nothing");
+        assert_eq!(store.roster_low_seq(), Some(1));
+    }
+
+    /// The journal is BOUNDED and says so honestly: past the cap it drops
+    /// oldest, `roster_seq` keeps counting (so a watermark stays meaningful),
+    /// and `roster_low_seq` rises to advertise exactly where the retained window
+    /// now starts — which is the signal a fallen-behind consumer needs in order
+    /// to know it must rebuild rather than replay a lossy delta.
+    #[test]
+    fn roster_journal_is_bounded_and_advertises_its_low_water() {
+        let mut store = SessionStore::default();
+        // Two membership changes per iteration (register + deregister), so the
+        // journal fills well past the cap.
+        for i in 0..(ROSTER_JOURNAL_CAP as u64) {
+            store.register(handle(i, None));
+            store.deregister_local(i);
+        }
+        let total = 2 * ROSTER_JOURNAL_CAP as u64;
+        assert_eq!(
+            store.roster_seq(),
+            total,
+            "seqs keep counting past eviction"
+        );
+        assert_eq!(
+            store.roster_since(0).count(),
+            ROSTER_JOURNAL_CAP,
+            "retention is capped"
+        );
+        assert_eq!(
+            store.roster_low_seq(),
+            Some(total - ROSTER_JOURNAL_CAP as u64 + 1),
+            "the low-water names the oldest retained seq"
+        );
+        assert!(
+            store.is_empty(),
+            "every session registered was deregistered"
         );
     }
 

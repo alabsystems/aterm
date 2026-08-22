@@ -28,15 +28,15 @@ fn rle_length_consistent() {
 
 /// Get always returns a value for valid indices.
 /// Reduced from len<=100 to len<=16 and added unwind(20) — the get() operation
-/// uses binary search over prefix sums, which doesn't benefit from large lengths.
-/// A single run with len<=16 fully exercises the binary search path.
+/// walks the RUNS, not the cells, so a large length buys no extra coverage.
+/// A single run with len<=16 fully exercises the walk.
 #[kani::proof]
 #[kani::unwind(8)]
 fn rle_get_valid_index() {
     let len: u8 = kani::any();
     let idx: u8 = kani::any();
-    // Reduced from len<=16 to len<=4: binary search verification doesn't
-    // benefit from large lengths; 4 elements covers all search paths.
+    // Reduced from len<=16 to len<=4: the run walk does not branch on the
+    // cell count; 4 elements covers every path through it.
     kani::assume(len > 0 && len <= 4);
     kani::assume(idx < len);
 

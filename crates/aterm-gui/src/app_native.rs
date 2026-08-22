@@ -2931,11 +2931,17 @@ impl App {
                 }
             }
             InputEvent::Key { .. } => None,
-            InputEvent::Wheel { dir_up, lines, .. } => Some(AppEvent::ScrollLines(if *dir_up {
-                -(*lines).max(1)
-            } else {
-                (*lines).max(1)
-            })),
+            // A native view scrolls ONE vertical list, so a horizontal wheel
+            // (audit I7) maps to no event at all rather than being folded into
+            // the vertical delta — `vertical_up()` returning `None` IS the
+            // "nothing to do here" answer.
+            InputEvent::Wheel { dir, lines, .. } => dir.vertical_up().map(|up| {
+                AppEvent::ScrollLines(if up {
+                    -(*lines).max(1)
+                } else {
+                    (*lines).max(1)
+                })
+            }),
             InputEvent::ScrollView(ScrollIntent::Up | ScrollIntent::PrevPrompt)
                 if markdown_active =>
             {

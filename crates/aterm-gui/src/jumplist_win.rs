@@ -6,17 +6,14 @@
 //! Without this, that menu shows only the shell defaults (the recent-items
 //! stub, "Pin to taskbar", "Close window") — a gap every established Windows
 //! terminal has closed (Windows Terminal, ConEmu, PuTTY, mintty all ship
-//! tasks). This is the **tasks-only cut**: a single "New Window" task that
-//! launches a fresh aterm. Deliberately NOT here, and why:
+//! tasks). This is the **tasks-only cut**: a "New Window" task that launches a
+//! fresh aterm, plus a "New Tab" task **when, and only when, the operator has
+//! asked for attach behaviour**. Deliberately NOT here, and why:
 //!
 //! * **"Settings"** — there is no CLI surface that opens the Settings tab
 //!   (`cli.rs` has no `--settings`; Ctrl-, is an in-app action), and a jump
 //!   list is the wrong reason to invent one. If a settings verb ever lands in
 //!   `cli.rs`, add a second [`task`] call below — the plumbing is ready.
-//! * **"New Tab"** — a task launches a *process*; routing "new tab" into the
-//!   already-running window needs the single-instance front door (backlog
-//!   S12), which does not exist yet. WT only offers window-scoped tasks from
-//!   the taskbar too. Deferred, not hacked around.
 //! * **Recent/Frequent destinations** — a terminal's "documents" would be
 //!   directories, which wants `SHAddToRecentDocs` plumbing and a privacy
 //!   stance (the list persists in the user's shell profile). Out of scope for
@@ -32,12 +29,30 @@
 //! `SetAppID` the list would attach to the exe-path identity and a *pinned*
 //! aterm would never show it.
 //!
-//! **Self-healing exe path**: the task's target is `current_exe()` resolved at
-//! every registration, not an install-time constant — move the install (or run
-//! a dev build) and the next launch rewrites the list to point at itself. The
-//! shell persists the committed list in the user profile, so re-committing an
-//! identical list each launch is exactly what Windows Terminal does; the write
-//! is a few KB once per process.
+//! **The tasks carry VERBS, not a bare launch** (S12). "New Window" runs
+//! `aterm.exe new-window`, the one verb the routing policy never redirects, so
+//! the row does what it says even when the operator set
+//! `windowing_behavior = "attach"` — a bare launch under that policy would open
+//! a TAB, and a taskbar row labelled "New Window" that opens a tab is a lie the
+//! shell would keep telling from the user's persisted profile. "New Tab" runs
+//! `aterm.exe new-tab`, and is only OFFERED under `attach`: under the default
+//! `new_window` policy that verb opens a window (deliberately — see
+//! `aterm_cli::route_launch`), so the row would be a second "New Window" with a
+//! misleading name. One list per policy, each honest about itself.
+//!
+//! **Self-healing exe path**: the task's target is resolved from
+//! `current_exe()` at every registration, not an install-time constant — move
+//! the install (or run a dev build) and the next launch rewrites the list to
+//! point at itself. The shell persists the committed list in the user profile,
+//! so re-committing an identical list each launch is exactly what Windows
+//! Terminal does; the write is a few KB once per process.
+//!
+//! It is `current_exe()`'s *front door*, not `current_exe()` itself — see
+//! [`front_door_exe`]. The install directory holds several identical copies of
+//! the one binary under the sibling names, the Start-Menu shortcut targets
+//! `aterm-gui.exe`, and this list is committed by whichever copy is running, so
+//! the row has to name a binary that ROUTES the verb rather than one that hands
+//! it to the window's flag parser.
 //!
 //! **Timing & failure posture**: registration runs once per process on a
 //! throwaway background thread spawned *after the first present* (see the
@@ -410,31 +425,111 @@ unsafe fn co_create(clsid: &Guid, iid: &Guid, step: &'static str) -> Result<Com,
 /// taskbar menu at shell defaults — identical to today's behaviour, never a
 /// startup failure.
 pub(crate) fn install() {
-    let exe = match std::env::current_exe() {
+    let current = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
             aterm_log::warn!("taskbar jump list skipped (current_exe: {error})");
             return;
         }
     };
+    let exe = front_door_exe(&current, |path| path.is_file());
     let exe_w: Vec<u16> = exe
         .as_os_str()
         .encode_wide()
         .chain(std::iter::once(0))
         .collect();
+    // Read the routing policy HERE rather than taking it as a parameter: this
+    // already runs on its own thread after the first present, a bounded config
+    // read costs nothing next to the shell's registry + profile round trip, and
+    // it keeps the first-present hook in `app_render.rs` a single argument-less
+    // call. The list is re-committed every launch anyway (see the module docs),
+    // so flipping the config and restarting rewrites the menu.
+    let attach = attach_policy_is_on();
     // SAFETY: `build` is one linear pass of documented shell COM calls; every
     // pointer it hands the shell lives for the duration of its call (the wide
     // strings are locals that outlive each use), every returned interface is
     // RAII-released, and the apartment is balanced by CoUninitGuard.
-    match unsafe { build(&exe_w) } {
-        Ok(()) => aterm_log::debug!("taskbar jump list committed (tasks: New Window)"),
+    match unsafe { build(&exe_w, attach) } {
+        Ok(()) => {
+            if attach {
+                aterm_log::debug!("taskbar jump list committed (tasks: New Tab, New Window)");
+            } else {
+                aterm_log::debug!("taskbar jump list committed (tasks: New Window)");
+            }
+        }
         Err((step, hr)) => {
             aterm_log::warn!("taskbar jump list skipped ({step}: hr={hr:#010x})");
         }
     }
 }
 
-unsafe fn build(exe: &[u16]) -> Result<(), StepError> {
+/// The executable a jump-list row should launch: the FRONT DOOR, which is the
+/// binary that routes `new-tab` / `new-window` / `split-pane`.
+///
+/// Not simply `current_exe()`, and the difference is a shipped-feature bug, not
+/// a dev-build nicety. The Windows install directory holds SEVERAL IDENTICAL
+/// COPIES of the one binary under the sibling names — `aterm.exe`,
+/// `aterm-gui.exe`, `aterm-ctl.exe`, … — and the Start-Menu shortcut targets
+/// `aterm-gui.exe`, so the live instance that commits this list is normally
+/// running as `aterm-gui.exe`. That name is an argv0 ALIAS: it means "the
+/// window", and `aterm-gui.exe new-window` used to reach the window's own flag
+/// parser and exit 2 with `unknown option 'new-window'` — to a console that does
+/// not exist, because the shell launched it. A working taskbar row went silently
+/// dead.
+///
+/// So: if this process is already `aterm`, use it. Otherwise prefer a sibling
+/// `aterm` in the same directory — the canonical front door, present in every
+/// install and in every dev `target/<profile>` (which also gets the row the
+/// icon `build.rs` compiles into `aterm.exe` alone). Only if there is no such
+/// sibling does the row fall back to this process, which the front door's
+/// alias dispatch now routes anyway; the two fixes are independent and either
+/// one alone is enough.
+///
+/// `exists` is injected so the rule is unit-testable without laying out a fake
+/// install tree on disk.
+fn front_door_exe(
+    current: &std::path::Path,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    // Folded FIRST, suffix included: Windows filenames are case-insensitive, so
+    // `ATERM.EXE` is the same file as `aterm.exe` and must take the same arm.
+    let name = current
+        .file_name()
+        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let suffix = std::env::consts::EXE_SUFFIX.to_ascii_lowercase();
+    let stem = name.strip_suffix(&suffix).unwrap_or(&name);
+    if stem == "aterm" {
+        return current.to_path_buf();
+    }
+    let sibling = current
+        .parent()
+        .map(|dir| dir.join(format!("aterm{}", std::env::consts::EXE_SUFFIX)));
+    match sibling {
+        Some(path) if exists(&path) => path,
+        _ => current.to_path_buf(),
+    }
+}
+
+/// Whether `windowing_behavior` is `attach` — i.e. whether a "New Tab" row would
+/// actually produce a tab.
+///
+/// The spelling test is intentionally duplicated in miniature rather than
+/// reached for through `aterm-cli` (this crate does not depend on it, and adding
+/// the dependency to decide one menu row would be backwards). Kept in sync by
+/// being the SAME two accepted spellings the front door's parser accepts for
+/// this value; anything else — including a typo — leaves the list at the safe
+/// one-task shape, which is exactly what the front door's own fallback does.
+fn attach_policy_is_on() -> bool {
+    crate::windowing_behavior_setting().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "attach" | "use_existing" | "use-existing" | "useexisting" | "existing"
+        )
+    })
+}
+
+unsafe fn build(exe: &[u16], attach: bool) -> Result<(), StepError> {
     // A fresh thread, so APARTMENTTHREADED cannot RPC_E_CHANGED_MODE; a real
     // failure here means COM itself is unavailable and the list is off the
     // table for this launch.
@@ -481,10 +576,34 @@ unsafe fn build(exe: &[u16]) -> Result<(), StepError> {
     };
     let tasks_ptr = tasks.0.cast::<IObjectCollection>();
 
-    // The one task of the tasks-only cut. A future "Settings" (pending a real
-    // CLI verb) or "New Tab" (pending S12 single-instance routing) is one more
-    // `task(...)` + `add_object` pair here.
-    let new_window = unsafe { task(exe, "New Window", "Open a new aterm window")? };
+    // The tasks of the tasks-only cut, in menu order. A future "Settings"
+    // (pending a real CLI verb) is one more `task(...)` + `add_object` pair here.
+    //
+    // "New Tab" leads under `attach` because it is then the ordinary act and
+    // "New Window" the deliberate one — the same order Windows Terminal's own
+    // jump list uses.
+    if attach {
+        let new_tab = unsafe {
+            task(
+                exe,
+                "new-tab",
+                "New Tab",
+                "Open a new tab in the running aterm",
+            )?
+        };
+        check(
+            unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_tab.0) },
+            "AddObject",
+        )?;
+    }
+    let new_window = unsafe {
+        task(
+            exe,
+            "new-window",
+            "New Window",
+            "Open a new aterm window",
+        )?
+    };
     check(
         unsafe { ((*(*tasks_ptr).vtbl).add_object)(tasks_ptr, new_window.0) },
         "AddObject",
@@ -500,18 +619,30 @@ unsafe fn build(exe: &[u16]) -> Result<(), StepError> {
     Ok(())
 }
 
-/// Build one task entry: an in-memory `IShellLinkW` whose target is `exe` with
-/// no arguments (a bare launch opens a fresh window on both the `aterm` router
-/// and the dev `aterm-gui` bin), whose icon is the exe's own (index 0 — the
-/// aterm icon compiled in by `build.rs`), and whose visible row text is set via
-/// the link's property store (`PKEY_Title` — see that const for why
-/// `SetDescription` alone would render "aterm-gui.exe").
-unsafe fn task(exe: &[u16], title: &str, tooltip: &str) -> Result<Com, StepError> {
+/// Build one task entry: an in-memory `IShellLinkW` whose target is `exe` run
+/// with `args` (a front-door VERB — see the module docs on why a bare launch is
+/// no longer good enough), whose icon is the exe's own (index 0 — the aterm icon
+/// compiled in by `build.rs`), and whose visible row text is set via the link's
+/// property store (`PKEY_Title` — see that const for why `SetDescription` alone
+/// would render "aterm-gui.exe").
+///
+/// `exe` is [`front_door_exe`]'s answer, not raw `current_exe()`: the row must
+/// name a binary that ROUTES the verb. That matters most for the thin dev
+/// `aterm-gui` bin, which is genuinely not the router and knows none of these
+/// verbs — it sits beside a real `target/<profile>/aterm.exe`, which is what the
+/// row then points at (and which is also the only one of the two carrying the
+/// icon `crates/aterm/build.rs` compiles in).
+unsafe fn task(exe: &[u16], args: &str, title: &str, tooltip: &str) -> Result<Com, StepError> {
     let link = unsafe { co_create(&CLSID_SHELL_LINK, &IID_ISHELL_LINK_W, "create ShellLink")? };
     let link_ptr = link.0.cast::<IShellLinkW>();
     let link_vt = unsafe { &*(*link_ptr).vtbl };
 
     check(unsafe { (link_vt.set_path)(link_ptr, exe.as_ptr()) }, "SetPath")?;
+    let args_w = wide(args);
+    check(
+        unsafe { (link_vt.set_arguments)(link_ptr, args_w.as_ptr()) },
+        "SetArguments",
+    )?;
     check(
         unsafe { (link_vt.set_icon_location)(link_ptr, exe.as_ptr(), 0) },
         "SetIconLocation",
@@ -549,4 +680,72 @@ unsafe fn task(exe: &[u16], title: &str, tooltip: &str) -> Result<Com, StepError
     )?;
     check(unsafe { (store_vt.commit)(store_ptr) }, "IPropertyStore::Commit")?;
     Ok(link)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::front_door_exe;
+    use std::path::{Path, PathBuf};
+
+    fn install_dir() -> PathBuf {
+        PathBuf::from(r"C:\Users\me\AppData\Local\Programs\aterm")
+    }
+
+    fn exe(name: &str) -> String {
+        format!("{name}{}", std::env::consts::EXE_SUFFIX)
+    }
+
+    /// THE SHIPPED WINDOWS LAYOUT, which is where this bit went wrong: the
+    /// install directory is several IDENTICAL copies of the one binary, the
+    /// Start-Menu shortcut targets `aterm-gui.exe`, and the running instance
+    /// that commits the jump list is therefore `aterm-gui.exe`. Every row must
+    /// still name the front door, because `aterm-gui.exe` is an argv0 alias for
+    /// "the window" and a row that hands `new-window` to the window's own flag
+    /// parser dies with `unknown option` against a console that does not exist.
+    #[test]
+    fn a_row_committed_by_an_alias_copy_still_names_the_front_door() {
+        let dir = install_dir();
+        for alias in [
+            "aterm-gui",
+            "aterm-ctl",
+            "aterm-cli",
+            "atpkg",
+            "aterm-fleet",
+        ] {
+            let current = dir.join(exe(alias));
+            assert_eq!(
+                front_door_exe(&current, |path| path == dir.join(exe("aterm"))),
+                dir.join(exe("aterm")),
+                "a list committed by {alias} must launch the front door"
+            );
+        }
+    }
+
+    /// `aterm.exe` itself is already the front door — no sibling lookup, no
+    /// chance of pointing at a different copy than the one that is running.
+    #[test]
+    fn the_front_door_itself_is_left_alone() {
+        let dir = install_dir();
+        let current = dir.join(exe("aterm"));
+        assert_eq!(
+            front_door_exe(&current, |_| panic!("must not probe for a sibling")),
+            current
+        );
+        // Windows filesystem names are case-insensitive; so is the check.
+        let shouty = dir.join(exe("ATERM").to_uppercase());
+        assert_eq!(
+            front_door_exe(&shouty, |_| panic!("must not probe for a sibling")),
+            shouty
+        );
+    }
+
+    /// No sibling front door on disk (a copy of the exe on its own somewhere):
+    /// fall back to this process rather than committing a row that names a file
+    /// that is not there. The front door's argv0-alias dispatch routes the verb
+    /// under the alias name too, so the row still works.
+    #[test]
+    fn a_lone_copy_falls_back_to_itself() {
+        let current = Path::new(r"C:\tmp\scratch").join(exe("aterm-gui"));
+        assert_eq!(front_door_exe(&current, |_| false), current);
+    }
 }

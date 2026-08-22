@@ -214,5 +214,22 @@ impl Terminal {
         // Clear secure keyboard entry flag — if a program enabled it and then
         // crashed, RIS should restore clean state (#7336).
         self.secure_keyboard_entry = false;
+        // Direct reset does not pass through `post_process`, so publish its
+        // wholesale coordinate change here. Drain the grid's reset sentinels:
+        // otherwise the next unrelated `process` batch would report this same
+        // reset a second time. The counters themselves deliberately survive.
+        let _ = self.grid.take_absolute_row_update();
+        let _ = self.grid.take_selection_row_update();
+        let _ = self.grid.take_content_scroll_delta();
+        // SELECTION CUSTODY Phase 4 added a SECOND grid-side signal for this same
+        // "coordinates moved" fact (the sentinel's split — see `post_process`). It
+        // must be drained here for exactly the reason the others are: otherwise the
+        // reset's own clear leaves it set and the next unrelated batch reports this
+        // reset a second time. The selection damage is drained with it — the
+        // selection is cleared outright a few lines above, so there is nothing left
+        // for a band to say.
+        let _ = self.grid.take_coordinates_invalidated();
+        let _ = self.grid.take_selection_damage();
+        self.content_scroll_state.invalidate();
     }
 }

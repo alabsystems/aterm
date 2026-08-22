@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bundle packaging (release spec §6 `dmg.rs`). Two containers carry the SAME
-//! signed `aterm.app`:
+//! Bundle packaging (release spec §6 `dmg.rs`). Up to three containers carry
+//! the SAME signed `aterm.app`:
 //!
 //! * the **DMG** — `hdiutil create` UDZO with the `/Applications` symlink (the
 //!   pretty create-dmg layout was deliberately dropped — spec decision 20). This
-//!   is the human download.
+//!   is the human download. On a cut whose seed covers both darwin triples it
+//!   becomes a PER-ARCH PAIR ([`create_arch_filtered`]): the fleet-pinned bare
+//!   `aterm-<v>.dmg` with the arm64 seed slice, plus the additive
+//!   `aterm-<v>-x86_64.dmg` with the Intel slice — one signing, one
+//!   notarization, two restages of the `optional = true` `.lproj` seal.
 //! * the **zip** — `ditto -c -k --sequesterRsrc --keepParent`. This is what the
 //!   in-app updater stages from, because `hdiutil attach` needs a live bootstrap
 //!   context (DiskImages registers with the `com.apple.hdiejectd` XPC service)
@@ -21,6 +25,7 @@
 //! goes in AS-IS: run this AFTER `sign::sign_app` (both containers freeze the
 //! app's bytes), and hand the DMG to `sign::sign_and_notarize_dmg` next.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -33,12 +38,18 @@ pub struct Packaged {
     pub size_bytes: u64,
 }
 
-/// Package `<app>` into `<out_dir>/aterm-<short>.dmg`.
+/// Package `<app>` into `<out_dir>/aterm-<short>.dmg` — the app exactly as it
+/// stands, seed and all (the single-DMG lane: a seedless or acknowledged
+/// arm64-only cut).
 ///
 /// The artifact name MUST stay `aterm-{short}.dmg` — it is the exact asset
 /// name written into the manifest's `dmg`/`url` fields, and every installed
 /// v0.25 client resolves its download by that name (a mismatch 404s the whole
-/// fleet's update).
+/// fleet's update). On a per-arch-DMG cut ([`create_arch_filtered`]) the bare
+/// name stays pinned to the CANONICAL (arm64-seeded) image for the same
+/// reason, and the Intel variant is strictly additive (`-x86_64` suffix): a
+/// symmetric `-arm64`/`-x86_64` rename would 404 or refuse every deployed
+/// client, which binds this exact spelling.
 pub fn create(app: &Path, out_dir: &Path, short_version: &str) -> Result<Packaged, String> {
     if !app.is_dir() {
         return Err(format!(
@@ -139,7 +150,7 @@ pub fn create_zip(
     // answers `None` for both "this cut ships no toolchain" and "the seal that was
     // here is gone", and on 2026-08-19 the second one happened: the live updater
     // adopted the half-built bundle and its successor reclaimed the payload out of
-    // it. The strip became a no-op, so `verify_stripped_bundle` below never ran —
+    // it. The strip became a no-op, so the restage verification below never ran —
     // the container shipped without the codesign + Gatekeeper proof that is the
     // entire reason the lean zip is allowed to exist. Whoever knows this cut is
     // seeded has to say so, because from in here the two states look identical.
@@ -163,13 +174,13 @@ pub fn create_zip(
     // "updater zip" to every client forever, and a wrong seal assumption would
     // ship a zip that fails verification on every client. Both are fleet-wide
     // and neither is recoverable by a resume.
-    // `#[cfg(unix)]` like the function it calls: `verify_stripped_bundle` shells out
+    // `#[cfg(unix)]` like the function it calls: `verify_restaged_bundle` shells out
     // to codesign/spctl, which exist only on macOS, and calling it unconditionally
     // broke the non-unix build outright. (`archive_app` already refuses there, so
     // nothing is lost — a non-unix cut cannot produce this container at all.)
     #[cfg(unix)]
     if staged.is_some() {
-        verify_stripped_bundle(source, notarized)?;
+        verify_restaged_bundle(source, notarized, SeedExpectation::Absent)?;
     }
     #[cfg(not(unix))]
     let _ = notarized;
@@ -195,6 +206,126 @@ pub fn create_zip(
     })
 }
 
+/// Package a PER-ARCH batteries-included DMG from the one signed (and, on the
+/// active tier, notarized + stapled) universal app: restage the bundle with its
+/// sealed seed filtered to `triple`'s artifact tarballs plus ALL signed
+/// manifests, re-prove the filtered seed through the client's own chain
+/// (`seedpack::validate_scoped`, `ArchScope::Only`) and the codesign/Gatekeeper
+/// seal (`verify_restaged_bundle`), then image it through the SAME
+/// volname/hdiutil lane as [`create`].
+///
+/// WHY: the dual-arch fat DMG measured 2,090,384,004 bytes on v0.46.0 — 97.3%
+/// of the 2 GiB `RELEASE_ASSET_DOWNLOAD_BOUND` — and every download carried
+/// ~0.9–1.1 GB of seed tarballs the receiving CPU can never execute (the
+/// client installs strictly by its own triple). Nothing is re-signed and
+/// nothing signed is altered: the filter subtracts whole artifact FILES from
+/// the `optional = true` `.lproj`, the index/roster/pkg manifests and their
+/// signatures ride intact, and every client re-verifies sha256 + tree_root at
+/// install exactly as today.
+///
+/// Names: `aarch64-apple-darwin` keeps the fleet-pinned bare `aterm-<v>.dmg`
+/// (bare-name-is-arm64 is the only fleet-safe spelling — see [`create`]);
+/// `x86_64-apple-darwin` is the additive `aterm-<v>-x86_64.dmg`. Any other
+/// triple has no DMG lane and is refused.
+#[cfg(unix)]
+pub fn create_arch_filtered(
+    app: &Path,
+    out_dir: &Path,
+    short_version: &str,
+    triple: &str,
+    notarized: bool,
+) -> Result<Packaged, String> {
+    if !app.is_dir() {
+        return Err(format!(
+            "{} not found — assemble the bundle first",
+            app.display()
+        ));
+    }
+    let dmg = match triple {
+        "aarch64-apple-darwin" => out_dir.join(format!("aterm-{short_version}.dmg")),
+        "x86_64-apple-darwin" => out_dir.join(format!("aterm-{short_version}-x86_64.dmg")),
+        other => {
+            return Err(format!(
+                "no per-arch DMG lane exists for triple {other:?} (aarch64-apple-darwin \
+                 takes the canonical bare name, x86_64-apple-darwin the -x86_64 suffix)"
+            ));
+        }
+    };
+    let seed_dir = app
+        .join("Contents/Resources")
+        .join(atpkg::SEED_DIR_NAME);
+    // The keep-set comes from the SEALED seed's own signed [[artifact]] rows,
+    // read back through the full client chain — never from filename suffixes,
+    // so every byte-selection decision stays anchored in attested data.
+    let keep = crate::seedpack::assets_by_triple(&seed_dir)
+        .map_err(|e| format!("per-arch DMG: the sealed seed does not re-validate: {e}"))?
+        .remove(triple)
+        .filter(|set| !set.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the sealed seed carries no {triple} artifacts — a {triple} DMG variant \
+                 is not producible from this seal (publish.rs should not have asked)"
+            )
+        })?;
+    let staged = restage_with_seed_filter(app, out_dir, SeedFilter::KeepAssets(&keep))?
+        .ok_or_else(|| {
+            format!(
+                "per-arch DMG requested but {} carries no sealed seed — a seedless cut \
+                 has exactly one DMG",
+                app.display()
+            )
+        })?;
+    // Re-prove the FILTERED registry through the shipped client's own chain,
+    // scoped to exactly this triple: a dropped manifest, a leaked wrong-arch
+    // tarball, or a gutted seed each refuses the cut here, before hdiutil.
+    let staged_seed = staged
+        .app
+        .join("Contents/Resources")
+        .join(atpkg::SEED_DIR_NAME);
+    crate::seedpack::validate_scoped(&staged_seed, crate::seedpack::ArchScope::Only(triple))
+        .map_err(|e| format!("per-arch DMG ({triple}): filtered seed refused: {e}"))?;
+    verify_restaged_bundle(&staged.app, notarized, SeedExpectation::FilteredPresent)?;
+
+    let volname = format!("aterm {short_version}");
+    let _ = std::fs::remove_file(&dmg);
+    let stage = out_dir.join(format!(".dmg-stage-{triple}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
+    let result = build_in_stage(&staged.app, &stage, &volname, &dmg);
+    let _ = std::fs::remove_dir_all(&stage); // cleanup on success AND failure
+    drop(staged); // remove the filtered app stage before hashing
+    result?;
+
+    let size_bytes = std::fs::metadata(&dmg)
+        .map_err(|e| format!("stat {}: {e}", dmg.display()))?
+        .len();
+    let sha256 = sha256_file(&dmg)?;
+    println!(
+        "==> done: {} ({:.1} MB, {triple} seed)",
+        dmg.display(),
+        size_bytes as f64 / 1_000_000.0
+    );
+    println!("    sha256: {sha256}");
+    Ok(Packaged {
+        path: dmg,
+        sha256,
+        size_bytes,
+    })
+}
+
+/// Per-arch DMG assembly is macOS end-to-end (restage + hdiutil); refuse
+/// plainly elsewhere, exactly like [`build_in_stage`].
+#[cfg(not(unix))]
+pub fn create_arch_filtered(
+    _app: &Path,
+    _out_dir: &Path,
+    _short_version: &str,
+    _triple: &str,
+    _notarized: bool,
+) -> Result<Packaged, String> {
+    Err("per-arch DMG creation requires macOS (hdiutil); build releases on a Mac".into())
+}
+
 /// A scratch copy of the signed bundle with the toolchain seed removed, deleted
 /// on drop. `None` when the bundle carries no seed (an `ATERM_SEEDLESS=1` cut),
 /// in which case the caller archives the original and copies nothing.
@@ -215,19 +346,69 @@ impl Drop for SeedlessStage {
     }
 }
 
+/// How a restage treats the sealed toolchain seed.
+#[cfg(unix)]
+enum SeedFilter<'a> {
+    /// Delete the whole `.lproj` (the lean updater zip — updates never carry
+    /// the seed).
+    Remove,
+    /// Keep every signed manifest (`*.toml` + `*.toml.sig` — the registry's
+    /// index/roster/pkg quads travel INTACT, their signatures untouched) and
+    /// only the named artifact tarballs. The per-arch DMG lane: the keep-set
+    /// comes from `seedpack::assets_by_triple`, i.e. from signed `[[artifact]]`
+    /// target rows, never from filename conventions.
+    KeepAssets(&'a BTreeSet<String>),
+}
+
+/// What [`verify_restaged_bundle`] must find where the seed used to be.
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum SeedExpectation {
+    /// The lean zip: the `.lproj` must be GONE (a silent no-op strip once
+    /// shipped an 850 MB "updater zip"; see create_zip).
+    Absent,
+    /// A per-arch DMG: the `.lproj` must still exist and still carry the
+    /// signed registry head (`index.toml`) — a filter that deleted the
+    /// manifests would ship batteries the client cannot verify, which it
+    /// treats as no batteries at all.
+    FilteredPresent,
+}
+
 /// Copy `app` to a scratch stage and delete its `Contents/Resources/*.lproj`
 /// toolchain seed, returning the stage (or `None` when there is no seed to strip).
+/// The lean-zip specialization of [`restage_with_seed_filter`].
+#[cfg(unix)]
+fn strip_seed_into_stage(app: &Path, out_dir: &Path) -> Result<Option<SeedlessStage>, String> {
+    restage_with_seed_filter(app, out_dir, SeedFilter::Remove)
+}
+
+/// Copy `app` to a scratch stage and apply `filter` to its sealed toolchain
+/// seed, returning the stage (or `None` when there is no seed to filter).
 ///
 /// The ORIGINAL bundle is never touched: it is the notarized, stapled artifact the
 /// DMG was built from, and mutating it after signing is the one thing this whole
-/// area of the pipeline forbids.
+/// area of the pipeline forbids. Filtering the STAGE is legal for the same
+/// reason stripping it is: the payload lives in a `.lproj` codesign seals
+/// `optional = true`, so subtracting whole files from it leaves the signature
+/// and the stapled ticket valid — an assumption `verify_restaged_bundle` turns
+/// into a per-cut proof rather than leaving measured-once.
 #[cfg(unix)]
-fn strip_seed_into_stage(app: &Path, out_dir: &Path) -> Result<Option<SeedlessStage>, String> {
+fn restage_with_seed_filter(
+    app: &Path,
+    out_dir: &Path,
+    filter: SeedFilter<'_>,
+) -> Result<Option<SeedlessStage>, String> {
     let seed_rel = Path::new("Contents/Resources").join(atpkg::SEED_DIR_NAME);
     if !app.join(&seed_rel).is_dir() {
-        return Ok(None); // seedless cut — the zip is already lean
+        return Ok(None); // seedless cut — nothing to filter
     }
-    let dir = out_dir.join("zip-stage");
+    let dir = out_dir.join(match filter {
+        SeedFilter::Remove => "zip-stage".to_string(),
+        // Distinct per-filter stage dirs: the zip restage and two DMG restages
+        // run in the same dist/ during one cut, and sharing a path would let
+        // one lane archive another lane's half-built stage.
+        SeedFilter::KeepAssets(_) => format!("dmg-arch-stage-{}", std::process::id()),
+    });
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     let stage = SeedlessStage {
@@ -254,17 +435,64 @@ fn strip_seed_into_stage(app: &Path, out_dir: &Path) -> Result<Option<SeedlessSt
         )?;
     }
     let seed = stage.app.join(&seed_rel);
-    let bytes = dir_size(&seed);
-    std::fs::remove_dir_all(&seed).map_err(|e| format!("strip {}: {e}", seed.display()))?;
-    println!(
-        "    stripped {} from the updater zip ({:.1} MB — the DMG keeps it)",
-        atpkg::SEED_DIR_NAME,
-        bytes as f64 / 1_000_000.0
-    );
+    match filter {
+        SeedFilter::Remove => {
+            let bytes = dir_size(&seed);
+            std::fs::remove_dir_all(&seed)
+                .map_err(|e| format!("strip {}: {e}", seed.display()))?;
+            println!(
+                "    stripped {} from the updater zip ({:.1} MB — the DMG keeps it)",
+                atpkg::SEED_DIR_NAME,
+                bytes as f64 / 1_000_000.0
+            );
+        }
+        SeedFilter::KeepAssets(keep) => {
+            // Subtract whole artifact files; NEVER touch a signed byte. Every
+            // `*.toml`/`*.toml.sig` rides (index, roster, and ALL pkg manifests
+            // + signatures — the per-asset sha256/tree_root the client
+            // re-verifies at install live inside them), and only tarballs the
+            // signed [[artifact]] rows name for this arch stay. Anything else
+            // would already have failed `seedpack::validate`'s
+            // nothing-unaccounted gate at cut time, so an unrecognized file
+            // here is a state that gate has never seen — fail, don't guess.
+            let mut kept = 0usize;
+            let mut dropped = 0usize;
+            let mut dropped_bytes = 0u64;
+            for entry in std::fs::read_dir(&seed)
+                .map_err(|e| format!("read staged seed {}: {e}", seed.display()))?
+            {
+                let entry = entry.map_err(|e| format!("read staged seed: {e}"))?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".toml") || name.ends_with(".toml.sig") {
+                    kept += 1;
+                    continue; // every signed manifest travels intact
+                }
+                if keep.contains(&name) {
+                    kept += 1;
+                    continue;
+                }
+                let path = entry.path();
+                dropped_bytes = dropped_bytes.saturating_add(
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                );
+                std::fs::remove_file(&path)
+                    .map_err(|e| format!("filter {}: {e}", path.display()))?;
+                dropped += 1;
+            }
+            println!(
+                "    filtered {}: kept {kept} file(s), dropped {dropped} other-arch \
+                 artifact(s) ({:.1} MB)",
+                atpkg::SEED_DIR_NAME,
+                dropped_bytes as f64 / 1_000_000.0
+            );
+        }
+    }
     Ok(Some(stage))
 }
 
-/// Prove the stripped bundle is (a) actually stripped and (b) still valid.
+/// Prove a restaged bundle is (a) actually restaged as intended and (b) still
+/// valid — it runs on EVERY restage, lean zip and per-arch DMG alike, so what
+/// each container ships is what was proven.
 ///
 /// This is the gate that turns the `.lproj` optional-seal property from a
 /// measured claim about a scratch bundle into a checked property of THIS cut's
@@ -273,32 +501,52 @@ fn strip_seed_into_stage(app: &Path, out_dir: &Path) -> Result<Option<SeedlessSt
 /// can be observed at all: `codesign --verify --deep --strict` covers the seal,
 /// and `spctl --assess` covers Gatekeeper's separate assessment path, which is
 /// NOT the same code path and is the one a stapled ticket participates in.
+/// Should a future macOS tighten the `.lproj` optional-seal rule, this gate
+/// stops the CUT — never the fleet.
 ///
-/// Fail-closed on both. A cut that cannot prove its updater container verifies
+/// Fail-closed on both. A cut that cannot prove its restaged container verifies
 /// must not publish one.
 #[cfg(unix)]
-fn verify_stripped_bundle(app: &Path, notarized: bool) -> Result<(), String> {
+fn verify_restaged_bundle(
+    app: &Path,
+    notarized: bool,
+    expect: SeedExpectation,
+) -> Result<(), String> {
     let seed = app.join("Contents/Resources").join(atpkg::SEED_DIR_NAME);
-    if seed.exists() {
-        return Err(format!(
-            "the updater zip's staged bundle STILL carries {} — the strip silently did \
-             nothing, and every client would download the seeded bundle on every update",
-            seed.display()
-        ));
+    match expect {
+        SeedExpectation::Absent => {
+            if seed.exists() {
+                return Err(format!(
+                    "the updater zip's staged bundle STILL carries {} — the strip silently did \
+                     nothing, and every client would download the seeded bundle on every update",
+                    seed.display()
+                ));
+            }
+        }
+        SeedExpectation::FilteredPresent => {
+            if !seed.join("index.toml").is_file() {
+                return Err(format!(
+                    "the per-arch DMG's staged bundle lost its signed registry head \
+                     ({}/index.toml) — the filter must subtract artifact tarballs only, \
+                     never a signed manifest",
+                    seed.display()
+                ));
+            }
+        }
     }
     run_quiet(
         Command::new("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict", "--verbose=2"])
             .arg(app),
-        "codesign --verify the stripped updater bundle",
+        "codesign --verify the restaged bundle",
     )
     .map_err(|e| {
         format!(
-            "{e}\n    The stripped bundle does NOT verify. This is the assumption the whole \
-             lean-update design rests on: `Contents/Resources/*.lproj` is supposed to be \
-             sealed `optional = true`, so removing it leaves the signature valid. If this \
-             fires, that is false for this bundle — do NOT ship; the updater zip would fail \
-             verification on every client."
+            "{e}\n    The restaged bundle does NOT verify. This is the assumption the whole \
+             lean-zip AND per-arch-DMG design rests on: `Contents/Resources/*.lproj` is \
+             supposed to be sealed `optional = true`, so subtracting from it leaves the \
+             signature valid. If this fires, that is false for this bundle — do NOT ship; \
+             the restaged container would fail verification on every client."
         )
     })?;
     // Gatekeeper's assessment is a DIFFERENT evaluation from codesign's, and it is
@@ -319,22 +567,23 @@ fn verify_stripped_bundle(app: &Path, notarized: bool) -> Result<(), String> {
         .output()
     {
         Ok(out) if out.status.success() => {
-            println!("    spctl accepts the stripped bundle (notarization leg proven)");
+            println!("    spctl accepts the restaged bundle (notarization leg proven)");
             Ok(())
         }
         Ok(out) => {
             let why = String::from_utf8_lossy(&out.stderr).trim().replace('\n', "; ");
             if notarized {
                 Err(format!(
-                    "the STRIPPED updater bundle is rejected by Gatekeeper: {why}. This cut is \
+                    "the RESTAGED bundle is rejected by Gatekeeper: {why}. This cut is \
                      Developer-ID signed and notarized, so this is decisive: the stapled ticket \
-                     does not survive removing the `.lproj` payload, and the lean updater zip \
-                     would fail verification on every client. Do not publish — re-examine the \
-                     lean-zip design (docs/GOLDEN-INSTALL-PATH.md §4)."
+                     does not survive subtracting from the `.lproj` payload, and this restaged \
+                     container would fail verification on every client. Do not publish — \
+                     re-examine the lean-zip / per-arch-DMG design \
+                     (docs/GOLDEN-INSTALL-PATH.md §4)."
                 ))
             } else {
                 println!(
-                    "    NOTE: spctl did not accept the stripped bundle — {why}. Expected on an \
+                    "    NOTE: spctl did not accept the restaged bundle — {why}. Expected on an \
                      ad-hoc/unsigned cut (no signing identity exists, so spctl rejects \
                      everything); this check becomes FATAL on a notarized cut."
                 );
@@ -344,8 +593,8 @@ fn verify_stripped_bundle(app: &Path, notarized: bool) -> Result<(), String> {
         Err(e) => {
             if notarized {
                 Err(format!(
-                    "could not run spctl ({e}) — a notarized cut must not publish an updater \
-                     zip whose Gatekeeper acceptance is unknown"
+                    "could not run spctl ({e}) — a notarized cut must not publish a restaged \
+                     container whose Gatekeeper acceptance is unknown"
                 ))
             } else {
                 println!("    NOTE: could not run spctl ({e}) — notarization leg unchecked");

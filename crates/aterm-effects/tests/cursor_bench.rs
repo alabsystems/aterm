@@ -95,6 +95,10 @@ fn saturated_sweep(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
             2 * SWEEP - phase - 1
         };
         cursor.1 = BASE + off as u16;
+        // Synthetic typing must carry the same explicit provenance as the
+        // shipping host; otherwise the anti-stray gate correctly rejects this
+        // benchmark's raw cursor deltas and the saturation guard is vacuous.
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some(cursor), now, &config, geometry, &mut quads);
     }
     (glow, now, cursor)
@@ -195,6 +199,7 @@ fn bench_cursor_rainbow_hot_ribbon_worstcase() {
             dir = -dir;
         }
         col = (col as i32 + dir) as u16;
+        glow.note_synthetic_typed(*now, 1);
         glow.tick(Some((row, col)), *now, &config, geometry, quads);
     };
     for _ in 0..1_200 {

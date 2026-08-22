@@ -98,6 +98,7 @@ fn space_cell() -> RenderCell {
         bg: [0x11, 0x13, 0x18],
         wide: false,
         emoji_presentation: false,
+        text_presentation: false,
         bold: false,
         italic: false,
         underline: UnderlineStyle::None,

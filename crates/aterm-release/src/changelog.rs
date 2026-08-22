@@ -273,12 +273,32 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 /// Only the release body gets the preamble. The manifest's `changelog` and the
 /// in-app Software Update notes stay the rolled section verbatim (spec §3) —
 /// an installed copy already knows what aterm is.
-pub fn release_notes_document(version: &str, changelog_body: &str) -> String {
+///
+/// `intel_dmg` — whether this release carries the per-arch `-x86_64` DMG
+/// variant (the cut knows; docs must not name an asset the release lacks, and
+/// an arm64-only or seedless cut still ships an honest asset guide).
+pub fn release_notes_document(version: &str, changelog_body: &str, intel_dmg: bool) -> String {
+    // Sizes are ballpark labels for a reader scanning the asset list, not
+    // records (the `.sha256` sidecars are the records): measured on the first
+    // per-arch pair built from the real v0.46.0 app — 1,161.6 MB arm64 /
+    // 959.7 MB Intel, dropping to ~1.11 GB / ~0.96 GB once the stripped+pruned
+    // seed (index 15) is sealed.
+    let intel_line = if intel_dmg {
+        format!(
+            "- `aterm-{version}-x86_64.dmg` — the same install for Intel Macs (~0.96 GB): \
+             identical signed app, the seed carries that architecture's binaries \
+             instead.\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "**aterm** is the batteries-included terminal for AI. New here? What each file is:\n\
          \n\
-         - `aterm-{version}.dmg` — the full batteries-included install (~1.1 GB): the app \
-         plus the offline ALab toolchain seed, so first launch needs no network.\n\
+         - `aterm-{version}.dmg` — the full batteries-included install for Apple silicon \
+         (~1.1 GB): the app plus the offline ALab toolchain seed, so first launch needs \
+         no network.\n\
+         {intel_line}\
          - `aterm-{version}-mac.zip` — the same signed, notarized app alone (~26 MB); the \
          toolchain installs on demand via `aterm pkg install --default-set`.\n\
          - `.sha256` files verify a download: `shasum -a 256 -c <asset>.sha256`.\n\
@@ -350,15 +370,22 @@ mod tests {
     #[test]
     fn the_release_body_is_preamble_then_the_changelog_verbatim() {
         let body = "### Fixed\n- a thing\n- another";
-        let doc = release_notes_document("0.44.0", body);
+        let doc = release_notes_document("0.44.0", body, true);
         // The preamble names THIS release's exact asset names, so a reader can
         // match the guide against the asset list one screen below it.
         assert!(doc.starts_with("**aterm** is the batteries-included terminal for AI."));
         assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
+        assert!(doc.contains("`aterm-0.44.0-x86_64.dmg`"), "{doc}");
         assert!(doc.contains("`aterm-0.44.0-mac.zip`"), "{doc}");
         assert!(doc.contains("shasum -a 256 -c"), "{doc}");
         assert!(doc.contains("atpkg-index-N"), "{doc}");
         // Changelog below the rule, byte-for-byte, newline-terminated.
         assert!(doc.ends_with(&format!("\n---\n\n{body}\n")), "{doc}");
+
+        // A release WITHOUT the Intel variant (arm64-only ack, seedless, or any
+        // pre-pair cut) must not advertise an asset it does not carry.
+        let doc = release_notes_document("0.44.0", body, false);
+        assert!(!doc.contains("x86_64.dmg"), "{doc}");
+        assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
     }
 }

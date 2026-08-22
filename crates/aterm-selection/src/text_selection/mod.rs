@@ -209,6 +209,33 @@ impl TextSelection {
         self.end
     }
 
+    /// SELECTION CUSTODY Phase 4: does this selection overlap the ABSOLUTE row band
+    /// `lo_abs..=hi_abs`?
+    ///
+    /// Anchors are in live-screen-relative space (0 = top visible row at the LIVE
+    /// bottom, negative = scrollback), so `live_top_abs + row` lifts them into the
+    /// absolute space the grid records damage in. `live_top_abs` is the caller's
+    /// `absolute_row_counter - visible_rows` — the same quantity
+    /// `Grid::visible_to_absolute` builds on, and likewise independent of
+    /// `display_offset`.
+    ///
+    /// This is the ONE place the two coordinate systems meet. Deliberately not a
+    /// representation change: the anchors stay relative, and the conversion happens
+    /// at the damage boundary only.
+    #[must_use]
+    pub fn intersects_absolute_band(&self, live_top_abs: u64, lo_abs: u64, hi_abs: u64) -> bool {
+        if self.state == SelectionState::None {
+            return false;
+        }
+        let base = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
+        let to_abs = |row: i32| base.saturating_add(i64::from(row));
+        let (a, b) = (to_abs(self.start.row), to_abs(self.end.row));
+        let (sel_lo, sel_hi) = if a <= b { (a, b) } else { (b, a) };
+        let lo = i64::try_from(lo_abs).unwrap_or(i64::MAX);
+        let hi = i64::try_from(hi_abs).unwrap_or(i64::MAX);
+        sel_lo <= hi && lo <= sel_hi
+    }
+
     /// Get the normalized start (the anchor that comes first).
     ///
     /// For block selection, returns the top-left corner.

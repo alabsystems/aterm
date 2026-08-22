@@ -277,7 +277,7 @@ fn run_ink(style: GlowStyle, total: usize, split_wrap_burst: bool) -> Run {
         t += Duration::from_millis(16);
         // The app_input seam: a plain Character keypress arms the typed hint
         // BEFORE its echo/repaint reaches the terminal.
-        glow.note_typed(t);
+        glow.note_synthetic_typed(t, 1);
         if split_wrap_burst && is_wrap_key {
             let (head, tail) = ink_burst_split(&typed);
             term.process(&head);
@@ -357,7 +357,7 @@ fn run_zsh(style: GlowStyle, total: usize) -> Run {
     for _n in 1..=total {
         let pre = sample(&term);
         t += Duration::from_millis(16);
-        glow.note_typed(t);
+        glow.note_synthetic_typed(t, 1);
         term.process(b"x");
         let post = sample(&term);
         // The autowrap move: previous frame on TEXT0, this frame on TEXT0+1.

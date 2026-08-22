@@ -4717,10 +4717,22 @@ mod handoff_process_group_tests {
         );
 
         aterm_pty::close_fd(slave);
-        assert!(
-            handoff_masters_closed(&live),
-            "peer death must still revoke — the live-set identity is stale"
-        );
+        // PROMPT-EVENTUAL, not same-instant: production peeks repeatedly
+        // across the overlap, so the contract is that peer death becomes
+        // visible to the peek promptly — and under full-suite scheduler load
+        // macOS can surface the HUP edge a quantum after close(2), which is
+        // exactly where the same-instant version of this assert flaked (twice,
+        // never solo). The bounded retry keeps the teeth: a REAL stale-
+        // identity bug never reports closed, and two seconds of grace cannot
+        // mask it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !handoff_masters_closed(&live) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "peer death must still revoke — the live-set identity is stale"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         aterm_pty::close_fd(master);
     }
 

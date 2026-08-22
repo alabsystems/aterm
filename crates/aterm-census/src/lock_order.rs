@@ -159,7 +159,8 @@ pub const LOCK_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits 
         match the zero-arg token.
       - OS FILE-ADVISORY LOCKS: `.lock()`/`.try_lock()` on a receiver whose live
         `let` binding (same fn, still in scope) lexically constructs a
-        std::fs::File (`File::open(`/`File::create(`/`OpenOptions::new()…open(`)
+        std::fs::File (`File::open(`/`File::create(`/`OpenOptions::new()…open(`,
+        or an explicit `: std::fs::File =` ascription — compiler-enforced)
         is the flock-class OS ADVISORY lock, not an in-process mutex. Such sites
         are categorized and listed separately and EXCLUDED from the mutex order
         graph: their waits are against OTHER PROCESSES, which an in-process lock
@@ -361,6 +362,18 @@ fn is_file_binding_rhs(line: &str) -> bool {
         || line.contains("File::create(")
         || line.contains("File::create_new(")
         || (line.contains("OpenOptions::new()") && line.contains(".open("))
+        // An EXPLICIT type ascription on the binding is compiler-enforced —
+        // stronger than any constructor-shape inference, and the shape that
+        // keeps evidence alive when the constructor moves behind a helper
+        // (aterm-update-core's `FileLock::open_lock_file` refactor is what
+        // silently demoted the update flock into the mutex graph and tripped
+        // the categorization existence test, 2026-08-22). Exact-suffix match
+        // (`… =` after the path) so a generic like `Option<std::fs::File>`
+        // never qualifies; the bare `File` spelling is deliberately NOT
+        // accepted — unlike `File::open(`, a bare-name ascription carries no
+        // constructor token to anchor it to std.
+        || line.contains(": std::fs::File =")
+        || line.contains(": fs::File =")
 }
 
 /// Raw-pointer-PRODUCING method names: a zero-arg `.read()` whose receiver is
@@ -3754,6 +3767,36 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_file_ascription_is_evidence_and_generics_are_not() {
+        // The compiler-enforced ascription arm: a binding declared
+        // `: std::fs::File` is File evidence even when the constructor lives
+        // behind a helper (the exact shape whose loss silently graphed the
+        // update flock as a mutex, 2026-08-22). A GENERIC mentioning the type
+        // (`Option<std::fs::File>`) is NOT the ascription and must stay
+        // fail-closed UNKNOWN.
+        let out = run_synth(
+            "fileascription",
+            "fn ledger_lock(path: &Path) -> Option<std::fs::File> {\n    \
+             let f: std::fs::File = open_lock_file(path).ok()?;\n    \
+             f.lock().ok()?;\n    Some(f)\n}\n\
+             fn generic_is_not_evidence(path: &Path) {\n    \
+             let g: Option<std::fs::File> = maybe_file(path);\n    \
+             let g = g.unwrap();\n    g.lock().unwrap();\n}\n",
+        );
+        assert!(out.ok, "GREEN expected:\n{}", out.log);
+        assert!(
+            out.log.contains("1 OS file-advisory"),
+            "the ascribed binding is advisory evidence; log:\n{}",
+            out.log
+        );
+        assert!(
+            out.log.contains("1 UNKNOWN-identity site(s)"),
+            "the generic-typed rebind must stay UNKNOWN; log:\n{}",
+            out.log
+        );
+    }
+
+    #[test]
     fn synthetic_file_advisory_lock_joins_no_mutex_edges() {
         // A file lock taken while a mutex is held, then another mutex: the
         // mutex->mutex order survives, but NO edge may touch the advisory
@@ -4519,11 +4562,12 @@ mod tests {
 
     #[test]
     fn file_advisory_locks_are_categorized_on_this_tree() {
-        // The two real OS file-advisory sites (`restore::with_restore_lock`'s
+        // The three real OS file-advisory sites (`restore::with_restore_lock`'s
         // sibling-lock flock over the restore manifest; the updater's
-        // install-ledger lock in aterm-update-core, picked up by the 2026-07-13
-        // crate-set widening) must be classified by File EVIDENCE, listed with
-        // their binding spans, and excluded from the mutex graph —
+        // install-ledger lock in aterm-update-core — its blocking `acquire`
+        // plus the bounded-wait `try_lock` loop `acquire_within` grew for the
+        // launch path) must be classified by File EVIDENCE, listed with their
+        // binding spans, and excluded from the mutex graph —
         // existence-checked here so the classification cannot silently rot into
         // UNKNOWN (or vanish).
         //
@@ -4532,10 +4576,18 @@ mod tests {
         // has carried ZERO `.lock()` calls since. The assertion had been failing
         // on `main` for an unknown span, i.e. this gate was dark. Naming the
         // ACTUAL site restores its teeth.
+        //
+        // NOTE (2026-08-22): the update flock's constructor moved behind
+        // `FileLock::open_lock_file`, which stripped the binding of its lexical
+        // File evidence and silently GRAPHED the flock as an in-process mutex —
+        // this test is what caught it. The bindings now carry an explicit
+        // `: std::fs::File` ascription (compiler-enforced evidence the census
+        // accepts), and the count includes `acquire_within`'s try_lock loop.
         let out = run_lock_order_census(&repo_root());
         assert!(
-            out.log.contains("2 OS file-advisory"),
-            "expected exactly the restore-manifest + update-core flocks in the \
+            out.log.contains("3 OS file-advisory"),
+            "expected exactly the restore-manifest flock plus update-core's two \
+             sites (blocking acquire + the bounded-wait try_lock loop) in the \
              advisory category:\n{}",
             out.log
         );

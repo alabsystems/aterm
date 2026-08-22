@@ -54,7 +54,38 @@ struct WinSession {
     /// HPCON; swapped to 0 once `ClosePseudoConsole` ran (idempotence guard).
     /// The mutex also makes UI-thread/control-thread resizes safe against the
     /// waiter's close (resize holds it across `ResizePseudoConsole`).
+    ///
+    /// **0 for an ADOPTED session** ([`adopt_handoff`]): in the DefTerm inbound
+    /// handoff conhost already created the pseudoconsole and kept it, so there
+    /// is no HPCON for us to hold, resize or close. The same mutex then guards
+    /// [`signal`](Self::signal) instead — see [`resize`] and
+    /// [`close_pseudoconsole`], which both branch on which of the two is live.
     hpc: Mutex<isize>,
+    /// The ConPTY SIGNAL PIPE's write end, for ADOPTED sessions only (0 for a
+    /// session we spawned ourselves, which resizes through its HPCON).
+    ///
+    /// This is the same handle `ResizePseudoConsole`/`ClosePseudoConsole` use
+    /// internally: verified by disassembling `kernelbase!ResizePseudoConsole`
+    /// on Windows 11 26200, which loads `hPC->[0]` and `WriteFile`s the 6-byte
+    /// packet [`encode_resize_signal`] builds; `ClosePseudoConsole` closes that
+    /// same `[0]` handle (plus `[8]`/`[0x10]`) to tear the session down. So an
+    /// adopted session reproduces both operations by hand on this one handle.
+    ///
+    /// **This mutex — not the `hpc` one — is what makes the adopted lane safe.**
+    /// [`resize`] holds THIS guard across its `WriteFile`;
+    /// [`close_pseudoconsole`] swaps the handle to 0 under THIS guard and calls
+    /// `CloseHandle` outside it. So a resize either wins the lock and writes to
+    /// a handle that is still open, or loses it and reads the 0 that says the
+    /// session is already gone — never a use-after-close.
+    ///
+    /// The `hpc` guard does NOT cover it: `close_pseudoconsole` takes the hpc
+    /// lock in a `let` initializer, so that guard is dropped at the semicolon
+    /// before this lock is acquired at all. What rules out a lock-order
+    /// inversion is instead that the order is consistently hpc → signal
+    /// everywhere it matters ([`resize`] holds `hpc` while taking `signal`;
+    /// [`close_pseudoconsole`] releases `hpc` first; `Drop` takes only this
+    /// one), and nothing ever takes `hpc` while holding `signal`.
+    signal: Mutex<isize>,
     /// Write end of the child-stdin pipe (we `WriteFile` keystrokes here).
     input: isize,
     /// Read end of the child-stdout pipe (we `ReadFile` VT output here).
@@ -86,6 +117,10 @@ impl Drop for WinSession {
     fn drop(&mut self) {
         // Close every owned handle. The job close is last-handle by construction
         // (only this struct holds it), so KILL_ON_JOB_CLOSE sweeps any orphans.
+        // `signal` is normally already 0 (the waiter's teardown swapped it out),
+        // but a session dropped before its waiter ran still owns it — take it
+        // through the mutex so the close happens exactly once either way.
+        let signal = std::mem::replace(&mut *self.signal.lock_or_recover(), 0);
         for h in [
             self.input,
             self.output,
@@ -93,6 +128,7 @@ impl Drop for WinSession {
             self.conhost,
             self.job,
             self.close_evt,
+            signal,
         ] {
             if h != 0 {
                 // SAFETY: each handle is owned solely by this session entry and
@@ -116,16 +152,55 @@ fn session(master: i32) -> Option<Arc<WinSession>> {
     SESSIONS.lock_or_recover().get(&master).cloned()
 }
 
-/// Find a session by child pid (linear scan — session counts are tiny).
+/// Find THE session whose child has this pid (linear scan — session counts are
+/// tiny). `None` when no session matches **or when more than one does**.
+///
+/// AMBIGUITY IS REFUSED, deliberately. The pid-keyed public ops ([`hangup`],
+/// [`reap`], [`exit_code`]) carry the Unix `killpg`/`waitpid` signatures, so a
+/// pid is all they get — but a pid is NOT a guaranteed unique key over this
+/// registry:
+///
+/// * A session we SPAWNED pins its pid: the entry holds an open process handle,
+///   so the number cannot be recycled while the entry lives. Those never
+///   collide with each other.
+/// * An ADOPTED session ([`adopt_handoff`]) takes whatever client conhost hands
+///   it, and the SAME client can be handed off more than once. A console
+///   program that calls `FreeConsole` and then `AllocConsole` (or is
+///   re-`AttachConsole`d) gets a fresh pseudoconsole and a fresh handoff under
+///   its ORIGINAL pid, while the previous entry is still registered — that one
+///   is removed only when the frontend's EOF path reaches [`close_master`],
+///   which is asynchronous. Two live entries, one pid.
+///
+/// A first-match scan resolved that window to an ARBITRARY entry (`HashMap`
+/// iteration order, which Rust randomizes per process), so closing one tab
+/// could hang up or reap the OTHER console. For an adopted session that console
+/// is somebody else's program — an installer mid-write is the case this whole
+/// lane is built to protect — so acting on the wrong one is the worst outcome
+/// available. Refusing lands instead on the miss semantics every caller already
+/// documents (`hangup`/`reap` no-op, `exit_code` → `None`): doing nothing to a
+/// console we cannot uniquely identify beats doing something to the wrong one,
+/// and the tab still tears down through its reader EOF / `close_master` path,
+/// which is master-keyed and never ambiguous.
+///
+/// `pid <= 1` is refused for the same reason: an adopted session whose process
+/// handle carried no query rights records pid 0 (see [`adopt_handoff`]), and
+/// several of those can coexist.
 fn session_by_pid(pid: i32) -> Option<Arc<WinSession>> {
     if pid <= 1 {
         return None;
     }
-    SESSIONS
-        .lock_or_recover()
-        .values()
-        .find(|s| s.pid == pid as u32)
-        .cloned()
+    let map = SESSIONS.lock_or_recover();
+    let mut hit: Option<Arc<WinSession>> = None;
+    for s in map.values() {
+        if s.pid == pid as u32 {
+            if hit.is_some() {
+                // Two live sessions claim this pid — refuse rather than guess.
+                return None;
+            }
+            hit = Some(Arc::clone(s));
+        }
+    }
+    hit
 }
 
 /// Pids of every console-host child (`conhost.exe` / `OpenConsole.exe`) of
@@ -177,12 +252,28 @@ fn conhost_children() -> Vec<u32> {
 /// Swap the session's HPCON to 0 under its lock and close it OUTSIDE the lock
 /// (`ClosePseudoConsole` can block until the out pipe drains; a resize on the
 /// UI thread must never wait behind that). Idempotent.
+///
+/// ADOPTED sessions ([`adopt_handoff`]) have no HPCON — conhost owns the
+/// pseudoconsole — so the equivalent teardown is to close the SIGNAL PIPE:
+/// conhost's `PtySignalInputThread` sees the broken pipe and tears its session
+/// down, which is precisely what `ClosePseudoConsole` does under the hood
+/// (verified: it closes `hPC->[0]`, the signal pipe, first). Closing the pipe
+/// is also the only teardown lever we have — we must NOT `TerminateProcess`
+/// the client, because the DefTerm client is somebody else's program (an
+/// installer mid-write, a `.bat` mid-copy) and killing it on window-close would
+/// be strictly worse than the console going away under it.
 fn close_pseudoconsole(s: &WinSession) {
     let hpc = std::mem::replace(&mut *s.hpc.lock_or_recover(), 0);
     if hpc != 0 {
         // SAFETY: the swap-to-0 makes this thread the sole closer; conhost
         // flushes pending output and breaks the out pipe (the reader's EOF).
         unsafe { ffi::ClosePseudoConsole(hpc) };
+        return;
+    }
+    let signal = std::mem::replace(&mut *s.signal.lock_or_recover(), 0);
+    if signal != 0 {
+        // SAFETY: same swap-to-0 sole-closer discipline as the HPCON above.
+        unsafe { ffi::CloseHandle(signal) };
     }
 }
 
@@ -217,7 +308,13 @@ fn waiter(s: &WinSession) {
         // session Arc so the handles/thread don't leak per closed tab).
         // SAFETY: process/job handles owned by the live session entry.
         let g = unsafe { ffi::WaitForSingleObject(s.process, CLOSE_GRACE_MS) };
-        if g == ffi::WAIT_TIMEOUT {
+        // `job == 0` is an ADOPTED (DefTerm handoff) session: we did not create
+        // the client, it is not in a job of ours, and there is deliberately no
+        // escalation — see `close_pseudoconsole`. The waiter still returns here
+        // (the wait above is bounded), so nothing leaks; the client simply keeps
+        // whatever lifetime the console-close signal gave it, exactly as it
+        // would have under conhost.
+        if g == ffi::WAIT_TIMEOUT && s.job != 0 {
             unsafe { ffi::TerminateJobObject(s.job, 1) };
             unsafe { ffi::WaitForSingleObject(s.process, CLOSE_KILL_REST_MS) };
         }
@@ -637,6 +734,9 @@ pub fn spawn_shell_with_pid(
     let pid = pi.dwProcessId as i32;
     let session = Arc::new(WinSession {
         hpc: Mutex::new(pcon.release()),
+        // We own the HPCON, so we resize/close through it; the signal pipe is
+        // conhost's private business here (only the adopted lane touches one).
+        signal: Mutex::new(0),
         input: in_write.into_raw(),
         output: out_read.into_raw(),
         process: h_process.into_raw(),
@@ -661,6 +761,166 @@ pub fn spawn_shell_with_pid(
         return Err(io::Error::other("failed to spawn the ConPTY waiter thread"));
     }
     Ok(SpawnedShell { master: key, pid })
+}
+
+/// Close the handles an inbound handoff carried, skipping the 0 slots (a
+/// handoff may legitimately arrive without a signal pipe). Used only on the
+/// [`adopt_handoff`] failure paths that CONSUME the handoff — see its
+/// `# Ownership` section, whose whole value to the broker is that it never has
+/// to guess which side owns what.
+fn release_handoff_handles(handles: [isize; 4]) {
+    for h in handles {
+        if h != 0 {
+            // SAFETY: each handle was handed to us and is not owned by any live
+            // session — this runs only before a session was built, or instead
+            // of building one.
+            unsafe { ffi::CloseHandle(h) };
+        }
+    }
+}
+
+/// ADOPT an inbound Windows 11 default-terminal (DefTerm) handoff: build a
+/// session around handles conhost ALREADY created, instead of creating our own.
+///
+/// This is the second constructor the DefTerm lane needs, and it is the exact
+/// inverse of [`spawn_shell_with_pid`] in who owns what. On the normal path we
+/// create the pipes, call `CreatePseudoConsole`, and `CreateProcessW` the child.
+/// On this path a console program was launched by somebody else — a
+/// double-clicked `.bat`, `Win+R cmd`, an installer shelling out — conhost
+/// created the pseudoconsole for it, then handed the far ends to the registered
+/// default terminal over COM. **We do NOT call `CreatePseudoConsole`; conhost
+/// owns it**, so `hpc` stays 0 and every operation that would have gone through
+/// the HPCON goes through the SIGNAL PIPE instead ([`resize`],
+/// [`close_pseudoconsole`]).
+///
+/// Handle roles, named from OUR side of the pipes so there is nothing to
+/// misread (the COM interface's own parameter names are written from conhost's
+/// perspective, and mapping them is the BROKER's job, not this function's):
+/// * `in_pipe` — we `WriteFile` keystrokes into it; conhost reads.
+/// * `out_pipe` — we `ReadFile` VT output from it; conhost writes.
+/// * `signal_pipe` — we write ConPTY signal packets into it (resize; closing it
+///   tears the session down). Pass 0 if the handoff carried none: the session
+///   still works, it just cannot be resized, which is strictly better than
+///   refusing to show the user their console at all.
+/// * `client_process` — the console program's process handle. LOAD-BEARING: the
+///   waiter keys EOF on exactly this handle, so it must be the client, never
+///   conhost. If it is 0 there is nothing to wait on and we fail rather than
+///   register a session that can never exit (a tab that never closes).
+///
+/// # Ownership
+/// On success the session OWNS all four handles and closes them on drop — the
+/// caller must not close them.
+///
+/// On failure the rule is by ERROR KIND, so the broker never has to guess or
+/// parse a message:
+/// * `InvalidInput` — the refusal happens before anything is taken, so the
+///   caller still owns every handle and can answer the COM call with an error
+///   and let conhost fall back. This is the only failure that leaves something
+///   for a fallback to use.
+/// * `Other` — the handles are CONSUMED and already closed; the caller must not
+///   close them again. That is true of the waiter-spawn failure (the session
+///   exists, and dropping it closes them) and it is made true of the
+///   `CreateEventW` failure by [`release_handoff_handles`], which closes all
+///   four before returning. Uniform closure is deliberate: the alternative
+///   would be a broker that leaks four handles precisely in the
+///   handle-exhaustion scenario that produced the failure.
+///
+/// # Errors
+/// `InvalidInput` when `client_process` is 0 (see above). `Other` when the
+/// hangup event cannot be created, or when the waiter thread cannot be spawned
+/// — in the latter case the just-registered session is removed again, because
+/// without a waiter EOF never fires and the tab could never close.
+///
+/// The waiter, the reader/writer paths, the registry and the exit-code plumbing
+/// are REUSED VERBATIM: the waiter already keys on the client process handle,
+/// which is exactly what the handoff hands us. That reuse is the whole reason
+/// this lane is small.
+pub fn adopt_handoff(
+    in_pipe: isize,
+    out_pipe: isize,
+    signal_pipe: isize,
+    client_process: isize,
+) -> io::Result<SpawnedShell> {
+    if client_process == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "adopt_handoff: a handoff without a client process handle has no EOF source \
+             (the waiter keys on it); refusing to register an unexitable session",
+        ));
+    }
+    // The hangup event. LOAD-BEARING, and not merely for `hangup`: the waiter
+    // blocks on the ARRAY [process, close_evt], and `WaitForMultipleObjects`
+    // fails IMMEDIATELY (WAIT_FAILED) if any handle in the array is invalid. A
+    // 0 here would therefore drop the waiter straight through to its teardown
+    // and close the signal pipe the instant the session was adopted — the
+    // console would flash and vanish. Created BEFORE the session is registered,
+    // so a failure yields no session at all rather than a live one that can
+    // never be hung up (the same rule the spawn path follows).
+    // SAFETY: NULL attrs/name; manual-reset (TRUE), initially unsignaled.
+    let close_evt = unsafe { ffi::CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+    if close_evt == 0 {
+        // CONSUME, so the `# Ownership` rule stays "InvalidInput ⇒ yours, Other
+        // ⇒ ours" with no third case for the broker to special-case. Closing the
+        // pipes lets conhost tear its own session down; leaking them under the
+        // handle exhaustion that caused this would strand the client's console.
+        release_handoff_handles([in_pipe, out_pipe, signal_pipe, client_process]);
+        return Err(io::Error::other(
+            "adopt_handoff: CreateEventW failed; refusing to register a session \
+             the waiter cannot wait on and nothing can hang up",
+        ));
+    }
+
+    // The child's pid, for the pid-keyed public ops (hangup/reap/exit_code).
+    // A failure here is NOT fatal: 0 simply means those pid-keyed lookups miss
+    // for this session, and every one of them is documented as a no-op on a
+    // miss. The master-keyed ops (read/write/resize/close) are unaffected.
+    // SAFETY: `client_process` is a live process handle owned by the caller
+    // until we take ownership below.
+    let pid = unsafe { ffi::GetProcessId(client_process) };
+
+    let session = Arc::new(WinSession {
+        // No HPCON: conhost kept the pseudoconsole. This 0 is what makes every
+        // HPCON-shaped operation take its signal-pipe branch.
+        hpc: Mutex::new(0),
+        signal: Mutex::new(signal_pipe),
+        input: in_pipe,
+        output: out_pipe,
+        process: client_process,
+        // No conhost handle: the focus-boost lane wants PROCESS_SET_INFORMATION
+        // on the host, and the handoff's server-process handle is not plumbed
+        // through this signature. The boost then covers nothing for adopted
+        // sessions rather than the wrong process — `set_focus_boost` already
+        // treats 0 as "not discovered" on the spawn path, so this is the
+        // existing, tested degradation, not a new one.
+        conhost: 0,
+        // No job: we did not create this process and must never sweep it. The
+        // client belongs to whoever launched it; see `waiter`'s `s.job != 0`
+        // guard for why there is deliberately no kill escalation here.
+        job: 0,
+        close_evt,
+        pid,
+        exit_code: Mutex::new(None),
+    });
+    let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
+    SESSIONS.lock_or_recover().insert(key, Arc::clone(&session));
+    let waiter_session = Arc::clone(&session);
+    let spawned = std::thread::Builder::new()
+        .name("aterm-pty-waiter".into())
+        .spawn(move || waiter(&waiter_session));
+    if spawned.is_err() {
+        // Same rule as the spawn path: without the waiter, EOF never fires and
+        // the tab never closes. Unlike the spawn path there is no job to
+        // terminate — dropping the last Arc closes the handles, which breaks
+        // the pipes and lets conhost tear its own session down.
+        SESSIONS.lock_or_recover().remove(&key);
+        return Err(io::Error::other(
+            "failed to spawn the ConPTY waiter thread for an adopted handoff",
+        ));
+    }
+    Ok(SpawnedShell {
+        master: key,
+        pid: pid as i32,
+    })
 }
 
 /// The `lpCurrentDirectory` for the spawn, as a wide NUL-terminated buffer.
@@ -701,7 +961,9 @@ fn paths_eq_ignore_ascii_case(a: &std::path::Path, b: &std::path::Path) -> bool 
 /// SIGHUP-on-controlling-tty, and exits; the broken out pipe then EOFs the
 /// reader. O(1) and non-blocking (the actual close runs on the waiter thread),
 /// so it is UI-thread-safe exactly like the Unix `killpg(SIGHUP)`. Best-effort
-/// no-op for a non-positive/unknown pid (the ESRCH contract).
+/// no-op for a non-positive/unknown pid (the ESRCH contract) — and for an
+/// AMBIGUOUS one: see [`session_by_pid`], which refuses a pid two live sessions
+/// claim rather than hang up an arbitrary one of them.
 pub fn hangup(pid: i32) {
     if pid <= 1 {
         return;
@@ -718,8 +980,10 @@ pub fn hangup(pid: i32) {
 /// escalation, killing the whole descendant tree like `killpg` — then wait out
 /// the rest of the ~2 s budget and record the exit code if the child signaled.
 /// Runs on the frontend's detached reaper thread exactly as on Unix.
-/// Best-effort; a no-op for a non-positive pid or an already-closed session
-/// (the ECHILD analog). Losing the race with [`close_master`]'s registry removal
+/// Best-effort; a no-op for a non-positive pid, an already-closed session (the
+/// ECHILD analog), or a pid two live sessions claim (see [`session_by_pid`] —
+/// escalating against a session we cannot identify could kill the wrong tree).
+/// Losing the race with [`close_master`]'s registry removal
 /// (the session is gone before this runs) is now BENIGN: the per-session waiter
 /// thread force-kills a close-surviving child via its job on a bounded wait (see
 /// [`waiter`] / `CLOSE_GRACE_MS`), so the SIGKILL escalation no longer depends on
@@ -735,7 +999,14 @@ pub fn reap(pid: i32) {
     };
     // SAFETY: process handle owned by the session Arc we hold.
     let mut r = unsafe { ffi::WaitForSingleObject(s.process, KILL_GRACE_MS) };
-    if r == ffi::WAIT_TIMEOUT {
+    // `job == 0` is an ADOPTED (DefTerm handoff) session — there is no job, and
+    // deliberately no escalation: the client is somebody else's program (an
+    // installer mid-write, a `.bat` mid-copy) that conhost handed us a handle
+    // to, not a shell we spawned. Killing it because a tab closed would be
+    // strictly worse than letting the console go away under it. The bare
+    // `TerminateJobObject(0, ..)` this replaces was already a harmless no-op;
+    // the guard makes the POLICY explicit rather than incidental.
+    if r == ffi::WAIT_TIMEOUT && s.job != 0 {
         // Still alive past the grace ⇒ escalate: kill the whole job tree.
         // SAFETY: job handle owned by the session Arc we hold.
         unsafe { ffi::TerminateJobObject(s.job, 1) };
@@ -754,7 +1025,9 @@ pub fn reap(pid: i32) {
 /// The recorded exit code of a spawned shell, once it has exited — the
 /// `waitpid(-1, &status)` replacement the aterm-cli Windows main loop needs to
 /// propagate the shell's exit status. `None` while the child runs, when the
-/// pid is unknown, or after [`close_master`] removed the session.
+/// pid is unknown, after [`close_master`] removed the session, or when two live
+/// sessions claim the pid — [`session_by_pid`] answers nothing rather than some
+/// other session's status.
 #[must_use]
 pub fn exit_code(pid: i32) -> Option<i32> {
     let s = session_by_pid(pid)?;
@@ -1026,10 +1299,51 @@ pub fn set_nonblocking(_master: i32, nonblocking: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// ConPTY signal-pipe opcode for a window resize.
+///
+/// MACHINE-VERIFIED, not recalled: `kernelbase!ResizePseudoConsole` on Windows
+/// 11 26200 materializes the literal `8` into the first `u16` of a 6-byte stack
+/// buffer (`lea r8d,[rbx+8]` / `mov [rsp+0x30],r8w`) and `WriteFile`s exactly 6
+/// bytes of it to `hPC->[0]`. See [`encode_resize_signal`].
+const PTY_SIGNAL_RESIZE_WINDOW: u16 = 8;
+
+/// Build ConPTY's 6-byte resize signal packet: `{opcode, columns, rows}`, three
+/// little-endian `u16`s IN THAT ORDER.
+///
+/// The column/row ORDER is the trap and the reason this is a separate, tested
+/// function: everything else in this module passes `rows, cols` (the Unix
+/// `winsize` habit), while the wire packet is `cols, rows` — the COORD `.X`
+/// before `.Y`. Verified against the shipping `kernelbase!ResizePseudoConsole`,
+/// which writes `dx` (COORD.X, columns) at buffer offset 2 and `ax`
+/// (COORD.Y, rows) at offset 4.
+///
+/// Counts are clamped through [`coord`] into ConPTY's positive `i16` range
+/// before the `u16` cast, so a caller's `0` or `u16::MAX` cannot become a
+/// negative COORD that `ResizePseudoConsole` would reject (the HPCON path
+/// rejects those explicitly — `test dx,dx / js error`) or that conhost would
+/// read as a garbage viewport on the adopted path.
+fn encode_resize_signal(rows: u16, cols: u16) -> [u8; 6] {
+    let c = coord(cols, rows);
+    let mut buf = [0u8; 6];
+    buf[0..2].copy_from_slice(&PTY_SIGNAL_RESIZE_WINDOW.to_le_bytes());
+    buf[2..4].copy_from_slice(&(c.x as u16).to_le_bytes());
+    buf[4..6].copy_from_slice(&(c.y as u16).to_le_bytes());
+    buf
+}
+
 /// Resize the pseudoconsole to `rows`×`cols`. Thread-safe: the session's HPCON
 /// mutex makes UI-thread + control-thread resizes safe against the waiter's
 /// `ClosePseudoConsole` (a closed session is a no-op). The result is ignored,
 /// like the Unix `TIOCSWINSZ` ioctl's. A fabricated/closed key is a no-op.
+///
+/// Two lanes, one lock EACH. A session WE spawned owns its HPCON and resizes
+/// through `ResizePseudoConsole` under the `hpc` lock. An ADOPTED session
+/// ([`adopt_handoff`]) has no HPCON — conhost kept the pseudoconsole — so it
+/// writes the same packet `ResizePseudoConsole` would have written, straight to
+/// the signal pipe conhost handed us, under the `signal` lock. Each branch is
+/// serialized against the waiter's teardown by the lock that owns ITS handle;
+/// see [`WinSession::signal`] for why the adopted branch cannot borrow the
+/// `hpc` guard's protection.
 pub fn resize(master: i32, rows: u16, cols: u16) {
     let Some(s) = session(master) else {
         return;
@@ -1039,6 +1353,32 @@ pub fn resize(master: i32, rows: u16, cols: u16) {
         // SAFETY: the HPCON is live while the lock is held (the waiter swaps it
         // to 0 under this same lock before closing).
         let _ = unsafe { ffi::ResizePseudoConsole(*g, coord(cols, rows)) };
+        return;
+    }
+    // Adopted lane. The `signal` MUTEX — not the `hpc` guard `g` — is what keeps
+    // this write off a closed handle: `close_pseudoconsole` swaps the handle to
+    // 0 under this same lock and closes it outside, so we either hold a live
+    // handle for the whole WriteFile or read the 0 that says it is gone. `g` is
+    // still in scope only to keep the lock order hpc → signal uniform (nothing
+    // anywhere takes `hpc` while holding `signal`, so there is no inversion).
+    let sig = s.signal.lock_or_recover();
+    if *sig != 0 {
+        let buf = encode_resize_signal(rows, cols);
+        // A 6-byte write to a signal pipe never blocks meaningfully (conhost's
+        // PtySignalInputThread is a dedicated reader on a 64 KiB pipe), so this
+        // is safe on the UI thread. Failure is ignored exactly like the HPCON
+        // branch's return code and the Unix `TIOCSWINSZ`'s: a dead conhost just
+        // means the session is already going away.
+        // SAFETY: `*sig` is a live pipe handle for as long as this guard is held.
+        let _ = unsafe {
+            ffi::WriteFile(
+                *sig,
+                buf.as_ptr(),
+                buf.len() as u32,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
     }
 }
 
@@ -1212,6 +1552,495 @@ mod tests {
         assert!(
             err.to_string().contains("fail-closed"),
             "error must describe the fail-closed refusal: {err}"
+        );
+    }
+
+    // ---- DefTerm inbound handoff: adopt_handoff + the signal-pipe resize ----
+
+    /// Access rights the adoption path actually depends on. `SYNCHRONIZE` is
+    /// the waiter's (it blocks on the client); `PROCESS_QUERY_LIMITED_INFORMATION`
+    /// is `GetProcessId`'s. We do NOT get to choose these in production — the
+    /// handoff hands us whatever conhost duplicated — which is exactly why the
+    /// pid is treated as optional.
+    const SYNCHRONIZE: u32 = 0x0010_0000;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x0000_1000;
+
+    /// `CREATE_NO_WINDOW` — the helper below must not flash a console.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// A REAL, DISTINCT client process for the adopted-session tests.
+    ///
+    /// Why not our own process (which is what these tests used to open): every
+    /// such session records the TEST PROCESS's pid, so two of them collide on
+    /// the one key `hangup`/`reap`/`exit_code` have — and the suite really did
+    /// go red about half the time because one test's `hangup` reached the other
+    /// test's session. A test whose subject is a pid-keyed operation needs a pid
+    /// of its own; anything else is testing the scheduler.
+    ///
+    /// `sort.exe` (System32, present on every Windows) blocks in `ReadFile` on
+    /// stdin until EOF. We hand it a pipe and never write to it, so its lifetime
+    /// is EXACTLY ours: it cannot exit early and make a teardown assertion pass
+    /// for the wrong reason, and it dies on `Drop`.
+    struct TestClient(std::process::Child);
+
+    impl TestClient {
+        fn spawn() -> Self {
+            use std::os::windows::process::CommandExt;
+            let exe = std::env::var_os("SystemRoot")
+                .map(|r| std::path::Path::new(&r).join("System32").join("sort.exe"))
+                .unwrap_or_else(|| std::path::PathBuf::from("sort.exe"));
+            let child = std::process::Command::new(exe)
+                .stdin(std::process::Stdio::piped()) // held open ⇒ it blocks
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .creation_flags(CREATE_NO_WINDOW)
+                .spawn()
+                .expect("spawning the System32 test client must succeed");
+            Self(child)
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// A handle with exactly the rights the adoption path needs, fresh each
+        /// call so the session can own and close it.
+        fn open(&self) -> isize {
+            // SAFETY: OpenProcess against a live child we are holding.
+            let h = unsafe {
+                ffi::OpenProcess(
+                    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                    0,
+                    self.0.id(),
+                )
+            };
+            assert_ne!(h, 0, "OpenProcess on the test client must succeed");
+            h
+        }
+
+        /// Still running? Guards teardown assertions against the vacuous pass
+        /// where the waiter woke because the CLIENT exited, not because of us.
+        fn is_alive(&mut self) -> bool {
+            matches!(self.0.try_wait(), Ok(None))
+        }
+    }
+
+    impl Drop for TestClient {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // The 6-byte ConPTY resize packet, pinned against the shipping
+    // kernelbase!ResizePseudoConsole (Windows 11 26200), which builds exactly
+    // this buffer and WriteFile()s 6 bytes of it to the signal pipe:
+    //   lea r8d,[rbx+8] ; mov [rsp+0x30],r8w   -> u16 opcode 8   at offset 0
+    //   mov [rsp+0x32],dx                      -> u16 COORD.X    at offset 2  (COLUMNS)
+    //   mov [rsp+0x34],ax                      -> u16 COORD.Y    at offset 4  (ROWS)
+    //   lea r8d,[rbx+6]                        -> 6 bytes written
+    // The column-before-row order is the whole point: every other function in
+    // this module takes (rows, cols).
+    #[test]
+    fn resize_signal_packet_is_opcode_then_columns_then_rows() {
+        let buf = encode_resize_signal(24, 80);
+        assert_eq!(buf.len(), 6, "ConPTY's resize signal is exactly 6 bytes");
+        assert_eq!(
+            &buf[0..2],
+            &8u16.to_le_bytes(),
+            "opcode must be PTY_SIGNAL_RESIZE_WINDOW (8), little-endian"
+        );
+        assert_eq!(
+            &buf[2..4],
+            &80u16.to_le_bytes(),
+            "offset 2 is COLUMNS (COORD.X) — not rows"
+        );
+        assert_eq!(
+            &buf[4..6],
+            &24u16.to_le_bytes(),
+            "offset 4 is ROWS (COORD.Y)"
+        );
+        // Whole-buffer form, so a reordering that happens to keep both halves
+        // individually plausible still fails.
+        assert_eq!(buf, [0x08, 0x00, 0x50, 0x00, 0x18, 0x00]);
+    }
+
+    // A non-square size cannot be symmetric, so a transposed encoder is caught
+    // even if the constants above were themselves wrong.
+    #[test]
+    fn resize_signal_is_not_transposed() {
+        let buf = encode_resize_signal(1, 999);
+        assert_eq!(u16::from_le_bytes([buf[2], buf[3]]), 999, "columns");
+        assert_eq!(u16::from_le_bytes([buf[4], buf[5]]), 1, "rows");
+    }
+
+    // Degenerate sizes must clamp into ConPTY's POSITIVE i16 COORD range: a raw
+    // 0 or 40000 reaching conhost is a zero/negative viewport. `coord` already
+    // clamps the HPCON path; the signal path must not bypass it.
+    #[test]
+    fn resize_signal_clamps_into_positive_coord_range() {
+        let zero = encode_resize_signal(0, 0);
+        assert_eq!(
+            u16::from_le_bytes([zero[2], zero[3]]),
+            1,
+            "0 cols clamps up to 1"
+        );
+        assert_eq!(
+            u16::from_le_bytes([zero[4], zero[5]]),
+            1,
+            "0 rows clamps up to 1"
+        );
+
+        let huge = encode_resize_signal(u16::MAX, u16::MAX);
+        let cols = u16::from_le_bytes([huge[2], huge[3]]);
+        let rows = u16::from_le_bytes([huge[4], huge[5]]);
+        assert_eq!(cols, 32767, "columns clamp to i16::MAX");
+        assert_eq!(rows, 32767, "rows clamp to i16::MAX");
+        assert!(
+            cols as i16 > 0 && rows as i16 > 0,
+            "a clamped COORD must stay positive when reinterpreted as i16"
+        );
+    }
+
+    // adopt_handoff must REFUSE a handoff with no client process handle rather
+    // than registering a session whose EOF can never fire (the waiter keys on
+    // exactly that handle) — a tab that could never close.
+    #[test]
+    fn adopt_handoff_without_a_client_process_is_refused_and_registers_nothing() {
+        let before = SESSIONS.lock_or_recover().len();
+        let err = adopt_handoff(0, 0, 0, 0)
+            .expect_err("a handoff with no client process handle must be refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(
+            SESSIONS.lock_or_recover().len(),
+            before,
+            "a refused handoff must not register a session"
+        );
+    }
+
+    // Construction shape: an adopted session must carry hpc == 0 (conhost owns
+    // the pseudoconsole — we must never call ClosePseudoConsole on it), no job
+    // (we did not create the client and must never sweep it), and the signal
+    // pipe we were handed. Uses a real, waitable process handle (our own,
+    // duplicated) so the waiter has something legitimate to block on.
+    #[test]
+    fn adopted_session_has_no_hpcon_no_job_and_keeps_the_signal_pipe() {
+        // A real kernel handle to stand in for the "client process": our own
+        // process, opened fresh so the session's Drop can own and close it.
+        // SYNCHRONIZE is what the waiter needs; QUERY_LIMITED_INFORMATION is
+        // what `GetProcessId` needs (see the pid-tolerance test below).
+        // SAFETY: OpenProcess on our own pid yields a real, closable handle.
+        let me = unsafe {
+            ffi::OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                ffi::GetCurrentProcessId(),
+            )
+        };
+        assert_ne!(me, 0, "OpenProcess on self must succeed");
+        // A real pipe to stand in for the signal pipe, so the handle the session
+        // takes ownership of is genuinely closable.
+        let (mut rd, mut wr): (isize, isize) = (0, 0);
+        // SAFETY: two out-params, default attrs, default buffer size.
+        assert_ne!(
+            unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+            0,
+            "CreatePipe must succeed"
+        );
+
+        let sh =
+            adopt_handoff(0, 0, wr, me).expect("adopt_handoff must accept a real client handle");
+        let s = session(sh.master).expect("the adopted session must be registered");
+        assert_eq!(
+            *s.hpc.lock_or_recover(),
+            0,
+            "an adopted session must hold NO HPCON — conhost owns the pseudoconsole"
+        );
+        assert_eq!(
+            *s.signal.lock_or_recover(),
+            wr,
+            "an adopted session must keep the signal pipe it was handed"
+        );
+        assert_eq!(
+            s.job, 0,
+            "an adopted session must own no job (never sweep someone else's process)"
+        );
+        assert_eq!(
+            s.conhost, 0,
+            "no host handle is plumbed through this signature"
+        );
+        assert_eq!(
+            s.pid,
+            unsafe { ffi::GetCurrentProcessId() },
+            "the pid must be derived from the client process HANDLE"
+        );
+
+        // resize() on the adopted lane must take the signal-pipe branch and not
+        // panic / not touch a null HPCON. Read it back off the pipe to prove the
+        // exact bytes reached the wire.
+        resize(sh.master, 24, 80);
+        let mut buf = [0u8; 6];
+        let mut got: u32 = 0;
+        // SAFETY: `rd` is the live read end; buffer is sized for the 6-byte packet.
+        let ok = unsafe { ffi::ReadFile(rd, buf.as_mut_ptr(), 6, &mut got, std::ptr::null_mut()) };
+        assert_ne!(
+            ok, 0,
+            "the resize packet must have been written to the signal pipe"
+        );
+        assert_eq!(got, 6, "exactly 6 bytes");
+        assert_eq!(
+            buf,
+            [0x08, 0x00, 0x50, 0x00, 0x18, 0x00],
+            "resize() must put opcode/cols/rows on the signal pipe verbatim"
+        );
+
+        // The waiter must still be BLOCKED, not already torn down. This is the
+        // deterministic half of the test: `adopt_handoff` must hand the waiter a
+        // real close event, because `WaitForMultipleObjects` over an array
+        // containing a 0 handle returns WAIT_FAILED IMMEDIATELY — which would
+        // drop the waiter straight through to its teardown and close the signal
+        // pipe the instant the session was created. Without this loop the test
+        // above merely races the waiter's thread start and usually wins.
+        for _ in 0..50 {
+            assert_ne!(
+                *s.signal.lock_or_recover(),
+                0,
+                "the waiter tore the adopted session down while its client was still alive"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // Teardown: close_master drops the session, closing the signal pipe (and
+        // the duplicated process handle) — no ClosePseudoConsole is reachable.
+        close_master(sh.master);
+        assert!(
+            session(sh.master).is_none(),
+            "close_master must unregister the adopted session"
+        );
+        // SAFETY: the read end is still ours (the session never owned it).
+        unsafe { ffi::CloseHandle(rd) };
+    }
+
+    // `hangup` must actually tear an adopted session down. It signals the close
+    // event, which the waiter is blocked on; the waiter then runs the adopted
+    // teardown, which closes the SIGNAL PIPE (there is no HPCON). Before this
+    // lane carried a real close event, `hangup` set an invalid handle and did
+    // nothing at all — so this test guards the lever, not just its plumbing.
+    #[test]
+    fn hangup_tears_down_an_adopted_session_through_the_signal_pipe() {
+        // A client process of OUR OWN, so `sh.pid` names this session and only
+        // this session no matter what else the suite is running concurrently.
+        let mut client = TestClient::spawn();
+        let (mut rd, mut wr): (isize, isize) = (0, 0);
+        // SAFETY: two out-params, default attrs/size.
+        assert_ne!(
+            unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+            0
+        );
+        let sh = adopt_handoff(0, 0, wr, client.open()).expect("adopt");
+        let s = session(sh.master).expect("registered");
+        assert_eq!(
+            sh.pid as u32,
+            client.pid(),
+            "the adopted session must key on the CLIENT's pid"
+        );
+        assert_ne!(
+            sh.pid as u32,
+            // SAFETY: no-argument pid query.
+            unsafe { ffi::GetCurrentProcessId() },
+            "the fixture must not borrow the test process's pid (see TestClient)"
+        );
+
+        hangup(sh.pid);
+
+        // The waiter should wake on the close event and close the signal pipe.
+        let mut closed = false;
+        for _ in 0..200 {
+            if *s.signal.lock_or_recover() == 0 {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            closed,
+            "hangup must reach the waiter and close the adopted session's signal pipe"
+        );
+        // NON-VACUITY: the waiter has exactly two ways to wake — the client
+        // exiting, or the close event. The client is still running, so it was
+        // the close event, i.e. `hangup` really is the lever under test.
+        assert!(
+            client.is_alive(),
+            "the client must still be running, or the teardown proves nothing"
+        );
+        close_master(sh.master);
+        // SAFETY: the read end was never owned by the session.
+        unsafe { ffi::CloseHandle(rd) };
+    }
+
+    // THE DUPLICATE-PID GUARD. A pid is not a unique key over the session
+    // registry: the same console client can be handed off twice (FreeConsole →
+    // AllocConsole) while the first entry is still registered, so two live
+    // sessions can carry one pid. `session_by_pid`'s old first-match scan
+    // resolved that to an ARBITRARY entry — HashMap order, randomized per
+    // process — so closing one tab could hang up somebody ELSE's console. The
+    // contract is now: an ambiguous pid resolves to NOTHING, and every pid-keyed
+    // op falls back to its documented miss behavior.
+    #[test]
+    fn a_pid_claimed_by_two_live_sessions_resolves_to_neither() {
+        // One client, adopted TWICE — exactly the production shape.
+        let client = TestClient::spawn();
+        let mut pipes = Vec::new();
+        let mut sessions = Vec::new();
+        for _ in 0..2 {
+            let (mut rd, mut wr): (isize, isize) = (0, 0);
+            // SAFETY: two out-params, default attrs/size.
+            assert_ne!(
+                unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+                0
+            );
+            pipes.push(rd);
+            let sh = adopt_handoff(0, 0, wr, client.open()).expect("adopt");
+            let s = session(sh.master).expect("registered");
+            assert_eq!(sh.pid as u32, client.pid());
+            sessions.push((sh, s));
+        }
+        let pid = sessions[0].0.pid;
+
+        // Ambiguous ⇒ hangup must touch NEITHER session. Both signal pipes stay
+        // open for the whole window; with a first-match scan one of them closes.
+        hangup(pid);
+        for _ in 0..50 {
+            for (i, (_, s)) in sessions.iter().enumerate() {
+                assert_ne!(
+                    *s.signal.lock_or_recover(),
+                    0,
+                    "hangup on a pid two live sessions claim tore down session {i}"
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Same rule for the read-only lookup: no wrong answer, no answer.
+        assert_eq!(
+            exit_code(pid),
+            None,
+            "an ambiguous pid must not report some other session's exit code"
+        );
+        // ...and reap must not escalate against a session it cannot identify.
+        // (Both are adopted, so `job == 0` and there is nothing to terminate —
+        // this asserts the lookup, and that it stays a bounded no-op.)
+        reap(pid);
+
+        // Drop one: the pid is unambiguous again, so the lever works again —
+        // the refusal is scoped to the collision, not a blanket disable.
+        let (sh0, _s0) = sessions.remove(0);
+        close_master(sh0.master);
+        let (sh1, s1) = &sessions[0];
+        hangup(sh1.pid);
+        let mut closed = false;
+        for _ in 0..200 {
+            if *s1.signal.lock_or_recover() == 0 {
+                closed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            closed,
+            "once only one session claims the pid, hangup must reach it again"
+        );
+
+        let masters: Vec<i32> = sessions.iter().map(|(sh, _)| sh.master).collect();
+        drop(sessions);
+        for m in masters {
+            close_master(m);
+        }
+        for rd in pipes {
+            // SAFETY: the read ends were never owned by a session.
+            unsafe { ffi::CloseHandle(rd) };
+        }
+    }
+
+    // The handoff failure paths that CONSUME must really close what they were
+    // given, and must skip the 0 slots (a handoff can arrive with no signal
+    // pipe). Proved by observation, not by inspection: the read end of a pipe
+    // whose only write handle was closed reports broken-pipe IMMEDIATELY,
+    // whereas a still-open write end makes the same ReadFile block forever — so
+    // the read runs on a thread with a deadline and a neutered
+    // `release_handoff_handles` fails the test instead of hanging it.
+    #[test]
+    fn release_handoff_handles_closes_the_live_slots_and_skips_the_zeros() {
+        let mut reads = Vec::new();
+        let mut writes = Vec::new();
+        for _ in 0..2 {
+            let (mut rd, mut wr): (isize, isize) = (0, 0);
+            // SAFETY: two out-params, default attrs/size.
+            assert_ne!(
+                unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+                0
+            );
+            reads.push(rd);
+            writes.push(wr);
+        }
+        // Zeros in the outer slots: position must not matter, and a 0 must not
+        // be handed to CloseHandle.
+        release_handoff_handles([0, writes[0], writes[1], 0]);
+
+        for (i, rd) in reads.iter().copied().enumerate() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1];
+                let mut got: u32 = 0;
+                // SAFETY: `rd` is the live read end; 1-byte buffer.
+                let ok = unsafe {
+                    ffi::ReadFile(rd, buf.as_mut_ptr(), 1, &mut got, std::ptr::null_mut())
+                };
+                let _ = tx.send(ok);
+            });
+            let ok = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!("slot {i}: ReadFile blocked, so its write end was never closed")
+                });
+            assert_eq!(ok, 0, "slot {i}: the read end must report broken pipe");
+            // SAFETY: the read ends are ours alone.
+            unsafe { ffi::CloseHandle(rd) };
+        }
+    }
+
+    // A process handle WITHOUT query rights must still yield a usable session.
+    // Found the hard way: `GetProcessId` needs PROCESS_QUERY_LIMITED_INFORMATION
+    // and returns 0 without it — and we do not control the access mask conhost
+    // duplicated into us. Refusing such a handoff (or, worse, panicking) would
+    // drop the user's console on the floor for a purely cosmetic missing pid, so
+    // the pid is optional and only the PID-KEYED lookups degrade to their
+    // documented no-op-on-miss behavior. The master-keyed ops must all still work.
+    #[test]
+    fn adopted_session_tolerates_a_process_handle_with_no_query_rights() {
+        // SAFETY: SYNCHRONIZE-only handle to our own process — enough for the
+        // waiter, deliberately NOT enough for GetProcessId.
+        let me = unsafe { ffi::OpenProcess(SYNCHRONIZE, 0, ffi::GetCurrentProcessId()) };
+        assert_ne!(me, 0, "OpenProcess(SYNCHRONIZE) on self must succeed");
+
+        let sh = adopt_handoff(0, 0, 0, me)
+            .expect("a query-less process handle must still be adoptable");
+        let s = session(sh.master).expect("the adopted session must be registered");
+        assert_eq!(
+            s.pid, 0,
+            "GetProcessId cannot see through a SYNCHRONIZE-only handle"
+        );
+        assert_eq!(
+            sh.pid, 0,
+            "the unknown pid is reported as 0, not fabricated"
+        );
+
+        // Master-keyed ops stay well-defined; a 0 signal pipe makes resize a no-op
+        // rather than a null-handle write.
+        resize(sh.master, 24, 80);
+        close_master(sh.master);
+        assert!(
+            session(sh.master).is_none(),
+            "close_master must unregister it"
         );
     }
 

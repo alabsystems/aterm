@@ -4847,16 +4847,22 @@ impl NativeAppModel for MarkdownApp {
     fn commands(&self, view: &Self::ViewState, out: &mut Vec<Command>) {
         let active_heading =
             crate::native_markdown::heading_at_source(&self.parsed, view.source_anchor);
+        // AUDIT I9 — the reader's navigation chords are NOT macOS-only: their
+        // dispatch arm tests `SUPER | CTRL` (`app_native`'s `command`), so
+        // Ctrl+[ / Ctrl+] / Ctrl+E genuinely work off macOS and blanking the
+        // label there would HIDE a live chord rather than merely stop lying
+        // about a dead one. Named per platform so the palette says the true
+        // half; `platform_accel` still strips any `Cmd-` that reaches it.
         out.push(Command {
             id: ActionId::new("markdown/back"),
             title: "Reader: Back".to_string(),
-            shortcut: Some("Cmd-[".to_string()),
+            shortcut: Some(reader_command_chord("[")),
             enabled: view.history.can_back(),
         });
         out.push(Command {
             id: ActionId::new("markdown/forward"),
             title: "Reader: Forward".to_string(),
-            shortcut: Some("Cmd-]".to_string()),
+            shortcut: Some(reader_command_chord("]")),
             enabled: view.history.can_forward(),
         });
         out.push(Command {
@@ -4877,14 +4883,32 @@ impl NativeAppModel for MarkdownApp {
         out.push(Command {
             id: ActionId::new("markdown/select-all"),
             title: "Reader: Select All Source".to_string(),
-            shortcut: Some("Cmd-A".to_string()),
+            // LIVE off macOS, same as back/forward/edit above — an earlier
+            // pass blanked this row there on a false premise. `app_native`'s
+            // `Key::Character('a' | 'A') if command` arm maps ⌘/Ctrl+A to
+            // `TextInput(SelectAll)`, and `MarkdownApp`'s reducer answers that
+            // event with the exact body of this action. The readline arms that
+            // shadow 'a' are gated on `settings_active` (false for the reader)
+            // and `ctrl+a` is not in `PLATFORM_DEFAULT_PAIRS`, so nothing
+            // upstream claims the chord. Blanking it hid a chord that works.
+            shortcut: Some(reader_command_chord("A")),
             enabled: self.can_select_source()
                 && self.selection(view).as_ref() != Some(&(0..self.parsed.source_len)),
         });
         out.push(Command {
             id: ActionId::new("markdown/copy"),
             title: "Reader: Copy Source Selection".to_string(),
-            shortcut: Some("Cmd-C".to_string()),
+            // Off macOS the live chord is the SEEDED `ctrl+shift+c` (`copy`),
+            // which `on_key_native_mode` special-cases into
+            // `copy_native_selection` — not Ctrl+C, and certainly not Win+C.
+            shortcut: Some(
+                if cfg!(target_os = "macos") {
+                    "Cmd-C"
+                } else {
+                    "Ctrl-Shift-C"
+                }
+                .to_string(),
+            ),
             enabled: self.selection(view).is_some(),
         });
         out.push(Command {
@@ -4908,7 +4932,7 @@ impl NativeAppModel for MarkdownApp {
         out.push(Command {
             id: ActionId::new("markdown/edit"),
             title: "Edit Document".to_string(),
-            shortcut: Some("Cmd-E".to_string()),
+            shortcut: Some(reader_command_chord("E")),
             enabled: true,
         });
 
@@ -5132,6 +5156,22 @@ fn bounded_markdown_block_text(block: &crate::native_markdown::MarkdownBlock) ->
         output.push('…');
     }
     output
+}
+
+/// The reader's own `command`-modifier chord for `key`, spelled the way THIS
+/// platform's keyboard actually reaches it (audit I9).
+///
+/// The dispatch arm those commands come out of tests `SUPER | CTRL`
+/// (`app_native`'s `command` flag), so both spellings are live on every
+/// platform — but only one of them is the one a user reaches for, and printing
+/// `Cmd-[` to a Windows user names the Windows key, which the shell owns.
+fn reader_command_chord(key: &str) -> String {
+    let modifier = if cfg!(target_os = "macos") {
+        "Cmd-"
+    } else {
+        "Ctrl-"
+    };
+    format!("{modifier}{key}")
 }
 
 fn bounded_markdown_text(text: &str, limit: usize) -> String {
@@ -6273,7 +6313,18 @@ impl NativeAppModel for EditorApp {
             Command {
                 id: ActionId::new("editor/save"),
                 title: "Save Buffer".to_string(),
-                shortcut: Some("Cmd-S · C-x C-s".to_string()),
+                // AUDIT I9. The `Cmd-S` half is macOS's and `platform_accel`
+                // strips it elsewhere; `C-x C-s` is emacs's and true everywhere.
+                // On Windows the editor also seeds the reflex every Windows app
+                // owes its user — plain Ctrl+S — see `Keymap::emacs`.
+                shortcut: Some(
+                    if cfg!(windows) {
+                        "C-s \u{b7} C-x C-s"
+                    } else {
+                        "Cmd-S \u{b7} C-x C-s"
+                    }
+                    .to_string(),
+                ),
                 enabled: self.dirty
                     && !self.checkpoint_pending
                     && !self.disk_conflict
@@ -6294,7 +6345,11 @@ impl NativeAppModel for EditorApp {
             Command {
                 id: ActionId::new("editor/find"),
                 title: "Incremental Search".to_string(),
-                shortcut: Some("C-s".to_string()),
+                // Windows spends `C-s` on Save (the reflex it cannot not have),
+                // so isearch answers to `M-s` there — emacs's own search-map
+                // prefix letter, free in this keymap. Everywhere else `C-s` is
+                // isearch, exactly as emacs users expect.
+                shortcut: Some(if cfg!(windows) { "M-s" } else { "C-s" }.to_string()),
                 enabled: buffer_ready,
             },
             Command {
@@ -7190,6 +7245,64 @@ mod markdown_reader_tests {
         let cleared = runtime.commands(instance, view).unwrap();
         assert!(!command(&cleared, "markdown/copy").enabled);
         assert!(command(&cleared, "markdown/select-all").enabled);
+    }
+
+    /// AUDIT I9 — every Reader row whose chord `app_native` really dispatches
+    /// must ADVERTISE that chord on THIS platform.
+    ///
+    /// The four rows below are all reached through the same `command`
+    /// (`SUPER | CTRL`) predicate in `App::on_key_native_mode`: Back/Forward/Edit
+    /// through the `markdown_active && command && Character(..)` arms, and Select
+    /// All through `Character('a' | 'A') if command` ->
+    /// `TextInput(SelectAll)`, which `MarkdownApp`'s reducer answers with the
+    /// body of `markdown/select-all` (pinned by
+    /// `markdown_select_all_copy_and_cancel_are_exact_source_actions`, which
+    /// dispatches that very event). None of the
+    /// four chords is seeded in `Keybindings::PLATFORM_DEFAULT_PAIRS`, and the
+    /// readline arms that shadow 'a'/'e' are gated on `settings_active`, so
+    /// nothing upstream claims them.
+    ///
+    /// Select All regressed here: it was pinned to the literal `"Cmd-A"`, which
+    /// `palette::platform_accel` BLANKS off macOS (correctly — a ⌘ chord would
+    /// mislead, and the string is also spoken aloud by Narrator through the
+    /// AccessKit description). The result was a live Ctrl+A shown with no
+    /// accelerator at all. Asserting the whole class, not just the one row,
+    /// keeps the next chord from landing the same way.
+    #[test]
+    fn reader_rows_advertise_the_chord_this_platform_actually_dispatches() {
+        let source = "# Guide\n\nBody.\n\n## Next\n\nMore.\n";
+        let (mut runtime, instance, view) = markdown_runtime(source);
+        // Give history a back entry so Back/Forward are enabled rows.
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(3))
+            .unwrap();
+        let commands = runtime.commands(instance, view).unwrap();
+
+        for (id, key) in [
+            ("markdown/back", "["),
+            ("markdown/forward", "]"),
+            ("markdown/edit", "E"),
+            ("markdown/select-all", "A"),
+        ] {
+            let shortcut = command(&commands, id)
+                .shortcut
+                .as_deref()
+                .unwrap_or_else(|| panic!("{id} must advertise its live chord"));
+            assert_eq!(
+                shortcut,
+                super::reader_command_chord(key),
+                "{id} must name the chord THIS platform dispatches"
+            );
+            // The property `platform_accel` enforces: off macOS a `Cmd-`
+            // accelerator is dropped, so a live chord spelled that way is
+            // shown (and spoken) as nothing at all.
+            if !cfg!(target_os = "macos") {
+                assert!(
+                    !shortcut.starts_with("Cmd-"),
+                    "{id}: a Cmd- chord is blanked off macOS, hiding a live binding"
+                );
+            }
+        }
     }
 
     #[test]

@@ -1820,8 +1820,10 @@ pub fn native_config_transaction_model() -> Model {
 /// Once an external generation is known, queued semantic writes remain fenced
 /// until that exact generation is admitted or a reconciliation sample orders it
 /// against a concurrent publication. Failed reconciliation retains the newest
-/// candidate, and a newer candidate that arrives after sampling must be
-/// resampled rather than silently discarded or admitted as the older sample.
+/// candidate and ANSWERS the queued writes with the failure (draining them —
+/// retention was abandonment: nothing else ever drained the queue), and a newer
+/// candidate that arrives after sampling must be resampled rather than silently
+/// discarded or admitted as the older sample.
 /// `Buggy=1` exposes all three historical failures: lost deferred bytes, a blind
 /// queued write, and stale-sample admission.
 #[must_use]
@@ -1881,6 +1883,13 @@ pub fn native_config_observation_handoff_model() -> Model {
                 pending = if Buggy == 1 { 0 } else { pending };
                 sampled = 0;
                 reconciliation_failed = 1;
+                // The queued writes are ANSWERED-and-drained, not retained: the
+                // sample they were waiting on is the one thing that could have
+                // cleared the fence, so "still queued" meant abandoned (nothing
+                // else drains this queue — a control caller sat on the 30 s wire
+                // timeout). A reply is not a loss; the SILENT losses stay the
+                // Buggy mutant's (`dropped_candidate`, the external bytes).
+                queued = 0;
                 dropped_candidate = if Buggy == 1 { 1 } else { dropped_candidate };
                 // A failed reconciliation ANSWERS its queued callers (with the
                 // error) instead of leaving them pending — 92a43f0d, pinned by

@@ -144,9 +144,9 @@ fn rle_find_run_out_of_bounds() {
     assert_eq!(rle.get(u32::MAX), None);
 }
 
-/// Extend then access: prefix sums stay consistent after extend_with.
+/// Extend then access: the run structure stays consistent after extend_with.
 #[test]
-fn rle_extend_with_prefix_sums_consistent() {
+fn rle_extend_with_run_structure_consistent() {
     let mut rle = Rle::from_iter([1u8, 2, 3]);
     rle.extend_with(4, 5);
 

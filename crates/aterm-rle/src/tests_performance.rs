@@ -119,12 +119,17 @@ fn rle_set_range_linear_in_runs() {
     );
 }
 
-/// Prove that `find_run()` uses O(log R) binary search when prefix sums are cached.
+/// Prove that `find_run()` is an O(R) walk that visits each run at most once.
 ///
-/// Accessing the last element should take 1 counted iteration (partition_point
-/// is O(log R) but counts a single iteration after binary search completes).
+/// The prefix-sum index that made this O(log R) was deleted: it cost one heap
+/// allocation on EVERY constructed `Rle` — paid by the scrollback
+/// materialization path per line, including the all-default lines whose `Rle`
+/// is discarded unread — and its only readers (`get`/`set`/`set_range`/`Index`)
+/// have no production caller. Runs per scrollback line are 1-6, so the walk is
+/// bounded by construction at the sizes that exist; what must not regress is
+/// visiting a run MORE than once, which this pins as an exact count.
 #[test]
-fn rle_find_run_binary_search_independent_of_size() {
+fn rle_find_run_linear_visits_each_run_once() {
     fn measure_find_last(run_count: u32) -> usize {
         let mut rle: Rle<u8> = Rle::new();
         for i in 0..run_count {
@@ -140,6 +145,6 @@ fn rle_find_run_binary_search_independent_of_size() {
     let small = measure_find_last(100);
     let large = measure_find_last(100_000);
 
-    assert_eq!(small, 1, "binary search counts 1 iteration (small)");
-    assert_eq!(large, 1, "binary search counts 1 iteration (large)");
+    assert_eq!(small, 100, "one iteration per run, no more (small)");
+    assert_eq!(large, 100_000, "one iteration per run, no more (large)");
 }

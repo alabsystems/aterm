@@ -184,7 +184,10 @@ fn cell_fp(c: &RenderCell) -> u64 {
         | (u64::from(c.italic) << 3)
         | (u64::from(c.strikethrough) << 4)
         | (u64::from(c.overline) << 5)
-        | (underline_id(c.underline) << 6);
+        | (underline_id(c.underline) << 6)
+        // Keep the pre-existing bit layout stable for ordinary cells; explicit
+        // VS15 occupies the first free bit above the 3-bit underline id.
+        | (u64::from(c.text_presentation) << 9);
     // Sentinel bit 32 distinguishes "no underline colour" from colour 0x000000.
     let ul = c
         .underline_color
@@ -568,6 +571,7 @@ mod tests {
             bg,
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,

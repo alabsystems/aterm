@@ -280,7 +280,11 @@ impl Grid {
 
         // Invalidate selection — IL shifts visible content within the scroll
         // region, so selection coordinates become stale (same as scroll_region_down).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
 
         // Mark only affected rows: cursor_row through region bottom.
         self.storage
@@ -418,7 +422,11 @@ impl Grid {
             margins.left..margins.right.saturating_add(1),
         );
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
@@ -493,7 +501,11 @@ impl Grid {
 
         // Invalidate selection — DL shifts visible content within the scroll
         // region, so selection coordinates become stale (same as scroll_region_up).
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
 
         // Mark only affected rows: cursor_row through region bottom.
         self.storage
@@ -635,7 +647,11 @@ impl Grid {
             );
         }
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(cursor_row, region.bottom.saturating_add(1));
     }
@@ -704,7 +720,11 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, cursor_col, cursor_col + count);
         }
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
@@ -767,7 +787,11 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
         }
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
@@ -810,7 +834,11 @@ impl Grid {
                 .shift_cols_left(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, right_bound - count, right_bound);
         }
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
@@ -851,7 +879,11 @@ impl Grid {
                 .shift_cols_right(row_idx, left, count, right_bound);
             self.fill_bce_rgb_range(row_idx, left, left + count);
         }
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
@@ -898,7 +930,11 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, left, left + 1);
         }
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }
@@ -941,7 +977,11 @@ impl Grid {
             self.fill_bce_rgb_range(row_idx, right_bound - 1, right_bound);
         }
 
-        self.storage.content_scroll_delta = i32::MAX;
+        // SELECTION CUSTODY Phase 4: this edit is confined to the scroll region, so
+        // that is the damage. A selection in scrollback — or anywhere outside the
+        // region — is untouched, where the old sentinel killed every selection
+        // anywhere on any of these ops.
+        self.damage_selection_scroll_region();
         self.storage
             .mark_content_rows(region.top, region.bottom.saturating_add(1));
     }

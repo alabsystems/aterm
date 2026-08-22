@@ -25,25 +25,26 @@ use aterm_spec::derive::{
     closed_recovery_ledgers_model, coalesce_model, composite_accessibility_route_model,
     config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
     control_connection_admission_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
-    cursor_cat_earn_floor_model, cursor_cat_model, cursor_cutout_clip_model, cursor_model,
-    damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
-    dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
-    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
-    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
-    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
-    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
-    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
-    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
-    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
-    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
-    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
-    manual_config_completion_model, manual_config_diagnostics_lane_model,
-    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
-    motion_policy_model, native_async_delivery_model, native_capture_source_model,
-    native_close_plan_model, native_config_observation_handoff_model,
-    native_config_transaction_model, native_control_routing_model,
-    native_document_publication_model, native_draft_journal_model,
+    cursor_cat_earn_floor_model, cursor_cat_model, cursor_cutout_clip_model,
+    cursor_effect_scroll_model, cursor_model, cursor_move_candidate_model,
+    cursor_scroll_signal_model, cursor_viewport_lifecycle_model, damage_to_present_model,
+    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
+    effect_phase_lock_model, effect_present_rebase_model, emacs_search_navigation_model,
+    emacs_search_repeat_work_model, evict_full_model, exact_instance_retention_model,
+    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
+    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
+    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
+    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
+    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
+    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
+    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
+    kitty_flush_worker_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
+    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
+    manual_config_diagnostics_lane_model, manual_config_handoff_model,
+    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
+    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
+    native_config_observation_handoff_model, native_config_transaction_model,
+    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -60,14 +61,15 @@ use aterm_spec::derive::{
     presentation_gate_model, presented_frame_tap_model, press_custody_model, proxy_forward_model,
     rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
-    rainbow_terminus_admission_model, read_image_seq_model, recording_model, recovery_redraw_model,
-    release_channel_floor_model, release_channel_single_head_model,
-    release_durable_post_intent_model, release_historical_recovery_model,
-    release_journal_prefix_model, release_key_epoch_transition_model,
-    release_published_identity_model, release_publisher_fence_model,
-    release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
-    scroll_glide_model, scrollback_maintenance_lane_model, seamless_nonce_model,
-    self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+    rainbow_move_admission_model, rainbow_terminus_admission_model, read_image_seq_model,
+    recording_model, recovery_redraw_model, release_channel_floor_model,
+    release_channel_single_head_model, release_durable_post_intent_model,
+    release_historical_recovery_model, release_journal_prefix_model,
+    release_key_epoch_transition_model, release_published_identity_model,
+    release_publisher_fence_model, release_yank_successor_first_model,
+    restore_manifest_single_use_model, ring_model, scroll_glide_model,
+    scrollback_maintenance_lane_model, seamless_nonce_model, self_governor_model,
+    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
     session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
     shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
@@ -5188,11 +5190,14 @@ fn derived_top_anchored_scroll_proves_history_retention() {
     let model = top_anchored_scroll_history_model();
     assert_proves_and_catches(&model);
 
+    // The OVERLAPPING flavours reproduce the original four regimes exactly: a
+    // selection sitting in the damaged rows is cleared by every non-archival scroll,
+    // and piecewise-remapped by the archival one.
     for (choice, expected_history) in [
-        ("ChooseArchival", 1),
-        ("ChooseInterior", 0),
-        ("ChooseMargined", 0),
-        ("ChooseEphemeral", 0),
+        ("ChooseArchivalOverlapping", 1),
+        ("ChooseInteriorOverlapping", 0),
+        ("ChooseMarginedOverlapping", 0),
+        ("ChooseEphemeralOverlapping", 0),
     ] {
         let mut state = model.init_state();
         assert!(model.fire(choice, &mut state));
@@ -5221,13 +5226,49 @@ fn derived_top_anchored_scroll_proves_history_retention() {
         assert_eq!(state.get("selection_footer_row"), Some(&4), "{choice}");
     }
 
+    // SELECTION CUSTODY Phase 4: the DISJOINT flavours are the new half. A selection
+    // outside the damaged rows survives every regime — including the interior and
+    // margined scrolls that used to kill it unconditionally. This is the reported
+    // bug, stated as a model property: a status bar repainting in a scroll region
+    // must not destroy a highlight anchored up in scrollback.
+    for choice in [
+        "ChooseInteriorDisjoint",
+        "ChooseMarginedDisjoint",
+        "ChooseEphemeralDisjoint",
+    ] {
+        let mut state = model.init_state();
+        assert!(model.fire(choice, &mut state));
+        assert!(model.fire("Scroll", &mut state));
+        assert_eq!(
+            state.get("selection_alive"),
+            Some(&1),
+            "{choice}: a disjoint selection must survive"
+        );
+        assert_eq!(
+            state.get("selection_region_row"),
+            Some(&2),
+            "{choice}: and must not be remapped — nothing moved under it"
+        );
+        assert_eq!(state.get("history_len"), Some(&0), "{choice}");
+    }
+
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
     let mut dropped = buggy.init_state();
-    assert!(buggy.fire("ChooseArchival", &mut dropped));
+    assert!(buggy.fire("ChooseArchivalOverlapping", &mut dropped));
     assert!(buggy.fire("Scroll", &mut dropped));
     assert!(!buggy.check_invariant("EligibleDisplacementIsRetained", &dropped));
     assert!(!buggy.check_invariant("FixedFooterAnchorTracksLogicalInsertion", &dropped));
     assert!(!buggy.check_invariant("EligibleSelectionUsesPiecewiseRemap", &dropped));
+
+    // …and the Phase 4 mutant: an interior scroll that clears a DISJOINT selection —
+    // the literal shipping defect the damage lattice removes.
+    let mut over_cleared = buggy.init_state();
+    assert!(buggy.fire("ChooseInteriorDisjoint", &mut over_cleared));
+    assert!(buggy.fire("Scroll", &mut over_cleared));
+    assert!(
+        !buggy.check_invariant("EligibleSelectionUsesPiecewiseRemap", &over_cleared),
+        "the restated invariant must catch an over-clear, not just the archival drop"
+    );
 }
 
 #[test]
@@ -6892,6 +6933,374 @@ fn derived_kitty_sing_detector_proves_and_catches_eight_press_arm() {
 #[test]
 fn derived_cursor_cat_earn_floor_proves_and_catches_v056_threshold() {
     assert_proves_and_catches(&cursor_cat_earn_floor_model());
+}
+
+/// A cold, unwitnessed cursor delta stays dark in both cursor-effect engines;
+/// typed/key/reflow witnesses admit, and Tab/paste's weaker gesture licence is
+/// fresh, one-shot, and consumed dark after expiry. The mutant restores the
+/// generic fall-through and a sticky/stale gesture licence.
+#[test]
+fn derived_rainbow_move_admission_proves_and_catches_stray_light() {
+    let model = rainbow_move_admission_model();
+    assert_proves_and_catches(&model);
+
+    // Pin the new mutant independently of the model's older Buggy branches:
+    // after a real echo the historical implementation incremented "spent"
+    // without removing the same cell from "pending", letting it fund a later
+    // coalesced move.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut retained = buggy.init_state();
+    assert!(buggy.fire("ArmTypedCredit", &mut retained));
+    assert!(buggy.fire("ObserveTypedEcho", &mut retained));
+    assert_eq!(retained["credit_arms"], 1);
+    assert_eq!(retained["pending_credits"], 1);
+    assert_eq!(retained["spent_credits"], 1);
+    assert_eq!(retained["observed_credit_boundary"], 1);
+    assert_eq!(retained["recent_typing_activity"], 0);
+    assert!(
+        !buggy.check_invariant("TypedCreditConservation", &retained),
+        "the retained-credit mutant must have its own concrete counterexample"
+    );
+    assert!(
+        !buggy.check_invariant("SpendingAdmissionKeepsRecentTypingActivity", &retained),
+        "the conflated-ledger mutant must not erase the recent-input reward"
+    );
+
+    let mut partial = buggy.init_state();
+    assert!(buggy.fire("ArmTypedCredit", &mut partial));
+    assert!(buggy.fire("ArmTypedCredit", &mut partial));
+    assert!(buggy.fire("ArmTypedCredit", &mut partial));
+    assert!(buggy.fire("ObserveTypedEcho", &mut partial));
+    assert_eq!(partial["credit_arms"], 3);
+    assert_eq!(partial["pending_credits"], 3);
+    assert!(
+        !buggy.check_invariant("ObservedTypedBoundaryClearsCreditHighWater", &partial),
+        "the in-flight partial-echo mutant must retain no usable history"
+    );
+    assert!(buggy.fire("ArmNextTypedCredit", &mut partial));
+    assert!(buggy.fire("ColdTwoCellMove", &mut partial));
+    assert_eq!(partial["cold_two_cell_admitted"], 1);
+    assert!(
+        !buggy.check_invariant("PostBoundaryCreditCannotPoolWithHistory", &partial),
+        "a new swallowed credit must not pool with the prior cohort"
+    );
+
+    let mut superseded = buggy.init_state();
+    assert!(buggy.fire("ArmTypedCredit", &mut superseded));
+    assert!(buggy.fire("SupersedeTypedCohort", &mut superseded));
+    assert_eq!(superseded["credit_superseded"], 1);
+    assert_eq!(superseded["pending_credits"], 1);
+    assert!(
+        !buggy.check_invariant("SupersessionRetiresTypedCreditCohort", &superseded),
+        "the swallowed-input supersession mutant must retain no credit"
+    );
+    assert!(buggy.fire("ArmNextTypedCredit", &mut superseded));
+    assert!(buggy.fire("ColdTwoCellMove", &mut superseded));
+    assert_eq!(superseded["cold_two_cell_admitted"], 1);
+
+    let mut expired = buggy.init_state();
+    assert!(buggy.fire("ArmTypedCredit", &mut expired));
+    assert!(buggy.fire("ExpireTypedCohort", &mut expired));
+    assert_eq!(expired["credit_expired"], 1);
+    assert_eq!(expired["pending_credits"], 1);
+    assert!(
+        !buggy.check_invariant("ExpiryRetiresTypedCreditCohort", &expired),
+        "the expired-hint mutant must retain no admission credit"
+    );
+    assert!(buggy.fire("ArmNextTypedCredit", &mut expired));
+    assert!(buggy.fire("ColdTwoCellMove", &mut expired));
+    assert_eq!(expired["cold_two_cell_admitted"], 1);
+
+    let mut queued_credit = buggy.init_state();
+    assert!(buggy.fire("ArmTyped", &mut queued_credit));
+    assert!(buggy.fire("ArmTypedCredit", &mut queued_credit));
+    assert!(buggy.fire("ArmTypedCredit", &mut queued_credit));
+    assert!(buggy.fire("RevokeQueued", &mut queued_credit));
+    assert_eq!(queued_credit["pending_credits"], 2);
+    assert!(
+        !buggy.check_invariant("QueuedDispatchRetiresTypedCreditCohort", &queued_credit),
+        "queued/latest-hint revocation must catch retained earlier cohort credits"
+    );
+    assert!(buggy.fire("ArmNextTypedCredit", &mut queued_credit));
+    assert!(buggy.fire("ColdTwoCellMove", &mut queued_credit));
+    assert_eq!(queued_credit["cold_two_cell_admitted"], 1);
+
+    let mut async_paste = buggy.init_state();
+    assert!(buggy.fire("ArmGesture", &mut async_paste));
+    assert!(buggy.fire("RevokeAsyncPaste", &mut async_paste));
+    assert_eq!(async_paste["async_paste_revoked"], 1);
+    assert_eq!(async_paste["gesture_hint"], 1);
+    assert!(
+        !buggy.check_invariant("AsyncPasteDispatchRevokes", &async_paste),
+        "the async-paste mutant must retain no arrival-time licence"
+    );
+}
+
+/// Every cursor-light style requires a consumed, origin/target-bound candidate;
+/// typed/delete candidates additionally require an exact coherent content diff.
+/// The mutant restores the fresh-timestamp-alone shortcut and must fail on the
+/// direct ArmTyped -> ObserveMove trace with no confirmation.
+#[test]
+fn derived_cursor_move_candidate_proves_and_catches_timestamp_only_admission() {
+    let model = cursor_move_candidate_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut state = buggy.init_state();
+    assert!(buggy.fire("ArmTyped", &mut state));
+    assert!(buggy.fire("DeliverStable", &mut state));
+    assert!(buggy.fire("ObserveMove", &mut state));
+    assert_eq!(state["admitted"], 1);
+    assert_eq!(state["evidence_exact"], 0);
+    assert!(
+        !buggy.check_invariant("EvidenceRequired", &state),
+        "timestamp-only admission must supply the model's concrete counterexample"
+    );
+
+    let mut raced = buggy.init_state();
+    assert!(buggy.fire("ArmTyped", &mut raced));
+    assert!(buggy.fire("DeliverRaced", &mut raced));
+    assert!(buggy.fire("ObserveMove", &mut raced));
+    assert!(
+        !buggy.check_invariant("StableDeliveryRequired", &raced),
+        "pre-delivery output must never be accepted as the authored echo"
+    );
+
+    let mut torn = buggy.init_state();
+    assert!(buggy.fire("ChargeResident", &mut torn));
+    assert!(buggy.fire("ArmSynthetic", &mut torn));
+    assert!(buggy.fire("ObserveMove", &mut torn));
+    assert!(buggy.fire("FinalExtractDrift", &mut torn));
+    assert_eq!(torn["resident_projection"], 1);
+    assert!(
+        !buggy.check_invariant("ResidentProjectionRequiresFinalGeneration", &torn),
+        "a final-extraction generation drift must suppress both projected and resident cursor light"
+    );
+
+    let mut resident_only = buggy.init_state();
+    assert!(buggy.fire("ChargeResident", &mut resident_only));
+    assert!(buggy.fire("FinalExtractDrift", &mut resident_only));
+    assert_eq!(resident_only["projection"], 0);
+    assert_eq!(resident_only["resident_projection"], 1);
+    assert!(
+        !buggy.check_invariant("ResidentProjectionRequiresFinalGeneration", &resident_only),
+        "resident kitty/pet/Robi geometry must be independently covered"
+    );
+
+    let mut rewritten = buggy.init_state();
+    assert!(buggy.fire("ChargeResident", &mut rewritten));
+    assert!(buggy.fire("FinalExtractSame", &mut rewritten));
+    assert_eq!(rewritten["resident_projection"], 1);
+    assert!(buggy.fire("UnownedContentRewrite", &mut rewritten));
+    assert!(
+        !buggy.check_invariant("UnownedContentRewriteRetiresResident", &rewritten),
+        "an in-place unowned PTY rewrite must retire already-projected resident light"
+    );
+
+    // An unowned parser generation consumes an in-flight candidate too. The
+    // candidate's nominal N+1 row may look exact later, but its one causal
+    // generation was already spent by this unrelated batch.
+    let healthy = aterm_spec::interp::with_buggy(&model, 0);
+    let mut interrupted = healthy.init_state();
+    assert!(healthy.fire("ArmTyped", &mut interrupted));
+    assert!(healthy.fire("DeliverStable", &mut interrupted));
+    assert!(healthy.fire("UnownedContentRewrite", &mut interrupted));
+    assert_eq!(interrupted["phase"], 4);
+    assert_eq!(interrupted["candidate_rewrite"], 1);
+    assert!(!healthy.fire("ConfirmTypedNext", &mut interrupted));
+    assert!(healthy.check_invariant("UnownedContentRewriteConsumesCandidate", &interrupted));
+
+    let mut interrupted_buggy = buggy.init_state();
+    assert!(buggy.fire("ArmTyped", &mut interrupted_buggy));
+    assert!(buggy.fire("DeliverStable", &mut interrupted_buggy));
+    assert!(buggy.fire("UnownedContentRewrite", &mut interrupted_buggy));
+    assert!(
+        !buggy.check_invariant("UnownedContentRewriteConsumesCandidate", &interrupted_buggy,),
+        "the stale-generation mutant must retain the in-flight candidate"
+    );
+    assert!(buggy.fire("ConfirmTypedNext", &mut interrupted_buggy));
+    assert!(buggy.fire("ObserveMove", &mut interrupted_buggy));
+    assert_eq!(interrupted_buggy["birth"], 1);
+
+    // A dark consumed cohort can explicitly begin a new epoch and admit an
+    // independent exact key. This guards recovery as well as fail-closedness.
+    assert!(healthy.fire("BeginCandidateEpoch", &mut interrupted));
+    for action in [
+        "ArmTyped",
+        "DeliverStable",
+        "ConfirmTypedNext",
+        "ObserveMove",
+    ] {
+        assert!(
+            healthy.fire(action, &mut interrupted),
+            "recovery trace: {action}"
+        );
+    }
+    assert_eq!(interrupted["birth"], 1);
+
+    // A retirement marker is one generation's completed proof. Healthy code
+    // must cross an explicit epoch boundary before later geometry can charge;
+    // it may not silently recharge while `unowned_rewrite` is still asserted.
+    let mut next_epoch = healthy.init_state();
+    for action in [
+        "ChargeResident",
+        "FinalExtractSame",
+        "UnownedContentRewrite",
+        "BeginResidentEpoch",
+        "ChargeResident",
+    ] {
+        assert!(
+            healthy.fire(action, &mut next_epoch),
+            "resident epoch trace: {action}"
+        );
+    }
+    assert_eq!(next_epoch["unowned_rewrite"], 0);
+    assert_eq!(next_epoch["resident_charged"], 1);
+
+    let mut sticky = healthy.init_state();
+    assert!(healthy.fire("ChargeResident", &mut sticky));
+    assert!(healthy.fire("UnownedContentRewrite", &mut sticky));
+    assert!(
+        !healthy.fire("ArmSynthetic", &mut sticky),
+        "a completed retirement marker cannot be silently overwritten"
+    );
+    assert!(healthy.fire("BeginResidentEpoch", &mut sticky));
+    assert!(healthy.fire("ArmSynthetic", &mut sticky));
+
+    let mut hidden = buggy.init_state();
+    assert!(buggy.fire("ChargeResident", &mut hidden));
+    assert!(buggy.fire("ArmSynthetic", &mut hidden));
+    assert!(buggy.fire("HiddenBoundary", &mut hidden));
+    assert!(
+        !buggy.check_invariant("HiddenBoundaryDrainsCandidateAndResident", &hidden),
+        "the hidden-boundary mutant must retain candidate/resident cursor state"
+    );
+
+    let mut selected = buggy.init_state();
+    assert!(buggy.fire("NextStyle", &mut selected));
+    assert!(buggy.fire("NextEngine", &mut selected));
+    assert!(buggy.fire("NextHost", &mut selected));
+    assert!(buggy.fire("ArmSynthetic", &mut selected));
+    assert!(buggy.fire("ObserveMove", &mut selected));
+    assert!(
+        !buggy.check_invariant("BirthBoundToSelectedStyleEngineHost", &selected),
+        "a birth must carry the actual selected style, engine and host"
+    );
+    assert!(buggy.fire("ReobserveConsumed", &mut selected));
+    assert!(
+        !buggy.check_invariant("CandidateConsumedOnce", &selected),
+        "a consumed candidate cannot birth/observe twice"
+    );
+
+    let mut unadmitted = buggy.init_state();
+    assert!(buggy.fire("ArmTyped", &mut unadmitted));
+    assert!(buggy.fire("DeliverQueued", &mut unadmitted));
+    assert!(buggy.fire("ForgeUnadmittedBirth", &mut unadmitted));
+    assert!(
+        !buggy.check_invariant("BirthRequiresAdmission", &unadmitted),
+        "every style birth must have an admitted candidate"
+    );
+
+    // A newly admitted birth becomes resident after its coherent extraction;
+    // the very next unowned generation must retire that geometry too. This is
+    // distinct from ChargeResident, which models light inherited from an
+    // earlier frame without a candidate in the current one.
+    let mut fresh = healthy.init_state();
+    for action in [
+        "ArmTyped",
+        "DeliverStable",
+        "ConfirmTypedNext",
+        "ObserveMove",
+        "FinalExtractSame",
+        "PromoteProjectedBirth",
+        "UnownedContentRewrite",
+    ] {
+        assert!(
+            healthy.fire(action, &mut fresh),
+            "healthy fresh trace: {action}"
+        );
+    }
+    assert_eq!(fresh["resident_charged"], 0);
+    assert_eq!(fresh["resident_projection"], 0);
+
+    let mut fresh_buggy = buggy.init_state();
+    for action in [
+        "ArmTyped",
+        "DeliverStable",
+        "ConfirmTypedNext",
+        "ObserveMove",
+        "FinalExtractSame",
+        "PromoteProjectedBirth",
+        "UnownedContentRewrite",
+    ] {
+        assert!(
+            buggy.fire(action, &mut fresh_buggy),
+            "buggy fresh trace: {action}"
+        );
+    }
+    assert!(
+        !buggy.check_invariant("UnownedContentRewriteRetiresResident", &fresh_buggy),
+        "a freshly born segment is resident and must not survive the next unowned generation"
+    );
+}
+
+/// Retained history is a different coordinate space from the active cursor.
+/// Every cursor-owned pixel/cell is suppressed immediately, a retained capture
+/// stays dark, and the hidden resident-pet lifecycle keeps progressing until
+/// its scheduler can settle. The mutant preserves the old overlays and stalls
+/// the pet tick.
+#[test]
+fn derived_cursor_viewport_lifecycle_proves_and_catches_history_overlays() {
+    let model = cursor_viewport_lifecycle_model();
+    assert_proves_and_catches(&model);
+
+    let charged = model.successors("ChargeLive", &model.init_state())[0].clone();
+    let history = model.successors("EnterHistory", &charged)[0].clone();
+    assert_eq!(history["live_viewport"], 0);
+    for key in [
+        "glow_visible",
+        "trail_visible",
+        "cursor_body_visible",
+        "pet_visible",
+        "base_cursor_visible",
+    ] {
+        assert_eq!(history[key], 0, "{key} must be dark in history");
+    }
+    assert_eq!(history["pet_brain_ticked"], 1);
+    let retained = model.successors("RetainHistory", &history)[0].clone();
+    assert_eq!(retained["retained_checked"], 1);
+    assert!(model.check_invariant("HistorySuppressesCursorOwnedPixels", &retained));
+    let settled = model.successors("SettleHistoryBrain", &retained)[0].clone();
+    assert_eq!(settled["pet_brain_pending"], 0);
+    assert_eq!(settled["scheduler_stuck"], 0);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let charged = buggy.successors("ChargeLive", &buggy.init_state())[0].clone();
+    let stale = buggy.successors("EnterHistory", &charged)[0].clone();
+    assert!(
+        !buggy.check_invariant("HistorySuppressesCursorOwnedPixels", &stale),
+        "the history-overlay mutant must retain visible cursor-owned pixels"
+    );
+    assert!(
+        !buggy.check_invariant("HiddenSchedulerNeverSticks", &stale),
+        "the history-overlay mutant must expose its stalled pet scheduler"
+    );
+}
+
+/// Every surviving cursor-effect anchor follows a PTY scroll by the exact row
+/// delta and every off-top member is retired. The mutant strands both families
+/// in their old coordinates.
+#[test]
+fn derived_cursor_effect_scroll_proves_and_catches_stranded_geometry() {
+    assert_proves_and_catches(&cursor_effect_scroll_model());
+}
+
+/// Capped/zero retained history cannot hide a uniform scroll from the host;
+/// non-uniform region/alt/reset motion instead invalidates all cached effect
+/// coordinates. The mutant restores retained-count diffing and strands light.
+#[test]
+fn derived_cursor_scroll_signal_proves_and_catches_capped_history_stranding() {
+    assert_proves_and_catches(&cursor_scroll_signal_model());
 }
 
 /// Fast-jump starbursts retain the newest item under their FIFO cap, move into

@@ -309,7 +309,7 @@ impl DeferredLine {
     /// Fast-path materialization for rows with no extras.
     fn materialize_no_extras(cells: &[Cell], wrapped: bool) -> Line {
         let mut text = String::with_capacity(cells.len());
-        let mut attrs_rle: Rle<CellAttrs> = Rle::new();
+        let mut attrs_rle = AttrRunBuilder::empty();
 
         for (idx, cell) in cells.iter().enumerate() {
             if is_spacer(cells, idx) {
@@ -321,7 +321,7 @@ impl DeferredLine {
             attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
         }
 
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, Vec::new());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
         if wrapped {
             line.set_wrapped(true);
         }
@@ -331,7 +331,7 @@ impl DeferredLine {
     /// Full materialization with extras (hyperlinks, complex chars, combining, RGB).
     fn materialize_with_extras(cells: &[Cell], extras: &ScrolledRowExtras, wrapped: bool) -> Line {
         let mut text = String::with_capacity(cells.len());
-        let mut attrs_rle: Rle<CellAttrs> = Rle::new();
+        let mut attrs_rle = AttrRunBuilder::empty();
         let mut cursors = RowToLineCursorState::default();
 
         for (physical_col, cell) in cells.iter().enumerate() {
@@ -370,7 +370,8 @@ impl DeferredLine {
             );
         }
 
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, extras.hyperlinks.clone());
+        let mut line =
+            Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
@@ -784,7 +785,7 @@ impl Grid {
         }
 
         let mut text = String::with_capacity(len);
-        let mut attrs_rle: Rle<CellAttrs> = Rle::new();
+        let mut attrs_rle = AttrRunBuilder::empty();
         let mut cursors = RowToLineCursorState::default();
 
         let cells = &row.as_slice()[..len];
@@ -827,7 +828,8 @@ impl Grid {
             );
         }
 
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, extras.hyperlinks.clone());
+        let mut line =
+            Line::with_hyperlinks_owned(text, attrs_rle.finish(), extras.hyperlinks.clone());
         if !extras.underline_colors.is_empty() {
             line.set_underline_colors(coalesce_underline_spans(&extras.underline_colors));
         }
@@ -843,7 +845,7 @@ impl Grid {
     fn row_to_line_no_extras(row: &Row, len: usize) -> Line {
         let cells = &row.as_slice()[..len];
         let mut text = String::with_capacity(len);
-        let mut attrs_rle: Rle<CellAttrs> = Rle::new();
+        let mut attrs_rle = AttrRunBuilder::empty();
 
         for (idx, cell) in cells.iter().enumerate() {
             #[cfg(any(test, feature = "testing"))]
@@ -862,7 +864,7 @@ impl Grid {
             attrs_rle.push(CellAttrs::from_raw(fg_raw, bg_raw, cell.flags().bits()));
         }
 
-        let mut line = Line::with_hyperlinks_owned(text, attrs_rle, Vec::new());
+        let mut line = Line::with_hyperlinks_owned(text, attrs_rle.finish(), Vec::new());
         if row.is_wrapped() {
             line.set_wrapped(true);
         }
@@ -1293,15 +1295,126 @@ pub(in crate::grid) fn resolve_cell_color(
     }
 }
 
-fn push_repeated_attrs(attrs_rle: &mut Rle<CellAttrs>, attrs: CellAttrs, char_count: usize) {
-    for _ in 0..char_count {
-        attrs_rle.push(attrs);
+/// Accumulates a materializing line's attribute runs, allocating NOTHING until
+/// a second distinct `CellAttrs` actually appears.
+///
+/// WHY: `Line::from_parts` throws the whole `Rle` away when it holds zero runs
+/// or one DEFAULT run — which is the shape of every plain-text line, the
+/// commonest thing a terminal ever scrolls. The old code still built that `Rle`
+/// in full: the first `push` allocated its `runs` vector, every later cell went
+/// through `push` -> `extend_with` -> `remaining_capacity` -> `runs.last_mut()`,
+/// and the finished object was dropped unread. Holding the open run in two
+/// locals instead makes the plain line allocation-free and turns the per-cell
+/// step into one comparison.
+///
+/// EQUIVALENCE. The emitted `Rle` is run-for-run identical to the old one in
+/// every case `from_parts` KEEPS, and the only case it differs is the one
+/// `from_parts` discards:
+///   * no cells             -> 0 runs (was: 0 runs)          -> `attrs = None`
+///   * one DEFAULT run      -> 0 runs (was: 1 default run)   -> `attrs = None`
+///   * one non-default run  -> 1 run  (was: 1 run, same)     -> stored
+///   * two or more runs     -> same runs, same order         -> stored
+///
+/// A spill only happens on a value CHANGE, so a spilled builder always emits at
+/// least two runs and can never collapse back into the discarded shape.
+struct AttrRunBuilder {
+    /// Runs already closed out. Empty (and unallocated) until the first spill.
+    rle: Rle<CellAttrs>,
+    /// Value of the OPEN run. Seeded to `DEFAULT` so the first cell of a plain
+    /// line merges into it instead of taking the cold path.
+    value: CellAttrs,
+    /// How many cells the open run covers. `0` means "nothing opened yet", and
+    /// because a fresh builder's `value` is `DEFAULT` a zero-length open run
+    /// merges correctly with whatever arrives first.
+    len: u32,
+    /// Whether any run was ever closed into `rle`. Distinguishes "one run, and
+    /// it is default" (drop it) from "several runs, the last happens to be
+    /// default" (keep them) — the case a naive `is_default()` test would lose.
+    spilled: bool,
+}
+
+impl AttrRunBuilder {
+    /// Deliberately NOT named `new`: the lock-order census resolves one-hop
+    /// held calls by callee NAME, so a helper called `new` would merge with
+    /// every other `new` in the tree.
+    fn empty() -> Self {
+        Self {
+            rle: Rle::new(),
+            value: CellAttrs::DEFAULT,
+            len: 0,
+            spilled: false,
+        }
     }
+
+    #[inline]
+    fn push(&mut self, attrs: CellAttrs) {
+        self.extend(attrs, 1);
+    }
+
+    /// PER-CELL HOT PATH — keep it to one comparison and one add.
+    ///
+    /// The `len == 0` case needs no test of its own: a fresh builder's open run
+    /// is `(DEFAULT, 0)`, so a default first cell merges (giving `(DEFAULT, n)`,
+    /// which is right) and a styled first cell falls into `open_new_run`, which
+    /// flushes nothing because `len` is 0.
+    ///
+    /// `open_new_run` is deliberately a SEPARATE, non-inlined function: folding
+    /// its `Rle::extend_with` call into this one made the whole thing too big to
+    /// inline into the per-cell materialization loop, and the measured result
+    /// was a 6-11% REGRESSION on the very workloads this change exists to speed
+    /// up. The split is what makes the fast path a straight-line compare.
+    #[inline]
+    fn extend(&mut self, attrs: CellAttrs, count: u32) {
+        if count == 0 {
+            return;
+        }
+        if self.value == attrs {
+            // A row is at most `u16::MAX` cells wide and each cell contributes a
+            // bounded number of characters, so this sum cannot reach `u32::MAX`;
+            // the saturating form just discharges the overflow obligation, and
+            // `Rle::extend_with` clamps to the remaining capacity at flush
+            // exactly as the old per-cell pushes did.
+            self.len = self.len.saturating_add(count);
+            return;
+        }
+        self.open_new_run(attrs, count);
+    }
+
+    /// Cold path: close the open run (if any) into the `Rle` and start a new one.
+    #[inline(never)]
+    fn open_new_run(&mut self, attrs: CellAttrs, count: u32) {
+        if self.len != 0 {
+            self.rle.extend_with(self.value, self.len);
+            self.spilled = true;
+        }
+        self.value = attrs;
+        self.len = count;
+    }
+
+    /// Close the open run and yield the `Rle` to hand to `Line::from_parts`.
+    ///
+    /// A single all-default run is dropped rather than emitted: that is the
+    /// value `from_parts` collapses to `None` anyway, and not emitting it is
+    /// what keeps a plain line's materialization allocation-free.
+    fn finish(mut self) -> Rle<CellAttrs> {
+        if self.len != 0 && (self.spilled || !self.value.is_default()) {
+            self.rle.extend_with(self.value, self.len);
+        }
+        self.rle
+    }
+}
+
+fn push_repeated_attrs(attrs_rle: &mut AttrRunBuilder, attrs: CellAttrs, char_count: usize) {
+    // `char_count` copies of ONE value is one run by construction, so hand the
+    // builder the count instead of looping a per-character push. Identical
+    // result: a loop of single pushes clamps each to `min(1, remaining)` for a
+    // total of `min(n, remaining)`, which is what one counted extend does.
+    attrs_rle.extend(attrs, u32::try_from(char_count).unwrap_or(u32::MAX));
 }
 
 fn push_combining_marks(
     text: &mut String,
-    attrs_rle: &mut Rle<CellAttrs>,
+    attrs_rle: &mut AttrRunBuilder,
     attrs: CellAttrs,
     extras: &ScrolledRowExtras,
     cursors: &mut RowToLineCursorState,

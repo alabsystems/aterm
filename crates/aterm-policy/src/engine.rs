@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use crate::{
     OriginTag, Policy, RateLimit, Response,
-    limits::{RateLimiterSet, TimeSource},
+    limits::{RateLimitSlot, RateLimiterSet, TimeSource},
     profiles,
     selector::{BucketKey, DispatchedSequence, FunctionKind, SequenceSelector},
 };
@@ -346,6 +346,32 @@ impl PolicyEngine {
         clock: &T,
     ) -> bool {
         self.limiters.try_consume(id, amount, clock)
+    }
+
+    /// Resolve a rate-limit id to its [`RateLimitSlot`] in this engine's
+    /// bucket set — for call sites that debit the same literal id on every
+    /// dispatch and would otherwise re-hash it each time.
+    ///
+    /// The slot belongs to THIS engine (see [`RateLimitSlot`]); a caller that
+    /// swaps engines must re-resolve. Unknown ids resolve to
+    /// [`RateLimitSlot::UNDECLARED`], which debits as "allow" — the same
+    /// answer [`Self::rate_limit_try_consume`] gives them.
+    #[must_use]
+    pub fn rate_limit_slot(&self, id: &str) -> RateLimitSlot {
+        self.limiters.slot(id)
+    }
+
+    /// Debit a bucket resolved earlier by [`Self::rate_limit_slot`].
+    ///
+    /// Identical semantics to [`Self::rate_limit_try_consume`], minus the
+    /// per-call hash of the id.
+    pub fn rate_limit_try_consume_slot<T: TimeSource>(
+        &mut self,
+        slot: RateLimitSlot,
+        amount: u64,
+        clock: &T,
+    ) -> bool {
+        self.limiters.try_consume_slot(slot, amount, clock)
     }
 
     /// Borrow the engine's rate-limiter set — intended for diagnostics

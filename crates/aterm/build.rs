@@ -180,6 +180,11 @@ fn report(why: &str) {
 /// crate inherits — so the strings Explorer and Task Manager show cannot drift
 /// from the crate version, ever.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
+    // AUTHORIZED direct read of cargo's version env (allowlisted by
+    // aterm-types' `shipped_crates_cannot_bypass_the_shared_app_version`):
+    // a build script cannot link aterm_types, and these vars are the same
+    // workspace `version` that APP_VERSION itself is derived from — one
+    // ground truth, read at the only time a build script can read it.
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
     let patch = env_num("CARGO_PKG_VERSION_PATCH");

@@ -2606,6 +2606,7 @@ mod tests {
             bg,
             wide: false,
             emoji_presentation: false,
+            text_presentation: false,
             bold: false,
             italic: false,
             underline: UnderlineStyle::None,

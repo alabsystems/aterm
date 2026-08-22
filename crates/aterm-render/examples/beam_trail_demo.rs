@@ -111,8 +111,10 @@ fn main() {
             glow.tick(Some((row, col)), now, &c, geom, &mut quads);
         }
         col += 1;
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((row, col)), now, &c, geom, &mut quads);
         if key == 15 {
+            assert!(!quads.is_empty(), "scripted Beam typing must emit light");
             shoot(
                 &mut renderer,
                 &quads,
@@ -167,7 +169,9 @@ fn main() {
     let mut now = t;
     glow.tick(Some((2, 60)), now, &c, geom, &mut quads);
     now += Duration::from_millis(40);
+    glow.note_synthetic_move(now);
     glow.tick(Some((7, 8)), now, &c, geom, &mut quads);
+    assert!(!quads.is_empty(), "scripted Beam jump must emit a rod");
     shoot(
         &mut renderer,
         &quads,
@@ -209,6 +213,7 @@ fn main() {
             glow.tick(Some((3, col)), now, &bar_cfg, geom, &mut quads);
         }
         col += 1;
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some((3, col)), now, &bar_cfg, geom, &mut quads);
     }
     shoot(
