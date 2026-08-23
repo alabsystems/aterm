@@ -85,6 +85,14 @@ pub struct GridStorage {
     /// Settings snapshot for the detached tiered store, plus mutations that
     /// arrived while the worker owned it. `None` outside a detach window.
     pub(crate) pending_scrollback_settings: Option<PendingScrollbackSettings>,
+    /// The viewport's trailing-blank-row count captured when a width-reflow
+    /// resize DETACHED the tiered store (see `resize_offloading_scrollback`).
+    /// The synchronous resize cannot bottom-anchor the viewport while the
+    /// history is out with the worker, so the deficit fill
+    /// (`fill_viewport_deficit_from_history`) runs at re-attach against this
+    /// target instead. `None` outside a detach window; consumed by the first
+    /// width-matched re-attach, cleared by erase/replacement/abort.
+    pub(crate) pending_fill_target: Option<usize>,
     /// THRU-5: true when an off-thread compression worker is attached to this
     /// session (set once at session setup). While true, the reader-thread ingest
     /// path does NOT drain the lazy buffer inline on `should_drain` — it lets the
@@ -212,6 +220,7 @@ impl GridStorage {
             lazy_buffer: LazyBuffer::new(),
             scrollback_detached_for_reflow: false,
             pending_scrollback_settings: None,
+                pending_fill_target: None,
             compress_offload_active: false,
             flood_truncated_lines: 0,
             ring_byte_watermark: None,

@@ -153,6 +153,24 @@ impl Terminal {
         // Keep the ACTIVE grid's offset valid too (it IS the primary when the
         // alt screen is down; a no-op re-clamp otherwise).
         self.grid.clamp_display_offset();
+        // SELECTION CUSTODY Phase 4: shrinking the limit EVICTS the oldest lines with
+        // no scroll and no damage band, so nothing else re-floors the selection —
+        // this is the entry point `adjust_for_scroll` cannot serve.
+        //
+        // Only off the alt screen. While alt is up the eviction above hit
+        // `self.alt_grid`, which holds the SAVED PRIMARY, whereas `text_selection`
+        // addresses `self.grid` — the alt buffer. Those are unrelated coordinate
+        // spaces: re-flooring here would clamp the live selection against a floor that
+        // does not describe its grid. The saved primary's own selection is re-floored
+        // when it is restored.
+        if !self.modes.alternate_screen {
+            let live_top_abs = self
+                .grid
+                .absolute_row_counter()
+                .saturating_sub(u64::from(self.grid.rows()));
+            self.text_selection
+                .truncate_to_floor(self.grid.oldest_absolute_row(), live_top_abs);
+        }
     }
 
     /// The retained scrollback line limit of the primary-content grid
@@ -220,6 +238,12 @@ impl Terminal {
             alt.erase_scrollback();
         }
         self.text_selection.clear();
+        // `erase_scrollback` above ran on BOTH grids, so the parked selection's
+        // anchors dangle in exactly the same way. The parked grid's own `All` damage
+        // would also reach the drain on the exit batch, but a selection that is
+        // already known to be dangling should not stay alive until then, and a later
+        // narrowing of that damage must not silently resurrect it.
+        self.parked_text_selection.clear();
         // Clear shell integration marks and marks state that contain absolute
         // row numbers — these become dangling references after scrollback is
         // erased (#7667).

@@ -155,6 +155,7 @@ fn negative_z_images_composite_before_base_and_combining_glyphs() {
             cols: 1,
             rows: 1,
             z_index: -1,
+            band_lift_px: 0,
         });
         let composited = aterm_render::blend_rgb(cell_bg_u32, image_rgb_u32, alpha);
         let composited_bg = [
@@ -234,6 +235,7 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
             cols: 1,
             rows: 1,
             z_index,
+            band_lift_px: 0,
         });
         for &col in image_cols {
             input.images[0].push((
@@ -270,6 +272,97 @@ fn kitty_extreme_negative_z_sits_below_non_default_cell_backgrounds() {
         aterm_render::rgb_to_u32(image_rgb),
         "the deepest tier remains visible through a default-background cell"
     );
+}
+
+#[test]
+fn chrome_band_lift_paints_the_lip_above_the_grid() {
+    // The tab strip's pixel band ([`ImageData::band_lift_px`]): an image whose
+    // canvas extends `lift` px ABOVE its first cell row must paint the chrome
+    // lip `[grid_top - lift, grid_top)` from its own top rows, seat its cell
+    // rows exactly where an unlifted image sits, and leave every pixel outside
+    // its columns untouched. A lift of 0 must remain byte-identical.
+    let Some(mut r) = Renderer::from_system(16.0, Theme::default()) else {
+        eprintln!("SKIP: no system monospace font found");
+        return;
+    };
+    let (cw, ch) = r.cell_size();
+    let (rows, cols) = (3usize, 6usize);
+    let (pad, pad_top, head) = (4usize, 2usize, 9usize);
+    r.set_pad(pad);
+    r.set_pad_top(pad_top);
+    r.set_head(head);
+    let lift = pad_top + head;
+    let grid_top = lift;
+
+    // A raw canvas: `lift` LIP rows of red over one cell row of green.
+    let (img_w, img_h) = (2 * cw, ch + lift);
+    let mut bytes = Vec::with_capacity(img_w * img_h * 4);
+    for y in 0..img_h {
+        let rgba: [u8; 4] = if y < lift { [220, 30, 30, 255] } else { [30, 200, 30, 255] };
+        for _ in 0..img_w {
+            bytes.extend_from_slice(&rgba);
+        }
+    }
+    let image = |band_lift_px: u16| {
+        Arc::new(aterm_core::grid::extra::ImageData {
+            bytes: bytes.clone(),
+            format: aterm_core::grid::extra::ImageFormat::RawRgba8 {
+                width: img_w as u16,
+                height: img_h as u16,
+            },
+            cols: 2,
+            rows: 1,
+            z_index: 0,
+            band_lift_px,
+        })
+    };
+    let make_input = |band_lift_px: u16| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        let image = image(band_lift_px);
+        for col in 0..2usize {
+            input.images[0].push((
+                col,
+                aterm_core::grid::extra::ImageRef {
+                    image: Arc::clone(&image),
+                    cell_row: 0,
+                    cell_col: col as u16,
+                },
+            ));
+        }
+        input
+    };
+
+    let lifted = r.render_input(&make_input(lift as u16));
+    let sample = |frame: &aterm_render::Frame, x: usize, y: usize| {
+        frame.pixels[y * frame.width + x] & 0x00ff_ffff
+    };
+    // The LIP above the grid, inside the image's columns: the canvas's red rows.
+    assert_eq!(
+        sample(&lifted, pad + cw / 2, grid_top / 2),
+        0x00DC_1E1E,
+        "the lip carries the canvas's top rows"
+    );
+    // The cell band itself: the canvas's green rows, at the unlifted position.
+    assert_eq!(
+        sample(&lifted, pad + cw / 2, grid_top + ch / 2),
+        0x001E_C81E,
+        "the cell row still paints its own band"
+    );
+    // Outside the image's columns the lip stays the theme's own chrome.
+    let outside = sample(&lifted, pad + 3 * cw, grid_top / 2);
+    assert_ne!(outside, 0x00DC_1E1E, "the lift never bleeds sideways");
+
+    // Control: lift 0 leaves the lip untouched (the canvas is drawn squashed
+    // into the footprint per the decode contract — nothing above `grid_top`).
+    let mut r2 = Renderer::from_system(16.0, Theme::default()).expect("font");
+    r2.set_pad(pad);
+    r2.set_pad_top(pad_top);
+    r2.set_head(head);
+    let unlifted = r2.render_input(&make_input(0));
+    let lip = sample(&unlifted, pad + cw / 2, grid_top / 2);
+    assert_ne!(lip, 0x00DC_1E1E, "lift 0 draws nothing above the grid");
 }
 
 /// Minimal CRC-32 (the PNG/IEEE 802.3 variant), table-free — tests only.

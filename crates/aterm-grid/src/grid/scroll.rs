@@ -223,6 +223,9 @@ impl Grid {
             return;
         }
 
+        // SU reveals genuine blank rows at the bottom — same fill-target rule
+        // as DL and the ED family.
+        self.invalidate_pending_fill_target();
         self.scroll_up_storage(n);
         self.finish_scroll_up(n);
     }

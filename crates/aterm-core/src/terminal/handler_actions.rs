@@ -1000,6 +1000,7 @@ impl TerminalHandler<'_> {
             rows,
             // Kitty z=: negative draws behind text. iTerm2/Sixel + z=0 default to 0.
             z_index: cmd.z_index.unwrap_or(0),
+            band_lift_px: 0,
         })
     }
 }

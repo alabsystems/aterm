@@ -70,12 +70,18 @@ fn row_len_is_logical_length() {
 
 #[test]
 fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
-    // P1: after a ring-only width-shrink reflow overflows wrapped rows into the
-    // lazy buffer, a scrolled-back HISTORY row (past the ring base, where
+    // P1: after a width-shrink reflow overflows wrapped rows into TIERED
+    // history, a scrolled-back HISTORY row (past the ring base, where
     // Grid::row is None) returned correct row_text — which routes through the
     // tier-aware visible_row_view — but pre-fix row_len/row_is_wrapped resolved
     // straight through Grid::row and so reported None for the same rows.
-    let mut grid = Grid::new(3, 40); // ring-only: 10k ring, no tiered store
+    //
+    // (This used to build the past-ring-base state on a ring-only grid, whose
+    // reflow overflow was stranded in the lazy buffer; since fixwave5 that
+    // overflow is absorbed into the ring — where Grid::row CAN resolve it — so
+    // the tiered store is now the way history lands beyond the ring base.)
+    let scrollback = Scrollback::new(100, 1000, 10_000_000);
+    let mut grid = Grid::with_tiered_scrollback(3, 40, 2, scrollback);
     // Three 30-char lines fill the 3 visible rows without wrapping at 40 cols;
     // the last has no line feed so the cursor rests on the bottom row.
     for (i, ch) in ['A', 'B', 'C'].into_iter().enumerate() {

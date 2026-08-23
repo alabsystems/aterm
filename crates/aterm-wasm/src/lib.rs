@@ -1616,8 +1616,11 @@ impl AtermTerminal {
     pub fn selection_start(&mut self, row: i32, col: u16) {
         // WF-1 gate: selection is Terminal-held but marks NO grid damage (the
         // native GUI folds it as its own RepaintKey term for the same reason).
-        // Every selection mutator below bumps unconditionally — idempotent
-        // inserts would need a fingerprint compare for zero benefit.
+        // The ONE-SHOT selection mutators (this one, word, line, finish, clear)
+        // bump unconditionally: a host calls them once per gesture, so an
+        // idempotence check would only ever buy back a frame that is never
+        // requested twice. `selection_extend` is the exception and explains
+        // itself there — it is the only one a host calls at pointer cadence.
         self.note_host_visual_change();
         let row = self.display_row_to_terminal(row);
         self.term.text_selection_mut().start_selection(
@@ -1668,12 +1671,45 @@ impl AtermTerminal {
     }
 
     /// Move the selection endpoint to `row`/`col` (during a drag).
+    ///
+    /// WF-1 gate, and the ONE exception to the unconditional-bump rule above:
+    /// this is the only `note_host_visual_change` caller a host invokes at
+    /// POINTER cadence. A pointer moving sub-cell re-asserts the SAME cell
+    /// across consecutive frames, and each such re-assertion used to reopen the
+    /// gate for a frame whose only outcome was a `DamageOutcome::GateHit` and
+    /// zero present bands — a full `cell_frame_into` resolve plus a full
+    /// `compute_dirty_rows` row walk, to conclude nothing changed. So bump only
+    /// when the RESOLVED selection actually differs.
+    ///
+    /// The comparison is over the engine's own `TextSelection` value (all
+    /// four fields: state, type, start anchor, end anchor) taken around the
+    /// update, NOT over the caller's `(row, col)` arguments. That is deliberate
+    /// — an argument shadow gets three cases wrong:
+    /// - the DISPLAY row has to be converted first: auto-scroll during a drag
+    ///   moves `display_offset` under a stationary display row, which IS a real
+    ///   move of the terminal-relative anchor;
+    /// - there is no shadow to reset, so `selection_start`/`word`/`line`/
+    ///   `finish`/`clear` cannot leave a stale one that swallows the first
+    ///   extend of the NEXT drag;
+    /// - the engine moves selection anchors behind this facade's back when
+    ///   content scrolls (`Terminal`'s `adjust_for_scroll`), after which
+    ///   byte-identical arguments genuinely change the span.
+    ///
+    /// `TextSelection` is four small scalars, so clone-and-compare is O(1) and
+    /// unconditionally cheaper than the frame it elides. It is also EXACTLY the
+    /// predicate the renderer's own row diff applies (`prev_input.selection !=
+    /// input.selection`, aterm-render), so "equal here" is precisely "no frame
+    /// to draw" — this cannot suppress a bump for a selection that would have
+    /// painted differently.
     pub fn selection_extend(&mut self, row: i32, col: u16) {
-        self.note_host_visual_change(); // WF-1 gate (see selection_start)
         let row = self.display_row_to_terminal(row);
+        let before = self.term.text_selection().clone();
         self.term
             .text_selection_mut()
             .update_selection(row, col, SelectionSide::Right);
+        if *self.term.text_selection() != before {
+            self.note_host_visual_change();
+        }
     }
 
     /// Finalize the selection (mouse released).
@@ -4917,6 +4953,135 @@ Un-ignore with the web-host migration."]
         assert!(
             !t.last_render_skipped(),
             "a viewport scroll must draw (display-offset damage -> epoch)"
+        );
+    }
+
+    /// The drag half of the WF-1 gate: `selection_extend` must bump ONLY when
+    /// the resolved selection actually moved in cell coordinates.
+    ///
+    /// This is the two-sided guard for the redundant-extend fix. Every "must
+    /// draw" case below is a way an argument shadow (rather than a comparison
+    /// of the engine's resolved `TextSelection`) would have lost a real update.
+    #[test]
+    fn redundant_selection_extend_gates_but_every_real_move_still_draws() {
+        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            eprintln!("no system font; skipping selection-extend gate test");
+            return;
+        };
+        for _ in 0..20 {
+            t.process(b"a line of selectable text\r\n");
+        }
+        t.render();
+
+        // ---- SKIP side: cell-identical jitter ------------------------------
+        t.selection_start(2, 4);
+        t.selection_extend(2, 10);
+        t.render();
+        assert!(!t.last_render_skipped(), "the first extend must draw");
+        let baseline = t.rgba();
+        let span = t.selection_text();
+        t.selection_extend(2, 10); // the pointer moved sub-cell: same cell
+        assert!(
+            !t.needs_frame(),
+            "a redundant extend must not reopen the gate"
+        );
+        t.render();
+        assert!(
+            t.last_render_skipped(),
+            "a cell-identical extend must be gated away"
+        );
+        assert_eq!(t.present_band_count(), 0, "gated frame exports zero bands");
+        assert_eq!(t.rgba(), baseline, "gated frame retains the framebuffer");
+        assert_eq!(t.selection_text(), span, "and the selection is unchanged");
+
+        // ---- DRAW side 1: a genuine one-cell move --------------------------
+        t.selection_extend(2, 11);
+        assert!(t.needs_frame(), "a one-cell move must reopen the gate");
+        t.render();
+        assert!(!t.last_render_skipped(), "a one-cell move must draw");
+        assert_ne!(t.selection_text(), span, "and it really moved");
+
+        // ---- DRAW side 2: leave a cell and come back -----------------------
+        // The head is at col 11. Go back to 10 and then to 11 again: BOTH are
+        // real changes relative to the immediately preceding state, so neither
+        // may be swallowed.
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled before the round trip");
+        t.selection_extend(2, 10);
+        t.render();
+        assert!(!t.last_render_skipped(), "moving back one cell must draw");
+        t.selection_extend(2, 11);
+        t.render();
+        assert!(
+            !t.last_render_skipped(),
+            "re-entering the previous cell must draw"
+        );
+
+        // ---- DRAW side 3: a NEW drag onto the old drag's end cell ----------
+        // A stale endpoint shadow would match here and lose the whole new
+        // highlight until the pointer moved again.
+        t.selection_finish();
+        t.render();
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled before the second drag");
+        t.selection_start(4, 2);
+        t.selection_extend(2, 11); // exactly where the previous drag ended
+        t.render();
+        assert!(
+            !t.last_render_skipped(),
+            "a new drag reaching the old end cell must draw"
+        );
+
+        // ---- DRAW side 4: the viewport scrolls under a stationary pointer --
+        // `selection_extend` takes a DISPLAY row; a scroll moves the
+        // terminal-relative anchor under an unmoved display row, so the SAME
+        // arguments name a different cell of the buffer.
+        t.selection_finish();
+        t.render();
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled before the scroll");
+        t.selection_start(3, 2);
+        t.selection_extend(3, 12);
+        t.render();
+        let before_scroll = t.selection_text();
+        t.scroll_lines(2);
+        t.render();
+        t.render();
+        assert!(t.last_render_skipped(), "re-settled after the scroll");
+        t.selection_extend(3, 12); // identical ARGUMENTS, different cell
+        assert!(
+            t.needs_frame(),
+            "a scroll under a stationary pointer must still reopen the gate"
+        );
+        t.render();
+        assert!(
+            !t.last_render_skipped(),
+            "an extend whose terminal-relative anchor moved must draw"
+        );
+        assert_ne!(
+            t.selection_text(),
+            before_scroll,
+            "and the selection really did change"
+        );
+
+        // ---- Pixel invisibility: the gate must never change the picture ----
+        let Some(mut fresh) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            return;
+        };
+        for _ in 0..20 {
+            fresh.process(b"a line of selectable text\r\n");
+        }
+        // The SAME gesture in the same order, but rendered only ONCE at the end
+        // — so if the de-dup had swallowed a real update, `t` would differ here.
+        fresh.selection_start(3, 2);
+        fresh.selection_extend(3, 12);
+        fresh.scroll_lines(2);
+        fresh.selection_extend(3, 12);
+        fresh.render();
+        assert_eq!(
+            t.rgba(),
+            fresh.rgba(),
+            "de-duping redundant extends must be pixel-invisible"
         );
     }
 }

@@ -251,6 +251,18 @@ impl App {
         if fired {
             self.about_copy(wid);
         }
+        // X11 convention, mirroring the terminal's `finish_selection`: a completed
+        // sweep ALWAYS owns the PRIMARY selection (independent of copy-on-select,
+        // which on Linux defaults off precisely because PRIMARY carries the
+        // selection there), so middle-click-paste of About text works without
+        // clobbering the explicit-copy CLIPBOARD.
+        #[cfg(target_os = "linux")]
+        if was_dragging && !cleared {
+            let text = self.about_copy_text(wid);
+            if !text.is_empty() {
+                crate::control::primary_set(&text);
+            }
+        }
         fired
     }
 

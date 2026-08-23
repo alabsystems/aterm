@@ -3242,12 +3242,14 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         | prefs::EDIT_SEARCH_HISTORY_LINES
         | prefs::EDIT_BIDI
         | prefs::EDIT_AMBIGUOUS_WIDTH => Some(Effect::TerminalRuntime),
-        prefs::EDIT_COPY_ON_SELECT | prefs::EDIT_OPTION_AS_META | prefs::EDIT_PREDICTIVE_ECHO => {
-            Some(Effect::InputRuntime)
-        }
-        prefs::EDIT_CONFIRM_MULTILINE_PASTE => {
-            cfg!(any(target_os = "macos", windows)).then_some(Effect::InputRuntime)
-        }
+        // `confirm_multiline_paste` is live EVERYWHERE now: macOS asks through
+        // the window sheet, Windows through MessageBoxW, and Linux through the
+        // in-window banner (`paste_banner`) — the "no prompt elsewhere" gate
+        // this arm used to carry described the audited silent no-op.
+        prefs::EDIT_COPY_ON_SELECT
+        | prefs::EDIT_OPTION_AS_META
+        | prefs::EDIT_PREDICTIVE_ECHO
+        | prefs::EDIT_CONFIRM_MULTILINE_PASTE => Some(Effect::InputRuntime),
         prefs::EDIT_MATRIX_RAIN_ENABLED
         // Sound VOLUME and PALETTE (2026-07-24 UX audit): both shipped and
         // both consumed by `trail_audio`, neither reachable from Settings —
@@ -3278,9 +3280,9 @@ fn native_advanced_effect(key: &str) -> Option<AdvancedEffectPath> {
         // THE AUDIBLE BEL. Unlike every key above it is NOT a synth voice —
         // it is the OS alert sound (`NSBeep` / `MessageBeep`), which is why
         // `trail_sound_volume` never reached it and why it had no key at all.
-        // Platform-gated exactly like `confirm_multiline_paste`: macOS and
-        // Windows have a beep call to suppress, other platforms have none, so
-        // the row appears only where turning it off does something.
+        // Platform-gated: macOS and Windows have a beep call to suppress,
+        // other platforms have none, so the row appears only where turning it
+        // off does something.
         prefs::EDIT_BELL_SOUND => {
             cfg!(any(target_os = "macos", windows)).then_some(Effect::TerminalRuntime)
         }
@@ -5301,6 +5303,14 @@ fn settings_search_bar(state: &SettingsViewState, placeholder: &str, height: Len
             .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
     ];
     if !state.search_input.value().is_empty() || !state.search.is_empty() {
+        // The button's text box is its width minus the 20pt padding pair, so
+        // the box must be authored from what "Clear" MEASURES in the UI face
+        // at the live scale — the old fixed 52pt handed a 33.5pt word a 32pt
+        // box and painted "Cl…" (2026-08 settings audit). Floored at the 44pt
+        // touch target; the search field is the Fill neighbour that yields.
+        let clear_width =
+            (crate::tray_raster::ui_text_width("Clear", 13.0 * settings_text_scale()) + 24.0)
+                .max(44.0);
         children.push(
             UiNode::new(
                 "settings/search-clear",
@@ -5314,7 +5324,7 @@ fn settings_search_bar(state: &SettingsViewState, placeholder: &str, height: Len
             )
             .layout(
                 Layout::default()
-                    .width(Length::Fixed(52.0 * settings_text_scale().min(1.25)))
+                    .width(Length::Fixed(clear_width))
                     .height(Length::Fill),
             ),
         );
@@ -6813,6 +6823,18 @@ fn page_navigation_node_with_format(
     ])
 }
 
+/// The widest content maximum any route claims at this width class (see
+/// [`page_maximum`]) — the ONE anchor [`page_insets`] derives every page's
+/// left inset from, so sibling routes share a left edge.
+fn widest_page_maximum(width: SettingsWidth) -> f32 {
+    match width {
+        SettingsWidth::Wide => 1_040.0,
+        SettingsWidth::Medium => 760.0,
+        // No navigation rail to stay aligned with: compact pages center.
+        SettingsWidth::Compact => 0.0,
+    }
+}
+
 fn page_insets(viewport_width: f32, width: SettingsWidth, maximum: f32) -> Insets {
     let (navigation, minimum, vertical) = match width {
         SettingsWidth::Wide => (216.0, 40.0, 32.0),
@@ -6828,8 +6850,24 @@ fn page_insets(viewport_width: f32, width: SettingsWidth, maximum: f32) -> Inset
         ),
     };
     let canvas = (viewport_width - navigation).max(0.0);
-    let horizontal = ((canvas - maximum) / 2.0).max(minimum);
-    Insets::symmetric(horizontal, vertical)
+    if width == SettingsWidth::Compact {
+        let horizontal = ((canvas - maximum) / 2.0).max(minimum);
+        return Insets::symmetric(horizontal, vertical);
+    }
+    // Every rail sibling shares ONE left edge: the inset the widest route's
+    // centered content would get. Centering each page around its OWN maximum
+    // made the content column jump ~130pt when navigating Home → an ordinary
+    // form page (2026-08 settings audit); now a narrower maximum gives the
+    // difference back on the RIGHT instead. The left+right sum is unchanged
+    // for every (viewport, maximum) pair, so no page's content width moves.
+    let left = ((canvas - widest_page_maximum(width)) / 2.0).max(minimum);
+    let right = (canvas - left - maximum).max(minimum);
+    Insets {
+        left,
+        right,
+        top: vertical,
+        bottom: vertical,
+    }
 }
 
 fn page_insets_for_viewport(viewport: LogicalRect, width: SettingsWidth, maximum: f32) -> Insets {
@@ -7092,9 +7130,11 @@ fn settings_page_content_width(viewport_width: f32, width: SettingsWidth, maximu
 fn choice_navigation_button_width() -> f32 {
     let scaled = (64.0 * settings_text_scale().min(1.25)).max(64.0);
     if settings_text_scale() >= 1.75 {
-        // At 2× the UI-face width of “Done” is fractionally wider than the
-        // 60pt text box inside an 80pt button. Keep a real padding margin.
-        scaled.max(84.0)
+        // At 2× the UI-face width of “Done” measures ~64.6pt, so the button
+        // needs that plus its 20pt padding pair. 84pt left the text box at
+        // exactly 64pt — fractionally short in the audited UI face — so keep
+        // a real margin past the measured requirement.
+        scaled.max(88.0)
     } else {
         scaled
     }
@@ -7462,19 +7502,39 @@ fn compact_landscape_choice_page(
     let pages = picker.options.len().div_ceil(page_size).max(1);
     let button_width = choice_navigation_button_width();
     let short_title = top_choice_short_title(&picker.key, field.label);
+    // The header title's REAL measure: the picker column minus its padding
+    // pair, the fixed navigation buttons, and the row gaps beside them. The
+    // ladder below only paints a variant that fits it — at 2× on a short
+    // landscape host even "Appearance · 1/3" overran the box, and the parent
+    // Group keeps the complete instruction either way.
+    let header_buttons = if paginated { 3.0 } else { 1.0 };
+    let title_available = (picker_width - 24.0 - header_buttons * (button_width + 4.0)).max(0.0);
+    let title_px = 11.0 * settings_text_scale();
+    let title_fits =
+        |candidate: &str| crate::tray_raster::ui_text_width(candidate, title_px) <= title_available;
+    let title = if paginated {
+        let preferred = if settings_text_scale() > 1.25 {
+            format!("{short_title} · {page}/{pages}")
+        } else {
+            format!("{} · {page}/{pages}", field.label)
+        };
+        if title_fits(&preferred) {
+            preferred
+        } else {
+            // The page ordinal is the one live fact this row alone reports;
+            // the field's name survives in the group label and option rows.
+            format!("{page}/{pages}")
+        }
+    } else if settings_text_scale() > 1.25 {
+        short_title
+    } else {
+        format!("Choose {}", field.label)
+    };
     let mut header_children = vec![
         UiNode::new(
             format!("settings/choice-title/{}", picker.key),
             UiContent::Text(TextSpec {
-                text: if paginated && settings_text_scale() > 1.25 {
-                    format!("{short_title} · {page}/{pages}")
-                } else if paginated {
-                    format!("{} · {page}/{pages}", field.label)
-                } else if settings_text_scale() > 1.25 {
-                    short_title
-                } else {
-                    format!("Choose {}", field.label)
-                },
+                text: title,
                 role: SemanticRole::Status,
                 style: StyleRef::Quiet,
             }),
@@ -8983,10 +9043,15 @@ fn top_settings_page(
             top_card(
                 "theme",
                 "Terminal colors & window appearance",
+                // One authored line inside a half-grid card: the shorter Wide
+                // hosts give this description ~422pt, and "Window appearance"
+                // needed ~447 even in the UI face — the card heading already
+                // says "window appearance", so the sentence drops the repeat
+                // instead of ellipsizing (2026-08 settings audit).
                 Some(if cfg!(target_os = "macos") {
-                    "Choose colors. Window appearance can follow macOS, Light, or Dark."
+                    "Choose colors. Appearance can follow macOS, Light, or Dark."
                 } else {
-                    "Choose colors. Window appearance can follow your system, Light, or Dark."
+                    "Choose colors. Appearance can follow your system, Light, or Dark."
                 }),
                 top_preview(
                     state,
@@ -9265,6 +9330,13 @@ fn manual_page(state: &SettingsViewState, cx: &ViewCx<'_>, width: SettingsWidth)
     out
 }
 
+/// Authored height of [`manual_search_result_node`]: the page-fitting probes
+/// budget the card with the same arithmetic the node itself is laid out with.
+fn manual_search_result_height(_width: SettingsWidth) -> f32 {
+    let text_height = 24.0_f32.max(20.0 * settings_text_scale());
+    28.0 + text_height + scaled_control_height() + 8.0
+}
+
 fn manual_search_result_node(matches: usize, width: SettingsWidth) -> UiNode {
     debug_assert!(matches > 0);
     let noun = if matches == 1 { "key" } else { "keys" };
@@ -9277,7 +9349,7 @@ fn manual_search_result_node(matches: usize, width: SettingsWidth) -> UiNode {
         )
     };
     let text_height = 24.0_f32.max(20.0 * settings_text_scale());
-    let height = 28.0 + text_height + scaled_control_height() + 8.0;
+    let height = manual_search_result_height(width);
     UiNode::new(
         "settings/search/manual-result",
         UiContent::Group(
@@ -10520,7 +10592,15 @@ fn settings_fields_page(
     }
 
     let preview_slices = usize::from(preview_disclosure);
-    if global_search && manual_matches > 0 && state.page_scroll == preview_slices {
+    // The Manual editor result is result #1 of a global search. On a compact
+    // host it keeps its own bounded virtual slice (tight page budgets), but a
+    // Medium/Wide page has the room to list it INLINE above the native rows —
+    // giving it a whole page there painted "1–1 of N" with every actual
+    // control exiled to later pages (2026-08 settings audit: searching
+    // "kitty" listed zero result rows on page 1).
+    let inline_manual_result =
+        global_search && manual_matches > 0 && state.page_scroll == preview_slices;
+    if inline_manual_result && width == SettingsWidth::Compact {
         if show_pager && total_search_results + preview_slices > 1 {
             out.push(page_navigation_node(
                 "settings/results-window",
@@ -10534,6 +10614,7 @@ fn settings_fields_page(
         out.push(manual_search_result_node(manual_matches, width));
         return out;
     }
+    let inline_manual_result = inline_manual_result && width != SettingsWidth::Compact;
 
     let search_manual_slices = usize::from(global_search && manual_matches > 0);
     let manual_offset = state
@@ -10575,12 +10656,26 @@ fn settings_fields_page(
         };
     let field_offset = state.page_scroll.saturating_sub(leading_slices);
     let start = field_offset.min(fields.len().saturating_sub(1));
-    let visible_count = visible_field_capacity(start, used, show_group_labels);
+    // The inline Manual card occupies authored height ahead of the first
+    // group, so the capacity probe pays for it exactly like any other
+    // leading node — rows the card displaces continue onto later pages.
+    let manual_extra = if inline_manual_result {
+        manual_search_result_height(width) + page_gap
+    } else {
+        0.0
+    };
+    let visible_count = visible_field_capacity(start, used + manual_extra, show_group_labels);
     let end = start.saturating_add(visible_count).min(fields.len());
     let native_total = fields.len();
     let leading_results = leading_slices;
     let total = native_total + leading_results;
-    let range_start = start + leading_results;
+    // An inline Manual result is PAINTED on this page, so the window the
+    // pager reports opens at the card (result #1), not past it.
+    let range_start = if inline_manual_result {
+        start
+    } else {
+        start + leading_results
+    };
     let range_end = end + leading_results;
     if range_start > 0 || range_end < total {
         out.push(page_navigation_node(
@@ -10619,6 +10714,9 @@ fn settings_fields_page(
                 .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
             ]),
         );
+    }
+    if inline_manual_result {
+        out.push(manual_search_result_node(manual_matches, width));
     }
     let fields = &fields[start..end];
     let mut groups = Vec::new();
@@ -11272,13 +11370,10 @@ fn platform_unavailability(
             "Unavailable on this platform",
             "Unavailable on this platform; saved for portability",
         )),
-        prefs::EDIT_CONFIRM_MULTILINE_PASTE if !availability.macos && !availability.windows => {
-            Some(unavailable(
-                "A native multiline-paste confirmation dialog is unavailable on this platform, so risky pastes currently proceed. The saved value is preserved for portability",
-                "Unavailable · Risky pastes currently proceed",
-                "Unavailable on this platform; risky pastes currently proceed",
-            ))
-        }
+        // `confirm_multiline_paste` carries NO unavailability arm any more: every
+        // platform now has a real confirmation surface (macOS sheet, Windows
+        // dialog, Linux in-window banner), so the old "risky pastes currently
+        // proceed" note would be false.
         prefs::EDIT_FOCUS_BOOST if !availability.windows => Some(unavailable(
             "Shell-priority focus boost is implemented only on Windows. This saved value has no effect on the current platform",
             "Windows only · No effect here",
@@ -13238,7 +13333,10 @@ fn about_page(
             text: if large_type_narrow {
                 "Fast and native.".to_string()
             } else if width == SettingsWidth::Compact {
-                "Fast, hardened, and introspectable.".to_string()
+                // A phone-width identity column gives this line ~206pt; the
+                // serial "and" pushed it to ~212 even in the UI face, so the
+                // asyndeton keeps every word whole (2026-08 settings audit).
+                "Fast, hardened, introspectable.".to_string()
             } else {
                 value(
                     "tagline",
@@ -13254,7 +13352,21 @@ fn about_page(
         "about/version-summary",
         UiContent::Text(TextSpec {
             text: if large_type_narrow {
-                format!("v{} · {}", value("version", "dev"), value("build", "local"))
+                // The identity column's real measure: page content minus the
+                // hero's 24pt padding pair. A ten-digit build beside the
+                // version misses that box by a hair at 2× on a phone, so the
+                // line keeps the version whole and leaves the exact build to
+                // the Build fact row and Copy Build Information.
+                let identity_width =
+                    (settings_page_content_width(viewport_width, width, 760.0) - 48.0).max(48.0);
+                let preferred =
+                    format!("v{} · {}", value("version", "dev"), value("build", "local"));
+                let px = 11.0 * text_scale;
+                if crate::tray_raster::ui_text_width(&preferred, px) <= identity_width {
+                    preferred
+                } else {
+                    format!("v{}", value("version", "dev"))
+                }
             } else {
                 format!(
                     "Version {}  ·  Build {}",
@@ -13397,7 +13509,10 @@ fn about_page(
         ),
     ];
     let metadata_value_width = about_metadata_value_width(viewport_width, width);
-    let row_count = build_rows.len().max(support_rows.len());
+    // Painted LINES, not facts: a long non-code value (the compiler line)
+    // wraps at its " · " separators, and the card must buy that height.
+    let row_count = metadata_line_count(&build_rows, metadata_value_width)
+        .max(metadata_line_count(&support_rows, metadata_value_width));
     let metadata_heading_height = 22.0_f32.max(16.0 * text_scale);
     let metadata_row_height = 28.0_f32.max(18.0 * text_scale);
     let card_height = ABOUT_METADATA_CARD_PADDING * 2.0
@@ -13439,7 +13554,11 @@ fn about_page(
                 / (metadata_row_height + 4.0))
                 .floor()
                 .max(1.0) as usize;
-            for (index, rows) in build_rows.chunks(maximum_rows).enumerate() {
+            for (index, rows) in
+                chunk_metadata_rows(&build_rows, maximum_rows, metadata_value_width)
+                    .iter()
+                    .enumerate()
+            {
                 let key = if index == 0 {
                     "about/provenance".to_string()
                 } else {
@@ -13454,7 +13573,8 @@ fn about_page(
                 };
                 let height = ABOUT_METADATA_CARD_PADDING * 2.0
                     + metadata_heading_height
-                    + rows.len() as f32 * (metadata_row_height + 4.0);
+                    + metadata_line_count(rows, metadata_value_width) as f32
+                        * (metadata_row_height + 4.0);
                 sections.push(metadata_card(
                     &key,
                     heading,
@@ -13463,7 +13583,11 @@ fn about_page(
                     metadata_value_width,
                 ));
             }
-            for (index, rows) in support_rows.chunks(maximum_rows).enumerate() {
+            for (index, rows) in
+                chunk_metadata_rows(&support_rows, maximum_rows, metadata_value_width)
+                    .iter()
+                    .enumerate()
+            {
                 let key = if index == 0 {
                     "about/support".to_string()
                 } else {
@@ -13478,7 +13602,8 @@ fn about_page(
                 };
                 let height = ABOUT_METADATA_CARD_PADDING * 2.0
                     + metadata_heading_height
-                    + rows.len() as f32 * (metadata_row_height + 4.0);
+                    + metadata_line_count(rows, metadata_value_width) as f32
+                        * (metadata_row_height + 4.0);
                 sections.push(metadata_card(
                     &key,
                     heading,
@@ -13812,6 +13937,88 @@ fn elide_metadata_value(text: &str, max_width: f32, code: bool) -> String {
     String::new()
 }
 
+/// How many painted lines one metadata fact needs at `value_width`, and the
+/// lines themselves. A non-code value that cannot fit its column wraps at its
+/// own " · " separators instead of ellipsizing mid-token (2026-08 settings
+/// audit: the About compiler row painted "release · tr…", chopping
+/// `trust_verify` in half). Code identifiers keep the two-ended elision — a
+/// hash's identifying ends beat any wrap — and a single unbreakable segment
+/// still elides as a last resort. Bounded so a pathological value cannot
+/// stretch its card without limit.
+const MAX_METADATA_VALUE_LINES: usize = 3;
+
+fn metadata_value_lines(label: &str, value: &str, value_width: f32) -> Vec<String> {
+    let budget = (value_width - ABOUT_METADATA_TEXT_SAFETY).max(0.0);
+    let code = metadata_value_is_code(label);
+    let px = 13.0 * crate::native_appearance::text_scale();
+    if code || metadata_value_text_width(value, px, code) <= budget {
+        return vec![elide_metadata_value(value, budget, code)];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for segment in value.split(" · ") {
+        let candidate = if current.is_empty() {
+            segment.to_string()
+        } else {
+            format!("{current} · {segment}")
+        };
+        if current.is_empty() || metadata_value_text_width(&candidate, px, false) <= budget {
+            current = candidate;
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = segment.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.len() > MAX_METADATA_VALUE_LINES {
+        lines.truncate(MAX_METADATA_VALUE_LINES);
+        if let Some(last) = lines.last_mut() {
+            *last = format!("{last} \u{2026}");
+        }
+    }
+    lines
+        .into_iter()
+        .map(|line| elide_metadata_value(&line, budget, false))
+        .collect()
+}
+
+/// Total painted rows a fact list occupies at `value_width` — the measure the
+/// card-height and compact-chunking arithmetic must share with the painter.
+fn metadata_line_count(rows: &[(String, String)], value_width: f32) -> usize {
+    rows.iter()
+        .map(|(label, value)| metadata_value_lines(label, value, value_width).len())
+        .sum()
+}
+
+/// Greedy fact chunking by PAINTED lines: a wrapped fact spends its real row
+/// budget, so no compact card overfills past the section height. Every chunk
+/// holds at least one whole fact — facts never split across cards.
+fn chunk_metadata_rows(
+    rows: &[(String, String)],
+    maximum_lines: usize,
+    value_width: f32,
+) -> Vec<Vec<(String, String)>> {
+    let maximum_lines = maximum_lines.max(1);
+    let mut chunks: Vec<Vec<(String, String)>> = Vec::new();
+    let mut current: Vec<(String, String)> = Vec::new();
+    let mut used = 0usize;
+    for row in rows {
+        let lines = metadata_value_lines(&row.0, &row.1, value_width).len();
+        if !current.is_empty() && used + lines > maximum_lines {
+            chunks.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        used += lines;
+        current.push(row.clone());
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
 fn metadata_card(
     key: &str,
     heading: &str,
@@ -13837,7 +14044,7 @@ fn metadata_card(
         )
         .layout(Layout::default().height(Length::Fixed(heading_height))),
     ];
-    children.extend(rows.iter().map(|(label, value)| {
+    children.extend(rows.iter().flat_map(|(label, value)| {
         let fragment = key_fragment(label);
         let code = metadata_value_is_code(label);
         let visual_label = elide_metadata_value(
@@ -13845,25 +14052,28 @@ fn metadata_card(
             (about_metadata_label_width() - ABOUT_METADATA_TEXT_SAFETY).max(0.0),
             false,
         );
-        let visual_value = elide_metadata_value(
-            value,
-            (value_width - ABOUT_METADATA_TEXT_SAFETY).max(0.0),
-            code,
-        );
-        UiNode::new(
-            format!("{stable_row_key}/row/{fragment}"),
-            UiContent::Group(GroupSpec::new(format!("{label}: {value}"))),
-        )
-        .layout(
-            Layout::row()
-                .height(Length::Fixed(row_height))
-                .gap(ABOUT_METADATA_ROW_GAP),
-        )
-        .children(vec![
+        let value_style = if code {
+            StyleRef::Code
+        } else {
+            StyleRef::Primary
+        };
+        let value_cell = |key: String, line: String| {
             UiNode::new(
-                format!("{stable_row_key}/label/{fragment}"),
+                key,
                 UiContent::Text(TextSpec {
-                    text: visual_label,
+                    text: line,
+                    role: SemanticRole::Text,
+                    style: value_style,
+                }),
+            )
+            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
+            .paint_only()
+        };
+        let label_cell = |key: String, text: String| {
+            UiNode::new(
+                key,
+                UiContent::Text(TextSpec {
+                    text,
                     role: SemanticRole::Text,
                     style: StyleRef::Quiet,
                 }),
@@ -13873,22 +14083,60 @@ fn metadata_card(
                     .width(Length::Fixed(about_metadata_label_width()))
                     .height(Length::Fill),
             )
-            .paint_only(),
-            UiNode::new(
-                format!("{stable_row_key}/value/{fragment}"),
-                UiContent::Text(TextSpec {
-                    text: visual_value,
-                    role: SemanticRole::Text,
-                    style: if code {
-                        StyleRef::Code
-                    } else {
-                        StyleRef::Primary
-                    },
-                }),
-            )
-            .layout(Layout::default().width(Length::Fill).height(Length::Fill))
-            .paint_only(),
-        ])
+            .paint_only()
+        };
+        let lines = metadata_value_lines(label, value, value_width);
+        // The FIRST line-row owns the row's complete accessibility contract;
+        // wrapped continuations are paint-only alignment rows below it.
+        lines
+            .into_iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let (row_key, row_content) = if index == 0 {
+                    (
+                        format!("{stable_row_key}/row/{fragment}"),
+                        UiContent::Group(GroupSpec::new(format!("{label}: {value}"))),
+                    )
+                } else {
+                    (
+                        format!("{stable_row_key}/row/{fragment}/line-{index}"),
+                        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+                    )
+                };
+                let mut row = UiNode::new(row_key, row_content)
+                    .layout(
+                        Layout::row()
+                            .height(Length::Fixed(row_height))
+                            .gap(ABOUT_METADATA_ROW_GAP),
+                    )
+                    .children(vec![
+                        label_cell(
+                            if index == 0 {
+                                format!("{stable_row_key}/label/{fragment}")
+                            } else {
+                                format!("{stable_row_key}/label/{fragment}/line-{index}")
+                            },
+                            if index == 0 {
+                                visual_label.clone()
+                            } else {
+                                String::new()
+                            },
+                        ),
+                        value_cell(
+                            if index == 0 {
+                                format!("{stable_row_key}/value/{fragment}")
+                            } else {
+                                format!("{stable_row_key}/value/{fragment}/line-{index}")
+                            },
+                            line,
+                        ),
+                    ]);
+                if index > 0 {
+                    row = row.paint_only();
+                }
+                row
+            })
+            .collect::<Vec<_>>()
     }));
     UiNode::new(
         key,
@@ -14093,6 +14341,33 @@ fn compact_update_detail(update: &UpdateProjection) -> String {
     } else {
         "Checks unavailable.".to_string()
     }
+}
+
+/// The tersest truthful rung for each [`compact_update_detail`] state: a
+/// phone-width status card at 2× native text gives the line ~16 characters,
+/// where even "No update staged." runs past the box. The complete sentence
+/// stays the card's semantic value; this is only what paints.
+fn compact_update_detail_minimum(update: &UpdateProjection) -> String {
+    if update.checking {
+        "Contacting…"
+    } else if update.staged.is_some() && update.apply_is_failing {
+        "Apply failing."
+    } else if update.staged.is_some() && update.failing_persistent {
+        "Checks failing."
+    } else if update.staged.is_some() {
+        "Ready."
+    } else if update.failing_persistent {
+        "Checks failing."
+    } else if !update.installable {
+        "Reinstall only."
+    } else if update.channel_unreadable {
+        "Channel unread."
+    } else if update.enabled {
+        "Nothing staged."
+    } else {
+        "Unavailable."
+    }
+    .to_string()
 }
 
 fn fit_native_bold_label(value: &str, max_width: f32, px: f32) -> String {
@@ -14302,6 +14577,35 @@ fn compact_update_summary(update: &UpdateProjection, available_width: f32) -> (U
 /// push the two controls off the page again.
 const MAX_UPDATE_OUTCOME_LINES: usize = 3;
 
+/// Bound wrapped outcome prose to [`MAX_UPDATE_OUTCOME_LINES`], eliding the
+/// last retained line so the appended ellipsis still FITS the wrap measure.
+/// Pushing '\u{2026}' onto a line the wrapper had already packed to
+/// `max_width` put the final line fractionally past its box — a real painted
+/// overflow the renderer audit measures (desktop Update page, 2026-08).
+fn bound_outcome_lines(lines: &mut Vec<String>, max_width: f32) {
+    if lines.len() <= MAX_UPDATE_OUTCOME_LINES {
+        return;
+    }
+    lines.truncate(MAX_UPDATE_OUTCOME_LINES);
+    let Some(last) = lines.pop() else {
+        return;
+    };
+    let px = 13.0 * crate::native_appearance::text_scale();
+    let measure = |candidate: &str| {
+        crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, candidate, px)
+    };
+    let mut graphemes = last.graphemes().collect::<Vec<_>>();
+    loop {
+        let retained = graphemes.concat();
+        let candidate = format!("{}\u{2026}", retained.trim_end());
+        if measure(&candidate) <= max_width || graphemes.is_empty() {
+            lines.push(candidate);
+            return;
+        }
+        graphemes.pop();
+    }
+}
+
 /// The last updater outcome as its own reachable slice.
 ///
 /// Only the short-landscape host needs this: there the status card collapses to
@@ -14317,12 +14621,7 @@ fn compact_update_outcome(update: &UpdateProjection, text_width: f32) -> Option<
         text_width,
         13.0 * crate::native_appearance::text_scale(),
     );
-    if lines.len() > MAX_UPDATE_OUTCOME_LINES {
-        lines.truncate(MAX_UPDATE_OUTCOME_LINES);
-        if let Some(last) = lines.last_mut() {
-            last.push('\u{2026}');
-        }
-    }
+    bound_outcome_lines(&mut lines, text_width);
     let height = 32.0 + lines.len() as f32 * line_height;
     Some((
         UiNode::new(
@@ -14474,7 +14773,16 @@ fn update_status_card(
         update.headline.clone()
     };
     let visual_detail = if large_type_narrow {
-        compact_update_detail(update)
+        // Author the richest single-line rung that FITS the card's wrap
+        // measure — the compact sentence itself overruns a phone column at
+        // 2× native text, and the painter's ellipsis is not a layout.
+        let preferred = compact_update_detail(update);
+        let px = 13.0 * crate::native_appearance::text_scale();
+        if crate::tray_raster::ui_text_width(&preferred, px) <= text_width {
+            preferred
+        } else {
+            compact_update_detail_minimum(update)
+        }
     } else {
         full_detail.clone()
     };
@@ -14490,12 +14798,7 @@ fn update_status_card(
                 text_width,
                 13.0 * crate::native_appearance::text_scale(),
             );
-            if lines.len() > MAX_UPDATE_OUTCOME_LINES {
-                lines.truncate(MAX_UPDATE_OUTCOME_LINES);
-                if let Some(last) = lines.last_mut() {
-                    last.push('\u{2026}');
-                }
-            }
+            bound_outcome_lines(&mut lines, text_width);
             lines
         })
         .unwrap_or_default();
@@ -15155,7 +15458,10 @@ fn update_page(
         state.record_result_page_limit(total.saturating_sub(1));
         let section = state.page_scroll.min(total.saturating_sub(1));
         let section_node = sections.swap_remove(section);
-        let mut out = page_heading("Software Update", update_page_subtitle(width, availability.macos));
+        let mut out = page_heading(
+            "Software Update",
+            update_page_subtitle(width, availability.macos),
+        );
         out.extend([
             page_navigation_node_pages(
                 "updates/pagination",
@@ -15171,7 +15477,10 @@ fn update_page(
     }
 
     state.record_result_page_limit(0);
-    let mut out = page_heading("Software Update", update_page_subtitle(width, availability.macos));
+    let mut out = page_heading(
+        "Software Update",
+        update_page_subtitle(width, availability.macos),
+    );
     out.extend(sections);
     out
 }
@@ -15182,6 +15491,22 @@ fn packages_sections(_packages: &PackagesProjection) -> usize {
 }
 
 const MAX_PACKAGE_PROGRAM_ROWS: usize = 8;
+
+/// atpkg's status ledger names its whole-toolset pseudo-program `*toolset*` —
+/// terminal-flavoured emphasis that a native page paints as literal asterisks
+/// (2026-08 settings audit). The meta-row gets its product name; any other
+/// emphasis-wrapped ledger name unwraps the same way. Real program names pass
+/// through untouched, and node KEYS keep the raw name for stable identity.
+fn package_program_display_name(name: &str) -> String {
+    if name == "*toolset*" {
+        return "ALab toolset".to_string();
+    }
+    name.strip_prefix('*')
+        .and_then(|inner| inner.strip_suffix('*'))
+        .filter(|inner| !inner.is_empty())
+        .unwrap_or(name)
+        .to_string()
+}
 
 fn packages_program_row_count(packages: &PackagesProjection) -> usize {
     if !packages.observed || packages.programs.is_empty() {
@@ -15773,7 +16098,7 @@ fn packages_page(
         ));
     } else {
         for row in packages.programs.iter().take(MAX_PACKAGE_PROGRAM_ROWS) {
-            let mut line = row.name.clone();
+            let mut line = package_program_display_name(&row.name);
             if let Some(build) = row.installed_build {
                 line.push_str("  ·  build ");
                 line.push_str(&build.to_string());
@@ -16588,7 +16913,13 @@ mod tests {
                     | prefs::EDIT_CURSOR_TRAIL_RADIUS
                     | prefs::EDIT_CURSOR_TRAIL_RING
                     | prefs::EDIT_CURSOR_TRAIL_ACCENT
-            );
+            )
+            // - font_thicken is CoreText FONT SMOOTHING at raster time;
+            //   `Renderer::set_font_thicken` is a no-op beyond recording the
+            //   flag anywhere fontdue rasterizes (no smoothing exists), and
+            //   the Settings row discloses exactly that inertness. The badge
+            //   pixels, semantics, and fingerprint above stay asserted.
+            || (key == prefs::EDIT_FONT_THICKEN && !cfg!(target_os = "macos"));
             if !body_exempt {
                 let base_body = preview_body_pixels(&base_ui, &base_pixels);
                 let candidate_body = preview_body_pixels(&candidate_ui, &candidate_pixels);
@@ -20927,6 +21258,79 @@ mod tests {
         assert!(check.enabled);
     }
 
+    /// atpkg's whole-toolset pseudo-row is spelled `*toolset*` in its status
+    /// ledger; the native page must present the product name, never literal
+    /// Markdown-style asterisks (2026-08 settings audit). The raw name stays
+    /// in the node key so the row's identity is stable across renames.
+    #[test]
+    fn packages_toolset_pseudo_row_paints_its_product_name_without_asterisks() {
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "*toolset*".to_string(),
+            atpkg::ProgramStatus {
+                installed_build: None,
+                state: "unavailable: no build for this architecture".to_string(),
+                tree_root: String::new(),
+            },
+        );
+        let status = atpkg::Status {
+            schema: 1,
+            updated_at: "2026-08-22T00:00:00Z".to_string(),
+            enabled: true,
+            index_source: "alabsystems/aterm".to_string(),
+            outcome: "up to date".to_string(),
+            programs,
+        };
+        let mut service = crate::packages_screen::PackagesService::new();
+        let sequence = service.begin(None).unwrap();
+        assert!(service.finish(
+            sequence,
+            crate::packages_screen::PackagesWorkerCompletion::refresh(
+                crate::packages_screen::PackagesStatusReport::from_parts(
+                    true,
+                    true,
+                    "fp".to_string(),
+                    Some(&status),
+                    &[],
+                ),
+            ),
+        ));
+        let (mut runtime, instance, view) = setup();
+        assert!(runtime.replace_settings_packages(service.state(true, true, true, false, true), 2));
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: route_action(SettingsRoute::Packages),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let cx = view_cx();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let row = compiled
+            .semantic(&UiKey::new("packages/programs/*toolset*"))
+            .expect("the pseudo-row keeps its raw-name key");
+        assert!(
+            row.label.starts_with("ALab toolset")
+                && row
+                    .label
+                    .contains("unavailable: no build for this architecture"),
+            "the toolset meta-row names the product: {}",
+            row.label
+        );
+        assert!(
+            !row.label.contains('*'),
+            "no literal ledger asterisks reach the page: {}",
+            row.label
+        );
+        assert_eq!(package_program_display_name("*toolset*"), "ALab toolset");
+        assert_eq!(package_program_display_name("*beta*"), "beta");
+        assert_eq!(package_program_display_name("ay"), "ay");
+        assert_eq!(package_program_display_name("*"), "*");
+    }
+
     #[test]
     fn packages_page_exposes_the_background_master_separately_from_auto_update() {
         let service = VersionedConfigService::new(
@@ -22118,7 +22522,9 @@ mod tests {
             let overflowing = compiled
                 .paint_audit_lines()
                 .into_iter()
-                .filter(|line| line.contains("overflow=true") || line.contains("clip-truncated=true"))
+                .filter(|line| {
+                    line.contains("overflow=true") || line.contains("clip-truncated=true")
+                })
                 .filter(|line| line.contains("paint-text key=\"updates/"))
                 .collect::<Vec<_>>();
             assert!(
@@ -22597,6 +23003,111 @@ mod tests {
                 "2x landscape Update page never reached {key}; saw {keys:?}",
             );
         }
+    }
+
+    /// 2026-08 settings audit: navigating Home → an ordinary form page moved
+    /// the content column ~130pt because each page centered around its OWN
+    /// route maximum. Sibling pages of one rail must share a left edge; the
+    /// narrower page keeps its deliberate width by yielding on the right.
+    #[test]
+    fn rail_sibling_pages_share_one_content_left_edge() {
+        let (mut runtime, instance, view) = setup();
+        let cx = view_cx_at(1_275.0, 828.0);
+        let mut heading_x = |route: SettingsRoute| {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: route_action(route),
+                        value: None,
+                    }),
+                )
+                .unwrap();
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            compiled
+                .paint
+                .iter()
+                .find(|node| {
+                    // The About page leads with its hero card instead of the
+                    // shared page heading; both start at the content column.
+                    node.key.as_str().starts_with("settings/page-heading/")
+                        || node.key.as_str() == "about/hero"
+                })
+                .unwrap_or_else(|| panic!("{route:?} paints a leading content node"))
+                .rect
+                .x
+        };
+        let home = heading_x(SettingsRoute::Home);
+        for route in [
+            SettingsRoute::CursorKitty,
+            SettingsRoute::Appearance,
+            SettingsRoute::Terminal,
+            SettingsRoute::SoftwareUpdate,
+            SettingsRoute::About,
+        ] {
+            let x = heading_x(route);
+            assert!(
+                (x - home).abs() <= 0.5,
+                "{route:?} content column starts at {x}, Home at {home}"
+            );
+        }
+    }
+
+    /// 2026-08 settings audit: the About compiler row ellipsized mid-token
+    /// ("release · tr…"). A non-code value that overflows its column now
+    /// wraps at its own " · " separators — every token whole, every line
+    /// inside the measure — while code identifiers keep two-ended elision.
+    #[test]
+    fn long_noncode_metadata_values_wrap_at_separators_not_mid_token() {
+        let value = "trustc 1.99.0-dev (dcc900ad) · trust · release · trust_verify off";
+        let width = 340.0;
+        let lines = metadata_value_lines("compiler", value, width);
+        assert!(lines.len() >= 2, "the audited value wraps: {lines:?}");
+        assert!(lines.len() <= MAX_METADATA_VALUE_LINES);
+        assert!(
+            lines.iter().all(|line| !line.contains('…')),
+            "no token is chopped: {lines:?}"
+        );
+        assert_eq!(
+            lines.join(" · "),
+            value,
+            "the wrap is a partition of the value at its separators"
+        );
+        let px = 13.0 * crate::native_appearance::text_scale();
+        for line in &lines {
+            assert!(
+                metadata_value_text_width(line, px, false)
+                    <= width - ABOUT_METADATA_TEXT_SAFETY + 0.01,
+                "every wrapped line fits the column: {line:?}"
+            );
+        }
+        // A short value stays one untouched line; a hash keeps its
+        // identifying ends instead of wrapping.
+        assert_eq!(
+            metadata_value_lines("compiler", "trustc 1.99.0", width),
+            vec!["trustc 1.99.0".to_string()]
+        );
+        let hash = metadata_value_lines("commit", &"0123456789abcdef".repeat(4), 96.0);
+        assert_eq!(hash.len(), 1);
+        assert!(hash[0].contains('…'));
+        // The line-aware measures agree with each other.
+        let rows = vec![
+            ("compiler".to_string(), value.to_string()),
+            ("signature".to_string(), "7a022df9673ccebb".to_string()),
+        ];
+        assert_eq!(
+            metadata_line_count(&rows, width),
+            lines.len() + 1,
+            "card height buys exactly the painted lines"
+        );
+        let chunks = chunk_metadata_rows(&rows, lines.len(), width);
+        assert_eq!(
+            chunks.len(),
+            2,
+            "chunking spends the wrapped fact's real line budget"
+        );
+        assert_eq!(chunks[0].len(), 1);
     }
 
     #[test]
@@ -26288,6 +26799,19 @@ mod tests {
                 .semantic(&UiKey::new("settings/search-clear"))
                 .expect("nonempty search exports visible Clear");
             assert!(clear.rect.width >= 44.0 && clear.rect.height >= 32.0);
+            // 2026-08 settings audit: the fixed 52pt box painted "Cl…" — the
+            // authored width must fit the whole word in the UI face.
+            let clear_paint = compiled
+                .paint_audit_lines()
+                .into_iter()
+                .find(|line| {
+                    line.starts_with("paint-text") && line.contains("\"settings/search-clear\"")
+                })
+                .expect("Clear button paints text");
+            assert!(
+                clear_paint.contains("overflow=false") && clear_paint.contains("painted=\"Clear\""),
+                "the visual Clear must fit its authored box: {clear_paint}"
+            );
             assert!(
                 compiled
                     .hits
@@ -29784,10 +30308,16 @@ enabled = true
             ("mechanical", "Mechanical"),
             ("felt", "Felt"),
         ] {
-            assert_eq!(setting_choice_label(prefs::EDIT_TRAIL_SOUND_STYLE, value), label);
+            assert_eq!(
+                setting_choice_label(prefs::EDIT_TRAIL_SOUND_STYLE, value),
+                label
+            );
         }
         // Other keys' `auto` keeps its generic label.
-        assert_eq!(setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto"), "Automatic");
+        assert_eq!(
+            setting_choice_label(prefs::EDIT_WINDOW_THEME, "auto"),
+            "Automatic"
+        );
         let field = prefs::editable_fields(&crate::app_config::Config::default())
             .into_iter()
             .find(|f| f.key == prefs::EDIT_TRAIL_SOUND_STYLE)
@@ -30055,16 +30585,16 @@ enabled = true
             settings_field_is_visible(prefs::EDIT_ALLOW_OSC52_QUERY, true, false),
             "Modified still lists the authored value"
         );
-        for (key, supported) in [
-            (
-                prefs::EDIT_CONFIRM_MULTILINE_PASTE,
-                cfg!(any(target_os = "macos", windows)),
-            ),
-            (
+        assert!(
+            settings_field_is_visible(prefs::EDIT_CONFIRM_MULTILINE_PASTE, false, false),
+            "the pastejacking confirm has a live host on every platform now \
+             (macOS sheet / Windows dialog / Linux in-window banner)"
+        );
+        {
+            let (key, supported) = (
                 prefs::EDIT_ALLOW_NOTIFICATIONS,
                 crate::notify::delivery_available(),
-            ),
-        ] {
+            );
             assert_eq!(
                 settings_field_is_visible(key, false, false),
                 supported,
@@ -30177,12 +30707,17 @@ enabled = true
             } else if cfg!(windows) {
                 51
             } else {
-                48
+                49
             },
             // +1 on every platform (2026-08-21): allow_osc52_query became an
             // ordinary Advanced switch when the GUI's clipboard callback
             // learned to answer authorized queries — a LIVE policy joins the
             // audited surface; anything still inert belongs in Manual.
+            // +1 on Linux (2026-08-23): `confirm_multiline_paste` stopped being
+            // hidden there when the pastejacking guard grew its in-window
+            // banner (`paste_banner`) — the switch now actuates a real
+            // confirmation on every platform, so it joins the audited surface
+            // instead of the platform-unavailable shelf.
             "the audited Advanced surface changed; new expert keys belong in Manual"
         );
         let ordinary_groups = fields
@@ -30225,9 +30760,7 @@ enabled = true
         if cfg!(target_os = "macos") {
             group_witnesses.push(("Transparency", prefs::EDIT_BACKGROUND_OPACITY));
         }
-        if cfg!(any(target_os = "macos", windows)) {
-            group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
-        }
+        group_witnesses.push(("Paste safety", prefs::EDIT_CONFIRM_MULTILINE_PASTE));
         assert_eq!(
             ordinary_groups,
             group_witnesses
@@ -30914,9 +31447,10 @@ enabled = true
             !unavailable(prefs::EDIT_ALLOW_NOTIFICATIONS),
             crate::notify::delivery_available()
         );
-        assert_eq!(
+        assert!(
             !unavailable(prefs::EDIT_CONFIRM_MULTILINE_PASTE),
-            cfg!(any(target_os = "macos", windows))
+            "the pastejacking confirm actuates on every platform now \
+             (macOS sheet / Windows dialog / Linux in-window banner)"
         );
         assert_eq!(
             !unavailable(prefs::EDIT_TRAIL_SOUNDS),
@@ -32826,6 +33360,82 @@ enabled = true
                 .semantic(&UiKey::new("settings/status"))
                 .map(|node| node.label.as_str()),
             Some("Undo available")
+        );
+    }
+
+    /// 2026-08 settings audit: a wide global search whose top match drives the
+    /// renderer preview ("kitty") painted page 1 as '1–1 of 3' with the Manual
+    /// editor card alone — ZERO native result rows — while every actual
+    /// control hid on later pages. A Medium/Wide page must list the Manual
+    /// result inline WITH the native rows it summarizes.
+    #[test]
+    fn wide_search_page_one_lists_native_rows_beside_the_manual_result() {
+        let (mut runtime, instance, view) = setup();
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/search"),
+                    value: Some(SemanticInput::Text("kitty".to_string())),
+                }),
+            )
+            .unwrap();
+        let cx = view_cx_at(1_275.0, 828.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/search/manual-result"))
+                .is_some(),
+            "the Manual editor result stays a first-class search result"
+        );
+        let rows: Vec<&str> = compiled
+            .semantics
+            .iter()
+            .map(|node| node.key.as_str())
+            .filter(|key| key.starts_with("settings/row/"))
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "page 1 of a wide search must list native result rows, not only the Manual card"
+        );
+        assert!(
+            rows.iter().any(|key| key.ends_with("cursor_trail_wake_ms")),
+            "the ranked native match paints on page 1: {rows:?}"
+        );
+        // The window the pager/summary reports covers what is actually painted:
+        // the Manual card plus every native row fits this viewport, so the
+        // page reports the complete roster instead of a phantom '1–1 of 3'.
+        let range = compiled
+            .semantic(&UiKey::new("settings/results-range"))
+            .expect("search results always disclose their visible window");
+        assert_eq!(range.label, "2 native controls · 6 Manual config keys");
+        // Later pages keep the classic one-result-per-step window (the audit
+        // found only page 1 broken).
+        runtime
+            .dispatch(
+                instance,
+                view,
+                AppEvent::Action(ActionInvocation {
+                    id: ActionId::new("settings/page-down"),
+                    value: None,
+                }),
+            )
+            .unwrap();
+        let paged = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            paged
+                .semantic(&UiKey::new("settings/results-range"))
+                .map(|node| node.label.as_str()),
+            Some("2–3 of 3")
+        );
+        assert!(
+            paged
+                .semantics
+                .iter()
+                .any(|node| node.key.as_str().starts_with("settings/row/")),
+            "page 2 keeps its native rows"
         );
     }
 }

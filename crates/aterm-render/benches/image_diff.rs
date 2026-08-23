@@ -66,6 +66,7 @@ fn transmit(bytes: Vec<u8>) -> Arc<ImageData> {
         cols: IMG_COLS as u16,
         rows: IMG_ROWS as u16,
         z_index: 0,
+        band_lift_px: 0,
     })
 }
 

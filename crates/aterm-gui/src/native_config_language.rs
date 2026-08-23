@@ -3271,7 +3271,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · the GUI drops every OSC 52 Query callback and cannot return clipboard contents; true is currently inert"
         }
         crate::prefs::EDIT_ALLOW_WINDOW_OPS => {
-            " · the GUI answers only XTWINOPS window-title and text-grid-size fallback reports; host manipulation and most state/geometry requests are ignored"
+            if cfg!(target_os = "linux") {
+                " · manipulations (iconify, maximize, fullscreen, resize — move stays denied) apply to the window; reports beyond the window-title and text-grid-size fallbacks remain unanswered"
+            } else {
+                " · the GUI answers only XTWINOPS window-title and text-grid-size fallback reports; host manipulation and most state/geometry requests are ignored"
+            }
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
             " · 0 searches only the live screen; a bounded index can report partial results for older retained history"
@@ -4724,12 +4728,27 @@ home = "~/aterm"
                 .iter()
                 .all(|diagnostic| diagnostic.severity == ConfigDiagnosticSeverity::Warning)
         );
-        for (message, token) in [
+        let mut expected_spans = vec![
             ("chord \"shift+entr\" invalid", "\"shift+entr\""),
             ("key_sequences[\"ctrl+x\"]: value invalid", "'\\q'"),
-            ("chord \"cmd+c\" conflicts with built-in", "\"cmd+c\""),
             ("unknown action \"no_such_action\"", "\"no_such_action\""),
-        ] {
+        ];
+        // The built-in-conflict warning follows the Cmd/Super suite gate
+        // (`HARDCODED_SUPER_CHORDS`): on Linux the suite is compiled off, so a
+        // cmd chord conflicts with nothing and the diagnostic must NOT appear.
+        if crate::app_input::HARDCODED_SUPER_CHORDS {
+            expected_spans.push(("chord \"cmd+c\" conflicts with built-in", "\"cmd+c\""));
+        } else {
+            assert!(
+                !analysis
+                    .diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.message.contains("conflicts with built-in")),
+                "no built-in conflict with the suite gated off: {:?}",
+                analysis.diagnostics
+            );
+        }
+        for (message, token) in expected_spans {
             let diagnostic = analysis
                 .diagnostics
                 .iter()
@@ -5252,7 +5271,15 @@ expect_nonce = "pin"
         let analysis = analyze(source);
         assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
 
-        for message in ["drops every OSC 52 Query", "most state/geometry requests"] {
+        // The window-ops phrasing is per-platform: Linux wires the manipulation
+        // half (frame audit #4), so its honest residue is the unanswered
+        // geometry reports; elsewhere the pre-wiring statement stands.
+        let window_ops_phrase = if cfg!(target_os = "linux") {
+            "remain unanswered"
+        } else {
+            "most state/geometry requests"
+        };
+        for message in ["drops every OSC 52 Query", window_ops_phrase] {
             let diagnostic = analysis
                 .diagnostics
                 .iter()

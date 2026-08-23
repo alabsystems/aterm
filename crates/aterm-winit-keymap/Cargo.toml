@@ -1,0 +1,45 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+#
+# THE winit -> engine keyboard map, as its OWN crate — deliberately not a
+# feature of `aterm-types`.
+#
+# It lived in aterm-types behind an optional `winit-keymap` feature, whose stated
+# purpose was that "non-GUI consumers never link winit". That is not what an
+# optional feature does in a workspace: Cargo unifies features across every
+# package in one resolve, so `cargo build --workspace` turned `winit-keymap` ON
+# for aterm-types globally, and `aterm-ctl` — which declares only aterm-types +
+# aterm-uds and no third-party dependency at all — came out of the build linking
+# AppKit, Carbon, ApplicationServices, CoreGraphics, CoreVideo, CoreFoundation,
+# Foundation and libobjc. Those are load commands dyld maps and initialises
+# before the first instruction of `main`, on a route that cannot call a symbol in
+# any of them. Measured on this box: ~3.36 ms per exec with them, ~1.7 ms
+# without (crates/aterm-bench/benches/startup_exec.rs).
+#
+# A separate crate is the version of that intent Cargo actually enforces: nothing
+# can unify a dependency edge that does not exist. `aterm-types` now has no
+# mention of winit anywhere in its manifest, so no future feature flag can drag
+# the window's platform stack back into a verb client.
+#
+# The code is unchanged from `aterm-types/src/keyboard/winit_map.rs` (K-2) and
+# still exists for the same reason it always did: the GUI and the future native
+# shell share ONE table instead of each hand-rolling an inline match that drifts.
+
+[package]
+name = "aterm-winit-keymap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "winit Key/NamedKey/PhysicalKey -> aterm engine keyboard types (K-2), split out so aterm-types never links winit"
+
+[dependencies]
+# The engine-side keyboard vocabulary this maps INTO. Default features only —
+# aterm-types is platform-free and must stay that way.
+aterm-types = { workspace = true }
+# The platform keyboard enums this maps FROM. A hard dependency here, and ONLY
+# here: this crate exists precisely so the edge is not optional anywhere else.
+winit = { workspace = true }
+
+[lints]
+workspace = true

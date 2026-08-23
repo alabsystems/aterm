@@ -85,6 +85,7 @@ impl Terminal {
             window_callback: None,
             text_sizing_callback: None,
             text_selection: crate::selection::TextSelection::new(),
+            parked_text_selection: crate::selection::TextSelection::new(),
             secure_keyboard_entry: false,
             vi: crate::vi_mode::ViMode::new(),
             sync_timeout_duration: std::time::Duration::from_secs(1),

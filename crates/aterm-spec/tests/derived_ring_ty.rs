@@ -19,32 +19,33 @@
 
 // The property models are iterated via `harness::instances()`, not named here.
 use aterm_spec::derive::{
-    Model, aa_edge_hardening_model, active_handle_model, anchored_artifact_transaction_model,
-    artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
-    capture_after_present_model, channel_bind_model, chrome_face_gate_model,
-    closed_recovery_ledgers_model, coalesce_model, composite_accessibility_route_model,
-    config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
-    control_connection_admission_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
-    cursor_cat_earn_floor_model, cursor_cat_model, cursor_cutout_clip_model,
-    cursor_effect_scroll_model, cursor_model, cursor_move_candidate_model,
-    cursor_scroll_signal_model, cursor_viewport_lifecycle_model, damage_to_present_model,
-    deco_band_containment_model, deco_phase_model, done_mark_lru_model, dsu_quiescence_model,
-    effect_phase_lock_model, effect_present_rebase_model, emacs_search_navigation_model,
-    emacs_search_repeat_work_model, evict_full_model, exact_instance_retention_model,
-    exact_profanity_completion_model, fallback_band_clip_model, fallback_precedence_model,
-    fallback_scale_clamp_model, fd_handoff_no_leak_model, flash_limiter_model,
-    flash_limiter_window_model, focus_modifier_cache_model, gpu_loss_recovery_model,
-    gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model, hdr_present_gate_model,
-    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_flush_worker_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
-    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
-    manual_config_diagnostics_lane_model, manual_config_handoff_model,
-    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
-    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
-    native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_draft_journal_model,
+    Model, aa_edge_hardening_model, active_handle_model, alt_selection_park_model,
+    anchored_artifact_transaction_model, artifact_reader_lease_model,
+    artifact_reply_publication_model, asymmetric_pad_layout_model, capture_after_present_model,
+    channel_bind_model, chrome_face_gate_model, closed_recovery_ledgers_model, coalesce_model,
+    composite_accessibility_route_model, config_catalog_snapshot_model,
+    config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
+    ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
+    cursor_cat_model, cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_model,
+    cursor_move_candidate_model, cursor_scroll_signal_model, cursor_viewport_lifecycle_model,
+    damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
+    dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
+    emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
+    exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
+    fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
+    flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
+    gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
+    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
+    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
+    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
+    kitty_collectibles_model, kitty_flush_worker_model, kitty_sidecar_durability_model,
+    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
+    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
+    motion_policy_model, native_async_delivery_model, native_capture_source_model,
+    native_close_plan_model, native_config_observation_handoff_model,
+    native_config_transaction_model, native_control_routing_model,
+    native_document_publication_model, native_draft_journal_model,
     native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
     native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
@@ -5557,6 +5558,60 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
     assert_eq!(
         typed["owner"], 0,
         "typing hands the viewport back to the tail"
+    );
+}
+
+/// SELECTION CUSTODY — a selection is scoped to the screen it was made on.
+///
+/// The park is ASYMMETRIC on purpose: entering the alt screen takes the main
+/// selection into the parked slot, leaving takes it back out and leaves the slot
+/// empty. The alt screen's own selection dies with the buffer it named. The
+/// obvious alternative — a symmetric swap — makes the parked slot a durable second
+/// selection with a lifetime of its own, and `ParkedEmptyOffAlt` is what says so.
+///
+/// `Buggy=1` also neuters the wholesale destroyer's parked half, the silent failure
+/// mode of the coordinated clear sites (`Terminal::reset`, byte-stream RIS,
+/// `clear_scrollback`, a width resize, `restore_checkpoint`) — five of which the
+/// compiler does not check. That member is caught by a DIFFERENT invariant, so a
+/// pass here is not one property doing all the work.
+#[test]
+fn derived_alt_selection_park_never_leaves_a_selection_parked_off_alt() {
+    let model = alt_selection_park_model();
+    assert_proves_and_catches(&model);
+
+    // The reported shape: select on main, run a pager, quit. The highlight is the
+    // same one, and nothing is left behind in the slot.
+    let mut pager = model.init_state();
+    for action in ["Select", "Enter", "Leave"] {
+        assert!(model.fire(action, &mut pager), "{action}: {pager:?}");
+    }
+    assert_eq!(pager["live_sel"], 1, "the main selection came back");
+    assert_eq!(pager["parked_sel"], 0, "…and the slot is empty again");
+    assert_eq!(pager["on_alt"], 0);
+
+    // The asymmetry, stated as a trace: a selection made ON alt does not leak back
+    // to main, because the restore OVERWRITES rather than swaps.
+    let mut on_alt = model.init_state();
+    for action in ["Enter", "Select", "Leave"] {
+        assert!(model.fire(action, &mut on_alt), "{action}: {on_alt:?}");
+    }
+    assert_eq!(
+        on_alt["live_sel"], 0,
+        "an alt-screen selection names a buffer the user can no longer see"
+    );
+    assert_eq!(on_alt["parked_sel"], 0);
+
+    // A wholesale destroyer reaches the parked slot, not just the live one.
+    let mut destroyed = model.init_state();
+    for action in ["Select", "Enter", "Wholesale", "Leave"] {
+        assert!(
+            model.fire(action, &mut destroyed),
+            "{action}: {destroyed:?}"
+        );
+    }
+    assert_eq!(
+        destroyed["live_sel"], 0,
+        "nothing may come back over content that was destroyed while parked"
     );
 }
 

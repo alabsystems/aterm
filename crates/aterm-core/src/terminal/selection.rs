@@ -202,14 +202,16 @@ impl Terminal {
         self.selection_to_string_bounded().0
     }
 
-    /// Like [`Self::selection_to_string`], but also returns whether the output was
-    /// TRUNCATED by [`MAX_SELECTION_ROWS`] / [`MAX_SELECTION_BYTES`].
+    /// Like [`Self::selection_to_string`], but also returns whether content is
+    /// MISSING from the returned text.
     ///
     /// The bool lets a caller surface truncation to its client honestly — mirroring
     /// how search reports an `incomplete` result — rather than returning a short
     /// string that is indistinguishable from an exact selection. `true` means real
-    /// selected content was dropped from the tail; the returned text still starts at
-    /// the selection's start row/col.
+    /// selected content is absent from EITHER end: the copy caps
+    /// ([`MAX_SELECTION_ROWS`] / [`MAX_SELECTION_BYTES`]) drop it from the tail, and
+    /// a scrollback eviction that clamped the selection's head to the history floor
+    /// drops it from the front.
     #[must_use]
     pub fn selection_to_string_bounded(&self) -> (Option<String>, bool) {
         self.selection_to_string_capped(MAX_SELECTION_ROWS, MAX_SELECTION_BYTES)
@@ -229,15 +231,25 @@ impl Terminal {
         // Use side-adjusted bounds so that the copied text matches the visual
         // highlight. Without this, a Right-sided start or Left-sided end would
         // include an extra character that isn't part of the rendered selection.
+        // SELECTION CUSTODY Phase 4: `truncated` is a two-sided report, and the
+        // eviction half is already decided before the walk runs. Fold it in HERE too,
+        // because head-clamping makes this arm newly reachable: when the surviving
+        // anchor also lands on the floor row at col 0 side Left, `apply_side_adjustment`
+        // retreats the end to `(min_row - 1, u16::MAX)` and the span collapses. Returning
+        // `(None, false)` there would answer `OK 0` with no ` incomplete` — a SILENT
+        // total loss, strictly worse than the honest clear this replaced.
+        let evicted = self.text_selection.truncated();
         let Some((adj_start_row, adj_start_col, adj_end_row, adj_end_col)) =
             self.text_selection.side_adjusted_bounds()
         else {
-            return (None, false);
+            return (None, evicted);
         };
 
         let mut result = String::new();
         let cols = self.grid.cols();
         if cols == 0 {
+            // A zero-column grid addresses no content at all; that is a degenerate
+            // geometry, not a partial report about a span that exists.
             return (None, false);
         }
 
@@ -298,10 +310,12 @@ impl Terminal {
             );
         }
 
+        // The two halves of the report are independent — a capped walk over an
+        // already-clamped selection is missing text at both ends — so they OR.
         if result.is_empty() {
-            (None, truncated)
+            (None, truncated || evicted)
         } else {
-            (Some(result), truncated)
+            (Some(result), truncated || evicted)
         }
     }
 

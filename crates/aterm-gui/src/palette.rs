@@ -213,6 +213,16 @@ pub(crate) struct PaletteLive {
     /// `MotionPolicy::Reduced` is in force: the realized row's fade FREEZES at full
     /// alpha (a decaying element is itself motion; Reduced pins every amplitude).
     pub reduced_motion: bool,
+    /// Accelerator HINTS for menu rows, as `(action, display chord)` pairs — the
+    /// EFFECTIVE `[keybindings]` chord for each menu action that has one
+    /// (platform seeds with the user's rebinds/unbinds applied, resolved by
+    /// `Keybindings::display_chord_for`). Populated by `App::palette_live` OFF
+    /// macOS only: macOS menu rows keep their native ⌘ key-equivalents, and off
+    /// macOS these hints replace the "" that [`accel`] honestly blanks ⌘ chords
+    /// to — so the palette (and the AccessKit description built from the same
+    /// string) shows the chord that actually works here. Empty = no hints (the
+    /// pure-test default).
+    pub menu_accels: Vec<(MenuAction, String)>,
 }
 
 impl PaletteState {
@@ -417,6 +427,19 @@ impl PaletteState {
             };
             row.checked = None;
             row.enabled = true;
+            // Accelerator hint (off macOS): carry the EFFECTIVE binding-table
+            // chord for this menu action in the native-`shortcut` slot, so
+            // `row_accel` — and the AccessKit description folded from the same
+            // string — renders the chord that actually works here instead of
+            // the "" that [`accel`] correctly blanks ⌘ equivalents to. The hint
+            // survives `platform_accel` untouched (it is not a macOS spelling).
+            // Idempotent like the rest of resolve: re-resolve rewrites or
+            // clears it, and an empty `menu_accels` (macOS, pure tests) leaves
+            // every menu row exactly as `PaletteState::new` built it.
+            row.shortcut = match live.menu_accels.iter().find(|(a, _)| *a == action) {
+                Some((_, chord)) => Cow::Owned(chord.clone()),
+                None => Cow::Borrowed(""),
+            };
             match action {
                 MenuAction::ToggleSettings => row.checked = Some(live.settings_open),
                 MenuAction::ToggleFullScreen => row.checked = Some(live.fullscreen),
@@ -989,9 +1012,12 @@ fn accel(mods: MenuMods, key: &str) -> String {
     // Off macOS these ⌘ key-equivalents mirror a native menu bar that does not
     // exist, AND the real chord differs (Copy is Ctrl+Shift+C, Settings is
     // Ctrl+Shift+S — not ⌘,), so painting a ⌘ glyph, or a naive ⌘→Ctrl rewrite,
-    // would MISLEAD a Linux user who has no ⌘ key. Stay label-driven there
-    // (type-to-filter + Enter); the real Linux chords live in `--help` and the
-    // [keybindings] table. On macOS the palette mirrors the menu bar verbatim.
+    // would MISLEAD a Linux user who has no ⌘ key. Blank here; the TRUE chord
+    // arrives instead through `PaletteLive::menu_accels` (resolved from the
+    // effective [keybindings] table by `App::palette_live`), which `resolve`
+    // writes into the row's `shortcut` slot — so `row_accel` never consults
+    // this "" for a menu action that has a real local chord. On macOS the
+    // palette mirrors the menu bar verbatim.
     if key.is_empty() || !cfg!(target_os = "macos") {
         return String::new();
     }
@@ -1478,6 +1504,55 @@ mod tests {
             let want = if cfg!(target_os = "macos") { mac } else { other };
             assert_eq!(platform_accel(source), want, "{source:?}");
         }
+    }
+
+    /// Keyboard audit #6 — menu-row accelerator HINTS. `resolve` writes the
+    /// effective binding-table chord (supplied via `PaletteLive::menu_accels`)
+    /// into the menu row's `shortcut` slot, so `row_accel` — the ONE projection
+    /// both the painted card and the AccessKit description read — shows the
+    /// chord that actually works here. An action with no hint keeps its
+    /// platform default, and a re-resolve WITHOUT hints clears a previously
+    /// applied one (resolve stays idempotent per-live-state).
+    #[test]
+    fn resolve_applies_menu_accel_hints_to_row_accel() {
+        let by_action = |s: &PaletteState, action: MenuAction| {
+            let row = s.rows.iter().find(|r| r.action == action).expect("row");
+            row_accel(row)
+        };
+        let mut s = PaletteState::new();
+        s.resolve(&PaletteLive {
+            menu_accels: vec![
+                (MenuAction::Copy, "Ctrl+Shift+C".to_string()),
+                (MenuAction::ToggleFullScreen, "F11".to_string()),
+            ],
+            has_selection: true,
+            ..Default::default()
+        });
+        assert_eq!(by_action(&s, MenuAction::Copy), "Ctrl+Shift+C");
+        assert_eq!(by_action(&s, MenuAction::ToggleFullScreen), "F11");
+        // No hint for Paste in this live set: the row paints its platform
+        // default — the ⌘ menu mirror on macOS, blank elsewhere.
+        assert_eq!(
+            by_action(&s, MenuAction::Paste),
+            if cfg!(target_os = "macos") {
+                "\u{2318}V"
+            } else {
+                ""
+            }
+        );
+        // Hints are per-resolve live state: resolving without them CLEARS.
+        s.resolve(&PaletteLive {
+            has_selection: true,
+            ..Default::default()
+        });
+        assert_eq!(
+            by_action(&s, MenuAction::ToggleFullScreen),
+            if cfg!(target_os = "macos") {
+                "\u{2303}\u{2318}F"
+            } else {
+                ""
+            }
+        );
     }
 
     /// The backstop's PREDICATE, tested on every platform — `platform_accel` is

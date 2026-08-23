@@ -1453,6 +1453,14 @@ mod tests {
             "crates/aterm-update/src",
             "crates/aterm-update-core/src",
             "crates/aterm-vi/src",
+            // Entered the closure when the K-2 winit→engine key map was split
+            // out of aterm-types into its own crate: as an OPTIONAL FEATURE of
+            // aterm-types it was unified on for every consumer in the workspace
+            // resolve, which linked AppKit into the dependency-free aterm-ctl.
+            // A normal [dependencies] edge from aterm-gui, so the whole crate is
+            // process code — and the closure is unchanged in substance: the same
+            // code was already in it via aterm-types.
+            "crates/aterm-winit-keymap/src",
             "crates/atpkg/src",
         ];
         let set = derive_gui_scan_set(&repo_root()).expect("derivation must succeed on HEAD");

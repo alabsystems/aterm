@@ -7,17 +7,25 @@
 //! The reusable bridge from winit's `Key`/`NamedKey`/`PhysicalKey` to the
 //! engine's bridge-agnostic [`Key`]/[`NamedKey`], plus the US-QWERTY
 //! `base_layout_key` derivation the Kitty `REPORT_ALTERNATE_KEYS` enhancement
-//! needs. It lives in `aterm-types` (behind the `winit-keymap` feature) so the
-//! GUI and the future native shell share ONE table instead of each hand-rolling
-//! an inline match that drifts (the old GUI match stopped at F12, dropped
-//! Super/Cmd, and had no numpad/media keys).
+//! needs. The GUI and the future native shell share ONE table instead of each
+//! hand-rolling an inline match that drifts (the old GUI match stopped at F12,
+//! dropped Super/Cmd, and had no numpad/media keys).
 //!
-//! Only built when the `winit-keymap` feature is on, so non-GUI consumers of
-//! `aterm-types` (the FFI / Alacritty bridges) never link winit.
+//! WHY ITS OWN CRATE. This was `aterm-types/src/keyboard/winit_map.rs` behind an
+//! optional `winit-keymap` feature whose stated job was "so non-GUI consumers of
+//! `aterm-types` never link winit". Cargo unifies features across a workspace
+//! resolve, so a plain `cargo build --workspace` turned that feature on for
+//! everyone and `aterm-ctl` — aterm-types + aterm-uds, no third-party
+//! dependency — shipped linking AppKit, Carbon, ApplicationServices,
+//! CoreGraphics, CoreVideo, CoreFoundation, Foundation and libobjc. A separate
+//! crate is the enforceable form of the same intent: `aterm-types` no longer
+//! mentions winit at all, so nothing can unify an edge that does not exist.
+//! See `crates/aterm-winit-keymap/Cargo.toml` and the measurement in
+//! `crates/aterm-bench/benches/startup_exec.rs`.
 
 use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey as WinitNamed, PhysicalKey};
 
-use super::{Key, NamedKey};
+use aterm_types::keyboard::{Key, NamedKey};
 
 /// Map a winit logical [`WinitKey`] (e.g. `ev.logical_key` or
 /// `key_without_modifiers()`) into the engine's [`Key`].
@@ -317,5 +325,48 @@ mod tests {
         );
         // No printable US-QWERTY char for a function key.
         assert_eq!(base_layout_key_for(PhysicalKey::Code(KeyCode::F1)), None);
+    }
+
+    /// THE REASON THIS CRATE EXISTS, as an always-on assertion rather than a
+    /// comment: `aterm-types` must not name `winit` anywhere in its manifest.
+    ///
+    /// It used to, as `winit = { workspace = true, optional = true }` behind a
+    /// `winit-keymap` feature whose comment promised non-GUI consumers would
+    /// never pull winit. Cargo unifies features across a workspace resolve, so
+    /// `cargo build --workspace` enabled it for everyone: `aterm-ctl`, which
+    /// declares only aterm-types + aterm-uds and no third-party dependency at
+    /// all, came out linking AppKit, Carbon, ApplicationServices, CoreGraphics,
+    /// CoreVideo, CoreFoundation, Foundation and libobjc — 7 framework load
+    /// commands dyld maps and initialises before the first instruction of
+    /// `main`, on a route that cannot call a symbol in any of them. Measured on
+    /// this tree with the same binary built both ways: 2.49 -> 1.15 ms per exec
+    /// (`crates/aterm-bench/benches/startup_exec.rs`).
+    ///
+    /// The BENCH's Mach-O reach guard catches the same regression from the other
+    /// end, but only when someone runs it. This catches it in `cargo test`.
+    #[test]
+    fn aterm_types_names_no_platform_dependency() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/aterm-winit-keymap sits under crates/")
+            .join("aterm-types/Cargo.toml");
+        let text = std::fs::read_to_string(&manifest)
+            .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+        // Comments explain the history and say the word; dependency lines and
+        // feature lines are what must not.
+        for (i, line) in text.lines().enumerate() {
+            let code = line.split('#').next().unwrap_or("");
+            assert!(
+                !code.contains("winit"),
+                "{}:{} names winit in code (not a comment): {line:?}\n\
+                 aterm-types is the platform-free vocabulary crate every consumer shares, \
+                 including binaries with no third-party dependencies at all. An optional \
+                 winit dep here does NOT stay off for them — Cargo unifies features across \
+                 the workspace resolve — it links AppKit into all of them. Put the platform \
+                 map in its own crate, the way this one is.",
+                manifest.display(),
+                i + 1
+            );
+        }
     }
 }

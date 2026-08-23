@@ -285,3 +285,158 @@ fn a_rows_grow_that_reveals_history_moves_the_selection_with_its_content() {
         );
     }
 }
+
+/// A terminal whose retained history is capped at `limit` and full, with the anchors
+/// left to the caller. `limit` lines of history plus a live screen is the only shape
+/// in which eviction is reachable without waiting for a default-sized scrollback to
+/// fill.
+fn with_capped_history(rows: u16, cols: u16, limit: usize) -> Terminal {
+    let mut term = Terminal::new(rows, cols);
+    term.set_scrollback_line_limit(Some(limit));
+    for i in 0..(limit + usize::from(rows) + 20) {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    assert_eq!(
+        term.grid().scrollback_lines(),
+        limit,
+        "the history cap must actually be saturated"
+    );
+    term
+}
+
+/// PARTIAL EVICTION. Scrolling one endpoint of a selection past the history floor
+/// used to destroy the whole highlight — including the part still on screen and still
+/// copyable. It now clamps that endpoint onto the oldest retained row and REPORTS the
+/// loss, which is what the copy walk has done for years: `selection_to_string_capped`
+/// reads `first_row = adj_start_row.max(-history)`.
+#[test]
+fn evicting_one_endpoint_truncates_instead_of_destroying_the_selection() {
+    let mut term = with_capped_history(24, 40, 50);
+    {
+        let sel = term.text_selection_mut();
+        // -50 is the oldest retained row; the span reaches four rows newer.
+        sel.start_selection(-50, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(-46, 6, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    let before = term
+        .selection_to_string()
+        .expect("the five-row span resolves to text");
+    assert!(!term.text_selection().truncated(), "nothing lost yet");
+
+    // Two more lines of output evict two more: rows -50 and -49 are gone.
+    term.process(b"more-0\r\n");
+    term.process(b"more-1\r\n");
+
+    assert!(
+        term.text_selection().has_selection(),
+        "the retained half of the span must survive its evicted half"
+    );
+    assert_eq!(term.text_selection().normalized_start().row, -50);
+    assert_eq!(
+        term.text_selection().normalized_start().col,
+        0,
+        "the clamped head starts at the beginning of the oldest retained row"
+    );
+    assert_eq!(term.text_selection().normalized_end().row, -48);
+    assert!(term.text_selection().truncated());
+
+    let (text, incomplete) = term.selection_to_string_bounded();
+    let text = text.expect("the surviving span still resolves to text");
+    assert!(
+        incomplete,
+        "the caps did not fire, so this flag can only be the eviction — it is the \
+         one signal that stops a short answer reading as an exact one"
+    );
+    assert!(
+        before.ends_with(&text),
+        "what survives is the TAIL of what was selected, unchanged: {before:?} vs {text:?}"
+    );
+}
+
+/// The non-vacuity control: once BOTH endpoints are evicted there is nothing to clamp
+/// onto and the honest answer is still a clear, with no sticky ` incomplete`.
+#[test]
+fn evicting_both_endpoints_still_clears_the_selection() {
+    let mut term = with_capped_history(24, 40, 50);
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(-50, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(-48, 6, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    for i in 0..4 {
+        term.process(format!("more-{i}\r\n").as_bytes());
+    }
+    assert!(!term.text_selection().has_selection());
+    assert!(!term.text_selection().truncated());
+    assert_eq!(term.selection_to_string_bounded(), (None, false));
+}
+
+/// EVICTION WITH NO DELTA. Shrinking the retention limit drops the oldest lines
+/// without scrolling anything and without recording a damage band, so neither the
+/// geometric transform nor the damage test in `post_process` sees it. This is the
+/// entry point `adjust_for_scroll` cannot serve.
+#[test]
+fn shrinking_the_retention_limit_truncates_a_selection_it_evicted() {
+    let mut term = with_capped_history(24, 40, 50);
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(-50, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(-46, 6, SelectionSide::Right);
+        sel.complete_selection();
+    }
+
+    term.set_scrollback_line_limit(Some(48));
+    assert_eq!(term.grid().scrollback_lines(), 48);
+
+    assert!(term.text_selection().has_selection());
+    assert_eq!(
+        term.text_selection().normalized_start().row,
+        -48,
+        "the head clamps onto the new floor with no scroll to carry it"
+    );
+    assert_eq!(
+        term.text_selection().normalized_end().row,
+        -46,
+        "the retained endpoint does not move: eviction renumbers nothing"
+    );
+    assert!(term.text_selection().truncated());
+}
+
+/// THE ALT-SCREEN GUARD, at the terminal level. The alt grid is always
+/// `Grid::with_scrollback(rows, cols, 0)`, so its floor is row 0 and there is no
+/// oldest RETAINED row to clamp onto. Clamping would pin the highlight to alt row 0 —
+/// content the user never selected — and a full-screen alt scroll takes the uniform
+/// delta path and records no damage band that could catch it afterwards. The guard is
+/// structural (`min_row == 0`), not a test of `alternate_screen`, so it holds for a
+/// primary grid configured with zero scrollback too.
+#[test]
+fn a_scroll_on_the_alt_screen_clears_rather_than_clamping_to_alt_row_zero() {
+    let mut term = Terminal::new(24, 40);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    term.process(b"\x1b[?1049h");
+    for i in 0..10 {
+        term.process(format!("alt-{i}\r\n").as_bytes());
+    }
+    // Select on alt with the LOWER endpoint one scroll away from the floor and the
+    // upper endpoint safely inside it — the shape a both-endpoints case cannot test.
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 3, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(2, 7, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    assert!(term.text_selection().has_selection());
+
+    term.process(b"\x1b[24;1H\n");
+
+    assert!(
+        !term.text_selection().has_selection(),
+        "alt has no history: the evicted row is unrecoverable and row 0 is not a \
+         substitute for it"
+    );
+    assert!(!term.text_selection().truncated());
+}

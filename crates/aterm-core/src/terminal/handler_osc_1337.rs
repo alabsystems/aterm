@@ -313,6 +313,7 @@ impl TerminalHandler<'_> {
             cols,
             rows,
             z_index: 0,
+            band_lift_px: 0,
         });
         // iTerm2 inline images are LEFT-anchored at the margin (column 0).
         self.place_image(&image, cols, rows, 0);
@@ -462,6 +463,7 @@ impl TerminalHandler<'_> {
             cols,
             rows,
             z_index: 0,
+            band_lift_px: 0,
         });
 
         // Sixel anchors at the CURRENT cursor column (VT340/xterm), NOT at the

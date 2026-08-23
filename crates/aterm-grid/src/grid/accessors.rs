@@ -133,6 +133,23 @@ impl Grid {
             .union(crate::SelectionDamage::All);
     }
 
+    /// Record that host-cached grid COORDINATES are stale, WITHOUT claiming the
+    /// content under any selection was destroyed.
+    ///
+    /// The alt-screen-switch half of [`Self::force_selection_invalidation`]. A buffer
+    /// swap does replace every visible coordinate — hosts that cache them (cursor
+    /// effects, the viewport row cache) TRANSLATE rather than rebuild while
+    /// `ContentScrollState::invalidation_epoch` is unchanged, so dropping the bump
+    /// leaves their state attached to cells from the other buffer. But the outgoing
+    /// screen's selection is PARKED across the switch, not destroyed, so recording
+    /// `SelectionDamage::All` here would clear the very selection the park exists to
+    /// keep. The two signals were one flag until they had to disagree; this is that
+    /// disagreement.
+    #[inline]
+    pub fn invalidate_host_coordinates(&mut self) {
+        self.storage.coordinates_invalidated = true;
+    }
+
     /// SELECTION CUSTODY Phase 4: record the SCROLL REGION's rows as damaged.
     ///
     /// The shorthand for the line/column editing family — IL, DL, DECIC, DECDC, SL,

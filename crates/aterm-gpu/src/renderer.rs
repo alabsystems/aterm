@@ -1355,10 +1355,12 @@ impl BlitUniform {
         self
     }
 
-    /// Fill the W1 placement fields: frame `dims`, the centred `content_off`
-    /// for a `dst_w`×`dst_h` swapchain, and the `band_rgb` (0x00RRGGBB live
-    /// terminal bg) band colour. Shared by the real present and the test blit so the
-    /// placement math has one owner (`aterm_render::band_offset`).
+    /// Fill the W1 placement fields: frame `dims`, the `content_off` for a
+    /// `dst_w`×`dst_h` swapchain (x centred, y per the platform policy —
+    /// top-pinned on Linux), and the `band_rgb` (0x00RRGGBB live terminal bg)
+    /// band colour. Shared by the real present and the test blit so the
+    /// placement math has one owner (`aterm_render::band_offset` /
+    /// `aterm_render::band_offset_y`).
     fn with_bands(mut self, fw: u32, fh: u32, dst_w: u32, dst_h: u32, band_rgb: u32) -> Self {
         let chan = |s: u32| ((band_rgb >> s) & 0xff) as f32 / 255.0;
         self.dims = [fw as f32, fh as f32];
@@ -1366,7 +1368,11 @@ impl BlitUniform {
         self.visible_h = fh as f32;
         self.content_off = [
             aterm_render::band_offset(dst_w as usize, fw as usize) as f32,
-            aterm_render::band_offset(dst_h as usize, fh as usize) as f32,
+            // Vertical placement is the platform policy (top-pinned on Linux so
+            // slack lands under the chrome band, centred elsewhere) — the same
+            // `band_offset_y` the CPU `place_frame_bands`, the pointer mapping
+            // and the visible-crop alignment use, so all four stay one law.
+            aterm_render::band_offset_y(dst_h as usize, fh as usize) as f32,
         ];
         self.band = [chan(16), chan(8), chan(0), 1.0];
         self
@@ -5039,6 +5045,12 @@ impl GpuRenderer {
         self.cpu.cell_geometry(px)
     }
 
+    /// PURE per-window decoration bands at `px`, delegated like
+    /// [`Self::cell_geometry`]. See [`aterm_render::Renderer::deco_metrics_for`].
+    pub fn deco_metrics_for(&self, px: f32) -> aterm_render::deco::DecoMetrics {
+        self.cpu.deco_metrics_for(px)
+    }
+
     /// Inject a broad-coverage (CJK + symbols) fallback face into the GPU's CPU
     /// face from font bytes and invalidate the atlas so the next frame
     /// re-rasterizes the new coverage. The browser GPU path has no system-font
@@ -5940,7 +5952,12 @@ impl GpuRenderer {
         for row in &input.images {
             for (_c, image) in row {
                 let fp_w = image.image.cols as usize * cw;
-                let fp_h = image.image.rows as usize * ch;
+                // Chrome-band lift: the strip band's raster is `band_lift_px`
+                // taller than its cell footprint (the lip above the grid). Same
+                // term as the CPU `blit_image_cell` footprint, so the decode
+                // cache keys and the sampled bytes stay byte-identical.
+                let fp_h =
+                    image.image.rows as usize * ch + usize::from(image.image.band_lift_px);
                 if fp_w == 0 || fp_h == 0 {
                     continue;
                 }
@@ -12647,7 +12664,13 @@ impl GpuRenderer {
                         continue;
                     }
                     let fp_w = image.image.cols as usize * cw;
-                    let fp_h = image.image.rows as usize * ch;
+                    // Chrome-band lift, mirroring the CPU `blit_image_cell`: the
+                    // footprint is `lift` px taller, the FIRST footprint row's
+                    // tile also paints the `[y0 − lift, y0)` lip, and every
+                    // row's source sits `lift` px lower. `lift == 0` (every
+                    // terminal image) keeps all four terms byte-identical.
+                    let lift = usize::from(image.image.band_lift_px);
+                    let fp_h = image.image.rows as usize * ch + lift;
                     let key = (std::sync::Arc::as_ptr(&image.image) as usize, fp_w, fp_h);
                     let Some(&(img_y0, dw, dh)) = plane.placements.get(&key) else {
                         // Failed decode (no texture rows): nothing to draw, the
@@ -12658,13 +12681,14 @@ impl GpuRenderer {
                     // uses `cell_col*cw`/`cell_row*ch`), offset by the image's row in
                     // the stacked texture. Clamp the tile to the footprint so a cell
                     // at the image edge never samples a neighbour's region.
+                    let lip = if image.cell_row == 0 { lift } else { 0 };
                     let sx0 = (image.cell_col as usize * cw) as u32;
-                    let sy0 = (image.cell_row as usize * ch) as u32;
+                    let sy0 = (image.cell_row as usize * ch + lift - lip) as u32;
                     if sx0 >= dw || sy0 >= dh {
                         continue;
                     }
                     let mut tile_w = (cw as u32).min(dw - sx0);
-                    let tile_h = (ch as u32).min(dh - sy0);
+                    let tile_h = ((ch + lip) as u32).min(dh - sy0);
                     // Mixed row: the tile is additionally clipped to its run's box.
                     // The tile is 1:1 (never DEC-scaled), so trimming the dest width
                     // trims exactly that many source texels — the `uv` below is
@@ -12680,7 +12704,11 @@ impl GpuRenderer {
                         }
                     }
                     let x0 = (pad + cx) as f32;
-                    let rect = [x0, y0, tile_w as f32, tile_h as f32];
+                    // The lip rows land ABOVE the cell band (`lip == 0` for all
+                    // but a lifted image's first row, where `y0 >= lift` by
+                    // construction — the lift is at most the chrome band `y0`
+                    // sits under).
+                    let rect = [x0, y0 - lip as f32, tile_w as f32, tile_h as f32];
                     let uv = [
                         sx0 as f32 / pw,
                         (img_y0 + sy0) as f32 / ph,
@@ -15364,8 +15392,16 @@ mod tests {
             8,
             0,
         );
-        assert_eq!(uniform.content_off, [-2.0, -2.0]);
-        assert_eq!(visible_source_scissor(&uniform, 7, 8), Some((0, 0, 7, 5)));
+        // Vertical placement is the platform policy: top-pinned on Linux
+        // (content_off.y == 0, the crop falls off the bottom), centred
+        // elsewhere — both from `aterm_render::band_offset_y`.
+        if cfg!(target_os = "linux") {
+            assert_eq!(uniform.content_off, [-2.0, 0.0]);
+            assert_eq!(visible_source_scissor(&uniform, 7, 8), Some((0, 1, 7, 6)));
+        } else {
+            assert_eq!(uniform.content_off, [-2.0, -2.0]);
+            assert_eq!(visible_source_scissor(&uniform, 7, 8), Some((0, 0, 7, 5)));
+        }
 
         let wholly_above = present_blit_uniform(
             false,
@@ -15380,11 +15416,21 @@ mod tests {
             1,
             0,
         );
-        assert_eq!(
-            visible_source_scissor(&wholly_above, 1, 1),
-            None,
-            "a fully clipped crown must not issue a zero/underflowed scissor"
-        );
+        if cfg!(target_os = "linux") {
+            // Top-pinned: source row 0 IS the on-screen row, so the crown's
+            // scissor legitimately covers the single destination pixel.
+            assert_eq!(
+                visible_source_scissor(&wholly_above, 1, 1),
+                Some((0, 0, 1, 1)),
+                "the pinned top row stays on screen"
+            );
+        } else {
+            assert_eq!(
+                visible_source_scissor(&wholly_above, 1, 1),
+                None,
+                "a fully clipped crown must not issue a zero/underflowed scissor"
+            );
+        }
     }
 
     /// A fresh, distinct `Arc<ImageData>` for the decode-cache tests (each call
@@ -15396,6 +15442,7 @@ mod tests {
             cols: 1,
             rows: 1,
             z_index: 0,
+            band_lift_px: 0,
         })
     }
 

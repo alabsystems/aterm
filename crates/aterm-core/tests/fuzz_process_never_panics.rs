@@ -177,6 +177,22 @@ fn check_invariants_reflow(term: &Terminal) {
         total >= rows as usize,
         "total_lines {total} < visible rows {rows} ({rows}x{cols})"
     );
+    // The cell walk below is an ORACLE WITH A PRECONDITION, so state it. `Grid::cell`
+    // resolves through `GridStorage::row_index`, the RING accessor — it serves only
+    // ring-resident rows and returns `None` for a viewport scrolled onto lazy or
+    // tiered history (pinned by `grid/tests/style_perf.rs`
+    // `row_returns_none_when_scrolled_into_tiered_scrollback`). The real viewport
+    // reader is `visible_row_view`, whose bound is `scrollback_lines()`. So "every
+    // visible cell is accessible" is a sound test only at offset 0, which is where
+    // these fuzzers always sit: nothing they emit moves the viewport, and the batch
+    // prologue re-pins only when it was already nonzero. Assert it rather than
+    // assume it — without this line a viewport change elsewhere reads out as
+    // "reflow corrupted the grid".
+    assert_eq!(
+        term.grid().display_offset(),
+        0,
+        "the cell oracle below is ring-only and therefore offset-0-only"
+    );
     // Every visible cell must be accessible (a corrupt row index/length would
     // panic or return None here), and reading its char must not panic.
     for r in 0..rows {

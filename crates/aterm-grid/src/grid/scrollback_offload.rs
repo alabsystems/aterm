@@ -630,7 +630,20 @@ impl Grid {
         // row rebuild. The ring is left EMPTY, so the resize below finds
         // nothing off-screen and its synchronous rewrap count is ZERO
         // (`offloaded_resize_synchronous_rewrap_is_zero` pins this).
-        let ring_lines = self.take_ring_scrollback_lines();
+        //
+        // Bottom-anchor bookkeeping (fixwave5): capture the pre-resize
+        // trailing-blank count FIRST — the deficit fill cannot run inside the
+        // synchronous resize (the history is out with the worker), so it runs
+        // at re-attach against this target instead.
+        let pending_fill_target = self.trailing_blank_rows_below_cursor();
+        let mut ring_lines = self.take_ring_scrollback_lines();
+        // Lift the viewport's leading soft-wrap continuation rows into the
+        // job's ring sequence (fixwave5): their logical line's HEAD is the
+        // newest ring history line, so joining them here lets the off-thread
+        // rewrap process the boundary-straddling line as ONE unit; the
+        // re-attach deficit fill pulls the rewrapped tail back into view.
+        ring_lines.extend(self.take_boundary_continuation_lines());
+        self.storage.pending_fill_target = Some(pending_fill_target);
 
         // With the store detached, the lazy buffer emptied and the ring history
         // lifted into the job, the resize's `take_scrollback_lines` rewraps
@@ -684,6 +697,8 @@ impl Grid {
             // The job-carried ring history is NOT part of the store the
             // replacement supersedes — it re-enters the ring (capped), the same
             // seat the pre-RFL-1 design kept it in across a replacement race.
+            // The reset also superseded the deficit-fill debt (fixwave5).
+            self.storage.pending_fill_target = None;
             self.reconcile_pending_scrollback_settings();
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
             return;
@@ -699,6 +714,9 @@ impl Grid {
             let mut store = reflowed.store;
             let _ = store.clear();
             self.storage.scrollback = Some(store);
+            // An erase means the pre-erase blanks are GENUINE now: never fill
+            // them from (erased) history (fixwave5).
+            self.storage.pending_fill_target = None;
             self.reconcile_pending_scrollback_settings();
             self.drain_lazy_buffer(); // post-erase window output (erase cleared the pre-erase lazy)
             self.storage.display_offset = 0; // an erase resets the scroll position
@@ -717,6 +735,20 @@ impl Grid {
         // the lazy buffer) into the store AFTER the reflowed old history — yielding
         // the documented order [old history | window output | live ring].
         self.drain_lazy_buffer();
+        // Bottom-anchor the viewport (fixwave5): the width-grow that opened
+        // this window unwrapped content into fewer rows, and the synchronous
+        // resize could not pull history back in — it was out with THIS job.
+        // Now the rewrapped history is home, fill the reflow-created blank
+        // band from it, re-seating the boundary line's tail under the content
+        // it belongs to. Only when the job's width still matches (a stale
+        // width re-detaches instead — see
+        // `reattach_reflowed_scrollback_or_redetach` — and fills on ITS
+        // re-attach); the target survives until a width-matched re-attach.
+        if reflowed.new_cols == self.storage.cols
+            && let Some(target) = self.storage.pending_fill_target.take()
+        {
+            self.fill_viewport_deficit_from_history(target);
+        }
         let sb = self.storage.scrollback_lines();
         // Audit bug D: restore the reader's pre-detach scroll position clamped to the
         // regrown full history (the synchronous resize had clamped it to the ring-only
@@ -947,6 +979,9 @@ impl Grid {
             return;
         }
         self.storage.scrollback_detached_for_reflow = false;
+        // The job (and the history a deficit fill would have pulled) is lost:
+        // drop the debt with it (fixwave5).
+        self.storage.pending_fill_target = None;
         if self.storage.scrollback.is_some() {
             // A reset/recovery path installed a replacement store before the
             // failed worker was noticed. It is authoritative: replay the newest

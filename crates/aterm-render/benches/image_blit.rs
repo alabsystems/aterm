@@ -129,6 +129,7 @@ fn placement(cw: usize, ch: usize, rows_per: usize, seed: u32) -> Arc<ImageData>
         // `>= 0`: the image OWNS the cell (the iTerm2/Sixel default and Kitty
         // `z=0`), which is the pass-2b blit path — not the `z<0` below-text tier.
         z_index: 0,
+        band_lift_px: 0,
     })
 }
 

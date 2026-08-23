@@ -37,6 +37,12 @@ fn scrolled_back(rows: u16, cols: u16, lines: usize) -> Terminal {
 }
 
 /// The top visible row's text — what the user is looking at.
+///
+/// `Grid::cell` is the RING accessor, not the viewport reader (`visible_row_view`
+/// is), so this oracle is only sound for a ring-only grid with an empty lazy
+/// buffer — which every fixture here is, at 24 columns and a few dozen lines. On a
+/// deep-history grid a scrolled-back row can be tiered and legitimately read back
+/// as blank; do not lift this helper into such a test without swapping the reader.
 fn top_row_text(term: &Terminal) -> String {
     let grid = term.grid();
     (0..grid.cols())
@@ -135,34 +141,33 @@ fn a_live_viewport_stays_live_across_the_round_trip() {
     );
 }
 
-/// SELECTION CUSTODY Phase 3 — KNOWN GAP, attempted and reverted. See below.
+/// SELECTION CUSTODY — a ROWS-ONLY resize keeps the same line under the eye.
 ///
 /// `display_offset` is measured from the live bottom, so restoring the same offset
 /// under a different `visible_rows` slides the content by exactly the row-count
 /// delta. Window height changes, font zoom and horizontal divider drags are all
-/// rows-only resizes, so this fires on every one of them — and Phase 1's removal of
+/// rows-only resizes, so this fired on every one of them — and Phase 1's removal of
 /// the font-zoom snap made it visible rather than hidden.
 ///
-/// The obvious fix — capture `top_visible_absolute_row()` before the resize and
-/// restore with `scroll_to_absolute_row()` after — WAS implemented and DOES fix this
-/// case, but it fails `fuzz_process_never_panics::reflow_wide_char_resize_never_panics`
-/// with "cell (0,0) inaccessible on a 1x82 grid". Isolated to `reflow.rs` alone by
-/// stashing each file in turn; the other Phase 3 changes are clean.
+/// `reflow.rs` now re-anchors on `top_visible_absolute_row()` when the width is
+/// unchanged, because a rows-only resize rewraps nothing and leaves
+/// `absolute_row_counter` alone: the row under the eye keeps its absolute number.
 ///
-/// Root cause as far as it was chased: on a rows-only SHRINK the anchor legitimately
-/// demands a LARGER offset than before (`visible_rows` fell, so the same top line now
-/// sits further from the live bottom), which clamps to `scrollback_lines()`. That
-/// count includes LAZY and TIERED lines that are not ring-resident
-/// (`state/scrollback.rs:142`), and at that boundary — mid-reflow, right after
-/// `restore_reflowed_scrollback` splices — a visible cell stops resolving.
-///
-/// The real finding is therefore about an EXISTING invariant, not about this design:
-/// `display_offset <= scrollback_lines()` (the postcondition `scroll_to_absolute_row`
-/// and `repin_display_offset` both assert) is evidently WEAKER than "every visible
-/// cell is addressable". Anything that drives the offset to that bound can expose it.
-/// Reverted rather than guessed at: this is the resize path the L0 whole-Mac-freeze
-/// work owns, and a wrong bound here is not a cosmetic bug.
-#[ignore = "known gap: the anchor restore trips a latent addressability bound at max display_offset; see the doc comment"]
+/// This WAS attempted once and reverted, on a misread that is worth recording so it
+/// is not re-derived. The revert was triggered by
+/// `fuzz_process_never_panics::reflow_wide_char_resize_never_panics` failing with
+/// "cell (0,0) inaccessible on a 1x82 grid", and the conclusion drawn was that
+/// `display_offset <= scrollback_lines()` is a broken bound. It is not. `Grid::cell`
+/// is the RING accessor (`GridStorage::row_index`) and legitimately returns `None`
+/// for a viewport parked on lazy or tiered history — `grid/tests/style_perf.rs`
+/// `row_returns_none_when_scrolled_into_tiered_scrollback` pins exactly that, and
+/// ⌘↑ (`scroll_to_top`) drives production to that same bound every day. The viewport
+/// reader is `visible_row_view`, not `Grid::cell`. What actually went wrong is that
+/// the reverted patch re-anchored even at `prev_offset == 0`, where the arithmetic
+/// wants `d + (v - t) > 0` on a height shrink: it scrolled LIVE viewports into
+/// history, which is the only reason that fuzz ever saw a nonzero offset. The
+/// `prev_offset > 0` gate is the fix; the fuzz oracle now asserts its own
+/// offset-0 precondition so the same false signal cannot recur.
 #[test]
 fn a_rows_only_resize_keeps_the_same_line_under_the_eye() {
     for (from_rows, to_rows) in [(6u16, 4u16), (4, 6), (10, 3)] {
@@ -178,6 +183,117 @@ fn a_rows_only_resize_keeps_the_same_line_under_the_eye() {
             top_row_text(&term),
             top_before,
             "{from_rows}->{to_rows} rows: the top visible line must not move"
+        );
+    }
+}
+
+/// The same property on DEEP history at the retention cap, read through the
+/// resolving reader rather than the ring accessor.
+///
+/// `top_row_text` above is `Grid::cell`, the RING accessor, which legitimately reads
+/// blank once the anchored row has been lazily buffered or tiered — that miscue is
+/// what got the first attempt reverted. This case therefore asserts on the absolute
+/// row itself and reads the line through `get_line_text`, which resolves ring, lazy
+/// and tiered alike. It also exercises the retention cap: the anchor arm is allowed
+/// to clamp there, so the assertion is on the anchor and the offset is checked only
+/// for still being in history.
+///
+/// HONEST SCOPE — this fixture does NOT reach TIERED storage, despite what an earlier
+/// name for it claimed. Measured: 20 000 lines through `Terminal::new(rows, 80)`
+/// gives `scrollback_lines = 10000`, `tiered_scrollback_lines = 0` — the ring
+/// retention cap bites first, so nothing is ever offloaded. The real guard against
+/// the reverted failure mode is
+/// `fuzz_process_never_panics::reflow_wide_char_resize_never_panics`, which drives
+/// 30 000 randomised resize/reflow rounds and is the gate the first attempt failed.
+/// A genuine tiered case would need a `TerminalBuilder` with a tiered store
+/// configured, and is worth adding.
+#[test]
+fn a_rows_only_resize_keeps_the_anchor_through_deep_capped_history() {
+    for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5)] {
+        let mut term = Terminal::new(from_rows, 80);
+        for i in 0..20_000 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        term.scroll_to_top();
+        // Off the very top, so a clamp cannot accidentally produce the right answer.
+        term.scroll_display(-200);
+        let anchor_before = term.grid().top_visible_absolute_row();
+        let offset_before = i32::try_from(term.grid().display_offset()).unwrap();
+        let text_before = term.get_line_text(-offset_before, None);
+        assert!(
+            text_before
+                .as_deref()
+                .is_some_and(|t| t.starts_with("line-")),
+            "{from_rows}->{to_rows}: the fixture must be reading real history"
+        );
+
+        term.resize(to_rows, 80);
+
+        assert_eq!(
+            term.grid().top_visible_absolute_row(),
+            anchor_before,
+            "{from_rows}->{to_rows} rows: the anchored absolute row must not move"
+        );
+        let offset_after = i32::try_from(term.grid().display_offset()).unwrap();
+        assert!(
+            offset_after > 0,
+            "{from_rows}->{to_rows} rows: the reader must still be in history"
+        );
+        assert_eq!(
+            term.get_line_text(-offset_after, None),
+            text_before,
+            "{from_rows}->{to_rows} rows: …and the same line must be under the eye"
+        );
+    }
+}
+
+/// Control for the `prev_offset > 0` gate, and the reason the first attempt at the
+/// anchor was reverted: a reader at the LIVE bottom must stay there.
+///
+/// The anchor arithmetic is `want = d + (v - t)`. At `d == 0` a height SHRINK still
+/// wants a positive offset, so re-anchoring unconditionally scrolls a tail-following
+/// viewport into history on every window-height drag — and that, not any bound in
+/// `scroll_to_absolute_row`, is what made the resize fuzzers see a nonzero offset.
+#[test]
+fn a_live_viewport_stays_live_across_a_rows_only_resize() {
+    for (from_rows, to_rows) in [(6u16, 4u16), (4, 6), (10, 3), (3, 10)] {
+        let mut term = Terminal::new(from_rows, 24);
+        for i in 0..64 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        assert_eq!(term.grid().display_offset(), 0, "starts live");
+
+        term.resize(to_rows, 24);
+
+        assert_eq!(
+            term.grid().display_offset(),
+            0,
+            "{from_rows}->{to_rows} rows: a tail follower must stay at the live bottom"
+        );
+    }
+}
+
+/// The resize can arrive while an alt-screen app is up — a window drag during `vim`
+/// is the everyday case. `Terminal::resize` then reflows the PARKED primary
+/// (`callback_setters.rs`: `saved_primary.resize(..)`), which still carries the
+/// reader's nonzero offset, so the anchor arm runs on a grid that is not `self.grid`.
+/// Exit must land on the same line the user left.
+#[test]
+fn a_rows_only_resize_while_alt_is_up_still_re_anchors_the_parked_primary() {
+    for (from_rows, to_rows) in [(6u16, 4u16), (4, 6)] {
+        let mut term = scrolled_back(from_rows, 24, 64);
+        term.scroll_display(-5);
+        let top_before = top_row_text(&term);
+
+        term.process(b"\x1b[?1049h");
+        term.process(b"a pager's screen\r\n");
+        term.resize(to_rows, 24);
+        term.process(b"\x1b[?1049l");
+
+        assert_eq!(
+            top_row_text(&term),
+            top_before,
+            "{from_rows}->{to_rows} rows under alt: the same line must come back"
         );
     }
 }
@@ -253,5 +369,407 @@ fn a_width_resize_still_clears_the_selection() {
     assert!(
         !term.text_selection().has_selection(),
         "a width change rewraps, so the selection must still be cleared"
+    );
+}
+
+// ===========================================================================
+// SELECTION CUSTODY — the SELECTION is screen-scoped too.
+//
+// The viewport half above proved the reading position survives a pager. The
+// highlight did not: every alt-screen switch recorded `SelectionDamage::All` on
+// the incoming grid, so `vim`/`less`/`fzf` destroyed a selection made on the main
+// screen — content the alt buffer never touched and could not have invalidated.
+//
+// The fix parks the outgoing screen's selection at the top of `post_process` and
+// restores it on the way back. These tests pin the OBSERVABLE property: the same
+// TEXT is still selected afterwards, not merely that some selection exists.
+// ===========================================================================
+
+use aterm_core::selection::{SelectionSide, SelectionType};
+
+/// A terminal with deep history holding a completed selection anchored in
+/// SCROLLBACK — the case an alt-screen app has no business touching.
+fn with_scrollback_selection(rows: u16, cols: u16) -> Terminal {
+    let mut term = Terminal::new(rows, cols);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    let sel = term.text_selection_mut();
+    sel.start_selection(-30, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(-30, 6, SelectionSide::Right);
+    sel.complete_selection();
+    assert!(term.text_selection().has_selection());
+    assert!(term.selection_to_string().is_some());
+    term
+}
+
+/// Every spelling of the switch, entry and exit paired.
+const ALT_MODES: [(&[u8], &[u8]); 3] = [
+    (b"\x1b[?1049h", b"\x1b[?1049l"),
+    (b"\x1b[?47h", b"\x1b[?47l"),
+    (b"\x1b[?1047h", b"\x1b[?1047l"),
+];
+
+/// THE SELECTION HALF OF THE REPORTED BUG. Highlight something, run a pager, quit:
+/// the highlight must still be over the same text.
+///
+/// Entry and exit in SEPARATE batches, which is the real shape — a pager's output
+/// arrives over many reads, and the enter batch is the one that used to destroy it.
+#[test]
+fn a_selection_survives_an_alt_screen_app_in_every_mode() {
+    for (enter, leave) in ALT_MODES {
+        let mut term = with_scrollback_selection(6, 24);
+        let start_before = term.text_selection().start();
+        let end_before = term.text_selection().end();
+        let text_before = term.selection_to_string();
+
+        term.process(enter);
+        term.process(b"a pager's screen\r\n");
+        term.process(leave);
+
+        assert!(
+            term.text_selection().has_selection(),
+            "mode {enter:?}: an alt-screen app must not destroy the main selection"
+        );
+        assert_eq!(term.text_selection().start().row, start_before.row);
+        assert_eq!(term.text_selection().start().col, start_before.col);
+        assert_eq!(term.text_selection().end().row, end_before.row);
+        assert_eq!(term.text_selection().end().col, end_before.col);
+        assert_eq!(
+            term.selection_to_string(),
+            text_before,
+            "mode {enter:?}: the same TEXT must still be selected"
+        );
+    }
+}
+
+/// The whole round trip inside ONE `process` batch. `was_alt` is captured once per
+/// batch, so an enter+exit pair that nets to no change must also net to no change
+/// for the selection — the park and the restore both have to be skipped, not run
+/// once each.
+#[test]
+fn a_selection_survives_an_alt_round_trip_inside_one_batch() {
+    for (enter, leave) in ALT_MODES {
+        let mut term = with_scrollback_selection(6, 24);
+        let text_before = term.selection_to_string();
+
+        let mut batch = Vec::new();
+        batch.extend_from_slice(enter);
+        batch.extend_from_slice(b"a pager's screen\r\n");
+        batch.extend_from_slice(leave);
+        term.process(&batch);
+
+        assert!(
+            term.text_selection().has_selection(),
+            "mode {enter:?}: a same-batch round trip must not destroy it either"
+        );
+        assert_eq!(term.selection_to_string(), text_before);
+    }
+}
+
+/// Control: a selection on the LIVE screen survives the round trip too. It is the
+/// main grid's content, and the main grid comes back untouched.
+#[test]
+fn a_live_screen_selection_survives_the_round_trip() {
+    let mut term = Terminal::new(6, 24);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(1, 6, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    let text_before = term.selection_to_string();
+
+    term.process(b"\x1b[?1049h");
+    term.process(b"pager\r\n");
+    term.process(b"\x1b[?1049l");
+
+    assert_eq!(
+        term.selection_to_string(),
+        text_before,
+        "a live-screen selection names main-grid content, which came back intact"
+    );
+}
+
+/// NEGATIVE CONTROL — the park is ASYMMETRIC on purpose. A selection made ON the
+/// alt screen must not leak back to main: it names the pager's buffer, which is
+/// gone. Restoring the main selection is a `mem::take`, so it overwrites.
+#[test]
+fn a_selection_made_on_alt_does_not_leak_back_to_main() {
+    for (enter, leave) in ALT_MODES {
+        let mut term = Terminal::new(6, 24);
+        for i in 0..64 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        term.process(enter);
+        term.process(b"pager row\r\n");
+        {
+            let sel = term.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        assert!(term.text_selection().has_selection(), "mode {enter:?}");
+
+        term.process(leave);
+
+        assert!(
+            !term.text_selection().has_selection(),
+            "mode {enter:?}: an alt-screen selection names a buffer the user can no longer see"
+        );
+    }
+}
+
+/// The main screen's selection stays parked for as long as the app runs, however
+/// much the app scrolls its own buffer. An alt full-screen scroll advances the alt
+/// grid's `absolute_row_counter` and takes the uniform `content_scroll_delta` path —
+/// which, before the park, was applied to the MAIN screen's anchors.
+#[test]
+fn alt_screen_scrolling_does_not_walk_the_parked_selection() {
+    let mut term = with_scrollback_selection(6, 24);
+    let text_before = term.selection_to_string();
+
+    term.process(b"\x1b[?1049h");
+    for i in 0..40 {
+        term.process(format!("pager row {i}\r\n").as_bytes());
+    }
+    term.process(b"\x1b[?1049l");
+
+    assert_eq!(
+        term.selection_to_string(),
+        text_before,
+        "40 rows of alt-screen scroll must not move a main-screen anchor"
+    );
+}
+
+/// THE SPLICE ASSERT, EXIT DIRECTION. A top-anchored DECSTBM archival scroll on
+/// main leaves a `pending_selection_row_update` stranded on the main grid when the
+/// next batch swaps it out; the batch that swaps it back drains it while
+/// `absolute_rows_before` still names the ALT grid's counter. The debug assert
+/// compares those two, and before the exemption it panicked in every debug build.
+#[test]
+fn a_stranded_splice_does_not_trip_the_cross_grid_assert_on_exit() {
+    let mut term = with_scrollback_selection(6, 24);
+
+    // A protected-footer archival scroll: rows 1..=3 move into history while the
+    // rows below stay fixed. Same shape as `processing.rs`'s own splice fixture.
+    term.process(b"\x1b[r\x1b[1;1HX\x1b[1;3r\x1b[3;1H\n\x1b[?1049h");
+    term.process(b"pager\r\n");
+    term.process(b"\x1b[?1049l");
+
+    // Reaching here in a debug build IS the assertion; keep a liveness check so the
+    // test cannot pass by doing nothing.
+    assert!(term.grid().scrollback_lines() > 0);
+}
+
+/// THE ENTER DIRECTION. `enter_alternate_screen_raw` REUSES the persistent alt
+/// buffer, so whatever that buffer recorded on the batch that swapped it out is
+/// still on it — nothing drains a parked grid — and the re-entry batch drains it
+/// while `absolute_rows_before` names the MAIN grid's counter.
+///
+/// The guard on the splice assert is symmetric for that reason, but be precise
+/// about what is reachable: a SPLICE cannot be recorded on the alt buffer at all.
+/// `Grid::scroll_region_up` only takes the archival top-anchored path when
+/// `max_scrollback > 0 || scrollback.is_some() || scrollback_detached_for_reflow`
+/// (`grid/scroll.rs`), and the alt buffer is always `Grid::with_scrollback(rows,
+/// cols, 0)` with no tiered store and no offload — `set_scrollback_line_limit` and
+/// `resize_offloading_scrollback` both target the PRIMARY-content grid, which while
+/// alt is up is the saved one. So the enter direction can strand a damage band and a
+/// scroll delta, never a splice. What this pins is that draining them on re-entry
+/// leaves the parked main selection alone.
+#[test]
+fn stranded_alt_buffer_bookkeeping_survives_re_entry() {
+    let mut term = with_scrollback_selection(6, 24);
+    let text_before = term.selection_to_string();
+
+    term.process(b"\x1b[?47h");
+    // A region scroll plus an erase on alt, then leave with both stranded.
+    term.process(b"\x1b[r\x1b[1;1HX\x1b[1;3r\x1b[3;1H\n\x1b[2J\x1b[?47l");
+    term.process(b"\x1b[?47h");
+    term.process(b"\x1b[?47l");
+
+    assert_eq!(
+        term.selection_to_string(),
+        text_before,
+        "the alt buffer's stale damage belongs to the alt buffer"
+    );
+}
+
+/// A parked grid can lose scrollback WHILE PARKED — the compression worker drains
+/// its lazy buffer, retention evicts. That happens with no scroll delta and no
+/// damage, so only the post-restore re-floor can catch it. Without it the anchor
+/// comes back pointing below the floor, at rows that no longer exist.
+#[test]
+fn scrollback_evicted_while_parked_does_not_resurrect_a_dangling_anchor() {
+    let mut term = with_scrollback_selection(6, 24);
+    let deepest = term
+        .text_selection()
+        .start()
+        .row
+        .min(term.text_selection().end().row);
+
+    term.process(b"\x1b[?1049h");
+    // Retention pressure against the PARKED main grid: the limit applies to the
+    // grid that owns the primary content, which while alt is up is the saved one.
+    term.set_scrollback_line_limit(Some(4));
+    term.process(b"\x1b[?1049l");
+
+    let floor = i32::try_from(term.grid().scrollback_lines()).unwrap_or(i32::MAX);
+    assert!(
+        floor < -deepest,
+        "the fixture must actually evict the anchor: floor {floor}, anchor {deepest}"
+    );
+    assert!(
+        !term.text_selection().has_selection()
+            || term.text_selection().start().row >= -floor
+                && term.text_selection().end().row >= -floor,
+        "an anchor evicted while parked must never come back below the floor"
+    );
+}
+
+/// A WIDTH resize while the pager is up rewraps the parked main grid, renumbering
+/// exactly the rows the parked selection is anchored to. It must go.
+#[test]
+fn a_width_resize_while_on_alt_clears_the_parked_selection() {
+    let mut term = with_scrollback_selection(6, 24);
+
+    term.process(b"\x1b[?1049h");
+    term.resize(6, 20);
+    term.process(b"\x1b[?1049l");
+
+    assert!(
+        !term.text_selection().has_selection(),
+        "a rewrap of the parked grid invalidates its anchors"
+    );
+}
+
+/// …and its rows-only twin must NOT. Nothing rewrapped; a window-height drag or a
+/// font zoom while `vim` is up has no business eating the highlight underneath.
+#[test]
+fn a_rows_only_resize_while_on_alt_keeps_the_parked_selection() {
+    let mut term = with_scrollback_selection(6, 24);
+    let text_before = term.selection_to_string();
+
+    term.process(b"\x1b[?1049h");
+    term.resize(8, 24);
+    term.process(b"\x1b[?1049l");
+
+    assert!(
+        term.text_selection().has_selection(),
+        "a rows-only resize rewraps nothing, on either grid"
+    );
+    assert_eq!(
+        term.selection_to_string(),
+        text_before,
+        "and the parked anchors must follow the parked grid's own revealed rows"
+    );
+}
+
+/// The wholesale destroyers reach the PARKED slot too. Each of these runs while the
+/// pager is up, and none of them goes through `post_process` on the way back.
+#[test]
+fn wholesale_destruction_while_on_alt_takes_the_parked_selection_with_it() {
+    // ED 3 / `clear_scrollback`: erases BOTH grids' history.
+    let mut term = with_scrollback_selection(6, 24);
+    term.process(b"\x1b[?1049h");
+    term.clear_scrollback();
+    term.process(b"\x1b[?1049l");
+    assert!(
+        !term.text_selection().has_selection(),
+        "clear_scrollback erased the rows the parked anchors named"
+    );
+
+    // Direct `Terminal::reset` — an implicit alt->main swap outside the handler.
+    let mut term = with_scrollback_selection(6, 24);
+    term.process(b"\x1b[?1049h");
+    term.reset();
+    assert!(!term.is_alternate_screen(), "RIS leaves the alt screen");
+    assert!(
+        !term.text_selection().has_selection(),
+        "a reset must not leave a parked selection standing"
+    );
+
+    // Byte-stream RIS — the same swap, reached from inside parser dispatch.
+    let mut term = with_scrollback_selection(6, 24);
+    term.process(b"\x1b[?1049h");
+    term.process(b"\x1bc");
+    assert!(!term.is_alternate_screen());
+    assert!(
+        !term.text_selection().has_selection(),
+        "byte-stream RIS is a sixth implicit switch and must clear it too"
+    );
+
+    // Checkpoint hydration swaps the whole coordinate lineage underneath both slots.
+    // The donor is captured ON alt so its `modes.alternate_screen` keeps the hydrated
+    // terminal there: the exit that follows is a REAL exit, and it is the one that
+    // would hand back a selection anchored in a lineage this terminal never had.
+    let mut donor = Terminal::new(6, 24);
+    // Deep enough history that the post-restore re-floor CANNOT be what saves this:
+    // a stale anchor at row -30 is comfortably inside the donor's own floor.
+    for i in 0..64 {
+        donor.process(format!("other-session-{i}\r\n").as_bytes());
+    }
+    donor.process(b"\x1b[?1049h");
+    let checkpoint = donor.checkpoint();
+    let mut term = with_scrollback_selection(6, 24);
+    term.process(b"\x1b[?1049h");
+    term.restore_checkpoint(&checkpoint);
+    assert!(term.is_alternate_screen(), "the donor was captured on alt");
+    term.process(b"\x1b[?1049l");
+    assert!(
+        !term.text_selection().has_selection(),
+        "a hydrated session must not resurrect the pre-hydration selection on alt exit"
+    );
+}
+
+/// RIS followed by a re-entry into alt IN ONE BATCH — no highlight may survive it.
+///
+/// `\x1bc\x1b[?1049h` leaves `was_alt` and `modes.alternate_screen` BOTH true at
+/// `post_process`, so the park/restore pair sits out the batch entirely: a stale
+/// pre-RIS main selection stays in the parked slot and is a candidate to be handed
+/// back on the next `?1049l`, over a grid the reset already erased.
+///
+/// HONEST SCOPE — this pins the user-visible PROPERTY, not one mechanism. Two
+/// independent things currently enforce it, and this test does not isolate either:
+/// the explicit `parked_text_selection.clear()` in the `pending_parser_reset` block,
+/// and the floor-0 guard in `truncate_to_floor` (RIS erases the scrollback, so the
+/// restored grid's floor is 0 and a clamp is refused). Verified by mutation:
+/// deleting the RIS clear alone leaves this test GREEN. It is kept because the
+/// property is worth pinning and the clear is worth keeping — the guard's coverage
+/// here is incidental, and a future change that gives the restored grid a nonzero
+/// floor would move the load onto the clear.
+#[test]
+fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
+    use aterm_core::selection::{SelectionSide, SelectionType};
+
+    let mut term = Terminal::new(6, 24);
+    for i in 0..40 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    // A selection on the MAIN screen, then park it by entering alt.
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(0, 4, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    term.process(b"\x1b[?1049h");
+    assert!(
+        !term.text_selection().has_selection(),
+        "entering alt parks the main selection"
+    );
+
+    // RIS and re-enter alt in ONE batch: neither park nor restore fires.
+    term.process(b"\x1bc\x1b[?1049h");
+    // Now leave alt. The slot must be empty — nothing to hand back.
+    term.process(b"\x1b[?1049l");
+
+    assert!(
+        !term.text_selection().has_selection(),
+        "RIS must destroy the parked selection; it cannot survive to be restored \
+         over a grid the reset erased"
     );
 }

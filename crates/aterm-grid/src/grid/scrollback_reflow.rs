@@ -98,9 +98,33 @@ impl Grid {
         let no_extras = super::ScrolledRowExtras::default();
         for i in 0..ring_scrollback {
             let extras = self.storage.ring_history_extras(i).unwrap_or(&no_extras);
-            lines.push(Self::row_to_line_with_stored_extras(
-                &self.storage.rows[i],
-                extras,
+            let row = &self.storage.rows[i];
+            // A row whose logical line CONTINUES (its successor — the next
+            // ring row, or the first visible row for the newest — is a wrap
+            // continuation) was filled to its last column by autowrap, so its
+            // trailing blank cells are real content: materialize the FULL
+            // width, or a width sweep erodes one mid-line space per chunk
+            // boundary (fixwave5). EXCEPT when the continuation opens with a
+            // WIDE cell: a wide char that cannot start at the last column
+            // EARLY-WRAPS, leaving that cell unwritten — materializing it
+            // would inject a phantom space before the wide char.
+            let successor = self.storage.rows.get(i + 1);
+            let len = if row.line_size() == super::LineSize::SingleWidth
+                && successor.is_some_and(super::Row::is_wrapped)
+            {
+                // Autowrap filled this row — its trailing blanks are content.
+                // A successor OPENING wide means exactly ONE cell (the early-
+                // wrap hole) was never written; real trimmed spaces before it
+                // still materialize.
+                let hole = successor
+                    .and_then(|r| r.as_slice().first())
+                    .is_some_and(super::Cell::is_wide);
+                row.cols() - u16::from(hole)
+            } else {
+                row.len()
+            };
+            lines.push(Self::row_to_line_with_stored_extras_at_len(
+                row, extras, len,
             ));
         }
         // Drop the scrollback rows; keep only the visible window.
@@ -118,8 +142,8 @@ impl Grid {
     /// converted to ring-buffer scrollback rows up to the configured
     /// `max_scrollback` cap (older lines beyond the cap are evicted —
     /// the correct, configured behavior).
-    pub(super) fn restore_reflowed_scrollback(&mut self, lines: Vec<Line>, new_cols: u16) {
-        if lines.is_empty() {
+    pub(super) fn restore_reflowed_scrollback(&mut self, mut lines: Vec<Line>, new_cols: u16) {
+        if lines.is_empty() && self.storage.scrollback.is_some() {
             return;
         }
         if let Some(scrollback) = self.storage.scrollback.as_mut() {
@@ -142,7 +166,22 @@ impl Grid {
                 self.drain_lazy_buffer();
             }
         } else {
-            self.prepend_ring_scrollback_lines(lines, new_cols);
+            // RING-ONLY grid: the visible-grid reflow's overflow (#7410) was
+            // staged into the lazy buffer, where — with no tiered store to
+            // drain into — the next `drain_lazy_buffer` would silently DISCARD
+            // it, and until then readers composed it in the WRONG order (the
+            // lazy buffer reads as older than ring history, but this overflow
+            // is newer than the rewrapped `lines`). Absorb it here as the
+            // newest tail of the restored history (fixwave5). The detached
+            // window keeps its staged flight output for re-attach instead.
+            if !self.storage.scrollback_detached_for_reflow
+                && !self.storage.lazy_buffer.is_empty()
+            {
+                lines.extend(self.storage.lazy_buffer.drain_all());
+            }
+            if !lines.is_empty() {
+                self.prepend_ring_scrollback_lines(lines, new_cols);
+            }
         }
     }
 

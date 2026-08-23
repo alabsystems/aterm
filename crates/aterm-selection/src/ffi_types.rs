@@ -91,7 +91,7 @@ pub fn build_selection_match(
 
 /// Selection type for text selection.
 ///
-/// See `tla/Selection.tla` for the formal specification.
+/// See `docs/DESIGN-selection-custody-2026-08-21.md` §5.2 for the specification.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AtermSelectionType {

@@ -156,6 +156,11 @@ pub(crate) fn primary_set(text: &str) -> bool {
 
 /// Read the X11 PRIMARY selection as UTF-8 text (the middle-click-paste source), or
 /// `None` when empty / off X11.
+///
+/// BLOCKING on a foreign owner (a `ConvertSelection` round-trip bounded at ~1 s),
+/// so the GUI middle-click path must never call this on the UI thread — it probes
+/// [`primary_get_owned`] first and runs this only on its paste worker
+/// (`App::paste_primary_into`), mirroring the [`pbpaste`]/[`pbpaste_owned`] split.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn primary_get() -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -167,4 +172,32 @@ pub(crate) fn primary_get() -> Option<String> {
     {
         None
     }
+}
+
+// The PRIMARY twin of `PBPASTE_STUB` (see its doc for the thread-local
+// rationale): lets a test drive the middle-click paste path
+// (`App::paste_primary_into`) with a deterministic PRIMARY selection instead of
+// whatever the developer last drag-selected. Answered by the own-slot fast path
+// (`primary_get_owned`) only — the foreign-owner worker runs on ANOTHER thread,
+// where a thread-local override could never be visible, so a stubbed test
+// always takes the synchronous branch. Compiled out of every shipping binary.
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    pub(crate) static PRIMARY_STUB: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The non-blocking twin of [`primary_get`]: the PRIMARY text only when we OWN the
+/// selection (the stored slot, instant), `None` when a FOREIGN client owns it — the
+/// same fast-path/offload split [`pbpaste_owned`] gives the CLIPBOARD. This is the
+/// COMMON middle-click case: a drag-select in aterm takes PRIMARY ownership
+/// (`finish_selection`), so select-here/paste-here never leaves the UI thread.
+#[cfg(target_os = "linux")]
+pub(crate) fn primary_get_owned() -> Option<String> {
+    #[cfg(test)]
+    if let Some(stub) = PRIMARY_STUB.with(|s| s.borrow().clone()) {
+        return (!stub.is_empty()).then_some(stub);
+    }
+    crate::clipboard_x11::X11Clipboard::get_handle()
+        .and_then(|c| c.get_owned(crate::clipboard_x11::Sel::Primary))
 }

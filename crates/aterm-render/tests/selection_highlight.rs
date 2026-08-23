@@ -147,6 +147,7 @@ fn selected_sparse_tail_paints_implicit_blanks_and_covers_deepest_image() {
         cols: 1,
         rows: 1,
         z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
+        band_lift_px: 0,
     });
     input.images[0].push((
         5,

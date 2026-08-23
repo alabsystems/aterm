@@ -2827,7 +2827,14 @@ fn security_label(key: &str) -> &'static str {
     match key {
         EDIT_ALLOW_OSC52_QUERY => "Allow programs to read the clipboard (OSC 52)",
         EDIT_SECURE_KEYBOARD_ENTRY => "Secure Keyboard Entry (block keystroke snooping)",
-        EDIT_ALLOW_WINDOW_OPS => "Allow title / text-grid-size queries (XTWINOPS)",
+        EDIT_ALLOW_WINDOW_OPS => {
+            if cfg!(target_os = "linux") {
+                // The manipulation half is wired there (frame audit #4).
+                "Allow window control & size queries (XTWINOPS)"
+            } else {
+                "Allow title / text-grid-size queries (XTWINOPS)"
+            }
+        }
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
         EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
         EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow local files for Kitty graphics (new sessions)",
@@ -7108,8 +7115,18 @@ listen = \"127.0.0.1:7777\" # local only
         assert_eq!(seed(EDIT_THEME), None);
         assert_eq!(seed(EDIT_CURSOR_STYLE), None);
         assert_eq!(seed(EDIT_SCROLLBACK), None);
-        // copy_on_select + ligatures are the bools whose default is ON.
-        assert_eq!(seed(EDIT_COPY_ON_SELECT).as_deref(), Some("true"));
+        // Bools seed their RESOLVED platform default: ligatures are ON everywhere;
+        // copy_on_select is ON off Linux and OFF on Linux, where a selection owns
+        // the X11 PRIMARY buffer and the CLIPBOARD stays for explicit copies (see
+        // `Config::copy_on_select_or_default`).
+        assert_eq!(
+            seed(EDIT_COPY_ON_SELECT).as_deref(),
+            Some(if cfg!(target_os = "linux") {
+                "false"
+            } else {
+                "true"
+            })
+        );
         assert_eq!(seed(EDIT_LIGATURES).as_deref(), Some("true"));
     }
 

@@ -35,7 +35,7 @@
 //! The full-bit-width arithmetic twin lives in `aterm-render`'s
 //! `pad_split_kani` trust-mc harnesses (`verify.sh --full`).
 
-use aterm_render::{band_offset, pad_split, place_frame_bands};
+use aterm_render::{band_offset, band_offset_y, pad_split, place_frame_bands};
 use aterm_spec::derive::pad_absorption_model;
 
 /// A deliberate odd/even lattice: every pad and cell parity combination, cells
@@ -191,9 +191,10 @@ fn synth_frame(w: usize, h: usize) -> Vec<u32> {
 const BAND: u32 = 0x0018_2830; // a recognizable theme background
 
 /// PLACEMENT LAW (the CPU half of the readback pin): a destination exactly
-/// `frame + 7px` per axis holds the frame BYTE-IDENTICAL at the centred band
-/// offset (3 leading, 4 trailing — zero scaling), and every band pixel is
-/// exactly the theme background.
+/// `frame + 7px` per axis holds the frame BYTE-IDENTICAL at the band offsets
+/// (x centred: 3 leading / 4 trailing; y per the platform `band_offset_y` —
+/// top-pinned on Linux, centred elsewhere — zero scaling either way), and
+/// every band pixel is exactly the theme background.
 #[test]
 fn place_frame_bands_offsets_without_scaling() {
     let (fw, fh) = (46usize, 30usize);
@@ -202,11 +203,11 @@ fn place_frame_bands_offsets_without_scaling() {
     let mut dst = vec![0xffff_ffffu32; dw * dh];
     place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND);
 
-    let (ox, oy) = (band_offset(dw, fw), band_offset(dh, fh));
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     assert_eq!(
         (ox, oy),
-        (3, 3),
-        "7px remainder splits 3 leading / 4 trailing"
+        (3, if cfg!(target_os = "linux") { 0 } else { 3 }),
+        "x: 7px remainder splits 3 leading / 4 trailing; y: platform policy"
     );
     let mut band_px = 0usize;
     for y in 0..dh {
@@ -248,21 +249,28 @@ fn place_frame_bands_exact_fit_is_identity_and_invert_is_xor() {
 }
 
 /// CROP (transient mid-drag / degenerate tiny window): a destination SMALLER
-/// than the frame takes the centred sub-rect — still never scaled — and an
-/// asymmetric (one-axis) remainder bands only that axis.
+/// than the frame takes an unscaled sub-rect — centred horizontally, and
+/// vertically per the platform policy (top-pinned on Linux keeps the frame's
+/// TOP rows and crops the bottom; centred elsewhere) — and an asymmetric
+/// (one-axis) remainder bands only that axis.
 #[test]
 fn place_frame_bands_crops_centred_and_handles_one_axis() {
     let (fw, fh) = (20usize, 12usize);
     let src = synth_frame(fw, fh);
 
-    // Crop both axes: dst 15x9 inside a 20x12 frame -> src starts at (2,1)
-    // (floor((15-20)/2) = -3 -> reading from src x=3? band_offset = -3, so
-    // dst (0,0) maps to src (3, 2)). Verify against the mapping directly.
+    // Crop both axes: dst 15x9 inside a 20x12 frame. Verify against the
+    // shipping offset pair directly, so the mapping below cannot drift from
+    // what `place_frame_bands` computes internally.
     let (dw, dh) = (15usize, 9usize);
     let mut dst = vec![0u32; dw * dh];
     place_frame_bands(&mut dst, dw, dh, &src, fw, fh, false, BAND);
-    let (ox, oy) = (band_offset(dw, fw), band_offset(dh, fh));
-    assert!(ox < 0 && oy < 0);
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    assert!(ox < 0);
+    if cfg!(target_os = "linux") {
+        assert_eq!(oy, 0, "top-pinned crop keeps the frame's top rows");
+    } else {
+        assert!(oy < 0);
+    }
     for y in 0..dh {
         for x in 0..dw {
             let (sx, sy) = ((x as i64 - ox) as usize, (y as i64 - oy) as usize);

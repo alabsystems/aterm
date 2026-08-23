@@ -243,3 +243,67 @@ fn decdwl_mixed_with_normal_rows_on_shrink() {
     assert!(grid.row(2).unwrap().is_wrapped());
     assert_eq!(grid.row(2).unwrap().get(0).unwrap().char_data(), '6' as u16);
 }
+
+#[test]
+fn decdwl_continuation_row_survives_shrink_merge() {
+    // A DECDWL row that is ITSELF a wrap continuation (autowrap onto it, then
+    // ESC # 6) must not be consumed by the shrink merge — it resizes in place,
+    // keeping BOTH its wrapped flag and its DoubleWidth attribute (fixwave5
+    // review, bug 4: the merge loop consumed any wrapped successor and the
+    // output chunk inherited only the FIRST source row's line_size).
+    let mut grid = Grid::new(5, 10);
+    for c in "ABCDEFGHIJKL".chars() {
+        grid.write_char_wrap(c);
+    }
+    assert!(
+        grid.row(1).unwrap().is_wrapped(),
+        "sanity: row 1 is a wrap continuation"
+    );
+    grid.row_mut(1)
+        .unwrap()
+        .set_line_size(LineSize::DoubleWidth);
+
+    grid.resize(5, 6);
+    grid.assert_invariants();
+
+    let dwl = (0..grid.rows())
+        .find(|&r| grid.row(r).unwrap().line_size() == LineSize::DoubleWidth)
+        .expect("the DECDWL continuation row must survive the shrink merge");
+    let row = grid.row(dwl).unwrap();
+    assert!(row.is_wrapped(), "the DECDWL row keeps its continuation flag");
+    assert_eq!(row.get(0).unwrap().char_data(), 'K' as u16);
+    assert_eq!(row.get(1).unwrap().char_data(), 'L' as u16);
+}
+
+#[test]
+fn decdwl_continuation_row_not_merged_on_grow() {
+    // Grow direction of the same defect: the head row must not absorb its
+    // wrapped DECDWL successor.
+    let mut grid = Grid::new(5, 10);
+    for c in "ABCDEFGHIJKL".chars() {
+        grid.write_char_wrap(c);
+    }
+    assert!(grid.row(1).unwrap().is_wrapped());
+    grid.row_mut(1)
+        .unwrap()
+        .set_line_size(LineSize::DoubleWidth);
+
+    grid.resize(5, 20);
+    grid.assert_invariants();
+
+    let row0 = grid.row(0).unwrap();
+    assert_eq!(
+        row0.len(),
+        10,
+        "the head must NOT absorb the DECDWL continuation"
+    );
+    let row1 = grid.row(1).unwrap();
+    assert_eq!(
+        row1.line_size(),
+        LineSize::DoubleWidth,
+        "DECDWL attribute must survive the grow reflow"
+    );
+    assert!(row1.is_wrapped(), "the continuation flag must survive too");
+    assert_eq!(row1.get(0).unwrap().char_data(), 'K' as u16);
+    assert_eq!(row1.get(1).unwrap().char_data(), 'L' as u16);
+}

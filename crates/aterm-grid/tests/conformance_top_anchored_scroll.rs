@@ -132,6 +132,17 @@ fn real_scroll_transition_in_region(
             }
         }
     }
+    // ...and the EVICTION step that follows it there. A top-anchored archival scroll
+    // is exactly the shape that can push an endpoint past the retention floor with no
+    // uniform delta to carry it, so the binding would otherwise model a `post_process`
+    // that stops one question short. Behaviourally a no-op in all six regimes — the
+    // fixture's anchors are live-screen rows — which is the point: it pins that the
+    // re-floor does not perturb the model's `selection_*` variables.
+    selection.truncate_to_floor(
+        grid.oldest_absolute_row(),
+        grid.absolute_row_counter()
+            .saturating_sub(u64::from(grid.rows())),
+    );
     let mut next = prev.clone();
     next.insert("phase", 2);
     next.insert("history_len", history_delta as i64);

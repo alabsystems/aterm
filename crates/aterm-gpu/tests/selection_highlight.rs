@@ -147,6 +147,7 @@ fn sparse_tail_selection_and_deepest_image_cover_match_cpu_gpu() {
         cols: 1,
         rows: 1,
         z_index: aterm_render::KITTY_IMAGE_BELOW_BG_Z_THRESHOLD - 1,
+        band_lift_px: 0,
     });
     input.images[0].push((
         5,

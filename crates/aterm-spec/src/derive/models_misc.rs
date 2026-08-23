@@ -1269,6 +1269,90 @@ pub fn press_custody_model() -> Model {
     }
 }
 
+/// SELECTION CUSTODY — the alt-screen selection PARK, as a lifecycle.
+///
+/// A text selection belongs to the screen it was made on. Entering the alternate
+/// screen parks the main screen's selection and leaves the alt buffer with none;
+/// leaving restores it and leaves the parked slot EMPTY. The engine spells that as
+/// two `mem::take`s at the top of `Terminal::post_process`.
+///
+/// The one property worth stating is the slot's lifetime: `parked_sel` is alive
+/// only between an enter and the next leave. That is what bounds the clear-site
+/// list to the handful of wholesale destroyers (`Terminal::reset`, byte-stream RIS,
+/// `clear_scrollback`, a width resize, `restore_checkpoint`) instead of making every
+/// future destroyer acquire a second obligation for a selection that outlived it.
+///
+/// `Buggy=1` is the regression family, two members naming two different invariants.
+/// The first is the obvious alternative implementation — a symmetric SWAP instead of
+/// an asymmetric take — under which the alt screen's own selection stays parked
+/// after the leave and reappears on the next round trip, over a buffer the user
+/// cannot see. The second is the wholesale destroyer that clears the live selection
+/// and forgets the parked one, which is exactly the failure mode of five of the six
+/// coordinated clear sites: nothing in the compiler notices.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn alt_selection_park_model() -> Model {
+    crate::ty_model! {
+        AltSelectionPark {
+            const Buggy = 0;
+
+            // 1 while the alternate screen is up.
+            var on_alt = 0;
+            // A selection on the ACTIVE screen, whichever that is.
+            var live_sel = 0;
+            // The OTHER screen's selection, held across the switch.
+            var parked_sel = 0;
+            // What just fired: 0 a user gesture, 1 an enter, 2 a wholesale
+            // destroyer, 3 a leave.
+            var last_event = 0;
+
+            action Select {
+                live_sel = 1;
+                last_event = 0;
+            }
+            action Deselect {
+                live_sel = 0;
+                last_event = 0;
+            }
+            // The park. Assignments are TLA+ simultaneous, so every right-hand side
+            // reads the PRE-state: at Buggy=1 this pair is a swap, and at Buggy=0 the
+            // live slot is emptied outright.
+            action Enter when (on_alt == 0) {
+                parked_sel = live_sel;
+                live_sel = if Buggy == 1 { parked_sel } else { 0 };
+                on_alt = 1;
+                last_event = 1;
+            }
+            // The restore. At Buggy=1 the alt screen's selection lands in the parked
+            // slot instead of dying with the buffer it named.
+            action Leave when (on_alt == 1) {
+                live_sel = parked_sel;
+                parked_sel = if Buggy == 1 { live_sel } else { 0 };
+                on_alt = 0;
+                last_event = 3;
+            }
+            // RIS, clear_scrollback, a width resize, restore_checkpoint: the content
+            // under BOTH selections is gone, so both slots must go.
+            action Wholesale {
+                live_sel = 0;
+                parked_sel = if Buggy == 1 { parked_sel } else { 0 };
+                last_event = 2;
+            }
+
+            invariant ParkedEmptyOffAlt:
+                if on_alt == 0 { parked_sel == 0 } else { parked_sel <= 1 };
+            invariant WholesaleLeavesNothingParked:
+                if last_event == 2 {
+                    live_sel == 0 && parked_sel == 0
+                } else {
+                    last_event <= 3
+                };
+            invariant StateBounds:
+                on_alt <= 1 && live_sel <= 1 && parked_sel <= 1 && last_event <= 3;
+        }
+    }
+}
+
 /// One-key press/repeat/release pairing at the GUI-to-PTY boundary.
 ///
 /// A press consumed by a physical-key GUI gate or by the engine-key overlay gate

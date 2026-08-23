@@ -20,8 +20,8 @@ use crate::{App, Wake, WindowId};
 use aterm_core::terminal::Terminal;
 use aterm_types::BlockState;
 use description::{
-    bounded_text, compose_presentation, deterministic_description, is_bidi_control,
-    title_is_presentation_clean,
+    bounded_text, compose_presentation, deterministic_description, idle_prompt_description,
+    is_bidi_control, title_is_presentation_clean,
 };
 use managed_ollama::{ManagedOllamaController, ManagedRuntimeExit, managed_ollama_paths};
 use redaction::redact_context_line;
@@ -337,6 +337,19 @@ struct Entry {
     /// `dirty`) would send a byte-identical prompt, so it is skipped.
     last_dispatched_snapshot: Option<u64>,
     last_error: Option<String>,
+    /// The description this session would present at a settled PROMPT ("Ready
+    /// in aterm"), captured from the same snapshot as `deterministic`. This is
+    /// what an [`ActivityState::Entering`] claim decays TO once the phase
+    /// classifier publishes `Idle` — see [`Coordinator::note_phase_settled`].
+    prompt_fallback: String,
+    /// The phase classifier's settled-idle verdict for this session, pushed by
+    /// the host at publish time. `observe` runs only on OUTPUT wakes, so a
+    /// half-typed command that is then abandoned would otherwise hold "Typing a
+    /// command" in the titlebar forever while `status` honestly says
+    /// `phase=idle` for minutes; this flag is how the presented subject follows
+    /// the settled phase instead. Cleared by the next semantic boundary (fresh
+    /// output is fresh evidence) as well as by a non-idle publish.
+    settled_idle: bool,
 }
 
 /// Exact resolved inference authority. Equality, rather than only a hash, detects
@@ -618,10 +631,22 @@ impl Coordinator {
             dirty: true,
             last_dispatched_snapshot: None,
             last_error: None,
+            prompt_fallback: String::new(),
+            settled_idle: false,
         });
         if boundary {
             entry.generation = entry.generation.saturating_add(1);
         }
+        // `settled_idle` is deliberately NOT cleared on a boundary: the phase
+        // classifier is the one idleness authority, and its published verdict is
+        // pushed here by the host both at publish edges
+        // (`refresh_session_status_chrome`) and after every observation
+        // (`note_title_activity`). An early cut cleared the flag on semantic
+        // boundaries "as fresh activity evidence" — and the live repro showed
+        // why that is wrong: a sub-dwell blip (type + run a one-liner) never
+        // re-publishes the unchanged `Idle`, so the cleared flag had no edge to
+        // restore it and the decayed subject stuck at "Typing a command" again,
+        // the very defect this exists to close.
         entry.semantic = semantic;
         entry.authority_epoch = self.authority_epoch;
         entry.config_fingerprint = fingerprint;
@@ -629,6 +654,7 @@ impl Coordinator {
             entry.last_error = None;
         }
         entry.deterministic.clone_from(&immediate);
+        entry.prompt_fallback = idle_prompt_description(&snapshot);
         entry.dirty |= boundary;
         // A model refinement remains visible through ordinary output and a periodic
         // refresh. Reset it only at a semantic/config boundary (or when the selected
@@ -927,17 +953,62 @@ impl Coordinator {
     }
 
     /// Current generated activity, independent of authored session metadata.
+    ///
+    /// SETTLED-PHASE DECAY (frame audit #3): an [`ActivityState::Entering`]
+    /// subject ("Typing a command" / "Typing cargo") is only an honest claim
+    /// while typing is plausibly ongoing. `observe` runs on OUTPUT wakes alone,
+    /// so a half-typed, abandoned command line freezes that claim in the window
+    /// title for as long as the shell sits untouched — minutes after `status`
+    /// started answering `phase=idle`. Once the host pushes the classifier's
+    /// settled-idle verdict ([`Self::note_phase_settled`]), the Entering claim
+    /// presents as the session's prompt-state description instead ("Ready in
+    /// aterm"). Read-time, not stored: the entry keeps its real state, so the
+    /// subject snaps back the moment either the flag clears or fresh output
+    /// moves the block.
     pub(crate) fn activity<'a>(&'a self, session: u64, config: &Config) -> Option<&'a str> {
         if !smart_titles_enabled(config) {
             return None;
         }
         self.entries.get(&session).map(|entry| {
+            if entry.settled_idle && entry.semantic.block_state == ActivityState::Entering {
+                return if entry.prompt_fallback.is_empty() {
+                    "Ready"
+                } else {
+                    entry.prompt_fallback.as_str()
+                };
+            }
             if entry.authority_epoch == self.authority_epoch {
                 entry.activity.as_str()
             } else {
                 entry.deterministic.as_str()
             }
         })
+    }
+
+    /// Push the phase classifier's settled verdict for one session: `idle` is
+    /// true exactly while the published record is a SETTLED `Idle`
+    /// ([`crate::session_status::Status::settled_idle`]) — an `Idle` still
+    /// carrying live keystroke echo pushes `false`, which is what lets the
+    /// typing subject show WHILE the user is typing. Returns `true` when the
+    /// PRESENTED subject changed (the Entering→prompt decay engaged or
+    /// released), so the caller can refresh the title/tab chrome it owns; a
+    /// verdict that changes nothing visible is free. See [`Self::activity`] for
+    /// the decay itself.
+    pub(crate) fn note_phase_settled(&mut self, session: u64, idle: bool) -> bool {
+        let Some(entry) = self.entries.get_mut(&session) else {
+            return false;
+        };
+        if entry.settled_idle == idle {
+            return false;
+        }
+        entry.settled_idle = idle;
+        if entry.semantic.block_state == ActivityState::Entering {
+            // The presentation moved: bump the revision the native-chrome caches
+            // key on, exactly as a model refinement does.
+            entry.revision = entry.revision.saturating_add(1);
+            return true;
+        }
+        false
     }
 
     /// Monotonic while a session is live; suitable for native-chrome cache keys.
@@ -1577,7 +1648,22 @@ impl App {
             self.title_summaries
                 .observe(session, &term, &self.config, active, Instant::now())
         };
-        if changed {
+        // Reconcile the settled-phase decay against the CURRENT published
+        // verdict on every observation, not only at publish edges: a session
+        // whose entry was created after the classifier settled (or whose
+        // sub-dwell activity blip never re-published the unchanged `Idle`)
+        // would otherwise never learn it is idle, and the Entering subject
+        // would stick — the frame-audit #3 defect, through the side door.
+        // SETTLED idle, never bare `Idle`: output wakes are exactly what
+        // typing produces, so a bare phase check here re-decayed the typing
+        // subject on every keystroke and it never showed live (review finding
+        // on the audit's fix — see `Status::settled_idle`).
+        let idle = self
+            .session_status
+            .status(session)
+            .is_some_and(crate::session_status::Status::settled_idle);
+        let decayed = self.title_summaries.note_phase_settled(session, idle);
+        if changed || decayed {
             self.refresh_title_presentation(session);
         }
         self.sync_settings_title_summary_health();
@@ -3155,6 +3241,108 @@ mod tests {
         assert_eq!(crashed["endpoint1"], 0);
         assert_eq!(crashed["health_endpoint1"], 0);
         assert!(model.check_invariant("RevokedHealthIsClear", &crashed));
+    }
+
+    /// FRAME AUDIT #3, end to end over the REAL App wiring: the published
+    /// `Idle` phase reaches the window-title subject through
+    /// [`crate::App::note_title_activity`]'s reconcile — including when the
+    /// phase was published BEFORE the title coordinator ever observed the
+    /// session (the launch order on a quiet shell), which is exactly the case
+    /// the publish-edge hook alone cannot cover.
+    #[test]
+    fn the_published_idle_phase_reaches_the_window_subject_through_the_app() {
+        use crate::session_status::{ActivitySample, Evidence, ShellEvidence};
+        let mut app = crate::App::headless_for_test();
+        let term = app
+            .front_terminal(crate::WindowId(0))
+            .expect("front terminal")
+            .term
+            .clone();
+        // The shell sits at a prompt with command input open (OSC 133 A + B):
+        // the audit's exact stuck shape — block Entering, nothing typed.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+
+        // The classifier publishes Idle BEFORE any title observation exists.
+        let evidence = Evidence {
+            pin: None,
+            shell: Some(ShellEvidence::Entering),
+            lifecycle: None,
+            foreground_job: Some(false),
+            activity: ActivitySample {
+                alt_screen: false,
+                content_seq: 1,
+                last_output: None,
+            },
+        };
+        let t0 = Instant::now();
+        assert!(!app.session_status.observe(0, &evidence, t0));
+        assert!(
+            app.session_status
+                .observe(0, &evidence, t0 + Duration::from_secs(5)),
+            "the dwelled candidate publishes Idle"
+        );
+
+        // An output wake observes the title — and must pick the verdict up.
+        app.note_title_activity(0);
+        assert_eq!(
+            app.title_summaries.activity(0, &app.config),
+            Some("Ready"),
+            "the settled phase reaches the presented subject"
+        );
+    }
+
+    /// FRAME AUDIT #3: a half-typed, abandoned command line must not hold
+    /// "Typing a command" in the chrome forever. `observe` runs only on output
+    /// wakes, so once typing stops the Entering claim freezes — while the phase
+    /// classifier honestly publishes `Idle`. The pushed verdict
+    /// ([`Coordinator::note_phase_settled`]) decays the presented subject to the
+    /// prompt-state description, and the next semantic boundary (fresh output)
+    /// snaps it straight back without waiting for the classifier's dwell.
+    #[test]
+    fn an_entering_subject_decays_to_the_prompt_description_on_settled_idle() {
+        let mut coordinator = Coordinator::new(None);
+        let config = Config::default(); // builtin provider, descriptive titles on
+        let mut term = Terminal::new(4, 40);
+        // OSC 133 A (prompt) then B (command input): the block is now
+        // EnteringCommand with no commandline, the audit's exact stuck shape.
+        term.process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(coordinator.activity(7, &config), Some("Typing a command"));
+        let revision_before = coordinator.activity_revision(7);
+
+        // An unknown session takes no verdict.
+        assert!(!coordinator.note_phase_settled(99, true));
+
+        // The classifier publishes Idle: the stale typing claim decays to the
+        // prompt description, visibly (revision moves for the chrome caches).
+        assert!(coordinator.note_phase_settled(7, true));
+        assert_eq!(coordinator.activity(7, &config), Some("Ready"));
+        assert!(coordinator.activity_revision(7) > revision_before);
+        assert!(
+            !coordinator.note_phase_settled(7, true),
+            "an unchanged verdict is free"
+        );
+
+        // A semantic boundary does NOT clear the decay on its own: the phase
+        // classifier is the idleness authority, and a sub-dwell activity blip
+        // never re-publishes the unchanged `Idle` — clearing here left the
+        // subject stuck at "Typing a command" again (live repro). The host
+        // re-pushes the current verdict after every observation instead.
+        term.set_title("vim");
+        coordinator.observe(7, &term, &config, true, Instant::now());
+        assert_eq!(
+            coordinator.activity(7, &config),
+            Some("Ready"),
+            "a boundary alone must not resurrect the stale Entering claim"
+        );
+
+        // Only the classifier's own non-idle verdict releases the decay.
+        assert!(coordinator.note_phase_settled(7, false));
+        assert_eq!(coordinator.activity(7, &config), Some("Typing a command"));
+        assert!(coordinator.note_phase_settled(7, true));
+        assert_eq!(coordinator.activity(7, &config), Some("Ready"));
     }
 
     /// Regression: a managed-runtime exit re-arms every session at `now`, so the

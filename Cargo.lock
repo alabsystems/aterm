@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "aterm"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-agent",
  "aterm-cli",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-agent"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-net",
  "aterm-observe",
@@ -423,14 +423,15 @@ dependencies = [
 
 [[package]]
 name = "aterm-alloc"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-bench"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "alacritty_terminal",
  "aterm-core",
+ "aterm-gpu-web",
  "aterm-grid",
  "aterm-policy",
  "aterm-render",
@@ -443,18 +444,18 @@ dependencies = [
 
 [[package]]
 name = "aterm-bidi"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "aterm-bits"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-buffer"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
  "aterm-spec",
@@ -463,15 +464,15 @@ dependencies = [
 
 [[package]]
 name = "aterm-cap"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-census"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-cli"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
@@ -487,14 +488,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-codec"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "criterion",
 ]
 
 [[package]]
 name = "aterm-conformance"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "aterm-types",
@@ -503,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-containment"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
  "aterm-log",
@@ -514,14 +515,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-control"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
 ]
 
 [[package]]
 name = "aterm-core"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-alloc",
  "aterm-bidi",
@@ -556,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-ctl"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-types",
  "aterm-uds",
@@ -564,11 +565,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-dev"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-effects"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "aterm-hash",
@@ -587,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-effects-web"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-effects",
  "aterm-render",
@@ -598,14 +599,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-error"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error-derive",
 ]
 
 [[package]]
 name = "aterm-error-derive"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -614,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-ffi"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "aterm-ffi-types",
@@ -622,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-ffi-types"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-log",
  "aterm-types",
@@ -630,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-codec",
  "aterm-core",
@@ -653,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gpu-web"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "aterm-effects",
@@ -674,7 +675,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-grapheme"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-types",
  "unicode-segmentation",
@@ -683,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-grid"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-alloc",
  "aterm-error",
@@ -703,7 +704,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-gui"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "accesskit",
  "accesskit_winit",
@@ -738,6 +739,7 @@ dependencies = [
  "aterm-uds",
  "aterm-update",
  "aterm-update-core",
+ "aterm-winit-keymap",
  "atpkg",
  "base64",
  "block2 0.5.1",
@@ -766,11 +768,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-hash"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-lexicon"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-hash",
  "criterion",
@@ -780,25 +782,25 @@ dependencies = [
 
 [[package]]
 name = "aterm-log"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-lz4"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "aterm-nest"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-uds",
 ]
 
 [[package]]
 name = "aterm-net"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-session",
  "aterm-spec",
@@ -810,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-observe"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "regex",
@@ -819,7 +821,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-parser"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-alloc",
  "aterm-provenance",
@@ -829,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-policy"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
  "criterion",
@@ -840,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-predict"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-grapheme",
  "aterm-spec",
@@ -849,14 +851,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-provenance"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
 ]
 
 [[package]]
 name = "aterm-pty"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-cap",
  "aterm-containment",
@@ -869,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-release"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-spec",
  "aterm-types",
@@ -886,7 +888,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-render"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "ab_glyph_rasterizer",
  "aterm-codec",
@@ -912,7 +914,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-render-api"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "png",
@@ -920,11 +922,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-rle"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-sandbox"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-cap",
  "aterm-spec",
@@ -934,14 +936,14 @@ dependencies = [
 
 [[package]]
 name = "aterm-scene"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "proptest",
 ]
 
 [[package]]
 name = "aterm-scrollback"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-alloc",
  "aterm-error",
@@ -959,7 +961,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-search"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
  "aterm-grapheme",
@@ -974,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-selection"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-ffi-types",
  "aterm-grapheme",
@@ -984,7 +986,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-session"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-pty",
  "aterm-spec",
@@ -994,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-shell-integration"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-containment",
  "aterm-log",
@@ -1005,11 +1007,11 @@ dependencies = [
 
 [[package]]
 name = "aterm-sixel"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-spec"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-error",
  "aterm-spec-macros",
@@ -1018,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-spec-macros"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-spec",
  "proc-macro2",
@@ -1028,25 +1030,25 @@ dependencies = [
 
 [[package]]
 name = "aterm-spec-models"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-spec",
 ]
 
 [[package]]
 name = "aterm-suggest"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-grapheme",
 ]
 
 [[package]]
 name = "aterm-tempfile"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-types"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-alloc",
  "aterm-error",
@@ -1055,16 +1057,15 @@ dependencies = [
  "proptest",
  "serde",
  "web-time",
- "winit",
 ]
 
 [[package]]
 name = "aterm-uds"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-update"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-log",
  "aterm-spec",
@@ -1082,7 +1083,7 @@ dependencies = [
 
 [[package]]
 name = "aterm-update-core"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-log",
  "aterm-types",
@@ -1095,18 +1096,18 @@ dependencies = [
 
 [[package]]
 name = "aterm-verify"
-version = "0.47.0"
+version = "0.48.0"
 
 [[package]]
 name = "aterm-vi"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-types",
 ]
 
 [[package]]
 name = "aterm-wasm"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-core",
  "aterm-effects",
@@ -1118,6 +1119,14 @@ dependencies = [
  "getrandom 0.2.17",
  "wasm-bindgen",
  "web-time",
+]
+
+[[package]]
+name = "aterm-winit-keymap"
+version = "0.48.0"
+dependencies = [
+ "aterm-types",
+ "winit",
 ]
 
 [[package]]
@@ -1137,7 +1146,7 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "atpkg"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-types",
  "aterm-update-core",
@@ -1154,7 +1163,7 @@ dependencies = [
 
 [[package]]
 name = "atpkg-keys"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-types",
  "aterm-update-core",
@@ -6080,7 +6089,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aterm-census",
  "aterm-grid",

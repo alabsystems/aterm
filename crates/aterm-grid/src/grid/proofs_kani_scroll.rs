@@ -154,6 +154,38 @@ fn clamp_display_offset_bounded() {
 }
 
 // =============================================================================
+// scroll_to_absolute_row
+// =============================================================================
+
+/// `scroll_to_absolute_row` keeps display_offset within scrollback bounds for ANY
+/// absolute row, including rows that no longer exist in either direction — a target
+/// at or below the live top saturates to offset 0, one older than the oldest retained
+/// line clamps to the top of history.
+///
+/// This is the viewport mutator `Grid::resize_with_reflow_mode` calls to re-anchor a
+/// scrolled-back reader across a rows-only resize, where the anchor is captured under
+/// the OLD `visible_rows` and applied under the new one — so the demanded offset can
+/// legitimately exceed what the resized grid can give, and the clamp is load-bearing
+/// rather than defensive.
+///
+/// ENSURES: display_offset <= scrollback_lines()
+#[kani::proof]
+fn scroll_to_absolute_row_bounded() {
+    let mut cells = [[Cell::EMPTY; Grid::KANI_MOCK_COLS as usize]; Grid::KANI_MOCK_ROWS as usize];
+    let mut grid = Grid::kani_mock(&mut cells);
+
+    // Unconstrained target: the point is that no caller has to pre-validate it.
+    let target: u64 = kani::any();
+
+    grid.scroll_to_absolute_row(target);
+
+    kani::assert(
+        grid.display_offset() <= grid.scrollback_lines(),
+        "scroll_to_absolute_row: display_offset exceeds scrollback",
+    );
+}
+
+// =============================================================================
 // set_scroll_region / reset_scroll_region
 // =============================================================================
 

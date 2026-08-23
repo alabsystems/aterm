@@ -140,9 +140,15 @@ aterm-gpu = { workspace = true }
 aterm-search = { workspace = true }
 # build_info: FxHash the running binary into a content signature (no crypto dep).
 aterm-hash = { workspace = true }
-# K-2: enable the winit→engine key map so the GUI and the future native shell
-# share one table instead of an inline match. POL-1: install a default OSC policy.
-aterm-types = { workspace = true, features = ["winit-keymap"] }
+# POL-1: install a default OSC policy. NO FEATURES — the winit→engine key map
+# this used to enable here (`features = ["winit-keymap"]`) is its own crate now,
+# `aterm-winit-keymap` below. Enabling it from here turned it on for every OTHER
+# consumer of aterm-types in the same resolve too, which is how `aterm-ctl`
+# acquired AppKit; keep this edge featureless.
+aterm-types = { workspace = true }
+# K-2: the winit→engine key map, so the GUI and the future native shell share one
+# table instead of an inline match that drifts.
+aterm-winit-keymap = { workspace = true }
 aterm-policy = { workspace = true }
 # Silent in-app self-update: checks the private GitHub Release, verifies the
 # notarized + Team-ID-pinned DMG, and swaps aterm.app on next launch. Inert in a

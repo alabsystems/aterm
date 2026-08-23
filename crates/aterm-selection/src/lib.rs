@@ -37,8 +37,8 @@
 //!
 //! ## Text Selection (Mouse-based)
 //!
-//! State machine for mouse-based text selection, implementing the TLA+ spec
-//! in `tla/Selection.tla`. Supports:
+//! State machine for mouse-based text selection, specified in
+//! `docs/DESIGN-selection-custody-2026-08-21.md` §5.2. Supports:
 //!
 //! - **Simple selection**: Character-by-character (single click + drag)
 //! - **Block selection**: Rectangular selection (Alt + click + drag)

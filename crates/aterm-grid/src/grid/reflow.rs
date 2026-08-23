@@ -46,6 +46,17 @@ struct ReflowResult {
     cursor_col: u16,
 }
 
+/// May the rewrap merge CONSUME `row` as a soft-wrap continuation of the
+/// preceding row? Only a single-width continuation merges: a DECDWL/DECDHL row
+/// carries a per-row `line_size` and must resize IN PLACE
+/// (`resize_double_width_row_in_place`, #7524) even when it is itself a wrap
+/// continuation — merging it would strip its DoubleWidth attribute (the merge
+/// buffer holds bare cells, and the output chunk inherits only the FIRST
+/// source row's line_size).
+fn is_mergeable_continuation(row: &Row) -> bool {
+    row.is_wrapped() && row.line_size() == LineSize::SingleWidth
+}
+
 /// Resize a DECDWL/DECDHL row in place (truncate or pad) without reflow.
 ///
 /// Double-width and double-height lines are logically half-width: each
@@ -142,14 +153,40 @@ impl Grid {
         // the end. A window resize / font zoom must not yank a reader who is scrolled
         // back in history down to the live bottom.
         let prev_offset = self.storage.display_offset;
+        // The ABSOLUTE row under the eye, captured before the line above destroys
+        // the offset it is derived from. Only meaningful while the reader is
+        // actually scrolled back: at offset 0 the anchor is the live top, and a
+        // height SHRINK legitimately wants `d + (v - t) > 0` for it — i.e. it
+        // would scroll a live, tail-following viewport into history on every
+        // window-height drag. The gate is what keeps the tail follower live, and
+        // it is also why the resize fuzzers (which never scroll) never reach the
+        // anchor arm below.
+        let prev_anchor = (prev_offset > 0).then(|| self.top_visible_absolute_row());
         self.storage.display_offset = 0;
+
+        // Bottom-anchor bookkeeping (fixwave5): remember how many trailing
+        // blank rows the viewport carried BEFORE the resize. A width-grow
+        // unwraps content into fewer rows; the deficit fill at the end of this
+        // method pulls history back until the trailing-blank band returns to
+        // this count, so the prompt stays anchored to its content instead of
+        // stranding mid-window above a band of reflow-created blanks.
+        let pre_trailing_blanks =
+            (new_cols != old_cols && reflow).then(|| self.trailing_blank_rows_below_cursor());
 
         // On a width change with reflow, lift the entire off-screen scrollback
         // out and rewrap it to the new width BEFORE any visible-grid mutation,
         // so history survives the resize (#7906). Reads ring_extras, so it must
         // precede the ring_extras.clear() below. Restored after adjust_row_count.
         let reflowed_scrollback = if new_cols != old_cols && reflow {
-            let old = self.take_scrollback_lines();
+            let mut old = self.take_scrollback_lines();
+            // Lift the viewport's leading soft-wrap continuation rows (the
+            // tail of a logical line whose HEAD is the last history line) into
+            // the history rewrap, so the boundary-straddling line rewraps as
+            // ONE unit instead of splitting permanently at the seam — the
+            // audit's "wrapped line stays split after returning to the
+            // original width" (fixwave5). The deficit fill below pulls the
+            // rewrapped tail back into the viewport.
+            old.extend(self.take_boundary_continuation_lines());
             // Bounded-cost obligation: every line counted here was rewrapped
             // SYNCHRONOUSLY on the caller's thread (under its lock). This must be
             // bounded by the viewport, not by session history — a deep-history
@@ -248,6 +285,14 @@ impl Grid {
             // reason: the column-reflow path owns its own tracking.
             self.storage.last_resize_row_shift = row_u16(revealed);
             let bound = new_rows.saturating_sub(1);
+            // The live extras follow their rows down too (fixwave5): without
+            // this, a hyperlink/RGB/combining entry stays keyed `revealed`
+            // rows ABOVE its cell and re-attaches to whatever content the
+            // reveal placed there. (The rings were invalidated above, so this
+            // shifts only the HashMap.)
+            self.storage
+                .extras
+                .shift_region_down_by(0, bound, row_u16(revealed));
             let row = self
                 .storage
                 .cursor
@@ -276,11 +321,45 @@ impl Grid {
         if let Some(lines) = reflowed_scrollback {
             self.restore_reflowed_scrollback(lines, new_cols);
         }
-        // Restore the pre-resize scrollback position, clamped to the new history
-        // length. After a width reflow the wrapped-line count changes, so an exact
-        // line anchor isn't possible — but staying in history (clamped) is far better
-        // than snapping a scrolled-back reader to the live bottom on every resize/zoom.
-        self.storage.display_offset = prev_offset.min(self.storage.scrollback_lines());
+        // Bottom-anchor the viewport (fixwave5): a width-grow just unwrapped
+        // content into fewer rows, leaving reflow-created blank rows under the
+        // cursor. Pull the newest history back in until the trailing-blank
+        // band matches its pre-resize count — this is also what rejoins the
+        // boundary-straddling logical line the belt lift above handed to the
+        // history rewrap. Runs at display_offset 0 (restored just below); on
+        // the OFFLOADED path the history is out with the worker, so the fill
+        // finds nothing here and runs at re-attach instead (see
+        // `pending_fill_target`).
+        if let Some(target) = pre_trailing_blanks {
+            self.fill_viewport_deficit_from_history(target);
+        }
+        // Restore the pre-resize reading position. `display_offset` is measured
+        // from the LIVE BOTTOM, so replaying the same number under a different
+        // `visible_rows` slides the content by exactly the row-count delta — and
+        // window-height drags, font zoom and divider drags are ALL rows-only
+        // resizes, so that fired on every one of them. A rows-only resize
+        // rewraps nothing and leaves `absolute_row_counter` alone; it only
+        // re-splits the same lines across the live/history boundary, and an
+        // ALREADY-ARCHIVED line keeps its absolute number exactly — a shrink
+        // pushes the bottom `v - t` viewport rows on top of history
+        // (`adjust_row_count_ring_only`) and a grow reclassifies the `t - v`
+        // newest history lines as visible; everything deeper is untouched in
+        // both. `prev_offset > 0` means the row under the eye IS such a line,
+        // which is what makes this anchor exact rather than approximate. A WIDTH
+        // reflow renumbers rows wholesale (the wrapped-line count changes), so no
+        // exact anchor exists there and the clamped offset stays the best
+        // available answer — staying in history is far better than snapping a
+        // scrolled-back reader to the live bottom.
+        //
+        // The anchor arm can still CLAMP: on a rows shrink at the retention cap
+        // the demanded `d + (v - t)` may exceed the post-resize
+        // `scrollback_lines()`. That moves the reader off the anchored line but
+        // stays in bounds — the same degradation the offset arm has always had.
+        // `Damage::Full` below subsumes the primitive's targeted damage.
+        match prev_anchor {
+            Some(anchor) if new_cols == old_cols => self.scroll_to_absolute_row(anchor),
+            _ => self.storage.display_offset = prev_offset.min(self.storage.scrollback_lines()),
+        }
         self.storage.pages.shrink_to_fit();
         self.storage.damage = Damage::Full;
         // Reflow/resize rewraps line content, so it is a CONTENT change even
@@ -584,23 +663,7 @@ impl Grid {
             .has_any_data()
             .then(|| std::mem::take(&mut self.storage.extras));
         let old_extras_ref = old_extras.as_ref();
-        if new_cols > self.storage.cols {
-            self.reflow_grow_columns(
-                target_rows,
-                new_cols,
-                cursor_row,
-                cursor_col,
-                old_extras_ref,
-            );
-        } else {
-            self.reflow_shrink_columns(
-                target_rows,
-                new_cols,
-                cursor_row,
-                cursor_col,
-                old_extras_ref,
-            );
-        }
+        self.reflow_rewrap_columns(target_rows, new_cols, cursor_row, cursor_col, old_extras_ref);
     }
 
     /// Pad or truncate to target row count and update grid state after reflow.
@@ -683,12 +746,20 @@ impl Grid {
         self.storage.cursor.col = result.cursor_col.min(new_cols.saturating_sub(1));
     }
 
-    /// Reflow when terminal gets wider: unwrap soft-wrapped lines.
+    /// Rewrap the visible rows to a new column count, in EITHER direction.
+    ///
+    /// Soft-wrapped continuation runs are merged into their logical line first
+    /// and then re-chunked at the new width — for a shrink as well as a grow.
+    /// The shrink path used to chunk each PHYSICAL row separately, which left
+    /// a run of `old_cols`-sized fragments each split at `new_cols` (ragged
+    /// `24,6,24,6,…` rows instead of the canonical `24,24,…`): the audit's
+    /// "stacked mid-resize tails", and the seed of the permanent wrap-topology
+    /// corruption a width sweep left behind (fixwave5).
     ///
     /// Reads row data directly from the ring buffer instead of cloning the
     /// entire visible grid. A reusable merge buffer handles continuation-row
     /// concatenation, eliminating per-logical-line `Vec` allocations (#4074).
-    fn reflow_grow_columns(
+    fn reflow_rewrap_columns(
         &mut self,
         target_rows: u16,
         new_cols: u16,
@@ -718,8 +789,10 @@ impl Grid {
             };
             let content_len = row.len() as usize;
             let first_row_idx = i;
-            let has_cont =
-                i + 1 < visible_count && self.row(row_u16(i + 1)).is_some_and(Row::is_wrapped);
+            let has_cont = i + 1 < visible_count
+                && self
+                    .row(row_u16(i + 1))
+                    .is_some_and(is_mergeable_continuation);
 
             let source_line_size = row.line_size();
 
@@ -854,6 +927,9 @@ impl Grid {
             .map_or(LineSize::SingleWidth, Row::line_size);
 
         // Copy first row's cells.
+        let old_cols = usize::from(self.storage.cols);
+        let mut row_start = merge_buf.len();
+        let mut row_idx = start;
         if let Some(row) = self.row(row_u16(start)) {
             let len = row.len() as usize;
             merge_buf.extend_from_slice(&row.as_slice()[..len]);
@@ -866,10 +942,46 @@ impl Grid {
         }
 
         // Copy continuation rows.
-        while *i + 1 < visible_count && self.row(row_u16(*i + 1)).is_some_and(Row::is_wrapped) {
+        while *i + 1 < visible_count
+            && self
+                .row(row_u16(*i + 1))
+                .is_some_and(is_mergeable_continuation)
+        {
             *i += 1;
+            // Each merged continuation row is a real O(cols) unit of work — count
+            // it so the `reflow_linear_time*` cost oracle sees per-row cost even
+            // when a whole screen is one logical line.
+            #[cfg(any(test, feature = "testing"))]
+            super::count_reflow_row_op();
+            // The row just appended CONTINUES onto this one, so autowrap
+            // filled it to its last column — its trailing blank cells are real
+            // content. Pad the merge buffer to the full old width, or a width
+            // sweep erodes one mid-line space per chunk boundary (fixwave5).
+            // EXCEPT when the continuation opens with a WIDE cell: a wide char
+            // that cannot start at the last column EARLY-WRAPS, leaving that
+            // cell UNWRITTEN — padding it here would materialize a phantom
+            // space inside the logical line, right before the wide char.
+            let early_wrap_hole = self
+                .row(row_u16(*i))
+                .and_then(|cont| cont.as_slice().first())
+                .is_some_and(super::Cell::is_wide);
+            // The hole is EXACTLY one cell — a width-2 glyph early-wraps only
+            // when precisely one column remains — so pad real trimmed spaces
+            // up to it rather than dropping the whole autowrap fill.
+            let pad_to = row_start + old_cols - usize::from(early_wrap_hole);
+            while merge_buf.len() < pad_to {
+                if old_extras.is_some() {
+                    merge_coords.push(CellCoord::new(
+                        row_u16(row_idx),
+                        row_u16(merge_buf.len() - row_start),
+                    ));
+                }
+                merge_buf.push(super::Cell::EMPTY);
+            }
             if let Some(cont) = self.row(row_u16(*i)) {
                 let off = merge_buf.len();
+                row_start = off;
+                row_idx = *i;
                 let len = cont.len() as usize;
                 merge_buf.extend_from_slice(&cont.as_slice()[..len]);
                 if old_extras.is_some() {
@@ -924,117 +1036,6 @@ impl Grid {
         }
     }
 
-    /// Reflow when terminal gets narrower: wrap long lines.
-    ///
-    /// Reads cell data directly from the ring buffer via row slices, avoiding
-    /// the full-grid clone that `collect_visible_rows()` previously performed
-    /// (#4074).
-    fn reflow_shrink_columns(
-        &mut self,
-        target_rows: u16,
-        new_cols: u16,
-        cursor_row: usize,
-        cursor_col: u16,
-        old_extras: Option<&CellExtras>,
-    ) {
-        let mut new_pages = PageStore::new();
-        let visible_count = usize::from(self.storage.visible_rows);
-        let est_rows = visible_count
-            .saturating_mul(self.storage.cols as usize)
-            .checked_div(new_cols as usize)
-            .unwrap_or(visible_count);
-        let mut new_rows: Vec<Row> = Vec::with_capacity(est_rows.min(visible_count * 4));
-        let mut cursor = (cursor_row, cursor_col);
-        let mut new_extras = CellExtras::new();
-
-        for i in 0..visible_count {
-            let row = match self.row(row_u16(i)) {
-                Some(r) => r,
-                None => continue,
-            };
-            let was_wrapped = row.is_wrapped();
-            let source_line_size = row.line_size();
-            let content_len = row.len() as usize;
-
-            #[cfg(any(test, feature = "testing"))]
-            super::count_reflow_row_op();
-
-            // DECDWL/DECDHL: resize in place, not reflow (#7524).
-            if source_line_size != LineSize::SingleWidth {
-                resize_double_width_row_in_place(
-                    row,
-                    i,
-                    new_cols,
-                    &mut new_pages,
-                    &mut new_rows,
-                    cursor_row,
-                    cursor_col,
-                    &mut cursor,
-                    old_extras,
-                    &mut new_extras,
-                );
-                continue;
-            }
-
-            if content_len == 0 {
-                // SAFETY: `new_row` is appended to `new_rows` and returned
-                // alongside `new_pages` in the same reflow result.
-                let mut new_row = unsafe { Row::new(new_cols, &mut new_pages) };
-                if was_wrapped {
-                    new_row.set_wrapped(true);
-                }
-                new_row.set_line_size(source_line_size);
-                if i == cursor_row {
-                    cursor = (new_rows.len(), cursor_col.min(new_cols.saturating_sub(1)));
-                }
-                new_rows.push(new_row);
-                continue;
-            }
-
-            let first_idx = new_rows.len();
-            let cells = &row.as_slice()[..content_len];
-            let offset = (i == cursor_row).then(|| usize::from(cursor_col));
-            let mut extras_ctx = ExtrasCopyCtx {
-                // Single source row `i` chunked across new rows → compute coords.
-                source: if old_extras.is_some() {
-                    ExtrasSource::Row(row_u16(i))
-                } else {
-                    ExtrasSource::None
-                },
-                old_extras,
-                new_extras: &mut new_extras,
-            };
-            chunk_cells_to_rows(
-                cells,
-                new_cols,
-                &mut new_pages,
-                &mut new_rows,
-                offset,
-                &mut cursor,
-                &mut extras_ctx,
-            );
-            // Inherit the original row's wrapped flag and line_size on the
-            // first chunk. Line size (DECDWL/DECDHL) from the source row.
-            if first_idx < new_rows.len() {
-                if was_wrapped {
-                    new_rows[first_idx].set_wrapped(true);
-                }
-                new_rows[first_idx].set_line_size(source_line_size);
-            }
-        }
-
-        self.finalize_reflow(
-            target_rows,
-            ReflowResult {
-                rows: new_rows,
-                pages: new_pages,
-                extras: new_extras,
-                cursor_row: cursor.0,
-                cursor_col: cursor.1,
-            },
-            new_cols,
-        );
-    }
 }
 
 #[cfg(test)]

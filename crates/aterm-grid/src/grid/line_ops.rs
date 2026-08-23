@@ -446,6 +446,9 @@ impl Grid {
         if count == 0 {
             return;
         }
+        // DL mints genuine blank rows below the cursor: a deficit fill armed
+        // before this must not repopulate them with pre-delete history.
+        self.invalidate_pending_fill_target();
 
         let cursor_row = self.storage.cursor.row;
         let region = self.storage.scroll_region;

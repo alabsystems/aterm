@@ -1447,15 +1447,16 @@ impl App {
         // regime, while a redundant same-value `set_pad` is a complete no-op.
         let pad_top = self.cfg_pad_top_for_scale(scale);
         self.backend.set_pad_top(pad_top);
-        // C3 (Windows): overwrite the measured band (0 — there is no AppKit
-        // titlebar to sample) with the SYNTHETIC tab band. Derived HERE, not up at
-        // the `titlebar_band_pts` measure, because the law's residue is
+        // C3 (Windows + Linux): overwrite the measured band (0 — there is no AppKit
+        // titlebar to sample on either) with the SYNTHETIC tab band. Derived HERE,
+        // not up at the `titlebar_band_pts` measure, because the law's residue is
         // `target − pad_top − strip_rows·cell_h` and `cell_h` is only knowable once
         // the block above has settled `self.font_px` and activated the backend at
         // it. `ws.metrics` is written from `head` immediately below, so this is the
-        // one write the whole attach needs. A no-op off Windows and whenever the
+        // one write the whole attach needs. A no-op on macOS (whose measured band
+        // this must never clobber — the attribute keeps it out) and whenever the
         // strip is off / the band is `compact`.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             let cell_h = self.backend.cell_geometry(self.font_px).1;
             let synthetic = self.synthetic_strip_head_px(scale, cell_h);
@@ -1552,6 +1553,16 @@ impl App {
         {
             let (cw, ch) = self.cell_size();
             window.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
+            // W1 companion (fixwave5): put the increment BASE on the same
+            // whole-cell frame lattice. winit's Wayland backend snaps
+            // interactive resizes to `min + k·increment`, so the creation-time
+            // 164×98 UX floor made the lattice incongruent with the frame law
+            // and a pure-vertical edge drag re-snapped the untouched width
+            // below the exact fit — shaving a column. See
+            // `whole_cell_min_size`. Linux-only: macOS/Windows never carried a
+            // min and their backends do not base increments on it.
+            #[cfg(target_os = "linux")]
+            window.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
             // (L1) Persist THIS scale's REAL cell metrics — "written when a
             // backend finishes": the joined backend is active at this window's
             // px, so `cell_size()` is the ground truth the next launch's early
@@ -2014,6 +2025,12 @@ impl App {
         // Drop the WindowState (its PresentTarget → GpuSurface/softbuffer Surface +
         // Arc<Window>; the shared GPU DEVICE on the Backend is untouched).
         self.windows.remove(&wid);
+        // SELECTION CUSTODY: the parked find origins are keyed by (session, window),
+        // but the only other prune is `detach_session_view`'s, which keys on SESSION.
+        // A window closed with a find origin still parked would leak its entry for
+        // the life of the process — and `WindowId`s are minted monotonically, so it
+        // can never be reclaimed by reuse either.
+        self.find_origins.retain(|(_, entry), _| *entry != wid);
         // Release this window's retained native toolbar backing objects (no-op off
         // macOS / when none was installed) so they don't outlive the window.
         self._toolbars.remove(&wid);
@@ -2026,6 +2043,13 @@ impl App {
         #[cfg(target_os = "macos")]
         if self.paste_confirm.as_ref().is_some_and(|c| c.wid == wid) {
             self.paste_confirm = None;
+        }
+        // Same rule for the in-window paste-confirmation banner (Linux): the parked
+        // text targeted THIS window's PTY, so the closing window takes the question
+        // with it — dropping the entry is the fail-closed cancel, and it frees the
+        // one-at-a-time slot for the next paste elsewhere.
+        if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
+            self.paste_banner = None;
         }
         // Clear the winit→logical mapping for this window (its OS id is gone).
         self.winit_to_window.retain(|_, &mut v| v != wid);
@@ -2721,6 +2745,126 @@ impl App {
         if title_changed {
             self.refresh_window_tabs(id);
         }
+    }
+
+    /// Apply one engine-authorized XTWINOPS window manipulation (frame audit #4:
+    /// `CSI 9;1t` with `allow_window_ops = true` did nothing, because nothing
+    /// connected the core's [`aterm_types::WindowOperation`] events to the winit
+    /// window). Runs on the main thread — the sole winit owner — via
+    /// [`crate::Wake::WindowOp`], posted by `spawn::configure_window_ops` (Linux).
+    ///
+    /// SECURITY is the engine's, not re-litigated here: this is only reachable
+    /// through the in-core `allow_window_ops` capability mint, window MOVE is
+    /// denied there outright, and both resize forms arrive pre-clamped to the
+    /// engine's minimums. What this method adds is ROUTING discipline:
+    ///
+    /// * the target window is re-resolved from the session (the spawn-stamped
+    ///   `window` is only a fallback), mirroring the bell's stale-stamp rule —
+    ///   a migrated tab manipulates the window it actually lives in;
+    /// * a CELL resize is honored only when the session IS the target window's
+    ///   focused one, and then routes through the one clamp+apply seam the
+    ///   `resize` verb uses (`echo_to_window: true`, RES-1), so grid, PTY and
+    ///   window converge through the proven path — a background tab cannot
+    ///   re-grid a window somebody else's shell is displayed in;
+    /// * `LowerWindow` and the axis-only maximizes are accepted-and-ignored:
+    ///   winit exposes no lower/vertical/horizontal affordance, and answering a
+    ///   manipulation with a WRONG one is worse than a no-op.
+    ///
+    /// Every winit call here is best-effort by contract — the WM/compositor may
+    /// clamp, defer, or refuse (Wayland in particular) — and any geometry that
+    /// does change flows back through the ordinary `Resized` path.
+    pub(crate) fn on_window_op(
+        &mut self,
+        window: WindowId,
+        session: u64,
+        op: aterm_types::WindowOperation,
+    ) {
+        use aterm_types::WindowOperation as W;
+        let Some(wid) = self.window_op_target(session, window) else {
+            return;
+        };
+        // A CELL resize needs no window handle of its own: it routes through
+        // the RES-1 clamp+apply seam, which resizes grid + PTY regardless and
+        // echoes the pixel size to whatever glass exists — the same headless
+        // posture as the `resize` verb. Handled before the glass gate below
+        // (which is also what lets the harness exercise the focused-session
+        // gate without an OS window).
+        if let W::ResizeWindowCells { rows, cols } = op {
+            if self.focused_session_id(wid) == Some(session) {
+                let _ = self.input(
+                    wid,
+                    crate::input::InputEvent::Resize {
+                        rows,
+                        cols,
+                        echo_to_window: true,
+                    },
+                    crate::input::Source::Controller {
+                        op: aterm_session::Op::WriteInput,
+                    },
+                );
+            }
+            return;
+        }
+        let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) else {
+            return; // headless / not yet attached: nothing to manipulate
+        };
+        match op {
+            W::DeIconify => w.set_minimized(false),
+            W::Iconify => w.set_minimized(true),
+            // xterm "raise" maps to requesting activation; winit has no raw
+            // restack-above, and focus is the portable near-equivalent.
+            W::RaiseWindow => w.focus_window(),
+            W::RefreshWindow => w.request_redraw(),
+            W::ResizeWindowPixels { height, width } => {
+                // The engine clamped both axes to its 200 px floor already; ask
+                // the window and let the platform's `Resized` drive the grid —
+                // the same inversion `InputEvent::ResizeWindowPx` documents.
+                #[cfg(target_os = "linux")]
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    // A driven resize owns the geometry from here: the launch
+                    // settle must not re-assert the attach grid over it.
+                    ws.initial_frame_settle = None;
+                }
+                let _ = w.request_inner_size(PhysicalSize::new(
+                    u32::from(width),
+                    u32::from(height),
+                ));
+            }
+            W::RestoreMaximized => w.set_maximized(false),
+            W::MaximizeWindow => w.set_maximized(true),
+            W::UndoFullscreen => w.set_fullscreen(None),
+            W::EnterFullscreen => {
+                w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+            }
+            W::ToggleFullscreen => {
+                if w.fullscreen().is_some() {
+                    w.set_fullscreen(None);
+                } else {
+                    w.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                }
+            }
+            // No honest winit mapping (lower/axis-maximize), and reports never
+            // ride the async wake (`configure_window_ops` answers them `None`
+            // at the callback, keeping the engine fallbacks). `_` also absorbs
+            // the `#[non_exhaustive]` future of `WindowOperation` (and the
+            // cell resize the early-return above already routed).
+            W::LowerWindow | W::MaximizeVertically | W::MaximizeHorizontally => {}
+            _ => {}
+        }
+    }
+
+    /// Stale-stamp target resolution for one XTWINOPS wake (see
+    /// [`Self::on_window_op`], mirroring `on_bell`): prefer the window whose
+    /// tab set focuses this session NOW — a migrated tab manipulates the
+    /// window it actually lives in — and fall back to the spawn-stamped window
+    /// only while it still names a live one. `None` (session gone AND stamp
+    /// dead) drops the operation. Split out so the routing is testable
+    /// without glass.
+    fn window_op_target(&self, session: u64, stamped: WindowId) -> Option<WindowId> {
+        self.windows_with_focused_session(session)
+            .first()
+            .copied()
+            .or_else(|| self.windows.contains_key(&stamped).then_some(stamped))
     }
 
     /// Publish an OSC-derived title only when the canonical active tab is a
@@ -3916,5 +4060,169 @@ mod tests {
             settle_state(&app).is_none(),
             "apply_grid_resize must clear the settle before requesting its own size"
         );
+    }
+
+    /// XTWINOPS transport (frame audit #4 follow-up: the routing had ZERO
+    /// automated coverage). Exactly the manipulation set posts
+    /// `Wake::WindowOp`, stamped with the requesting session and its owner
+    /// window and carrying the operation unchanged; reports — and the in-core
+    /// denied `MoveWindow` — post NOTHING, so the engine's own fallbacks stay
+    /// the only answerer.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn xtwinops_manipulations_post_a_window_op_wake_and_reports_post_nothing() {
+        use aterm_types::WindowOperation as W;
+        let manipulations = [
+            W::DeIconify,
+            W::Iconify,
+            W::RaiseWindow,
+            W::LowerWindow,
+            W::RefreshWindow,
+            W::ResizeWindowPixels {
+                height: 300,
+                width: 500,
+            },
+            W::ResizeWindowCells { rows: 30, cols: 90 },
+            W::RestoreMaximized,
+            W::MaximizeWindow,
+            W::MaximizeVertically,
+            W::MaximizeHorizontally,
+            W::UndoFullscreen,
+            W::EnterFullscreen,
+            W::ToggleFullscreen,
+        ];
+        for op in manipulations {
+            match crate::spawn::window_op_wake(op.clone(), 7, WindowId(3)) {
+                Some(crate::Wake::WindowOp {
+                    session,
+                    window,
+                    op: routed,
+                }) => {
+                    assert_eq!(session, 7, "{op:?} must stamp the requesting session");
+                    assert_eq!(window, WindowId(3), "{op:?} must stamp the owner window");
+                    assert_eq!(routed, op, "the operation must survive the post unchanged");
+                }
+                other => panic!("{op:?} must post a WindowOp wake, got {other:?}"),
+            }
+        }
+        let silent = [
+            // Denied in-core; the transport must stay inert even if it leaked.
+            W::MoveWindow { x: 10, y: 10 },
+            // Reports: an async wake cannot carry a synchronous reply, so the
+            // engine's in-core fallbacks own every answer.
+            W::ReportWindowState,
+            W::ReportWindowPosition,
+            W::ReportTextAreaPosition,
+            W::ReportTextAreaSizePixels,
+            W::ReportWindowSizePixels,
+            W::ReportScreenSizePixels,
+            W::ReportCellSizePixels,
+            W::ReportTextAreaSizeCells,
+            W::ReportScreenSizeCells,
+            W::ReportIconLabel,
+            W::ReportWindowTitle,
+            // Title-stack ops are applied in-core, never by the host.
+            W::PushTitle {
+                icon: true,
+                window: true,
+            },
+            W::PopTitle {
+                icon: true,
+                window: true,
+            },
+        ];
+        for op in silent {
+            assert!(
+                crate::spawn::window_op_wake(op.clone(), 7, WindowId(3)).is_none(),
+                "{op:?} must not ride the wake"
+            );
+        }
+    }
+
+    /// The focused-session gate on `ResizeWindowCells` (RES-1): only the
+    /// target window's FOCUSED session may re-grid it; a background pane's
+    /// request is accepted-and-ignored, so somebody else's shell cannot
+    /// re-grid the window the user is looking at.
+    #[test]
+    fn a_cell_resize_is_honored_only_for_the_focused_session() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let focused = app.split_active_stub_tab(wid);
+        assert_ne!(focused, 0, "the split spawns and focuses a second session");
+        let dims = |app: &App| {
+            let ws = &app.windows[&wid];
+            (ws.rows, ws.cols)
+        };
+        let before = dims(&app);
+
+        // The BACKGROUND pane asks: gated out, nothing moves.
+        app.on_window_op(
+            wid,
+            0,
+            aterm_types::WindowOperation::ResizeWindowCells { rows: 30, cols: 90 },
+        );
+        assert_eq!(
+            dims(&app),
+            before,
+            "a background pane must not re-grid the window"
+        );
+
+        // The FOCUSED session's request routes through the RES-1 seam.
+        app.on_window_op(
+            wid,
+            focused,
+            aterm_types::WindowOperation::ResizeWindowCells { rows: 30, cols: 90 },
+        );
+        assert_eq!(dims(&app), (30, 90), "the focused session re-grids");
+    }
+
+    /// The stale-stamp rule: the wake's spawn-stamped window is only a
+    /// FALLBACK. A session whose tab has moved manipulates the window it
+    /// actually lives in; a dead stamp with no session match drops the
+    /// operation instead of guessing.
+    #[test]
+    fn a_window_op_re_resolves_the_stale_spawn_stamp() {
+        let mut app = App::headless_for_test();
+        let sid = app.next_session_id;
+        let wid_b = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+
+        // The session resolves its REAL window over any stamp, live or dead.
+        assert_eq!(app.window_op_target(sid, WindowId(0)), Some(wid_b));
+        assert_eq!(app.window_op_target(sid, WindowId(77)), Some(wid_b));
+        // No session match: a live stamp is the fallback, a dead one is nothing.
+        assert_eq!(app.window_op_target(9999, WindowId(0)), Some(WindowId(0)));
+        assert_eq!(app.window_op_target(9999, WindowId(77)), None);
+
+        // End to end through the RES-1 seam: the stale stamp (window A) must
+        // not stop window B's focused session from re-gridding B — and must
+        // not let it touch A.
+        app.on_window_op(
+            WindowId(0),
+            sid,
+            aterm_types::WindowOperation::ResizeWindowCells { rows: 30, cols: 90 },
+        );
+        let dims = |app: &App, wid: WindowId| {
+            let ws = &app.windows[&wid];
+            (ws.rows, ws.cols)
+        };
+        assert_eq!(
+            dims(&app, wid_b),
+            (30, 90),
+            "the operation lands on the window the session lives in"
+        );
+        assert_eq!(
+            dims(&app, WindowId(0)),
+            (24, 80),
+            "the stamped window is untouched"
+        );
+
+        // A dead stamp with no resolvable session is a silent drop.
+        app.on_window_op(
+            WindowId(77),
+            9999,
+            aterm_types::WindowOperation::ResizeWindowCells { rows: 50, cols: 50 },
+        );
+        assert_eq!(dims(&app, wid_b), (30, 90));
+        assert_eq!(dims(&app, WindowId(0)), (24, 80));
     }
 }

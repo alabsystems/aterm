@@ -447,15 +447,174 @@ fn test_adjust_for_scroll_deep_scrollback_survives_then_evicts() {
     assert_eq!(sel.normalized_start().row, -41); // -40 - 1
     assert_eq!(sel.normalized_end().row, -39); // -38 - 1
 
-    // Scrolling the start endpoint below the retained-history floor (its row
-    // would drop to -41 - 460 = -501 < -500) means the content is truly
-    // evicted, so the selection is correctly cleared.
+    // Scrolling the START endpoint below the retained-history floor (its row would
+    // drop to -41 - 460 = -501 < -500) evicts that endpoint's content — but NOT the
+    // end's, which is still retained at -499. Destroying the whole selection there
+    // threw away a span the user can still see; it now clamps the head onto the
+    // oldest retained row and reports the loss.
     let visible = sel.adjust_for_scroll(460, max_rows, floor);
     assert!(
-        !visible,
-        "selection clears once an endpoint scrolls below the history floor"
+        visible,
+        "one evicted endpoint is PARTIAL eviction: the retained half survives"
     );
+    assert!(sel.has_selection());
+    assert_eq!(
+        sel.normalized_start().row,
+        -500,
+        "the evicted head clamps onto the oldest retained row"
+    );
+    assert_eq!(
+        sel.normalized_start().col,
+        0,
+        "the clamped head starts at the beginning of that row"
+    );
+    assert_eq!(
+        sel.normalized_end().row,
+        -499,
+        "the retained end does not move"
+    );
+    assert!(sel.truncated(), "the partial loss is reported, not hidden");
+}
+
+/// The non-vacuity control for the test above: once BOTH endpoints fall below the
+/// floor there is nothing left to clamp onto, and the honest answer is still a clear.
+#[test]
+fn test_adjust_for_scroll_clears_when_both_endpoints_are_evicted() {
+    let max_rows = 24;
+    let floor = 500;
+    let mut sel = TextSelection::new();
+    sel.start_selection(-40, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(-38, 10, SelectionSide::Right);
+    sel.complete_selection();
+    assert!(sel.adjust_for_scroll(1, max_rows, floor));
+
+    // -641 and -639 are both past the -500 floor.
+    assert!(!sel.adjust_for_scroll(600, max_rows, floor));
     assert!(!sel.has_selection());
+    assert!(
+        !sel.truncated(),
+        "a cleared selection reports no partial loss"
+    );
+}
+
+/// THE ALT-SCREEN GUARD. With `floor == 0` there is no retained history, so `min_row`
+/// is 0 and there is no oldest RETAINED row to clamp onto — the alt grid is always
+/// `Grid::with_scrollback(rows, cols, 0)`. Clamping here would pin the highlight to
+/// alt row 0, content the user never selected, and a full-screen alt scroll takes the
+/// uniform-delta path and records no damage band that could catch it afterwards.
+///
+/// This is the shape no test covered: only the LOWER endpoint evicted. The
+/// single-row-terminal case cannot detect the guard's removal because both of its
+/// anchors go below the floor together and take the both-gone arm either way.
+#[test]
+fn test_adjust_for_scroll_zero_floor_clears_rather_than_clamping_to_row_zero() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(0, 3, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(2, 7, SelectionSide::Right);
+    sel.complete_selection();
+
+    // delta 1 => rows -1 and 1: the lower endpoint alone is below min_row 0.
+    let visible = sel.adjust_for_scroll(1, 24, 0);
+    assert!(
+        !visible,
+        "with no retained history there is nothing to clamp to"
+    );
+    assert!(
+        !sel.has_selection(),
+        "clamping to row 0 here would leave a highlight over content the user \
+         never selected"
+    );
+    assert!(!sel.truncated());
+}
+
+/// The evicted endpoint is not necessarily `start`: an upward drag leaves the older
+/// row in `end`, and the clamp must follow the row order, not the field name.
+#[test]
+fn test_adjust_for_scroll_clamps_the_evicted_end_anchor_on_an_upward_drag() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(-38, 10, SelectionSide::Right, SelectionType::Simple);
+    sel.update_selection(-40, 4, SelectionSide::Right);
+    sel.complete_selection();
+
+    assert!(sel.adjust_for_scroll(461, 24, 500));
+    assert_eq!(sel.start().row, -499, "the newer anchor rides the scroll");
+    assert_eq!(
+        sel.end().row,
+        -500,
+        "the older anchor clamps onto the floor"
+    );
+    assert_eq!(sel.end().col, 0);
+    assert_eq!(
+        sel.end().side,
+        SelectionSide::Left,
+        "a Right side on the clamped head would eat the first cell of the row"
+    );
+    assert!(sel.truncated());
+}
+
+/// BLOCK selections clamp the ROW only. `normalized_start`/`normalized_end` take the
+/// min/max of rows and cols INDEPENDENTLY, so forcing the clamped anchor to column 0
+/// would widen the rectangle to column 0 across every retained row — a wrong-copy
+/// path rather than a degradation.
+#[test]
+fn test_adjust_for_scroll_block_clamp_preserves_columns() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(-40, 12, SelectionSide::Left, SelectionType::Block);
+    sel.update_selection(-38, 20, SelectionSide::Right);
+    sel.complete_selection();
+
+    assert!(sel.adjust_for_scroll(461, 24, 500));
+    assert_eq!(sel.start().row, -500, "the evicted row clamps");
+    assert_eq!(
+        (sel.start().col, sel.end().col),
+        (12, 20),
+        "a block keeps its column span; widening it to 0 would copy unselected text"
+    );
+    assert!(sel.truncated());
+}
+
+/// A clamp that leaves nothing selectable is a TOTAL loss, not a partial one, and
+/// must not survive as a selection nothing paints and nothing copies. The surviving
+/// anchor here is itself `(min_row, 0, Left)`, so side adjustment retreats the end to
+/// `(min_row - 1, u16::MAX)` and the span is empty the instant the head clamps onto it.
+#[test]
+fn test_adjust_for_scroll_clears_when_the_clamp_collapses_the_span() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(-49, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(-50, 0, SelectionSide::Left);
+    sel.complete_selection();
+
+    // delta 1 => -50 and -51 against a floor of 50: the older anchor clamps onto
+    // -50, which is exactly where the surviving one already sits.
+    assert!(!sel.adjust_for_scroll(1, 24, 50));
+    assert!(
+        !sel.has_selection(),
+        "an empty clamped span is the honest total-loss clear, not a ghost selection"
+    );
+    assert!(!sel.truncated());
+}
+
+/// The truncation report is per-SPAN, not sticky: `aterm-control`'s conformance check
+/// compares the `selection` reply header exactly, so a flag that outlived its
+/// selection would append ` incomplete` to every later reply.
+#[test]
+fn test_truncated_resets_on_new_selection_and_on_clear() {
+    let mut sel = TextSelection::new();
+    sel.start_selection(-40, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(-38, 10, SelectionSide::Right);
+    sel.complete_selection();
+    assert!(sel.adjust_for_scroll(461, 24, 500));
+    assert!(sel.truncated());
+
+    sel.start_selection(2, 0, SelectionSide::Left, SelectionType::Simple);
+    assert!(!sel.truncated(), "a fresh span has lost nothing");
+
+    sel.update_selection(4, 4, SelectionSide::Right);
+    sel.complete_selection();
+    assert!(sel.adjust_for_scroll(503, 24, 500));
+    assert!(sel.truncated());
+    sel.clear();
+    assert!(!sel.truncated(), "no span left to be partial");
 }
 
 #[test]
@@ -517,11 +676,26 @@ fn test_adjust_for_row_splice_clears_only_after_real_history_eviction() {
     assert!(retained.adjust_for_row_splice(3, 1, 5, 5));
     assert_eq!(retained.normalized_start().row, -5);
 
+    // One endpoint evicted by the splice is PARTIAL eviction and clamps, exactly as
+    // in `adjust_for_scroll`. Routing the splice through a byte-identical below-floor
+    // clear would have left a top-anchored archival splice destroying a whole
+    // selection for one evicted endpoint.
+    let mut partly_evicted = TextSelection::new();
+    partly_evicted.start_selection(-5, 0, SelectionSide::Left, SelectionType::Simple);
+    partly_evicted.update_selection(-2, 2, SelectionSide::Right);
+    partly_evicted.complete_selection();
+    assert!(partly_evicted.adjust_for_row_splice(3, 1, 5, 5));
+    assert!(partly_evicted.has_selection());
+    assert_eq!(partly_evicted.normalized_start().row, -5);
+    assert_eq!(partly_evicted.normalized_end().row, -3);
+    assert!(partly_evicted.truncated());
+
+    // Both endpoints gone is still a clear — the non-vacuity control.
     let mut evicted = TextSelection::new();
     evicted.start_selection(-5, 0, SelectionSide::Left, SelectionType::Simple);
-    evicted.update_selection(-2, 2, SelectionSide::Right);
+    evicted.update_selection(-4, 2, SelectionSide::Right);
     evicted.complete_selection();
-    assert!(!evicted.adjust_for_row_splice(3, 1, 5, 5));
+    assert!(!evicted.adjust_for_row_splice(3, 2, 5, 5));
     assert!(!evicted.has_selection());
 }
 

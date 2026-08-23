@@ -765,10 +765,24 @@ impl Grid {
     /// instead of placeholder values. RGB overflow colors and StyleId colors
     /// are both pre-resolved into the extras vectors at extraction time.
     pub(crate) fn row_to_line_with_stored_extras(row: &Row, extras: &ScrolledRowExtras) -> Line {
+        Self::row_to_line_with_stored_extras_at_len(row, extras, row.len())
+    }
+
+    /// [`Self::row_to_line_with_stored_extras`] with an explicit cell count —
+    /// the width-reflow seams pass the FULL row width for a row whose logical
+    /// line CONTINUES on the next physical row (fixwave5): autowrap filled
+    /// such a row to its last column, so its trailing blank cells are real
+    /// content, and the default `row.len()` trim would erode one mid-line
+    /// space per chunk boundary on every width sweep.
+    pub(crate) fn row_to_line_with_stored_extras_at_len(
+        row: &Row,
+        extras: &ScrolledRowExtras,
+        len: u16,
+    ) -> Line {
         #[cfg(any(test, feature = "testing"))]
         super::count_row_to_line_op();
 
-        let len = row.len() as usize;
+        let len = usize::from(len.min(row.cols()));
         if len == 0 {
             let mut line = Line::new();
             if row.is_wrapped() {

@@ -183,6 +183,20 @@ pub struct Terminal {
     /// managed by the UI layer but stored here so it can be adjusted when the
     /// terminal scrolls or text changes.
     pub(super) text_selection: crate::selection::TextSelection,
+    /// SELECTION CUSTODY, screen-scoped selection (the Phase-3 remainder): the OTHER
+    /// screen's selection, parked across an alternate-screen switch.
+    ///
+    /// A selection belongs to the screen it was made on. While `alternate_screen`
+    /// is set this slot holds the MAIN screen's selection — the name reads
+    /// backwards on purpose, because it names the slot's ROLE (parked), not its
+    /// occupant. Lifetime invariant: **empty whenever `alternate_screen` is
+    /// false**. `post_process` parks with `mem::take` on the batch that enters alt
+    /// and restores with `mem::take` on the batch that leaves, so the slot is never
+    /// a durable second selection with a lifetime of its own — which is what keeps
+    /// RIS, `clear_scrollback`, `restore_checkpoint` and a width resize from each
+    /// acquiring an independent "must also clear the parked one" obligation for a
+    /// selection that could outlive them.
+    pub(super) parked_text_selection: crate::selection::TextSelection,
     /// Secure keyboard entry mode.
     ///
     /// When enabled, indicates that the UI layer should enable platform-specific

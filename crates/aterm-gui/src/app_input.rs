@@ -279,6 +279,7 @@ const fn native_binding_allowed(action: keybinding::Action) -> bool {
             | Action::ToggleMatrixRain
             | Action::ToggleSeriousMode
             | Action::OpenPalette
+            | Action::ToggleFullscreen
     )
 }
 
@@ -693,6 +694,27 @@ fn is_bare_modifier_key(key: &Key) -> bool {
     )
 }
 
+/// Whether the HARDCODED Cmd (Super) shortcut suite is live on this platform —
+/// the gate on every `mods.super_key()` arm that claims a chord BEFORE the PTY
+/// (the super/super-shift chord matchers, pane focus, ⌘F/⌘C/⌘V, ⌘S/⌘R search,
+/// ⌘↑/⌘↓, font zoom, and the final unclaimed-Cmd swallow).
+///
+/// macOS: live — ⌘ chords ARE the platform convention, mirrored by the app
+/// menu's key equivalents. Windows: live (status quo) — `super` is the Win key,
+/// which the shell claims almost everywhere, so the arms are near-dead but
+/// harmless. Linux: OFF (keyboard audit #4) — the desktop owns Super (GNOME
+/// Activities, tiling, workspace switching), the seeded `[keybindings]` table
+/// already carries every default chord in its Ctrl/Alt spellings, and these
+/// arms did real damage there: a Super chord the compositor happened NOT to
+/// grab was either misread as a macOS command (Super+T opened a tab) or eaten
+/// by the unclaimed-Cmd swallow before the PTY — so a kitty-protocol app could
+/// never observe ANY Super chord. Gated off, a Super chord falls through to the
+/// seam encoder, which reports Super to a kitty-protocol app and — like
+/// xterm/gnome-terminal — ignores it in legacy encoding. A Linux user can still
+/// bind `super+…` chords explicitly in `[keybindings]`, which resolve ABOVE
+/// this suite either way.
+pub(crate) const HARDCODED_SUPER_CHORDS: bool = !cfg!(target_os = "linux");
+
 /// The default (hardcoded) scrollback chord, if any: Shift + PageUp/PageDown/Home/End
 /// → a [`ScrollIntent`], else `None` so the key falls through to the PTY encoder.
 /// Shift must be the SOLE chord modifier (Ctrl/Alt/Super excluded; Caps/Num Lock are
@@ -715,7 +737,12 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
     // Routed as a `ScrollIntent` like every other scrollback chord, so it moves the
     // viewport WITHOUT snapping and WITHOUT clearing — you come back to live with
     // your selection intact, which a keystroke that reached the seam could not do.
-    if mods.super_key() && !mods.shift_key() && !mods.control_key() && !mods.alt_key() {
+    if HARDCODED_SUPER_CHORDS
+        && mods.super_key()
+        && !mods.shift_key()
+        && !mods.control_key()
+        && !mods.alt_key()
+    {
         return match ev.logical_key {
             Key::Named(NamedKey::ArrowDown) => Some(ScrollIntent::Bottom),
             Key::Named(NamedKey::ArrowUp) => Some(ScrollIntent::Top),
@@ -793,6 +820,10 @@ fn find_suspends_action(action: keybinding::Action) -> bool {
     matches!(
         action,
         A::Copy
+            // Select All drives the TERMINAL's selection, which an open find is
+            // using to mark its match — the same "deliberately inert rather
+            // than wrong" rule the menu's SelectAll arm applies under find.
+            | A::SelectAll
             | A::Paste
             | A::ScrollPageUp
             | A::ScrollPageDown
@@ -813,7 +844,12 @@ fn find_suspends_action(action: keybinding::Action) -> bool {
 /// chord available to its existing owner. The caller intentionally runs this only
 /// after native-view, configured-keybinding, and vi-mode boundaries.
 fn terminal_emacs_search_direction(base: &Key, mods: ModifiersState) -> Option<bool> {
-    if !mods.super_key() || mods.shift_key() || mods.control_key() || mods.alt_key() {
+    if !HARDCODED_SUPER_CHORDS
+        || !mods.super_key()
+        || mods.shift_key()
+        || mods.control_key()
+        || mods.alt_key()
+    {
         return None;
     }
     match base {
@@ -827,7 +863,9 @@ fn font_zoom_repeat_action(
     mods: ModifiersState,
     ev: &KeyEvent,
 ) -> Option<crate::FontZoomRepeatAction> {
-    if !mods.super_key() {
+    // Part of the hardcoded Cmd suite: off Linux only (the seeded `ctrl+=` /
+    // `ctrl+-` / `ctrl+0` keybindings are the zoom chords there).
+    if !HARDCODED_SUPER_CHORDS || !mods.super_key() {
         return None;
     }
     let Key::Character(character) = &ev.logical_key else {
@@ -1216,7 +1254,12 @@ fn capture_committed_move_proof(
     term.row_cols_into(usize::from(material.0), row);
     // Grid rows are sparse: an untouched row can materialize as zero cells,
     // while the exact proof is deliberately a full visible-row snapshot.
-    // Fill the implicit tail just as the renderer and pipeline hosts do.
+    // Fill the implicit tail so the post-write `committed_proof_still_current`
+    // fence compares equal-width captures. The confirm seam itself never
+    // trusts lengths: the render hosts feed the engine the row AS STORED, and
+    // `CursorGlow::confirm_content_candidate` reads both sides through the
+    // implicit-blank lens (`padded_probe_cell`), so this fill is a host-side
+    // convention, not something the proof depends on.
     row.resize(usize::from(term.cols()), ' ');
     let baseline = aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(row)?;
     Some(CommittedMoveProof {
@@ -2651,6 +2694,21 @@ impl App {
                                     .and_then(|row| capture_delete_move_proof(&t, row))
                             })
                             .flatten();
+                        // ATERM_TRACE_SPAWN press sensor (same once-sampled gate
+                        // as the render trace): one line per typed-class press
+                        // naming which arming precondition held, so a box where
+                        // the ribbon never lights is diagnosed at the capture
+                        // seam instead of inferred from downstream silence.
+                        if crate::app_render::trace_spawn_enabled() && typed_forward.is_some() {
+                            eprintln!(
+                                "PRESS fwd={typed_forward:?} typed={typed:?} pend={} origin={candidate_origin:?} term={terminal_origin:?} expect={} tproof={} dproof={} gen={}",
+                                candidate_was_pending,
+                                typed_expected.is_some(),
+                                typed_move_proof.is_some(),
+                                delete_move_proof.is_some(),
+                                t.pipeline_timestamps().process_sequence,
+                            );
+                        }
                         (
                             scrolled,
                             cleared,
@@ -3085,13 +3143,27 @@ impl App {
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
                     let t = term_lock(&term);
-                    let _ = arm_committed_move_after_inline(
+                    let armed = arm_committed_move_after_inline(
                         ws,
                         &t,
                         armed_at,
                         typed_move_proof,
                         delete_move_proof,
                     );
+                    // ATERM_TRACE_SPAWN diagnostic (same once-sampled gate as
+                    // the render trace): did this press arm a content proof,
+                    // and at which processing generation? An `armed=false`
+                    // here means the post-write fence found the terminal
+                    // already past the captured boundary (an ultra-fast echo).
+                    if crate::app_render::trace_spawn_enabled() {
+                        eprintln!(
+                            "ARM armed={} typed={} delete={} gen={}",
+                            armed,
+                            typed_move_proof.is_some(),
+                            delete_move_proof.is_some(),
+                            t.pipeline_timestamps().process_sequence,
+                        );
+                    }
                 }
                 if wrote_inline
                     && outcome == InputOutcome::Ok
@@ -4138,8 +4210,19 @@ impl App {
             if let Some(applied) =
                 w.request_inner_size(winit::dpi::PhysicalSize::new(width, height))
             {
+                // "Same path the event would have taken" includes the metrics:
+                // the `Resized` handler ARMS the resize→present and
+                // resize→reflow slices before reconfiguring the surface, and
+                // no `Resized` will ever arrive to do it here — without this,
+                // `last_/max_resize_present_ms` (and the reflow twin) recorded
+                // ZEROS for every Wayland px-resize, which is exactly the path
+                // the drag audits drive (fixwave5).
+                crate::metrics::note_resize_arrival();
                 if let Some(ws) = self.windows.get_mut(&target) {
                     ws.win_px = Some(applied);
+                    // The trail's resize license reads this exactly like a
+                    // live edge drag's `Resized` (see the event handler).
+                    ws.last_resized_event_at = Some(std::time::Instant::now());
                 }
                 self.sync_surface_to_window(target);
                 self.on_resize(target, applied);
@@ -4987,6 +5070,16 @@ impl App {
                 keybinding::ChordResolution::Action(action) => {
                     if action == keybinding::Action::Copy {
                         let _ = self.copy_native_selection(wid);
+                    } else if action == keybinding::Action::SelectAll {
+                        // Select All over a native view targets the VIEW's own
+                        // text model (the same TextInput event the menu path
+                        // sends), never the parked terminal beneath it.
+                        let _ = self.dispatch_native_event(
+                            wid,
+                            crate::native_app::AppEvent::TextInput(
+                                crate::native_app::TextInputEvent::SelectAll,
+                            ),
+                        );
                     } else if native_binding_allowed(action) {
                         self.dispatch_action(wid, action);
                     }
@@ -5003,10 +5096,13 @@ impl App {
 
         // These are content-agnostic host commands (or explicitly fenced no-ops
         // for unsupported native splits). Keep their canonical implementations,
-        // but run them before editor command lowering.
-        if self.on_key_super_shift_chord(mods, ev)
-            || self.on_key_super_chord(mods, ev)
-            || self.on_key_pane_focus(mods, ev)
+        // but run them before editor command lowering. Gated with the rest of
+        // the hardcoded Cmd suite — off Linux the seeded `[keybindings]`
+        // spellings above carry these commands (see `HARDCODED_SUPER_CHORDS`).
+        if HARDCODED_SUPER_CHORDS
+            && (self.on_key_super_shift_chord(mods, ev)
+                || self.on_key_super_chord(mods, ev)
+                || self.on_key_pane_focus(mods, ev))
         {
             self.note_consumed_press(wid, ev);
             return true;
@@ -5015,7 +5111,8 @@ impl App {
         // Clipboard and find need host capabilities rather than reducer-only key
         // events. Their implementations resolve the active native view and never
         // read the parked terminal here.
-        if mods.super_key()
+        if HARDCODED_SUPER_CHORDS
+            && mods.super_key()
             && let Key::Character(character) = &ev.logical_key
         {
             if character.eq_ignore_ascii_case("f") {
@@ -5229,6 +5326,34 @@ impl App {
         let inert = keymap::press_is_inert(&ev);
         // Typing makes the cursor solid and restarts the blink period.
         self.reset_blink(wid);
+        // MULTI-LINE-PASTE CONFIRMATION BANNER (Linux — `paste_banner` is `None` on
+        // the native-alert platforms): while the banner is up over THIS window it is
+        // MODAL and owns the keyboard, exactly as the macOS sheet's key window and
+        // the Windows MessageBox do — checked before every other gate so no
+        // keybinding, `[key_sequences]` raw-byte rule, chord, or PTY write can fire
+        // under a security question. Enter accepts (the parked paste delivers),
+        // Escape cancels (the parked text is dropped); everything else is swallowed,
+        // so a pastejacking payload can never have the confirming Return leak into
+        // the shell beneath. The decision is [`crate::alert_keys::confirm_key`] —
+        // the same pure accept/cancel router the macOS sheet interceptor answers
+        // through. A key aimed at a DIFFERENT window passes untouched (the sheet's
+        // per-window scoping rule).
+        if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
+            let (chars, code) = match &ev.logical_key {
+                Key::Named(NamedKey::Enter) => (Some("\r"), 0),
+                Key::Named(NamedKey::Escape) => (Some("\u{1b}"), 0),
+                _ => (None, 0),
+            };
+            match crate::alert_keys::confirm_key(true, 0, chars, code) {
+                crate::alert_keys::ConfirmKey::Accept => self.answer_paste_banner(true),
+                crate::alert_keys::ConfirmKey::Cancel => self.answer_paste_banner(false),
+                // Not an answer: swallowed anyway — the banner is modal, and a
+                // keystroke reaching the PTY from under it would defeat the guard.
+                crate::alert_keys::ConfirmKey::PassThrough => {}
+            }
+            self.note_press_disposition(wid, &ev, None);
+            return;
+        }
         // While the Settings overlay is open it OWNS the keyboard: swallow every key —
         // move / activate / edit / close — BEFORE any keybinding, `[key_sequences]` rule,
         // hardcoded Cmd chord, scrollback chord, or Cmd-F can fire. Checked first, mirroring
@@ -5274,7 +5399,7 @@ impl App {
         // no strip / no terminal tab. Either way the key falls through here
         // UNTOUCHED and takes the ordinary encoder path.
         #[cfg(windows)]
-        if let Some(ekey) = aterm_types::keyboard::map_logical_key(&ev.logical_key)
+        if let Some(ekey) = aterm_winit_keymap::map_logical_key(&ev.logical_key)
             && tab_menu_chord(
                 self.config.tab_menu_chord_or_default(),
                 keymap::modifiers_from_winit(mods),
@@ -5448,15 +5573,20 @@ impl App {
             self.terminal_emacs_search_pressed(wid, ev.physical_key, forward);
             return;
         }
-        if self.on_key_super_shift_chord(mods, &ev) {
+        // The hardcoded Cmd/Super suite (chord matchers + pane focus below, and
+        // the ⌘F/⌘C/⌘V/font-zoom/swallow arms further down) is gated OFF on
+        // Linux — GNOME owns Super, and the seeded `[keybindings]` table above
+        // carries all of these commands in their Ctrl/Alt spellings. See
+        // `HARDCODED_SUPER_CHORDS`.
+        if HARDCODED_SUPER_CHORDS && self.on_key_super_shift_chord(mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
-        if self.on_key_super_chord(mods, &ev) {
+        if HARDCODED_SUPER_CHORDS && self.on_key_super_chord(mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
-        if self.on_key_pane_focus(mods, &ev) {
+        if HARDCODED_SUPER_CHORDS && self.on_key_pane_focus(mods, &ev) {
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -5486,8 +5616,10 @@ impl App {
             return;
         }
         // Cmd-F enters find mode; while active, keystrokes drive the find (query
-        // edit + match navigation) instead of reaching the PTY.
-        if mods.super_key()
+        // edit + match navigation) instead of reaching the PTY. (Off Linux —
+        // the seeded Ctrl+Shift+F keybinding is the find chord there.)
+        if HARDCODED_SUPER_CHORDS
+            && mods.super_key()
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("f")
         {
@@ -5522,7 +5654,8 @@ impl App {
         // Routed by the press's own `wid` rather than `self.frontmost_window`:
         // the two diverge (see `lib.rs`'s window routing), and a copy must read
         // the terminal the keystroke was addressed to.
-        if mods.super_key()
+        if HARDCODED_SUPER_CHORDS
+            && mods.super_key()
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("c")
         {
@@ -5572,7 +5705,8 @@ impl App {
         // it). Pasting does not clear the selection. (The `Paste` seam arm snaps
         // separately, but this key can also be swallowed by an empty clipboard, so
         // it keeps its own snap exactly as before.)
-        if mods.super_key()
+        if HARDCODED_SUPER_CHORDS
+            && mods.super_key()
             && let Key::Character(s) = &ev.logical_key
             && s.eq_ignore_ascii_case("v")
         {
@@ -5648,7 +5782,13 @@ impl App {
         // typing intent. (⌘-K was never a documented jump-to-live; it reached the
         // live view only as a side effect of being unclaimed. ⌘↓ is the honest
         // spelling of that intent — Phase 2.)
-        if mods.super_key() {
+        //
+        // NOT on Linux (keyboard audit #4): there Super is the DESKTOP's
+        // modifier, not the app's — an unclaimed Super chord that reached us is
+        // one GNOME chose not to grab, and it belongs to the PTY (a
+        // kitty-protocol app sees the Super bit; the legacy encoder ignores it,
+        // exactly as xterm/gnome-terminal do). See `HARDCODED_SUPER_CHORDS`.
+        if HARDCODED_SUPER_CHORDS && mods.super_key() {
             self.note_consumed_press(wid, &ev);
             return;
         }
@@ -6591,7 +6731,7 @@ impl App {
         let nav = if crate::keymap::press_is_inert(ev) {
             crate::tab_menu::MenuNav::Inert
         } else {
-            aterm_types::keyboard::map_logical_key(&ev.logical_key)
+            aterm_winit_keymap::map_logical_key(&ev.logical_key)
                 .as_ref()
                 .map_or(
                     crate::tab_menu::MenuNav::Dismiss,
@@ -7447,6 +7587,20 @@ impl App {
             Action::RenameSession => {
                 self.begin_active_session_rename(wid);
             }
+            // Same verb + same find gate as the menu's SelectAll arm: the find
+            // bar borrows the terminal selection for its match highlight, so
+            // under an open find this is deliberately inert rather than wrong.
+            // (The keybinding path is normally parked earlier by
+            // `find_suspends_action`; this guard covers dispatches that did not
+            // come through `on_key` — the routed window's field included.)
+            Action::SelectAll => {
+                if self.find_field_window().is_none() {
+                    self.select_all();
+                }
+            }
+            // The same winit borderless-fullscreen toggle the View menu row
+            // fires (keyboard audit #3: F11 seeded off macOS).
+            Action::ToggleFullscreen => self.toggle_fullscreen(),
         }
     }
 
@@ -8902,7 +9056,10 @@ mod terminal_emacs_search_input_tests {
     }
 
     /// Exhaust all 16 modifier subsets for both navigation keys (plus case and a
-    /// non-navigation negative control). Only the exact bare-Super subset qualifies.
+    /// non-navigation negative control). Only the exact bare-Super subset
+    /// qualifies — and only where the hardcoded Cmd suite is live at all: on
+    /// Linux (`HARDCODED_SUPER_CHORDS` off) Super belongs to the desktop and
+    /// EVERY subset must fall through to the PTY (keyboard audit #4).
     #[test]
     fn bare_super_s_r_classifier_is_exhaustive_over_modifier_power_set() {
         let flags = [
@@ -8918,7 +9075,7 @@ mod terminal_emacs_search_input_tests {
                     mods |= flag;
                 }
             }
-            let expected = mods == ModifiersState::SUPER;
+            let expected = super::HARDCODED_SUPER_CHORDS && mods == ModifiersState::SUPER;
             assert_eq!(
                 terminal_emacs_search_direction(&character("s"), mods),
                 expected.then_some(true),
@@ -11749,14 +11906,22 @@ mod press_path_lock_elision_tests {
         let down = modifier_event(WNamed::ArrowDown, KeyCode::ArrowDown, ElementState::Pressed);
         let up = modifier_event(WNamed::ArrowUp, KeyCode::ArrowUp, ElementState::Pressed);
 
-        assert!(matches!(
-            super::scrollback_chord(ModifiersState::SUPER, &down),
-            Some(ScrollIntent::Bottom)
-        ));
-        assert!(matches!(
-            super::scrollback_chord(ModifiersState::SUPER, &up),
-            Some(ScrollIntent::Top)
-        ));
+        // ⌘-arrow is part of the hardcoded Cmd suite: live on macOS/Windows,
+        // gated OFF on Linux where Super+arrow is a DESKTOP chord (GNOME
+        // tiling/unmaximize) and must fall through (keyboard audit #4).
+        if super::HARDCODED_SUPER_CHORDS {
+            assert!(matches!(
+                super::scrollback_chord(ModifiersState::SUPER, &down),
+                Some(ScrollIntent::Bottom)
+            ));
+            assert!(matches!(
+                super::scrollback_chord(ModifiersState::SUPER, &up),
+                Some(ScrollIntent::Top)
+            ));
+        } else {
+            assert!(super::scrollback_chord(ModifiersState::SUPER, &down).is_none());
+            assert!(super::scrollback_chord(ModifiersState::SUPER, &up).is_none());
+        }
         // ⌘⌥arrow stays PANE FOCUS — the new chord must not shadow it.
         assert!(
             super::scrollback_chord(ModifiersState::SUPER | ModifiersState::ALT, &down).is_none(),
@@ -11987,6 +12152,13 @@ mod press_path_lock_elision_tests {
     /// The WINDOW half still runs: `j` is not a modifier, so the press is not
     /// inert and the banked glide residual is still dropped. Only the terminal
     /// half — the thing that loses the user's place — is gone.
+    ///
+    /// ON LINUX the swallow itself is gone (keyboard audit #4,
+    /// `HARDCODED_SUPER_CHORDS` off): Super belongs to the desktop, so an
+    /// unclaimed Super chord GNOME chose not to grab falls through to the seam
+    /// encoder — the legacy encoding ignores the Super bit exactly as
+    /// xterm/gnome-terminal do, so Super+J TYPES `j` (a genuine typing intent,
+    /// which also snaps the viewport like any other keystroke).
     #[cfg(unix)]
     #[test]
     fn a_swallowed_cmd_chord_no_longer_snaps_the_viewport() {
@@ -12006,19 +12178,33 @@ mod press_path_lock_elision_tests {
 
         app.on_key(wid, character_event('j', ElementState::Pressed));
 
-        assert_eq!(
-            term_lock(&term).grid().display_offset(),
-            offset_before,
-            "a swallowed Cmd chord must leave the reading position alone"
-        );
+        if super::HARDCODED_SUPER_CHORDS {
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                offset_before,
+                "a swallowed Cmd chord must leave the reading position alone"
+            );
+            assert_eq!(
+                drain(pipe),
+                Vec::<u8>::new(),
+                "and it must never leak a byte to the PTY"
+            );
+        } else {
+            assert_eq!(
+                drain(pipe),
+                b"j".to_vec(),
+                "on Linux the unclaimed Super chord reaches the PTY (legacy \
+                 encoding ignores Super, like xterm)"
+            );
+            assert_eq!(
+                term_lock(&term).grid().display_offset(),
+                0,
+                "…and a genuine typing press snaps to live like any keystroke"
+            );
+        }
         assert_eq!(
             app.windows[&wid].scroll_frac_px, 0,
             "the window half still drops the banked glide residual"
-        );
-        assert_eq!(
-            drain(pipe),
-            Vec::<u8>::new(),
-            "and it must never leak a byte to the PTY"
         );
         unsafe {
             libc::close(pipe[0]);
@@ -15434,11 +15620,15 @@ mod find_field_key_tests {
         crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
     }
 
-    /// The three SEEDED paste spellings — ctrl+v, ctrl+shift+v, shift+insert
-    /// (`Keybindings::PLATFORM_DEFAULT_PAIRS`) — all paste into the query. This is
-    /// the shipping Windows/Linux configuration: platform defaults installed, no
-    /// user table. Off-macOS only because macOS deliberately seeds no table (⌘V is
-    /// its hardcoded find-field paste, covered above).
+    /// The SEEDED paste spellings (`Keybindings::PLATFORM_DEFAULT_PAIRS`) all
+    /// paste into the query — and plain ctrl+v is seeded on WINDOWS ONLY
+    /// (keyboard audit #1): on Linux it stays the PTY's (readline quoted-insert
+    /// / vim visual-block), so in the find field it must do NOTHING — the
+    /// keybinding table misses, `field_edit_action` has no `v` arm, and its
+    /// text tail refuses control chords. This is the shipping Windows/Linux
+    /// configuration: platform defaults installed, no user table. Off-macOS
+    /// only because macOS deliberately seeds no table (⌘V is its hardcoded
+    /// find-field paste, covered above).
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn every_seeded_paste_spelling_pastes_into_the_query() {
@@ -15450,13 +15640,25 @@ mod find_field_key_tests {
         app.search_enter();
         set_mods(&mut app, wid, ModifiersState::CONTROL);
         app.on_key(wid, character("v"));
-        assert_eq!(query(&app, wid), Some(("x".to_string(), 1)), "ctrl+v");
+        let mut q = String::new();
+        if cfg!(windows) {
+            q.push('x');
+            assert_eq!(query(&app, wid), Some((q.clone(), 1)), "ctrl+v (Windows seed)");
+        } else {
+            assert_eq!(
+                query(&app, wid),
+                Some((String::new(), 0)),
+                "plain ctrl+v is NOT seeded on Linux — the field ignores it"
+            );
+        }
         set_mods(&mut app, wid, ModifiersState::CONTROL | ModifiersState::SHIFT);
         app.on_key(wid, character("v"));
-        assert_eq!(query(&app, wid), Some(("xx".to_string(), 2)), "ctrl+shift+v");
+        q.push('x');
+        assert_eq!(query(&app, wid), Some((q.clone(), q.len())), "ctrl+shift+v");
         set_mods(&mut app, wid, ModifiersState::SHIFT);
         app.on_key(wid, named(NamedKey::Insert));
-        assert_eq!(query(&app, wid), Some(("xxx".to_string(), 3)), "shift+insert");
+        q.push('x');
+        assert_eq!(query(&app, wid), Some((q.clone(), q.len())), "shift+insert");
         assert!(app.windows[&wid].search.is_some(), "find stays open");
         crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
     }

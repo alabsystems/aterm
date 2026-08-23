@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Kani proofs for the `TextSelection` state machine (INV-SEL-31 through INV-SEL-54).
+//! Kani proofs for the `TextSelection` state machine (INV-SEL-31 through INV-SEL-54,
+//! plus INV-SEL-57/58 over `truncate_to_floor`).
+//!
+//! INV-SEL-55/56 over `intersects_absolute_band` are named by design §8 and are
+//! DEFERRED, not forgotten: `scripts/verify-kani-proofs.sh` exits 3 without
+//! trust-mc, so an unrunnable harness here would be a claim nothing checks.
 //!
 //! All proofs use symbolic inputs via `kani::any()` to explore the full bounded
 //! input space. Strengthened from concrete-only versions (Part of #6850).
@@ -511,4 +516,103 @@ fn text_selection_expand_lines_guards() {
     sel.expand_lines(line_width);
     kani::assert(sel.start().col == 0, "expand works in Lines");
     kani::assert(sel.end().col == line_width, "expand end = width");
+}
+
+/// INV-SEL-57: `truncate_to_floor` clamps a single evicted endpoint onto the floor
+/// and clears ONLY when the whole span is unreachable.
+///
+/// The three outcomes are exhaustive and are asserted as such: nothing evicted (rows
+/// untouched, no report), everything evicted or no history at all (cleared), and one
+/// endpoint evicted (the surviving row is preserved EXACTLY, the head lands on the
+/// floor, the state machine does not move). The `floor == 0` arm is the alt-screen
+/// guard: with no retained history there is no row to clamp onto and clamping would
+/// pin the highlight to row 0 of a buffer the user never selected in.
+#[kani::proof]
+fn text_selection_truncate_to_floor_clamps_one_evicted_endpoint() {
+    let mut sel = TextSelection::new();
+
+    let r1 = any_row();
+    let c1 = any_col();
+    let r2 = any_row();
+    let c2 = any_col();
+
+    sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(r2, c2, SelectionSide::Right);
+    sel.complete_selection();
+
+    // Symbolic floor. The oldest retained row sits `floor` rows above the live top,
+    // which is exactly the relation `Grid::oldest_absolute_row()` maintains, so the
+    // relative floor the method derives is `-floor`.
+    let floor: u64 = kani::any();
+    kani::assume(floor <= 200);
+    let oldest_abs: u64 = 1000;
+    let live_top_abs = oldest_abs + floor;
+    let min_row = -i32::try_from(floor).unwrap();
+
+    let lo = if r1 <= r2 { r1 } else { r2 };
+    let hi = if r1 <= r2 { r2 } else { r1 };
+
+    let survived = sel.truncate_to_floor(oldest_abs, live_top_abs);
+
+    if lo >= min_row {
+        kani::assert(survived, "nothing evicted = nothing to lose");
+        kani::assert(sel.start().row == r1, "untouched start row");
+        kani::assert(sel.end().row == r2, "untouched end row");
+        kani::assert(!sel.truncated(), "no loss to report");
+    } else if hi < min_row || min_row == 0 {
+        kani::assert(!survived, "no reachable content left");
+        kani::assert(sel.state() == SelectionState::None, "both gone = cleared");
+        kani::assert(!sel.truncated(), "a cleared selection reports nothing");
+    } else if survived {
+        kani::assert(sel.truncated(), "partial loss is reported");
+        kani::assert(
+            sel.state() == SelectionState::Complete,
+            "a clamp does not move the state machine",
+        );
+        kani::assert(
+            sel.normalized_start().row == min_row,
+            "the evicted head clamps onto the oldest retained row",
+        );
+        kani::assert(
+            sel.normalized_end().row == hi,
+            "the retained endpoint's row is preserved exactly",
+        );
+    } else {
+        // The only other outcome: the clamp left an empty span (the surviving anchor
+        // was itself the floor row at col 0, side Left), which is a TOTAL loss and
+        // clears rather than surviving as something nothing paints and nothing copies.
+        kani::assert(sel.state() == SelectionState::None, "empty clamp clears");
+    }
+}
+
+/// INV-SEL-58: the Block twin of INV-SEL-57 — a clamp moves the ROW only.
+///
+/// `normalized_start`/`normalized_end` take the min/max of rows and columns
+/// INDEPENDENTLY for a Block, so forcing the clamped anchor's column to 0 would widen
+/// the rectangle to column 0 across every retained row: a wrong-copy path rather than
+/// a degradation.
+#[kani::proof]
+fn text_selection_truncate_to_floor_block_preserves_columns() {
+    let mut sel = TextSelection::new();
+
+    let r1 = any_row();
+    let c1 = any_col();
+    let r2 = any_row();
+    let c2 = any_col();
+
+    sel.start_selection(r1, c1, SelectionSide::Left, SelectionType::Block);
+    sel.update_selection(r2, c2, SelectionSide::Right);
+    sel.complete_selection();
+
+    let floor: u64 = kani::any();
+    kani::assume(floor <= 200);
+    let oldest_abs: u64 = 1000;
+    let live_top_abs = oldest_abs + floor;
+
+    let survived = sel.truncate_to_floor(oldest_abs, live_top_abs);
+
+    if survived && sel.truncated() {
+        kani::assert(sel.start().col == c1, "block start column preserved");
+        kani::assert(sel.end().col == c2, "block end column preserved");
+    }
 }

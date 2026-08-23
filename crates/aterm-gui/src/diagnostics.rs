@@ -354,6 +354,11 @@ pub(crate) fn config_semantic_warnings(
                     key: "keybindings",
                     message: format!("keybindings: chord {chord:?} invalid ({e})"),
                 });
+            } else if crate::keybinding::is_unbind_action(action) {
+                // `"none"`/`"unbind"` is the documented unbind spelling (it masks
+                // a platform seed), NOT an unknown action — the loader accepts it
+                // silently, so the validator (and the Settings editor's live
+                // diagnostics, which share this pass) must not red-flag it.
             } else if crate::keybinding::Action::parse(action).is_none() {
                 warnings.push(ConfigSemanticWarning {
                     key: "keybindings",
@@ -588,10 +593,18 @@ pub(crate) fn config_semantic_warnings(
         });
     }
     if config.allow_window_ops == Some(true) {
+        // Linux wires the manipulation half (frame audit #4: `spawn::
+        // configure_window_ops` → `App::on_window_op`); the surviving gap there
+        // is the position/pixel-geometry reports. Elsewhere the pre-wiring
+        // statement is still the honest one.
+        let message = if cfg!(target_os = "linux") {
+            "allow_window_ops is wired to the window on Linux: manipulations (iconify, maximize, fullscreen, resize) apply and move stays denied; position/pixel-geometry reports beyond the window-title and text-grid-size fallbacks remain unanswered"
+        } else {
+            "allow_window_ops enables only the GUI's XTWINOPS window-title and text-grid-size fallback reports; no window callback is installed, so host manipulation and most state/geometry requests are ignored"
+        };
         warnings.push(ConfigSemanticWarning {
             key: "allow_window_ops",
-            message: "allow_window_ops enables only the GUI's XTWINOPS window-title and text-grid-size fallback reports; no window callback is installed, so host manipulation and most state/geometry requests are ignored"
-                .to_string(),
+            message: message.to_string(),
         });
     }
     warnings
@@ -1589,13 +1602,7 @@ pub(crate) fn list_keybinds() -> String {
         Some(table) => {
             let _ = writeln!(s, "user [keybindings] (from config):");
             for (chord, action) in table {
-                let note = if crate::keybinding::Action::parse(action).is_none() {
-                    "  (UNKNOWN action)".to_string()
-                } else if let Some(lbl) = crate::keybinding::builtin_shadow_label(chord) {
-                    format!("  (conflicts with {lbl})")
-                } else {
-                    String::new()
-                };
+                let note = user_keybinding_note(chord, action);
                 let _ = writeln!(s, "  {chord:<16} {action}{note}");
             }
         }
@@ -1635,7 +1642,31 @@ pub(crate) fn list_keybinds() -> String {
     for name in crate::keybinding::ACTION_NAMES {
         let _ = writeln!(s, "  {name}");
     }
+    // The unbind spelling is part of the value surface too (it is not an action,
+    // so it cannot live in ACTION_NAMES — a test there asserts every name
+    // parses): document it where a user shopping for values is already looking.
+    let _ = writeln!(
+        s,
+        "  none | unbind      (not an action: unbinds the chord's built-in default)"
+    );
     s
+}
+
+/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`],
+/// extracted so the spellings are testable without a config file on disk. The
+/// unbind spelling is checked FIRST: `"f11" = "none"` is the documented way to
+/// free a seeded default, and printing `(UNKNOWN action)` for it (the old
+/// behaviour) told the user their working config was broken.
+fn user_keybinding_note(chord: &str, action: &str) -> String {
+    if crate::keybinding::is_unbind_action(action) {
+        "  (unbinds a default)".to_string()
+    } else if crate::keybinding::Action::parse(action).is_none() {
+        "  (UNKNOWN action)".to_string()
+    } else if let Some(lbl) = crate::keybinding::builtin_shadow_label(chord) {
+        format!("  (conflicts with {lbl})")
+    } else {
+        String::new()
+    }
 }
 
 fn show_config_font_px(value: f32, explicit: bool) -> String {
@@ -2010,8 +2041,16 @@ palette = ["#112233"]
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_window_ops"
                 && warning.message.contains("window-title and text-grid-size")
-                && warning.message.contains("host manipulation")
-                && warning.message.contains("most state/geometry")
+                && if cfg!(target_os = "linux") {
+                    // The manipulation half is wired there (frame audit #4);
+                    // the honest residue is the geometry-report gap.
+                    warning.message.contains("wired to the window")
+                        && warning.message.contains("move stays denied")
+                        && warning.message.contains("remain unanswered")
+                } else {
+                    warning.message.contains("host manipulation")
+                        && warning.message.contains("most state/geometry")
+                }
         }));
 
         assert!(
@@ -2406,6 +2445,9 @@ ink = "rainbow"
     /// a [keybindings] entry on a built-in Cmd chord warns "conflicts with built-in Copy"; a
     /// [key_sequences] chord that is BOTH a built-in AND bound in [keybindings] warns
     /// both ways. No code gate — the override capability is preserved, just surfaced.
+    /// The shadow half follows `HARDCODED_SUPER_CHORDS`: where the Cmd/Super suite
+    /// is compiled OFF (Linux), a cmd/super chord conflicts with NOTHING, so the
+    /// conflict warnings must NOT fire — only the cross-table collision remains.
     #[test]
     fn validate_flags_shadow_and_collision() {
         let cfg = r#"
@@ -2418,12 +2460,36 @@ ink = "rainbow"
         let joined = validate_config_text(cfg)
             .expect("structurally valid TOML")
             .join("\n");
-        assert!(joined.contains("conflicts with built-in Copy"), "{joined}");
-        assert!(
+        let suite_live = crate::app_input::HARDCODED_SUPER_CHORDS;
+        assert_eq!(
+            joined.contains("conflicts with built-in Copy"),
+            suite_live,
+            "{joined}"
+        );
+        assert_eq!(
             joined.contains("conflicts with built-in New Tab"),
+            suite_live,
             "{joined}"
         );
         assert!(joined.contains("also bound in [keybindings]"), "{joined}");
+    }
+
+    /// The documented unbind spelling (`"none"` / `"unbind"`) is a VALID
+    /// [keybindings] value the loader accepts silently — the validator (and the
+    /// Settings editor's live diagnostics, which share `config_semantic_warnings`)
+    /// must not flag it as an unknown action.
+    #[test]
+    fn validate_accepts_the_unbind_spellings() {
+        let cfg = r#"
+[keybindings]
+"f11" = "none"
+"ctrl+tab" = "unbind"
+"#;
+        let warnings = validate_config_text(cfg).expect("structurally valid TOML");
+        assert!(
+            warnings.is_empty(),
+            "unbind entries are not unknown actions: {warnings:?}"
+        );
     }
 
     /// An empty `[key_sequences]` value is valid TOML but the loader warn-skips it (it
@@ -2658,6 +2724,37 @@ ink = "rainbow"
         for name in crate::keybinding::ACTION_NAMES {
             assert!(out.contains(name), "{name} must be listed");
         }
+        // The unbind spelling is part of the value surface: it lives in the
+        // action-names footer (it cannot join ACTION_NAMES — those must parse).
+        assert!(
+            out.contains("none | unbind"),
+            "unbind spelling documented in the footer: {out}"
+        );
+    }
+
+    /// The per-row [keybindings] note: an unbind entry says what it DOES
+    /// ("f11 none (UNKNOWN action)" — the old print — told the user their
+    /// working unbind was broken); a genuinely unknown action still shouts; the
+    /// conflict note follows `builtin_shadow_label` (gated off with the Cmd
+    /// suite on Linux); an ordinary binding gets no note.
+    #[test]
+    fn user_keybinding_note_labels_unbinds_and_unknowns() {
+        assert_eq!(user_keybinding_note("f11", "none"), "  (unbinds a default)");
+        assert_eq!(
+            user_keybinding_note("ctrl+tab", "unbind"),
+            "  (unbinds a default)"
+        );
+        assert_eq!(
+            user_keybinding_note("cmd+k", "no_such_action"),
+            "  (UNKNOWN action)"
+        );
+        assert_eq!(user_keybinding_note("ctrl+shift+t", "new_tab"), "");
+        let expected = if crate::app_input::HARDCODED_SUPER_CHORDS {
+            "  (conflicts with Copy)".to_string()
+        } else {
+            String::new()
+        };
+        assert_eq!(user_keybinding_note("cmd+c", "copy"), expected);
     }
 
     #[test]

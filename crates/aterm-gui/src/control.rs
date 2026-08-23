@@ -139,15 +139,19 @@ pub(crate) use clipboard::{pbcopy, pbpaste};
 // deterministic without touching the real system clipboard.
 #[cfg(test)]
 pub(crate) use clipboard::PBPASTE_STUB;
+// Its PRIMARY twin, for tests driving the Linux middle-click paste path.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use clipboard::PRIMARY_STUB;
 // `pbpaste_owned` (the X11 non-blocking own-selection read, for the OSC-52
 // query arm — which must never block inside the terminal lock on a
-// foreign-owned selection) and `primary_get`/`primary_set` (PRIMARY-selection
-// paste/own, wired ONLY to Linux middle-click / selection-release in
-// `app_mouse`). ONE grouped re-export: a second standalone `pbpaste_owned`
+// foreign-owned selection), `primary_get`/`primary_get_owned` (PRIMARY-selection
+// paste: the blocking foreign read for the middle-click worker + its instant
+// own-slot fast path) and `primary_set` (PRIMARY own on selection-release /
+// OSC 52 'p'). ONE grouped re-export: a second standalone `pbpaste_owned`
 // line is E0252 (duplicate import) on the Linux build. Linux-only — on macOS
-// all three would be unused imports.
+// all four would be unused imports.
 #[cfg(target_os = "linux")]
-pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_set};
+pub(crate) use clipboard::{pbpaste_owned, primary_get, primary_get_owned, primary_set};
 
 /// Media-capture verbs (`image`/`image read`/`window`/`chrome`). Child module of
 /// `control`; dispatched as `control_media::cmd_*` from [`handle`]. The file
@@ -6744,6 +6748,7 @@ mod tests {
             cols: 1,
             rows: 1,
             z_index: 0,
+            band_lift_px: 0,
         };
         let (fmt, b64) = image_payload(&small);
         assert_eq!(fmt, "png");
@@ -6755,6 +6760,7 @@ mod tests {
             cols: 80,
             rows: 24,
             z_index: 0,
+            band_lift_px: 0,
         };
         let (fmt, b64) = image_payload(&big);
         assert_eq!(fmt, "truncated", "oversized image must be marked truncated");

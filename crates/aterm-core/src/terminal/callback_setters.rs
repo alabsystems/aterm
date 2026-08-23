@@ -194,6 +194,13 @@ impl Terminal {
         // gone.
         if cols_changed {
             self.text_selection.clear();
+            // The PARKED selection (see `post_process`) is anchored in the other
+            // grid, which this resize rewrapped too. It must go for the same reason
+            // — and unconditionally, because `finish_resize_offload` /
+            // `abort_resize_offload` mutate that grid's scrollback AFTER this runs,
+            // with no selection call anywhere. That is sound only while the offload
+            // path stays width-only; narrow this clear and it reopens silently.
+            self.parked_text_selection.clear();
         } else {
             // A rows-GROW that revealed retained history re-labelled the newest ring
             // lines as the top of the viewport, so every pre-resize row — the
@@ -208,11 +215,35 @@ impl Terminal {
             // their content: the highlight covers different text and a copy returns
             // something the user never selected. Read from the ACTIVE grid — `resize`
             // resizes both grids and each records its own shift.
+            //
+            // Below-floor is now a CLAMP, not a clear (SELECTION CUSTODY Phase 4), and
+            // that is only sound with the `-revealed` delta above: with the old delta
+            // of 0 the clear was the single thing masking the mis-anchor, and clamping
+            // instead would leave a live highlight anchored `revealed` rows off its
+            // content after any window-height drag or font zoom. A rows-only SHRINK
+            // needs no delta of its own — `revealed == 0` there — and is protected by
+            // the above-live-bottom clear, which this change kept verbatim.
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
             let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
             self.text_selection
                 .adjust_for_scroll(-revealed, max_rows, floor);
+            // The parked selection gets the identical treatment against the OTHER
+            // grid — `resize` resized both, and each recorded its own shift. Its
+            // floor must come from that grid: while alt is up the ACTIVE grid's
+            // `scrollback_lines()` is 0, which would evict every scrollback anchor
+            // the main screen is holding. `max_rows` is shared, both grids having
+            // been resized to the same `rows`.
+            if let Some(parked_grid) = self.alt_grid.as_mut() {
+                let parked_revealed = i32::from(parked_grid.take_last_resize_row_shift());
+                let parked_floor =
+                    i32::try_from(parked_grid.scrollback_lines()).unwrap_or(i32::MAX);
+                self.parked_text_selection.adjust_for_scroll(
+                    -parked_revealed,
+                    max_rows,
+                    parked_floor,
+                );
+            }
         }
         // DEC mode 2048: emit an in-band size report on every resize so a
         // subscribed app (neovim 0.10+) learns the new geometry without an ioctl.

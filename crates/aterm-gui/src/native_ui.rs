@@ -3099,16 +3099,30 @@ fn paint_compiled_node(
         UiContent::Switch(control) => {
             paint_control_surface(prims, rect, control.state, roles);
             let on = matches!(control.value, SemanticValue::Bool(true));
+            let enabled = control.state.enabled;
             let track_w = 42.0_f32.min((rect.width - 8.0).max(0.0));
             let track_h = 22.0_f32.min((rect.height - 8.0).max(0.0));
+            // A switch that cannot be operated must LOOK inert: the track
+            // fill sinks toward the surface and the thumb dims to the same
+            // subordinate tone `control_text_color` gives the caption.
+            // Full-strength accent on a disabled switch left the off-macOS
+            // Updates toggle pixel-identical to a live one (2026-08 settings
+            // audit).
             prims.push(DrawPrim::Capsule {
                 x: rect.right() - track_w - 8.0,
                 y: rect.y + (rect.height - track_h) / 2.0,
                 w: track_w,
                 h: track_h,
                 frac: if on { 1.0 } else { 0.0 },
-                fill: rgba(roles.accent, 255),
-                track: rgba(roles.control_track, 180),
+                fill: rgba(
+                    if enabled {
+                        roles.accent
+                    } else {
+                        mix_rgb(roles.accent, roles.elevated, 0.55)
+                    },
+                    if enabled { 255 } else { 150 },
+                ),
+                track: rgba(roles.control_track, if enabled { 180 } else { 90 }),
             });
             // A moving, high-contrast thumb is the primary state cue; color and
             // the adjacent On/Off text are redundant cues. This reads as a
@@ -3122,12 +3136,14 @@ fn paint_compiled_node(
                 cy: rect.y + rect.height / 2.0,
                 r: (track_h / 2.0 - 3.0).max(2.0),
                 color: rgba(
-                    if on {
+                    if !enabled {
+                        mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
+                    } else if on {
                         roles.on_accent
                     } else {
                         roles.text_secondary
                     },
-                    255,
+                    if enabled { 255 } else { 170 },
                 ),
                 breathe: false,
             });
@@ -4982,6 +4998,78 @@ mod tests {
         assert!(!materially_clipped(rect, rect));
         assert!(!materially_clipped(rect, rounding_noise));
         assert!(materially_clipped(rect, visible_clip));
+    }
+
+    /// A disabled switch must not paint pixel-identical to an enabled one
+    /// (2026-08 settings audit: the off-macOS Updates toggle looked live).
+    /// The track capsule and the thumb dot both dim; geometry stays put.
+    #[test]
+    fn disabled_switch_dims_its_track_and_thumb() {
+        let switch_tree = |enabled: bool| {
+            UiTree::new(
+                UiNode::new(
+                    "app",
+                    UiContent::Group(GroupSpec::unlabeled(SemanticRole::Application)),
+                )
+                .layout(Layout::column().padding(Insets::all(8.0)))
+                .children(vec![
+                    UiNode::new(
+                        "switch",
+                        UiContent::Switch(
+                            crate::native_ui::Control::new(
+                                SwitchSpec {
+                                    label: "Automatic updates".to_string(),
+                                    description: None,
+                                },
+                                ActionId::new("test/switch"),
+                            )
+                            .value(SemanticValue::Bool(true))
+                            .state(ControlState {
+                                enabled,
+                                ..ControlState::default()
+                            }),
+                        ),
+                    )
+                    .layout(Layout::default().height(Length::Fixed(36.0))),
+                ]),
+            )
+            .compile(LogicalRect::new(0.0, 0.0, 220.0, 52.0))
+            .expect("switch fixture compiles")
+            .tray(aterm_render::Theme::default(), 13.0)
+            .prims
+        };
+        let feature = |prims: &[crate::widget::DrawPrim]| {
+            prims
+                .iter()
+                .filter_map(|prim| match prim {
+                    crate::widget::DrawPrim::Capsule { fill, track, .. } => {
+                        Some(format!("capsule fill={fill:?} track={track:?}"))
+                    }
+                    crate::widget::DrawPrim::Dot { color, cx, cy, .. } => {
+                        Some(format!("dot color={color:?} at {cx},{cy}"))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let live = switch_tree(true);
+        let inert = switch_tree(false);
+        let live_features = feature(&live);
+        let inert_features = feature(&inert);
+        assert_eq!(live_features.len(), inert_features.len());
+        assert_ne!(
+            live_features, inert_features,
+            "a disabled switch must be visibly dimmed, not a pixel twin of the live control"
+        );
+        // The thumb stays in the same place — only its color yields.
+        let position = |features: &[String]| {
+            features
+                .iter()
+                .find(|feature| feature.starts_with("dot"))
+                .and_then(|feature| feature.split(" at ").nth(1))
+                .map(str::to_string)
+        };
+        assert_eq!(position(&live_features), position(&inert_features));
     }
 
     #[test]

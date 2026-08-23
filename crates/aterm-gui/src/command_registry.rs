@@ -232,6 +232,10 @@ pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpe
         K::OpenPalette => spec("palette.open", S::Window, A::Owner, C::Any),
         K::ToggleViMode => spec("terminal.vi.toggle", S::View, A::LocalUi, C::Terminal),
         K::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
+        // Same identities as the menu faces (M::SelectAll / M::ToggleFullScreen
+        // above): one command each, two faces, converging on the same verbs.
+        K::SelectAll => spec("selection.select_all", S::View, A::Clipboard, C::Any),
+        K::ToggleFullscreen => spec("window.fullscreen", S::Window, A::LocalUi, C::Any),
     }
 }
 

@@ -156,6 +156,19 @@ pub struct ImageData {
     /// paints on top); `>= 0` (the default for iTerm2/Sixel and `z=0` Kitty) draws
     /// OVER the cell, which keeps the historical "image owns the cell" behavior.
     pub z_index: i32,
+    /// CHROME-BAND LIFT, in device px: how far this image's raster extends ABOVE
+    /// its first covered cell row, into the window's chrome band (`pad_top +
+    /// head`). `0` for every terminal-content image — the engine's OSC 1337 /
+    /// sixel / Kitty constructors never set it, so nothing an application prints
+    /// can draw outside its own cells. Non-zero ONLY for the host's tab-strip
+    /// band raster (`aterm-gui`'s pixel band), whose design needs the one canvas
+    /// a cell-quantised footprint cannot give it: the full optical band from the
+    /// window's top edge down. Renderers honour it by (a) decoding the footprint
+    /// `lift` px taller than `rows·cell_h` and (b) letting the FIRST footprint
+    /// row's tile paint `[y0 − lift, y0)` as well as its own cell band; rows past
+    /// the first read their source `lift` px lower. With `0` both clauses are
+    /// arithmetic no-ops, byte-identical to the pre-lift renderers.
+    pub band_lift_px: u16,
 }
 
 /// A single cell's reference into a placed [`ImageData`].

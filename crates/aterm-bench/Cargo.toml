@@ -33,6 +33,12 @@ proptest = { workspace = true }
 # is an rlib as well as a cdylib, and its closure is platform-free, so it links
 # natively without a wasm32 toolchain.
 aterm-wasm = { path = "../aterm-wasm" }
+# The WebGL browser backend, built for the HOST here: `gpu_web_frame_gate` prices
+# its per-rAF-tick frame build (and the settled-frame gate that elides it) through
+# the crate's native `render_headless` seam. Like `aterm-wasm` it is an rlib as
+# well as a cdylib; the wgpu/WebGL closure is confined to its `cfg(target_arch =
+# "wasm32")` dependency table, so a native link pulls only the engine deps.
+aterm-gpu-web = { path = "../aterm-gpu-web" }
 # The policy-gate bench installs the SAME engine the shipping GUI installs
 # (`PolicyEngine::new(profiles::standard())`, aterm-gui/src/spawn.rs:733). Without
 # it, no bench in the tree ever takes the engine branch of a capability gate.
@@ -66,6 +72,17 @@ harness = false
 name = "wasm_frame_gate"
 harness = false
 
+# The drag half of the WF-1 gate: what a redundant `selection_extend` costs.
+[[bench]]
+name = "wasm_selection_drag"
+harness = false
+
+# The WebGL browser backend's per-rAF-tick frame build (engine-side half only —
+# the GL present is not measurable in this repo; see the bench's header).
+[[bench]]
+name = "gpu_web_frame_gate"
+harness = false
+
 [[bench]]
 name = "policy_gate"
 harness = false
@@ -76,6 +93,16 @@ harness = false
 # `scrollback: None`, and therefore never builds a `Line` at all.
 [[bench]]
 name = "scrollback_materialize"
+harness = false
+
+# THE ONLY BENCH THAT MEASURES A PROCESS RATHER THAN A FUNCTION: what one
+# `exec()` of a built binary costs, and how much of it is dyld mapping
+# frameworks the route never calls. Not criterion — a criterion iteration would
+# BE a spawn — so it runs its own alternating exec loops and carries a two-sided
+# Mach-O load-command reach guard. It needs `cargo build --release --workspace
+# --bins` first and SKIPS cleanly (exit 0) when the binaries are absent.
+[[bench]]
+name = "startup_exec"
 harness = false
 
 [lints]

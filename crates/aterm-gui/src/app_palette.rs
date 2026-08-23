@@ -17,6 +17,47 @@ use crate::App;
 use crate::Wake;
 use crate::palette::{NativeCommandScope, NativeCommandTarget, PaletteLive, PaletteState};
 
+/// The `[keybindings]` face of a menu action, when one exists — the map that
+/// lets [`App::palette_live`] resolve each menu row's accelerator HINT from the
+/// EFFECTIVE binding table (platform seeds + the user's rebinds/unbinds) off
+/// macOS, where the ⌘ key-equivalents are honestly blanked and the rows used to
+/// show no chord at all. `None` = the command has no rebindable chord (its row
+/// simply shows no hint). The pairing mirrors `dispatch_menu_action` ↔
+/// `dispatch_action`: both faces of an entry here run the same verb, so the
+/// hint can never advertise a chord that does something different.
+#[cfg(not(target_os = "macos"))]
+fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Action> {
+    use crate::keybinding::Action as K;
+    use crate::menu::MenuAction as M;
+    Some(match action {
+        // Version is the glance, About the detail — both open the About route,
+        // exactly as their dispatch arms do.
+        M::About | M::Version => K::ToggleAbout,
+        M::NewWindow => K::NewWindow,
+        M::NewTab => K::NewTab,
+        M::ReopenClosedTab => K::ReopenClosedTab,
+        M::CloseTab => K::CloseTab,
+        M::Copy => K::Copy,
+        M::Paste => K::Paste,
+        M::SelectAll => K::SelectAll,
+        M::Find => K::Find,
+        M::ToggleFullScreen => K::ToggleFullscreen,
+        M::FontIncrease => K::FontIncrease,
+        M::FontDecrease => K::FontDecrease,
+        M::FontActualSize => K::FontReset,
+        M::SplitVertical => K::SplitVertical,
+        M::SplitHorizontal => K::SplitHorizontal,
+        M::ToggleMatrixRain => K::ToggleMatrixRain,
+        M::ToggleSeriousMode => K::ToggleSeriousMode,
+        M::ToggleSettings => K::ToggleSettings,
+        M::OpenPalette => K::OpenPalette,
+        M::NextTab => K::NextTab,
+        M::PrevTab => K::PrevTab,
+        M::RenameSession => K::RenameSession,
+        _ => return None,
+    })
+}
+
 impl App {
     /// Snapshot command metadata for exactly the active native view in `wid`. A terminal
     /// tab returns `None`, so app-local rows structurally disappear from its palette.
@@ -109,6 +150,28 @@ impl App {
         let can_rename = self
             .frontmost_window
             .is_some_and(|wid| self.can_rename_session(wid));
+        // Accelerator hints for menu rows (keyboard audit #6): the resolved
+        // chord for every menu action bound in the EFFECTIVE keybinding table,
+        // deduped by action (a command listed in two menus shows one truth).
+        // macOS supplies none — its rows keep their native ⌘ key-equivalents.
+        #[cfg(target_os = "macos")]
+        let menu_accels = Vec::new();
+        #[cfg(not(target_os = "macos"))]
+        let menu_accels = {
+            let mut hints: Vec<(crate::menu::MenuAction, String)> = Vec::new();
+            for section in crate::menu::MENU_MODEL {
+                for entry in section.entries {
+                    if let crate::menu::MenuEntry::Item { action, .. } = entry
+                        && !hints.iter().any(|(a, _)| a == action)
+                        && let Some(binding) = menu_binding(*action)
+                        && let Some(chord) = self.keybindings.display_chord_for(binding)
+                    {
+                        hints.push((*action, chord));
+                    }
+                }
+            }
+            hints
+        };
         PaletteLive {
             has_selection,
             can_rename,
@@ -129,6 +192,7 @@ impl App {
             // Serious mode removes the decorative row altogether above.
             // Focused=true: the palette only paints on the focused front window.
             reduced_motion: self.motion_policy(true) == crate::motion::MotionPolicy::Reduced,
+            menu_accels,
         }
     }
 

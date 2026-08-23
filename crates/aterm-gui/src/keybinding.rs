@@ -148,6 +148,16 @@ pub enum Action {
     /// several split sessions. No chord by default — bind it in `[keybindings]`
     /// (e.g. `ctrl+shift+r = "rename_session"`).
     RenameSession,
+    /// Select the entire visible screen as whole lines (Edit ▸ Select All —
+    /// `App::select_all`, the same verb the menu row fires). Default
+    /// Ctrl+Shift+A off macOS (keyboard audit #5); ⌘A stays a menu equivalent
+    /// on macOS.
+    SelectAll,
+    /// Toggle the window's borderless full-screen state (View ▸ Enter Full
+    /// Screen — `App::toggle_fullscreen`, the same winit path the menu row
+    /// takes). Default F11 off macOS (keyboard audit #3) — the chord every
+    /// Linux/Windows full-screen surface answers; bindable everywhere.
+    ToggleFullscreen,
 }
 
 /// Every bindable action NAME, in a stable order — the canonical discoverable
@@ -191,6 +201,8 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "open_palette",
     "toggle_vi_mode",
     "rename_session",
+    "select_all",
+    "toggle_fullscreen",
 ];
 
 /// Built-in Cmd-* shortcuts hardcoded in `App::on_key` + its helpers, as
@@ -243,9 +255,26 @@ pub(crate) const BUILTIN_CMD_CHORDS: &[(&str, &str)] = &[
 /// the built-in, not the reverse); else
 /// `None`. Compares NORMALIZED chords (so `cmd+C` / `shift+cmd+…` spellings agree),
 /// and `None` for unparseable input. Used by BOTH `--validate-config` and the
-/// `--list-keybinds` inline note so they can't disagree.
+/// `--list-keybinds` inline note so they can't disagree. Gated on the suite
+/// actually being LIVE ([`crate::app_input::HARDCODED_SUPER_CHORDS`]): on Linux
+/// the whole Cmd/Super suite is compiled off, so no chord conflicts with it and
+/// this always answers `None` there ([`builtin_shadow_label_when`]).
 #[must_use]
 pub(crate) fn builtin_shadow_label(chord_str: &str) -> Option<&'static str> {
+    builtin_shadow_label_when(chord_str, crate::app_input::HARDCODED_SUPER_CHORDS)
+}
+
+/// The testable core of [`builtin_shadow_label`] with the suite gate EXPLICIT.
+/// When the hardcoded Cmd/Super suite is compiled off (Linux — keyboard audit
+/// #4, `HARDCODED_SUPER_CHORDS`), `on_key` intercepts NONE of these chords, so
+/// nothing can be shadowed and every probe answers `None`: a `super+t` binding
+/// there is exactly the explicit rebind the audit promised, not a conflict —
+/// warning about it would tell a Linux user their working binding fights a
+/// built-in that does not exist on their build.
+fn builtin_shadow_label_when(chord_str: &str, suite_live: bool) -> Option<&'static str> {
+    if !suite_live {
+        return None;
+    }
     let target = Chord::parse(chord_str).ok()?;
     BUILTIN_CMD_CHORDS
         .iter()
@@ -264,9 +293,11 @@ pub(crate) fn chord_in_keybindings(
     let Ok(target) = Chord::parse(chord_str) else {
         return false;
     };
+    // An UNBIND entry (`= "none"`) is not a claim on the chord — it frees it —
+    // so it must not report a shadow that will never fire.
     keybindings
-        .keys()
-        .any(|k| Chord::parse(k).is_ok_and(|c| c == target))
+        .iter()
+        .any(|(k, v)| !is_unbind_action(v) && Chord::parse(k).is_ok_and(|c| c == target))
 }
 
 impl Action {
@@ -316,9 +347,24 @@ impl Action {
             "open_palette" => Action::OpenPalette,
             "toggle_vi_mode" => Action::ToggleViMode,
             "rename_session" => Action::RenameSession,
+            "select_all" => Action::SelectAll,
+            "toggle_fullscreen" => Action::ToggleFullscreen,
             _ => return None,
         })
     }
+}
+
+/// Whether a `[keybindings]` VALUE spells "unbind this chord" — `"none"` or
+/// `"unbind"` — rather than naming an action. An unbind entry MASKS a platform
+/// seed in [`Keybindings::resolved`]/[`Keybindings::resolved_warn`]: the chord
+/// falls through to the PTY encoder as if it had never been seeded (keyboard
+/// audit #2 — e.g. `"ctrl+tab" = "none"` returns Ctrl+Tab to a kitty-protocol
+/// app). Unbinding a chord that was never bound is a harmless no-op, NOT a
+/// warning — a config that pins "this chord stays free" should survive a seed
+/// table that later grows it.
+#[must_use]
+pub(crate) fn is_unbind_action(name: &str) -> bool {
+    matches!(name.trim(), "none" | "unbind")
 }
 
 /// Map a config modifier word to its mask bit. Accepts the common aliases so a
@@ -475,6 +521,85 @@ impl Chord {
         }
         Some(Chord { mods: mask, key })
     }
+
+    /// Human-readable presentation of this chord — `Ctrl+Shift+C`, `F11`,
+    /// `Shift+Insert` — the accelerator-hint spelling the palette/menu rows
+    /// show off macOS. ROUND-TRIPS: every output re-parses (case-folded)
+    /// through [`Chord::parse`] to this same chord, so a hint is always a
+    /// string the user could paste straight into `[keybindings]`. Modifier
+    /// order is the Windows/GTK convention (Ctrl, Alt, Shift, Super).
+    #[must_use]
+    // Reached only through `Keybindings::display_chord_for`, whose caller in
+    // `app_palette.rs` is `#[cfg(not(target_os = "macos"))]`; `test` because the
+    // round-trip tests below exercise it on every platform.
+    #[cfg(any(test, not(target_os = "macos")))]
+    pub(crate) fn display(&self) -> String {
+        let mut out = String::new();
+        if self.mods & MOD_CTRL != 0 {
+            out.push_str("Ctrl+");
+        }
+        if self.mods & MOD_ALT != 0 {
+            out.push_str("Alt+");
+        }
+        if self.mods & MOD_SHIFT != 0 {
+            out.push_str("Shift+");
+        }
+        if self.mods & MOD_CMD != 0 {
+            out.push_str("Super+");
+        }
+        match &self.key {
+            // `+` is the parse separator, so its round-trippable spelling is the
+            // word form (`ctrl+plus`), title-cased like the named keys.
+            KeyToken::Char('+') => out.push_str("Plus"),
+            // ASCII-only uppercase, because `parse` folds ASCII-only: the
+            // Unicode fold broke the documented round-trip both ways — 'ß'
+            // uppercased to the TWO-char "SS" (an unknown word that fails
+            // `key_token`), and a one-char map like 'é'→'É' re-parsed to 'É',
+            // which `to_ascii_lowercase` never folds back to 'é'.
+            KeyToken::Char(c) => out.push(c.to_ascii_uppercase()),
+            KeyToken::Named(named) => out.push_str(named_key_display(*named)),
+        }
+        out
+    }
+}
+
+/// Display name of a parseable [`NamedKey`] — the reverse of [`key_token`]'s
+/// named table, in the spelling that re-parses. Only keys `key_token` can
+/// produce reach this in practice (a [`Chord`] in a map was built by `parse` or
+/// matched one that was); the `"?"` tail keeps the match total for any future
+/// `from_event`-only chord that acquires a display path.
+#[cfg(any(test, not(target_os = "macos")))]
+fn named_key_display(named: NamedKey) -> &'static str {
+    match named {
+        NamedKey::Enter => "Enter",
+        NamedKey::Tab => "Tab",
+        NamedKey::Space => "Space",
+        NamedKey::Escape => "Esc",
+        NamedKey::Backspace => "Backspace",
+        NamedKey::Delete => "Del",
+        NamedKey::Insert => "Insert",
+        NamedKey::ArrowUp => "Up",
+        NamedKey::ArrowDown => "Down",
+        NamedKey::ArrowLeft => "Left",
+        NamedKey::ArrowRight => "Right",
+        NamedKey::Home => "Home",
+        NamedKey::End => "End",
+        NamedKey::PageUp => "PageUp",
+        NamedKey::PageDown => "PageDown",
+        NamedKey::F1 => "F1",
+        NamedKey::F2 => "F2",
+        NamedKey::F3 => "F3",
+        NamedKey::F4 => "F4",
+        NamedKey::F5 => "F5",
+        NamedKey::F6 => "F6",
+        NamedKey::F7 => "F7",
+        NamedKey::F8 => "F8",
+        NamedKey::F9 => "F9",
+        NamedKey::F10 => "F10",
+        NamedKey::F11 => "F11",
+        NamedKey::F12 => "F12",
+        _ => "?",
+    }
 }
 
 /// The parsed `[keybindings]` table: a chord → action map consulted at the top of
@@ -486,13 +611,17 @@ pub struct Keybindings {
 }
 
 impl Keybindings {
-    /// Collect the parsed map PLUS a per-entry WARNING string (unprefixed) for each
-    /// skipped chord/action. Shared by [`Self::from_config`] (which eprintln!s them)
-    /// and [`Self::from_config_warn`] (which returns them for an in-window notice).
+    /// Collect the parsed map, the UNBIND chords (`"none"`/`"unbind"` values —
+    /// see [`is_unbind_action`]), PLUS a per-entry WARNING string (unprefixed)
+    /// for each skipped chord/action. Shared by [`Self::from_config`] (which
+    /// eprintln!s the warnings), [`Self::from_config_warn`] (which returns them
+    /// for an in-window notice), and [`Self::resolved_warn`] (the only consumer
+    /// of the unbinds — a config-only map has no platform seed to mask).
     fn collect(
         table: Option<&std::collections::BTreeMap<String, String>>,
-    ) -> (HashMap<Chord, Action>, Vec<String>) {
+    ) -> (HashMap<Chord, Action>, Vec<Chord>, Vec<String>) {
         let mut map = HashMap::new();
+        let mut unbinds = Vec::new();
         let mut warns = Vec::new();
         if let Some(table) = table {
             for (chord_str, action_str) in table {
@@ -503,6 +632,10 @@ impl Keybindings {
                         continue;
                     }
                 };
+                if is_unbind_action(action_str) {
+                    unbinds.push(chord);
+                    continue;
+                }
                 let Some(action) = Action::parse(action_str) else {
                     warns.push(format!(
                         "config keybindings: skipping {chord_str:?}: unknown action {action_str:?}"
@@ -512,7 +645,7 @@ impl Keybindings {
                 map.insert(chord, action);
             }
         }
-        (map, warns)
+        (map, unbinds, warns)
     }
 
     /// Build from the raw config table (chord-string → action-name). Each entry
@@ -526,7 +659,7 @@ impl Keybindings {
     #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn from_config(table: Option<&std::collections::BTreeMap<String, String>>) -> Keybindings {
-        let (map, warns) = Self::collect(table);
+        let (map, _unbinds, warns) = Self::collect(table);
         for w in &warns {
             eprintln!("aterm-gui: {w}");
         }
@@ -536,11 +669,16 @@ impl Keybindings {
     /// Like [`Self::from_config`] but RETURNS the warnings instead of printing them, so
     /// the GUI can surface dropped rules in an in-window notice (stderr is invisible to
     /// a Finder-launched .app). The map is byte-identical to `from_config`.
+    // Config-only ctor pair of `from_config`: production moved to `resolved_warn`
+    // (which consults `collect` directly so unbinds can mask the platform seeds),
+    // leaving both no-defaults ctors to the config-parsing tests — same allowance,
+    // same reason as `from_config` above.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[must_use]
     pub fn from_config_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (Keybindings, Vec<String>) {
-        let (map, warns) = Self::collect(table);
+        let (map, _unbinds, warns) = Self::collect(table);
         (Keybindings { map }, warns)
     }
 
@@ -561,9 +699,15 @@ impl Keybindings {
     pub(crate) const PLATFORM_DEFAULT_PAIRS: &'static [(&'static str, &'static str)] = &[
         ("ctrl+shift+c", "copy"),
         ("ctrl+shift+v", "paste"),
-        // The Windows-native muscle memory (Windows Terminal defaults): plain
-        // Ctrl+V pastes — the deliberate WT tradeoff (it shadows bash's
-        // quoted-insert ^V; rebindable) — plus the classic Insert pair.
+        // WINDOWS ONLY: plain Ctrl+V pastes — the Windows-native muscle memory
+        // (Windows Terminal ships it, accepting that it shadows quoted-insert
+        // ^V; rebindable). On Linux the chord is deliberately NOT seeded
+        // (keyboard audit #1): ^V there is readline quoted-insert and vim's
+        // visual-block entry — keys a terminal owes its user — and every Linux
+        // terminal convention pastes on Ctrl+Shift+V / Shift+Insert, both of
+        // which stay seeded. A Linux user who wants the WT behaviour writes one
+        // config line: `"ctrl+v" = "paste"`.
+        #[cfg(windows)]
         ("ctrl+v", "paste"),
         ("shift+insert", "paste"),
         ("ctrl+insert", "copy"),
@@ -619,8 +763,20 @@ impl Keybindings {
         ("ctrl+-", "font_decrease"),
         ("ctrl+0", "font_reset"),
         ("ctrl+shift+s", "toggle_settings"),
-        ("ctrl+shift+a", "toggle_about"),
+        // Ctrl+Shift+A is SELECT ALL (keyboard audit #5): the Shift-elevated
+        // form of the universal ^A, the same pattern every seeded clipboard
+        // chord here follows (^C/^V/^F → Ctrl+Shift+…). It used to open About —
+        // but a whole-screen selection is a daily verb and About is a
+        // destination, reachable from the palette (Ctrl+Shift+P) and the menu,
+        // and still bindable via `toggle_about`.
+        ("ctrl+shift+a", "select_all"),
         ("ctrl+shift+p", "open_palette"),
+        // F11 full-screen (keyboard audit #3): the chord every Linux/Windows
+        // full-screen surface answers (GNOME/KDE convention, Windows Terminal
+        // default). It does shadow the raw F11 a TUI app could receive — the
+        // same trade GNOME Terminal makes — and both escape hatches are one
+        // line: rebind it, or `"f11" = "none"` to return the key to the PTY.
+        ("f11", "toggle_fullscreen"),
         // NOTE: jump-to-tab-N is intentionally NOT seeded, on EITHER spelling.
         // Both candidate chords collide with something a keyboard already owes
         // its user, and neither collision is ours to accept by default:
@@ -686,22 +842,26 @@ impl Keybindings {
     #[cfg_attr(not(test), allow(dead_code))] // test-only now; App::new uses resolved_warn
     #[must_use]
     pub fn resolved(table: Option<&std::collections::BTreeMap<String, String>>) -> Keybindings {
-        let mut kb = Keybindings::platform_defaults();
-        for (chord, action) in Keybindings::from_config(table).map {
-            kb.map.insert(chord, action);
-        }
-        kb
+        Self::resolved_warn(table).0
     }
 
     /// Like [`Self::resolved`] but RETURNS the user-table warnings (the platform
     /// defaults are compile-time-checked and never warn). For the GUI config notice.
+    ///
+    /// This is also where an UNBIND entry (`"<chord>" = "none"`/`"unbind"`)
+    /// takes effect: the chord is REMOVED from the platform-default map before
+    /// the user's own bindings overlay, so a masked seed falls through to the
+    /// PTY encoder exactly as if it had never been seeded.
     #[must_use]
     pub fn resolved_warn(
         table: Option<&std::collections::BTreeMap<String, String>>,
     ) -> (Keybindings, Vec<String>) {
         let mut kb = Keybindings::platform_defaults();
-        let (user, warns) = Keybindings::from_config_warn(table);
-        for (chord, action) in user.map {
+        let (user, unbinds, warns) = Self::collect(table);
+        for chord in &unbinds {
+            kb.map.remove(chord);
+        }
+        for (chord, action) in user {
             kb.map.insert(chord, action);
         }
         (kb, warns)
@@ -724,6 +884,41 @@ impl Keybindings {
         }
         let chord = Chord::from_event(logical, mods)?;
         self.map.get(&chord).copied()
+    }
+
+    /// The DISPLAY chord for `action` in this EFFECTIVE map, if any — the
+    /// accelerator hint the palette's menu rows show off macOS (where the ⌘
+    /// key-equivalents are honestly blanked and the rows used to show nothing).
+    ///
+    /// Preference order: the first [`Self::PLATFORM_DEFAULT_PAIRS`] entry
+    /// (presentation order — so Next Tab shows `Ctrl+Shift+Right`, not one of
+    /// its aliases) that STILL resolves to `action` in this map — a user rebind
+    /// or `"none"` unbind of a seed is therefore honored, never advertised
+    /// stale. When no seed survives, the lexicographically smallest display of
+    /// any user-bound chord (stable across the `HashMap`'s arbitrary iteration
+    /// order). `None` when nothing is bound: the row shows no hint rather than
+    /// a chord that does not work.
+    #[must_use]
+    // The palette hint column; its one caller (`app_palette.rs`) is
+    // `#[cfg(not(target_os = "macos"))]` because macOS draws the hint from the
+    // native menu instead, and its test carries the SAME gate — so on macOS this
+    // is genuinely unreachable and the cfg is exact rather than widened with
+    // `test`.
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn display_chord_for(&self, action: Action) -> Option<String> {
+        for (chord_str, action_str) in Self::PLATFORM_DEFAULT_PAIRS {
+            if Action::parse(action_str) == Some(action)
+                && let Ok(chord) = Chord::parse(chord_str)
+                && self.map.get(&chord) == Some(&action)
+            {
+                return Some(chord.display());
+            }
+        }
+        self.map
+            .iter()
+            .filter(|&(_, a)| *a == action)
+            .map(|(c, _)| c.display())
+            .min()
     }
 }
 
@@ -1156,17 +1351,37 @@ mod tests {
                 Some(Action::NewTab),
                 "Ctrl+Shift+T new tab"
             );
-            // The native Settings tab and in-window About surface are the ONLY
-            // way to reach them off macOS, so their default chords are load-bearing.
+            // The native Settings tab is the ONLY way to reach Settings off
+            // macOS, so its default chord is load-bearing.
             assert_eq!(
                 kb.lookup(&ch("s"), cs),
                 Some(Action::ToggleSettings),
                 "Ctrl+Shift+S opens Settings"
             );
+            // Keyboard audit #5: Ctrl+Shift+A is SELECT ALL, not About — About
+            // moved to the palette/menu (and stays bindable via `toggle_about`).
             assert_eq!(
                 kb.lookup(&ch("a"), cs),
-                Some(Action::ToggleAbout),
-                "Ctrl+Shift+A opens About"
+                Some(Action::SelectAll),
+                "Ctrl+Shift+A selects all"
+            );
+            // Keyboard audit #3: F11 toggles full-screen (bare chord, no mods).
+            assert_eq!(
+                kb.lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
+                Some(Action::ToggleFullscreen),
+                "F11 toggles full-screen"
+            );
+            // Keyboard audit #1: plain Ctrl+V pastes ONLY on Windows (the WT
+            // default). On Linux it stays the PTY's — readline quoted-insert
+            // and vim visual-block — with Ctrl+Shift+V/Shift+Insert seeded.
+            assert_eq!(
+                kb.lookup(&ch("v"), ModifiersState::CONTROL),
+                if cfg!(windows) {
+                    Some(Action::Paste)
+                } else {
+                    None
+                },
+                "plain Ctrl+V is a Windows-only paste seed"
             );
             // Plain Ctrl+C is NOT bound (stays SIGINT to the PTY).
             assert_eq!(kb.lookup(&ch("c"), ModifiersState::CONTROL), None);
@@ -1290,6 +1505,118 @@ mod tests {
             Some(Action::SwitchTab(2)),
             "opt-in still works"
         );
+    }
+
+    /// UNBIND (keyboard audit #2): a `[keybindings]` value of `"none"` (or
+    /// `"unbind"`) MASKS a platform seed — the chord misses the map and falls
+    /// through to the PTY encoder as if never seeded — and is NOT an unknown
+    /// action (no warning). Unbinding a chord that was never bound is a silent
+    /// no-op, and the surrounding seeds survive untouched.
+    #[test]
+    fn unbind_value_masks_platform_seed() {
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+tab".to_string(), "none".to_string());
+        table.insert("f11".to_string(), "unbind".to_string());
+        table.insert("ctrl+alt+f9".to_string(), "none".to_string()); // never bound: no-op
+        let (kb, warns) = Keybindings::resolved_warn(Some(&table));
+        assert!(warns.is_empty(), "unbind is not an unknown action: {warns:?}");
+        assert_eq!(
+            kb.lookup(&WinitKey::Named(NamedKey::Tab), ModifiersState::CONTROL),
+            None,
+            "ctrl+tab seed is masked"
+        );
+        assert_eq!(
+            kb.lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
+            None,
+            "f11 seed is masked (both spellings work)"
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            kb.lookup(&ch("c"), ModifiersState::CONTROL | ModifiersState::SHIFT),
+            Some(Action::Copy),
+            "the other seeds survive an unbind"
+        );
+        // An unbind in the config-only ctor simply binds nothing (no seed to
+        // mask there), and never warns.
+        let (kb_cfg, warns_cfg) = Keybindings::from_config_warn(Some(&table));
+        assert!(warns_cfg.is_empty());
+        assert!(kb_cfg.is_empty());
+        // …and an unbind entry is NOT a [key_sequences] shadow claim.
+        assert!(!chord_in_keybindings("ctrl+tab", &table));
+    }
+
+    /// The accelerator-hint reverse lookup: seeds resolve in PRESENTATION order,
+    /// a user rebind/unbind is honored (never a stale hint), an unbound action
+    /// yields None, and every display spelling round-trips through
+    /// `Chord::parse` so a hint is always pasteable into `[keybindings]`.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn display_chord_for_resolves_effective_hints() {
+        let kb = Keybindings::resolved(None);
+        assert_eq!(
+            kb.display_chord_for(Action::Copy).as_deref(),
+            Some("Ctrl+Shift+C")
+        );
+        assert_eq!(
+            kb.display_chord_for(Action::ToggleFullscreen).as_deref(),
+            Some("F11")
+        );
+        assert_eq!(
+            kb.display_chord_for(Action::NextTab).as_deref(),
+            Some("Ctrl+Shift+Right"),
+            "presentation order picks the FIRST seeded spelling, not an alias"
+        );
+        assert_eq!(
+            kb.display_chord_for(Action::ToggleMatrixRain),
+            None,
+            "an unbound action shows no hint"
+        );
+        // Unseat BOTH copy seeds and rebind: the hint follows the user's table.
+        let mut t = std::collections::BTreeMap::new();
+        t.insert("ctrl+shift+c".to_string(), "none".to_string());
+        t.insert("ctrl+insert".to_string(), "none".to_string());
+        t.insert("ctrl+shift+y".to_string(), "copy".to_string());
+        let kb2 = Keybindings::resolved(Some(&t));
+        assert_eq!(
+            kb2.display_chord_for(Action::Copy).as_deref(),
+            Some("Ctrl+Shift+Y")
+        );
+        // Unseat only the primary: the surviving seed is the honest hint.
+        let mut t2 = std::collections::BTreeMap::new();
+        t2.insert("ctrl+shift+c".to_string(), "none".to_string());
+        let kb3 = Keybindings::resolved(Some(&t2));
+        assert_eq!(
+            kb3.display_chord_for(Action::Copy).as_deref(),
+            Some("Ctrl+Insert")
+        );
+        // Round-trip: every seed's display re-parses to the same chord.
+        for (chord_str, _) in Keybindings::PLATFORM_DEFAULT_PAIRS {
+            let chord = Chord::parse(chord_str).unwrap();
+            assert_eq!(
+                Chord::parse(&chord.display()),
+                Ok(chord.clone()),
+                "display of {chord_str:?} must round-trip"
+            );
+        }
+    }
+
+    /// Display's uppercase is ASCII-only, because `parse` folds ASCII-only:
+    /// the Unicode fold turned `ctrl+ß` into "Ctrl+SS" (two chars — an unknown
+    /// word that no longer parses) and `ctrl+é` into "Ctrl+É" (which re-parses
+    /// to the DIFFERENT chord key 'É'). Non-ASCII keys display verbatim and
+    /// round-trip; ASCII letters keep their uppercase hint spelling.
+    #[test]
+    fn display_round_trips_non_ascii_chord_keys() {
+        for spelling in ["ctrl+ß", "ctrl+é", "ctrl+shift+a", "alt+µ"] {
+            let chord = Chord::parse(spelling).unwrap();
+            assert_eq!(
+                Chord::parse(&chord.display()),
+                Ok(chord.clone()),
+                "display of {spelling:?} must round-trip"
+            );
+        }
+        assert_eq!(Chord::parse("ctrl+ß").unwrap().display(), "Ctrl+ß");
+        assert_eq!(Chord::parse("ctrl+a").unwrap().display(), "Ctrl+A");
     }
 
     // ---- [key_sequences] input policy ------------------------------------
@@ -1447,15 +1774,33 @@ mod tests {
         }
     }
 
-    /// builtin_shadow_label maps known built-ins (normalizing spelling); None otherwise.
+    /// builtin_shadow_label maps known built-ins (normalizing spelling); None
+    /// otherwise. Exercised through the gate-explicit core with the suite LIVE,
+    /// so the mapping is asserted identically on every platform.
     #[test]
     fn builtin_shadow_label_maps_known_and_normalizes() {
-        assert_eq!(builtin_shadow_label("cmd+c"), Some("Copy"));
-        assert_eq!(builtin_shadow_label("cmd+shift+]"), Some("Next Tab"));
-        assert_eq!(builtin_shadow_label("cmd+1"), Some("Switch to Tab 1"));
-        assert_eq!(builtin_shadow_label("shift+cmd+]"), Some("Next Tab"));
-        assert_eq!(builtin_shadow_label("cmd+k"), None);
-        assert_eq!(builtin_shadow_label("garbage++"), None);
+        assert_eq!(builtin_shadow_label_when("cmd+c", true), Some("Copy"));
+        assert_eq!(builtin_shadow_label_when("cmd+shift+]", true), Some("Next Tab"));
+        assert_eq!(builtin_shadow_label_when("cmd+1", true), Some("Switch to Tab 1"));
+        assert_eq!(builtin_shadow_label_when("shift+cmd+]", true), Some("Next Tab"));
+        assert_eq!(builtin_shadow_label_when("cmd+k", true), None);
+        assert_eq!(builtin_shadow_label_when("garbage++", true), None);
+    }
+
+    /// With the Cmd/Super suite compiled OFF (Linux — keyboard audit #4) NO
+    /// chord can shadow it, so every probe answers None — a Linux `super+t`
+    /// rebind must not warn "conflicts with built-in New Tab" for a suite that
+    /// is not there. The platform wrapper follows `HARDCODED_SUPER_CHORDS`.
+    #[test]
+    fn builtin_shadow_label_is_silent_when_the_suite_is_gated_off() {
+        assert_eq!(builtin_shadow_label_when("cmd+c", false), None);
+        assert_eq!(builtin_shadow_label_when("super+t", false), None);
+        let expected = if crate::app_input::HARDCODED_SUPER_CHORDS {
+            Some("Copy")
+        } else {
+            None
+        };
+        assert_eq!(builtin_shadow_label("cmd+c"), expected);
     }
 
     /// chord_in_keybindings detects a cross-table collision (normalized).

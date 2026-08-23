@@ -15,17 +15,18 @@
 //! needs to depend on the other for keyboard functionality.
 
 // The DOM (KeyboardEvent.key) → engine key map, the web bindings' sibling of
-// winit_map. Pure string matching (no platform deps), so no feature gate.
+// the winit map. Pure string matching (no platform deps), so it belongs here.
 mod dom_map;
 mod encode;
 mod key_types;
 mod mode;
 mod term_mode;
-// K-2: the winit→engine key map (the GUI's platform keyboard, and the future
-// native shell's, mapped into the engine's bridge-agnostic `Key`). Behind the
-// `winit-keymap` feature so non-GUI consumers never link winit.
-#[cfg(feature = "winit-keymap")]
-mod winit_map;
+// THE winit→engine key map (K-2) is NOT here: it is `aterm-winit-keymap`, its
+// own crate. It sat here behind an optional `winit-keymap` feature meant to keep
+// non-GUI consumers winit-free, and workspace feature unification defeated that
+// — `aterm-ctl` came out of a plain `cargo build --workspace` linking AppKit.
+// Keeping this module platform-free is the point; a new platform map goes in a
+// crate of its own, never behind a feature of aterm-types.
 
 pub use dom_map::{encode_dom_key, map_dom_key};
 pub use encode::{
@@ -35,8 +36,6 @@ pub use encode::{
 pub use key_types::{Key, KeyEventType, Modifiers, NamedKey};
 pub use mode::KeyboardMode;
 pub use term_mode::TermMode;
-#[cfg(feature = "winit-keymap")]
-pub use winit_map::{base_layout_key_for, map_logical_key, map_named_key, map_physical_numpad};
 
 #[cfg(test)]
 mod tests;

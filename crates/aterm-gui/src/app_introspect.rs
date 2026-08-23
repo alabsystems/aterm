@@ -1270,10 +1270,29 @@ fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> 
 
 /// Present-time placement of one frame axis inside one raw surface axis.
 /// Positive remainder becomes leading/trailing background bands; negative
-/// remainder becomes leading/trailing crop. The offset is exactly the shared
-/// CPU/GPU [`aterm_render::band_offset`] rule used by application-present.
+/// remainder becomes leading/trailing crop. The HORIZONTAL axis uses exactly
+/// the shared CPU/GPU centred [`aterm_render::band_offset`] rule; the vertical
+/// one takes [`dims_axis_y`] (the platform [`aterm_render::band_offset_y`],
+/// top-pinned on Linux) so `dims` reports the placement the presenters used.
 fn dims_axis(surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
-    let offset = aterm_render::band_offset(surface as usize, frame as usize);
+    dims_axis_at(
+        aterm_render::band_offset(surface as usize, frame as usize),
+        surface,
+        frame,
+    )
+}
+
+/// [`dims_axis`]'s vertical twin: same band/crop algebra over the platform
+/// vertical placement offset.
+fn dims_axis_y(surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
+    dims_axis_at(
+        aterm_render::band_offset_y(surface as usize, frame as usize),
+        surface,
+        frame,
+    )
+}
+
+fn dims_axis_at(offset: i64, surface: u32, frame: u32) -> (i64, u32, u32, u32, u32) {
     let surface = i64::from(surface);
     let frame = i64::from(frame);
     let end = offset + frame;
@@ -1630,7 +1649,7 @@ impl App {
         let (offset_x, band_left, band_right, crop_left, crop_right) =
             dims_axis(surface_w, frame_w);
         let (offset_y, band_top, band_bottom, crop_top, crop_bottom) =
-            dims_axis(surface_h, frame_h);
+            dims_axis_y(surface_h, frame_h);
         let (
             present_retry_state,
             present_retry_count,
@@ -2877,6 +2896,7 @@ impl App {
                 }
             }
             self.splice_config_notice(front);
+            self.splice_paste_banner(front);
             // C5: the open tab context menu is the topmost chrome on the glass,
             // so it must be the topmost chrome in the capture too — an
             // introspection frame that omits it would tell a driving AI the
@@ -3147,6 +3167,7 @@ impl App {
             // Native preparation leaves the semantic surface in the tray. Paint
             // diagnostic cells afterward, exactly like the application-present path.
             self.splice_config_notice(front);
+            self.splice_paste_banner(front);
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
         }
@@ -3770,6 +3791,7 @@ impl App {
             self.splice_notice(front);
             self.splice_level_up(front);
             self.splice_config_notice(front);
+            self.splice_paste_banner(front);
             // C5 — topmost chrome; see the `chrome`-capture route above.
             self.splice_tab_menu(front);
             capture_grid
@@ -5840,7 +5862,7 @@ pub(crate) fn encode_rgba8_png(rgba: &[u8], width: u32, height: u32) -> Result<V
 mod dims_snapshot_tests {
     use std::time::Instant;
 
-    use super::{App, dims_axis};
+    use super::{App, dims_axis, dims_axis_y};
     use crate::WindowId;
     use winit::dpi::PhysicalSize;
 
@@ -5856,6 +5878,15 @@ mod dims_snapshot_tests {
             (-6, 0, 0, 6, 5),
             "the same centered rule exposes transient crop on both sides"
         );
+        // The vertical axis follows the platform placement: top-pinned on Linux
+        // (all slack/crop trailing), the centred rule elsewhere.
+        if cfg!(target_os = "linux") {
+            assert_eq!(dims_axis_y(111, 100), (0, 0, 11, 0, 0));
+            assert_eq!(dims_axis_y(100, 111), (0, 0, 0, 0, 11));
+        } else {
+            assert_eq!(dims_axis_y(111, 100), dims_axis(111, 100));
+            assert_eq!(dims_axis_y(100, 111), dims_axis(100, 111));
+        }
     }
 
     #[test]
@@ -5978,7 +6009,14 @@ mod dims_snapshot_tests {
             (surface.width, surface.height)
         );
         assert_eq!((banded.band_left, banded.band_right), (5, 6));
-        assert_eq!((banded.band_top, banded.band_bottom), (14, 14));
+        // Vertical placement is the platform policy: top-pinned on Linux (the
+        // whole 28 px remainder lands in the bottom band, keeping the chrome
+        // band glued to the titlebar), centred elsewhere.
+        if cfg!(target_os = "linux") {
+            assert_eq!((banded.band_top, banded.band_bottom), (0, 28));
+        } else {
+            assert_eq!((banded.band_top, banded.band_bottom), (14, 14));
+        }
         assert_eq!(banded.offset_y, i64::from(banded.band_top));
         assert_eq!(
             banded.band_top + banded.band_bottom,
@@ -5986,8 +6024,10 @@ mod dims_snapshot_tests {
         );
         assert_eq!(
             banded.pad_bottom + banded.band_bottom,
-            26,
-            "visible trailing edge is base bottom plus only the raw-surface remainder",
+            if cfg!(target_os = "linux") { 40 } else { 26 },
+            "visible trailing edge is base bottom plus the raw-surface remainder \
+             this platform's vertical placement leaves below the frame \
+             (all 28 px on top-pinned Linux, the centred half elsewhere)",
         );
         assert_eq!(
             (

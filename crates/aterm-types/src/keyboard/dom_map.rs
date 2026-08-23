@@ -6,8 +6,8 @@
 //!
 //! The reusable bridge from a browser's [UI Events `KeyboardEvent.key`] value to
 //! the engine's bridge-agnostic [`Key`]/[`NamedKey`], the web sibling of
-//! `winit_map.rs` (K-2): it lives here so the wasm bindings (`aterm-wasm`,
-//! `aterm-gpu-web`) share ONE table instead of each host hand-rolling a
+//! the `aterm-winit-keymap` crate (K-2): it lives here so the wasm bindings
+//! (`aterm-wasm`, `aterm-gpu-web`) share ONE table instead of each host hand-rolling a
 //! legacy-only TS encoder that drifts (the old embedder encoder dropped
 //! Shift/Ctrl/Alt on arrows/nav keys and could never speak the Kitty protocol
 //! the engine advertises).
@@ -64,7 +64,7 @@ pub fn encode_dom_key(
 /// launch / browser keys) no terminal escape sequence covers.
 ///
 /// `" "` maps to [`NamedKey::Space`], not `Key::Character(' ')`, mirroring
-/// `winit_map::map_named_key` — the legacy encoder's named-Space arm carries
+/// `aterm_winit_keymap::map_named_key` — the legacy encoder's named-Space arm carries
 /// the Ctrl+Space → NUL and Alt+Space → ESC SP semantics the encoder tests
 /// pin (`tests_legacy.rs`), and its Kitty code (32) matches the character form.
 ///
@@ -204,7 +204,7 @@ mod tests {
     fn space_maps_to_the_named_form_legacy_expects() {
         // DOM reports the space bar as the literal " " string. The engine's
         // legacy encoder pins Ctrl+Space → NUL on the NAMED Space arm
-        // (tests_legacy.rs), mirroring winit_map's Space → NamedKey::Space.
+        // (tests_legacy.rs), mirroring aterm-winit-keymap's Space → NamedKey::Space.
         assert_eq!(map_dom_key(" "), Some(Key::Named(NamedKey::Space)));
     }
 

@@ -137,12 +137,26 @@ impl Terminal {
                 self.parser.reset();
                 // Clear session-only state not accessible from the handler (#7336).
                 self.secure_keyboard_entry = false;
+                // Kill the parked selection HERE, not by leaning on the park/restore
+                // below and not on the `All` that the reset's `erase_scrollback`
+                // happens to record on the way past.
+                //
+                // RIS does swap the main grid back (`reset_common_fields`), but that
+                // does NOT guarantee the restore fires: for `\x1bc\x1b[?1049h` — RIS
+                // then re-enter alt in ONE batch — `was_alt` and
+                // `modes.alternate_screen` are both true at `post_process`, so
+                // neither the park nor the restore runs. That is exactly the case
+                // this line is load-bearing for: without it the stale pre-RIS main
+                // selection sits in the slot and is restored on the NEXT `?1049l`,
+                // over a grid the reset already erased. The reason it must go is the
+                // reset itself.
+                self.parked_text_selection.clear();
                 self.transient.pending_parser_reset = false;
             }
             let parse_end = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (web_time = std on native, JS clock on wasm)
 
             let grid_start = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (web_time = std on native, JS clock on wasm)
-            self.post_process(lines_before);
+            self.post_process(lines_before, was_alt);
             // Observation Kernel (L0): evaluate + latch armed watchers at the one
             // seam where this batch's mutation has landed. `process_now` is the
             // injected clock (never read here), so this is replay-deterministic.
@@ -166,9 +180,23 @@ impl Terminal {
                 self.parser.reset();
                 // Clear session-only state not accessible from the handler (#7336).
                 self.secure_keyboard_entry = false;
+                // Kill the parked selection HERE, not by leaning on the park/restore
+                // below and not on the `All` that the reset's `erase_scrollback`
+                // happens to record on the way past.
+                //
+                // RIS does swap the main grid back (`reset_common_fields`), but that
+                // does NOT guarantee the restore fires: for `\x1bc\x1b[?1049h` — RIS
+                // then re-enter alt in ONE batch — `was_alt` and
+                // `modes.alternate_screen` are both true at `post_process`, so
+                // neither the park nor the restore runs. That is exactly the case
+                // this line is load-bearing for: without it the stale pre-RIS main
+                // selection sits in the slot and is restored on the NEXT `?1049l`,
+                // over a grid the reset already erased. The reason it must go is the
+                // reset itself.
+                self.parked_text_selection.clear();
                 self.transient.pending_parser_reset = false;
             }
-            self.post_process(lines_before);
+            self.post_process(lines_before, was_alt);
             // Observation Kernel (L0): see the gated branch above — same seam,
             // same injected clock, replay-deterministic.
             self.observe_at(self.transient.process_now);
@@ -259,7 +287,12 @@ impl Terminal {
     }
 
     /// Post-processing after parser advances: selection adjustment and BiDi sync.
-    fn post_process(&mut self, absolute_rows_before: u64) {
+    ///
+    /// `was_alt` is which screen the batch STARTED on, captured by the caller
+    /// before the parser ran — the batch may have switched screens since, and this
+    /// is the only place that can tell.
+    #[allow(clippy::too_many_lines)] // the crate's per-function convention (lib.rs)
+    fn post_process(&mut self, absolute_rows_before: u64, was_alt: bool) {
         // Top-anchored partial scrollback inserts logical rows immediately
         // before a protected footer. Keep every durable OSC/shell anchor paired
         // with the footer content that stayed fixed on screen.
@@ -272,6 +305,41 @@ impl Terminal {
                 &mut self.transient,
                 &mut self.absolute_row_revision,
             );
+        }
+
+        // SELECTION CUSTODY, screen-scoped selection (the Phase-3 remainder).
+        // A selection belongs to the SCREEN it was made on. Park the outgoing
+        // screen's on the batch that leaves it; restore the incoming screen's on
+        // the batch that comes back.
+        //
+        // This is the top of `post_process` on purpose, and neither of the two more
+        // obvious homes works:
+        //
+        // - The VT handler runs MID-batch. Parking there would hand the rest of the
+        //   batch's row-splice / scroll-delta / damage drain below to the wrong
+        //   selection, and those signals are drained from `self.grid`, which by then
+        //   is already the incoming grid.
+        // - The SCR-1 epilogue runs AFTER that drain. By then a 1049 enter has
+        //   already compared the band `enter_alternate_screen`'s `new_grid
+        //   .erase_screen()` recorded — computed from the FRESH ALT grid's
+        //   `absolute_row_counter`, so `[0, rows-1]` — against MAIN-screen anchors.
+        //   `SelectionDamage::Band` carries no grid identity, so that comparison
+        //   type-checks, runs, and silently relates two unrelated coordinate spaces:
+        //   a main LIVE selection is destroyed and a main SCROLLBACK selection (whose
+        //   absolutes are negative) survives, for no reason either one could name.
+        //
+        // Placed here, `self.grid` and `self.text_selection` are the same screen's
+        // for the whole rest of the function.
+        //
+        // `mem::take` in both directions, deliberately NOT a swap: the alt screen's
+        // own selection dies at exit rather than becoming a second durable selection
+        // with its own lifetime. See the field doc for why that asymmetry is what
+        // keeps the clear-site list finite.
+        let left_alt = was_alt && !self.modes.alternate_screen;
+        if left_alt {
+            self.text_selection = std::mem::take(&mut self.parked_text_selection);
+        } else if !was_alt && self.modes.alternate_screen {
+            self.parked_text_selection = std::mem::take(&mut self.text_selection);
         }
 
         // Adjust selection coordinates after content scroll (#4056). A
@@ -329,13 +397,37 @@ impl Terminal {
                 // operation clear arm below. Enforce that cross-field contract
                 // at the process boundary in every debug/test build.
                 let absolute_rows_after = self.grid.absolute_row_counter();
+                // EXEMPT a batch that switched screens. `absolute_rows_before` was read
+                // from the OUTGOING grid and `absolute_rows_after` from the INCOMING
+                // one; the two counters are unrelated (a fresh alt grid restarts at
+                // `rows`), so the accounting identity is not merely violated, it is not
+                // even a statement about one coordinate space. The projection below is
+                // unaffected: `at`, `inserted` and `absolute_rows_after` all come from
+                // the incoming grid, so it stays self-consistent.
+                //
+                // The EXIT direction is live today: a top-anchored DECSTBM archival
+                // scroll on main strands a splice on the main grid — nothing drains a
+                // parked grid — and the batch that swaps it back drains it. This arm was
+                // unreachable on a switching batch until now only because
+                // `force_selection_invalidation` forced `scroll_delta == i32::MAX` into
+                // the fail-closed `(Some(_), _)` arm.
+                //
+                // The guard is symmetric anyway. The ENTER direction cannot reach it as
+                // the code stands — `enter_alternate_screen_raw` reuses the persistent
+                // alt buffer, but that buffer can never RECORD a splice: the archival
+                // top-anchored path needs `max_scrollback > 0 || scrollback.is_some() ||
+                // scrollback_detached_for_reflow` and the alt grid is always
+                // `Grid::with_scrollback(rows, cols, 0)` with no tiered store. That is a
+                // property of the alt grid's construction, not of this arm, so do not
+                // narrow the guard to match it.
                 debug_assert!(
-                    splice_accounts_for_batch_row_advance(
-                        absolute_rows_before,
-                        absolute_rows_after,
-                        inserted,
-                    ),
-                    "zero-delta selection splice must account for the batch's entire absolute-row advance: before={absolute_rows_before}, after={absolute_rows_after}, inserted={inserted}; every other absolute_row_counter bump must set content_scroll_delta",
+                    was_alt != self.modes.alternate_screen
+                        || splice_accounts_for_batch_row_advance(
+                            absolute_rows_before,
+                            absolute_rows_after,
+                            inserted,
+                        ),
+                    "zero-delta selection splice must account for the batch's entire absolute-row advance: before={absolute_rows_before}, after={absolute_rows_after}, inserted={inserted}; every other absolute_row_counter bump must set content_scroll_delta (a batch that also switched screens is exempt: the two counters belong to different grids)",
                 );
                 let new_live_top = absolute_rows_after.saturating_sub(u64::from(self.grid.rows()));
                 let projection = new_live_top
@@ -390,6 +482,45 @@ impl Terminal {
                 }
             }
         }
+
+        // A grid can lose scrollback WHILE PARKED — `drain_lazy_bounded` and
+        // retention eviction both run against it through `Terminal`'s alt-aware
+        // accessors — and it does so with no `content_scroll_delta` and no damage,
+        // so the `(None, 0)` arm above performed no range check at all. Re-floor the
+        // restored selection against the grid it has just come back to, or an anchor
+        // now below that grid's floor survives pointing at evicted rows.
+        //
+        // Kept ALONGSIDE the unconditional eviction re-floor below, not replaced by
+        // it: `adjust_for_scroll` also range-checks the UPPER bound and clears an
+        // anchor above the live bottom, which `truncate_to_floor` deliberately does
+        // not — it only knows about the floor. A selection parked while alt was up
+        // and restored to a grid whose row count shrank needs exactly that upper
+        // check.
+        if left_alt {
+            self.text_selection.adjust_for_scroll(0, max_rows, floor);
+        }
+
+        // SELECTION CUSTODY Phase 4 — EVICTION, the third and last question, after
+        // motion and damage.
+        //
+        // Retention pressure can drop the oldest history in a batch that scrolled by
+        // ZERO — a memory-budget trim, or a splice that archived rows past the ring
+        // cap — and neither the transform above (which only runs on a delta or a
+        // splice) nor the damage test (which is about REPLACED rows, not vanished
+        // ones) asks about it. Re-flooring unconditionally here makes "no anchor sits
+        // below `oldest_absolute_row()`" true on exit from every batch, and it is a
+        // no-op on the ordinary path because `adjust_for_scroll` was already handed
+        // the same floor.
+        //
+        // An evicted endpoint CLAMPS rather than clearing: the copy walk has read
+        // `adj_start_row.max(-history)` for years, so this only makes the anchor
+        // agree with the text a copy already returns.
+        let live_top_abs = self
+            .grid
+            .absolute_row_counter()
+            .saturating_sub(u64::from(self.grid.rows()));
+        self.text_selection
+            .truncate_to_floor(self.grid.oldest_absolute_row(), live_top_abs);
 
         // Sync BiDi cache invalidation from grid damage
         // This ensures BiDi resolutions are re-computed for modified rows
@@ -474,7 +605,8 @@ impl Terminal {
 /// Session-only fields (not forwarded to handler during VT processing):
 /// - `parser` — drives the handler, not passed into it
 /// - `font` — rendering config, not VT protocol state
-/// - `text_selection` — UI-layer state adjusted post-process
+/// - `text_selection` / `parked_text_selection` — UI-layer state adjusted
+///   post-process
 /// - `vi` — vi-mode navigation (not VT protocol)
 fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
     let Terminal {
@@ -521,6 +653,11 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         parser: _,
         font: _,
         text_selection: _,
+        // The OTHER screen's selection, parked across an alt switch. Session-only
+        // for the same reason `text_selection` is, and additionally kept out of the
+        // handler by design: the park/restore is a post_process decision (see
+        // there), never a VT-dispatch one.
+        parked_text_selection: _,
         vi: _,
         sync_timeout_duration: _,
         clipboard_auth: _,
@@ -706,6 +843,50 @@ mod tests {
             term.content_scroll_state().invalidation_epoch,
             before.invalidation_epoch + 1
         );
+    }
+
+    /// SELECTION CUSTODY — the epoch survives the split of
+    /// `force_selection_invalidation`.
+    ///
+    /// The four alt-switch call sites now use `invalidate_host_coordinates`, which
+    /// drops the `SelectionDamage::All` half (the selection is parked, not
+    /// destroyed) and KEEPS the `coordinates_invalidated` half. That half is the
+    /// public `ContentScrollState::invalidation_epoch` contract: consumers with
+    /// cached grid coordinates TRANSLATE rather than rebuild while the epoch is
+    /// unchanged, so losing the bump would leave cursor-effect state attached to
+    /// cells from the other buffer. One batch per spelling, so each bump is
+    /// attributable.
+    ///
+    /// Delete the four calls instead of replacing them and five of these six fail.
+    /// Only 1049-ENTER survives — its `new_grid.erase_screen()` bumps the epoch by
+    /// itself — which makes it this test's built-in vacuity control.
+    #[test]
+    fn every_alt_screen_switch_advances_the_host_coordinate_epoch_exactly_once() {
+        let mut term = TerminalBuilder::new()
+            .size(3, 12)
+            .ring_buffer_size(8)
+            .build();
+        for spelling in [
+            &b"\x1b[?1049h"[..],
+            &b"\x1b[?1049l"[..],
+            &b"\x1b[?47h"[..],
+            &b"\x1b[?47l"[..],
+            &b"\x1b[?1047h"[..],
+            &b"\x1b[?1047l"[..],
+        ] {
+            let before = term.content_scroll_state();
+            term.process(spelling);
+            assert_eq!(
+                term.content_scroll_state().invalidation_epoch,
+                before.invalidation_epoch + 1,
+                "{spelling:?} replaces every visible coordinate exactly once"
+            );
+            assert_eq!(
+                term.content_scroll_state().uniform_up_rows,
+                before.uniform_up_rows,
+                "{spelling:?}: a buffer swap is not a translation the host can apply"
+            );
+        }
     }
 
     #[test]

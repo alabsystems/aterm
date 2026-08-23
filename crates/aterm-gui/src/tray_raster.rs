@@ -1150,7 +1150,11 @@ fn semantic_font_snapshot_locked(
 /// followed by the renderer it produced (`None` when that key resolved to "no
 /// semantic font"). Named because the inline spelling trips
 /// `clippy::type_complexity` under the workspace's `-D warnings`.
-type SemanticForkMemo = (crate::widget::SemanticFontCandidate, u64, Option<Rc<Renderer>>);
+type SemanticForkMemo = (
+    crate::widget::SemanticFontCandidate,
+    u64,
+    Option<Rc<Renderer>>,
+);
 
 thread_local! {
     /// The last semantic fork this thread captured, keyed by
@@ -1426,9 +1430,30 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
 #[cfg(target_os = "linux")]
 fn ui_font_candidates() -> Vec<UiFontCandidate> {
     [
+        // `resolve_ui_font_assets` accepts a candidate only when BOTH faces
+        // parse, so each Noto pairing must name a file the distro actually
+        // ships. fonts-noto-core on Debian/Ubuntu installs exactly the four
+        // Regular/Bold (+Italics) cuts — there is NO NotoSans-SemiBold.ttf
+        // there (that cut arrives only with the separate -extra package). The
+        // SemiBold pair stays first for the distros that do carry it; the
+        // Regular+Bold pair right behind it is what keeps stock Debian on
+        // Noto at all. Without it every chrome surface silently fell through
+        // to DejaVu Sans, ~8% wider, and each width the pages authored
+        // against Noto turned into systemic truncation (2026-08 settings
+        // audit: theme card, wallpaper, font credits, badges, search
+        // placeholder).
         (
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+        ),
+        (
+            "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        ),
+        // Arch/Fedora keep Noto under /usr/share/fonts/noto.
+        (
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf",
         ),
         (
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -3290,6 +3315,87 @@ mod tests {
             assert_ne!(
                 candidate.regular_path, candidate.semibold_path,
                 "a candidate must never pair a face with itself"
+            );
+        }
+    }
+
+    /// The Linux ladder must reach Noto Sans on a host that ships only the
+    /// fonts-noto-core cuts (Regular/Bold — Debian and Ubuntu never install a
+    /// NotoSans-SemiBold.ttf). Pairing Regular exclusively with SemiBold made
+    /// every stock Debian box fall through to DejaVu Sans, ~8% wider, which the
+    /// 2026-08 settings audit measured as systemic truncation across the
+    /// chrome. SemiBold keeps priority where a distro does carry it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ui_face_ladder_reaches_noto_on_bold_only_hosts() {
+        let candidates = ui_font_candidates();
+        let file = |path: &std::path::Path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_ascii_lowercase)
+                .unwrap_or_default()
+        };
+        let noto_pairs: Vec<(String, String)> = candidates
+            .iter()
+            .filter(|candidate| file(&candidate.regular_path).contains("noto"))
+            .map(|candidate| {
+                (
+                    file(&candidate.regular_path),
+                    file(&candidate.semibold_path),
+                )
+            })
+            .collect();
+        assert!(
+            noto_pairs
+                .iter()
+                .any(|(regular, semibold)| regular == "notosans-regular.ttf"
+                    && semibold == "notosans-bold.ttf"),
+            "a Regular+Bold pairing must back up the SemiBold cut Debian never ships: {noto_pairs:?}"
+        );
+        assert_eq!(
+            noto_pairs.first().map(|(_, semibold)| semibold.as_str()),
+            Some("notosans-semibold.ttf"),
+            "the true SemiBold keeps priority where a distro ships it"
+        );
+        let first_dejavu = candidates
+            .iter()
+            .position(|candidate| file(&candidate.regular_path).contains("dejavu"))
+            .expect("DejaVu remains the last-resort pair");
+        let last_noto = candidates
+            .iter()
+            .rposition(|candidate| file(&candidate.regular_path).contains("noto"))
+            .expect("Noto pairs exist");
+        assert!(
+            last_noto < first_dejavu,
+            "every Noto pairing outranks the wider DejaVu fallback"
+        );
+        for candidate in &candidates {
+            assert_ne!(
+                candidate.regular_path, candidate.semibold_path,
+                "a candidate must never pair a face with itself"
+            );
+        }
+        // Host-conditional leg: with the Debian core cuts on disk the resolver
+        // must land Noto Sans — regular AND a real bold companion — never the
+        // DejaVu fallback.
+        let debian_regular =
+            std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf");
+        let debian_bold = std::path::Path::new("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf");
+        if debian_regular.exists() && debian_bold.exists() {
+            let assets = resolve_ui_font_assets();
+            let regular = assets.regular.expect("Noto regular resolves");
+            assert!(
+                regular.name().is_some_and(|name| name.contains("Noto")),
+                "regular face is Noto: {:?}",
+                regular.name()
+            );
+            let semibold = assets
+                .semibold
+                .expect("a heavier companion resolves beside the regular");
+            assert!(
+                semibold.name().is_some_and(|name| name.contains("Noto")),
+                "the UiBold face stays in the Noto family: {:?}",
+                semibold.name()
             );
         }
     }

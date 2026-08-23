@@ -3140,6 +3140,7 @@ mod tests {
                     cols: 1,
                     rows: 1,
                     z_index: 0,
+                    band_lift_px: 0,
                 }),
                 cell_row: 0,
                 cell_col: 0,

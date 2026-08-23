@@ -12,8 +12,11 @@
 //! it is unit-testable without a window or event loop.
 //!
 //! The winit→engine key map (Character / Named / numpad / base-layout) lives in
-//! `aterm_types::keyboard` (the `winit-keymap` feature, K-2) so the future
-//! native shell reuses the same table.
+//! the `aterm-winit-keymap` crate (K-2) so the future native shell reuses the
+//! same table. It is a CRATE and not a feature of `aterm-types` because a
+//! workspace resolve unifies optional features: as a feature it linked AppKit
+//! into every consumer of `aterm-types`, including the dependency-free
+//! `aterm-ctl`.
 
 use aterm_types::keyboard::{self, KeyEventType, KeyboardMode, Modifiers};
 use winit::event::KeyEvent;
@@ -250,10 +253,10 @@ pub fn encode_key_event(
     mods: Modifiers,
     mode: KeyboardMode,
 ) -> Option<Vec<u8>> {
-    let key = keyboard::map_logical_key(logical_key)?;
+    let key = aterm_winit_keymap::map_logical_key(logical_key)?;
     // base_layout_key only matters for Character keys under REPORT_ALTERNATE_KEYS;
     // the engine ignores it otherwise, so deriving it unconditionally is harmless.
-    let base_layout = keyboard::base_layout_key_for(physical_key);
+    let base_layout = aterm_winit_keymap::base_layout_key_for(physical_key);
     let bytes =
         keyboard::encode_key_with_layout(&key, mods, mode, KeyEventType::Press, base_layout);
     if bytes.is_empty() { None } else { Some(bytes) }
@@ -276,7 +279,7 @@ pub fn encode_key_event(
 /// modifier's `KeyboardInput` is delivered).
 #[must_use]
 pub fn press_is_inert(ev: &KeyEvent) -> bool {
-    if keyboard::map_logical_key(&ev.logical_key)
+    if aterm_winit_keymap::map_logical_key(&ev.logical_key)
         .as_ref()
         .is_some_and(keyboard::is_modifier_or_lock_key)
     {
@@ -399,8 +402,8 @@ pub fn build_key_input(
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
     use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
-    let key = keyboard::map_logical_key(&ev.key_without_modifiers())?;
-    Some((key, mods, keyboard::base_layout_key_for(ev.physical_key)))
+    let key = aterm_winit_keymap::map_logical_key(&ev.key_without_modifiers())?;
+    Some((key, mods, aterm_winit_keymap::base_layout_key_for(ev.physical_key)))
 }
 
 /// Fallback for [`build_key_input`] on platforms WITHOUT
@@ -417,8 +420,8 @@ pub fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
-    let key = keyboard::map_logical_key(&ev.logical_key)?;
-    Some((key, mods, keyboard::base_layout_key_for(ev.physical_key)))
+    let key = aterm_winit_keymap::map_logical_key(&ev.logical_key)?;
+    Some((key, mods, aterm_winit_keymap::base_layout_key_for(ev.physical_key)))
 }
 
 #[cfg(test)]

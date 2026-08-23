@@ -449,10 +449,13 @@ fn reflow_extras_flags_consistent_after_grow() {
     grid.assert_invariants();
 }
 
-/// #3977: Reflow must size the rebuilt row buffer to the requested height so
-/// truncated extras do not reappear when rows are grown later.
+/// #3977 (updated for fixwave5): a height shrink pushes the overflowing top
+/// rows into ring history instead of discarding them — the width branch used
+/// to strand them in the lazy buffer where the next drain dropped them — so a
+/// regrow REVEALS them again, and the bottom row's hyperlink follows its
+/// content instead of resurfacing on some other row.
 #[test]
-fn reflow_row_shrink_drops_truncated_extras_before_regrow() {
+fn reflow_row_shrink_retains_rows_and_extras_follow_regrow() {
     let mut grid = Grid::new(5, 10);
     for row in 0..5u16 {
         grid.set_cursor(row, 0);
@@ -463,20 +466,33 @@ fn reflow_row_shrink_drops_truncated_extras_before_regrow() {
     extra.set_hyperlink(Some(Arc::from("https://bottom.example")));
 
     grid.resize(3, 5);
-    grid.resize(5, 5);
+    // Shrink kept the cursor's window: C, D, E visible; A, B in history.
+    assert_eq!(grid.row(0).unwrap().to_string(), "C");
+    assert_eq!(grid.row(2).unwrap().to_string(), "E");
+    assert_eq!(grid.scrollback_lines(), 2, "A and B retained as history");
 
-    assert!(grid.cell_extra(4, 0).is_none());
-    assert!(
-        !grid
-            .cell(4, 0)
-            .expect("regrown blank row should exist")
-            .has_extras(),
-        "regrown blank rows must not inherit truncated extras"
+    grid.resize(5, 5);
+    // The regrow reveals the retained history: all five rows return.
+    for (row, expect) in ["A", "B", "C", "D", "E"].iter().enumerate() {
+        assert_eq!(
+            grid.row(row_u16(row)).unwrap().to_string(),
+            *expect,
+            "row {row} restored after the round-trip"
+        );
+    }
+    // The hyperlink stays WITH 'E' — no stale extras on any other row.
+    let remapped = grid.cell_extra(4, 0).expect("E keeps its hyperlink");
+    assert_eq!(
+        remapped.hyperlink().map(|u| u.as_ref()),
+        Some("https://bottom.example")
     );
-    assert!(
-        grid.row(4).expect("row should exist").is_empty(),
-        "regrown rows should stay blank"
-    );
+    for row in 0..4u16 {
+        assert!(
+            grid.cell_extra(row, 0).is_none(),
+            "no stale extras on row {row}"
+        );
+    }
+    grid.assert_invariants();
 }
 
 /// #7473: Height decrease (no column change) must push excess front rows to

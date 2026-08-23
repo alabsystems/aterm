@@ -156,6 +156,7 @@ mod instance_retention_conformance;
 #[cfg(windows)]
 mod jumplist_win;
 mod palette;
+mod paste_banner;
 mod pinned_dir;
 /// The native Windows application-runtime (DWM chrome): `AppRt` peer of `AppRtMacOS`.
 #[cfg(windows)]
@@ -1283,12 +1284,14 @@ fn confirm_multiline_paste_dialog(lines: usize, owner_hwnd: isize) -> bool {
     )
 }
 
-/// Fallback for [`confirm_multiline_paste_dialog`] on the remaining platforms: no
-/// native dialog wired, so proceed (Linux/X11 daily-driver work is a separate lane).
-#[cfg(not(any(target_os = "macos", windows)))]
-fn confirm_multiline_paste_dialog(_lines: usize) -> bool {
-    true
-}
+// The remaining platforms (Linux) have no native alert to wire — a fallback here
+// used to return `true` unconditionally, which made the pastejacking guard a
+// silent no-op exactly where the X11 clipboard makes pastejacking easiest (audit
+// finding). They confirm through the in-window banner instead: `deliver_paste`
+// PARKS the text on `App::paste_banner` (fail-closed — nothing reaches the PTY)
+// and `present_multiline_paste_banner` splices the question + preview over the
+// top grid rows; Enter/Escape answer it through the same `alert_keys::confirm_key`
+// router the macOS sheet interceptor uses.
 
 /// The tiny Win32 FFI surface of the GUI shell itself — direct user32/kernel32
 /// declarations in the same approved style as [`clipboard_win`] (user32 is on the
@@ -2137,6 +2140,22 @@ enum Wake {
     /// it, so the flash/attention is routed to that window. A background tab's
     /// bell still flashes the owning window — the "bell on activity" affordance.
     Bell { session: u64, window: WindowId },
+    /// XTWINOPS (`CSI t`): a session's program asked for a WINDOW manipulation
+    /// and the engine authorized it (`allow_window_ops` minted the in-core
+    /// capability; move is denied and resizes clamped THERE, so this arrives
+    /// pre-vetted). Posted from the reader thread under the Terminal lock, like
+    /// `Bell`; the main thread — sole owner of every winit window — applies it
+    /// ([`App::on_window_op`]). `session` is the requesting tab; `window` is
+    /// the spawn-stamped owner, used only as a fallback when the tab has since
+    /// moved (the handler re-resolves, mirroring the bell's stale-stamp rule).
+    /// Constructed only on Linux today (`spawn::configure_window_ops`); the
+    /// variant exists on every target so `Wake` stays platform-independent.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    WindowOp {
+        session: u64,
+        window: WindowId,
+        op: aterm_types::WindowOperation,
+    },
     /// The control thread queued one or more `ImageReq`s and needs the main
     /// thread (which owns the renderer) to render; the PNG encode + write + the
     /// dims reply then happen on the encode worker (post-write, FIFO).
@@ -3136,9 +3155,15 @@ fn visible_frame_height(raw_height: usize, pad: usize, pad_top: usize) -> usize 
     raw_height.saturating_sub(pad.saturating_sub(pad_top))
 }
 
-/// Source rows the GPU's centred blit clips above the shorter visible frame.
-/// Deriving this from both band offsets (instead of assuming `ceil(delta/2)`)
-/// is load-bearing when both the removed padding and row-fit remainder are odd.
+/// Source rows the GPU's blit clips above the shorter visible frame — how far
+/// the RAW frame must slide up so its grid lands exactly where placing the
+/// VISIBLE frame at the platform vertical offset would put it. Deriving this
+/// from both band offsets (instead of assuming `ceil(delta/2)`) is load-bearing
+/// when both the removed padding and row-fit remainder are odd — and it is what
+/// makes the platform policy flow through for free: with the Linux top-pinned
+/// [`aterm_render::band_offset_y`] both offsets are 0, so the crop collapses to
+/// 0 and the GPU raw layout degenerates to the CPU visible one (all surplus at
+/// the bottom, banded).
 fn gpu_visible_crop_top(
     raw_height: usize,
     destination_height: usize,
@@ -3146,8 +3171,8 @@ fn gpu_visible_crop_top(
     pad_top: usize,
 ) -> usize {
     let visible_height = visible_frame_height(raw_height, pad, pad_top);
-    let visible_offset = aterm_render::band_offset(destination_height, visible_height);
-    let raw_offset = aterm_render::band_offset(destination_height, raw_height);
+    let visible_offset = aterm_render::band_offset_y(destination_height, visible_height);
+    let raw_offset = aterm_render::band_offset_y(destination_height, raw_height);
     let removed = raw_height.saturating_sub(visible_height);
     usize::try_from(visible_offset.saturating_sub(raw_offset))
         .unwrap_or(removed)
@@ -3348,9 +3373,9 @@ mod bottom_padding_geometry_tests {
                     let raw_pad_top = pad_top + crop_top;
 
                     assert_eq!(
-                        aterm_render::band_offset(destination_height, raw_height)
+                        aterm_render::band_offset_y(destination_height, raw_height)
                             + i64::try_from(head + raw_pad_top).unwrap(),
-                        aterm_render::band_offset(destination_height, visible_height)
+                        aterm_render::band_offset_y(destination_height, visible_height)
                             + i64::try_from(head + pad_top).unwrap(),
                         "GPU and visible grid origins diverged: pad={pad} top={pad_top} dest={destination_height}",
                     );
@@ -3361,14 +3386,16 @@ mod bottom_padding_geometry_tests {
         }
 
         // Odd removed padding + odd row remainder is where a fixed ceil(delta/2)
-        // compensation is one pixel wrong.
+        // compensation is one pixel wrong. (On Linux the top-pinned vertical
+        // placement makes both offsets 0, so the crop collapses to 0 — the GPU
+        // raw layout degenerates to the CPU visible one by the same derivation.)
         let (pad, pad_top, grid_height) = (11, 2, 100);
         let raw_height = grid_height + 2 * pad;
         let visible_height = visible_frame_height(raw_height, pad, pad_top);
         let destination_height = visible_height + 5;
         assert_eq!(
             gpu_visible_crop_top(raw_height, destination_height, pad, pad_top),
-            4
+            if cfg!(target_os = "linux") { 0 } else { 4 }
         );
         assert_eq!((pad - pad_top).div_ceil(2), 5);
     }
@@ -3391,11 +3418,16 @@ mod bottom_padding_geometry_tests {
             pixels: (0..12).flat_map(|row| [row, row]).collect(),
         };
         let crop_top = gpu_visible_crop_top(12, 9, 4, 1);
-        assert_eq!(crop_top, 2);
+        // Top-pinned vertical placement (Linux) needs no raw slide at all; the
+        // centred placement elsewhere slides the raw source up by 2 to align.
+        let expected_crop = if cfg!(target_os = "linux") { 0 } else { 2 };
+        assert_eq!(crop_top, expected_crop);
         crop_visible_frame(&mut gpu, crop_top, 4, 1);
         assert_eq!((gpu.width, gpu.height), (2, 9));
-        assert_eq!(&gpu.pixels[..2], &[2, 2]);
-        assert_eq!(&gpu.pixels[16..], &[10, 10]);
+        let first = expected_crop as u32;
+        let last = first + 8;
+        assert_eq!(&gpu.pixels[..2], &[first, first]);
+        assert_eq!(&gpu.pixels[16..], &[last, last]);
     }
 
     /// Tier-1: drive the real clamp + frame-crop helpers over the model's entire
@@ -3736,6 +3768,18 @@ impl Backend {
         match self {
             Backend::Cpu(r) => r.cell_geometry(px),
             Backend::Gpu(g) => g.cell_geometry(px),
+        }
+    }
+
+    /// PURE per-window decoration bands at `px` — the same mixed-DPI contract as
+    /// [`Backend::cell_geometry`]. The strip's pixel band reads the seam
+    /// underline's resolved position through this so its cards clear the very
+    /// rule the cell row will stamp over them.
+    #[cfg(any(windows, target_os = "linux"))]
+    fn deco_metrics_for(&self, px: f32) -> aterm_render::deco::DecoMetrics {
+        match self {
+            Backend::Cpu(r) => r.deco_metrics_for(px),
+            Backend::Gpu(g) => g.deco_metrics_for(px),
         }
     }
 
@@ -4262,6 +4306,12 @@ impl BackendSlot {
 
     fn cell_geometry(&self, px: f32) -> (usize, usize, i32) {
         self.ready().cell_geometry(px)
+    }
+
+    /// See [`Backend::deco_metrics_for`].
+    #[cfg(any(windows, target_os = "linux"))]
+    fn deco_metrics_for(&self, px: f32) -> aterm_render::deco::DecoMetrics {
+        self.ready().deco_metrics_for(px)
     }
 
     fn fallback_parse_pending(&mut self) -> bool {
@@ -7043,13 +7093,13 @@ struct WindowState {
     /// without re-running the field's scroll math ([`crate::app_input::
     /// PreeditOwner::Rename`] — the anchor used to stay on the GRID caret).
     cached_strip_rename_caret: Option<usize>,
-    /// THE PIXEL BAND (Windows) — per-STRIP-ROW `ImageRef` slices of the one
-    /// UI-font band raster ([`tab_bar::pixel_band`]), rebuilt with (and cached
+    /// THE PIXEL BAND (Windows + Linux) — per-STRIP-ROW `ImageRef` slices of the
+    /// one UI-font band raster ([`tab_bar::pixel_band`]), rebuilt with (and cached
     /// exactly as long as) `cached_strip_rows`. Non-empty ⇒ the splice lays these
     /// over the strip rows INSTEAD of `cached_strip_images` (the band bakes the
     /// icon/status marks itself, vertically centred); empty ⇒ the byte-identical
     /// legacy cell strip (no UI face installed, or the raster declined).
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     cached_strip_band: Vec<Vec<(usize, aterm_core::grid::extra::ImageRef)>>,
     /// The band-geometry + font-epoch key `cached_strip_band` was rastered for:
     /// `(cell_w, cell_h, band_top_px, scale bits, chrome-font epoch)`. A separate
@@ -7058,7 +7108,7 @@ struct WindowState {
     /// metrics (mixed-DPI, font size), its scale, and on the asynchronously
     /// landing chrome faces — a scale flip or the font landing must repaint the
     /// band even when cols and titles happen to be unchanged.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     strip_band_key: (usize, usize, usize, u32, u64),
     /// The last `(segment_count, selected)` this window's NATIVE titlebar tab strip
     /// (`refresh_window_tabs` → `toolbar::set_window_tabs`) was told to render — a
@@ -8267,9 +8317,9 @@ impl WindowState {
             strip_metadata_scratch: Vec::new(),
             cached_strip_images: Vec::new(),
             cached_strip_rename_caret: None,
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             cached_strip_band: Vec::new(),
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             strip_band_key: (0, 0, 0, 0, 0),
             // Seed from canonical content; a detached native-only window has no
             // compatibility projection but still has one real tab-strip entry.
@@ -9305,6 +9355,16 @@ struct App {
     /// estimate, and an unknown session gets `Default` = nothing measured) while
     /// making the knowledge survive the switch. Pruned with the session in `detach`.
     link_estimates: HashMap<u64, aterm_predict::LinkEstimate>,
+    /// The viewport each open find was opened FROM, keyed by `(session, window)`.
+    ///
+    /// Not a `SearchState` field, because `SearchState` dies with the find bar and a
+    /// tab switch tears the bar down without the user having exited find: parking the
+    /// anchor beside the state lets a reopen on that terminal still cancel home. Keyed
+    /// by the pair rather than by session alone because ⌘⇧O gives two windows one
+    /// shared session, and each can have its own find open with its own origin — a
+    /// session-only key would let B's ⌘F inherit A's origin and B's ⎋ delete it.
+    /// Pruned with the session in `detach`, and by both user exits (⎋ and ⏎).
+    find_origins: HashMap<(u64, WindowId), app_search::FindOrigin>,
     /// Stable typed view registry. Terminal entries link to `pool`; native
     /// entries link to the in-process app runtime without fabricating PTYs.
     view_store: tab_model::ViewStore,
@@ -9856,6 +9916,15 @@ struct App {
     /// exit path can leave a keystroke filter behind.
     #[cfg(target_os = "macos")]
     paste_confirm: Option<alert_keys::PasteConfirm>,
+    /// The ONE outstanding multi-line-paste confirmation BANNER — the in-window
+    /// twin of the macOS sheet for the platforms with no native alert (Linux).
+    /// `Some` ⇔ the banner is up over `wid`'s top rows and the parked text's
+    /// answer is still owed (fail-closed: the text lives here and nowhere else);
+    /// answered by Enter/Escape in `on_key` (via [`alert_keys::confirm_key`]) or
+    /// a click on the band, and dropped when its window closes. Populated only by
+    /// [`App::deliver_paste`]'s no-native-dialog arm, so it stays `None` on
+    /// macOS/Windows.
+    paste_banner: Option<paste_banner::PendingPaste>,
     /// Whether a completed mouse selection auto-copies to the system clipboard
     /// (config `copy_on_select`, default `true`). Read in
     /// `finish_selection` when a drag-select settles. Live-reloadable. GLOBAL
@@ -11009,6 +11078,17 @@ impl App {
         // `selecting`/`gesture` and leaves a zombie `InProgress` selection.
         // Suppressed like the blur settle: a tab switch is not a completed drag.
         self.settle_selection_gesture(wid);
+        // FIND CUSTODY: tear the find bar down through its own close seam instead of
+        // nulling `ws.search` below. Two things only that seam does: it hands the
+        // window title back from Search authority to the canonical Smart Title (a
+        // direct null left the title advertising a find that is no longer on screen),
+        // and it PARKS the find origin rather than discarding it, so reopening find on
+        // the tab you came back to can still cancel home. `false` because the switch is
+        // not a user exit — it must not destroy a selection the user made — and because
+        // this runs under the no-engine-mutex discipline documented below: the neutral
+        // close is lock-free, which is exactly why the switch parks rather than
+        // restores the viewport.
+        self.search_close_in(wid, false);
         self.refresh_active_split_presentation(wid);
         // Disjoint borrows: the target WindowState is a different field from `pool`,
         // so destructuring lets us write the mirror while reading the pool.
@@ -11141,13 +11221,11 @@ impl App {
                 window.request_redraw();
             }
         });
-        ws.search = None;
-        // Drop the clickable find-bar geometry WITH the search state (mirrors
-        // `search_exit`): otherwise the last frame's `find_bar_hit` outlives the overlay,
-        // and a later click on those bottom-row cells hits the pixel-band gate + stale
-        // indicator span and is silently swallowed (a no-op toggle) instead of selecting /
-        // focusing / reaching the program — a dead-zone until ⌘F is reopened.
-        ws.find_bar_hit = None;
+        // `ws.search` / `ws.find_bar_hit` are dropped by the `search_close_in` at the
+        // TOP of this function, not here: the find bar and its clickable-indicator
+        // geometry have one teardown seam so the title and the parked origin travel
+        // with them. Nulling them here as well would be harmless but would re-hide the
+        // seam the switch is supposed to go through.
         ws.selecting = false;
         ws.gesture = None;
         // In-flight speculative echo belongs to the focused pane's grid. A real
@@ -11582,6 +11660,7 @@ impl App {
             _reduce_motion: None,
             pool,
             link_estimates: HashMap::new(),
+            find_origins: HashMap::new(),
             view_store,
             native_runtime: native_app::NativeRuntime::new(),
             native_config_service,
@@ -11670,6 +11749,7 @@ impl App {
             confirm_multiline_paste: true,
             #[cfg(target_os = "macos")]
             paste_confirm: None,
+            paste_banner: None,
             copy_on_select: Config::default().copy_on_select_or_default(),
             window_theme: app_config::WindowTheme::default(),
             window_colorspace: app_config::WindowColorspace::default(),
@@ -12676,11 +12756,13 @@ impl App {
                         return; // user cancelled
                     }
                 }
+                // Linux (and the remaining platforms): park the text on the
+                // in-window banner and return — the paste resumes only when
+                // Enter answers it in `on_key` (fail-closed, like the sheet).
                 #[cfg(not(any(target_os = "macos", windows)))]
                 {
-                    if !confirm_multiline_paste_dialog(text.lines().count()) {
-                        return; // user cancelled
-                    }
+                    self.present_multiline_paste_banner(wid, text, source);
+                    return;
                 }
             }
         }
@@ -12850,6 +12932,85 @@ impl App {
         // Route through the seam so paste-formatting + the snap-to-bottom side
         // effect converge with the controller `paste` verb.
         self.input(wid, InputEvent::Paste(text), source);
+    }
+
+    /// Present the multi-line paste confirmation as an IN-WINDOW BANNER over `wid`'s
+    /// top grid rows — the no-native-alert twin of
+    /// [`Self::present_multiline_paste_sheet`], for the platforms where aterm
+    /// composes its own chrome (Linux). The text is PARKED on `self.paste_banner`
+    /// (fail-closed: it reaches the PTY only through [`Self::answer_paste_banner`]'s
+    /// Accept arm) and the banner is spliced by `App::splice_paste_banner` on the
+    /// next redraw. ONE confirmation at a time, exactly like the sheet: a second
+    /// unconfirmed paste arriving while one is parked is DROPPED with a log line
+    /// rather than stacking or silently replacing the question the user is reading.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn present_multiline_paste_banner(&mut self, wid: WindowId, text: String, source: Source) {
+        if self.paste_banner.is_some() {
+            aterm_log::warn!(
+                "multiline-paste confirmation already open; dropping the new \
+                 unconfirmed paste ({} bytes) rather than stacking a second banner",
+                text.len(),
+            );
+            return;
+        }
+        self.paste_banner = Some(paste_banner::PendingPaste::new(wid, text, source));
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            w.request_redraw();
+        }
+    }
+
+    /// Answer the in-window paste-confirmation banner: `proceed` delivers the parked
+    /// text through the SAME confirmed seam the macOS sheet resumes into (never
+    /// re-running the guard, which would ask twice); `!proceed` drops it — the text's
+    /// only copy dies here, which is the fail-closed cancel. Reached from the Enter/
+    /// Escape gate in `on_key` and from a click on the banner band (`app_mouse`).
+    /// No-op when no banner is up.
+    pub(crate) fn answer_paste_banner(&mut self, proceed: bool) {
+        let Some(pending) = self.paste_banner.take() else {
+            return;
+        };
+        let (wid, text, source) = pending.take();
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            w.request_redraw();
+        }
+        if proceed {
+            self.deliver_paste_confirmed(wid, text, source);
+        }
+    }
+
+    /// Paste the X11 PRIMARY selection (the middle-click buffer) into `wid` through
+    /// the SAME asynchronous pipeline + pastejacking guard as every other paste.
+    /// The own-selection read is instant (stored slot, no round-trip) and delivers
+    /// synchronously; a FOREIGN owner requires a `ConvertSelection` round-trip that
+    /// blocks up to ~1 s on a slow/hung owner, so that read runs on a worker thread
+    /// posting `Wake::PasteReady` — mirroring `paste_clipboard_into`'s Linux arm.
+    /// (The audited middle-click defect was exactly this pair: a synchronous
+    /// `primary_get` in the winit handler AND a raw `self.input(…Paste…)` that
+    /// skipped `deliver_paste`'s guard.)
+    #[cfg(target_os = "linux")]
+    pub(crate) fn paste_primary_into(&mut self, wid: WindowId) {
+        if let Some(text) = control::primary_get_owned() {
+            self.deliver_paste(wid, text, Source::Human);
+            return;
+        }
+        // A real run always has a proxy; guard rather than panic (test-only None).
+        let Some(proxy) = self.proxy.clone() else {
+            return;
+        };
+        std::thread::Builder::new()
+            .name("aterm-x11-primary-paste".into())
+            .spawn(move || {
+                // Empty / unavailable PRIMARY -> no PasteReady, so no Paste fires
+                // (mirrors the clipboard worker's `let Some(text) = ...` shape).
+                if let Some(text) = control::primary_get() {
+                    let _ = proxy.send_event(Wake::PasteReady {
+                        wid,
+                        text,
+                        source: Source::Human,
+                    });
+                }
+            })
+            .ok();
     }
 
     /// Route a dragged file according to the content it landed on. Markdown and
@@ -15296,6 +15457,14 @@ impl ApplicationHandler<Wake> for App {
             // "bell on activity" affordance; a background tab's bell additionally
             // requests user attention so off-screen activity still surfaces.
             Wake::Bell { session, window } => self.on_bell(window, session),
+            // XTWINOPS: apply an engine-authorized window manipulation on the
+            // thread that owns the winit windows. Pre-vetted in-core (capability
+            // gate, move denial, resize clamps) — see the variant's doc.
+            Wake::WindowOp {
+                session,
+                window,
+                op,
+            } => self.on_window_op(window, session, op),
             // VIDEO introspection: start recording the frontmost window's presents.
             // The reply stays pending until the encode worker lands index.json.
             Wake::Video {
@@ -18891,6 +19060,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         seamless_position: seamless_window.and_then(|w| Some((w.outer_x?, w.outer_y?))),
         pool,
         link_estimates: HashMap::new(),
+        find_origins: HashMap::new(),
         view_store,
         native_runtime: native_app::NativeRuntime::new(),
         native_config_service,
@@ -18981,6 +19151,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         confirm_multiline_paste: config.confirm_multiline_paste_or_default(),
         #[cfg(target_os = "macos")]
         paste_confirm: None,
+        paste_banner: None,
         copy_on_select: config.copy_on_select_or_default(),
         window_theme: config.window_theme_or_default(),
         window_colorspace: config.window_colorspace_or_default(),
@@ -26071,16 +26242,23 @@ mod tests {
         );
     }
 
-    /// `copy_on_select` now defaults to `true` (the X11-style copy-on-select
-    /// convenience, flipped on with the other visual/UX defaults); an explicit
-    /// `false` opts back into the ghostty/macOS explicit-copy behaviour.
+    /// `copy_on_select` defaults PER PLATFORM: `true` off Linux (the
+    /// copy-on-select convenience, flipped on with the other visual/UX
+    /// defaults), `false` ON Linux — a selection there already owns the X11
+    /// PRIMARY buffer unconditionally, and the platform convention keeps the
+    /// CLIPBOARD for explicit copies (the audited default clobbered the user's
+    /// Ctrl+Shift+C copy on every drag). An explicit value wins everywhere:
+    /// `true` opts Linux into writing both buffers, `false` opts the others
+    /// into the ghostty/macOS explicit-copy behaviour.
     #[test]
-    fn copy_on_select_defaults_true() {
-        assert!(Config::default().copy_on_select_or_default());
-        assert!(
+    fn copy_on_select_defaults_follow_the_platform_convention() {
+        let default_on = cfg!(not(target_os = "linux"));
+        assert_eq!(Config::default().copy_on_select_or_default(), default_on);
+        assert_eq!(
             toml::from_str::<Config>("font_px = 18.0")
                 .unwrap()
-                .copy_on_select_or_default()
+                .copy_on_select_or_default(),
+            default_on
         );
         assert!(
             toml::from_str::<Config>("copy_on_select = true")
@@ -26560,8 +26738,13 @@ mod tests {
             "single-tab title chrome retains the New Tab action"
         );
 
-        // Switch to Dracula but DON'T invalidate: the cache (key unchanged) stale-serves.
-        let tp = aterm_types::scheme::builtin("Dracula")
+        // Switch to a LIGHT scheme but DON'T invalidate: the cache (key
+        // unchanged) stale-serves. Light on purpose: on Linux the band's BASE
+        // tone is the CSD headerbar gray of the theme's appearance (dark
+        // `#303030` / light `#EBEBEB`, `chrome_band::band_colors`), so two DARK
+        // schemes now share cell 0's band tone by design — the retint this test
+        // proves needs a theme whose appearance actually flips the strip.
+        let tp = aterm_types::scheme::builtin("GitHub Light")
             .unwrap()
             .to_theme_parts();
         app.theme = super::Theme {
@@ -26662,10 +26845,15 @@ mod tests {
         assert_eq!(t.selection_to_string().as_deref(), Some("hit"));
     }
 
-    /// Scrollback find + scroll-to-match over the REAL shared path (what
-    /// `search_recompute`/`apply_current` do): a match in HISTORY maps to a NEGATIVE
-    /// selection row, and `scroll_to_bottom` + `scroll_display(-row)` brings it into
-    /// view (display_offset == -row) with the selection round-tripping to the text.
+    /// Scrollback find over the shared `map_matches` + selection path: a match in
+    /// HISTORY maps to a NEGATIVE selection row, and putting the viewport `-row` lines
+    /// up brings it into view with the selection round-tripping to the text.
+    ///
+    /// This hand-replicates the coordinate arithmetic; it is NOT an end-to-end pin on
+    /// how `search_apply_current_in` moves the viewport (that path positions by
+    /// absolute row and applies the find-bar clearance, neither of which is modelled
+    /// here). `emacs_navigation_conforms_to_derived_transition_model` and the
+    /// `cancel_*` tests in `app_render` are the pins on the real path.
     #[test]
     fn search_scrollback_scroll_to_match() {
         use crate::app_search::map_matches;
@@ -30617,6 +30805,7 @@ mod compose_tests {
                 cols: 1,
                 rows: 1,
                 z_index: 0,
+                band_lift_px: 0,
             }),
             cell_row: 0,
             cell_col: 0,
@@ -31503,6 +31692,167 @@ mod effect_cadence_tests {
     }
 }
 
+/// The Linux multi-line-paste confirmation BANNER's App-level contract — the
+/// fail-closed park/answer flow behind the audit's "silent no-op" finding, pinned
+/// against a REAL pipe-backed PTY sink so "nothing reached the shell" is a byte
+/// observation, not an inference. (The banner's ROW composition is pinned in
+/// `paste_banner::tests`; the Enter/Escape keystroke router in `alert_keys`.)
+/// Unix-only for the observer pipe; skipped on macOS/Windows, whose guards
+/// confirm through the sheet/MessageBox instead and never park here.
+#[cfg(all(test, unix, not(target_os = "macos")))]
+mod paste_banner_flow_tests {
+    use std::sync::Arc;
+
+    use aterm_session::sink::SinkWriter;
+
+    use super::{App, WindowId};
+    use crate::input::Source;
+
+    /// A headless App whose session sink is the WRITE end of a nonblocking pipe,
+    /// plus the READ end: every byte the paste seam sends to the "shell" is
+    /// observable, and an empty pipe is proof nothing was delivered.
+    fn app_with_pty_observer() -> (App, i32) {
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "observer pipe");
+        let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(pipe[1])));
+        (app, pipe[0])
+    }
+
+    /// Everything currently queued on the observer pipe (empty = the paste never
+    /// reached the PTY — the fail-closed assertion this module exists to make).
+    /// A delivered paste egresses on the per-session `paste_order` WRITER thread,
+    /// so `drain` POLLS briefly: it returns as soon as any bytes arrive, or empty
+    /// after the deadline. The negative ("nothing delivered") assertions ride the
+    /// same deadline — a parked paste submits NO writer job, so if bytes were
+    /// going to leak they would do so within it.
+    fn drain_within(fd: i32, ms: u64) -> Vec<u8> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+        let mut out = Vec::new();
+        let mut buf = [0u8; 256];
+        loop {
+            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                out.extend_from_slice(&buf[..n as usize]);
+                continue; // pull the rest of the frame before returning
+            }
+            if !out.is_empty() || std::time::Instant::now() >= deadline {
+                return out;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The positive form: wait generously for the writer thread's delivery.
+    fn drain(fd: i32) -> Vec<u8> {
+        drain_within(fd, 2000)
+    }
+
+    /// The negative form: a parked/cancelled paste submits NO writer job, so a
+    /// short grace window is enough to catch a leak without slowing the suite.
+    fn assert_no_bytes(fd: i32, why: &str) {
+        assert_eq!(drain_within(fd, 150), b"", "{why}");
+    }
+
+    /// THE CORE CONTRACT: a multi-line unbracketed Human paste PARKS on the
+    /// banner with ZERO bytes reaching the PTY; Escape (answer `false`) drops it
+    /// — still zero bytes — and a re-presented paste answered with Enter
+    /// (`true`) delivers through the real paste seam (LF→CR, the unbracketed
+    /// paste encoding). The old Linux arm delivered unconditionally.
+    #[test]
+    fn a_risky_paste_parks_fail_closed_until_enter_answers_it() {
+        let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        let parked = app.paste_banner.as_ref().expect("the paste must park");
+        assert_eq!(parked.wid, wid);
+        assert_eq!(parked.text(), "ls\nrm -rf ~");
+        assert_no_bytes(rx, "parked text must not touch the PTY");
+
+        // Escape: the only copy of the text dies with the entry.
+        app.answer_paste_banner(false);
+        assert!(app.paste_banner.is_none(), "cancel clears the banner");
+        assert_no_bytes(rx, "a cancelled paste delivers NOTHING");
+
+        // Enter on a fresh confirmation: the parked text — exactly it — delivers.
+        app.deliver_paste(wid, "ls\nrm -rf ~".to_string(), Source::Human);
+        app.answer_paste_banner(true);
+        assert!(app.paste_banner.is_none(), "accept consumes the banner");
+        assert_eq!(
+            drain(rx),
+            b"ls\rrm -rf ~",
+            "accept delivers through the real paste seam (LF->CR, unbracketed)"
+        );
+    }
+
+    /// ONE question at a time (the macOS sheet's rule): a second unconfirmed
+    /// paste arriving while one is parked is DROPPED — the question the user is
+    /// reading is never silently replaced, and the dropped text never delivers,
+    /// not even after the first is answered.
+    #[test]
+    fn a_second_unconfirmed_paste_never_replaces_the_open_question() {
+        let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        app.deliver_paste(wid, "first\nquestion".to_string(), Source::Human);
+        app.deliver_paste(wid, "second\nsneaks-in".to_string(), Source::Human);
+        assert_eq!(
+            app.paste_banner.as_ref().expect("still parked").text(),
+            "first\nquestion",
+            "the open question keeps ITS text"
+        );
+        app.answer_paste_banner(true);
+        assert_eq!(
+            drain(rx),
+            b"first\rquestion",
+            "only the answered paste delivers; the dropped one is gone"
+        );
+        assert!(app.paste_banner.is_none());
+    }
+
+    /// `confirm_multiline_paste = false` (the explicit opt-out) delivers a risky
+    /// paste straight through, exactly as before the banner existed.
+    #[test]
+    fn the_opt_out_keeps_the_direct_delivery_path() {
+        let (mut app, rx) = app_with_pty_observer();
+        app.confirm_multiline_paste = false;
+        app.deliver_paste(WindowId(0), "a\nb".to_string(), Source::Human);
+        assert!(app.paste_banner.is_none(), "opt-out never parks");
+        assert_eq!(drain(rx), b"a\rb");
+    }
+
+    /// THE AUDITED MIDDLE-CLICK BYPASS, CLOSED: `paste_primary_into` (the
+    /// middle-click arm's one entry point) runs the SAME pastejacking guard as
+    /// every other paste — a multi-line PRIMARY parks on the banner instead of
+    /// hitting the PTY raw, and a single-line PRIMARY delivers instantly off the
+    /// own-selection fast path. PRIMARY is stubbed (`PRIMARY_STUB`), so the test
+    /// takes the synchronous own-slot branch deterministically and never reads
+    /// the machine's real selection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn middle_click_primary_paste_runs_the_same_guard() {
+        let (mut app, rx) = app_with_pty_observer();
+        let wid = WindowId(0);
+        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("ls\npwned".to_string()));
+        app.paste_primary_into(wid);
+        let parked = app.paste_banner.as_ref().expect("guard must park it");
+        assert_eq!(parked.text(), "ls\npwned");
+        assert_no_bytes(rx, "the raw-input bypass stays closed");
+        app.answer_paste_banner(false);
+
+        // The common benign case: a single-line selection pastes immediately.
+        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("hello".to_string()));
+        app.paste_primary_into(wid);
+        assert!(app.paste_banner.is_none(), "single-line never asks");
+        assert_eq!(drain(rx), b"hello");
+        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
+    }
+}
+
 #[cfg(test)]
 mod edr_headroom_tests {
     //! The aurora present re-samples the panel's EDR headroom on a THROTTLE
@@ -31604,10 +31954,15 @@ mod ime_cursor_area_tests {
             (rows * ch + pad_top + pad + ch.saturating_sub(1).max(2)) as u32,
         ));
         let origin = app.frame_origin(wid);
-        assert!(
-            origin.0 > 0 && origin.1 > 0,
-            "fixture needs a frame remainder"
-        );
+        assert!(origin.0 > 0, "fixture needs a horizontal frame remainder");
+        if cfg!(target_os = "linux") {
+            // Top-pinned vertical placement: the remainder lands below the
+            // frame, so the IME rect's Y is origin-invariant by construction
+            // and the X axis carries the origin-shift assertion.
+            assert_eq!(origin.1, 0, "Linux pins the frame top");
+        } else {
+            assert!(origin.1 > 0, "fixture needs a vertical frame remainder");
+        }
         app.report_ime_cursor_area(wid, cell, (0, 0), true);
         let shifted = app.windows[&wid].last_ime_rect.expect("shifted IME rect");
         assert_eq!(shifted.0, padded.0 + i32::try_from(origin.0).unwrap());

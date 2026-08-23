@@ -372,16 +372,48 @@ fn forced_band_colors(hc: ForcedChrome) -> BandColors {
     }
 }
 
+/// The CSD headerbar fills the band sits directly under on Linux — sctk-adwaita's
+/// ACTIVE `ColorMap::headerbar` values (`theme.rs` in the vendored winit's
+/// decoration crate): `Color::from_rgba8(48, 48, 48)` dark, `(235, 235, 235)`
+/// light. Transcribed, not sampled: the frame-audit measured aterm's band at
+/// `#303135` (dark) against the CSD's `#303030` — a 2-luma-step mismatch that
+/// made the two strips read as separate headers with a visible tone break at
+/// their seam. The band's base tone is now the SAME gray family as the titlebar
+/// above it, so titlebar + band read as ONE header (the Ptyxis/libadwaita look
+/// the audit held up as the reference).
+///
+/// ACTIVE tones on purpose: the band does not track window focus (no repaint
+/// exists on focus change for it), and an active-matched band under an inactive
+/// titlebar is the quieter failure than a focus-flickering band.
+#[cfg(target_os = "linux")]
+pub(crate) const CSD_HEADERBAR_DARK: [u8; 3] = [0x30, 0x30, 0x30];
+#[cfg(target_os = "linux")]
+pub(crate) const CSD_HEADERBAR_LIGHT: [u8; 3] = [0xEB, 0xEB, 0xEB];
+
 /// Appearance-aware, theme-derived band tones with WCAG-AA text contrast.
 ///
 /// Under an OS-forced chrome palette (Windows High Contrast) this defers wholesale
 /// to [`forced_band_colors`] — the OS owns chrome colour then, and a theme-derived
 /// blend under an OS-palette caption is the seam that made HC support incoherent.
+///
+/// LINUX: the band's base tone is NOT theme-derived — it is the exact adwaita
+/// headerbar gray of the CSD titlebar directly above it (see
+/// [`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), picked dark/light by the same
+/// [`bg_is_light`] classifier every other chrome surface uses. The inks below are
+/// contrast-floored against whatever surface they land on, so a theme's fg keeps
+/// clearing AA on the fixed gray exactly as it did on the blend.
 pub(crate) fn band_colors(theme: Theme) -> BandColors {
     if let Some(hc) = forced_chrome() {
         return forced_band_colors(hc);
     }
     let light = bg_is_light(rgb(theme.bg));
+    #[cfg(target_os = "linux")]
+    let bar_bg = if light {
+        CSD_HEADERBAR_LIGHT
+    } else {
+        CSD_HEADERBAR_DARK
+    };
+    #[cfg(not(target_os = "linux"))]
     let bar_bg = blend(theme.bg, theme.fg, if light { 0.10 } else { 0.16 });
     let warn_base = if light {
         rgb(0x009A_6700)
@@ -710,6 +742,41 @@ mod tests {
         );
         assert!(publish_forced_chrome(None), "…and retracting is a move");
         assert_eq!(published_forced_chrome(), None);
+    }
+
+    /// THE DOUBLE-HEADER GRAYS (frame audit): on Linux the band's base tone must
+    /// be byte-identical to the CSD headerbar it sits under — `#303030` dark,
+    /// `#EBEBEB` light — for EVERY theme of that appearance, not merely close.
+    /// A near-miss (`#303135`, the old 0.16 blend on the default dark scheme)
+    /// reads as two stacked headers with a tone break at their seam.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_band_base_tone_is_the_exact_csd_headerbar_gray() {
+        assert_eq!(
+            forced_chrome(),
+            None,
+            "theme-derived band tones are only defined with no OS-forced palette"
+        );
+        for name in aterm_types::scheme::builtin_names() {
+            let scheme = aterm_types::scheme::builtin(name).expect("listed scheme exists");
+            let parts = scheme.to_theme_parts();
+            let theme = Theme {
+                fg: parts.fg,
+                bg: parts.bg,
+                cursor: parts.cursor,
+                selection: parts.selection,
+            };
+            let expected = if bg_is_light(rgb(theme.bg)) {
+                CSD_HEADERBAR_LIGHT
+            } else {
+                CSD_HEADERBAR_DARK
+            };
+            assert_eq!(
+                band_colors(theme).bar_bg,
+                expected,
+                "{name}: the band must sit on the CSD's own gray"
+            );
+        }
     }
 
     #[test]

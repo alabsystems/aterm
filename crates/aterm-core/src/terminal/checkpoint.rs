@@ -514,6 +514,20 @@ impl Terminal {
         // cannot remain attached to pre-restore cells. A freshly constructed
         // `from_checkpoint` terminal needs no edge: consumers baseline it.
         self.content_scroll_state.invalidate();
+        // Hydration replaced BOTH grids and `modes.alternate_screen` with another
+        // session's, so every selection anchor now names content from a lineage this
+        // terminal never saw. `text_selection` is deferred from the checkpoint
+        // `Repr`, so neither slot was restored — they were simply left standing, and
+        // the parked one would come back on the next alt exit as a highlight with no
+        // history behind it.
+        // Only the PARKED slot, which this design introduced and therefore owns.
+        // Hydration arguably invalidates the LIVE selection too — its anchors name a
+        // lineage this terminal never saw — but that is a pre-existing gap, and
+        // clearing it here is user-visible on the seamless-update ADOPT path
+        // (`spawn.rs`'s `restore_checkpoint`): a highlight would vanish across an
+        // in-place update. Left alone deliberately rather than changed as a side
+        // effect of screen-scoping.
+        self.parked_text_selection.clear();
     }
 }
 

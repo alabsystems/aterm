@@ -211,6 +211,12 @@ impl Terminal {
         self.invalidate_bidi_all();
         // Clear selection — anchors point at content that no longer exists.
         self.text_selection.clear();
+        // `reset_common_fields` swapped the main grid back and dropped the alt
+        // buffer: an alt->main switch that never reaches `post_process`, so nothing
+        // else restores or retires the parked slot. Without this the slot outlives
+        // the reset holding a selection over a grid that was just erased — the
+        // lifetime invariant on the field, violated.
+        self.parked_text_selection.clear();
         // Clear secure keyboard entry flag — if a program enabled it and then
         // crashed, RIS should restore clean state (#7336).
         self.secure_keyboard_entry = false;

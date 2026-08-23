@@ -1118,7 +1118,14 @@ mod tests {
             full.height.saturating_sub(8).max(1),
         ));
         let origin = app.frame_origin(wid);
-        assert!(origin.0 < 0 && origin.1 < 0, "fixture is a centred crop");
+        assert!(origin.0 < 0, "fixture crops horizontally (centred)");
+        if cfg!(target_os = "linux") {
+            // The vertical axis is top-pinned there: the crop falls off the
+            // bottom and the origin stays at the frame top.
+            assert_eq!(origin.1, 0, "Linux pins the frame top");
+        } else {
+            assert!(origin.1 < 0, "fixture is a centred crop");
+        }
 
         let artifact = app
             .retained_native_leaf_artifact(wid, view, true)

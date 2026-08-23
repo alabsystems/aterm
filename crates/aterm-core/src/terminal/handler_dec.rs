@@ -369,8 +369,11 @@ impl TerminalHandler<'_> {
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
-        // Invalidate selection — grid content changed completely.
-        self.grid.force_selection_invalidation();
+        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
+        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
+        // outgoing screen's selection — `post_process` parks it — and the `All` this
+        // used to record would clear it on the way back in.
+        self.grid.invalidate_host_coordinates();
         if let Some(cb) = self.buffer_activation_callback {
             cb(true);
         }
@@ -425,8 +428,11 @@ impl TerminalHandler<'_> {
         }
         self.grid.restore_tab_stops(&tab_stops);
         self.modes.alternate_screen = false;
-        // Invalidate selection — grid content changed completely.
-        self.grid.force_selection_invalidation();
+        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
+        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
+        // outgoing screen's selection — `post_process` parks it — and the `All` this
+        // used to record would clear it on the way back in.
+        self.grid.invalidate_host_coordinates();
         if let Some(cb) = self.buffer_activation_callback {
             cb(false);
         }
@@ -534,8 +540,11 @@ impl TerminalHandler<'_> {
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
-        // Invalidate selection — grid content changed completely.
-        self.grid.force_selection_invalidation();
+        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
+        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
+        // outgoing screen's selection — `post_process` parks it — and the `All` this
+        // used to record would clear it on the way back in.
+        self.grid.invalidate_host_coordinates();
         if let Some(cb) = self.buffer_activation_callback {
             cb(true);
         }
@@ -603,8 +612,11 @@ impl TerminalHandler<'_> {
         let saved = self.cursor_save.main;
         self.restore_cursor_snapshot(saved);
         self.modes.alternate_screen = false;
-        // Invalidate selection — grid content changed completely.
-        self.grid.force_selection_invalidation();
+        // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
+        // do NOT record `SelectionDamage::All`. A switch no longer destroys the
+        // outgoing screen's selection — `post_process` parks it — and the `All` this
+        // used to record would clear it on the way back in.
+        self.grid.invalidate_host_coordinates();
         if let Some(cb) = self.buffer_activation_callback {
             cb(false);
         }

@@ -244,6 +244,28 @@ pub(crate) struct Status {
 }
 
 impl Status {
+    /// Whether this record is the LIVE typing state: `Idle` published from
+    /// prompt-entry evidence (`ShellEvidence::Entering`) with the keystroke
+    /// echo still recent, marked by the movement reason riding the record.
+    /// The phase stays `Idle` on the wire — a prompt with no foreground job
+    /// IS idle, and RFC §6 permits no stronger claim — but chrome may keep a
+    /// "Typing …" subject up while this is true. No other `Idle` candidate
+    /// carries an activity reason, so the pair is unambiguous.
+    fn typing_live(&self) -> bool {
+        self.phase == Phase::Idle && self.reasons.contains(&Reason::ContentActivity)
+    }
+
+    /// The verdict the smart-title coordinator's Entering→prompt decay keys
+    /// on (frame audit #3): `Idle` that has actually SETTLED — at a prompt
+    /// with the keystroke echo aged out past `quiet_after`. A bare `phase ==
+    /// Idle` check killed the live state: `Entering` classifies as `Idle`
+    /// unconditionally, so the decay engaged WHILE the user was typing and
+    /// the typing subject never showed at all (review finding on the audit's
+    /// fix).
+    pub(crate) fn settled_idle(&self) -> bool {
+        self.phase == Phase::Idle && !self.typing_live()
+    }
+
     fn seed(now: Instant) -> Self {
         Self {
             phase: Phase::Starting,
@@ -297,15 +319,17 @@ impl StatusFsm {
     }
 
     /// The instant at which this session could publish a transition that NO new
-    /// output would cause. Two exist: a candidate still serving its dwell, and
-    /// `Running` aging into `Quiet`. Everything else is edge-driven — an `Idle`
-    /// pane cannot become anything until bytes arrive — so it returns `None`
-    /// and costs the event loop nothing.
+    /// output would cause. Three exist: a candidate still serving its dwell,
+    /// `Running` aging into `Quiet`, and the LIVE typing `Idle` settling into
+    /// plain `Idle` — all keyed off the same movement clock. Everything else is
+    /// edge-driven — a settled `Idle` pane cannot become anything until bytes
+    /// arrive — so it returns `None` and costs the event loop nothing.
     fn owed_wake(&self) -> Option<Instant> {
         if let Some((_, first_seen)) = &self.pending {
             return Some(*first_seen + self.policy.dwell);
         }
-        (self.published.phase == Phase::Running)
+        let aging = self.published.phase == Phase::Running || self.published.typing_live();
+        aging
             .then(|| self.last_movement.map(|at| at + self.policy.quiet_after))
             .flatten()
     }
@@ -419,6 +443,25 @@ impl StatusFsm {
                         vec![Reason::ShellBlock, Reason::Stall]
                     },
                     conflict,
+                    outcome: None,
+                },
+                // LIVE TYPING (review follow-up to frame audit #3): prompt
+                // entry with the keystroke echo still moving the grid is the
+                // one `Idle` that is NOT settled. Same phase on the wire, but
+                // the movement reason rides the record so the chrome's typing
+                // subject can stay live WHILE the user is typing — the audit's
+                // decay killed that state by classifying `Entering` as plain
+                // `Idle` unconditionally. The echo aging out (`quiet_after`,
+                // the module's one activity window) retires the marker, which
+                // is the decay itself: an abandoned half-typed prompt settles
+                // to plain `Idle` with no new bytes at all (see `owed_wake`).
+                // `Prompt` never carries the marker — its movement is the
+                // `tail -f &` case, not a keystroke.
+                ShellEvidence::Entering if self.moved_recently(now) => Candidate {
+                    phase: Phase::Idle,
+                    confidence: Confidence::Strong,
+                    reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
+                    conflict: false,
                     outcome: None,
                 },
                 ShellEvidence::Prompt | ShellEvidence::Entering => Candidate {
@@ -1162,6 +1205,24 @@ impl crate::App {
     /// pass per window: `refresh_window_tabs` takes every tab's terminal lock,
     /// and this runs on the output path.
     pub(crate) fn refresh_session_status_chrome(&mut self, session: u64) {
+        // TITLE FOLLOWS THE SETTLED PHASE (frame audit #3): push this publish's
+        // idle verdict into the smart-title coordinator BEFORE the chrome below
+        // recomposes, so a stale "Typing a command" subject decays to the
+        // prompt-state description in the same repaint that carries the phase
+        // change — instead of holding the titlebar for minutes after `status`
+        // started answering `phase=idle`. Runs at publish (transition) rate; a
+        // verdict that moves nothing visible is a cheap flag write.
+        //
+        // SETTLED is the verdict, never bare `Idle` (review finding on the
+        // audit's fix): `Entering` classifies as `Idle`, so a bare phase check
+        // decayed the typing subject WHILE the user was typing and it never
+        // showed at all. `Status::settled_idle` keeps the verdict false while
+        // the keystroke echo is fresh and flips it once the echo has aged out.
+        let idle = self
+            .session_status
+            .status(session)
+            .is_some_and(Status::settled_idle);
+        let _ = self.title_summaries.note_phase_settled(session, idle);
         let mut windows = self.windows_with_focused_session(session);
         for (wid, tab_id) in self.tabs_viewing_session(session) {
             if self.refresh_tab_status_indicators(wid, tab_id) && !windows.contains(&wid) {
@@ -2134,5 +2195,173 @@ mod tests {
             "the pin must not need the terminal lock: {record}"
         );
         drop(held);
+    }
+
+    /// LIVE TYPING (review follow-up to frame audit #3). The audit's decay
+    /// classified `Entering` as plain `Idle` unconditionally, so the settled
+    /// verdict engaged WHILE the user was typing and the typing subject never
+    /// showed. Typing must publish the live marker at once: prompt entry with
+    /// fresh keystroke echo is the same `Idle` phase on the wire, but NOT
+    /// settled — and because the phase does not change, the marker rides a
+    /// same-phase reasons update and never waits out a dwell.
+    #[test]
+    fn typing_at_the_prompt_publishes_live_without_a_dwell() {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Prompt);
+        settle(&mut fsm, &ev, t0);
+        assert_eq!(fsm.status().phase, Phase::Idle);
+        assert!(fsm.status().settled_idle(), "a bare prompt is settled idle");
+
+        // The first keystroke: block Entering, the echo advances the counter.
+        ev.shell = Some(ShellEvidence::Entering);
+        ev.activity.content_seq = 2;
+        let t1 = t0 + DWELL + Duration::from_millis(10);
+        assert!(fsm.observe(&ev, t1), "the live marker publishes immediately");
+        assert_eq!(
+            fsm.status().phase,
+            Phase::Idle,
+            "typing is still idle on the wire — RFC §6 permits no stronger claim"
+        );
+        assert!(
+            !fsm.status().settled_idle(),
+            "…but NOT settled, so the typing subject may show while keys land"
+        );
+        assert_eq!(
+            fsm.status().reasons,
+            vec![Reason::ShellBlock, Reason::ContentActivity],
+            "the record says WHY: prompt entry plus live echo"
+        );
+    }
+
+    /// An ABANDONED half-typed prompt: the echo ages out over `quiet_after`,
+    /// the observer owes the event loop a wake for a transition no new output
+    /// will ever cause, and the record settles to plain `Idle` — the decay of
+    /// frame audit #3, with the live state intact this time.
+    #[test]
+    fn an_abandoned_prompt_settles_and_owes_the_wake_that_retires_it() {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Entering);
+        observer.observe(1, &ev, t0);
+        let t1 = t0 + Duration::from_millis(10);
+        ev.activity.content_seq = 2;
+        observer.observe(1, &ev, t1);
+        let t2 = t1 + DWELL;
+        ev.activity.content_seq = 3;
+        observer.observe(1, &ev, t2);
+        let status = observer.status(1).expect("published");
+        assert_eq!(status.phase, Phase::Idle);
+        assert!(!status.settled_idle(), "typing is live");
+
+        // No more keystrokes will ever land. The event loop must still be
+        // told to come back, or the typing subject never decays.
+        let owed = observer.next_wake().expect("a live typing pane owes a wake");
+        assert_eq!(
+            owed,
+            t2 + QUIET,
+            "the settle window is quiet_after past the last echo"
+        );
+
+        // At that wake the marker retires with no new bytes at all.
+        assert!(observer.observe(1, &ev, owed), "the decay publishes");
+        assert!(
+            observer.status(1).expect("published").settled_idle(),
+            "an abandoned prompt settles to plain Idle"
+        );
+        // Settled: nothing left owing a wake, so an idle machine parks.
+        assert_eq!(observer.next_wake(), None);
+    }
+
+    /// A command that is typed, run, and finishes returns to a SETTLED idle at
+    /// the Complete mark itself: the typing marker never outlives prompt
+    /// entry, so the decay needs no echo window after real work.
+    #[test]
+    fn a_settled_command_returns_to_settled_idle() {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Entering);
+        fsm.observe(&ev, t0);
+        ev.activity.content_seq = 2;
+        let t1 = t0 + DWELL;
+        fsm.observe(&ev, t1);
+        assert!(!fsm.status().settled_idle(), "typing is live");
+
+        ev.shell = Some(ShellEvidence::Executing);
+        ev.activity.content_seq = 3;
+        let t2 = settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Running);
+
+        ev.shell = Some(ShellEvidence::Complete { exit_code: Some(0) });
+        ev.activity.content_seq = 4;
+        settle(&mut fsm, &ev, t2 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Idle);
+        assert!(
+            fsm.status().settled_idle(),
+            "Complete is not prompt entry: the marker does not survive it"
+        );
+        assert_eq!(fsm.status().last_outcome, Outcome::Success);
+    }
+
+    /// The verdict seam end to end over the REAL App wiring: while the user is
+    /// typing, NEITHER push site — the publish edge
+    /// (`refresh_session_status_chrome`) nor the per-observation reconcile
+    /// (`note_title_activity`, which runs on the very output wakes typing
+    /// produces) — may decay the typing subject; once the echo settles, both
+    /// flip it to the prompt description.
+    #[test]
+    fn the_typing_subject_shows_while_typing_and_decays_once_settled() {
+        let mut app = crate::App::headless_for_test();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        // OSC 133 A + B: the block is EnteringCommand — prompt entry is open.
+        term.lock()
+            .unwrap()
+            .process(b"\x1b]133;A\x1b\\\x1b]133;B\x1b\\");
+
+        // Classifier: Entering with the echo moving the grid between samples.
+        let t0 = Instant::now();
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Entering);
+        app.session_status.observe(0, &ev, t0);
+        ev.activity.content_seq = 2;
+        assert!(
+            app.session_status.observe(0, &ev, t0 + DWELL),
+            "the live typing record publishes"
+        );
+        assert!(!app.session_status.status(0).expect("published").settled_idle());
+
+        // The coordinator observes the Entering block; the reconcile pushes
+        // the LIVE verdict, so the typing subject stays up.
+        app.note_title_activity(0);
+        assert_eq!(
+            app.title_summaries.activity(0, &app.config),
+            Some("Typing a command"),
+            "the typing subject must show WHILE the user is typing"
+        );
+
+        // The publish edge pushes the same live verdict.
+        app.refresh_session_status_chrome(0);
+        assert_eq!(
+            app.title_summaries.activity(0, &app.config),
+            Some("Typing a command"),
+            "the publish edge must not decay a LIVE typing subject"
+        );
+
+        // The echo ages out with no further bytes: the abandoned prompt
+        // settles, and the same edge now decays the subject.
+        assert!(
+            app.session_status.observe(0, &ev, t0 + DWELL + QUIET),
+            "the settle publishes"
+        );
+        assert!(app.session_status.status(0).expect("published").settled_idle());
+        app.refresh_session_status_chrome(0);
+        assert_eq!(
+            app.title_summaries.activity(0, &app.config),
+            Some("Ready"),
+            "an abandoned prompt decays to the prompt-state description"
+        );
     }
 }

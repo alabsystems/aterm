@@ -4883,9 +4883,38 @@ pub fn band_offset(dst_px: usize, src_px: usize) -> i64 {
     (dst_px as i64 - src_px as i64).div_euclid(2)
 }
 
+/// W1's VERTICAL placement policy: where the frame's TOP edge sits inside a raw
+/// surface of `dst_px` height.
+///
+/// On Linux the in-grid tab band is the window's top chrome, drawn to meet the
+/// CSD titlebar directly above it — so the frame is PINNED to the top edge
+/// (offset 0, both when `dst > src` and in the transient `dst < src` crop):
+/// every sub-cell row-fit remainder and every mid-drag surface-vs-frame
+/// mismatch becomes a band (or crop) at the BOTTOM only, and nothing can open a
+/// terminal-background slit between the titlebar and the band (frame audit #1:
+/// a 6 px slit maximized, ~14 px during drags, from the centred split putting
+/// half the slack above the frame). Everywhere else this is the centred
+/// [`band_offset`], byte-identical to the historical placement.
+///
+/// The HORIZONTAL axis stays centred on every platform (plain [`band_offset`]):
+/// no chrome meets the side edges, and a left-pinned grid would just hug one
+/// edge for no reason. Every vertical placement consumer — the CPU
+/// [`place_frame_bands`], the GPU blit's `content_off`, the GUI's pointer
+/// mapping, visible-crop alignment and `dims` introspection — must use THIS
+/// function for Y so the placement and every coordinate mapping stay one law.
+#[must_use]
+pub fn band_offset_y(dst_px: usize, src_px: usize) -> i64 {
+    if cfg!(target_os = "linux") {
+        0
+    } else {
+        band_offset(dst_px, src_px)
+    }
+}
+
 /// W1: place the rendered frame (`src`, `src_w`×`src_h`, packed `0x00RRGGBB`)
 /// into a RAW-window-sized destination (`dst_w`×`dst_h`) at the centred
-/// [`band_offset`], painting the surrounding remainder bands `band_rgb` (the
+/// [`band_offset`] horizontally and the platform [`band_offset_y`] vertically
+/// (top-pinned on Linux), painting the surrounding remainder bands `band_rgb` (the
 /// caller-resolved live background) — the CPU/softbuffer twin of the GPU blit's
 /// band-aware `fs_blit`. `invert` XORs the CONTENT pixels (the visual-bell flash); the
 /// bands are chrome and never flash, matching the GPU shader's early-out.
@@ -4911,7 +4940,10 @@ pub fn place_frame_bands(
     let band = band_rgb & 0x00ff_ffff;
     let xor = if invert { 0x00ff_ffff } else { 0 };
     let off_x = band_offset(dst_w, src_w);
-    let off_y = band_offset(dst_h, src_h);
+    // Vertical placement is the PLATFORM policy, not the centred split: pinned
+    // to the top on Linux (slack to the bottom, under the chrome band), centred
+    // elsewhere. See [`band_offset_y`].
+    let off_y = band_offset_y(dst_h, src_h);
     // The content columns visible in dst: [x0, x1) in dst coords.
     let x0 = off_x.max(0) as usize;
     let x1 = (off_x + src_w as i64).clamp(0, dst_w as i64) as usize;
@@ -8069,6 +8101,26 @@ impl Renderer {
             self.cell_h,
             self.baseline,
             self.px,
+            self.deco_tables,
+            self.underline_adjust_pos,
+            self.underline_adjust_thick,
+        )
+    }
+
+    /// [`Self::deco_metrics`] for an arbitrary font size — a PURE read like
+    /// [`Self::cell_geometry`], resolved from the same fitted geometry that
+    /// size would activate to, without touching the live state. The mixed-DPI
+    /// twin: a host laying out chrome for a window the shared renderer is not
+    /// currently activated to (the tab strip's pixel band aligning its cards
+    /// against that window's own seam underline) reads the bands it will
+    /// actually be drawn with, not the active window's.
+    #[must_use]
+    pub fn deco_metrics_for(&self, px: f32) -> deco::DecoMetrics {
+        let (_, cell_h, baseline) = self.cell_geometry(px);
+        deco::resolve_deco_metrics(
+            cell_h,
+            baseline,
+            self.fitted_px(px),
             self.deco_tables,
             self.underline_adjust_pos,
             self.underline_adjust_thick,
@@ -13989,8 +14041,16 @@ impl Renderer {
             .set(self.image_cells.get().saturating_add(1));
         let cw = self.cell_w;
         let ch = self.cell_h;
+        // CHROME-BAND LIFT ([`aterm_core::grid::extra::ImageData::band_lift_px`]):
+        // the host's strip-band raster extends `lift` px ABOVE its first cell row,
+        // into the chrome band the `ChromeBleed` fills. The footprint is decoded
+        // that much taller, the first footprint row's tile paints the lip band
+        // `[y0 − lift, y0)` before its own cell band, and every row reads its
+        // source `lift` px lower. `lift == 0` (every terminal image) makes all
+        // three adjustments arithmetic no-ops — the pre-lift bytes exactly.
+        let lift = usize::from(image.image.band_lift_px);
         let fp_w = image.image.cols as usize * cw;
-        let fp_h = image.image.rows as usize * ch;
+        let fp_h = image.image.rows as usize * ch + lift;
         // Decode + scale on the first cell of a new placement; reuse thereafter.
         // The decoded cache is the PER-WINDOW `WindowCpu::image_cache`, threaded
         // in as `ic` (so the shared `Renderer` needs only `&self` here). The cache
@@ -14019,12 +14079,19 @@ impl Renderer {
             return;
         }
         // Source origin for THIS cell's tile within the footprint-scaled image.
+        // With a lift, every tile's source sits `lift` px lower — and the FIRST
+        // row's tile additionally owns the `[0, lift)` lip above it.
         let sx0 = image.cell_col as usize * cw;
-        let sy0 = image.cell_row as usize * ch;
+        let lip = if image.cell_row == 0 { lift } else { 0 };
+        let sy0 = image.cell_row as usize * ch + lift - lip;
         // Frame edge AND (on a composed row) pane edge: one bound, taken once.
         let x_end = w.min(x_clip);
-        for dy in 0..ch {
-            let py = y0 + dy;
+        for dy in 0..ch + lip {
+            // The lip rows land ABOVE the cell band; `y0 >= lift` by construction
+            // (the lift is at most `pad_top + head`, the very band `y0` sits
+            // under), and the saturation keeps a malformed input on-screen
+            // rather than out of bounds.
+            let py = (y0 + dy).saturating_sub(lip);
             if py >= h {
                 break;
             }
@@ -20167,6 +20234,7 @@ mod tests {
                 cols,
                 rows: 4,
                 z_index: z,
+                band_lift_px: 0,
             })
         };
         let base = mk(payload.clone(), 8, 0);
@@ -20250,6 +20318,7 @@ mod tests {
                 cols: 4,
                 rows: 2,
                 z_index: 0,
+                band_lift_px: 0,
             })
         };
         let fill = |input: &mut RenderInput, img: &Arc<ImageData>| {
@@ -21244,6 +21313,7 @@ mod tests {
                 cols: 1,
                 rows: 1,
                 z_index: 0,
+                band_lift_px: 0,
             })
         };
         let (a, b) = (mk(), mk());
@@ -21285,6 +21355,7 @@ mod tests {
             cols: 1,
             rows: 1,
             z_index: 0,
+            band_lift_px: 0,
         })
     }
 

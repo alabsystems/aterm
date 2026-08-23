@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use crate::{App, term_lock};
 use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
+use aterm_core::terminal::Terminal;
 use aterm_core::selection::{SelectionSide, SelectionType};
 
 /// Direction of an incremental terminal search. Forward is the legacy Cmd-F
@@ -38,6 +39,7 @@ impl SearchDirection {
             Self::Backward
         }
     }
+
 
     #[cfg(test)]
     fn initial_index(self, match_count: usize) -> usize {
@@ -259,6 +261,76 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
     }
 }
 
+/// Drop the find highlight only when the output that invalidated the match vector
+/// could actually have moved the text under it.
+///
+/// The three stamps the find bar keeps (`results_dirty`, `match_absolute_row_revision`,
+/// `match_content_seq`) answer ONE question: "may I still use this match vector to
+/// compute a row and a column". They are not evidence about the HIGHLIGHT, which since
+/// the selection-custody work is maintained by `post_process` itself — a uniform scroll
+/// remaps the anchors, a piecewise splice remaps or destroys them, and a damage band
+/// that overlaps them clears them. By the time the GUI runs, the selection is already
+/// correct or already gone.
+///
+/// So the band that matters is the MUTABLE one: rows at or below `live_top_abs` are the
+/// live screen, which the streaming write can have overwritten cell-by-cell under an
+/// unchanged row number. Rows above it are archived history — immutable except for
+/// eviction and wholesale renumbering, both of which the engine already accounted for.
+/// This is the same immutability argument `CachedSearchIndex` is built on.
+///
+/// `live_top_abs` is `absolute_row_counter − rows`, i.e. `Grid::base_y()`, NOT
+/// `top_visible_absolute_row()` — the latter folds in `display_offset`, which would make
+/// the predicate depend on where the user happens to be looking.
+fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) {
+    let live_top_abs = u64::try_from(term.grid().base_y()).unwrap_or(u64::MAX);
+    let live_bottom_abs = live_top_abs.saturating_add(u64::from(term.rows().saturating_sub(1)));
+    if term
+        .text_selection()
+        .intersects_absolute_band(live_top_abs, live_top_abs, live_bottom_abs)
+    {
+        term.text_selection_mut().clear();
+    }
+}
+
+/// The viewport a find was OPENED from, as an ABSOLUTE anchor rather than a
+/// `display_offset` + `base_y` pair to re-derive a delta from.
+///
+/// The delta form (`origin_offset + (base_y_now − origin_base_y)`) is only correct
+/// while every row keeps its absolute number and the row count is unchanged, so it
+/// carried a revision gate that skipped the restore outright whenever a top-anchored
+/// protected-footer splice landed. That gate fires for exactly the TUIs that repaint
+/// a pinned footer — codex, Claude Code — so ⎋ silently did nothing all day. An
+/// absolute anchor needs no gate: `scroll_to_absolute_row` re-finds the same LINE
+/// however much output streamed past it, and a splice only renumbers rows BELOW the
+/// insertion point (`apply_absolute_row_update` shifts from `old_live_top + bottom + 1`
+/// down), which is strictly under any scrolled-back origin.
+///
+/// Two staleness channels genuinely have no answer and are refused rather than
+/// guessed at, because both make the anchor name a row that no longer exists:
+/// [`Self::history_renumber_epoch`] (a Kitty CSI +T unscroll, a width reflow) and
+/// [`Self::on_alt_screen`] (entering/leaving the alt buffer swaps in a grid whose
+/// absolute counter restarts at `visible_rows`). The old arithmetic teleported the
+/// user to the top of scrollback in the alt case; refusing is a no-op instead.
+///
+/// A THIRD channel is deliberately unguarded: scrollback eviction / `\x1b[3J` can
+/// drop the anchored line while find is open. `scroll_to_absolute_row` clamps to the
+/// oldest retained row, which is what `scroll_display` already did, so the failure
+/// mode degrades to "as far back as history still goes" rather than teleporting.
+/// `Grid::oldest_absolute_row` is the predicate if that is ever worth refusing too.
+pub(crate) struct FindOrigin {
+    /// The absolute row that was at the TOP of the viewport when find opened.
+    pub(crate) top_visible_absolute_row: u64,
+    /// Find opened at the live tail (`display_offset == 0`). Load-bearing, not
+    /// defensive: at the tail the anchored row is exactly the row a protected-footer
+    /// splice ARCHIVES, so anchoring would drop a tail follower one row off the
+    /// bottom on every footer repaint. A tail follower gets the tail back instead.
+    pub(crate) was_live: bool,
+    /// Which buffer the anchor's absolute numbering belongs to.
+    pub(crate) on_alt_screen: bool,
+    /// Grid renumber epoch the anchor was captured against.
+    pub(crate) history_renumber_epoch: u64,
+}
+
 /// In-progress Cmd-F find over the full live screen + scrollback history. Matches are
 /// `(row, start_col, end_col)` in SELECTION coordinates (0..rows = live screen,
 /// negative = scrollback); the current one is highlighted by setting the text
@@ -312,20 +384,6 @@ pub(crate) struct SearchState {
     /// searched history", not "none anywhere". Copied from [`aterm_search::SearchResults`]
     /// `incomplete` each recompute so the find bar can qualify a zero-match honestly.
     pub(crate) truncated: bool,
-    /// The viewport's `display_offset` when find was ENTERED, so a cancel (⎋/^G)
-    /// restores the view you were looking at — the emacs `C-g` "abort back to where
-    /// you started" contract. Paired with [`Self::origin_base_y`] to survive PTY
-    /// output scrolling the grid mid-find.
-    pub(crate) origin_display_offset: i32,
-    /// The grid `base_y()` [`Self::origin_display_offset`] was captured against. If
-    /// output streams in during the find, base_y advances by `delta`; the content the
-    /// user was reading is then `origin_display_offset + delta` lines above the (new)
-    /// bottom, so the cancel path re-anchors exactly like the match paths do.
-    pub(crate) origin_base_y: i64,
-    /// Protected-footer insertion revision captured with the origin viewport.
-    /// If it changes while find is open there is no single offset delta that can
-    /// restore the old view, so cancel leaves the current viewport in place.
-    pub(crate) origin_absolute_row_revision: u64,
     /// Absolute search origin used for Emacs-style point anchoring. At the live
     /// bottom this is the terminal cursor; in a scrolled viewport it is the
     /// visible edge in the active search direction.
@@ -530,10 +588,11 @@ fn take_point_lookup_comparisons() -> usize {
 /// overlay's SELECTION coordinates: `sel_row = abs_row − base_y` (0..rows = live
 /// screen, negative = scrollback) with INCLUSIVE end columns, sorted top-to-bottom
 /// then left-to-right so next/prev reads in visual order. `base_y` is the absolute
-/// row of the top visible line (`grid().base_y()`) — display-offset-independent, so
-/// the coordinates are valid against the bottom-snapped viewport the apply path
-/// resets to. Rows or columns that fall outside the overlay's `i32`/`u16` range are
-/// dropped rather than wrapped. Pure, so it is unit-testable.
+/// row of the LIVE top line (`grid().base_y()`) — display-offset-independent, so the
+/// coordinates are valid wherever the viewport happens to be sitting; the apply path
+/// moves it by absolute row and never needs a snap. Rows or columns that fall outside
+/// the overlay's `i32`/`u16` range are dropped rather than wrapped. Pure, so it is
+/// unit-testable.
 ///
 /// The engine's columns are DISPLAY/cell columns (its `ColumnMap` counts a wide CJK
 /// glyph as two), so they pass straight through — the mapped `(start, end)` index the
@@ -602,7 +661,7 @@ impl App {
             }
         }
         if let Some(term) = term {
-            term_lock(&term).text_selection_mut().clear();
+            clear_selection_if_content_is_mutable(&mut term_lock(&term));
         }
     }
 
@@ -678,9 +737,9 @@ impl App {
         forward: bool,
         legacy_from_start: bool,
     ) {
-        let Some(term) = self
+        let Some((term, session)) = self
             .front_terminal(wid)
-            .map(|terminal| terminal.term.clone())
+            .map(|terminal| (terminal.term.clone(), terminal.session))
         else {
             if let Some(window) = self.windows.get_mut(&wid) {
                 window.search = None;
@@ -707,21 +766,38 @@ impl App {
                 )
             };
             (
-                display_offset,
-                base_y,
-                terminal.absolute_row_revision(),
+                FindOrigin {
+                    // The same quantity as `top` above, read from the accessor that
+                    // owns the definition rather than re-derived from two reads.
+                    top_visible_absolute_row: terminal.grid().top_visible_absolute_row(),
+                    was_live: display_offset == 0,
+                    on_alt_screen: terminal.is_alternate_screen(),
+                    history_renumber_epoch: terminal.grid().history_renumber_epoch(),
+                },
                 anchor_absolute_row,
                 anchor_col,
             )
         };
+        let (find_origin, anchor_absolute_row, anchor_col) = origin;
+        let already_open = self.windows.get(&wid).is_some_and(|ws| ws.search.is_some());
+        if !already_open {
+            // A ⌘S/⌘R that only flips the direction of an OPEN find must not move the
+            // origin to wherever find navigation just put the viewport, hence the gate.
+            //
+            // `or_insert`, not `insert`: a tab switch tears the bar down through the
+            // neutral close, which PARKS this entry rather than restoring (it runs on
+            // the winit thread under the no-engine-mutex discipline `sync_window`
+            // documents, so it cannot scroll). Reopening find on that terminal and
+            // pressing ⎋ therefore still lands on what the user was reading before the
+            // find that the switch interrupted. Both USER exits — ⎋ and ⏎ — remove the
+            // entry, so every open that follows a modelled exit captures afresh, which
+            // is what `EmacsSearchNavigation`'s unconditional `origin = viewport`
+            // says. A tab switch is not in that model's alphabet.
+            self.find_origins
+                .entry((session, wid))
+                .or_insert(find_origin);
+        }
         if let Some(ws) = self.windows.get_mut(&wid) {
-            let (
-                origin_display_offset,
-                origin_base_y,
-                origin_absolute_row_revision,
-                anchor_absolute_row,
-                anchor_col,
-            ) = origin;
             if let Some(search) = ws.search.as_mut() {
                 search.direction = direction;
                 if legacy_from_start {
@@ -733,9 +809,6 @@ impl App {
                     direction,
                     case_sensitive,
                     is_regex,
-                    origin_display_offset,
-                    origin_base_y,
-                    origin_absolute_row_revision,
                     anchor_absolute_row: if legacy_from_start {
                         i64::MIN
                     } else {
@@ -887,26 +960,19 @@ impl App {
             content_seq,
             consistent,
         ) = if query.is_empty() {
-            let terminal = term_lock(&term);
-            (
-                Vec::new(),
-                None,
-                false,
-                false,
-                i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
-                terminal.absolute_row_revision(),
-                terminal.content_seq(),
-                true,
-            )
+            // The guard lives in its own fn DELIBERATELY (OB-7): the lock
+            // census is lexical and branch-blind, so a `term_lock` here read
+            // as "held" across the else-arm's `search_full_history_direction`
+            // — which takes the same lock class. The arms are exclusive, but a
+            // tripwire that cannot see exclusivity is satisfied by a guard
+            // whose scope is a function — which is also simply clearer.
+            let (base_y, row_rev, seq) = empty_query_term_snapshot(&term);
+            (Vec::new(), None, false, false, base_y, row_rev, seq, true)
         } else {
-            // Snap to the bottom before searching. The search result carries
-            // the exact base_y + protected-footer revision captured with its
-            // own index key, so a splice between these two locks cannot mis-tag
-            // coordinates from one grid state as another.
-            {
-                let mut terminal = term_lock(&term);
-                terminal.scroll_to_bottom();
-            }
+            // No viewport snap before searching. `search_full_history_direction` never
+            // reads `display_offset`, and the `base_y()` the result is tagged with is
+            // display-offset-independent, so the stated rationale for snapping — stable
+            // coordinates — was already true without moving the user's view.
             let engine_direction = match direction {
                 SearchDirection::Forward => EngineSearchDirection::Forward,
                 SearchDirection::Backward => EngineSearchDirection::Backward,
@@ -1056,11 +1122,13 @@ impl App {
                 // A protected-footer insertion is piecewise: applying this stale
                 // match with a uniform base_y delta could select unrelated text;
                 // ordinary edits can invalidate the columns. Fail closed until
-                // the output wake/next navigation refreshes the batch.
-                term.text_selection_mut().clear();
+                // the output wake/next navigation refreshes the batch. The REFUSAL is
+                // unconditional — nothing below may be recomputed from `mat` — but the
+                // highlight already on glass is only destroyed when the output could
+                // have reached it.
+                clear_selection_if_content_is_mutable(&mut term);
                 return;
             }
-            term.scroll_to_bottom(); // reset to display_offset = 0 (stable coords)
             // Re-anchor the stored (frame-relative) selection row to THIS frame: if output
             // scrolled the grid since the search, base_y advanced by `delta`, so the match's
             // current row is `stored_row − delta`. Read base_y under this same lock so the
@@ -1083,17 +1151,27 @@ impl App {
             // the VIEWPORT so the match clears the band keeps the panel still — the
             // behaviour every native find bar has — and leaves the float for the one
             // case scrolling cannot fix: no history left above the match, where
-            // `scroll_display` clamps and the splice floats instead. Applies to
+            // the scroll clamps and the splice floats instead. Applies to
             // scrollback matches (row < 0) and live ones alike; a terminal shorter than
             // the panel keeps whatever clearance it has.
+            //
+            // Stated ABSOLUTELY rather than as "snap to the bottom, then scroll back
+            // `clearance − row`". The two are offset-identical when there IS a row —
+            // `live_top + row − clearance` is exactly the line the relative form lands
+            // on, and a match already clear of the panel saturates to the live bottom
+            // just as the snap did. They differ where the old form was gratuitous: with
+            // no row at all (an empty query, zero hits, a malformed regex) the viewport
+            // no longer moves, so opening ⌘F on a scrolled-back view stops yanking the
+            // user to the tail before they have typed anything.
             if let Some(row) = row {
                 let clearance = i32::try_from(crate::find_bar::FIND_BAR_ROWS)
                     .unwrap_or(1)
                     .min(i32::from(rows.saturating_sub(1)))
                     .max(0);
-                if row < clearance {
-                    term.scroll_display(clearance - row);
-                }
+                let target = base_y
+                    .saturating_add(i64::from(row))
+                    .saturating_sub(i64::from(clearance));
+                term.scroll_to_absolute_row(u64::try_from(target).unwrap_or(0));
             }
         }
         let warning_armed = ws
@@ -1456,13 +1534,19 @@ impl App {
                 .zip(anchor)
                 .map(|(session, (row, start, end))| (session, revision, row, start, end));
         }
+        // ⏎ is a user EXIT: the origin has served its purpose and must not outlive it,
+        // or the next ⌘F would silently inherit this find's origin instead of the
+        // viewport the user opens it from.
+        if let Some(session) = session {
+            self.find_origins.remove(&(session, wid));
+        }
         self.search_close_in(wid, false);
     }
 
     /// Leave find mode via ⎋/^G CANCEL (emacs `C-g`): clear the highlight and RESTORE
-    /// the viewport captured at [`Self::search_enter`] — re-anchored by
-    /// `base_y_now − origin_base_y` past any output that streamed in mid-find — so an
-    /// abandoned find never teleports the user away from what they were reading.
+    /// the viewport captured at [`Self::search_enter`] — by the ABSOLUTE anchor parked
+    /// in [`FindOrigin`], so however much output streamed past mid-find the user lands
+    /// back on the same LINE rather than the same distance from a moved bottom.
     /// Frontmost-window convenience wrapper. Every PRODUCTION caller is the
     /// window-targeted `search_cancel_in` form (a keystroke stays bound to the window it was
     /// routed to), so this survives for the headless tests that drive one window.
@@ -1477,30 +1561,26 @@ impl App {
     /// Window-targeted ⎋/^G CANCEL — the twin of [`Self::search_accept_in`], for the
     /// same press-episode-stays-on-its-window reason.
     pub(crate) fn search_cancel_in(&mut self, wid: crate::WindowId) {
-        let origin = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.search.as_ref())
-            .map(|s| {
-                (
-                    s.origin_display_offset,
-                    s.origin_base_y,
-                    s.origin_absolute_row_revision,
-                )
-            });
-        if let Some((origin_offset, origin_base_y, origin_revision)) = origin
-            && let Some(term) = self.front_terminal(wid).map(|t| t.term.clone())
+        if let Some((term, session)) = self
+            .front_terminal(wid)
+            .map(|terminal| (terminal.term.clone(), terminal.session))
         {
-            let mut terminal = term_lock(&term);
-            if terminal.absolute_row_revision() == origin_revision {
-                let base_y = i64::try_from(terminal.grid().base_y()).unwrap_or(0);
-                let delta = base_y - origin_base_y;
-                let target = i64::from(origin_offset) + delta;
-                terminal.scroll_to_bottom();
-                if let Ok(target) = i32::try_from(target.clamp(0, i64::from(i32::MAX)))
-                    && target > 0
-                {
-                    terminal.scroll_display(target);
+            // Removed whether or not the restore applies: ⎋ ends this find, and a
+            // stale entry would be inherited by the next ⌘F on this terminal.
+            if let Some(origin) = self.find_origins.remove(&(session, wid)) {
+                let mut terminal = term_lock(&term);
+                // The absolute space the anchor was written in has to still exist.
+                // Neither of these can be repaired by any amount of arithmetic — the
+                // rows the anchor names are either renumbered wholesale or belong to a
+                // different buffer — so refuse and leave the viewport alone.
+                let coherent = origin.on_alt_screen == terminal.is_alternate_screen()
+                    && origin.history_renumber_epoch == terminal.grid().history_renumber_epoch();
+                if coherent {
+                    if origin.was_live {
+                        terminal.scroll_to_bottom();
+                    } else {
+                        terminal.scroll_to_absolute_row(origin.top_visible_absolute_row);
+                    }
                 }
             }
         }
@@ -1530,7 +1610,12 @@ impl App {
         self.search_close_in(wid, clear_selection);
     }
 
-    fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
+    /// `pub(crate)` for `sync_window`: a tab/pane switch tears the find bar down and
+    /// must go through THIS seam rather than nulling `ws.search` itself, or the title
+    /// stays stuck under Search authority showing a find that is no longer on screen.
+    /// It deliberately does NOT drop the parked [`FindOrigin`] — the switch is not a
+    /// user exit (see `search_enter_impl_in`'s `or_insert`).
+    pub(crate) fn search_close_in(&mut self, wid: crate::WindowId, clear_selection: bool) {
         // Why: a native front has no terminal, but parked host search state must still be
         // dropped — bailing on the missing terminal left a stale find bar armed.
         let term = self
@@ -1539,6 +1624,13 @@ impl App {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
+        // Nothing find-owned was on screen, so nothing find-owned needs taking back.
+        // `sync_window` runs this on every focus publish — a pane-focus click, an
+        // accessibility focus change, a window attach, a settings sync — and an
+        // unguarded title restore there would push a `set_title` + `request_redraw`
+        // through ~40 seams that never opened find, where it is invisible to the
+        // headless tests and merely wasteful in production.
+        let was_open = ws.search.is_some() || ws.find_bar_hit.is_some();
         ws.search = None;
         ws.find_bar_hit = None; // drop the clickable-indicator geometry with the overlay
         if clear_selection && let Some(term) = term {
@@ -1547,14 +1639,28 @@ impl App {
         let warning_armed = ws
             .close_warning_until
             .is_some_and(|deadline| Instant::now() < deadline);
-        if crate::app_window::window_title_authority(warning_armed, false)
-            == crate::app_window::WindowTitleAuthority::Canonical
+        if was_open
+            && crate::app_window::window_title_authority(warning_armed, false)
+                == crate::app_window::WindowTitleAuthority::Canonical
             && let Some(w) = &ws.os_window
         {
             w.set_title(&ws.current_title);
             w.request_redraw();
         }
     }
+}
+
+/// The empty-query snapshot of `search_recompute_from_anchor_in`: base row,
+/// row revision, content sequence — taken and released under one short guard.
+/// A FREE fn so the OB-7 lock census sees the guard end here (see the call
+/// site's comment).
+fn empty_query_term_snapshot(term: &std::sync::Mutex<Terminal>) -> (i64, u64, u64) {
+    let terminal = term_lock(term);
+    (
+        i64::try_from(terminal.grid().base_y()).unwrap_or(i64::MAX),
+        terminal.absolute_row_revision(),
+        terminal.content_seq(),
+    )
 }
 
 #[cfg(test)]
@@ -2069,6 +2175,15 @@ mod tests {
         assert_ne!(term_lock(&term).content_seq(), before_seq);
         app.search_refresh_for_output(0);
         assert!(app.windows[&wid].search.as_ref().unwrap().results_dirty);
+        // The highlight is dropped because this hit is on the LIVE SCREEN — the band the
+        // streaming write can rewrite cell-by-cell under an unchanged row number. The
+        // scrollback twin below is the control that says the clear is narrow, not
+        // reflexive; without asserting the fixture's position here that pair would drift
+        // apart silently.
+        assert!(
+            before_abs >= i64::try_from(term_lock(&term).grid().base_y()).unwrap(),
+            "fixture hit must be on the live screen"
+        );
         assert!(!term_lock(&term).text_selection().has_selection());
 
         app.search_repeat(true);
@@ -2079,6 +2194,194 @@ mod tests {
         let after_abs = after.match_base_y + i64::from(after.current_match().unwrap().0);
         assert!(after_abs > before_abs, "repeat must reach the streamed hit");
         assert!(term_lock(&term).text_selection().has_selection());
+    }
+
+    /// Deep-scrollback twin of the test above, and the direct pin on the narrowed
+    /// clear. Output that invalidates the MATCH VECTOR must not destroy a highlight
+    /// sitting on ARCHIVED rows: those rows are immutable except for eviction and
+    /// wholesale renumbering, both of which `post_process` has already accounted for
+    /// by the time the GUI runs. Restore either clear to unconditional and this fails
+    /// while its live-screen twin keeps passing.
+    #[test]
+    fn streaming_output_keeps_a_scrollback_highlight_alive() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut terminal = term_lock(&term);
+            terminal.process(b"NEEDLE here\r\n");
+            for line in 0..200 {
+                terminal.process(format!("filler {line:03}\r\n").as_bytes());
+            }
+        }
+
+        app.search_enter_direction(true);
+        set_query(&mut app, wid, "NEEDLE");
+        app.search_recompute();
+        let hit_abs = {
+            let search = app.windows[&wid].search.as_ref().unwrap();
+            assert_eq!(search.matches.len(), 1);
+            search.match_base_y + i64::from(search.current_match().unwrap().0)
+        };
+        assert!(
+            hit_abs < i64::try_from(term_lock(&term).grid().base_y()).unwrap(),
+            "fixture hit must be in scrollback"
+        );
+        let highlighted = term_lock(&term)
+            .selection_to_string()
+            .expect("the match is highlighted");
+
+        term_lock(&term).process(b"streamed non-match\r\n");
+        app.search_refresh_for_output(0);
+        assert!(
+            app.windows[&wid].search.as_ref().unwrap().results_dirty,
+            "the match VECTOR is still refused — only the highlight survives"
+        );
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some(highlighted.as_str()),
+            "an archived highlight still covers exactly the text it did before"
+        );
+    }
+
+    /// ⌘F on a scrolled-back viewport with nothing to go to LEAVES THE VIEW ALONE.
+    ///
+    /// The apply path used to snap to the bottom before deciding where to put the
+    /// viewport, so opening find — or typing a query that matches nothing, or a
+    /// malformed regex — yanked the reader to the live tail before they had asked for
+    /// anything. Positioning by absolute row makes "no row" mean "no movement".
+    #[test]
+    fn opening_find_with_nothing_to_show_does_not_move_the_viewport() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut terminal = term_lock(&term);
+            for line in 0..120 {
+                terminal.process(format!("line {line:03}\r\n").as_bytes());
+            }
+            terminal.scroll_display(17);
+        }
+        let reading = term_lock(&term).row_text(0).expect("a top visible row");
+
+        app.search_enter();
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            17,
+            "a bare ⌘F on an empty query must not move the view"
+        );
+        set_query(&mut app, wid, "no such text anywhere");
+        app.search_recompute();
+        assert_eq!(
+            app.windows[&wid].search.as_ref().unwrap().matches.len(),
+            0,
+            "fixture query must miss"
+        );
+        assert_eq!(
+            term_lock(&term).row_text(0).as_deref(),
+            Some(reading.as_str()),
+            "a zero-match query leaves the reader where they were"
+        );
+    }
+
+    /// ⎋ restores a SCROLLED-BACK origin across a protected-footer splice — the
+    /// codex/Claude Code shape, asserted on the row TEXT rather than on
+    /// `display_offset`, because the splice moves rows relative to the tail.
+    ///
+    /// This is the repo's own daily-driver bug. `absolute_row_revision` has exactly one
+    /// producer, a top-anchored archival scroll with a protected footer, so the old
+    /// revision gate skipped the restore for precisely the TUIs that repaint a pinned
+    /// footer: ⎋ silently did nothing. There is no gate now, and the anchor is immune
+    /// because a splice only renumbers rows BELOW the insertion point.
+    #[test]
+    fn cancel_restores_a_scrolled_back_origin_across_a_footer_splice() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let rows = app.windows[&wid].rows;
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut terminal = term_lock(&term);
+            for line in 0..120 {
+                terminal.process(format!("hit {line:03}\r\n").as_bytes());
+            }
+            terminal.scroll_display(23);
+        }
+        let reading = term_lock(&term).row_text(0).expect("a top visible row");
+
+        app.search_enter();
+        set_query(&mut app, wid, "hit 004");
+        app.search_recompute();
+        assert_ne!(
+            term_lock(&term).grid().display_offset(),
+            23,
+            "find navigation must have moved the viewport away from the origin"
+        );
+
+        // The codex footer shape: a top-anchored DECSTBM region whose scroll archives
+        // the displaced row, which is the ONLY producer of an `absolute_row_revision`
+        // bump — i.e. the exact input the deleted gate refused to restore across.
+        let region_bottom = rows - 2;
+        term_lock(&term).process(
+            format!("\x1b[1;1HA\x1b[1;{region_bottom}r\x1b[{region_bottom};1H\r\nX\x1b[r")
+                .as_bytes(),
+        );
+        assert_eq!(term_lock(&term).absolute_row_revision(), 1);
+
+        app.search_cancel();
+        assert_eq!(
+            term_lock(&term).row_text(0).as_deref(),
+            Some(reading.as_str()),
+            "⎋ puts the reader back on the LINE they were reading, splice or no splice"
+        );
+    }
+
+    /// A tab/pane switch is not a find EXIT. It tears the bar down through the neutral
+    /// close, which hands the title back and PARKS the origin, so reopening find on
+    /// that terminal and pressing ⎋ still lands on what the user was reading before the
+    /// find the switch interrupted — rather than on wherever the interrupted find left
+    /// the viewport.
+    #[test]
+    fn a_neutral_close_parks_the_find_origin_for_the_next_open() {
+        let _serial = crate::control::search_cap_test_guard();
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        {
+            let mut terminal = term_lock(&term);
+            for line in 0..120 {
+                terminal.process(format!("hit {line:03}\r\n").as_bytes());
+            }
+            terminal.scroll_display(31);
+        }
+        let reading = term_lock(&term).row_text(0).expect("a top visible row");
+
+        app.search_enter();
+        set_query(&mut app, wid, "hit 007");
+        app.search_recompute();
+        assert_ne!(term_lock(&term).grid().display_offset(), 31);
+
+        // What `sync_window` does on a switch.
+        app.search_close_in(wid, false);
+        assert!(app.windows[&wid].search.is_none(), "the bar is gone");
+        assert!(
+            app.find_origins.contains_key(&(0, wid)),
+            "but the origin is parked, not discarded"
+        );
+
+        app.search_enter();
+        app.search_cancel();
+        assert_eq!(
+            term_lock(&term).row_text(0).as_deref(),
+            Some(reading.as_str()),
+            "the reopened find cancels home, not to where the interrupted one stopped"
+        );
+        assert!(
+            !app.find_origins.contains_key(&(0, wid)),
+            "⎋ is a user exit and takes the parked origin with it"
+        );
     }
 
     #[test]
@@ -2227,14 +2530,15 @@ mod tests {
         fire(&mut state, "RefreshRepeatForward");
         assert_active_projection(&app, &state, 3);
 
+        // Read the PARKED anchor before cancelling — ⎋ removes the entry. The number
+        // this produces is the same 9 the deleted `origin_offset + (base_y_now −
+        // origin_base_y)` produced on this fixture (no splice, no resize), which is
+        // the point: the anchor generalises the delta rather than replacing it.
         let expected_cancel_offset = {
-            let search = app.windows[&wid].search.as_ref().unwrap();
+            let origin = app.find_origins.get(&(0, wid)).expect("parked find origin");
             let base_now = i64::try_from(term_lock(&term).grid().base_y()).unwrap();
-            usize::try_from(
-                i64::from(search.origin_display_offset)
-                    + base_now.saturating_sub(search.origin_base_y),
-            )
-            .unwrap()
+            usize::try_from(base_now - i64::try_from(origin.top_visible_absolute_row).unwrap())
+                .unwrap()
         };
         app.search_cancel();
         fire(&mut state, "Cancel");

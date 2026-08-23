@@ -1750,7 +1750,7 @@ mod tests {
     /// intent — closing the "but the builders could diverge" gap. We can't
     /// construct a winit `KeyEvent` (its `platform_specific` field is `pub(crate)`),
     /// so we drive the SAME primitives `keymap::build_key_input` uses
-    /// (`aterm_types::keyboard::{map_logical_key, base_layout_key_for}`) as the
+    /// (`aterm_winit_keymap::{map_logical_key, base_layout_key_for}`) as the
     /// human side, and the real control-verb parsers (`control::parse_key`,
     /// `parse_ctrl`, `parse_mouse`) as the controller side. For the named-key /
     /// ctrl-chord intents both sides land on the identical `InputEvent` — and then
@@ -1758,9 +1758,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn builders_converge() {
-        use aterm_types::keyboard::{
-            Key, Modifiers, NamedKey, base_layout_key_for, map_logical_key,
-        };
+        use aterm_types::keyboard::{Key, Modifiers, NamedKey};
+        use aterm_winit_keymap::{base_layout_key_for, map_logical_key};
         use winit::keyboard::{Key as WinitKey, KeyCode, NamedKey as WinitNamed, PhysicalKey};
 
         // --- "press the Up arrow" --------------------------------------------

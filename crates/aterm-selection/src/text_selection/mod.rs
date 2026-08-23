@@ -4,7 +4,9 @@
 
 //! Mouse-based text selection state machine.
 //!
-//! This module implements the text selection system per the TLA+ spec in `tla/Selection.tla`.
+//! This module implements the text selection state machine specified in
+//! `docs/DESIGN-selection-custody-2026-08-21.md` §5.2. (It used to cite a TLA+ spec
+//! at `tla/Selection.tla`; no such file has ever existed in this repo.)
 //!
 //! Selection lifecycle:
 //! - None -> InProgress (start selection on mouse down)
@@ -124,11 +126,15 @@ impl Ord for SelectionAnchor {
 
 /// Text selection state.
 ///
-/// This is a state machine implementing the TLA+ spec in `tla/Selection.tla`.
+/// This is a state machine specified in
+/// `docs/DESIGN-selection-custody-2026-08-21.md` §5.2.
 ///
 /// `PartialEq`/`Eq` exist so the renderer can detect a selection change between
 /// frames (the damage-tracking fast path falls back to a full render whenever
-/// the selection differs); two selections are equal iff all four fields match.
+/// the selection differs); two selections are equal iff all FIVE fields match,
+/// `truncated` included. A `truncated`-only difference therefore opens the
+/// renderer's per-row span loop and marks nothing dirty — harmless in cost, and
+/// cheaper than a hand-written comparison that would drift from the field list.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TextSelection {
     /// Current selection state.
@@ -139,6 +145,10 @@ pub struct TextSelection {
     start: SelectionAnchor,
     /// End anchor (updated on mouse move).
     end: SelectionAnchor,
+    /// Whether an endpoint was CLAMPED to the history floor because its content
+    /// was evicted from scrollback — the selection still names real text, but
+    /// less of it than the user picked. Reported, never rendered from.
+    truncated: bool,
 }
 
 impl TextSelection {
@@ -150,6 +160,7 @@ impl TextSelection {
             selection_type: SelectionType::Simple,
             start: SelectionAnchor::new(0, 0, SelectionSide::Left),
             end: SelectionAnchor::new(0, 0, SelectionSide::Left),
+            truncated: false,
         }
     }
 
@@ -209,6 +220,20 @@ impl TextSelection {
         self.end
     }
 
+    /// Has an endpoint been clamped to the history floor because its content was
+    /// evicted?
+    ///
+    /// `true` means the selection still resolves to real text but the oldest part
+    /// of the span is gone. Callers that report to a client (the control socket's
+    /// `selection`/`copy` verbs) surface it as ` incomplete`; nothing PAINTS from
+    /// it — `SelectionFingerprint::of` reads state/kind/start/end only, which is
+    /// sound exactly because a truncation always moves an anchor row too.
+    #[must_use]
+    #[inline]
+    pub const fn truncated(&self) -> bool {
+        self.truncated
+    }
+
     /// SELECTION CUSTODY Phase 4: does this selection overlap the ABSOLUTE row band
     /// `lo_abs..=hi_abs`?
     ///
@@ -234,6 +259,110 @@ impl TextSelection {
         let lo = i64::try_from(lo_abs).unwrap_or(i64::MAX);
         let hi = i64::try_from(hi_abs).unwrap_or(i64::MAX);
         sel_lo <= hi && lo <= sel_hi
+    }
+
+    /// SELECTION CUSTODY Phase 4: re-floor the selection after history was EVICTED
+    /// with no accompanying scroll.
+    ///
+    /// `oldest_abs` is `Grid::oldest_absolute_row()` and `live_top_abs` is
+    /// `absolute_row_counter - visible_rows` — the same base
+    /// [`Self::intersects_absolute_band`] converts through, and likewise independent
+    /// of `display_offset`. Their difference is the deepest still-addressable anchor
+    /// row in the selection's own relative space.
+    ///
+    /// This is the eviction-with-no-DELTA entry point: a retention-limit shrink or a
+    /// memory-budget trim drops the oldest lines without moving anything, so
+    /// [`Self::adjust_for_scroll`] — which only ever runs on a real content scroll —
+    /// never sees it. Returns `false` (and clears) only when BOTH endpoints are gone.
+    pub fn truncate_to_floor(&mut self, oldest_abs: u64, live_top_abs: u64) -> bool {
+        // `u64 as i64` wraps (`clippy::cast_possible_wrap`); saturating through
+        // `try_from` keeps an absurd counter fail-safe instead of folding a huge
+        // absolute row into a negative one.
+        let oldest = i64::try_from(oldest_abs).unwrap_or(i64::MAX);
+        let live_top = i64::try_from(live_top_abs).unwrap_or(i64::MAX);
+        // A floor too deep for the anchor space is a floor no anchor can be below,
+        // so `i32::MIN` is the safe saturation: nothing is treated as evicted.
+        let min_row = i32::try_from(oldest.saturating_sub(live_top)).unwrap_or(i32::MIN);
+        // The design asked for `debug_assert_eq!(min_row, -scrollback_lines)`. That is
+        // NOT assertable: `oldest_absolute_row()` saturating-subs twice, so the
+        // identity holds only while `absolute_row_counter >= visible_rows +
+        // scrollback_lines()`, and a rows-grow moves `visible_rows` without touching
+        // the counter. Assert the weaker always-true form — the oldest retained row
+        // sits at or above the live top — and clamp, so a saturated counter degrades
+        // to "no history" rather than to "every live row is evicted".
+        debug_assert!(
+            min_row <= 0,
+            "history floor cannot sit below the live top: min_row={min_row}"
+        );
+        self.clamp_head_to_min_row(min_row.min(0))
+    }
+
+    /// Clamp an endpoint evicted below `min_row` onto the oldest retained row.
+    ///
+    /// Returns `false` (and clears) only when BOTH endpoints are gone. The copy walk
+    /// has performed this head clamp for years — `first_row = adj_start_row.max(-history)`
+    /// in `aterm-core`'s `selection_to_string_capped` — so clamping the ANCHOR makes
+    /// the highlight agree with the text a copy already returns, instead of
+    /// destroying the retained half of the span for the sake of the lost half.
+    ///
+    /// The floor is the deepest RETAINED row, not the deepest ring-resident one:
+    /// `Terminal::history_line_rev` resolves tiered and lazily-restored lines just as
+    /// well as ring lines, so narrowing this to ring residency would reinstate
+    /// whole-selection clearing under the tiered store for no correctness gain.
+    fn clamp_head_to_min_row(&mut self, min_row: i32) -> bool {
+        if self.state == SelectionState::None {
+            return true;
+        }
+        // Only the LOWER-row anchor can be evicted first, and it is not necessarily
+        // `start`: an upward drag leaves the older row in `end`.
+        let lo = self.start.row.min(self.end.row);
+        let hi = self.start.row.max(self.end.row);
+        if lo >= min_row {
+            return true;
+        }
+        // The ALT-SCREEN guard, deliberately structural. The alt grid is always
+        // `Grid::with_scrollback(rows, cols, 0)`, so on alt `min_row == 0`: there is
+        // no oldest RETAINED row to clamp onto, and clamping would pin the highlight
+        // to alt row 0 — content the user never selected. A full-screen alt scroll
+        // takes the uniform-delta path and records no damage band, so nothing
+        // downstream would catch it. Testing `min_row == 0` rather than
+        // `modes.alternate_screen` keeps the rule in the coordinate space it is
+        // about, and covers a primary grid configured with zero scrollback by the
+        // same line.
+        if min_row >= 0 || hi < min_row {
+            self.clear();
+            return false;
+        }
+        let anchor = if self.start.row <= self.end.row {
+            &mut self.start
+        } else {
+            &mut self.end
+        };
+        anchor.row = min_row;
+        // BLOCK selections clamp the ROW only. `normalized_start`/`normalized_end`
+        // take the min/max of rows and cols INDEPENDENTLY, so forcing col 0 here
+        // would widen the rectangle to column 0 across EVERY retained row — a
+        // wrong-copy path, not a degradation.
+        if self.selection_type != SelectionType::Block {
+            anchor.col = 0;
+            // `Right` on the head anchor means "start AFTER this cell", which would
+            // eat the first cell of the oldest row we just clamped onto.
+            anchor.side = SelectionSide::Left;
+        }
+        self.truncated = true;
+        // A clamp that leaves NOTHING selectable is a total loss, not a partial one:
+        // when the surviving anchor also lands on the floor row at col 0 side Left,
+        // `apply_side_adjustment` retreats the end to `(min_row - 1, u16::MAX)` and
+        // both `side_adjusted_bounds` and `project_range` go empty — for `Lines` too
+        // (`project_range` re-tests `start_row > end_row` after its Lines exemption).
+        // Leaving that alive would be a selection nothing paints and nothing copies,
+        // reported to the control socket as a bare `OK 0`. Clear instead: the honest
+        // total-loss answer, which is what this change replaces only for PARTIAL loss.
+        if self.side_adjusted_bounds().is_none() {
+            self.clear();
+            return false;
+        }
+        true
     }
 
     /// Get the normalized start (the anchor that comes first).
@@ -358,6 +487,10 @@ impl TextSelection {
         self.selection_type = selection_type;
         self.start = SelectionAnchor::new(row, col, side);
         self.end = SelectionAnchor::new(row, col, side);
+        // A fresh span has lost nothing. Leaving this set would make the control
+        // socket's `selection`/`copy` replies carry ` incomplete` forever after one
+        // eviction, which `aterm-control`'s conformance check compares exactly.
+        self.truncated = false;
     }
 
     /// Update the selection endpoint (during mouse drag).
@@ -380,6 +513,8 @@ impl TextSelection {
     pub fn clear(&mut self) {
         self.state = SelectionState::None;
         // Keep anchors for debugging but they're invalid now
+        // ...and so is the truncation report: there is no span left to be partial.
+        self.truncated = false;
     }
 
     /// Extend an existing complete selection.
@@ -408,7 +543,10 @@ impl TextSelection {
     /// Adjust selection for scroll.
     ///
     /// When the terminal scrolls, selection coordinates need to be updated.
-    /// Returns false if selection scrolled entirely off-screen and was cleared.
+    /// Returns false only if the WHOLE selection left the valid coordinate range
+    /// and was cleared; a single endpoint scrolled below the history floor is
+    /// partial eviction and clamps to the oldest retained row instead (see
+    /// [`Self::truncated`]).
     ///
     /// Selection rows are live-screen coordinates where scrollback is negative
     /// (e.g. a selection made while scrolled back `D` lines has rows near `-D`).
@@ -446,19 +584,21 @@ impl TextSelection {
         let min_row = floor.saturating_neg();
         let max_row = max_rows;
 
-        if new_start_row < min_row
-            || new_start_row > max_row
-            || new_end_row < min_row
-            || new_end_row > max_row
-        {
-            // Selection scrolled off - clear it
+        // ABOVE the live bottom is nonsense rather than eviction: there is no
+        // content up there to clamp onto, so this half stays an unconditional
+        // clear. The control socket's `select` verb parses unclamped i32 rows and
+        // its out-of-range behaviour is pinned on exactly this.
+        if new_start_row > max_row || new_end_row > max_row {
             self.clear();
             return false;
         }
 
         self.start.row = new_start_row;
         self.end.row = new_end_row;
-        true
+        // BELOW the floor is eviction, and eviction of one endpoint is a PARTIAL
+        // loss. Destroying the whole selection there threw away the half the user
+        // can still see and still copy.
+        self.clamp_head_to_min_row(min_row)
     }
 
     /// Translate both anchor rows into a presentation coordinate space.
@@ -484,9 +624,12 @@ impl TextSelection {
     /// uniform delta would either detach the footer endpoint or detach the
     /// archived endpoint.
     ///
-    /// Returns `false` and clears the selection if either remapped endpoint is
-    /// outside the retained coordinate range. Selection state, type, columns,
-    /// and sub-cell sides are otherwise preserved exactly.
+    /// Returns `false` and clears the selection when a remapped endpoint lands above
+    /// the live bottom, or when BOTH land below the history floor. One endpoint
+    /// below the floor is partial eviction and clamps, exactly as in
+    /// [`Self::adjust_for_scroll`] — a top-anchored archival splice would otherwise
+    /// still destroy a whole selection for one evicted endpoint. Selection state,
+    /// type, columns, and sub-cell sides are otherwise preserved exactly.
     pub fn adjust_for_row_splice(
         &mut self,
         boundary_row: i32,
@@ -512,18 +655,14 @@ impl TextSelection {
         let new_start_row = remap(self.start.row);
         let new_end_row = remap(self.end.row);
         let min_row = floor.saturating_neg();
-        if new_start_row < min_row
-            || new_start_row > max_rows
-            || new_end_row < min_row
-            || new_end_row > max_rows
-        {
+        if new_start_row > max_rows || new_end_row > max_rows {
             self.clear();
             return false;
         }
 
         self.start.row = new_start_row;
         self.end.row = new_end_row;
-        true
+        self.clamp_head_to_min_row(min_row)
     }
 
     /// Check if a cell is within the selection, accounting for wide characters.

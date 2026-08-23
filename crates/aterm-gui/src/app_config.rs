@@ -470,12 +470,18 @@ pub(crate) struct Config {
     /// content is NOT persisted (layout + cwd only). See
     /// [`Config::restore_session_or_default`].
     pub(crate) restore_session: Option<bool>,
-    /// Copy a mouse selection to the system clipboard automatically the moment a
+    /// Copy a mouse selection to the system CLIPBOARD automatically the moment a
     /// drag-select completes (mouse-up), so no explicit Cmd-C is needed. DEFAULT
-    /// ON — the X11-style copy-on-select convenience, flipped on with the other
-    /// visual/UX defaults. Set `copy_on_select = false` to opt out (the
-    /// explicit-copy behaviour). The selection is left highlighted either way,
-    /// so Cmd-C still works. See [`Config::copy_on_select_or_default`].
+    /// ON off Linux — the copy-on-select convenience, flipped on with the other
+    /// visual/UX defaults; set `copy_on_select = false` to opt out (the
+    /// explicit-copy behaviour). ON LINUX the default is OFF, because a
+    /// selection there already owns the X11 PRIMARY buffer unconditionally
+    /// (`finish_selection`) — the platform convention is selection→PRIMARY,
+    /// explicit copy→CLIPBOARD, and defaulting this on made every drag CLOBBER
+    /// the explicit Ctrl+Shift+C copy (audit finding); `copy_on_select = true`
+    /// still opts into writing both. The selection is left highlighted either
+    /// way, so Cmd-C / Ctrl+Shift+C still works. See
+    /// [`Config::copy_on_select_or_default`].
     pub(crate) copy_on_select: Option<bool>,
     /// RIGHT-CLICK gesture in the terminal grid: `"copy_paste"` — the
     /// conhost/Windows-Terminal convention (a right press with VT mouse tracking
@@ -826,10 +832,14 @@ pub(crate) struct Config {
     /// config commit; macOS-only — Wayland is secure by default, X11 cannot
     /// be secured, and the Settings row says so instead of pretending.
     pub(crate) secure_keyboard_entry: Option<bool>,
-    /// Security opt-in for XTWINOPS (`CSI t`). The GUI installs no window
-    /// callback, so only the engine's window-title and text-grid-size fallback
-    /// reports work; manipulation and most state/geometry requests are ignored.
-    /// Default OFF because even title/grid reports can fingerprint the host.
+    /// Security opt-in for XTWINOPS (`CSI t`). On Linux the GUI installs a
+    /// window callback (`spawn::configure_window_ops` → `App::on_window_op`),
+    /// so authorized manipulations (iconify, maximize, fullscreen, resize —
+    /// move stays denied in-core) reach the winit window; position/pixel
+    /// geometry reports beyond the engine's window-title and text-grid-size
+    /// fallbacks remain unanswered. Elsewhere no callback is installed and only
+    /// those fallback reports work. Default OFF because even title/grid
+    /// reports can fingerprint the host.
     pub(crate) allow_window_ops: Option<bool>,
     /// Security opt-in: allow desktop notifications (OSC 9 / 99 / 777). Default
     /// OFF. Maps to `allow_notifications`.
@@ -2532,12 +2542,18 @@ impl Config {
         self.restore_session.unwrap_or(true)
     }
 
-    /// Whether a completed mouse selection auto-copies to the clipboard. DEFAULT
-    /// when absent is `true` — the X11-style copy-on-select convenience, flipped on
-    /// with the other visual/UX defaults. Setting `copy_on_select = false` opts out
-    /// (the ghostty/macOS explicit-copy behaviour).
+    /// Whether a completed mouse selection auto-copies to the system CLIPBOARD.
+    /// DEFAULT when absent is `true` off Linux — the copy-on-select convenience,
+    /// flipped on with the other visual/UX defaults; `copy_on_select = false`
+    /// opts out (the ghostty/macOS explicit-copy behaviour). On LINUX the
+    /// default is `false`: a selection already owns the X11 PRIMARY buffer
+    /// unconditionally, and the platform convention keeps the CLIPBOARD for
+    /// explicit copies only — defaulting this on made every drag clobber the
+    /// user's Ctrl+Shift+C copy (audit finding). An explicit
+    /// `copy_on_select = true` still opts into writing both buffers.
     pub(crate) fn copy_on_select_or_default(&self) -> bool {
-        self.copy_on_select.unwrap_or(true)
+        self.copy_on_select
+            .unwrap_or(cfg!(not(target_os = "linux")))
     }
 
     /// Master switch for generated live Activity. Generation is batteries-on,
@@ -4377,9 +4393,9 @@ impl Config {
 
     /// C3: resolve the in-grid tab band's height policy ([`TabBandHeight`]) from
     /// config `tab_band_height`. The DEFAULT when the key is absent is PER-PLATFORM
-    /// ([`TabBandHeight::PLATFORM_DEFAULT`]): `standard` on Windows, `compact`
-    /// elsewhere. An unknown / malformed value warns and falls back to that same
-    /// platform default (the `window_theme` fail-safe shape).
+    /// ([`TabBandHeight::PLATFORM_DEFAULT`]): `standard` on Windows and Linux,
+    /// `compact` elsewhere. An unknown / malformed value warns and falls back to
+    /// that same platform default (the `window_theme` fail-safe shape).
     pub(crate) fn tab_band_height_or_default(&self) -> TabBandHeight {
         match self.tab_band_height.as_deref() {
             None => TabBandHeight::PLATFORM_DEFAULT,
@@ -5113,11 +5129,15 @@ pub(crate) enum TabBandHeight {
 impl TabBandHeight {
     /// The per-platform default when the key is absent: `Standard` on Windows (the
     /// in-grid strip is the window's ONLY tab chrome there, and a 23 px band next
-    /// to a 32 px caption reads as a squashed toolbar), `Compact` everywhere else —
-    /// macOS carries tabs in the native toolbar and never paints this band at all,
-    /// and the Linux strip's geometry was tuned against its own chrome. A `cfg!`
-    /// const, not two `#[cfg]` items, so both arms stay type-checked everywhere.
-    pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(windows) {
+    /// to a 32 px caption reads as a squashed toolbar) AND on Linux (same
+    /// only-chrome premise, and the pixel band that designs the Linux strip —
+    /// [`crate::tab_bar::pixel_band`] — is drawn for the full
+    /// [`TAB_BAND_STANDARD_LOGICAL_PX`] canvas: cards optically centred in a
+    /// native-height bar, which one 18-px cell row cannot carry). `Compact` on
+    /// macOS, which carries tabs in the native toolbar and never paints this band
+    /// at all. A `cfg!` const, not two `#[cfg]` items, so both arms stay
+    /// type-checked everywhere.
+    pub(crate) const PLATFORM_DEFAULT: Self = if cfg!(any(windows, target_os = "linux")) {
         Self::Standard
     } else {
         Self::Compact
@@ -5145,11 +5165,17 @@ impl TabBandHeight {
     }
 }
 
-/// The `"standard"` band target in LOGICAL px. 32 is the Win11/WinUI tab strip
-/// height (Windows Terminal's own tab row measures 32-34 px at 100%), and it is
-/// also what the caption next to it is — so the two read as one chrome block
-/// rather than a full-height title bar over a squashed toolbar.
-pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 = 32.0;
+/// The `"standard"` band target in LOGICAL px, per platform's own chrome idiom.
+/// WINDOWS: 32 is the Win11/WinUI tab strip height (Windows Terminal's own tab
+/// row measures 32-34 px at 100%), and it is also what the caption next to it is
+/// — so the two read as one chrome block rather than a full-height title bar
+/// over a squashed toolbar. LINUX: 36 is the libadwaita `AdwTabBar` content
+/// height (GNOME Console/Text Editor tab rows measure 34-38 px at 100%), the
+/// bar the pixel band's card design is drawn against. A `cfg!` const so both
+/// arms stay type-checked everywhere; only the platform that reads the value
+/// through [`TabBandHeight::Standard`] ever feels it.
+pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 =
+    if cfg!(target_os = "linux") { 36.0 } else { 32.0 };
 
 /// Sanity cap on the SYNTHETIC head, in device px, as a multiple of the cell
 /// height: a pathological config (huge `tab_band_height` target against a tiny
@@ -6976,8 +7002,8 @@ impl App {
                 }
             }
         }
-        // C3 (Windows): the SYNTHETIC tab-band head, re-derived. Unlike macOS's
-        // band this one is COMPUTED, not sampled — from the window's own cell box,
+        // C3 (Windows + Linux): the SYNTHETIC tab-band head, re-derived. Unlike
+        // macOS's band this one is COMPUTED, not sampled — from the window's own cell box,
         // the live strip row count and the configured target — so it has to be
         // re-derived on the one event every input funnels through. And they do all
         // funnel through here: a font zoom and a config reload both re-grid every
@@ -6992,20 +7018,23 @@ impl App {
         // band, and seeding a synthetic one would move the geometry every headless
         // capture/snapshot pins.
         //
-        // `if cfg!(windows)` and NOT `#[cfg(windows)]` — the same form the macOS band
-        // block twelve lines above uses, and for the same reason `TabBandHeight::
+        // A runtime `cfg!` and NOT a `#[cfg]` attribute — the same form the macOS
+        // band block twelve lines above uses, and for the same reason `TabBandHeight::
         // PLATFORM_DEFAULT` is a `cfg!` const rather than two `#[cfg]` items: this is
         // the ONE non-test call site of the whole C3 config chain
         // (`synthetic_strip_head_px` → `tab_band_height_or_default` → `TabBandHeight`
         // → `synthetic_band_head_px`), so an attribute here would make every link
-        // unreachable off Windows and hand the lint gate (`-D warnings`, tools/verify.sh)
-        // six `dead_code` findings plus "field `tab_band_height` is never read" on
-        // macOS and Linux. As a runtime `false` the body still type-checks on every
-        // platform and still costs nothing: off Windows `PLATFORM_DEFAULT` is
-        // `Compact`, so the law would return 0 even if the branch DID run, and the
-        // optimiser drops it whole. The two other call sites (attach, the L1 early
-        // reveal) can stay `#[cfg(windows)]` — one live root is enough.
-        if cfg!(windows) {
+        // unreachable on macOS and hand the lint gate (`-D warnings`, tools/verify.sh)
+        // six `dead_code` findings plus "field `tab_band_height` is never read" there.
+        // As a runtime `false` the body still type-checks on every platform and still
+        // costs nothing: on macOS `PLATFORM_DEFAULT` is `Compact`, so the law would
+        // return 0 even if the branch DID run, and the optimiser drops it whole —
+        // which is also the guard that matters: macOS's `ws.metrics.head` holds a
+        // real MEASURED AppKit titlebar band, and letting this write run there would
+        // clobber it with the law's 0. The Windows-only attach and L1-early-reveal
+        // call sites can stay `#[cfg(windows)]` — one live root per platform is
+        // enough, and Linux's attach path funnels through here.
+        if cfg!(any(windows, target_os = "linux")) {
             let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
             let cell_h = self.win_cell_size(wid).1;
             let head = self.synthetic_strip_head_px(scale, cell_h);
@@ -7088,6 +7117,55 @@ impl App {
         ) as u16;
         let rows = win_rows.saturating_sub(self.tab_strip_rows).max(1);
         (rows, cols)
+    }
+
+    /// W1 (Wayland column-shave fix, fixwave5): the min inner size that puts
+    /// the resize-increment lattice ON the whole-cell frame lattice for
+    /// window `wid`.
+    ///
+    /// winit's Wayland backend snaps every INTERACTIVE resize to
+    /// `min_inner_size + k·increment` (the X11 base-size convention, with the
+    /// min standing in as the base). With the min at the arbitrary UX floor
+    /// (164×98 logical), that lattice is incongruent with the frame law
+    /// (`2·pad + cols·cell_w` wide), so a PURE-VERTICAL bottom-edge drag
+    /// re-snapped the untouched width down by up to `cell_w − 1` px — below
+    /// the exact fit — and shaved one column (the band residue absorbed
+    /// asymmetrically by the snap). Anchoring the min to the frame lattice
+    /// makes every snapped size an exact whole-cell frame, so an edge drag
+    /// can never shave a column (or row) the user did not drag away.
+    ///
+    /// The historical 164×98 LOGICAL floor is kept as a lower bound: the
+    /// returned min is the smallest lattice point at or above it, in PHYSICAL
+    /// px — the same unit the increments are passed in, so winit's logical
+    /// conversion treats base and step alike.
+    // PLATFORM SCOPE, mirrored from the caller: the only call site is
+    // `app_window.rs`'s `set_min_inner_size`, which is `#[cfg(target_os = "linux")]`
+    // ("macOS/Windows never carried a whole-cell floor"). Without the same cfg here
+    // the fn is dead on every other target and trips the dead-code gate.
+    // `test` is in the set because this module's own tests call it on every host.
+    #[cfg(any(test, target_os = "linux"))]
+    pub(crate) fn whole_cell_min_size(&self, wid: WindowId) -> PhysicalSize<u32> {
+        let (cw, ch) = self.win_cell_size(wid);
+        let (cw, ch) = (cw.max(1), ch.max(1));
+        let pad = self.win_pad(wid);
+        let scale = self.windows.get(&wid).map_or(1.0, |ws| ws.scale);
+        let floor_w = (164.0 * scale).round().max(0.0) as usize;
+        let floor_h = (98.0 * scale).round().max(0.0) as usize;
+        // Width lattice: 2·pad + C·cell_w, C ≥ 1 — the inverse of
+        // `grid_dims_for`'s `pad_split`.
+        let base_w = 2 * pad + cw;
+        let min_w = base_w + floor_w.saturating_sub(base_w).div_ceil(cw) * cw;
+        // Height lattice: head + pad_top + pad + (R + strip)·cell_h, R ≥ 1
+        // (the strip rows are spliced in as real grid rows — `grid_dims_for`).
+        let base_h = self.win_head(wid)
+            + self.win_pad_top(wid)
+            + pad
+            + (1 + usize::from(self.tab_strip_rows)) * ch;
+        let min_h = base_h + floor_h.saturating_sub(base_h).div_ceil(ch) * ch;
+        PhysicalSize::new(
+            u32::try_from(min_w).unwrap_or(u32::MAX),
+            u32::try_from(min_h).unwrap_or(u32::MAX),
+        )
     }
 
     /// Whether applying `size` to window `wid` would change its COLUMN count —
@@ -7307,12 +7385,18 @@ impl App {
             // W12: resize increments are window/monitor geometry.  One shared
             // renderer cell box cannot be copied to every mixed-DPI window.
             let (cw, ch) = self.win_cell_size(wid);
+            // The increment BASE must track the cell box too (fixwave5) — see
+            // `whole_cell_min_size`. Computed before the `&mut` borrow below.
+            #[cfg(target_os = "linux")]
+            let min_size = self.whole_cell_min_size(wid);
             if let Some(ws) = self.windows.get_mut(&wid) {
                 if size.width > 0 && size.height > 0 {
                     ws.win_px = Some(size);
                 }
                 if let Some(w) = ws.os_window.as_ref() {
                     w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
+                    #[cfg(target_os = "linux")]
+                    w.set_min_inner_size(Some(min_size));
                 }
             }
             self.on_resize(wid, size);
@@ -7637,6 +7721,10 @@ impl App {
         let (cw, ch) = self.win_cell_size(wid);
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
             w.set_resize_increments(Some(PhysicalSize::new(cw as u32, ch as u32)));
+            // Keep the increment BASE on the whole-cell lattice at the new
+            // DPI too (fixwave5) — see `whole_cell_min_size`.
+            #[cfg(target_os = "linux")]
+            w.set_min_inner_size(Some(self.whole_cell_min_size(wid)));
         }
     }
 
@@ -8960,7 +9048,7 @@ impl App {
     }
 
     /// C3 — THE SYNTHETIC TAB-BAND HEAD, in DEVICE px, for a window at `scale`
-    /// whose cell box is `cell_h` px tall. `0` off Windows, `0` with the strip off,
+    /// whose cell box is `cell_h` px tall. `0` on macOS, `0` with the strip off,
     /// `0` under `tab_band_height = "compact"`, and `0` whenever the strip's cell
     /// rows already reach the target — every one of which reproduces the pre-C3
     /// geometry byte for byte.
@@ -8999,14 +9087,14 @@ impl App {
     /// consumer of the C3 config chain (`Config::tab_band_height_or_default`,
     /// [`TabBandHeight`], [`synthetic_band_head_px`], [`TAB_BAND_STANDARD_LOGICAL_PX`],
     /// `SYNTHETIC_BAND_HEAD_CELL_CAP`), so gating it out would make all of them
-    /// unreachable off Windows and break the `-D warnings` gate on macOS and Linux
-    /// with a fan of `dead_code` findings. Off Windows it is not a stub either: the
+    /// unreachable off Windows and Linux and break the `-D warnings` gate on macOS
+    /// with a fan of `dead_code` findings. On macOS it is not a stub either: the
     /// law genuinely evaluates to 0 there, because [`TabBandHeight::PLATFORM_DEFAULT`]
     /// is `Compact` and a `compact` target collapses the whole derivation. The `0`
     /// promised in the first paragraph is therefore a RESULT, computed by the same
-    /// arithmetic Windows runs, not a platform special case — which is also what
-    /// keeps the chain type-checked and test-covered on the platforms that never
-    /// call it (see `tab_band_height_tests`).
+    /// arithmetic Windows and Linux run, not a platform special case — which is
+    /// also what keeps the chain type-checked and test-covered on the platform
+    /// that never calls it (see `tab_band_height_tests`).
     pub(crate) fn synthetic_strip_head_px(&self, scale: f64, cell_h: usize) -> usize {
         synthetic_band_head_px(
             self.config.tab_band_height_or_default().target_logical_px(),
@@ -9017,15 +9105,15 @@ impl App {
         )
     }
 
-    // NOTE: no non-Windows TWIN, deliberately — one function, one law, every
-    // platform. Off Windows the synthetic band does not exist (macOS's `head` is a
-    // MEASURED AppKit titlebar — see `AppRt::titlebar_band_pts` — and Linux's in-grid
-    // strip keeps its cell-row height), but that absence is expressed by
-    // `PLATFORM_DEFAULT = Compact` returning 0 through the shared arithmetic, not by
-    // a second `#[cfg]` body. The one Windows-shaped guard that DOES have to stay a
-    // guard is the CALL in `on_resize`, and it is a runtime `if cfg!(windows)` for
-    // the same reason: on macOS `ws.metrics.head` holds a real measured titlebar
-    // band, so letting the C3 write run there would clobber it with this law's 0.
+    // NOTE: no per-platform TWIN, deliberately — one function, one law, every
+    // platform. On macOS the synthetic band does not exist (its `head` is a
+    // MEASURED AppKit titlebar — see `AppRt::titlebar_band_pts`), but that absence
+    // is expressed by `PLATFORM_DEFAULT = Compact` returning 0 through the shared
+    // arithmetic, not by a second `#[cfg]` body. The one platform-shaped guard that
+    // DOES have to stay a guard is the CALL in `on_resize`, and it is a runtime
+    // `cfg!(any(windows, target_os = "linux"))` for the same reason: on macOS
+    // `ws.metrics.head` holds a real measured titlebar band, so letting the C3
+    // write run there would clobber it with this law's 0.
 
     /// THE HONESTY DRAIN. Move anything queued on the deferred notice lane
     /// ([`crate::config_notice::queue_deferred`]) into the in-window banner — the
@@ -11797,11 +11885,11 @@ mod tab_band_height_tests {
     }
 
     /// The absent-key default is PER-PLATFORM — `standard` only where the in-grid
-    /// band is the window's actual tab chrome. Asserted against `cfg!` so the same
-    /// test is honest on every host.
+    /// band is the window's actual tab chrome (Windows and Linux). Asserted
+    /// against `cfg!` so the same test is honest on every host.
     #[test]
     fn tab_band_height_defaults_per_platform_when_absent() {
-        let expected = if cfg!(windows) {
+        let expected = if cfg!(any(windows, target_os = "linux")) {
             TabBandHeight::Standard
         } else {
             TabBandHeight::Compact
@@ -11879,29 +11967,41 @@ mod tab_band_height_tests {
     }
 
     /// The whole point: `head + pad_top + strip_rows·cell_h` lands ON the target,
-    /// at 96 dpi and at 150%. These are the shipped Windows numbers — a 2 px top
-    /// pad and one strip row — with the cell heights the default face produces.
+    /// at 96 dpi and at 150%. Asserted against the platform's own
+    /// [`super::TAB_BAND_STANDARD_LOGICAL_PX`] (32 on Windows — the WinUI tab
+    /// row; 36 on Linux — the libadwaita one), with a 2-3 px top pad and one
+    /// strip row, the shipped shape on both.
     #[test]
     fn standard_totals_the_target_band_at_96dpi_and_150_percent() {
         let target = TabBandHeight::Standard.target_logical_px();
-        // 96 dpi: 32 px band = 2 pad + 21 row + 9 head.
+        assert_eq!(target, super::TAB_BAND_STANDARD_LOGICAL_PX);
+        // 96 dpi: the band = pad_top + row + head = the target, exactly.
+        let band = target as usize;
         let head = synthetic_band_head_px(target, 2, 1, 21, 1.0);
-        assert_eq!(head, 9);
-        assert_eq!(head + 2 + 21, 32, "the band the viewer sees IS the target");
-        // 150%: the target scales with the DPI (48 px), and so does everything it
-        // is measured against, so the residue is re-derived rather than scaled.
+        assert_eq!(head, band - 2 - 21);
+        assert_eq!(
+            head + 2 + 21,
+            band,
+            "the band the viewer sees IS the target"
+        );
+        // 150%: the target scales with the DPI, and so does everything it is
+        // measured against, so the residue is re-derived rather than scaled.
+        let band = (target as f64 * 1.5).round() as usize;
         let head = synthetic_band_head_px(target, 3, 1, 28, 1.5);
-        assert_eq!(head, 48 - 3 - 28);
-        assert_eq!(head + 3 + 28, 48);
+        assert_eq!(head, band - 3 - 28);
+        assert_eq!(head + 3 + 28, band);
     }
 
     /// A SUBTRACTION, not an addition: once the strip's own rows reach the target
     /// (a big font, or `tab_strip_rows = 2`), the band stops growing instead of
-    /// stacking a constant on top of an already-tall row.
+    /// stacking a constant on top of an already-tall row. Cell heights are
+    /// derived from the platform's own target so the premise holds on every
+    /// per-platform `TAB_BAND_STANDARD_LOGICAL_PX`.
     #[test]
     fn a_tall_strip_absorbs_the_target_and_the_head_collapses() {
         let target = TabBandHeight::Standard.target_logical_px();
-        assert_eq!(synthetic_band_head_px(target, 2, 1, 30, 1.0), 0);
+        let absorbing = target as usize - 2; // one row + the pad reaches the target
+        assert_eq!(synthetic_band_head_px(target, 2, 1, absorbing, 1.0), 0);
         assert_eq!(synthetic_band_head_px(target, 2, 1, 64, 1.0), 0);
         assert_eq!(synthetic_band_head_px(target, 2, 2, 21, 1.0), 0);
     }
@@ -12060,10 +12160,12 @@ mod tab_band_height_tests {
             .find(|l| l.starts_with("#[cfg") || l.starts_with("if cfg!"))
             .unwrap_or_default();
         assert_eq!(
-            gate, "if cfg!(windows) {",
-            "the on_resize C3 block must gate with a runtime `if cfg!(windows)` (the form \
-             the macOS band block above it uses), not a `#[cfg]` attribute — an attribute \
-             deletes the only live call site off Windows and takes the whole chain with it"
+            gate,
+            "if cfg!(any(windows, target_os = \"linux\")) {",
+            "the on_resize C3 block must gate with a runtime `cfg!` (the form the macOS \
+             band block above it uses), not a `#[cfg]` attribute — an attribute deletes \
+             the only live call site on the excluded platforms and takes the whole chain \
+             with it"
         );
     }
 }
@@ -13199,6 +13301,47 @@ mod reload_dedupe_tests {
             a != b,
             "the styles differ, so the reload itself still applies"
         );
+    }
+}
+
+#[cfg(test)]
+mod whole_cell_min_size_tests {
+    //! fixwave5: winit's Wayland backend snaps interactive resizes to
+    //! `min_inner_size + k·increment`, so the min must sit ON the whole-cell
+    //! frame lattice or an exact-fit width gets re-snapped below the fit on a
+    //! pure-vertical edge drag (one column shaved).
+
+    #[test]
+    fn min_size_sits_on_the_whole_cell_frame_lattice() {
+        let app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        let min = app.whole_cell_min_size(wid);
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid);
+        let base_h = app.win_head(wid)
+            + app.win_pad_top(wid)
+            + pad
+            + usize::from(app.tab_strip_rows) * ch;
+
+        // Congruence: every exact whole-cell frame `2·pad + C·cw` at or above
+        // the min is a lattice point of `min + k·cw` — the property that keeps
+        // a vertical drag from re-snapping the width below the exact fit.
+        assert_eq!(
+            (min.width as usize - 2 * pad) % cw,
+            0,
+            "min width must be an exact whole-cell frame"
+        );
+        assert_eq!(
+            (min.height as usize - base_h) % ch,
+            0,
+            "min height must be an exact whole-cell frame"
+        );
+        // The historical UX floor still holds (headless scale is 1.0).
+        assert!(min.width >= 164, "min width keeps the 164 logical floor");
+        assert!(min.height >= 98, "min height keeps the 98 logical floor");
+        // And the min stays within one cell of the floor (no runaway growth).
+        assert!((min.width as usize) < 164 + cw + 2 * pad + cw);
+        assert!((min.height as usize) < 98 + ch + base_h + ch);
     }
 }
 

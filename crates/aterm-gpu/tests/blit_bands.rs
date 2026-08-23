@@ -26,7 +26,7 @@
 
 use aterm_core::terminal::Terminal;
 use aterm_gpu::{DropOverlay, GpuRenderer, PresentCrop};
-use aterm_render::{RenderInput, Theme, band_offset, place_frame_bands};
+use aterm_render::{RenderInput, Theme, band_offset, band_offset_y, place_frame_bands};
 
 const ROWS: usize = 6;
 const COLS: usize = 24;
@@ -76,11 +76,11 @@ fn window_seven_px_past_grid_fit_offsets_content_without_scaling() {
         "blit target must be the raw window size"
     );
 
-    let (ox, oy) = (band_offset(dw, fw), band_offset(dh, fh));
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     assert_eq!(
         (ox, oy),
-        (3, 3),
-        "a 7px remainder splits 3 leading / 4 trailing"
+        (3, if cfg!(target_os = "linux") { 0 } else { 3 }),
+        "x: a 7px remainder splits 3 leading / 4 trailing; y: platform policy"
     );
 
     let bg = Theme::default().bg & 0x00ff_ffff;
@@ -133,7 +133,7 @@ fn bands_do_not_invert_on_bell() {
     let (dw, dh) = (fw + 5, fh + 2);
     let blit = gpu.blit_to_sized_for_test(&mut win, true, dw as u32, dh as u32);
 
-    let (ox, oy) = (band_offset(dw, fw), band_offset(dh, fh));
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
     let bg = Theme::default().bg & 0x00ff_ffff;
     for y in 0..dh {
         for x in 0..dw {
@@ -165,8 +165,13 @@ fn undersized_swapchain_crops_centred_never_scales() {
     let (dw, dh) = (fw - 9, fh - 3);
     let blit = gpu.blit_to_sized_for_test(&mut win, false, dw as u32, dh as u32);
 
-    let (ox, oy) = (band_offset(dw, fw), band_offset(dh, fh));
-    assert!(ox < 0 && oy < 0, "an undersized dst must be a centred crop");
+    let (ox, oy) = (band_offset(dw, fw), band_offset_y(dh, fh));
+    assert!(ox < 0, "an undersized dst must crop horizontally, centred");
+    if cfg!(target_os = "linux") {
+        assert_eq!(oy, 0, "the top-pinned crop keeps the frame's top rows");
+    } else {
+        assert!(oy < 0, "an undersized dst must be a centred crop");
+    }
     for y in 0..dh {
         for x in 0..dw {
             let got = blit.pixels[y * dw + x] & 0x00ff_ffff;

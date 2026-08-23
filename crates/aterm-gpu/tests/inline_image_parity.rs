@@ -195,6 +195,7 @@ fn combining_mark_draws_over_negative_z_image_on_cpu_and_gpu() {
         cols: 1,
         rows: 1,
         z_index: -1,
+        band_lift_px: 0,
     });
 
     let make_input = |text: &str, with_image: bool| {
@@ -354,6 +355,7 @@ fn semitransparent_negative_z_image_composites_before_text_cpu_and_gpu() {
         cols: 1,
         rows: 1,
         z_index: -1,
+        band_lift_px: 0,
     });
 
     let make_input = |bg: [u8; 3], with_image: bool| {
@@ -491,6 +493,7 @@ fn kitty_z_threshold_and_below_cell_background_tier_match_cpu_gpu() {
             cols: 1,
             rows: 1,
             z_index,
+            band_lift_px: 0,
         });
         for col in 0..=1 {
             input.images[0].push((

@@ -3238,6 +3238,27 @@ fn captured_probe_row<'a>(
     }
 }
 
+/// One padded-column read of a captured row: a column at or past the stored
+/// length is an IMPLICIT blank. The grid stores rows sparsely — an untouched
+/// tail materializes as no cells at all — so a captured row's LENGTH measures
+/// storage, not content, and the per-frame probe (stored cells only) routinely
+/// disagrees with the input-time baseline the host tail-filled to the full
+/// grid width. Every content comparison in the exact proofs must read both
+/// sides through this one lens; a `'\0'` wide continuation is a real stored
+/// cell and never equals a blank, so wide-glyph evidence stays exact.
+#[inline]
+fn padded_probe_cell(cells: &[char], col: usize) -> char {
+    cells.get(col).copied().unwrap_or(' ')
+}
+
+/// CONTENT inequality of two captured rows under the implicit-blank lens —
+/// shared by the exact proofs and their trace reasons. Two rows that differ
+/// only in how much blank tail they STORE are the same content.
+fn probe_rows_content_differ(a: &[char], b: &[char]) -> bool {
+    let width = a.len().max(b.len());
+    (0..width).any(|col| padded_probe_cell(a, col) != padded_probe_cell(b, col))
+}
+
 /// What a [`Vapor`] puff IS — palette + growth curve family.
 ///
 /// `Steam`/`Smoke` are the FIRE style's thermal language (quench flash /
@@ -6122,12 +6143,55 @@ impl CursorGlow {
         };
     }
 
+    /// The `ATERM_TRACE_SPAWN` gate for the confirm-seam diagnostics below —
+    /// the same once-sampled static as the host's `SPAWNSRC` trace, so with
+    /// the trace off every decision pays one cached bool load.
+    fn trace_confirm_enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("ATERM_TRACE_SPAWN").is_some())
+    }
+
+    /// Env-gated (`ATERM_TRACE_SPAWN`) confirm-seam diagnostic: one line per
+    /// [`Self::confirm_content_candidate`] decision naming WHY the content
+    /// proof confirmed, stayed pending, or retired. This is the sensor for
+    /// echo choreography at the proof seam — a shell that echoes one keystroke
+    /// as several spaced `write(2)`s shows up here as `base=N cur=N+2..`
+    /// (`generation-skip`) or as an early `row-mismatch` on the prefix write,
+    /// and the `DIFF` twin in the typed arm names the exact columns (it is how
+    /// the sparse-storage length mismatch was caught on a live box).
+    fn trace_confirm(
+        reason: &str,
+        candidate: &GlowMoveCandidate,
+        current: ContentGeneration,
+        now: Instant,
+    ) {
+        if !Self::trace_confirm_enabled() {
+            return;
+        }
+        eprintln!(
+            "CONFIRM reason={reason} age_ms={:.1} base={:?} cur={} alt={} origin={:?} target={:?}",
+            now.saturating_duration_since(candidate.at).as_secs_f64() * 1e3,
+            candidate
+                .baseline_generation
+                .map(|generation| generation.process_sequence),
+            current.process_sequence,
+            current.alternate_screen,
+            candidate.origin,
+            candidate.target,
+        );
+    }
+
     /// Confirm the pending content-bound candidate against the input-time row
     /// snapshot supplied by the host and this coherent render snapshot. Typed
     /// input must materialize the exact committed cells while every cell it did
     /// not own stays identical. A deletion must be one exact end-of-line blank
     /// with every survivor identical. A timestamp or matching landing alone is
     /// never evidence.
+    ///
+    /// Row equality is CONTENT equality under the implicit-blank lens
+    /// ([`padded_probe_cell`]): the host's baseline is tail-filled to the grid
+    /// width while the per-frame probe ends at the last stored cell, so raw
+    /// slice length is a storage artifact, never counter-evidence.
     pub fn confirm_content_candidate(
         &mut self,
         current_cursor: Option<(u16, u16)>,
@@ -6136,6 +6200,7 @@ impl CursorGlow {
     ) -> Option<ContentCandidateDecision> {
         let candidate = self.move_candidate?;
         if now.saturating_duration_since(candidate.at).as_secs_f32() > Self::TYPE_HINT_FRESH {
+            Self::trace_confirm("stale", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6146,6 +6211,7 @@ impl CursorGlow {
             return None;
         }
         let Some(baseline_generation) = candidate.baseline_generation else {
+            Self::trace_confirm("unbaselined", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6155,6 +6221,7 @@ impl CursorGlow {
         if current_generation == baseline_generation {
             // No PTY batch has landed yet. A byte-identical present may precede
             // a delayed echo, so keep the one-shot pending.
+            Self::trace_confirm("await-echo", &candidate, current_generation, now);
             return None;
         }
         if current_generation.terminal_id != baseline_generation.terminal_id
@@ -6164,6 +6231,7 @@ impl CursorGlow {
         {
             // More than one batch crossed the input boundary. Even if the row
             // now happens to match, causality is no longer attributable.
+            Self::trace_confirm("generation-skip", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6174,6 +6242,7 @@ impl CursorGlow {
             // This is already the sole next processing generation. A host
             // that cannot supply its coherent row cannot defer the proof to a
             // later frame and still attribute it to this input.
+            Self::trace_confirm("no-row-probe", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6181,6 +6250,7 @@ impl CursorGlow {
             });
         };
         if candidate.at > current_meta.at {
+            Self::trace_confirm("probe-predates-key", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6202,13 +6272,55 @@ impl CursorGlow {
                 let end = start.saturating_add(expected.len());
                 let baseline_row = candidate.baseline_row?;
                 let baseline = baseline_row.as_slice();
-                let changed = baseline != current;
-                let exact = baseline.len() == current.len()
-                    && end <= current.len()
-                    && current.get(start..end) == Some(expected)
-                    && baseline.get(start..end) != Some(expected)
-                    && baseline[..start] == current[..start]
-                    && baseline[end..] == current[end..];
+                // SPARSE-STORAGE LAW: `current` is this frame's probe and ends
+                // at the row's last STORED cell, while `baseline` was
+                // tail-filled to the grid width at input time. Comparing raw
+                // slices here compared storage, not content — on a host whose
+                // grid keeps rows trimmed, every honest echo mismatched on
+                // length alone and the proof retired forever (the ribbon
+                // never lit). Both sides are therefore read through the
+                // implicit-blank lens; the law itself is unweakened — the
+                // typed cells must NEWLY materialize exactly, and every cell
+                // the input did not own must be content-identical.
+                let width = baseline.len().max(current.len());
+                let changed = probe_rows_content_differ(baseline, current);
+                let owned = start..end;
+                let exact = expected
+                    .iter()
+                    .enumerate()
+                    .all(|(k, &cell)| padded_probe_cell(current, start + k) == cell)
+                    && expected
+                        .iter()
+                        .enumerate()
+                        .any(|(k, &cell)| padded_probe_cell(baseline, start + k) != cell)
+                    && (0..width).filter(|col| !owned.contains(col)).all(|col| {
+                        padded_probe_cell(baseline, col) == padded_probe_cell(current, col)
+                    });
+                // ATERM_TRACE_SPAWN diff sensor: on a failed typed proof, name
+                // the exact columns where the probe departed from the armed
+                // baseline (RAW storage view, so a length asymmetry stays
+                // visible), attributing a box-wide mismatch to real cells
+                // instead of a boolean.
+                if !exact && Self::trace_confirm_enabled() {
+                    let mut diffs = String::new();
+                    let mut shown = 0usize;
+                    for i in 0..width {
+                        let b = baseline.get(i).copied();
+                        let c = current.get(i).copied();
+                        if b != c {
+                            if shown < 8 {
+                                use std::fmt::Write as _;
+                                let _ = write!(diffs, " [{i}]{b:?}->{c:?}");
+                            }
+                            shown += 1;
+                        }
+                    }
+                    eprintln!(
+                        "DIFF start={start} end={end} expected={expected:?} blen={} clen={} ndiff={shown}{diffs}",
+                        baseline.len(),
+                        current.len(),
+                    );
+                }
                 (exact, changed)
             }
             GlowMoveIntent::Delete => {
@@ -6223,15 +6335,20 @@ impl CursorGlow {
                 let col = usize::from(target.1);
                 let baseline_row = candidate.baseline_row?;
                 let baseline = baseline_row.as_slice();
-                let changed = baseline != current;
+                // Same sparse-storage law as the typed arm: an EOL erase is
+                // exactly where the stored row SHRINKS below the tail-filled
+                // baseline width, so the raw length equality retired every
+                // honest Backspace echo on a trimmed-row host. The erased
+                // cell must still go glyph -> blank and every survivor must
+                // be content-identical.
+                let width = baseline.len().max(current.len());
+                let changed = probe_rows_content_differ(baseline, current);
                 let exact = target.0 == candidate.origin.0
-                    && baseline.len() == current.len()
-                    && col < current.len()
-                    && baseline[col] != ' '
-                    && current[col] == ' '
-                    && baseline[..col] == current[..col]
-                    && baseline[col.saturating_add(1)..]
-                        == current[col.saturating_add(1)..];
+                    && padded_probe_cell(baseline, col) != ' '
+                    && padded_probe_cell(current, col) == ' '
+                    && (0..width).all(|i| {
+                        i == col || padded_probe_cell(baseline, i) == padded_probe_cell(current, i)
+                    });
                 (exact, changed)
             }
             _ => (false, false),
@@ -6240,7 +6357,16 @@ impl CursorGlow {
             // The first post-input processing batch completed without the exact
             // owned diff. This is a mismatch even when another row/title was
             // the only visible mutation; a later batch may not borrow it.
-            let _ = row_changed;
+            Self::trace_confirm(
+                if row_changed {
+                    "row-mismatch"
+                } else {
+                    "row-unchanged"
+                },
+                &candidate,
+                current_generation,
+                now,
+            );
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6251,6 +6377,7 @@ impl CursorGlow {
             // The authored bytes changed content but produced no path. This is
             // a completed no-move boundary, not a delayed echo: consume its
             // proof dark so the next unrelated CUP cannot borrow it.
+            Self::trace_confirm("no-move", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6265,6 +6392,7 @@ impl CursorGlow {
         {
             self.confirmed_delete_span = Some((candidate.at, row, col));
         }
+        Self::trace_confirm("confirmed", &candidate, current_generation, now);
         Some(ContentCandidateDecision::Confirmed {
             at: candidate.at,
             origin: candidate.origin,
@@ -23451,6 +23579,116 @@ mod tests {
             );
             assert!(!ok, "{action} must consume the candidate dark");
         }
+    }
+
+    /// THE ECHO AS A TRIMMED-ROW HOST ACTUALLY DELIVERS IT. The grid stores
+    /// rows sparsely, so the per-frame probe ends at the last STORED cell
+    /// while the input-time baseline is tail-filled to the grid width
+    /// (`capture_committed_move_proof`). The exact proofs must read both
+    /// sides through the implicit-blank lens: before this law, a live Linux
+    /// box retired EVERY honest single-batch echo on length alone
+    /// (`blen=80 clen=21`, `CONFIRM reason=row-mismatch` on each keystroke —
+    /// the ATERM_TRACE_SPAWN diagnosis), so the momentum ribbon could never
+    /// light. Storage asymmetry with identical content confirms; a REAL
+    /// content divergence inside a sparse probe still retires, and shorter
+    /// storage alone is never read as materialization.
+    #[test]
+    fn sparse_probe_storage_is_implicit_blank_content_not_a_mismatch() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 9,
+            alternate_screen: false,
+        };
+        // The prompt row as the INPUT side captures it: a glyph at column 0,
+        // implicit tail filled with blanks to the full 12-column width.
+        let mut baseline_cells = [' '; 12];
+        baseline_cells[0] = '$';
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let mut out = Vec::new();
+
+        // CONFIRM: the probe stores only the occupied prefix — the echoed 'x'
+        // landed at column 2 and storage ends right behind it. Three stored
+        // cells against a 12-cell baseline is the same content.
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 3), (2, 2), baseline, generation(10));
+        let sparse_echo = ['$', ' ', 'x'];
+        glow.observe_row(2, 3, &sparse_echo, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            generation(11),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "content-identical sparse probe must confirm: {decision:?}"
+        );
+
+        // RETIRE: the sparse probe carries a REAL divergence beside the typed
+        // cell ('$' became '#') — the implicit-blank lens is not a licence
+        // for ambient repaints or TUI redraws.
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 3), (2, 2), baseline, generation(20));
+        let diverged = ['#', ' ', 'x'];
+        glow.observe_row(2, 3, &diverged, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            generation(21),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "sparse probe with real divergence must retire: {decision:?}"
+        );
+
+        // RETIRE: the echo was swallowed and the probe merely stores LESS of
+        // the same blanks. Shorter storage is not materialization.
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 3), (2, 2), baseline, generation(30));
+        let trimmed_unchanged = ['$'];
+        glow.observe_row(2, 3, &trimmed_unchanged, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 3)),
+            at + Duration::from_millis(1),
+            generation(31),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "trimmed storage without the typed cell must retire: {decision:?}"
+        );
+
+        // DELETE twin: an EOL Backspace SHRINKS the stored row below the
+        // baseline width — the storage asymmetry in its natural direction.
+        // The erased cell goes glyph -> implicit blank; every survivor is
+        // content-identical; the proof must confirm.
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 3)), t0, &c, g, &mut out);
+        let mut del_baseline_cells = [' '; 12];
+        del_baseline_cells[0] = '$';
+        del_baseline_cells[2] = 'x';
+        let del_baseline = ExpectedRowSnapshot::from_slice(&del_baseline_cells).unwrap();
+        let at = t0 + Duration::from_millis(1);
+        glow.note_delete_candidate(at, (2, 2), del_baseline, generation(40));
+        let sparse_erased = ['$'];
+        glow.observe_row(2, 2, &sparse_erased, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 2)),
+            at + Duration::from_millis(1),
+            generation(41),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "EOL erase that trims storage must confirm: {decision:?}"
+        );
     }
 
     /// A parser batch can rewrite a lit cell without moving the cursor. Every

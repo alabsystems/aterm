@@ -2161,6 +2161,7 @@ mod z_index_tests {
                 cols: 3,
                 rows: 2,
                 z_index: z,
+                band_lift_px: 0,
             })
         };
         let fill = |img: &Arc<ImageData>| -> Vec<Vec<(usize, ImageRef)>> {
@@ -2228,6 +2229,7 @@ mod z_index_tests {
                 cols: 1,
                 rows: 1,
                 z_index: z,
+                band_lift_px: 0,
             }),
             cell_row: 0,
             cell_col: 0,

@@ -52,6 +52,23 @@ pub(super) fn deterministic_description(snapshot: &Snapshot) -> String {
     }
 }
 
+/// The description `snapshot` would carry at a settled PROMPT, regardless of its
+/// actual block state — the same `Ready in {cwd}` arm (same sensitive-cwd
+/// filtering) [`deterministic_description`] uses for [`ActivityState::Prompt`].
+/// This is what a stale `Entering` claim decays to once the phase classifier
+/// publishes `Idle` (see `Coordinator::note_phase_settled`): the block still
+/// says "typing", but nobody has typed for minutes, and the honest label for an
+/// abandoned command line is the prompt it is sitting at.
+pub(super) fn idle_prompt_description(snapshot: &Snapshot) -> String {
+    let place = cwd_label(&snapshot.cwd);
+    let place = if contains_sensitive_text(&place) {
+        String::new()
+    } else {
+        place
+    };
+    ready_description(&place)
+}
+
 fn generic_completion_description(exit_code: Option<i32>) -> String {
     if let Some(code) = exit_code.filter(|code| *code != 0) {
         format!("Command failed (exit {code})")

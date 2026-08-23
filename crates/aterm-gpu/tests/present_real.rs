@@ -29,7 +29,7 @@ use aterm_core::terminal::Terminal;
 use aterm_gpu::video_tap::{CaptureOpts, DEFAULT_BUDGET, VideoTake};
 use aterm_render::{
     CharFg, FireHaloCell, FireMode, FirePatch, GlowQuad, HaloMode, RainHalo, RenderInput, Theme,
-    TrailCell, band_offset, place_frame_bands, premul_rgb,
+    TrailCell, band_offset, band_offset_y, place_frame_bands, premul_rgb,
 };
 
 fn gpu_or_skip(px: f32, theme: Theme) -> Option<aterm_gpu::GpuRenderer> {
@@ -282,9 +282,9 @@ fn production_present_resolves_odd_bands_and_trailing_content() {
     let (fw, fh) = (source.width, source.height);
     let (dw, dh) = (fw + 7, fh + 7);
     assert_eq!(
-        (band_offset(dw, fw), band_offset(dh, fh)),
-        (3, 3),
-        "a +7 destination must split into 3 leading / 4 trailing pixels"
+        (band_offset(dw, fw), band_offset_y(dh, fh)),
+        (3, if cfg!(target_os = "linux") { 0 } else { 3 }),
+        "x: a +7 destination splits 3 leading / 4 trailing; y: platform policy"
     );
     let mut expected = vec![0u32; dw * dh];
     place_frame_bands(

@@ -492,10 +492,12 @@ pub fn cmd_select(host: &impl SessionHost, sid: u64, rest: &str) -> String {
 /// data lines (the text split on newlines, same framing as `text`). No or empty
 /// selection -> `OK 0\n`.
 ///
-/// INCOMPLETE: if the selection is so large it hits the engine's copy caps
-/// (`MAX_SELECTION_ROWS`/`MAX_SELECTION_BYTES`), the header carries a trailing
-/// ` incomplete` token — mirroring `cmd_search` — so a client knows the text was
-/// truncated rather than trusting a short list silently.
+/// INCOMPLETE: the header carries a trailing ` incomplete` token — mirroring
+/// `cmd_search` — whenever selected content is MISSING from the reply, so a client
+/// knows not to trust a short list silently. Two causes: the selection hit the
+/// engine's copy caps (`MAX_SELECTION_ROWS`/`MAX_SELECTION_BYTES`) and lost its tail,
+/// or scrollback eviction clamped its head to the history floor and it lost its
+/// front.
 pub fn cmd_selection(host: &impl SessionHost, sid: u64) -> String {
     let Some((text, truncated)) = host.with_terminal(sid, Terminal::selection_to_string_bounded)
     else {
@@ -524,9 +526,10 @@ pub fn cmd_selection(host: &impl SessionHost, sid: u64) -> String {
 /// answers `ERR unsupported` BEFORE reading the selection — the verb genuinely
 /// does not exist there, and saying so beats a write that silently goes nowhere.
 ///
-/// INCOMPLETE: as with `selection`, a copy clipped by the engine's copy caps
-/// carries a trailing ` incomplete` token so the client knows the clipboard holds
-/// a truncated prefix, not the whole selection.
+/// INCOMPLETE: as with `selection`, a copy that is missing selected content carries
+/// a trailing ` incomplete` token so the client knows the clipboard holds part of the
+/// selection — a prefix when the copy caps clipped the tail, a suffix when scrollback
+/// eviction clamped the head to the history floor.
 ///
 /// [`HostCapabilities::clipboard`]: crate::HostCapabilities::clipboard
 pub fn cmd_copy(host: &impl SessionHost, sid: u64) -> String {

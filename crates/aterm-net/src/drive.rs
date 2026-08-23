@@ -82,8 +82,92 @@ impl Drop for InFlightGuard {
 const WD_RUNNING: u8 = 0;
 const WD_AUTHED: u8 = 1;
 const WD_FIRED: u8 = 2;
-/// How often the watchdog wakes to check whether the unauth phase finished early.
-const WD_STEP: Duration = Duration::from_millis(50);
+
+/// The unauthenticated-phase watchdog: one thread holding a CLONE of the socket,
+/// armed for a total wall-clock `handshake_timeout`, which force-closes that clone
+/// if the deadline elapses before the handshaking thread claims [`WD_AUTHED`].
+/// Both ends of the drive ([`accept_and_relay_inner`], [`dial_and_relay_pinned_inner`])
+/// arm one; keeping it in a single type is what stops the two copies drifting.
+///
+/// **Event-driven, not polled.** The thread parks for the WHOLE remaining deadline
+/// in one go and [`finish`](Self::finish) `unpark`s it the instant the handshake
+/// claims `WD_AUTHED`, so a connection that authenticates early — loopback/LAN,
+/// i.e. the normal case — does not wait out a poll interval before the join
+/// returns. It previously slept in 50 ms steps, which made that whole step the
+/// connection-setup latency (~55 ms loopback vs ~0.6 ms for the same handshake
+/// with no watchdog).
+///
+/// **The deadline is not weakened by the wake.** Every wake — `unpark`, or one of
+/// `park_timeout`'s permitted spurious wakeups — re-reads the tri-state and
+/// recomputes the remaining time from the arming instant, so the force-close still
+/// happens at exactly `handshake_timeout` after arming and no wake can shorten,
+/// lengthen or starve it. Exactly one of {authed, fired} wins the CAS, so the
+/// watchdog never shuts a socket the relay is about to use.
+struct HandshakeWatchdog {
+    /// The tri-state claimed by exactly one of the handshake and the watchdog.
+    state: Arc<AtomicU8>,
+    /// The parked watchdog thread — its `Thread` handle is the wake channel.
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl HandshakeWatchdog {
+    /// Arm the deadline on a clone of `tcp`. The clone MUST be taken here, before
+    /// the caller moves `tcp` into the TLS handshake.
+    ///
+    /// # Errors
+    /// If the socket cannot be cloned (the caller then never starts the handshake).
+    fn arm(tcp: &TcpStream, handshake_timeout: Duration) -> io::Result<Self> {
+        let state = Arc::new(AtomicU8::new(WD_RUNNING));
+        let wd_sock = tcp.try_clone()?;
+        let wd_state = Arc::clone(&state);
+        let thread = std::thread::spawn(move || {
+            let start = Instant::now();
+            loop {
+                if wd_state.load(Ordering::Acquire) != WD_RUNNING {
+                    return; // finished early — nothing to cut off
+                }
+                // Remaining time measured from ARMING, so a spurious wake or an
+                // `unpark` that raced a state store cannot move the deadline.
+                let Some(remaining) = handshake_timeout.checked_sub(start.elapsed()) else {
+                    break; // deadline reached
+                };
+                if remaining.is_zero() {
+                    break;
+                }
+                std::thread::park_timeout(remaining);
+            }
+            // Deadline reached: claim FIRED iff still running, then force-close so
+            // the blocked handshake/AUTH read errors out.
+            if wd_state
+                .compare_exchange(WD_RUNNING, WD_FIRED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let _ = wd_sock.shutdown(std::net::Shutdown::Both);
+            }
+        });
+        Ok(Self { state, thread })
+    }
+
+    /// Claim [`WD_AUTHED`] iff the watchdog has not already fired, wake it, and
+    /// JOIN it — so its socket clone is dropped before the caller touches the
+    /// connection again. Returns whether the unauthenticated phase beat the
+    /// deadline; `false` means the watchdog already claimed `WD_FIRED` and the
+    /// caller must tear the connection down.
+    ///
+    /// The state is published by the `AcqRel` compare-exchange BEFORE the wake, so
+    /// the watchdog's re-check on waking always observes it; and `unpark` issued
+    /// before the thread parks leaves a token that makes its next `park_timeout`
+    /// return at once, so the wake can never be lost to that race.
+    fn finish(self) -> bool {
+        let authed_in_time = self
+            .state
+            .compare_exchange(WD_RUNNING, WD_AUTHED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        self.thread.thread().unpark();
+        let _ = self.thread.join();
+        authed_in_time
+    }
+}
 
 /// Listener side, ONE connection: complete the TLS handshake on `tcp` with the
 /// operator `config`, verify the dialer's channel-bound capability via `lookup`,
@@ -133,28 +217,7 @@ where
     // elapses, so a peer that DRIBBLES bytes (resetting the per-syscall timer) is
     // still cut off. Exactly one of {authed, fired} wins the CAS, so the watchdog
     // never shuts a socket the relay will use.
-    let state = Arc::new(AtomicU8::new(WD_RUNNING));
-    let watchdog = {
-        let wd_sock = tcp.try_clone()?;
-        let wd_state = Arc::clone(&state);
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            while start.elapsed() < handshake_timeout {
-                if wd_state.load(Ordering::Acquire) != WD_RUNNING {
-                    return; // finished early — nothing to cut off
-                }
-                std::thread::sleep(WD_STEP);
-            }
-            // Deadline reached: claim FIRED iff still running, then force-close so
-            // the blocked handshake/AUTH read errors out.
-            if wd_state
-                .compare_exchange(WD_RUNNING, WD_FIRED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                let _ = wd_sock.shutdown(std::net::Shutdown::Both);
-            }
-        })
-    };
+    let watchdog = HandshakeWatchdog::arm(&tcp, handshake_timeout)?;
 
     // The unauthenticated phase. Any error here (incl. the watchdog's force-close)
     // tears the connection down.
@@ -164,12 +227,9 @@ where
         let granted = verify_capability(transport.stream(), &exporter, lookup)?;
         Ok((transport, granted))
     })();
-    // Claim AUTHED iff the watchdog has not already fired; then join it (so its
-    // socket clone is dropped before we touch the connection again).
-    let authed_in_time = state
-        .compare_exchange(WD_RUNNING, WD_AUTHED, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
-    let _ = watchdog.join();
+    // Claim AUTHED iff the watchdog has not already fired; then wake and join it
+    // (so its socket clone is dropped before we touch the connection again).
+    let authed_in_time = watchdog.finish();
 
     let (mut transport, granted) = match unauth {
         Ok(v) if authed_in_time => v,
@@ -470,28 +530,7 @@ where
     // Exactly one of {authed, fired} wins the CAS, so the watchdog never shuts a
     // socket the relay will use. The clone MUST be taken before `tcp` is moved into
     // `tls::connect`.
-    let state = Arc::new(AtomicU8::new(WD_RUNNING));
-    let watchdog = {
-        let wd_sock = tcp.try_clone()?;
-        let wd_state = Arc::clone(&state);
-        std::thread::spawn(move || {
-            let start = Instant::now();
-            while start.elapsed() < handshake_timeout {
-                if wd_state.load(Ordering::Acquire) != WD_RUNNING {
-                    return; // finished early — nothing to cut off
-                }
-                std::thread::sleep(WD_STEP);
-            }
-            // Deadline reached: claim FIRED iff still running, then force-close so the
-            // blocked handshake/verdict read errors out.
-            if wd_state
-                .compare_exchange(WD_RUNNING, WD_FIRED, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
-                let _ = wd_sock.shutdown(std::net::Shutdown::Both);
-            }
-        })
-    };
+    let watchdog = HandshakeWatchdog::arm(&tcp, handshake_timeout)?;
 
     // The unauthenticated phase: complete TLS, then present the channel-bound
     // capability and read the verdict. Any error here (incl. the watchdog's
@@ -502,12 +541,9 @@ where
         present_capability(transport.stream(), &exporter, src, op, token)?;
         Ok(transport)
     })();
-    // Claim AUTHED iff the watchdog has not already fired; then join it (so its
-    // socket clone is dropped before we touch the connection again).
-    let authed_in_time = state
-        .compare_exchange(WD_RUNNING, WD_AUTHED, Ordering::AcqRel, Ordering::Acquire)
-        .is_ok();
-    let _ = watchdog.join();
+    // Claim AUTHED iff the watchdog has not already fired; then wake and join it
+    // (so its socket clone is dropped before we touch the connection again).
+    let authed_in_time = watchdog.finish();
 
     let mut transport = match unauth {
         Ok(t) if authed_in_time => t,
@@ -845,11 +881,14 @@ mod tests {
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            // Upper bound over a SLEEP-POLLED background watchdog (WD_STEP 50ms to a
-            // 300ms deadline) — the tick-vs-deadline shape of cb8c0cff. Without the
-            // watchdog the dial hangs for the whole handshake timeout, so a wide
-            // bound still fails loudly on 'runs unbounded'.
-            elapsed < Duration::from_secs(30),
+            // Upper bound. The watchdog is EVENT-DRIVEN: it parks for the whole
+            // remaining deadline in one go, so it force-closes at the deadline
+            // itself rather than at the next tick after it — which is why this
+            // bound is 5s against a 300ms deadline and no longer the 30s the
+            // sleep-polled shape needed. Without the watchdog the dial hangs for
+            // the whole handshake timeout, so this still fails loudly on
+            // 'runs unbounded' — AND now also on 'the wake starved the deadline'.
+            elapsed < Duration::from_secs(5),
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = dribbler.join();
@@ -906,14 +945,272 @@ mod tests {
             "the cut-off must be the wall-clock watchdog (~300ms), not an instant reject ({elapsed:?})"
         );
         assert!(
-            // Upper bound over a SLEEP-POLLED background watchdog (WD_STEP 50ms to a
-            // 300ms deadline) — the tick-vs-deadline shape of cb8c0cff. Without the
-            // watchdog the dial hangs for the whole handshake timeout, so a wide
-            // bound still fails loudly on 'runs unbounded'.
-            elapsed < Duration::from_secs(30),
+            // Upper bound. The watchdog is EVENT-DRIVEN: it parks for the whole
+            // remaining deadline in one go, so it force-closes at the deadline
+            // itself rather than at the next tick after it — which is why this
+            // bound is 5s against a 300ms deadline and no longer the 30s the
+            // sleep-polled shape needed. Without the watchdog the dial hangs for
+            // the whole handshake timeout, so this still fails loudly on
+            // 'runs unbounded' — AND now also on 'the wake starved the deadline'.
+            elapsed < Duration::from_secs(5),
             "the wall-clock deadline must bound the dribble, not run unbounded ({elapsed:?})"
         );
         let _ = server.join();
+    }
+
+    /// One loopback connection through the SHIPPING drive path (a watchdog armed on
+    /// BOTH ends), timed from "start connecting" to "the first control byte has made
+    /// the full round trip through the authenticated relay" — the span a
+    /// `dial <name> <verb>` actually pays, since aterm-ctl rejects a bare
+    /// `dial <name>` and every remote verb is therefore a fresh TCP+TLS connection.
+    fn time_drive_setup(listener: &TcpListener, token: EdgeToken) -> Duration {
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let echo = spawn_echo(svc_b);
+        let svc_a = Arc::new(Mutex::new(Some(svc_a)));
+
+        // Park the host in accept() BEFORE the clock starts: we time the connection,
+        // not thread creation on the listener side.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let listener_clone = listener.try_clone().unwrap();
+        let host = std::thread::spawn({
+            let svc_a = Arc::clone(&svc_a);
+            move || {
+                ready_tx.send(()).unwrap();
+                let (tcp, _) = listener_clone.accept().unwrap();
+                accept_and_relay(
+                    tcp,
+                    scfg,
+                    |_s, op| (op == "drive").then_some(token),
+                    move || Ok(svc_a.lock().unwrap().take().unwrap()),
+                )
+            }
+        });
+        ready_rx.recv().unwrap();
+
+        let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
+        let started = Instant::now();
+        let driver = std::thread::spawn(move || {
+            dial_and_relay(addr, ccfg, "probe", "drive", &token, b"", drv_local)
+        });
+        drv_client.write_all(b"P\n").unwrap();
+        drv_client.flush().unwrap();
+        let mut got = [0u8; 2];
+        drv_client.read_exact(&mut got).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(&got, b"P\n");
+
+        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(drv_client);
+        let granted = host.join().unwrap().unwrap();
+        // Reach witness for the ARM: reaching `Granted` means the capability gate
+        // inside `accept_and_relay_inner` ran, and that function arms a watchdog
+        // unconditionally — so this sample provably contains the state under test.
+        assert_eq!(granted.op, "drive");
+        driver.join().unwrap().ok();
+        echo.join().ok();
+        elapsed
+    }
+
+    /// The CONTROL: the identical TLS 1.3 handshake, channel-bound capability
+    /// exchange and relay, assembled inline with NO watchdog. Nothing here calls
+    /// `accept_and_relay`/`dial_and_relay`, so no watchdog is ever armed — this is
+    /// the transport floor the drive path is measured against.
+    fn time_bare_handshake(listener: &TcpListener, token: EdgeToken) -> Duration {
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let timeout = Duration::from_secs(10);
+
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let echo = spawn_echo(svc_b);
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+        let listener_clone = listener.try_clone().unwrap();
+        let host = std::thread::spawn(move || -> io::Result<()> {
+            ready_tx.send(()).unwrap();
+            let (tcp, _) = listener_clone.accept().unwrap();
+            tcp.set_read_timeout(Some(timeout))?;
+            tcp.set_write_timeout(Some(timeout))?;
+            let mut transport = tls::accept(tcp, scfg)?;
+            let exporter = transport.exporter().to_vec();
+            let _granted = verify_capability(transport.stream(), &exporter, |_s, op| {
+                (op == "drive").then_some(token)
+            })?;
+            {
+                let sock = transport.stream().get_mut();
+                sock.set_read_timeout(None)?;
+                sock.set_write_timeout(None)?;
+            }
+            tls::relay(transport, svc_a)
+        });
+        ready_rx.recv().unwrap();
+
+        let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
+        let started = Instant::now();
+        let driver = std::thread::spawn(move || -> io::Result<()> {
+            let tcp = TcpStream::connect_timeout(&addr, timeout)?;
+            tcp.set_read_timeout(Some(timeout))?;
+            tcp.set_write_timeout(Some(timeout))?;
+            let mut transport = tls::connect(tcp, tls::fixed_server_name(), ccfg)?;
+            let exporter = transport.exporter().to_vec();
+            present_capability(transport.stream(), &exporter, "probe", "drive", &token)?;
+            {
+                let sock = transport.stream().get_mut();
+                sock.set_read_timeout(None)?;
+                sock.set_write_timeout(None)?;
+            }
+            tls::relay(transport, drv_local)
+        });
+        drv_client.write_all(b"P\n").unwrap();
+        drv_client.flush().unwrap();
+        let mut got = [0u8; 2];
+        drv_client.read_exact(&mut got).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(&got, b"P\n");
+
+        drv_client.shutdown(std::net::Shutdown::Both).unwrap();
+        drop(drv_client);
+        host.join().unwrap().unwrap();
+        driver.join().unwrap().ok();
+        echo.join().ok();
+        elapsed
+    }
+
+    #[test]
+    fn a_fast_handshake_is_not_paced_by_the_watchdogs_wake_interval() {
+        // TWO-SIDED, and the two arms differ ONLY by the watchdog:
+        //   ARM     — `accept_and_relay` + `dial_and_relay`: a watchdog on each end.
+        //   CONTROL — the same TLS handshake, capability exchange and relay inline,
+        //             with no watchdog at all.
+        //
+        // The watchdog used to sleep-poll in 50 ms steps and then be JOINED, so a
+        // connection whose unauthenticated phase finished early — loopback and LAN,
+        // i.e. the normal case — could not complete setup until the CURRENT step
+        // expired. Measured on loopback before this became event-driven: the ARM
+        // p50 was 55.4 ms against a 0.64 ms CONTROL, so ~99% of connection setup
+        // was the poll interval. Event-driven, the two arms coincide.
+        //
+        // The bound is RELATIVE (arm minus control) so a slow or loaded box moves
+        // both arms together and cannot make this flake; 20 ms is under half a
+        // 50 ms poll step, so the old shape fails it by ~35 ms every single time.
+        const MAX_WATCHDOG_COST: Duration = Duration::from_millis(20);
+        const REPS: usize = 3;
+
+        let token = EdgeToken::generate();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        // Warm: the first connection of each shape pays rustls provider init.
+        let _ = time_bare_handshake(&listener, token);
+        let _ = time_drive_setup(&listener, token);
+
+        // Minimum over the repetitions: for a latency this is the sample least
+        // polluted by an unrelated scheduling stall, and the defect under test is
+        // deterministic (it is present in EVERY pre-fix sample, never just the tail).
+        let control = (0..REPS)
+            .map(|_| time_bare_handshake(&listener, token))
+            .min()
+            .unwrap();
+        let arm = (0..REPS)
+            .map(|_| time_drive_setup(&listener, token))
+            .min()
+            .unwrap();
+
+        let cost = arm.saturating_sub(control);
+        assert!(
+            cost < MAX_WATCHDOG_COST,
+            "the unauthenticated-phase watchdog must not pace a fast handshake: \
+             drive setup {arm:?} vs the same transport without a watchdog {control:?} \
+             (watchdog cost {cost:?}, budget {MAX_WATCHDOG_COST:?}). A cost near a whole \
+             wake interval means the watchdog is being waited out instead of woken."
+        );
+    }
+
+    #[test]
+    fn spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline() {
+        // The hazard the event-driven watchdog introduces, tested head-on. Its wake
+        // channel is `Thread::unpark`, and `park_timeout` is also allowed to return
+        // spuriously. Either could break the deadline in one of two directions:
+        //   * SHORTEN it — the watchdog concludes on a wake and force-closes early,
+        //     killing a connection that was still inside its budget; or
+        //   * STARVE it — a wake restarts the wait and the deadline never arrives, so
+        //     a slow-loris peer pins the handler forever. A watchdog that can be
+        //     starved of its deadline is a hang.
+        // So: arm a short deadline on a real socket, never claim WD_AUTHED, and
+        // hammer the wake channel every 3 ms — for far LONGER than the deadline, and
+        // longer than the ceiling asserted below, because a starvation bug only
+        // shows while the wakes keep coming. The force-close must still land at the
+        // deadline: not before it, and not pushed out by the hammering.
+        const DEADLINE: Duration = Duration::from_millis(150);
+        /// Must exceed `CEILING`, or a watchdog whose deadline restarts on every
+        /// wake would simply fire once the hammering stopped and escape the test.
+        const HAMMER_BUDGET: Duration = Duration::from_secs(3);
+        /// Generous against scheduling noise but far under `HAMMER_BUDGET`.
+        const CEILING: Duration = Duration::from_millis(1500);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepting = std::thread::spawn(move || listener.accept().unwrap().0);
+        let tcp = TcpStream::connect(addr).unwrap();
+        // Hold the peer open and silent: the ONLY thing that can end our read is the
+        // watchdog force-closing our own socket.
+        let _peer = accepting.join().unwrap();
+        tcp.set_read_timeout(Some(Duration::from_millis(5))).unwrap();
+
+        let started = Instant::now();
+        let watchdog = HandshakeWatchdog::arm(&tcp, DEADLINE).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let waker = watchdog.thread.thread().clone();
+        let hammer = std::thread::spawn({
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(Ordering::SeqCst) && started.elapsed() < HAMMER_BUDGET {
+                    waker.unpark();
+                    std::thread::sleep(Duration::from_millis(3));
+                }
+            }
+        });
+
+        let mut probe = &tcp;
+        let mut buf = [0u8; 1];
+        let closed_after = loop {
+            match probe.read(&mut buf) {
+                Ok(0) => break started.elapsed(), // force-closed by the watchdog
+                Ok(_) => panic!("the silent peer cannot have sent anything"),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(
+                        started.elapsed() < Duration::from_secs(20),
+                        "the deadline was STARVED outright: the watchdog never force-closed"
+                    );
+                }
+                Err(_) => break started.elapsed(), // also a close
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        hammer.join().unwrap();
+
+        assert!(
+            closed_after >= DEADLINE.mul_f64(0.8),
+            "a wake must not SHORTEN the deadline: force-closed after {closed_after:?}, \
+             but the deadline is {DEADLINE:?}"
+        );
+        assert!(
+            closed_after < CEILING,
+            "a wake must not STARVE the deadline: the deadline is {DEADLINE:?} but the \
+             force-close only landed after {closed_after:?} of continuous wakes"
+        );
+        assert!(
+            !watchdog.finish(),
+            "the watchdog claimed the deadline, so the handshake must lose the CAS"
+        );
     }
 
     #[test]

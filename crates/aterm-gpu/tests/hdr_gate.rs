@@ -556,12 +556,12 @@ fn gpu_hdr_blit_bands_take_the_reference_white_scale() {
     assert_eq!((w as usize, h as usize), (fw + 7, fh + 7));
     let (ox, oy) = (
         aterm_render::band_offset(w as usize, fw),
-        aterm_render::band_offset(h as usize, fh),
+        aterm_render::band_offset_y(h as usize, fh),
     );
     assert_eq!(
         (ox, oy),
-        (3, 3),
-        "a 7px remainder splits 3 leading / 4 trailing"
+        (3, if cfg!(target_os = "linux") { 0 } else { 3 }),
+        "x: a 7px remainder splits 3 leading / 4 trailing; y: platform policy"
     );
 
     let bg = aterm_render::Theme::default().bg & 0x00ff_ffff;

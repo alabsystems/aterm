@@ -330,6 +330,9 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, false);
+        // The blanks below the cursor are genuine now — an in-flight offloaded
+        // reflow must not deficit-fill them from pre-erase history (fixwave5).
+        self.invalidate_pending_fill_target();
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
@@ -386,6 +389,9 @@ impl Grid {
         // sentinel used to kill that too.
         let last = self.storage.visible_rows.saturating_sub(1);
         self.damage_selection_visible_rows_ext(0, last, true);
+        // ED 2's blanks are genuine — an in-flight offloaded reflow must not
+        // deficit-fill the cleared screen from pre-erase history (fixwave5).
+        self.invalidate_pending_fill_target();
         self.storage.mark_content_full();
     }
 
@@ -531,6 +537,9 @@ impl Grid {
         let cursor_row = self.storage.cursor.row;
         let visible_rows = self.storage.visible_rows;
         self.clear_rows(cursor_row.saturating_add(1)..visible_rows, true);
+        // Same debt invalidation as ED 0: the band below the cursor is a
+        // genuine erase now, not reflow padding (fixwave5).
+        self.invalidate_pending_fill_target();
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.
@@ -565,6 +574,9 @@ impl Grid {
     pub fn selective_erase_screen(&mut self) {
         // Deferred wrap survives a cell erase (see erase_to_end_of_line).
         self.clear_rows(0..self.storage.visible_rows, true);
+        // Same debt invalidation as ED 2: the cleared screen's blanks are
+        // genuine, never deficit-fill them from pre-erase history (fixwave5).
+        self.invalidate_pending_fill_target();
         // SELECTION CUSTODY Phase 4: an ED/DECSED erases VISIBLE rows. It does not
         // touch history, so a selection anchored in scrollback survives it — the
         // sentinel used to kill that too.

@@ -369,6 +369,11 @@ impl App {
             // the entry describes a link that no longer exists, and without this the
             // map would accumulate one entry per closed tab for the process lifetime.
             self.link_estimates.remove(&session);
+            // The parked find origin names an absolute row in a grid that is about to
+            // stop existing; without this the map would grow one entry per closed tab
+            // per window for the process lifetime. `retain`, not `remove`, because the
+            // key carries the window a shared session's find was opened in.
+            self.find_origins.retain(|(entry, _), _| *entry != session);
             self.session_chrome_expiry.cancel_session(session);
             self.title_drift.forget(session);
             for window in self.windows.values_mut() {

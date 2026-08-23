@@ -91,8 +91,8 @@ pub(crate) enum RightPressPlan {
     /// half) — via `App::paste_clipboard_into`, NEVER a raw
     /// `self.input(…Paste…)`: the paste MUST pass `deliver_paste`'s
     /// pastejacking guard. (The Linux middle-click arm in `on_mouse_input`
-    /// predates the guard and bypasses it — audited as a defect; do not copy
-    /// that shape.)
+    /// routes through the guard too, via `App::paste_primary_into` — the raw
+    /// shape it once had is the audited defect; do not reintroduce it.)
     Paste,
     /// Fall through to the seam untouched: tracking is ON (the app owns the
     /// button — press/release report exactly as before this gesture existed),
@@ -901,7 +901,10 @@ impl App {
             .saturating_add(pad);
         (
             aterm_render::band_offset(size.width as usize, frame_w),
-            aterm_render::band_offset(size.height as usize, frame_h),
+            // Vertical placement is the platform policy (top-pinned on Linux):
+            // the SAME `band_offset_y` the presenters place the frame with, so
+            // pointer geometry and pixels can't disagree.
+            aterm_render::band_offset_y(size.height as usize, frame_h),
         )
     }
 
@@ -2550,11 +2553,13 @@ impl App {
     /// Left release ending a drag: complete the selection — unless the pointer
     /// never left the press cell, in which case a plain click deselects.
     ///
-    /// COPY-ON-SELECT: when `copy_on_select` is enabled (config, default on) and
-    /// the release actually COMPLETED a selection (a real drag, not a deselecting
-    /// click), the selected text is copied to the system clipboard right here — no
-    /// explicit Cmd-C needed. The highlight is left intact (`copy_selection` does
-    /// not clear it), so Cmd-C still works on the same selection afterwards.
+    /// COPY-ON-SELECT: when `copy_on_select` is enabled (config; default ON off
+    /// Linux, OFF on Linux where a selection owns PRIMARY instead — see
+    /// [`crate::app_config::Config::copy_on_select_or_default`]) and the release
+    /// actually COMPLETED a selection (a real drag, not a deselecting click), the
+    /// selected text is copied to the system clipboard right here — no explicit
+    /// Cmd-C needed. The highlight is left intact (`copy_selection` does not
+    /// clear it), so Cmd-C still works on the same selection afterwards.
     ///
     /// Returns whether the copy-on-select path FIRED (an opted-in completed drag) —
     /// the auto-copy trigger, independent of whether `pbcopy` itself succeeded — so
@@ -3041,16 +3046,32 @@ impl App {
                 let (_, fy) = self.window_to_frame(wid, px, py);
                 let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
                 if fy >= top && fy < f64::from(floor) {
-                    self.config_notice = None;
+                    // The multi-line-paste confirmation paints over the config
+                    // notice when both bands are up, so it takes the click first:
+                    // a press on a modal security question is its FAIL-CLOSED
+                    // answer (cancel — the parked text is dropped), never a
+                    // confirm. Only with no confirmation outstanding does the
+                    // click dismiss the config-warning banner as before.
+                    if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
+                        self.answer_paste_banner(false);
+                    } else {
+                        self.config_notice = None;
+                    }
                     self.request_redraw_all_windows();
                     return;
                 }
             }
         }
         // MIDDLE-CLICK PASTE (X11 PRIMARY): when no app is tracking the mouse, a
-        // middle press pastes the PRIMARY selection (the X convention) through the
-        // same seam as Ctrl+Shift+V; when tracking is ON it falls through to the
-        // mouse-report encoding below so TUIs still receive the button. X11 only.
+        // middle press pastes the PRIMARY selection (the X convention) through
+        // `App::paste_primary_into` — the same asynchronous pipeline + pastejacking
+        // guard (`deliver_paste`) as Ctrl+Shift+V, with the own-selection fast path
+        // delivered synchronously and a FOREIGN owner's blocking `ConvertSelection`
+        // round-trip offloaded to a worker (audit: the old arm called the blocking
+        // read directly in this winit handler — up to ~1 s of UI freeze on a hung
+        // owner — and raw `self.input(…Paste…)` skipped the multi-line-paste
+        // guard). When tracking is ON it falls through to the mouse-report
+        // encoding below so TUIs still receive the button. X11 only.
         #[cfg(target_os = "linux")]
         if pressed && button == WinitMouseButton::Middle {
             let tracking = self
@@ -3058,9 +3079,7 @@ impl App {
                 .map(|terminal| terminal.term.clone())
                 .is_some_and(|t| term_lock(&t).mouse_tracking_enabled());
             if !tracking {
-                if let Some(text) = crate::control::primary_get() {
-                    self.input(wid, InputEvent::Paste(text), Source::Human);
-                }
+                self.paste_primary_into(wid);
                 return;
             }
         }
@@ -3078,7 +3097,7 @@ impl App {
         //   * the paste goes through `paste_clipboard_into` -> `deliver_paste`
         //     (the pastejacking guard + the S9 CF_HDROP file fallback), NEVER
         //     `self.input(…Paste…)` directly — the middle-click arm above
-        //     bypasses the guard and is audited as a defect, not a precedent.
+        //     routes through the same guard via `paste_primary_into`.
         // Cross-platform by config (macOS/Linux default `off` — their hands
         // expect a context menu / middle-click paste), so no cfg here: the
         // platform split lives in `RightClickGesture::PLATFORM_DEFAULT`.
@@ -4946,10 +4965,13 @@ mod tests {
             (rows * ch + 4 + 12 + 3 + ch.saturating_sub(1).max(2)) as u32,
         ));
         let (origin_x, origin_y) = app.frame_origin(wid);
-        assert!(
-            origin_x > 0 && origin_y > 0,
-            "fixture needs remainder bands"
-        );
+        assert!(origin_x > 0, "fixture needs a horizontal remainder band");
+        if cfg!(target_os = "linux") {
+            // The vertical axis is top-pinned there: all slack below the frame.
+            assert_eq!(origin_y, 0, "Linux pins the frame top");
+        } else {
+            assert!(origin_y > 0, "fixture needs a vertical remainder band");
+        }
         let panel_rows = app.windows[&wid].settings_panel_rows();
         let left = (origin_x + 12) as f64;
         let top = (origin_y + 4 + 3) as f64;
@@ -5016,7 +5038,14 @@ mod tests {
             (rows * ch + 4 + 12 + 3 + rh) as u32,
         ));
         let (ox, oy) = app.frame_origin(wid);
-        assert!(ox > 0 && oy > 0, "fixture needs both frame remainder bands");
+        assert!(ox > 0, "fixture needs the horizontal remainder band");
+        if cfg!(target_os = "linux") {
+            // Top-pinned vertical placement: the origin is 0 by policy, and the
+            // origin-stripping seam is still exercised through the X axis.
+            assert_eq!(oy, 0, "Linux pins the frame top");
+        } else {
+            assert!(oy > 0, "fixture needs the vertical remainder band");
+        }
 
         let panel_rows = app.windows[&wid].settings_panel_rows();
         let pane = crate::settings::pane_geom_cells(cols, panel_rows);
@@ -5470,10 +5499,11 @@ mod tests {
     }
 
     /// W1 regression (kill the compositor stretch): the pointer geometry mirrors
-    /// the band placement. A window exactly grid-fit + 7px shifts the frame — and
-    /// thus every pixel→cell mapping — by the leading 3px band (`band_offset`
-    /// splits 7 as 3/4); headless (no `win_px`) and an exact grid fit stay at
-    /// origin 0. The fixture uses independent 2px top / 12px bottom padding.
+    /// the band placement — horizontally the centred `band_offset` (grid-fit +
+    /// 7px shifts the frame by the leading 3px band), vertically the platform
+    /// `band_offset_y` (top-pinned on Linux, centred elsewhere); headless (no
+    /// `win_px`) and an exact grid fit stay at origin 0. The fixture uses
+    /// independent 2px top / 12px bottom padding.
     #[test]
     fn pointer_geometry_tracks_the_band_offset() {
         use crate::{App, WindowId};
@@ -5524,12 +5554,19 @@ mod tests {
             fit.width + rw as u32,
             fit.height + rh as u32,
         ));
-        // pad_split centres: the leading band is the low half of the remainder.
-        let (ox, oy) = (rw / 2, rh / 2);
+        // Horizontally the leading band is the low half of the remainder
+        // (centred); vertically it follows the PLATFORM policy — top-pinned on
+        // Linux (the whole remainder lands under the frame, keeping the chrome
+        // band glued to the titlebar), centred elsewhere. Both come from the
+        // same `band_offset`/`band_offset_y` pair the presenters place with.
+        let (ox, oy) = (
+            rw / 2,
+            if cfg!(target_os = "linux") { 0 } else { rh / 2 },
+        );
         assert_eq!(
             app.frame_origin(wid),
             (ox as i64, oy as i64),
-            "a sub-cell remainder centres into a leading band"
+            "a sub-cell remainder must land exactly where the presenter's bands do"
         );
         assert_eq!(
             app.pixel_to_cell(wid, px + ox as f64, py + oy as f64),
@@ -5541,19 +5578,26 @@ mod tests {
         let (_, col) = app.pixel_to_cell(wid, 1.0, py + oy as f64);
         assert_eq!(col, 0, "a band click clamps to the leading cell");
 
-        // A transient surface smaller than the composed frame is a centred
-        // SOURCE crop. Preserve its signed origin so window pixel 0 maps to the
-        // actual positive frame coordinate instead of incorrectly clamping at 0.
+        // A transient surface smaller than the composed frame is a SOURCE crop:
+        // centred horizontally everywhere; vertically top-pinned on Linux (the
+        // crop falls off the bottom, the band stays glued to the titlebar) and
+        // centred elsewhere. Preserve the signed origin so window pixel 0 maps
+        // to the actual frame coordinate instead of incorrectly clamping at 0.
         app.windows.get_mut(&wid).expect("window").win_px = Some(PhysicalSize::new(
             fit.width.saturating_sub(3).max(1),
             fit.height.saturating_sub(5).max(1),
         ));
         let cropped_origin = app.frame_origin(wid);
-        assert!(cropped_origin.0 < 0 && cropped_origin.1 < 0);
+        assert!(cropped_origin.0 < 0);
+        if cfg!(target_os = "linux") {
+            assert_eq!(cropped_origin.1, 0, "a top-pinned crop keeps the frame top");
+        } else {
+            assert!(cropped_origin.1 < 0);
+        }
         assert_eq!(
             app.window_to_frame(wid, 0.0, 0.0),
             (-cropped_origin.0 as f64, -cropped_origin.1 as f64),
-            "pointer transform must retain the centred source crop"
+            "pointer transform must retain the source-crop origin"
         );
     }
 

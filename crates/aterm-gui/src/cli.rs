@@ -464,14 +464,15 @@ const STARTER_CONFIG: &str = "\
 
 # --- behaviour ----------------------------------------------------------------
 # gpu = false                      # GPU rendering is ON by default (auto CPU fallback); set false / --cpu / $ATERM_CPU to force CPU
-# copy_on_select = true            # auto-copy mouse selection to clipboard (DEFAULT on; false opts out)
+# copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (DEFAULT on; OFF on Linux, where a
+                                   # selection owns PRIMARY and the CLIPBOARD stays for explicit copies; true opts into both)
 # show_build_badge = false         # OPTIONAL floating top-right v<version>·<build> pill — DEFAULT off
                                    # (the version lives in the menu bar: the v<version> menu opens About)
-# confirm_multiline_paste = true   # macOS/Windows: confirm unbracketed multiline paste; preserved but no prompt elsewhere
+# confirm_multiline_paste = true   # confirm unbracketed multiline paste (macOS sheet / Windows dialog / Linux in-window banner)
 # focus_boost = true               # Windows: boost the visible shells' priority while aterm is focused (DEFAULT on; no-op elsewhere)
 
 # --- security opt-ins (all default OFF) ---------------------------------------
-# allow_window_ops = false         # XTWINOPS title/text-grid-size reports; GUI manipulation and most geometry requests are ignored
+# allow_window_ops = false         # XTWINOPS title/text-grid-size reports; Linux also applies window manipulations (move stays denied)
 # allow_notifications = false
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false
@@ -1342,9 +1343,14 @@ mod tests {
         let stream_fade = line_for("stream_fade");
         assert!(stream_fade.contains("set true to enable"), "{stream_fade}");
         assert!(stream_fade.contains("default OFF"), "{stream_fade}");
+        // The pastejacking confirm has a surface on every platform now — the
+        // starter config must name all three, and never resurrect the audited
+        // "no prompt elsewhere" caveat.
         let paste = line_for("confirm_multiline_paste");
-        assert!(paste.contains("macOS/Windows"), "{paste}");
-        assert!(paste.contains("no prompt elsewhere"), "{paste}");
+        assert!(paste.contains("macOS sheet"), "{paste}");
+        assert!(paste.contains("Linux in-window banner"), "{paste}");
+        let cos = line_for("copy_on_select");
+        assert!(cos.contains("OFF on Linux"), "{cos}");
     }
 
     #[test]

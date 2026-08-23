@@ -735,6 +735,10 @@ pub(crate) fn spawn_session(
     ));
 
     configure_bell(&term, proxy, id, window);
+    // XTWINOPS host transport (Linux): the engine gates on `allow_window_ops`
+    // in-core; without this callback an authorized `CSI 9;1t` was a no-op.
+    #[cfg(target_os = "linux")]
+    configure_window_ops(&term, proxy, id, window);
 
     // Wake coalescing: at most ONE `Wake::Output` in flight per session. The
     // reader arms it on a clear->armed edge; the main thread's handler clears it
@@ -1375,45 +1379,142 @@ fn new_live_terminal(
 /// limit + memory budget, not this ring.
 const LIVE_SCROLLBACK_RING_LINES: usize = 10_000;
 
-/// OSC 52 clipboard for one session: WRITE authorized (pbcopy on a dedicated thread
-/// so the blocking subprocess never runs under the Terminal lock), QUERY denied —
-/// handing the user's clipboard back to a program stays off. Each tab gets its own
-/// authorization + callback so a background tab's yank still reaches pbcopy.
-/// Drain a channel's currently-queued backlog and return the LATEST value,
-/// starting from `first` (a value already `recv`'d). Non-blocking: `try_recv`
-/// consumes only what is already queued, so a burst of clipboard sets collapses
-/// to one last-writer-wins value and thus one `pbcopy` spawn (bounds queue
-/// depth). Behaviour-identical to processing each in turn when the clipboard is
-/// last-writer-wins, since only the final value survives.
-fn drain_latest<T>(first: T, rx: &std::sync::mpsc::Receiver<T>) -> T {
+/// One OSC 52 write, already ROUTED to its platform destinations by
+/// [`route_osc52_write`]: the text bound for the system CLIPBOARD and/or the text
+/// bound for the X11 PRIMARY selection. `None` = "this destination untouched", so
+/// a `'p'`-only set can never clobber the CLIPBOARD and vice versa.
+struct ClipWrite {
+    clipboard: Option<String>,
+    primary: Option<String>,
+}
+
+/// PURE routing of an OSC 52 selection list onto the two real destinations
+/// (audit: every target used to funnel into `pbcopy`, so `\x1b]52;p;…` — the
+/// PRIMARY selection by its own spec — silently overwrote the user's explicit
+/// CLIPBOARD copy).
+///
+/// * `'p'` (Primary) routes to the PRIMARY selection — when `primary_supported`
+///   (X11). Elsewhere PRIMARY does not exist, so `'p'` FALLS BACK to the
+///   clipboard: that preserves the macOS/Windows behaviour every OSC 52 client
+///   (remote tmux/vim yank) has always relied on, where the general pasteboard
+///   is the only buffer there is.
+/// * everything else — `'c'`, `'s'`, `'q'`, the cut buffers, and the EMPTY list
+///   (xterm's default when no selection chars were given) — routes to the
+///   system clipboard, exactly as before.
+fn route_osc52_write(
+    selections: &[aterm_core::terminal::ClipboardSelection],
+    content: &str,
+    primary_supported: bool,
+) -> ClipWrite {
+    use aterm_core::terminal::ClipboardSelection as Sel;
+    let wants_primary = selections.iter().any(|s| matches!(s, Sel::Primary));
+    let wants_clipboard = selections.is_empty()
+        || selections.iter().any(|s| !matches!(s, Sel::Primary))
+        || (wants_primary && !primary_supported);
+    ClipWrite {
+        clipboard: wants_clipboard.then(|| content.to_owned()),
+        primary: (wants_primary && primary_supported).then(|| content.to_owned()),
+    }
+}
+
+/// The slot an OSC 52 QUERY answers from — the read-side mirror of
+/// [`route_osc52_write`] (audit follow-up: `'p'` Sets started writing PRIMARY
+/// but the query arm kept answering from the CLIPBOARD own-slot, so a
+/// set-then-query round-trip through `'p'` returned the WRONG buffer).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuerySource {
+    Clipboard,
+    Primary,
+}
+
+/// PURE routing of an OSC 52 query's selection list onto the slot it reads,
+/// mirroring [`route_osc52_write`] target-for-target so set-then-query is
+/// COHERENT: a `'p'`-only query reads the PRIMARY slot its Set wrote (X11);
+/// `'c'` and friends — and the EMPTY xterm default — keep reading the
+/// CLIPBOARD. One query yields ONE response, so a mixed `"cp"` list answers
+/// from the CLIPBOARD (the established priority; its Set wrote both slots, so
+/// the answer is still one the same command stored). Off X11 `'p'` folds into
+/// the clipboard, exactly like the write fallback.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn route_osc52_query(
+    selections: &[aterm_core::terminal::ClipboardSelection],
+    primary_supported: bool,
+) -> QuerySource {
+    use aterm_core::terminal::ClipboardSelection as Sel;
+    let only_primary = !selections.is_empty()
+        && selections.iter().all(|s| matches!(s, Sel::Primary));
+    if only_primary && primary_supported {
+        QuerySource::Primary
+    } else {
+        QuerySource::Clipboard
+    }
+}
+
+/// Drain a channel's currently-queued backlog and fold it into `first` (a write
+/// already `recv`'d), keeping the LATEST value PER DESTINATION. Non-blocking:
+/// `try_recv` consumes only what is already queued, so a burst of clipboard sets
+/// collapses to at most one platform write per destination (bounds queue depth).
+/// Behaviour-identical to processing each in turn when each selection is
+/// last-writer-wins, since only a destination's final value survives — and the
+/// fold is per-destination so a trailing `'p'`-only set cannot swallow the
+/// CLIPBOARD half of an earlier `'c'` set in the same burst.
+fn drain_latest_write(first: ClipWrite, rx: &std::sync::mpsc::Receiver<ClipWrite>) -> ClipWrite {
     let mut latest = first;
     while let Ok(next) = rx.try_recv() {
-        latest = next;
+        if next.clipboard.is_some() {
+            latest.clipboard = next.clipboard;
+        }
+        if next.primary.is_some() {
+            latest.primary = next.primary;
+        }
     }
     latest
 }
 
+/// OSC 52 clipboard for one session: WRITE authorized (pbcopy/PRIMARY-own on a
+/// dedicated thread so the blocking platform write never runs under the Terminal
+/// lock), QUERY denied — handing the user's clipboard back to a program stays off.
+/// Each tab gets its own authorization + callback so a background tab's yank still
+/// reaches the platform. Selection targets are ROUTED ([`route_osc52_write`]):
+/// `'c'` and friends own the system CLIPBOARD, `'p'` owns the X11 PRIMARY — and
+/// an authorized query reads back through the SAME map ([`route_osc52_query`]).
 fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
-    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<String>();
+    let (clip_tx, clip_rx) = std::sync::mpsc::channel::<ClipWrite>();
     std::thread::spawn(move || {
-        // Coalesce an OSC-52 set flood: each set is one blocking pbcopy call
+        // Coalesce an OSC-52 set flood: each set is one blocking platform write
         // (in-process NSPasteboard on macOS, X11 on Linux), so an authorized
-        // burst could grow the queue without bound. Clipboard is
-        // last-writer-wins, so after a recv() drain the backlog and pbcopy only
-        // the latest — bounding queue depth and collapsing a burst to one write.
-        while let Ok(content) = clip_rx.recv() {
-            control::pbcopy(&drain_latest(content, &clip_rx));
+        // burst could grow the queue without bound. Each selection is
+        // last-writer-wins, so after a recv() drain the backlog and write only
+        // the latest per destination — bounding queue depth and collapsing a
+        // burst to at most one write per destination.
+        while let Ok(write) = clip_rx.recv() {
+            let write = drain_latest_write(write, &clip_rx);
+            if let Some(text) = write.clipboard {
+                control::pbcopy(&text);
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(text) = write.primary {
+                control::primary_set(&text);
+            }
         }
     });
     let mut t = term_lock(term);
     t.authorize_clipboard_access(ClipboardAccess::Write);
+    // Off X11, `route_osc52_write` folds 'p' into the clipboard instead — the
+    // routed `primary` half is then always `None`, which is what lets the worker
+    // above compile the PRIMARY write out entirely on those platforms.
+    let primary_supported = cfg!(target_os = "linux");
     t.set_clipboard_callback(move |op| match op {
-        ClipboardOperation::Set { content, .. } => {
-            let _ = clip_tx.send(content);
+        ClipboardOperation::Set {
+            selections,
+            content,
+        } => {
+            let _ = clip_tx.send(route_osc52_write(&selections, &content, primary_supported));
             None
         }
-        ClipboardOperation::Clear { .. } => {
-            let _ = clip_tx.send(String::new());
+        ClipboardOperation::Clear { selections } => {
+            let _ = clip_tx.send(route_osc52_write(&selections, "", primary_supported));
             None
         }
         // The engine reaches this arm ONLY through a minted
@@ -1430,9 +1531,12 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
         // to an empty reply (a valid "clipboard is empty" response), never to
         // silence — silence is indistinguishable from denial, and the host
         // already decided this session is allowed to know.
-        ClipboardOperation::Query { .. } => {
+        ClipboardOperation::Query { selections } => {
             #[cfg(not(target_os = "linux"))]
             {
+                // Off X11 every target (the 'p' spelling included) folds into
+                // the one pasteboard, mirroring the write fallback above.
+                let _ = &selections;
                 Some(crate::control::pbpaste().unwrap_or_default())
             }
             #[cfg(target_os = "linux")]
@@ -1441,7 +1545,15 @@ fn configure_clipboard(term: &Arc<Mutex<Terminal>>) {
                 // owner means a blocking round-trip inside the terminal lock,
                 // which is worse than no answer. Partial by design; the
                 // blocking-read offload is the Linux daily-driver lane's work.
-                crate::control::pbpaste_owned()
+                // The slot HONORS the query's selections ([`route_osc52_query`]):
+                // a 'p' query reads the PRIMARY own-slot its Set now writes,
+                // 'c' and friends keep the CLIPBOARD own-slot — so an OSC 52
+                // set-then-query round-trip answers from the SAME buffer for
+                // both targets.
+                match route_osc52_query(&selections, primary_supported) {
+                    QuerySource::Primary => crate::control::primary_get_owned(),
+                    QuerySource::Clipboard => crate::control::pbpaste_owned(),
+                }
             }
         }
     });
@@ -1515,6 +1627,86 @@ fn configure_bell(
             window,
         });
     });
+}
+
+/// XTWINOPS → `Wake::WindowOp` for one session (Linux). The engine's `CSI t`
+/// dispatch already carries the WHOLE security story — nothing here runs unless
+/// `allow_window_ops = true` minted a capability in-core, window MOVE is denied
+/// there outright, and resizes arrive pre-clamped to the engine's minimums — so
+/// this callback is pure transport: it fires inside `process()` on this tab's
+/// reader thread under the Terminal lock (exactly like the bell) and must not
+/// touch the window from there, so it posts the operation to the main thread,
+/// the sole owner of every winit window (`App::on_window_op`).
+///
+/// Frame-audit #4 is the reason this exists: with `allow_window_ops = true`,
+/// `CSI 9;1t` (maximize) did NOTHING, because no host callback was ever
+/// installed. Manipulations now apply; REPORT operations still return `None`
+/// here, which keeps the engine's own fallbacks (text-grid size, title/icon
+/// label) byte-identical and leaves the position/pixel-geometry reports
+/// unanswered exactly as before — an async wake cannot carry a synchronous
+/// reply, and inventing stale geometry from this thread would be worse than
+/// silence.
+#[cfg(target_os = "linux")]
+fn configure_window_ops(
+    term: &Arc<Mutex<Terminal>>,
+    proxy: &EventLoopProxy<Wake>,
+    id: u64,
+    window: WindowId,
+) {
+    let proxy = proxy.clone();
+    term_lock(term).set_window_callback(move |op| {
+        if let Some(wake) = window_op_wake(op, id, window) {
+            let _ = proxy.send_event(wake);
+        }
+        // Manipulations answer no bytes; reports keep the engine's fallbacks —
+        // so the callback's reply is `None` either way.
+        None
+    });
+}
+
+/// The PURE half of [`configure_window_ops`]: the transport decision for one
+/// engine-authorized XTWINOPS operation. Manipulations become the
+/// [`Wake::WindowOp`] the main thread applies, stamped with the requesting
+/// session and its spawn-time owner window; reports (and any future
+/// operation) return `None`, so the engine's in-core fallbacks stay the only
+/// answerer — an async wake cannot carry a synchronous reply. Split from the
+/// installed callback because an `EventLoopProxy` cannot exist headless: this
+/// is the seam the XTWINOPS routing tests exercise (review finding: the
+/// transport had zero automated coverage).
+#[cfg(target_os = "linux")]
+pub(crate) fn window_op_wake(
+    op: aterm_types::WindowOperation,
+    session: u64,
+    window: WindowId,
+) -> Option<Wake> {
+    use aterm_types::WindowOperation as W;
+    match op {
+        // Manipulations: applied asynchronously by the main thread; none of
+        // these answers bytes, so posting alone is complete.
+        op @ (W::DeIconify
+        | W::Iconify
+        | W::RaiseWindow
+        | W::LowerWindow
+        | W::RefreshWindow
+        | W::ResizeWindowPixels { .. }
+        | W::ResizeWindowCells { .. }
+        | W::RestoreMaximized
+        | W::MaximizeWindow
+        | W::MaximizeVertically
+        | W::MaximizeHorizontally
+        | W::UndoFullscreen
+        | W::EnterFullscreen
+        | W::ToggleFullscreen) => Some(Wake::WindowOp {
+            session,
+            window,
+            op,
+        }),
+        // Reports (and any future operation): unanswered here — the engine's
+        // in-core fallbacks own what can be answered honestly. `MoveWindow` is
+        // denied in-core and can never arrive; the fallthrough keeps the
+        // transport inert even if it somehow did.
+        _ => None,
+    }
 }
 
 /// Maximum bytes a Kitty non-direct medium may supply (matches the engine's
@@ -2780,33 +2972,131 @@ mod bundle_path_env_tests {
 
 #[cfg(test)]
 mod clipboard_coalesce_tests {
-    use super::drain_latest;
+    use aterm_core::terminal::ClipboardSelection as Sel;
 
-    /// A backlog of clipboard sets collapses to the LAST value (last-writer-wins),
-    /// so one pbcopy spawns per burst instead of one per set. Regression: the
-    /// consumer used to `pbcopy` every queued message unconditionally.
+    use super::{ClipWrite, QuerySource, drain_latest_write, route_osc52_query, route_osc52_write};
+
+    fn set(clipboard: Option<&str>, primary: Option<&str>) -> ClipWrite {
+        ClipWrite {
+            clipboard: clipboard.map(str::to_owned),
+            primary: primary.map(str::to_owned),
+        }
+    }
+
+    /// THE AUDIT FINDING: `\x1b]52;p;…` names the PRIMARY selection, so on X11 it
+    /// must own PRIMARY and leave the user's explicit CLIPBOARD copy alone.
     #[test]
-    fn drain_latest_returns_the_final_queued_value() {
-        let (tx, rx) = std::sync::mpsc::channel::<String>();
-        // Simulate an OSC-52 set flood already sitting in the queue.
-        tx.send("a".to_string()).unwrap();
-        tx.send("b".to_string()).unwrap();
-        tx.send("c".to_string()).unwrap();
-        // `first` is the value the consumer already recv'd; drain the rest.
-        let first = "first".to_string();
+    fn primary_target_routes_to_primary_not_clipboard_on_x11() {
+        let w = route_osc52_write(&[Sel::Primary], "yanked", true);
+        assert_eq!(w.primary.as_deref(), Some("yanked"));
+        assert_eq!(w.clipboard, None, "'p' must NOT clobber the CLIPBOARD");
+    }
+
+    /// `'c'` (and the empty default) keep their established clipboard routing,
+    /// with PRIMARY untouched; `"cp"` sets both.
+    #[test]
+    fn clipboard_and_default_targets_route_to_the_clipboard() {
+        let w = route_osc52_write(&[Sel::Clipboard], "x", true);
+        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("x"), None));
+        let w = route_osc52_write(&[], "x", true);
         assert_eq!(
-            drain_latest(first, &rx),
-            "c",
-            "drains backlog to the latest"
+            (w.clipboard.as_deref(), w.primary),
+            (Some("x"), None),
+            "an empty selection list is the xterm clipboard default"
+        );
+        let w = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "x", true);
+        assert_eq!(w.clipboard.as_deref(), Some("x"));
+        assert_eq!(w.primary.as_deref(), Some("x"));
+    }
+
+    /// Off X11 there IS no PRIMARY: `'p'` falls back to the clipboard (the
+    /// behaviour every macOS/Windows OSC 52 client has always relied on), and a
+    /// `"cp"` set collapses to ONE clipboard write, not two.
+    #[test]
+    fn primary_falls_back_to_the_clipboard_where_primary_does_not_exist() {
+        let w = route_osc52_write(&[Sel::Primary], "y", false);
+        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
+        let w = route_osc52_write(&[Sel::Clipboard, Sel::Primary], "y", false);
+        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
+    }
+
+    /// THE QUERY-SIDE AUDIT FOLLOW-UP: `'p'` Sets write PRIMARY, so a `'p'`
+    /// query must READ the PRIMARY slot — while `'c'` (and the empty xterm
+    /// default) keeps answering from the CLIPBOARD. Set-then-query coherence,
+    /// target for target: the slot the query reads is one its own Set wrote.
+    #[test]
+    fn query_reads_the_slot_its_set_wrote_per_target() {
+        // 'p' on X11: Set writes ONLY primary; the query reads Primary.
+        let w = route_osc52_write(&[Sel::Primary], "yank", true);
+        assert_eq!((w.clipboard, w.primary.as_deref()), (None, Some("yank")));
+        assert_eq!(route_osc52_query(&[Sel::Primary], true), QuerySource::Primary);
+        // 'c' and the empty default: Set writes the clipboard; so reads the query.
+        assert_eq!(
+            route_osc52_query(&[Sel::Clipboard], true),
+            QuerySource::Clipboard
+        );
+        assert_eq!(route_osc52_query(&[], true), QuerySource::Clipboard);
+        // "cp": Set wrote BOTH slots, the one response keeps the established
+        // CLIPBOARD priority — still a slot the same Set stored.
+        assert_eq!(
+            route_osc52_query(&[Sel::Clipboard, Sel::Primary], true),
+            QuerySource::Clipboard
+        );
+        // Off X11 'p' folds into the clipboard on BOTH sides of the round-trip.
+        let w = route_osc52_write(&[Sel::Primary], "y", false);
+        assert_eq!((w.clipboard.as_deref(), w.primary), (Some("y"), None));
+        assert_eq!(
+            route_osc52_query(&[Sel::Primary], false),
+            QuerySource::Clipboard
         );
     }
 
-    /// With an empty backlog, `drain_latest` returns `first` unchanged — the
+    /// End-to-end on the stubbed slots (Linux): with DIFFERENT text stored in
+    /// the CLIPBOARD and PRIMARY own-slots, the routed query reader returns the
+    /// PRIMARY text for 'p' and the CLIPBOARD text for 'c' — the exact
+    /// confusion of the finding ('p' answered from the CLIPBOARD slot).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn query_arm_answers_primary_text_for_p_and_clipboard_text_for_c() {
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = Some("clip".to_string()));
+        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = Some("prim".to_string()));
+        let read = |sels: &[Sel]| match route_osc52_query(sels, true) {
+            QuerySource::Primary => crate::control::primary_get_owned(),
+            QuerySource::Clipboard => crate::control::pbpaste_owned(),
+        };
+        assert_eq!(read(&[Sel::Primary]).as_deref(), Some("prim"));
+        assert_eq!(read(&[Sel::Clipboard]).as_deref(), Some("clip"));
+        assert_eq!(read(&[]).as_deref(), Some("clip"));
+        crate::control::PBPASTE_STUB.with(|s| *s.borrow_mut() = None);
+        crate::control::PRIMARY_STUB.with(|s| *s.borrow_mut() = None);
+    }
+
+    /// A backlog of sets collapses to the LAST value PER DESTINATION, so at most
+    /// one platform write fires per destination per burst — and a trailing
+    /// `'p'`-only set cannot swallow the CLIPBOARD half of an earlier `'c'` set.
+    #[test]
+    fn drain_folds_the_backlog_per_destination() {
+        let (tx, rx) = std::sync::mpsc::channel::<ClipWrite>();
+        // Simulate an OSC-52 set flood already sitting in the queue.
+        tx.send(set(Some("b"), None)).unwrap();
+        tx.send(set(Some("c"), Some("p1"))).unwrap();
+        tx.send(set(None, Some("p2"))).unwrap();
+        let folded = drain_latest_write(set(Some("a"), None), &rx);
+        assert_eq!(
+            folded.clipboard.as_deref(),
+            Some("c"),
+            "clipboard keeps ITS latest even though a primary-only set came later"
+        );
+        assert_eq!(folded.primary.as_deref(), Some("p2"));
+    }
+
+    /// With an empty backlog the first write passes through unchanged — the
     /// common single-set path is byte-identical to the old behaviour.
     #[test]
-    fn drain_latest_with_empty_backlog_returns_first() {
-        let (_tx, rx) = std::sync::mpsc::channel::<String>();
-        assert_eq!(drain_latest("only".to_string(), &rx), "only");
+    fn drain_with_empty_backlog_returns_first() {
+        let (_tx, rx) = std::sync::mpsc::channel::<ClipWrite>();
+        let folded = drain_latest_write(set(Some("only"), None), &rx);
+        assert_eq!((folded.clipboard.as_deref(), folded.primary), (Some("only"), None));
     }
 }
 

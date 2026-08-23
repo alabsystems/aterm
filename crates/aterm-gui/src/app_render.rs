@@ -91,6 +91,17 @@ enum CursorEffectScrollDecision {
     Invalidate,
 }
 
+/// The `ATERM_TRACE_SPAWN` diagnostic gate, shared by the per-present
+/// `SPAWNSRC` cursor trace below and the input path's `PRESS`/`ARM` traces
+/// (the content-proof capture and arming sensors in `app_input`; the engine's
+/// own `CONFIRM`/`DIFF` twins live behind the same env var in `cursor_glow`).
+/// A static once-sampled bool — a mid-run env mutation is not a supported use
+/// — so every trace site pays one cached load when the trace is off.
+pub(crate) fn trace_spawn_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("ATERM_TRACE_SPAWN").is_some())
+}
+
 /// Project CursorGlow's coherent content proof onto the classic trail twin
 /// before either engine observes this frame's cursor delta.
 fn confirm_cursor_move_candidate(
@@ -11304,8 +11315,7 @@ impl App {
         // static debug gate, so it is SAMPLED ONCE (a mid-run mutation is not a
         // supported use): the per-present cost off is a single cached bool load,
         // not the env-lock + environ scan `var_os` does every frame.
-        static TRACE_SPAWN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *TRACE_SPAWN.get_or_init(|| std::env::var_os("ATERM_TRACE_SPAWN").is_some()) {
+        if crate::app_render::trace_spawn_enabled() {
             static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
             static LAST: std::sync::Mutex<Option<Option<(u16, u16)>>> = std::sync::Mutex::new(None);
             let e = *EPOCH.get_or_init(std::time::Instant::now);
@@ -13696,6 +13706,9 @@ impl App {
         // Paint their cell band after preparation; the shared present seam crops
         // the later native tray below it so the banner remains truly topmost.
         self.splice_config_notice(id);
+        // The multi-line-paste confirmation is a SECURITY question: it paints
+        // over the config notice when both bands are up (same mechanics).
+        self.splice_paste_banner(id);
         // C5: the tab context menu is the topmost chrome while it is open — it
         // owns the pointer and the keyboard, so it paints after everything, the
         // config banner included. A no-op with no menu up.
@@ -13748,6 +13761,9 @@ impl App {
             return;
         }
         self.splice_config_notice(id);
+        // The multi-line-paste confirmation is a SECURITY question: it paints
+        // over the config notice when both bands are up (same mechanics).
+        self.splice_paste_banner(id);
         // C5 — topmost chrome; see the terminal route for the ordering rule.
         self.splice_tab_menu(id);
         let visuals = self.host_visual_state(id, frame_started);
@@ -16451,6 +16467,9 @@ impl App {
         // pass below, not this card. A no-op when no celebration / the arrow has faded.
         self.splice_level_up(id);
         self.splice_config_notice(id);
+        // The multi-line-paste confirmation is a SECURITY question: it paints
+        // over the config notice when both bands are up (same mechanics).
+        self.splice_paste_banner(id);
         // C5 — topmost chrome; see the note at the heterogeneous route above.
         self.splice_tab_menu(id);
         if !multi_pane && let Some(ws) = self.windows.get_mut(&id) {
@@ -17410,7 +17429,10 @@ impl App {
                     }
                     let (ox, oy) = (
                         aterm_render::band_offset(dw, fw),
-                        aterm_render::band_offset(dh, fh),
+                        // The platform vertical policy `place_frame_bands` just
+                        // placed with (top-pinned on Linux) — chrome composition
+                        // must land on the same rows.
+                        aterm_render::band_offset_y(dh, fh),
                     );
                     // One canonical backend order: base → tray → bell invert →
                     // accent overlay. GPU already applies its blit effects after
@@ -17473,7 +17495,10 @@ impl App {
                     // bands are constant (age == 1 ⇒ no resize) and stay valid from
                     // the last full present, so only the content columns are copied.
                     let off_x = aterm_render::band_offset(dw, fw);
-                    let off_y = aterm_render::band_offset(dh, fh);
+                    // Same platform vertical policy as the full-copy placement
+                    // above: the dirty rows must land on the rows the last full
+                    // present put them on.
+                    let off_y = aterm_render::band_offset_y(dh, fh);
                     let x0 = off_x.max(0) as usize;
                     let x1 = (off_x + fw as i64).clamp(0, dw as i64) as usize;
                     let span = x1.saturating_sub(x0);
@@ -20043,7 +20068,13 @@ impl App {
         // background through that strip instead, so the chip reaches the window's top
         // edge. Windows-only, and only while the synthetic head is actually reserving
         // pixels: with `head == 0` the strip IS just the top pad, where the flat fill
-        // is right (and is what Linux keeps, byte-identical).
+        // is right. LINUX has a synthetic head too, but deliberately keeps the FLAT
+        // fill: its pixel band paints the whole lip itself (cards floating in the
+        // band, not columns extruded to the window edge — see
+        // `tab_bar::pixel_band::BAND_OWNS_SURFACES`), and under the band's
+        // font-not-yet-landed cell fallback a flat lip above quiet chip cards is the
+        // honest transitional frame, where extruded card columns would flash the
+        // exact glued-slab look the pixel design replaces.
         let extend_top = cfg!(windows) && self.win_head(wid) > 0;
         self.backend.set_chrome_bleed(
             (strip > 0)
@@ -20114,14 +20145,14 @@ impl App {
                     None => (tab, text, cursor),
                 }
             });
-        // THE PIXEL BAND's extra key (Windows): the band raster is a function of
+        // THE PIXEL BAND's extra key (Windows + Linux): the band raster is a function of
         // this window's own cell box + band lip + scale (mixed-DPI, font size)
         // and of the asynchronously landing chrome faces — none of which the
         // cell rows depend on, so none of which `StripCacheKey` carries. Folded
         // into the hit below as one more equality term: a scale flip, a font-px
         // change that happens to keep `cols`, or the UI face landing after the
         // first frames each force ONE rebuild, which re-rasters the band.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let band_key = {
             let (cell_w, cell_h) = self.win_cell_size(wid);
             let band_top = self.win_pad_top(wid) + self.win_head(wid);
@@ -20141,9 +20172,9 @@ impl App {
         // `subtitle.clone()` on every presented frame. The key is materialized
         // below, only on a miss, by MOVING `subtitle` into it.
         let hit = self.windows.get(&wid).is_some_and(|ws| {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             let band_hit = ws.strip_band_key == band_key;
-            #[cfg(not(windows))]
+            #[cfg(not(any(windows, target_os = "linux")))]
             let band_hit = true;
             band_hit
                 && ws.cached_strip_rows.len() == strip
@@ -20227,14 +20258,14 @@ impl App {
                 }
                 rows.push(row);
             }
-            // T1 — the strip in the UI FONT (Windows): raster the band's text
+            // T1 — the strip in the UI FONT (Windows + Linux): raster the band's text
             // and marks as ONE pixel image over the freshly painted cells, from
             // the SAME segments/titles/paint state (geometry converts cols→px
             // through this window's own `cell_w`, so paint and hit-testing
             // cannot disagree). `None`/empty ⇒ the legacy cell strip verbatim
             // (no UI face yet, or nothing qualified) — see
             // [`tab_bar::pixel_band`] for the fallback and coverage contract.
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             let strip_band = {
                 let paint = tab_bar::StripPaint {
                     hovered,
@@ -20247,6 +20278,23 @@ impl App {
                         }
                     }),
                 };
+                // The seam's resolved canvas position (Linux design lane): the
+                // deco underline the cell lane stamps across the strip's LAST
+                // row, through the PURE per-window read so mixed-DPI windows
+                // resolve their own bands. Every input is already a band-key
+                // term (cell metrics, font epoch → deco tables and adjusts land
+                // with a backend rebuild + epoch bump), so no new key term.
+                #[cfg(target_os = "linux")]
+                let seam_top_px = self.windows.get(&wid).map(|ws| {
+                    band_key.2
+                        + strip.saturating_sub(1) * band_key.1
+                        + self
+                            .backend
+                            .deco_metrics_for(ws.metrics.font_px)
+                            .underline_y
+                });
+                #[cfg(not(target_os = "linux"))]
+                let seam_top_px = None;
                 tab_bar::pixel_band::raster_band(
                     &tab_bar::pixel_band::BandInput {
                         segments: &segments,
@@ -20263,6 +20311,7 @@ impl App {
                             strip_rows: strip,
                             band_top_px: band_key.2,
                             scale: f32::from_bits(band_key.3),
+                            seam_top_px,
                         },
                     },
                     &strip_images,
@@ -20275,7 +20324,7 @@ impl App {
                 ws.cached_strip_images = strip_images;
                 ws.cached_strip_rename_caret = strip_rename_caret;
                 ws.last_strip_fp = Some((tab_strip, cols, show_update, hovered, subtitle));
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 {
                     ws.cached_strip_band = strip_band;
                     ws.strip_band_key = band_key;
@@ -20328,12 +20377,12 @@ impl App {
             grid_top,
             &mut ws.strip_row_pool,
         );
-        // THE PIXEL BAND (Windows): when the UI-font band rastered, its per-row
+        // THE PIXEL BAND (Windows + Linux): when the UI-font band rastered, its per-row
         // `ImageRef` slices replace the icon list wholesale — the band bakes the
         // icon/status marks itself (vertically centred), and any fallback
         // segment's shipped rasters were merged back in at build time. An empty
         // band (no UI face; the raster declined) is the legacy path verbatim.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         let band_applied = {
             let applied = !ws.cached_strip_band.is_empty();
             for (r, refs) in ws.cached_strip_band.iter().enumerate().take(strip) {
@@ -20343,7 +20392,7 @@ impl App {
             }
             applied
         };
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         let band_applied = false;
         if !band_applied
             && let Some(image_row) = ws.input_scratch.images.get_mut(strip - 1)
@@ -21357,21 +21406,35 @@ impl App {
         }
     }
 
-    /// Device-pixel floor below the config-warning cell band.
+    /// Device-pixel floor below the top-row BANNER band — the config-warning
+    /// banner and/or the multi-line-paste confirmation banner, whichever reaches
+    /// deeper.
     ///
-    /// The banner overwrites composed rows starting at the renderer's grid
+    /// The banners overwrite composed rows starting at the renderer's grid
     /// origin (`pad_top + head`). Tray cards are a later pixel pass, so every
     /// present/capture path crops its selected card to this floor to preserve
-    /// the banner's declared topmost ordering. `0` is the no-banner sentinel and
+    /// the band's declared topmost ordering. `0` is the no-banner sentinel and
     /// leaves a card byte-identical.
     pub(crate) fn config_notice_tray_floor_y(&self, wid: WindowId) -> u32 {
-        let Some(notice) = self.config_notice.as_ref() else {
-            return 0;
-        };
         let Some(window) = self.windows.get(&wid) else {
             return 0;
         };
-        let rows = notice.wanted_rows().min(window.input_scratch.cells.len());
+        // The band is the DEEPER of the two top-row occupants: the config-warning
+        // banner (global) and the multi-line-paste confirmation banner (this
+        // window's, painted on top of it — see `splice_paste_banner`). Either alone
+        // still owns its band; neither yields 0, the no-banner sentinel.
+        let notice_rows = self
+            .config_notice
+            .as_ref()
+            .map_or(0, crate::config_notice::ConfigNotice::wanted_rows);
+        let banner_rows = self
+            .paste_banner
+            .as_ref()
+            .filter(|p| p.wid == wid)
+            .map_or(0, crate::paste_banner::PendingPaste::wanted_rows);
+        let rows = notice_rows
+            .max(banner_rows)
+            .min(window.input_scratch.cells.len());
         if rows == 0 {
             return 0;
         }
@@ -21426,6 +21489,23 @@ impl App {
             };
             crate::config_notice::notice_rows(&notice.lines, cols, panel_rows, theme)
         };
+        self.splice_band_rows(wid, built, cols, panel_rows, cell_h);
+    }
+
+    /// Overwrite the top `panel_rows` composed rows of `wid`'s frame with `built`
+    /// (each row exactly `cols` wide) — the shared body of
+    /// [`Self::splice_config_notice`] and [`Self::splice_paste_banner`]: cells
+    /// replaced in place, the parallel per-row arrays cleared so covered terminal
+    /// content cannot bleed through, the band's overlay pixels scrubbed, and the
+    /// smooth-scroll grid band pushed below the chrome.
+    fn splice_band_rows(
+        &mut self,
+        wid: WindowId,
+        built: Vec<Vec<aterm_core::terminal::RenderCell>>,
+        cols: usize,
+        panel_rows: usize,
+        cell_h: usize,
+    ) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             for (r, row) in built.into_iter().enumerate() {
                 if r >= ws.input_scratch.cells.len() {
@@ -21472,6 +21552,51 @@ impl App {
             }
             ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         }
+    }
+
+    /// Paint the multi-line-paste CONFIRMATION banner (`self.paste_banner`) by
+    /// OVERWRITING the top rows in place — the same band mechanics as
+    /// [`Self::splice_config_notice`], called immediately AFTER it so a security
+    /// question paints over a config notice when both are up. Per-WINDOW (the
+    /// banner belongs to the window whose paste is parked); a no-op — and a
+    /// byte-identical frame — for every other window and whenever no confirmation
+    /// is outstanding. Unlike the config notice there is no TTL: the band stands
+    /// until Enter/Escape (or a click on it) answers the question.
+    pub(crate) fn splice_paste_banner(&mut self, wid: WindowId) {
+        let panel_rows = {
+            let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) else {
+                return; // no confirmation here -> byte-identical frame
+            };
+            let avail = match self.windows.get(&wid) {
+                Some(ws) => ws.input_scratch.cells.len(),
+                None => return,
+            };
+            pending.wanted_rows().min(avail)
+        };
+        if panel_rows == 0 {
+            return;
+        }
+        let cols = match self.windows.get(&wid) {
+            Some(ws) => ws.cols as usize,
+            None => return,
+        };
+        let cell_h = self.win_cell_size(wid).1;
+        // Tint off the live OSC-11 background (like splice_config_notice) so the
+        // band colors keep the banner text WCAG-AA legible on a recoloured bg.
+        let mut theme = self.theme;
+        if let Some(ws) = self.windows.get(&wid) {
+            let live = ws.input_scratch.default_bg;
+            if live != aterm_core::render::COLOR_UNSET {
+                theme.bg = live;
+            }
+        }
+        let built = {
+            let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) else {
+                return;
+            };
+            crate::paste_banner::banner_rows(pending.text(), cols, panel_rows, theme)
+        };
+        self.splice_band_rows(wid, built, cols, panel_rows, cell_h);
     }
 
     /// C5 — paint the OPEN tab CONTEXT MENU over the finished frame.
@@ -24597,18 +24722,20 @@ mod find_bar_splice_tests {
         term_lock(&term).scroll_display(3);
         assert_eq!(term_lock(&term).grid().display_offset(), 3);
 
+        let live_top = u64::try_from(term_lock(&term).grid().base_y()).unwrap();
         app.search_enter();
-        assert_eq!(
-            app.windows
-                .get(&wid)
-                .unwrap()
-                .search
-                .as_ref()
-                .unwrap()
-                .origin_display_offset,
-            3,
-            "enter captured the origin viewport"
-        );
+        {
+            let origin = app
+                .find_origins
+                .get(&(0, wid))
+                .expect("enter parked the origin viewport");
+            assert_eq!(
+                origin.top_visible_absolute_row,
+                live_top - 3,
+                "the parked anchor is the absolute row the user was reading"
+            );
+            assert!(!origin.was_live, "the user was scrolled back, not tailing");
+        }
         seed_query(&mut app, wid, "hit");
         app.search_recompute();
         assert_ne!(
@@ -24637,21 +24764,29 @@ mod find_bar_splice_tests {
         );
     }
 
+    /// A find opened at the LIVE TAIL cancels back to the live tail, even across a
+    /// protected-footer splice that archives the very row the viewport was showing.
+    ///
+    /// This used to hold for the wrong reason: `search_cancel_in` re-derived the origin
+    /// as `origin_offset + (base_y_now − origin_base_y)`, which a piecewise splice makes
+    /// meaningless, so it carried a revision gate that skipped the restore outright.
+    /// The gate is gone — an absolute anchor needs none — and `FindOrigin::was_live` is
+    /// what keeps a tail follower on the tail. Remove `was_live` and this test fails:
+    /// the anchored row is now one line up in history.
     #[test]
-    fn cancel_does_not_apply_uniform_origin_delta_across_codex_footer_splice() {
+    fn cancel_at_the_live_tail_survives_a_codex_footer_splice() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let rows = app.windows[&wid].rows;
         let term = app.pool.get(0).expect("session 0").term.clone();
 
         app.search_enter();
-        assert_eq!(
-            app.windows[&wid]
-                .search
-                .as_ref()
-                .unwrap()
-                .origin_absolute_row_revision,
-            0
+        assert!(
+            app.find_origins
+                .get(&(0, wid))
+                .expect("enter parked the origin viewport")
+                .was_live,
+            "the fixture opens find at the live bottom"
         );
         // Row 0 must be WRITTEN for the displaced row to archive and splice.
         let region_bottom = rows - 2;
@@ -24670,7 +24805,7 @@ mod find_bar_splice_tests {
         assert_eq!(
             term_lock(&term).grid().display_offset(),
             0,
-            "cancel must not turn the piecewise footer insertion into a false one-line origin delta"
+            "a tail follower is handed the tail back, not the row the splice archived"
         );
     }
 

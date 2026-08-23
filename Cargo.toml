@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.47.0"
+version = "0.48.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -100,7 +100,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # that the spec_xref_closure gate collects at test time (TRUST_NATIVE_TLA, Phase 0).
 inventory = "0.3"
 rand_core = { version = "0.6", features = ["getrandom"] }
-winit = "0.30"   # aterm-gui windowing; aterm-types winit-keymap feature reuses its key enums
+# aterm-gui windowing; aterm-winit-keymap reuses its key enums. TWO consumers,
+# both of them GUI-side and both hard deps — deliberately never an OPTIONAL dep
+# of a platform-free crate, because workspace feature unification turns those on
+# for every consumer in the resolve.
+winit = "0.30"
 # Drop-in std::time replacement: EXACTLY `std::time` on native (zero-cost, byte-identical),
 # JS clock on wasm32 — lets the engine's internal Instant/SystemTime reads run under wasm
 # instead of panicking "time not implemented".
@@ -157,6 +161,11 @@ aterm-grapheme = { path = "crates/aterm-grapheme" }
 # Multilingual whole-word matching for the sparkle-words text decorations.
 aterm-lexicon = { path = "crates/aterm-lexicon" }
 aterm-types = { path = "crates/aterm-types" }
+# The winit→engine key map (K-2). A CRATE and not a feature of aterm-types on
+# purpose: an optional dep unifies across the workspace resolve, which is how the
+# dependency-free `aterm-ctl` ended up linking AppKit. Only aterm-gui depends on
+# this; every other consumer of aterm-types stays platform-free by construction.
+aterm-winit-keymap = { path = "crates/aterm-winit-keymap" }
 aterm-spec = { path = "crates/aterm-spec" }
 aterm-spec-macros = { path = "crates/aterm-spec-macros" }
 aterm-spec-models = { path = "crates/aterm-spec-models" }
@@ -208,6 +217,31 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)', 'cfg(loom)', 'cfg(
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# aterm-census is a DEV-ONLY lexical scanner (11k lines of pure std over the
+# 1425 .rs files under crates/) that never ships — nothing in `expose` or
+# `bundle` depends on it. It is also on the critical path of every local gate
+# run: `cargo test -p aterm-census` runs 98 tests that each walk the real tree,
+# and `cargo xtask gate mainloop` is one of the three verbs
+# `tools/verify.sh` executes. Unoptimized, that scanning dominates both.
+#
+# Measured on this tree, arms alternated ABBA across 3 rounds, 98/98 tests
+# passing in both:
+#   cargo test -p aterm-census   2.98 s -> 0.65 s   (-2.33 s per verify.sh run)
+#   xtask gate mainloop census   0.77 s -> 0.14 s   (-0.63 s per verify.sh run)
+# Cost side, measured the same way (3 cold builds per arm, alternated):
+# +1.64 s of codegen, paid only when this crate is recompiled, not per run.
+#
+# `debug-assertions` is deliberately left inheriting `true` from profile.dev:
+# this crate is a build-BLOCKING safety gate and its arithmetic must keep
+# panicking on overflow. Only opt-level moves, and opt-level is not a proof
+# obligation — verified, not assumed: all four censuses emit byte-identical
+# logs and exit codes at opt-level 0 and 2.
+#
+# The gate's OTHER consumer, tools/freeze-safety-gate, is its own workspace and
+# carries the matching `[profile.dev.build-override]` in its own manifest.
+[profile.dev.package.aterm-census]
+opt-level = 2
 
 [profile.release]
 # Aggressive size+speed, functionality-preserving: fat LTO (whole-program

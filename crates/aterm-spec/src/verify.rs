@@ -543,10 +543,70 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// It buys less on the suite than that ratio suggests — 266s to 228s — and the
 /// reason is worth writing down so nobody re-measures it hoping for more. With
 /// the spawns serialised, suite wall-clock is ~390 runs times the PER-PROCESS
-/// cost, and what dominates that now is `ty`'s own startup: ~0.5s before it
-/// reads the spec, against ~0.15s for the binary this machine ran a day earlier.
-/// Backend choice cannot touch that floor; only spawning `ty` fewer times could,
-/// and the serialisation buying determinism is worth more than the seconds.
+/// cost, and what dominated that was a fixed ~0.55s floor no backend choice can
+/// touch. **That floor was mis-attributed here for a month** — this doc used to
+/// blame "`ty`'s own startup: ~0.5s before it reads the spec" and concluded
+/// "only spawning `ty` fewer times could" fix it. Both halves are false, and
+/// measurement says so: `ty --version` returns in under 10ms, and the SAME spec
+/// with `--bfs-only` finishes in 0.03s. The 0.55s was the fused CDEMC symbolic
+/// lane, and it is now switched off below.
+///
+/// **`--bfs-only`** — run the pure explicit-state BFS lane, not `ty`'s fused
+/// BFS+symbolic (CDEMC) default.
+///
+/// The fused default races explicit BFS against PDR / BMC / k-induction and
+/// takes the first definitive answer. For the models in this workspace the
+/// symbolic half has never once supplied that answer: over **639 real
+/// comparisons** — all 125 `xref::model_registry()` models at `Buggy = 0` and
+/// `Buggy = 1`, the same 250 again with `CHECK_DEADLOCK TRUE`, the 125-model
+/// `--strict-vacuity` sweep the `aterm-gui` gate runs, and the 14 hand-written
+/// `aterm-spec-models` specs — every fused run reported `Winner: BFS
+/// (explicit-state)`, and the symbolic lanes reported `[ay-kind] k-induction
+/// inconclusive` and `MODEL-UNCONFIRMED … rejected by mandatory strict
+/// certification`. 0.55s per spawn to conclude nothing, ~400 times per
+/// `tools/verify.sh` run.
+///
+/// It is not weaker, and that is the only question that mattered. Across those
+/// 639 comparisons the two lanes agree byte-for-byte on every fact this
+/// workspace reads out of a transcript: exit status, `States found:` (the input
+/// to [`assert_same_space_explored`]), `Soundness mode: Sound`, `Search
+/// completeness: exhaustive`, the `Deadlock reached` wording
+/// `deadlock_free_and_catches_tiered` matches, the `dead action(s) (never
+/// fired):` set `audit_dead_negative_controls` parses, and `is violated`. ZERO
+/// differences. The one text that does change is the clean-run wording, and it
+/// changes toward correctness: fused prints "No error has been found", BFS
+/// prints "No errors found (exhaustive)" — the string
+/// `examples/trust_models.rs` has always tested for and, under the fused
+/// default, never saw.
+///
+/// The completeness argument is structural, not empirical. Every `.cfg` this
+/// workspace hands `ty` is INVARIANT-only over a finite bounded machine
+/// (`Model::to_cfg` emits CONSTANT / SPECIFICATION / INVARIANT /
+/// CHECK_DEADLOCK and nothing else; `Model::to_tla` emits `Spec == Init /\
+/// [][Next]_vars` with no fairness conjunct; the 14 hand-written specs match).
+/// An exhaustive BFS of a finite reachable space IS the complete proof of a
+/// safety invariant — there is no obligation left for a symbolic lane to
+/// discharge. And a symbolic-only verdict could not be credited here anyway:
+/// [`assert_same_space_explored`] demands a `States found:` count equal to the
+/// interpreter's walk, which only the BFS lane produces.
+///
+/// The flag is safe for a cfg that grows a temporal PROPERTY, which was checked
+/// rather than assumed: on a `WF_vars`-fair spec with a violated `<>(done)`,
+/// both lanes print the identical four-state counterexample and exit 1.
+///
+/// **`--force`** — bypass `ty`'s local check cache. Load-bearing, and NOT a
+/// speed flag: it is a fail-closed re-derivation flag that closes a hole that
+/// exists today, before this patch. The cache is PATH-keyed (verified: identical
+/// spec bytes in a fresh directory always miss), so the drivers that write a
+/// per-PID temp dir never hit it — but `aterm-spec-models`' `model_check.rs`
+/// checks the CHECKED-IN `specs/*.tla` at a stable repo path, and on a repeat
+/// run `ty` replays `Cache hit: PASS` in 7ms, complete with a
+/// `States found: 512` line that every parser in this file will take for fresh
+/// evidence. That is a cached security verdict for the ISOLATION family
+/// (Sandbox, PathConfine, ForkExec …) standing in for an exhaustive walk. It is
+/// the same shape as the false proof this whole arming exists to prevent, so it
+/// is refused the same way. Measured cost of refusing it: the ISOLATION specs go
+/// from a 7ms replay to a 20ms genuine re-derivation.
 ///
 /// This is a SPEED choice, not a trust one, and it is worth being explicit about
 /// which: the native and interpreted engines are two implementations inside the
@@ -583,6 +643,8 @@ pub fn arm_whole_space_check(cmd: &mut Command) -> &mut Command {
         .arg("8192")
         .arg("--backend")
         .arg("interpreter")
+        .arg("--bfs-only")
+        .arg("--force")
 }
 
 /// Run a `ty` subprocess — ONE AT A TIME, across the whole test binary.
@@ -1526,6 +1588,57 @@ mod tests {
     use super::*;
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;
+
+    /// The arming is a LIST, and every entry on it is load-bearing for a
+    /// different reason — so the list is pinned exactly, not merely "contains".
+    ///
+    /// `ty_drivers_are_armed` proves every driver CALLS this function. Nothing
+    /// proved what the function then emits, which is the half that actually
+    /// arms anything: the 2026-08-06 red gate was a driver that emitted four
+    /// of these five flags. An `assert!(contains)` per flag would let the list
+    /// be quietly reordered or extended; an exact match makes any edit to the
+    /// arming a deliberate, reviewed act.
+    ///
+    /// It is also this file's REACH GUARD for the fast lane. `--bfs-only` is
+    /// what makes each spawn 0.03s instead of 0.58s, and it is invisible
+    /// everywhere else: drop it and every verdict in the workspace stays
+    /// green while `tools/verify.sh` silently grows ~3.5 minutes back. The
+    /// only place that regression can be caught is here.
+    #[test]
+    fn the_arming_emits_exactly_the_flags_it_documents() {
+        let mut cmd = Command::new("ty");
+        arm_whole_space_check(&mut cmd);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                // Reduction OFF, both halves — the whole-space obligation, and
+                // the only reason `assert_same_space_explored` can be written.
+                "--no-auto-por",
+                "--no-auto-symmetry",
+                // Footprint hint: 4x the largest model, so it bounds nothing.
+                "--initial-capacity",
+                "8192",
+                // The oracle engine, not the native codegen lane.
+                "--backend",
+                "interpreter",
+                // The fused CDEMC symbolic lane OFF: 0.55s per spawn to report
+                // `Winner: BFS` on every model in the tree. Removing this is a
+                // ~3.5 minute regression on every `tools/verify.sh` run.
+                "--bfs-only",
+                // No cached verdicts. The cache is path-keyed, and the
+                // hand-written ISOLATION specs live at a stable path, so
+                // without this a repeat run replays a security PASS it never
+                // re-derived.
+                "--force",
+            ],
+            "the `ty` arming changed — every flag here is load-bearing; see the \
+             doc on `arm_whole_space_check` before editing this list"
+        );
+    }
 
     /// The atpkg-store prefix mirror must keep matching
     /// `atpkg::platform::default_prefix` + `/bin` (the deliberate
