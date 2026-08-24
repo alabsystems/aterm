@@ -767,13 +767,47 @@ impl App {
     /// Only `MenuAction::Copy` keeps the frontmost-window form, because a menu
     /// item genuinely carries no window of its own.
     pub(crate) fn copy_selection_in(&self, wid: WindowId) -> bool {
-        let Some(terminal) = self.front_terminal(wid) else {
-            return false;
-        };
-        let Some(text) = term_lock(&terminal.term).selection_to_string() else {
+        let Some(text) = self.window_selection_text(wid) else {
             return false;
         };
         !text.is_empty() && control::pbcopy(&text)
+    }
+
+    /// The text of window `wid`'s live selection, resolved ACROSS PANES: the
+    /// focused pane when it holds one, else the first visible pane in layout
+    /// order that does.
+    ///
+    /// SELECTION CUSTODY: a selection in an unfocused split pane is alive, and
+    /// since `push_pane_selection` it is also PAINTED, so refusing to copy it
+    /// would leave the user looking at a highlight ⌘-C ignores. The two halves
+    /// ship together deliberately: resolving the copy without the paint is the
+    /// inverse hazard — copying text the user cannot see highlighted — which is
+    /// why this landed with the projection and not before it.
+    ///
+    /// The focused pane keeps absolute priority, so a window whose focused pane
+    /// has a selection behaves exactly as it always did; the fallback runs only
+    /// where the old code returned nothing at all.
+    pub(crate) fn window_selection_text(&self, wid: WindowId) -> Option<String> {
+        if let Some(terminal) = self.front_terminal(wid)
+            && let Some(text) = term_lock(&terminal.term).selection_to_string()
+        {
+            return Some(text);
+        }
+        let plan = self.active_visible_leaf_plan(wid)?;
+        for leaf in &plan.leaves {
+            let Some(crate::tab_model::View::Terminal(view)) =
+                self.view_store.get(leaf.view).copied()
+            else {
+                continue;
+            };
+            let Some(session) = self.pool.get(view.session) else {
+                continue;
+            };
+            if let Some(text) = term_lock(&session.term).selection_to_string() {
+                return Some(text);
+            }
+        }
+        None
     }
 
     /// [`Self::copy_selection_in`] against the frontmost window — the menu and

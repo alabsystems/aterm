@@ -496,10 +496,14 @@ fn ink_skip_is_coverage_monotone_end_to_end() {
 /// 12px the resolved underline band starts within 1px of the baseline, and the
 /// probe's 1px vertical dilation used to reach the bottom row of EVERY letter
 /// — chopping a continuous underline (and the tab strip's accent rule, which
-/// is drawn as a cell underline) into dashes. The probe is now clamped to the
-/// baseline row: only true descender ink (rows at/below the baseline) skips.
-/// Guarded HERE at the tight geometry — the 18px fixture of the test above
-/// leaves a row of air under the letters, so it never caught this.
+/// is drawn as a cell underline) into dashes. The probe is now clamped to
+/// strictly below the baseline row: only true descender ink skips. Strictly,
+/// because round bottoms (a/e/u here — this is why the text is `nnaeuu`, not
+/// just flat-footed letters) OVERSHOOT the baseline by design, and at 12px
+/// that lands one AA row exactly ON the baseline row — sitting on the line,
+/// not descending through it. Guarded HERE at the tight geometry — the 18px
+/// fixture of the test above leaves a row of air under the letters, so it
+/// never caught this.
 #[test]
 fn baseline_bottoms_keep_the_underline_at_12px() {
     let Some(bytes) = embedded_font_bytes() else {

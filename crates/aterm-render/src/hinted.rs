@@ -160,7 +160,23 @@ impl HintBank {
         px: f32,
         mode: HintMode,
     ) -> Option<std::sync::Arc<HintingInstance>> {
-        let options = mode.options()?;
+        self.instance_with(key_ptr, bytes, index, px, mode.options())
+    }
+
+    /// [`Self::instance`] with the skrifa options handed in directly — the seam
+    /// the subpixel raster ([`crate::subpixel`]) uses to memoize LCD-target
+    /// instances in its OWN bank (the map key does not carry the target, so one
+    /// bank must never hold two targets for the same face+px). `None` options =
+    /// hinting disabled = no instance.
+    pub(crate) fn instance_with(
+        &mut self,
+        key_ptr: usize,
+        bytes: &[u8],
+        index: u32,
+        px: f32,
+        options: Option<HintingOptions>,
+    ) -> Option<std::sync::Arc<HintingInstance>> {
+        let options = options?;
         if !px.is_finite() || px <= 0.0 {
             return None;
         }
@@ -247,7 +263,7 @@ pub(crate) fn hinted_glyph_raster(
     }
     let (w, h) = (w as usize, h as usize);
     let mut ras = ab_glyph_rasterizer::Rasterizer::new(w, h);
-    pen.fill(&mut ras, x_min, y_max);
+    pen.fill(&mut ras, x_min, y_max, 1.0);
     let mut cov = vec![0u8; w * h];
     ras.for_each_pixel(|i, a| {
         if let Some(slot) = cov.get_mut(i) {
@@ -272,16 +288,22 @@ enum Cmd {
 /// it into an `ab_glyph_rasterizer` grid (pixels, y DOWN, origin at the ink
 /// box's top-left) — the same mapping as `variation::OutlineToRaster`, minus
 /// the design-unit scale (skrifa already delivers pixel coordinates).
+/// `pub(crate)` for the subpixel raster ([`crate::subpixel`]), which replays
+/// the same recorded outline at 3× horizontal resolution.
 #[derive(Default)]
-struct PathPen {
+pub(crate) struct PathPen {
     cmds: Vec<Cmd>,
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
+    pub(crate) min_x: f32,
+    pub(crate) min_y: f32,
+    pub(crate) max_x: f32,
+    pub(crate) max_y: f32,
 }
 
 impl PathPen {
+    pub(crate) fn is_blank(&self) -> bool {
+        self.cmds.is_empty() || !self.min_x.is_finite()
+    }
+
     fn see(&mut self, x: f32, y: f32) {
         if self.cmds.is_empty() {
             (self.min_x, self.max_x) = (x, x);
@@ -294,11 +316,20 @@ impl PathPen {
         }
     }
 
-    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`.
-    /// Contours are implicitly closed (TrueType/CFF convention; ab_glyph needs
-    /// the closing edge for nonzero winding), matching `OutlineToRaster`.
-    fn fill(&self, ras: &mut ab_glyph_rasterizer::Rasterizer, x_min: f32, y_max: f32) {
-        let map = |x: f32, y: f32| ab_glyph_rasterizer::point(x - x_min, y_max - y);
+    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`,
+    /// with the x axis scaled by `xs` AFTER the translate (`xs = 1.0` is the
+    /// exact identity — multiplying an f32 by 1.0 is bit-precise — and `3.0`
+    /// is the subpixel raster's horizontal oversample). Contours are
+    /// implicitly closed (TrueType/CFF convention; ab_glyph needs the closing
+    /// edge for nonzero winding), matching `OutlineToRaster`.
+    pub(crate) fn fill(
+        &self,
+        ras: &mut ab_glyph_rasterizer::Rasterizer,
+        x_min: f32,
+        y_max: f32,
+        xs: f32,
+    ) {
+        let map = |x: f32, y: f32| ab_glyph_rasterizer::point((x - x_min) * xs, y_max - y);
         let mut last = ab_glyph_rasterizer::point(0.0, 0.0);
         let mut start = last;
         let close = |ras: &mut ab_glyph_rasterizer::Rasterizer,

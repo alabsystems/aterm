@@ -2894,6 +2894,117 @@ fn ink_selection_and_decdwl_gpu_match_cpu() {
     assert_ne!(cpu_frame.pixels, cpu.render_input(&plain).pixels);
 }
 
+/// TWO panes selected on the SAME rows, each with its OWN live OSC 17/19 colour
+/// and its own focus — the composed-split shape `push_pane_selection` produces.
+///
+/// This is the highest-risk spot for the ±8 gate: the band colour is no longer
+/// one hoisted scalar but a per-entry resolution, and doing that resolution
+/// twice (once in `aterm-render`, once in `aterm-gpu`) is exactly how the two
+/// faces start drifting. Both go through `RenderInput::selection_hit` and
+/// `Renderer::selection_palette`, so this pins that they still derive one pixel.
+#[test]
+fn per_pane_selection_colours_gpu_match_cpu() {
+    use aterm_core::render::{PaneSelection, SelectionClip};
+    use aterm_core::selection::{SelectionSide, SelectionType, TextSelection};
+
+    let theme = Theme::default();
+    let px = 18.0;
+    let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        return;
+    };
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
+    let mut win = aterm_gpu::WindowGpu::new();
+
+    let (rows, cols) = (2usize, 17usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // Two panes of 8 columns with a 1-cell divider at column 8.
+    term.process(b"\x1b[?25lleft one|right on\r\nleft two|right tw");
+    let mut input = term.cell_frame(rows, cols);
+
+    let pane = |lo: u16, hi: u16, clip: SelectionClip, bg: u32, fg: u32, inactive: bool| {
+        let mut selection = TextSelection::new();
+        selection.start_selection(0, lo, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(1, hi, SelectionSide::Right);
+        selection.complete_selection();
+        PaneSelection {
+            selection,
+            clip,
+            bg,
+            fg,
+            inactive,
+        }
+    };
+    input.selections = vec![
+        // Focused pane: a live OSC 17 band with an explicit OSC 19 ink.
+        pane(
+            0,
+            7,
+            SelectionClip::new(0, 2, 0, 8),
+            0x0021_4365,
+            0x00fe_dcba,
+            false,
+        ),
+        // Unfocused pane: no live colour at all, so it takes the theme policy —
+        // and, being unfocused, its INACTIVE derivation.
+        pane(
+            9,
+            16,
+            SelectionClip::new(0, 2, 9, 17),
+            aterm_core::render::COLOR_UNSET,
+            aterm_core::render::COLOR_UNSET,
+            true,
+        ),
+    ];
+
+    let cpu_frame = cpu.render_input(&input);
+    let gpu_frame = gpu.render_input(&mut win, &input, None);
+    assert_eq!(
+        (gpu_frame.width, gpu_frame.height),
+        (cpu_frame.width, cpu_frame.height)
+    );
+    let delta = max_channel_delta(&cpu_frame, &gpu_frame);
+    eprintln!("per-pane selection GPU vs CPU max per-channel delta = {delta}");
+    assert!(
+        delta <= 8,
+        "per-pane selection CPU/GPU diverge: delta {delta} > 8"
+    );
+
+    // Non-vacuous, and the two bands really are DIFFERENT colours on both faces:
+    // the focused pane wears its live OSC 17, the unfocused one the derived
+    // inactive theme band. A regression that hoists one scalar again would make
+    // these equal — and would still pass the delta gate above.
+    let (cw, ch) = cpu.cell_size();
+    let live = 0x0021_4365;
+    let dim = aterm_render::derive_inactive_selection_bg(theme.selection, theme.bg);
+    assert_ne!(live, dim, "the fixture's two bands must differ");
+    for (name, frame) in [("CPU", &cpu_frame), ("GPU", &gpu_frame)] {
+        assert!(
+            cell_pixels(frame, cw, ch, 0, 7)
+                .iter()
+                .any(|&p| dist(p, live) <= 24),
+            "{name}: the focused pane's band is its own live OSC 17 colour"
+        );
+        assert!(
+            cell_pixels(frame, cw, ch, 0, 16)
+                .iter()
+                .any(|&p| dist(p, dim) <= 24),
+            "{name}: the unfocused pane's band is the derived inactive colour"
+        );
+        assert!(
+            cell_pixels(frame, cw, ch, 0, 8)
+                .iter()
+                .all(|&p| dist(p, live) > 24 && dist(p, dim) > 24),
+            "{name}: the divider between them takes neither band"
+        );
+    }
+
+    // …and dropping the list hands the frame back to the scalar authority, which
+    // here paints nothing — proof the list is what produced those bands.
+    let plain = term.cell_frame(rows, cols);
+    assert_ne!(cpu_frame.pixels, cpu.render_input(&plain).pixels);
+}
+
 /// A scrollback-seeded grid with distinct per-row colour/text so any stray
 /// vertical shift is detectable, scrolled into history (a real smooth-scroll
 /// frame). Mirrors aterm-render's `scroll_frac_translate` seed.

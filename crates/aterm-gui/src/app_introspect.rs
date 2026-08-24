@@ -1481,6 +1481,38 @@ fn native_settings_route_not_open_controls_lines(
 }
 
 impl App {
+    /// The `trail` control-socket verb ([`crate::Wake::TrailAdmissions`]): the
+    /// FOCUSED window's cursor-trail ADMISSION DIAGNOSIS ring — the last
+    /// armed/confirmed/retired content-candidate decisions with the confirm
+    /// seam's reason tokens, generations, and endpoints, newest last
+    /// (`aterm_effects::cursor_glow::AdmissionRecord::line` rows).
+    ///
+    /// It exists because the rainbow-trail blackout (201449c2) was diagnosed
+    /// by rebuilding with `ATERM_TRACE_SPAWN` and reading stderr archaeology;
+    /// a user report should be ONE COMMAND. Read-only over state the engine
+    /// already records beside its decisions; typed TEXT is never reported —
+    /// records carry positions, generations and reason tokens only.
+    ///
+    /// `Err` when there is no focused window — an honest refusal, never a
+    /// fabricated empty ring. An idle ring answers `OK 0`, which is itself a
+    /// finding (no candidate ever armed: the input seam never saw a key).
+    pub(crate) fn trail_admissions(
+        &self,
+        count: Option<usize>,
+    ) -> Result<Vec<String>, String> {
+        let Some(ws) = self.frontmost_window.and_then(|wid| self.windows.get(&wid)) else {
+            return Err("no focused window".to_string());
+        };
+        let now = Instant::now();
+        let all: Vec<String> = ws
+            .cursor_glow
+            .admission_log()
+            .map(|record| record.line(now))
+            .collect();
+        let keep = count.unwrap_or(all.len()).min(all.len());
+        Ok(all[all.len() - keep..].to_vec())
+    }
+
     /// Sample the selected terminal grid and all main-thread-owned presentation
     /// geometry as one event-turn record. A busy terminal returns immediately;
     /// callers can retry without ever parking the renderer behind this lock.
@@ -3445,7 +3477,7 @@ impl App {
     ) {
         use std::hash::Hash;
 
-        "terminal-render-model-v4".hash(hash);
+        "terminal-render-model-v5".hash(hash);
         input.rows.hash(hash);
         input.cols.hash(hash);
         for row in &input.cells {
@@ -3542,6 +3574,32 @@ impl App {
             selection.is_block.hash(hash);
         } else {
             false.hash(hash);
+        }
+        // v5: the PER-PANE selection list. On a composed split frame this is the
+        // renderer's actual selection authority — the scalar fields above are
+        // only the focused pane's — so a capture that hashed just the scalars
+        // would report two visibly different frames as the same model whenever
+        // an unfocused pane's highlight moved. Empty (and therefore
+        // hash-identical to v4 modulo the tag) on every single-terminal frame.
+        input.selections.len().hash(hash);
+        for pane in &input.selections {
+            pane.clip.hash(hash);
+            pane.bg.hash(hash);
+            pane.fg.hash(hash);
+            pane.inactive.hash(hash);
+            pane.selection.has_selection().hash(hash);
+            std::mem::discriminant(&pane.selection.state()).hash(hash);
+            std::mem::discriminant(&pane.selection.selection_type()).hash(hash);
+            if let Some(projected) = pane.selection.project_range(last_col) {
+                true.hash(hash);
+                projected.start_row.hash(hash);
+                projected.start_col.hash(hash);
+                projected.end_row.hash(hash);
+                projected.end_col.hash(hash);
+                projected.is_block.hash(hash);
+            } else {
+                false.hash(hash);
+            }
         }
     }
 
@@ -7111,6 +7169,107 @@ mod terminal_split_capture_tests {
         assert_projection(&app.windows[&wid].input_scratch, "capture");
     }
 
+    /// SELECTION CUSTODY — the deferred Phase-2 item, both halves at once.
+    ///
+    /// An UNFOCUSED split pane's selection (1) paints in the composed frame and
+    /// (2) is what ⌘-C resolves to when the focused pane holds none. The halves
+    /// ship together on purpose: paint without the copy resolution leaves a
+    /// highlight ⌘-C ignores, and the copy resolution without the paint copies
+    /// text the user cannot see highlighted — the hazard §3 row 26 exists to
+    /// close. Focus keeps absolute priority, so a focused pane with a selection
+    /// behaves exactly as it always did.
+    #[test]
+    fn an_unfocused_pane_selection_paints_and_is_what_a_copy_resolves() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let (mut app, wid, right) = split_fixture();
+        let (rows, cols) = {
+            let window = &app.windows[&wid];
+            (usize::from(window.rows), usize::from(window.cols))
+        };
+        let rects = app
+            .active_tree(wid)
+            .expect("split tree")
+            .compute_layout(rows as u16, cols as u16);
+        let left_rect = *rects.iter().find(|rect| rect.session == 0).unwrap();
+        assert_eq!(
+            app.active_tree(wid).unwrap().focus(),
+            right,
+            "the split fixture focuses the NEW pane, so session 0 is unfocused"
+        );
+
+        // Select "LEFT" in the UNFOCUSED pane.
+        let left_term = app.pool.get(0).expect("left pane").term.clone();
+        {
+            let mut terminal = term_lock(&left_term);
+            let selection = terminal.text_selection_mut();
+            selection.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(0, 3, SelectionSide::Right);
+            selection.complete_selection();
+        }
+
+        assert!(
+            app.redraw_compose(
+                wid,
+                rows,
+                cols,
+                false,
+                false,
+                None,
+                0,
+                std::time::Instant::now(),
+            )
+            .is_some(),
+            "an unfocused pane's new selection must reach the present early-out"
+        );
+        let input = &app.windows[&wid].input_scratch;
+        assert!(
+            !input.selection.has_selection(),
+            "the FOCUSED pane holds no selection, so the scalar anchor is empty"
+        );
+        assert_eq!(
+            input.selections.len(),
+            1,
+            "…and the unfocused pane's highlight rides the per-pane list"
+        );
+        assert!(input.selections[0].inactive);
+        let row0 = usize::from(left_rect.row_off);
+        let col0 = usize::from(left_rect.col_off);
+        assert!(
+            input.selection_contains_cell(row0, col0, false, false),
+            "the unfocused pane's selection PAINTS (this is the whole item)"
+        );
+        let divider = usize::from(left_rect.col_off + left_rect.cols);
+        assert!(
+            !input.selection_contains_cell(row0, divider, false, false),
+            "and is still confined to its own pane box"
+        );
+
+        // The copy half. Asserted through the resolver rather than
+        // `copy_selection_in`, because `pbcopy` writes the developer's real
+        // pasteboard (see `a_copy_resolves_the_routed_window_not_the_frontmost_one`).
+        assert_eq!(
+            app.window_selection_text(wid).as_deref(),
+            Some("LEFT"),
+            "⌘-C resolves the pane whose highlight is on screen"
+        );
+
+        // Focus keeps absolute priority once the focused pane has its own.
+        let right_term = app.pool.get(right).expect("right pane").term.clone();
+        {
+            let mut terminal = term_lock(&right_term);
+            let selection = terminal.text_selection_mut();
+            selection.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(0, 4, SelectionSide::Right);
+            selection.complete_selection();
+        }
+        assert_eq!(
+            app.window_selection_text(wid).as_deref(),
+            Some("RIGHT"),
+            "the focused pane wins whenever it has a selection at all"
+        );
+    }
+
     /// Observing an unchanged composite is idempotent at the audit-model layer,
     /// while changed cells inside the same latched damage epoch still produce a
     /// new identity. The same idle-stability law applies to zoom, whose one
@@ -8478,8 +8637,13 @@ mod encode_worker_tests {
         );
     }
 
+    /// SELECTION CUSTODY: a mixed composite paints EVERY terminal leaf's
+    /// selection, and the focused terminal leaf additionally stamps the scalar
+    /// anchor. Focusing the NATIVE pane leaves the terminal's highlight on
+    /// screen — it used to vanish, while `⌘-C` still copied it — with the scalar
+    /// fields neutral, because no terminal leaf is focused.
     #[test]
-    fn mixed_composite_projects_only_the_focused_terminal_selection() {
+    fn mixed_composite_paints_every_terminal_selection_and_anchors_the_focused_one() {
         use aterm_core::selection::{SelectionSide, SelectionType};
 
         let mut app = App::headless_for_test();
@@ -8571,6 +8735,15 @@ mod encode_worker_tests {
         );
         assert_eq!(input.selection_bg, 0x0021_4365);
         assert_eq!(input.selection_fg, 0x00fe_dcba);
+        assert_eq!(
+            input.selections.len(),
+            1,
+            "the one terminal leaf contributes one entry"
+        );
+        assert!(
+            !input.selections[0].inactive,
+            "it is the focused leaf, so its band is the active colour"
+        );
         assert!(input.selection_contains_cell(row + 1, col + pane_cols - 1, false, false));
         assert!(
             !input.selection_contains_cell(native_point.0, native_point.1, false, false),
@@ -8612,6 +8785,24 @@ mod encode_worker_tests {
         assert_eq!(input.selection_clip, None);
         assert_eq!(input.selection_bg, aterm_core::render::COLOR_UNSET);
         assert_eq!(input.selection_fg, aterm_core::render::COLOR_UNSET);
+        // …but the terminal leaf's highlight is STILL PAINTED. The scalar fields
+        // are the FOCUSED leaf's authority and the focused leaf is native, so
+        // they stay neutral; the per-pane list carries the live selection.
+        assert_eq!(input.selections.len(), 1);
+        assert!(
+            input.selections[0].inactive,
+            "an unfocused pane's band takes the inactive colour"
+        );
+        assert_eq!(input.selections[0].bg, 0x0021_4365);
+        assert_eq!(input.selections[0].fg, 0x00fe_dcba);
+        assert!(
+            input.selection_contains_cell(row + 1, col + pane_cols - 1, false, false),
+            "the unfocused terminal pane keeps painting its selection"
+        );
+        assert!(
+            !input.selection_contains_cell(native_point.0, native_point.1, false, false),
+            "and still never reaches the native sibling"
+        );
         assert!(
             input.cursor_glow_add.is_empty()
                 && input.cursor_trail.is_empty()

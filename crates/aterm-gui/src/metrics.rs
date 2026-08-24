@@ -295,6 +295,12 @@ pub(crate) enum DeadlineOwner {
     /// The program cat's tenure gate (`app_kitty::KittyTenure`): one wake at
     /// the instant a pending claim earns or releases the cursor.
     KittyTenure = 33,
+    /// The toolchain-provisioning progress card (`crate::PkgProgressUi`): 16ms
+    /// frame wakes ONLY while the card is visible AND animating — bytes moved
+    /// within the last second, or a completion flourish in flight. Hidden or
+    /// settled, it folds nothing (FL-1: data arrives solely as
+    /// `Wake::PkgProgress`, so an idle window never wakes for it).
+    PkgProgress = 34,
 }
 
 impl DeadlineOwner {
@@ -333,6 +339,7 @@ impl DeadlineOwner {
             31 => Self::SessionChrome,
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
+            34 => Self::PkgProgress,
             _ => Self::None,
         }
     }
@@ -374,6 +381,7 @@ impl DeadlineOwner {
             Self::SessionChrome => "session_chrome",
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
+            Self::PkgProgress => "pkg_progress",
         }
     }
 }
@@ -559,6 +567,15 @@ pub(crate) struct StartupAttachMilestones {
 impl StartupAttachMilestones {
     pub(crate) const fn new(points: [Instant; 7]) -> Self {
         Self { points }
+    }
+
+    /// The two stamps that bracket `backend_finalize_ns` — the join entry and
+    /// the join exit. Named rather than indexed at the call site so the worker
+    /// drill-down and `derive_startup_attach` can never disagree about which
+    /// pair of points the phase is.
+    fn backend_finalize_bounds(self) -> (Instant, Instant) {
+        let [_, _, _, before_backend_finalize, after_backend_finalize, _, _] = self.points;
+        (before_backend_finalize, after_backend_finalize)
     }
 }
 
@@ -836,6 +853,315 @@ fn derive_startup_attach(
         return StartupAttachSample::default();
     }
     sample
+}
+
+// ---------------------------------------------------------------------------
+// BACKEND-BUILD WORKER — the inside of `backend_finalize`.
+//
+// `startup_attach_backend_finalize_ns` measures ONE `handle.join()`: the event
+// loop blocking on the backend-build worker spawned in `crate::main_entry`.
+// That single number is the LARGEST phase in the whole ledger (300.83 ms
+// median on macOS, 66.1% of rust_main → first_present) and, until these
+// stamps, the only phase with no drill-down — so every optimization proposed
+// inside it had to be argued from a guess, and three in a row were refused for
+// being unsizeable.
+//
+// TWO SEPARATE QUESTIONS live in that number, and conflating them is what made
+// the guesses wrong:
+//
+//   1. WHAT does the worker do? The exclusive legs below ([`StartupWorkerLegs`])
+//      plus the renderer-side split in `aterm_gpu::startup_probe`, which times
+//      the wgpu instance/adapter/device legs, the parallel font thread and its
+//      join, and every render pipeline.
+//   2. HOW MUCH of that was still OUTSTANDING when the join was reached? A
+//      worker already 90% done at the join has nothing left to win from more
+//      overlap; a worker 10% done has everything. `backend_finalize_ns` cannot
+//      tell those apart — it reads the same either way. `overlap_ns` vs
+//      `after_join_ns` IS that split, and it is what any "start it earlier /
+//      overlap it harder" proposal has to be sized against.
+//
+// Both stamps ride the one process `Instant` clock: `spawn` is taken on the
+// MAIN thread immediately before `thread::spawn` (thread-creation cost lands
+// inside the worker's own timeline, where it belongs), `done` on the WORKER
+// thread immediately before it publishes the finished backend. First-write-wins
+// like every other startup stamp — a process has one cold build.
+static BACKEND_WORKER_SPAWN: OnceLock<Instant> = OnceLock::new();
+static BACKEND_WORKER_DONE: OnceLock<Instant> = OnceLock::new();
+static BACKEND_WORKER_LEGS: OnceLock<StartupWorkerLegs> = OnceLock::new();
+
+/// Wire schema for the backend-build worker partition — the exclusive
+/// drill-down of `startup_attach_backend_finalize_ns`.
+pub(crate) const STARTUP_WORKER_SCHEMA: u64 = 1;
+
+/// Wire schema for the renderer-side sub-split of the worker's GPU build,
+/// sourced from `aterm_gpu::startup_probe`.
+pub(crate) const STARTUP_GPU_SCHEMA: u64 = 1;
+
+/// The worker's own exclusive legs, timed on the worker thread and published in
+/// ONE transaction so a snapshot can never pair a filled leg with a missing one.
+/// The remaining slice (`epilogue_ns`) is DERIVED against the worker's total
+/// rather than stamped, so an unmeasured line inside the worker surfaces as
+/// epilogue instead of silently vanishing from the partition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StartupWorkerLegs {
+    /// Worker entry → the renderer constructor call.
+    pub(crate) prelude_ns: u64,
+    /// `GpuRenderer::new_with_family` (or the CPU `from_system_with_family`
+    /// fallback) — the leg `aterm_gpu::startup_probe` splits further.
+    pub(crate) gpu_build_ns: u64,
+    /// The worker's wait for the main thread to hand over the resolved font
+    /// generation (`startup_font_rx.recv()`). Non-zero means the worker
+    /// out-ran launch config resolution, not that fonts are slow.
+    pub(crate) font_admit_ns: u64,
+    /// `apply_font_config_to_backend`.
+    pub(crate) font_apply_ns: u64,
+    /// `seal_admitted_font_sources` — the worker-only broad fallback/symbol/
+    /// emoji admission.
+    pub(crate) font_seal_ns: u64,
+}
+
+/// Mark the instant the backend-build worker is spawned (main thread, strictly
+/// before `thread::spawn`).
+pub(crate) fn mark_backend_worker_spawn() {
+    let _ = BACKEND_WORKER_SPAWN.set(Instant::now());
+}
+
+/// Nanoseconds elapsed since `started`, saturating.
+///
+/// The backend-build worker runs on a background thread with no ledger state of
+/// its own: it times its legs against plain `Instant`s and hands the finished
+/// durations over in ONE transaction ([`record_backend_worker_legs`]), so this
+/// is the only ns conversion it needs.
+pub(crate) fn leg_elapsed_ns(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// Publish the worker's complete leg timing (worker thread, before `done`).
+pub(crate) fn record_backend_worker_legs(legs: StartupWorkerLegs) {
+    let _ = BACKEND_WORKER_LEGS.set(legs);
+}
+
+/// Mark the instant the worker finished building the backend (worker thread,
+/// immediately before it publishes).
+pub(crate) fn mark_backend_worker_done() {
+    let _ = BACKEND_WORKER_DONE.set(Instant::now());
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupWorkerSample {
+    valid: bool,
+    total_ns: u64,
+    overlap_ns: u64,
+    after_join_ns: u64,
+    post_join_ns: u64,
+    prelude_ns: u64,
+    gpu_build_ns: u64,
+    font_admit_ns: u64,
+    font_apply_ns: u64,
+    font_seal_ns: u64,
+    epilogue_ns: u64,
+}
+
+impl StartupWorkerSample {
+    /// The measured legs, in worker order. `epilogue_ns` closes them against
+    /// `total_ns`, so this sum plus the epilogue IS the worker's wall time.
+    fn measured_leg_total_ns(self) -> Option<u64> {
+        [
+            self.prelude_ns,
+            self.gpu_build_ns,
+            self.font_admit_ns,
+            self.font_apply_ns,
+            self.font_seal_ns,
+        ]
+        .into_iter()
+        .try_fold(0u64, |total, leg| total.checked_add(leg))
+    }
+}
+
+/// Derive the worker partition from the four `Instant`s that bound it plus the
+/// worker's own legs.
+///
+/// The worker can legally finish BEFORE the join is reached (a warm launch, a
+/// CPU backend, a machine where window creation outlasts the build) or AFTER it
+/// (every measured macOS cold launch so far). Both orders produce a well-formed
+/// partition — which one happened is the finding, not an error — so the split
+/// point is `min(done, join_entry)` and the resume point `max(done, join_entry)`,
+/// giving two exact identities:
+///
+/// * `overlap_ns + after_join_ns == total_ns` — the worker's own wall time,
+///   split at the join.
+/// * `after_join_ns + post_join_ns == backend_finalize_ns` — the join's wall
+///   time, split at the worker's finish.
+///
+/// `post_join_ns` is therefore the part of `backend_finalize` that is NOT the
+/// worker at all: the thread handoff plus the post-join setup `finalize_backend`
+/// runs (pad/head seed, GPU effect pins, font-feature warnings).
+fn derive_startup_worker(
+    spawn: Option<Instant>,
+    done: Option<Instant>,
+    legs: Option<StartupWorkerLegs>,
+    join_entry: Option<Instant>,
+    join_exit: Option<Instant>,
+) -> StartupWorkerSample {
+    let Some(spawn) = spawn else {
+        return StartupWorkerSample::default();
+    };
+    let Some(done) = done else {
+        return StartupWorkerSample::default();
+    };
+    let Some(legs) = legs else {
+        return StartupWorkerSample::default();
+    };
+    let Some(join_entry) = join_entry else {
+        return StartupWorkerSample::default();
+    };
+    let Some(join_exit) = join_exit else {
+        return StartupWorkerSample::default();
+    };
+    let Some(total_ns) = duration_ns(spawn, done) else {
+        return StartupWorkerSample::default();
+    };
+    let split = done.min(join_entry);
+    let resume = done.max(join_entry);
+    let Some(overlap_ns) = duration_ns(spawn, split) else {
+        return StartupWorkerSample::default();
+    };
+    let after_join_ns = duration_ns(join_entry, done).unwrap_or(0);
+    let Some(post_join_ns) = duration_ns(resume, join_exit) else {
+        return StartupWorkerSample::default();
+    };
+    let sample = StartupWorkerSample {
+        valid: true,
+        total_ns,
+        overlap_ns,
+        after_join_ns,
+        post_join_ns,
+        prelude_ns: legs.prelude_ns,
+        gpu_build_ns: legs.gpu_build_ns,
+        font_admit_ns: legs.font_admit_ns,
+        font_apply_ns: legs.font_apply_ns,
+        font_seal_ns: legs.font_seal_ns,
+        epilogue_ns: 0,
+    };
+    let Some(measured_ns) = sample.measured_leg_total_ns() else {
+        return StartupWorkerSample::default();
+    };
+    let Some(epilogue_ns) = total_ns.checked_sub(measured_ns) else {
+        return StartupWorkerSample::default();
+    };
+    if overlap_ns.checked_add(after_join_ns) != Some(total_ns)
+        || after_join_ns.checked_add(post_join_ns) != duration_ns(join_entry, join_exit)
+    {
+        return StartupWorkerSample::default();
+    }
+    StartupWorkerSample {
+        epilogue_ns,
+        ..sample
+    }
+}
+
+/// The renderer-side split of the worker's GPU build, read back from
+/// `aterm_gpu::startup_probe` — the crate where the work happens and which
+/// cannot see this ledger.
+///
+/// `font_thread_ns` is the ONE parallel leg (it overlaps the GPU legs by
+/// design), so it is reported ALONGSIDE the partition, never inside it;
+/// `font_join_ns` is its exclusive residue — the wait GPU init actually paid
+/// for it, and the honest ceiling on what removing the font work could win.
+/// `tail_ns` is derived, closing the measured legs against `gpu_build_ns`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct StartupGpuSample {
+    valid: bool,
+    instance_ns: u64,
+    adapter_ns: u64,
+    device_ns: u64,
+    context_tail_ns: u64,
+    font_thread_ns: u64,
+    font_join_ns: u64,
+    pipelines_ns: u64,
+    pipe_shader_ns: u64,
+    pipe_uniform_atlas_ns: u64,
+    pipe_cell_ns: u64,
+    pipe_blit_ns: u64,
+    pipe_tray_ns: u64,
+    pipe_bloom_ns: u64,
+    pipe_vbuf_ns: u64,
+    pipe_tail_ns: u64,
+    tail_ns: u64,
+    cell_pipeline_ns: [u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
+}
+
+/// Fold the GPU probe's slots into a sample, closed against the worker's own
+/// measurement of the same call (`gpu_build_ns`).
+///
+/// `valid` is false — and every field stays zero — whenever the process took the
+/// CPU backend (no GPU leg ever ran), the probe is incomplete, or the legs do
+/// not fit inside `gpu_build_ns`. An honest "no data" beats a partition that
+/// does not reconcile.
+fn derive_startup_gpu(gpu_build_ns: u64) -> StartupGpuSample {
+    close_startup_gpu(read_gpu_probe(), gpu_build_ns)
+}
+
+/// Read the process-global probe slots into an unclosed sample (`tail_ns` still
+/// 0, `valid` still provisional). Kept separate from [`close_startup_gpu`] so
+/// the reconciliation rules have a local, GPU-free test — the same split
+/// [`record_initial_attach_milestones_once`] uses for first-writer-wins.
+fn read_gpu_probe() -> StartupGpuSample {
+    use aterm_gpu::startup_probe::{Leg, cell_pipeline_ns, leg_ns};
+    StartupGpuSample {
+        valid: true,
+        instance_ns: leg_ns(Leg::GpuInstance),
+        adapter_ns: leg_ns(Leg::GpuAdapter),
+        device_ns: leg_ns(Leg::GpuDevice),
+        context_tail_ns: leg_ns(Leg::GpuContextTail),
+        font_thread_ns: leg_ns(Leg::FontThread),
+        font_join_ns: leg_ns(Leg::FontJoin),
+        pipelines_ns: leg_ns(Leg::PipeTotal),
+        pipe_shader_ns: leg_ns(Leg::PipeShader),
+        pipe_uniform_atlas_ns: leg_ns(Leg::PipeUniformAtlas),
+        pipe_cell_ns: leg_ns(Leg::PipeCell),
+        pipe_blit_ns: leg_ns(Leg::PipeBlit),
+        pipe_tray_ns: leg_ns(Leg::PipeTray),
+        pipe_bloom_ns: leg_ns(Leg::PipeBloom),
+        pipe_vbuf_ns: leg_ns(Leg::PipeVertexBuffers),
+        pipe_tail_ns: leg_ns(Leg::PipeTail),
+        tail_ns: 0,
+        cell_pipeline_ns: cell_pipeline_ns(),
+    }
+}
+
+/// Close a probe read against the worker's own measurement of the same call.
+fn close_startup_gpu(sample: StartupGpuSample, gpu_build_ns: u64) -> StartupGpuSample {
+    // A zero slot is the probe's UNSET sentinel (a recorded leg floors at 1 ns),
+    // so any zero here means this process never took the GPU path.
+    if [
+        sample.instance_ns,
+        sample.adapter_ns,
+        sample.device_ns,
+        sample.context_tail_ns,
+        sample.font_thread_ns,
+        sample.font_join_ns,
+        sample.pipelines_ns,
+    ]
+    .into_iter()
+    .any(|leg| leg == 0)
+    {
+        return StartupGpuSample::default();
+    }
+    let exclusive_ns = [
+        sample.instance_ns,
+        sample.adapter_ns,
+        sample.device_ns,
+        sample.context_tail_ns,
+        sample.font_join_ns,
+        sample.pipelines_ns,
+    ]
+    .into_iter()
+    .try_fold(0u64, |total, leg| total.checked_add(leg));
+    let Some(tail_ns) = exclusive_ns.and_then(|measured| gpu_build_ns.checked_sub(measured)) else {
+        return StartupGpuSample::default();
+    };
+    StartupGpuSample { tail_ns, ..sample }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1713,6 +2039,63 @@ pub struct Snapshot {
     pub startup_attach_chrome_geometry_ns: u64,
     pub startup_attach_surface_create_ns: u64,
     pub startup_attach_finish_ns: u64,
+    /// Exclusive drill-down of `startup_attach_backend_finalize_ns` — the
+    /// backend-build worker. `startup_worker_valid` is false until the worker's
+    /// spawn/done stamps, its leg transaction, and the join bracket all exist
+    /// and reconcile. See the `BACKEND_WORKER_SPAWN` block for what the two
+    /// halves (`overlap` vs `after_join`) actually answer.
+    pub startup_worker_schema: u64,
+    pub startup_worker_valid: bool,
+    /// Worker spawn → worker publish: the build's own wall time, which is NOT
+    /// `backend_finalize_ns` (most of it runs concurrently with launch).
+    pub startup_worker_total_ns: u64,
+    /// The part of the worker that had already run when the join was reached.
+    pub startup_worker_overlap_ns: u64,
+    /// The part still outstanding at the join — the ONLY part more overlap
+    /// could win back.
+    pub startup_worker_after_join_ns: u64,
+    /// The part of `backend_finalize_ns` that is not the worker: thread handoff
+    /// plus `finalize_backend`'s own post-join setup.
+    pub startup_worker_post_join_ns: u64,
+    pub startup_worker_prelude_ns: u64,
+    pub startup_worker_gpu_build_ns: u64,
+    pub startup_worker_font_admit_ns: u64,
+    pub startup_worker_font_apply_ns: u64,
+    pub startup_worker_font_seal_ns: u64,
+    /// Derived remainder closing the legs above against
+    /// `startup_worker_total_ns`.
+    pub startup_worker_epilogue_ns: u64,
+    /// Renderer-side split of `startup_worker_gpu_build_ns`, from
+    /// `aterm_gpu::startup_probe`. `startup_gpu_valid` is false on any CPU-backend
+    /// launch (no GPU leg ran) and whenever the legs do not fit their parent.
+    pub startup_gpu_schema: u64,
+    pub startup_gpu_valid: bool,
+    pub startup_gpu_instance_ns: u64,
+    pub startup_gpu_adapter_ns: u64,
+    pub startup_gpu_device_ns: u64,
+    pub startup_gpu_context_tail_ns: u64,
+    /// PARALLEL leg: the font thread's own wall time. Overlaps the GPU legs by
+    /// design, so it is NOT part of the exclusive partition — compare it against
+    /// `startup_gpu_font_join_ns`, which is what the GPU leg actually paid.
+    pub startup_gpu_font_thread_ns: u64,
+    pub startup_gpu_font_join_ns: u64,
+    /// `GpuRenderer::from_parts` — all thirteen pipelines, 26 shader compiles on
+    /// Metal. Parent of every `startup_gpu_pipe_*` field.
+    pub startup_gpu_pipelines_ns: u64,
+    pub startup_gpu_pipe_shader_ns: u64,
+    pub startup_gpu_pipe_uniform_atlas_ns: u64,
+    pub startup_gpu_pipe_cell_ns: u64,
+    pub startup_gpu_pipe_blit_ns: u64,
+    pub startup_gpu_pipe_tray_ns: u64,
+    pub startup_gpu_pipe_bloom_ns: u64,
+    pub startup_gpu_pipe_vbuf_ns: u64,
+    pub startup_gpu_pipe_tail_ns: u64,
+    /// Derived remainder closing the GPU legs against
+    /// `startup_worker_gpu_build_ns`.
+    pub startup_gpu_tail_ns: u64,
+    /// Per-cell-pipeline split of `startup_gpu_pipe_cell_ns`, in
+    /// `aterm_gpu::startup_probe::CELL_PIPELINE_NAMES` order.
+    pub startup_gpu_cell_pipeline_ns: [u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
 }
 
 /// Read the current counters (lock-free).
@@ -1724,6 +2107,25 @@ pub fn snapshot() -> Snapshot {
     // caller observes frame 1, it must also observe the startup sample that
     // record_present initialized before its Release increment.
     let startup = STARTUP_PRESENT.get().copied().unwrap_or_default();
+    // The worker partition is derived LIVE rather than baked into
+    // STARTUP_PRESENT: every stamp it needs is set long before the first
+    // present (the join precedes the first frame by construction), and reading
+    // them here keeps the immutable present-anchored fact one struct smaller.
+    let (join_entry, join_exit) = INITIAL_ATTACH_MILESTONES
+        .get()
+        .copied()
+        .map_or((None, None), |milestones| {
+            let (entry, exit) = milestones.backend_finalize_bounds();
+            (Some(entry), Some(exit))
+        });
+    let worker = derive_startup_worker(
+        BACKEND_WORKER_SPAWN.get().copied(),
+        BACKEND_WORKER_DONE.get().copied(),
+        BACKEND_WORKER_LEGS.get().copied(),
+        join_entry,
+        join_exit,
+    );
+    let gpu = derive_startup_gpu(worker.gpu_build_ns);
     Snapshot {
         frames_presented,
         last_present_latency_ns: LAST_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
@@ -1802,6 +2204,189 @@ pub fn snapshot() -> Snapshot {
         startup_attach_chrome_geometry_ns: startup.attach.chrome_geometry_ns,
         startup_attach_surface_create_ns: startup.attach.surface_create_ns,
         startup_attach_finish_ns: startup.attach.finish_ns,
+        startup_worker_schema: STARTUP_WORKER_SCHEMA,
+        startup_worker_valid: worker.valid,
+        startup_worker_total_ns: worker.total_ns,
+        startup_worker_overlap_ns: worker.overlap_ns,
+        startup_worker_after_join_ns: worker.after_join_ns,
+        startup_worker_post_join_ns: worker.post_join_ns,
+        startup_worker_prelude_ns: worker.prelude_ns,
+        startup_worker_gpu_build_ns: worker.gpu_build_ns,
+        startup_worker_font_admit_ns: worker.font_admit_ns,
+        startup_worker_font_apply_ns: worker.font_apply_ns,
+        startup_worker_font_seal_ns: worker.font_seal_ns,
+        startup_worker_epilogue_ns: worker.epilogue_ns,
+        startup_gpu_schema: STARTUP_GPU_SCHEMA,
+        startup_gpu_valid: gpu.valid,
+        startup_gpu_instance_ns: gpu.instance_ns,
+        startup_gpu_adapter_ns: gpu.adapter_ns,
+        startup_gpu_device_ns: gpu.device_ns,
+        startup_gpu_context_tail_ns: gpu.context_tail_ns,
+        startup_gpu_font_thread_ns: gpu.font_thread_ns,
+        startup_gpu_font_join_ns: gpu.font_join_ns,
+        startup_gpu_pipelines_ns: gpu.pipelines_ns,
+        startup_gpu_pipe_shader_ns: gpu.pipe_shader_ns,
+        startup_gpu_pipe_uniform_atlas_ns: gpu.pipe_uniform_atlas_ns,
+        startup_gpu_pipe_cell_ns: gpu.pipe_cell_ns,
+        startup_gpu_pipe_blit_ns: gpu.pipe_blit_ns,
+        startup_gpu_pipe_tray_ns: gpu.pipe_tray_ns,
+        startup_gpu_pipe_bloom_ns: gpu.pipe_bloom_ns,
+        startup_gpu_pipe_vbuf_ns: gpu.pipe_vbuf_ns,
+        startup_gpu_pipe_tail_ns: gpu.pipe_tail_ns,
+        startup_gpu_tail_ns: gpu.tail_ns,
+        startup_gpu_cell_pipeline_ns: gpu.cell_pipeline_ns,
+    }
+}
+
+#[cfg(test)]
+mod startup_worker_tests {
+    use super::{StartupGpuSample, StartupWorkerLegs, close_startup_gpu, derive_startup_worker};
+    use std::time::{Duration, Instant};
+
+    /// Legs summing to 30 ms, the shape a real cold launch produces (the seal
+    /// dominates, the GPU build is next, everything else is noise).
+    fn legs() -> StartupWorkerLegs {
+        StartupWorkerLegs {
+            prelude_ns: 1_000_000,
+            gpu_build_ns: 12_000_000,
+            font_admit_ns: 2_000_000,
+            font_apply_ns: 1_000_000,
+            font_seal_ns: 14_000_000,
+        }
+    }
+
+    #[test]
+    fn a_worker_still_running_at_the_join_splits_both_intervals_exactly() {
+        let spawn = Instant::now();
+        let join_entry = spawn + Duration::from_millis(20);
+        let done = join_entry + Duration::from_millis(10);
+        let join_exit = done + Duration::from_millis(1);
+        let sample = derive_startup_worker(
+            Some(spawn),
+            Some(done),
+            Some(legs()),
+            Some(join_entry),
+            Some(join_exit),
+        );
+        assert!(sample.valid);
+        assert_eq!(sample.total_ns, 30_000_000);
+        assert_eq!(sample.overlap_ns, 20_000_000);
+        assert_eq!(sample.after_join_ns, 10_000_000);
+        assert_eq!(sample.post_join_ns, 1_000_000);
+        // The two identities the whole drill-down rests on.
+        assert_eq!(sample.overlap_ns + sample.after_join_ns, sample.total_ns);
+        assert_eq!(sample.after_join_ns + sample.post_join_ns, 11_000_000);
+        // Legs plus the derived epilogue close against the worker's wall time.
+        assert_eq!(sample.epilogue_ns, 0);
+    }
+
+    #[test]
+    fn a_worker_finished_before_the_join_costs_the_join_nothing() {
+        // The measured macOS shape today: the whole build is hidden, so the
+        // join waits on NOTHING and `after_join` must read exactly zero.
+        let spawn = Instant::now();
+        let done = spawn + Duration::from_millis(30);
+        let join_entry = done + Duration::from_millis(5);
+        let join_exit = join_entry + Duration::from_micros(10);
+        let sample = derive_startup_worker(
+            Some(spawn),
+            Some(done),
+            Some(legs()),
+            Some(join_entry),
+            Some(join_exit),
+        );
+        assert!(sample.valid);
+        assert_eq!(sample.after_join_ns, 0);
+        assert_eq!(sample.overlap_ns, sample.total_ns);
+        assert_eq!(sample.post_join_ns, 10_000);
+    }
+
+    #[test]
+    fn a_missing_stamp_or_leg_transaction_publishes_nothing() {
+        let spawn = Instant::now();
+        let join_entry = spawn + Duration::from_millis(20);
+        let done = join_entry + Duration::from_millis(10);
+        let join_exit = done + Duration::from_millis(1);
+        // Each row drops exactly one input; every one must publish nothing.
+        for (spawn, done, legs, entry, exit) in [
+            (None, Some(done), Some(legs()), Some(join_entry), Some(join_exit)),
+            (Some(spawn), None, Some(legs()), Some(join_entry), Some(join_exit)),
+            (Some(spawn), Some(done), None, Some(join_entry), Some(join_exit)),
+            (Some(spawn), Some(done), Some(legs()), None, Some(join_exit)),
+            (Some(spawn), Some(done), Some(legs()), Some(join_entry), None),
+        ] {
+            let sample = derive_startup_worker(spawn, done, legs, entry, exit);
+            assert!(!sample.valid);
+            assert_eq!(sample.total_ns, 0);
+        }
+    }
+
+    #[test]
+    fn legs_that_overrun_the_worker_refuse_to_publish_a_partition() {
+        // A leg longer than the whole worker means the stamps disagree; an
+        // honest "no data" beats an epilogue that would have to be negative.
+        let spawn = Instant::now();
+        let join_entry = spawn + Duration::from_millis(1);
+        let done = join_entry + Duration::from_millis(1);
+        let join_exit = done + Duration::from_millis(1);
+        let sample = derive_startup_worker(
+            Some(spawn),
+            Some(done),
+            Some(legs()),
+            Some(join_entry),
+            Some(join_exit),
+        );
+        assert!(!sample.valid);
+    }
+
+    /// A probe read whose legs sum to 12 ms — the parent `gpu_build_ns` a
+    /// reconciling sample must be closed against.
+    fn probe() -> StartupGpuSample {
+        StartupGpuSample {
+            valid: true,
+            instance_ns: 10_000,
+            adapter_ns: 7_000_000,
+            device_ns: 2_400_000,
+            context_tail_ns: 5_000,
+            font_thread_ns: 5_400_000,
+            font_join_ns: 10_000,
+            pipelines_ns: 2_500_000,
+            pipe_shader_ns: 850_000,
+            pipe_uniform_atlas_ns: 50_000,
+            pipe_cell_ns: 1_400_000,
+            pipe_blit_ns: 100_000,
+            pipe_tray_ns: 40_000,
+            pipe_bloom_ns: 30_000,
+            pipe_vbuf_ns: 20_000,
+            pipe_tail_ns: 1_000,
+            tail_ns: 0,
+            cell_pipeline_ns: [100_000; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
+        }
+    }
+
+    #[test]
+    fn the_gpu_tail_absorbs_whatever_the_probe_did_not_measure() {
+        let exclusive_ns = 10_000 + 7_000_000 + 2_400_000 + 5_000 + 10_000 + 2_500_000;
+        let sample = close_startup_gpu(probe(), exclusive_ns + 80_000);
+        assert!(sample.valid);
+        assert_eq!(sample.tail_ns, 80_000);
+        // The parallel font leg is reported but never spent from the parent.
+        assert_eq!(sample.font_thread_ns, 5_400_000);
+    }
+
+    #[test]
+    fn an_unset_probe_is_not_a_zero_length_gpu_build() {
+        // The CPU-backend launch: no GPU leg ever ran, so every slot is the
+        // UNSET sentinel and the sample must refuse rather than report zeros.
+        assert!(!close_startup_gpu(StartupGpuSample::default(), 12_000_000).valid);
+        let mut partial = probe();
+        partial.device_ns = 0;
+        assert!(!close_startup_gpu(partial, 12_000_000).valid);
+    }
+
+    #[test]
+    fn legs_that_do_not_fit_their_parent_refuse_to_publish() {
+        assert!(!close_startup_gpu(probe(), 1_000_000).valid);
     }
 }
 

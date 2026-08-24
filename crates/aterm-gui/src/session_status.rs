@@ -189,6 +189,14 @@ pub(crate) struct ActivitySample {
     /// Age of the most recent PTY output, from the session's cheap activity
     /// atomic. `None` when never observed.
     pub(crate) last_output: Option<Instant>,
+    /// Age of the most recent USER KEYSTROKE aimed at this session (the
+    /// window's key stamp, carried only for the window's focused session).
+    /// `None` when this session is nobody's typing target.
+    ///
+    /// Movement alone cannot tell typing from a background `tail -f` at a
+    /// prompt — both advance `content_seq` — so the live-typing marker needs
+    /// evidence that a human actually pressed something.
+    pub(crate) last_input: Option<Instant>,
 }
 
 /// Everything the classifier is allowed to look at. Assembling this is the
@@ -371,6 +379,18 @@ impl StatusFsm {
             .is_some_and(|at| now.saturating_duration_since(at) < self.policy.quiet_after)
     }
 
+    /// LIVE TYPING: a keystroke aimed at this session, still inside the one
+    /// activity window, AND the grid moved for it. Movement alone was the
+    /// review's regression — `EnteringCommand` is the steady state whenever a
+    /// prompt is displayed, so any background output re-stuck the typing
+    /// subject on an idle prompt.
+    fn typed_recently(&self, sample: &ActivitySample, now: Instant) -> bool {
+        sample
+            .last_input
+            .is_some_and(|at| now.saturating_duration_since(at) < self.policy.quiet_after)
+            && self.moved_recently(now)
+    }
+
     fn output_recently(&self, sample: &ActivitySample, now: Instant) -> bool {
         sample
             .last_output
@@ -457,7 +477,7 @@ impl StatusFsm {
                 // to plain `Idle` with no new bytes at all (see `owed_wake`).
                 // `Prompt` never carries the marker — its movement is the
                 // `tail -f &` case, not a keystroke.
-                ShellEvidence::Entering if self.moved_recently(now) => Candidate {
+                ShellEvidence::Entering if self.typed_recently(&evidence.activity, now) => Candidate {
                     phase: Phase::Idle,
                     confidence: Confidence::Strong,
                     reasons: vec![Reason::ShellBlock, Reason::ContentActivity],
@@ -1009,6 +1029,14 @@ impl crate::App {
                     .lat_epoch
                     .checked_add(std::time::Duration::from_nanos(ns)),
             };
+            // The keystroke stamp of the window this session is FOCUSED in —
+            // the only session a human is typing into. A background tab's
+            // sample carries `None`, so its prompt never claims live typing.
+            let last_input = self.windows.iter().find_map(|(wid, ws)| {
+                (self.focused_session_id(*wid) == Some(id))
+                    .then_some(ws.last_key_at)
+                    .flatten()
+            });
             // Foreground-job PRESENCE only: `tcgetpgrp` gives a Boolean, not a
             // process name (the name is not available on the session path at
             // all), so the classifier is deliberately built to need only this.
@@ -1032,6 +1060,7 @@ impl crate::App {
                     alt_screen: guard.is_alternate_screen(),
                     content_seq: guard.content_seq(),
                     last_output,
+                    last_input,
                 },
             };
             drop(guard);
@@ -1111,6 +1140,7 @@ impl crate::App {
                 alt_screen: false,
                 content_seq: 0,
                 last_output: None,
+                last_input: None,
             },
         };
         if self
@@ -1348,6 +1378,7 @@ mod tests {
         ActivitySample {
             alt_screen: false,
             content_seq: seq,
+            last_input: None,
             last_output: None,
         }
     }
@@ -1466,6 +1497,7 @@ mod tests {
         let mut ev = evidence(ActivitySample {
             alt_screen: false,
             content_seq: 900,
+            last_input: None,
             last_output: None,
         });
         ev.foreground_job = Some(true);
@@ -1474,6 +1506,7 @@ mod tests {
         ev.activity = ActivitySample {
             alt_screen: true,
             content_seq: 3,
+            last_input: None,
             last_output: None,
         };
         settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
@@ -2214,10 +2247,12 @@ mod tests {
         assert_eq!(fsm.status().phase, Phase::Idle);
         assert!(fsm.status().settled_idle(), "a bare prompt is settled idle");
 
-        // The first keystroke: block Entering, the echo advances the counter.
+        // The first keystroke: block Entering, the echo advances the counter,
+        // and the KEY ITSELF is evidence — movement alone is a background job.
         ev.shell = Some(ShellEvidence::Entering);
         ev.activity.content_seq = 2;
         let t1 = t0 + DWELL + Duration::from_millis(10);
+        ev.activity.last_input = Some(t1);
         assert!(fsm.observe(&ev, t1), "the live marker publishes immediately");
         assert_eq!(
             fsm.status().phase,
@@ -2235,6 +2270,49 @@ mod tests {
         );
     }
 
+    /// THE REVIEW'S REGRESSION, pinned: `EnteringCommand` is the steady state
+    /// whenever a prompt is DISPLAYED, so a background job printing at an idle
+    /// prompt (`tail -f &`, a sibling build) moves the grid without anyone
+    /// typing. Movement alone re-stuck the "Typing a command" subject on a
+    /// window nobody had touched for minutes; the marker needs a keystroke.
+    #[test]
+    fn background_output_at_a_prompt_is_not_live_typing() {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Entering);
+        settle(&mut fsm, &ev, t0);
+        assert!(
+            fsm.status().settled_idle(),
+            "a displayed prompt nobody typed at is settled"
+        );
+
+        // A background job prints: the counter advances, no key was pressed.
+        ev.activity.content_seq = 2;
+        let t1 = t0 + DWELL + Duration::from_millis(10);
+        fsm.observe(&ev, t1);
+        assert_eq!(fsm.status().phase, Phase::Idle);
+        assert!(
+            fsm.status().settled_idle(),
+            "ambient output must not claim live typing"
+        );
+        assert_eq!(
+            fsm.status().reasons,
+            vec![Reason::ShellBlock],
+            "no ContentActivity marker without a keystroke"
+        );
+
+        // A STALE keystroke (older than the activity window) is no better.
+        ev.activity.content_seq = 3;
+        ev.activity.last_input = Some(t1);
+        let t2 = t1 + QUIET + Duration::from_millis(1);
+        fsm.observe(&ev, t2);
+        assert!(
+            fsm.status().settled_idle(),
+            "a keystroke aged past quiet_after cannot resurrect the subject"
+        );
+    }
+
     /// An ABANDONED half-typed prompt: the echo ages out over `quiet_after`,
     /// the observer owes the event loop a wake for a transition no new output
     /// will ever cause, and the record settles to plain `Idle` — the decay of
@@ -2248,9 +2326,13 @@ mod tests {
         observer.observe(1, &ev, t0);
         let t1 = t0 + Duration::from_millis(10);
         ev.activity.content_seq = 2;
+        ev.activity.last_input = Some(t1);
         observer.observe(1, &ev, t1);
         let t2 = t1 + DWELL;
         ev.activity.content_seq = 3;
+        // The LAST keystroke; nothing lands after it, so the stamp ages
+        // out exactly like the echo it caused.
+        ev.activity.last_input = Some(t2);
         observer.observe(1, &ev, t2);
         let status = observer.status(1).expect("published");
         assert_eq!(status.phase, Phase::Idle);
@@ -2287,6 +2369,7 @@ mod tests {
         fsm.observe(&ev, t0);
         ev.activity.content_seq = 2;
         let t1 = t0 + DWELL;
+        ev.activity.last_input = Some(t1);
         fsm.observe(&ev, t1);
         assert!(!fsm.status().settled_idle(), "typing is live");
 
@@ -2327,6 +2410,8 @@ mod tests {
         ev.shell = Some(ShellEvidence::Entering);
         app.session_status.observe(0, &ev, t0);
         ev.activity.content_seq = 2;
+        // The keystroke behind that echo — the marker's evidence.
+        ev.activity.last_input = Some(t0 + DWELL);
         assert!(
             app.session_status.observe(0, &ev, t0 + DWELL),
             "the live typing record publishes"

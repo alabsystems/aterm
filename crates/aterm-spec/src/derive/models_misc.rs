@@ -1269,6 +1269,205 @@ pub fn press_custody_model() -> Model {
     }
 }
 
+/// SELECTION CUSTODY — when a selection may be destroyed, as a lifecycle.
+///
+/// The whole design in one model: a highlight is the user's, and only an act that
+/// destroys the CONTENT it names may destroy it. The shipped defect was the
+/// opposite — twenty-five grid sites set a `content_scroll_delta = i32::MAX`
+/// sentinel meaning "kill the selection", fired by ops that had not touched the
+/// selected rows at all, so a status bar repainting at the bottom of the screen
+/// destroyed a highlight anchored far up in scrollback.
+///
+/// The model works in the ABSOLUTE row space that `intersects_absolute_band`
+/// converts into — NOT in the selection's own space. `TextSelection` anchors are
+/// relative `i32` rows and stay that way; the conversion happens at the damage
+/// boundary only. Absolute is the right abstraction here because a uniform scroll
+/// advances `absolute_row_counter` by the same delta `adjust_for_scroll` subtracts,
+/// so the interval is stable under ordinary output.
+///
+/// Damage bands are LITERAL per action rather than chosen, because the `ty_model!`
+/// grammar has no nondeterministic range arm. Two bands and two selections give all
+/// four overlap/disjoint pairings: `RegionDamageLow` covers rows 0..1,
+/// `RegionDamageHigh` covers row 3; `SelectLow` takes rows 0..1 and `SelectHigh`
+/// rows 2..3.
+///
+/// SCOPE, stated rather than implied: this models the ENGINE's destroyers — the
+/// ones reachable from `Terminal::post_process` and its callers. The GUI has its
+/// own clear sites (`app_search`, `app_mouse`, `subscribe`, `control_host`) and the
+/// wasm bridges have theirs; none of them are in this environment, and a claim that
+/// this enumerates "every legitimate destroyer" would be false.
+///
+/// `WholesaleInvalidate` is ONE action, not an alt-enter/alt-exit pair, because the
+/// three `force_selection_invalidation` callers outside the screen switch — ED 3,
+/// `clear_scrollback`, and a Kitty unscroll that renumbers history — are one class:
+/// the coordinate space itself is gone, so no band can describe the damage and
+/// `All` is the honest answer.
+///
+/// `Buggy = 1` is the literal shipping defect: ANY region damage clears, whether or
+/// not it overlapped.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn selection_custody_model() -> Model {
+    crate::ty_model! {
+        SelectionCustody {
+            const Buggy = 0;
+
+            // A completed selection exists.
+            var alive = 0;
+            // Its absolute row interval, `sel_lo <= sel_hi`.
+            var sel_lo = 0;
+            var sel_hi = 0;
+            // The last damage band recorded this step.
+            var band_lo = 0;
+            var band_hi = 0;
+            // The oldest retained absolute row. Rises on eviction.
+            var floor = 0;
+            // A head clamped to the floor by partial eviction.
+            var truncated = 0;
+            // What just happened. ORDERED, so membership tests are prefixes — the
+            // grammar renders `&&` unparenthesised and `||` parenthesised, so
+            // mixing them is unsafe and every test below is a nested `if`.
+            // 0 none, 1 user gesture, 2 typing press, 3 inert press,
+            // 4 region damage, 5 uniform scroll, 6 eviction, 7 wholesale.
+            var last_event = 0;
+
+            // Guarded on the floor: you cannot select a row that has been evicted,
+            // because it is not on screen to select. Without this the model reaches
+            // `alive` with `sel_lo` below `floor` by selecting row 0 after an
+            // eviction — a dangling anchor no code path can produce, which would
+            // make `NoDanglingAnchors` false for a reason the terminal never has.
+            action SelectLow when (floor == 0) {
+                alive = 1;
+                sel_lo = 0;
+                sel_hi = 1;
+                truncated = 0;
+                last_event = 1;
+            }
+            action SelectHigh {
+                alive = 1;
+                sel_lo = 2;
+                sel_hi = 3;
+                truncated = 0;
+                last_event = 1;
+            }
+            // A deliberate deselect — always allowed, it IS the user's intent.
+            action UserClear {
+                alive = 0;
+                truncated = 0;
+                last_event = 1;
+            }
+            // The ONE handover: typing means take me to the prompt, and deselect.
+            action TypingPress {
+                alive = 0;
+                truncated = 0;
+                last_event = 2;
+            }
+            // A bare modifier. Guarded on `alive` so the invariant below is about a
+            // selection that existed to be destroyed.
+            action InertPress when (alive == 1) {
+                last_event = 3;
+            }
+            // Ordinary output while the user reads: the anchors ride the content, so
+            // in the absolute space the interval does not move at all.
+            action UniformScroll when (alive == 1) {
+                last_event = 5;
+            }
+            // Rows 0..1 replaced. Overlap reduces to `sel_lo <= 1`, because
+            // `band_lo == 0 <= sel_hi` holds for every reachable selection.
+            action RegionDamageLow when (alive == 1) {
+                band_lo = 0;
+                band_hi = 1;
+                alive = if Buggy == 1 {
+                    0
+                } else {
+                    if sel_lo <= 1 { 0 } else { 1 }
+                };
+                last_event = 4;
+            }
+            // Row 3 replaced. Overlap reduces to `sel_hi > 2`, because
+            // `sel_lo <= 3 == band_hi` holds for every reachable selection.
+            action RegionDamageHigh when (alive == 1) {
+                band_lo = 3;
+                band_hi = 3;
+                alive = if Buggy == 1 {
+                    0
+                } else {
+                    if sel_hi > 2 { 0 } else { 1 }
+                };
+                last_event = 4;
+            }
+            // Retention drops the oldest row. A head below the new floor CLAMPS and
+            // records the loss; only both endpoints gone destroys the selection.
+            // Every right-hand side reads the PRE-eviction state — assignments are
+            // simultaneous — which is what lets `truncated` and `sel_lo` agree.
+            action Evict when (alive == 1 && floor == 0) {
+                floor = 1;
+                alive = if sel_hi > 0 { 1 } else { 0 };
+                sel_lo = if sel_lo > 0 { sel_lo } else { 1 };
+                truncated = if sel_lo > 0 { truncated } else { 1 };
+                last_event = 6;
+            }
+            // ED 3 / clear_scrollback / RIS / Kitty unscroll: the coordinate space
+            // itself is gone.
+            action WholesaleInvalidate when (alive == 1) {
+                alive = 0;
+                truncated = 0;
+                last_event = 7;
+            }
+
+            // A bare modifier expresses no intent and may not destroy anything.
+            // This is complaint (1), as a model property.
+            invariant InertPressPreservesTheSelection:
+                if last_event == 3 { alive == 1 } else { alive <= 1 };
+            // Ordinary output cannot take a highlight. This is complaint (2).
+            invariant UniformScrollPreservesTheSelection:
+                if last_event == 5 { alive == 1 } else { alive <= 1 };
+            // Damage that missed the selected rows leaves them alone — the half the
+            // sentinel could not express, and the reason a status bar destroyed a
+            // scrollback highlight.
+            invariant DisjointDamagePreserves:
+                if last_event == 4 {
+                    if sel_lo > band_hi {
+                        alive == 1
+                    } else {
+                        if band_lo > sel_hi { alive == 1 } else { alive <= 1 }
+                    }
+                } else {
+                    alive <= 1
+                };
+            // …and damage that HIT them must clear: a highlight left over replaced
+            // text is worse than a lost one, because a copy then returns something
+            // the user never selected.
+            invariant OverlapDamageClears:
+                if last_event == 4 {
+                    if sel_lo > band_hi {
+                        alive <= 1
+                    } else {
+                        if band_lo > sel_hi { alive <= 1 } else { alive == 0 }
+                    }
+                } else {
+                    alive <= 1
+                };
+            // Losing the oldest line of a selection is not losing the selection.
+            invariant PartialEvictionTruncates:
+                if last_event == 6 {
+                    if sel_hi > 0 { alive == 1 } else { alive == 0 }
+                } else {
+                    alive <= 1
+                };
+            // Whatever else happens, a live selection never names an evicted row.
+            invariant NoDanglingAnchors:
+                if alive == 1 { floor <= sel_lo } else { alive == 0 };
+            // A truncation is only ever recorded against a live, clamped head.
+            invariant TruncationImpliesAClampedHead:
+                if truncated == 1 { floor <= sel_lo } else { truncated == 0 };
+            invariant StateIsBounded:
+                alive <= 1 && truncated <= 1 && floor <= 1 && sel_lo <= 3 &&
+                sel_hi <= 3 && band_lo <= 3 && band_hi <= 3 && last_event <= 7;
+        }
+    }
+}
+
 /// SELECTION CUSTODY — the alt-screen selection PARK, as a lifecycle.
 ///
 /// A text selection belongs to the screen it was made on. Entering the alternate

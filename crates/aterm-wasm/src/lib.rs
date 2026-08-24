@@ -4257,11 +4257,6 @@ mod tests {
     /// the pointer stable across animation frames, and stay identity (len 0,
     /// rev still) at 0/0 chrome.
     #[test]
-    #[ignore = "RED since 201449c2 — same structural gap as aterm-gpu-web's \
-spill_exports_surface_band_content_on_the_cpu_face (see its ignore note for \
-the full mechanism): the movement-admission gate needs a typed-move proof no \
-web host can arm yet, so the fire trail this test waits for can never spawn. \
-Un-ignore with the web-host migration."]
     fn spill_exports_track_band_content_through_the_real_pipeline() {
         let Some(mut t) = AtermTerminal::new_from_system(12, 40, 16.0) else {
             return;
@@ -4274,20 +4269,42 @@ Un-ignore with the web-host migration."]
         let (pad, head) = (12usize, 30usize);
         t.set_chrome(pad as u16, head as u16);
         // The glow observes cursor motion FRAME-TO-FRAME, so keystrokes
-        // interleave with renders; a row-0 burn then licks into the head band.
+        // interleave with renders, each WITNESSED through the committed-char
+        // seam exactly as a JS keydown handler would (RED from 201449c2 until
+        // that seam existed: the movement-admission gate leaves unwitnessed
+        // motion dark, and note_keystroke is deliberately text-blind); the
+        // admitted row-0 burn then licks into the head band.
         t.set_cursor_glow(true, "ember", None, None, 400, 64, 1.0, 2.0, true);
-        for ch in [b"a", b"b", b"c", b"d"] {
-            t.process(ch);
+        // Seed the just-enabled engines' cursor anchor so the first witness
+        // below has an owner to check against (apply is the anchor authority).
+        t.render();
+        for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c"), ('d', b"d")] {
+            assert!(
+                t.note_typed_char(ch),
+                "a witnessed simple scalar must arm movement provenance"
+            );
+            t.process(bytes);
             t.advance_effects(30.0);
             t.render();
         }
+        // Find a frame whose band coverage is LIVE (nonzero alpha), not merely
+        // rev-ticked: the rev also advances on the ERASE that follows an
+        // ember's exit, and parity below must sample a frame with something on
+        // it to be non-vacuous. Check-then-advance: the last witnessed burn is
+        // typically still licking upward right now.
+        let mut lit_frame = false;
         for _ in 0..40 {
-            t.advance_effects(16.0);
-            t.render();
-            if t.spill_rev() > 0 && t.spill_rect_count() > 0 {
+            if t.spill_rev() > 0
+                && t.spill_rect_count() > 0
+                && t.spill.rgba().as_chunks::<4>().0.iter().any(|px| px[3] != 0)
+            {
+                lit_frame = true;
                 break;
             }
+            t.advance_effects(16.0);
+            t.render();
         }
+        assert!(lit_frame, "the witnessed burn must reach the band live");
         let (w, h) = (t.width(), t.height());
         let grid_h = h - 2 * pad - head;
         assert_eq!(

@@ -191,6 +191,15 @@ fn main() -> ExitCode {
         return atpkg::cli::main_entry(run_args);
     }
 
+    // PENDING-PROGRAM arm (R6): a default-set tool whose real shim has not landed
+    // yet resolves to a pending STUB in the managed store — `aterm trust` moments
+    // after a lean install must print the live install state (and bump trust to the
+    // front of the queue), never fall through to "unknown option". Same in-process
+    // dispatch as the arm above; `atpkg __pending` prints the message and exits 127.
+    if aterm_cli::is_tool_candidate(Some(first.as_str())) && pending_stub_resolves(&first) {
+        return atpkg::cli::main_entry(vec![OsString::from("__pending"), rest[0].clone()]);
+    }
+
     // Mode fork. Explicit flags first — `--session` and `--window` force a
     // mode from anywhere (both stripped here; the mode libraries don't know
     // them). Without one: window when headless is requested, when the release
@@ -738,6 +747,15 @@ fn print_update_status(build: u64, st: &aterm_update::UpdateStatus) {
 // with the page cache empty).
 fn store_resolves(tool: &str) -> bool {
     atpkg::store::resolve_configured().is_some_and(|layout| atpkg::which(&layout, tool).is_some())
+}
+
+/// Whether the managed store holds a PENDING stub for `tool` — the front door's
+/// second arm, checked only after [`store_resolves`] says no (a real shim always
+/// outranks a stub). Same configured layout, same best-effort posture; the check is
+/// one bounded read of `bin/<tool>` gated on the stub's marker line.
+fn pending_stub_resolves(tool: &str) -> bool {
+    atpkg::store::resolve_configured()
+        .is_some_and(|layout| atpkg::stub::pending_stub_exists(&layout, tool))
 }
 
 /// TTY probe for the mode fork. std's `IsTerminal` on stdin: a Finder/.app

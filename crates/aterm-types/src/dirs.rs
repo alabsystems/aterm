@@ -122,6 +122,35 @@ pub fn config_dir() -> Option<PathBuf> {
     }
 }
 
+/// Return the user's CACHE directory — re-derivable bytes only, safe to
+/// delete at any time (the OS may: macOS purges Caches under disk pressure,
+/// which is exactly the contract callers must survive).
+///
+/// - **macOS**: `$HOME/Library/Caches`
+/// - **Linux**: `$XDG_CACHE_HOME` or `$HOME/.cache`
+/// - **Windows**: `%LOCALAPPDATA%` (Windows has no separate cache root; callers
+///   should nest under an app-named `cache` subdirectory)
+#[must_use]
+pub fn cache_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        home_dir().map(|h| h.join("Library/Caches"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        xdg_dir("XDG_CACHE_HOME").or_else(|| home_dir().map(|h| h.join(".cache")))
+    }
+    #[cfg(windows)]
+    {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    }
+    // wasm and other targets have no OS cache dir.
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 /// Return the user's data directory.
 ///
 /// - **macOS**: `$HOME/Library/Application Support`

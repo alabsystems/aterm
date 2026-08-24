@@ -1814,6 +1814,16 @@ impl App {
         self.theme.bg.hash(&mut paint);
         self.theme.cursor.hash(&mut paint);
         self.theme.selection.hash(&mut paint);
+        // The CHROME-resolved palette is a second paint input (Linux config
+        // `window_theme` can force it off the terminal theme —
+        // `chrome_palette_theme`); hashing the RESOLVED fields means a
+        // `window_theme` edit re-lowers retained native pages exactly when it
+        // moved their pixels, and costs nothing where the two themes coincide.
+        let chrome_theme = self.chrome_palette_theme();
+        chrome_theme.fg.hash(&mut paint);
+        chrome_theme.bg.hash(&mut paint);
+        chrome_theme.cursor.hash(&mut paint);
+        chrome_theme.selection.hash(&mut paint);
         self.win_font_px(wid).to_bits().hash(&mut paint);
         self.font_family.hash(&mut paint);
         self.font_config.styled_paths.hash(&mut paint);

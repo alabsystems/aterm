@@ -947,6 +947,20 @@ fn keep_partial(before: u64, after: u64) -> bool {
     after > before
 }
 
+/// Whether a FAILED attempt died on the RANGE itself — a server (or upstream object)
+/// that refused to serve the requested offset — as opposed to a transport or HTTP
+/// failure that would recur from offset 0 too.
+///
+/// Two spellings reach us: curl exit 33 (`CURLE_RANGE_ERROR`, the server cannot or will
+/// not resume) and an HTTP 416 surfaced through `--fail` as exit 22 (the offset is past
+/// what the upstream object now holds — it shrank or was clobbered). Both mean the
+/// SAME prefix retried at the SAME offset can never succeed, and both are exactly the
+/// cases a fresh attempt from 0 can: that is what makes the in-call fresh retry in
+/// [`download_to_resumable`] worthwhile for these and pointless for anything else.
+fn range_refused(exit_code: Option<i32>, stderr: &str) -> bool {
+    exit_code == Some(33) || curl_http_error_code(stderr) == Some(416)
+}
+
 /// [`download_to_args`] plus the resume flags. `offset == 0` adds NOTHING — a fresh
 /// transfer must go out as the byte-for-byte historical request, with no `Range` header
 /// for a server to mishandle.
@@ -994,6 +1008,18 @@ fn download_resume_args<'a>(
 /// The total-bytes cap is preserved by subtracting the offset ([`resume_plan`]); a
 /// failed attempt that made no progress discards its prefix ([`keep_partial`]) so a dead
 /// offset can never wedge the lane.
+///
+/// # A range-refused resume retries fresh ONCE, in-call
+///
+/// [`keep_partial`] already guaranteed a range-refusing server could not WEDGE the lane
+/// — the dead prefix was discarded and the NEXT call started clean. But "next call" was
+/// a whole failed pass away (six hours, or one spurious failed row in a progress
+/// surface). When the failure names the range itself ([`range_refused`]: curl 33, or a
+/// 416 because the upstream object shrank), this call now discards the `.part` and
+/// retries from offset 0 immediately — at most once per call, with the cap recomputed
+/// from the FULL `max_filesize` and a fresh curl process (hence a fresh wall clock) for
+/// the fresh attempt. Any other failure keeps today's semantics exactly, and the sha256
+/// gate downstream is untouched either way.
 // Skip: same audited display-lossy Err-path class as `api_get`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable(
@@ -1007,50 +1033,73 @@ pub fn download_to_resumable(
         return Err("destination has no file name".to_string());
     };
     let part_s = part.to_str().ok_or("non-UTF-8 destination path")?;
-    let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let plan = resume_plan(existing, max_filesize);
-    let existing = if plan.discard {
-        let _ = std::fs::remove_file(&part);
-        0
-    } else {
-        existing
-    };
-    // Both must outlive the argv, which borrows them as `&str`.
-    let cap = plan.remaining_cap.to_string();
-    // The wall clock stays derived from the FULL cap, not the remainder: it is a backstop
-    // against a transfer that trickles forever, and shrinking it for a resumed attempt
-    // would re-introduce the fixed-wall stranding it exists to prevent.
-    let max_time = download_max_time_secs(max_filesize).to_string();
-    let offset_text = plan.offset.to_string();
-    // `None` at offset 0: a fresh transfer must carry no range at all.
-    let offset = (plan.offset > 0).then_some(offset_text.as_str());
-    let out = curl_fetch(
-        &download_resume_args(&cap, &max_time, part_s, offset),
-        asset_url,
-        token,
-    )?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-        if !keep_partial(existing, after) {
+    // At most ONE fresh retry per call: the loop runs a second iteration only through
+    // the range-refused arm below, which sets this flag and deletes the `.part` — so
+    // the second iteration is provably a fresh (offset-0) attempt and provably the last.
+    let mut retried_fresh = false;
+    loop {
+        let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+        let plan = resume_plan(existing, max_filesize);
+        let existing = if plan.discard {
             let _ = std::fs::remove_file(&part);
+            0
+        } else {
+            existing
+        };
+        // Both must outlive the argv, which borrows them as `&str`.
+        let cap = plan.remaining_cap.to_string();
+        // The wall clock stays derived from the FULL cap, not the remainder: it is a
+        // backstop against a transfer that trickles forever, and shrinking it for a
+        // resumed attempt would re-introduce the fixed-wall stranding it exists to
+        // prevent. Recomputed per attempt so the fresh-retry iteration hands its curl
+        // child a full, rebuilt budget rather than whatever the refused attempt left.
+        let max_time = download_max_time_secs(max_filesize).to_string();
+        let offset_text = plan.offset.to_string();
+        // `None` at offset 0: a fresh transfer must carry no range at all.
+        let offset = (plan.offset > 0).then_some(offset_text.as_str());
+        let out = curl_fetch(
+            &download_resume_args(&cap, &max_time, part_s, offset),
+            asset_url,
+            token,
+        )?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            // A RESUMED attempt the server refused at the range itself: discard the
+            // prefix (it is exactly the thing being refused) and go around once from
+            // offset 0. Only a ranged attempt can take this arm — a fresh attempt
+            // carries no range for a server to refuse — so termination holds even if
+            // curl exit 33 ever appeared on a rangeless transfer.
+            if plan.offset > 0 && !retried_fresh && range_refused(out.status.code(), &stderr) {
+                let _ = std::fs::remove_file(&part);
+                retried_fresh = true;
+                continue;
+            }
+            let after = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if !keep_partial(existing, after) {
+                let _ = std::fs::remove_file(&part);
+            }
+            // Same classification as `download_to`: a 429/403 on the asset lane is named
+            // as a rate limit so the check lane can defer instead of booking a broken
+            // pipeline.
+            if let Some(code) = curl_http_error_code(&stderr)
+                && (code == 429 || code == 403)
+            {
+                return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
+            }
+            return Err(format!(
+                "curl download failed ({}): {}",
+                out.status,
+                stderr.trim()
+            ));
         }
-        // Same classification as `download_to`: a 429/403 on the asset lane is named as a
-        // rate limit so the check lane can defer instead of booking a broken pipeline.
-        if let Some(code) = curl_http_error_code(&stderr)
-            && (code == 429 || code == 403)
-        {
-            return Err(format!("{RATE_LIMIT_ERROR_PREFIX}{code}) fetching asset"));
-        }
-        return Err(format!("curl download failed ({}): {}", out.status, stderr.trim()));
+        // ONLY a curl success promotes the part. `dest` therefore never holds a prefix,
+        // and every existing caller's "the file at `dest` is the whole asset" assumption
+        // is untouched.
+        return std::fs::rename(&part, dest).map_err(|e| {
+            let _ = std::fs::remove_file(&part);
+            format!("finalize download: {e}")
+        });
     }
-    // ONLY a curl success promotes the part. `dest` therefore never holds a prefix, and
-    // every existing caller's "the file at `dest` is the whole asset" assumption is
-    // untouched.
-    std::fs::rename(&part, dest).map_err(|e| {
-        let _ = std::fs::remove_file(&part);
-        format!("finalize download: {e}")
-    })
 }
 
 #[cfg(test)]
@@ -1081,7 +1130,7 @@ mod tests {
         HttpError, RELEASE_ASSET_DOWNLOAD_BOUND, api_get_args, conditional_args, curl_argv,
         curl_bin, curl_fetch, curl_prepared, download_bytes_args, download_max_time_secs,
         download_resume_args, download_to_args, download_to_resumable, etag_from_header_dump,
-        is_not_modified, keep_partial, part_path, resume_plan, token_config_safe,
+        is_not_modified, keep_partial, part_path, range_refused, resume_plan, token_config_safe,
         transient_api_status, validator_safe,
     };
     use std::process::Command;
@@ -1667,6 +1716,35 @@ mod tests {
         assert!(!keep_partial(0, 0), "nothing arrived");
         assert!(!keep_partial(600_000_000, 600_000_000), "a dead offset");
         assert!(!keep_partial(600_000_000, 4), "a truncated/clobbered prefix");
+    }
+
+    /// The in-call fresh-retry trigger: exactly the failures that name the RANGE (curl
+    /// exit 33; HTTP 416 through `--fail`'s exit 22) qualify, and nothing else — a
+    /// stalled transfer, a 404, or a rate limit would fail from offset 0 too, so
+    /// retrying them fresh would only double the cost of an already-failed attempt.
+    #[test]
+    fn only_a_range_refusal_earns_the_in_call_fresh_retry() {
+        assert!(range_refused(Some(33), ""), "curl 33: server refuses ranges");
+        assert!(
+            range_refused(
+                Some(22),
+                "curl: (22) The requested URL returned error: 416"
+            ),
+            "416: the offset is past what the upstream object now holds"
+        );
+        assert!(
+            !range_refused(Some(28), "curl: (28) Operation too slow"),
+            "a stall recurs from offset 0 too"
+        );
+        assert!(
+            !range_refused(Some(22), "curl: (22) The requested URL returned error: 404"),
+            "a missing asset is not a range problem"
+        );
+        assert!(
+            !range_refused(Some(22), "curl: (22) The requested URL returned error: 429"),
+            "a rate limit must reach the rate-limit classifier, not a retry"
+        );
+        assert!(!range_refused(None, ""), "a signal-killed curl proves nothing");
     }
 
     /// A refused URL fails before anything is created, and leaves no part behind — the

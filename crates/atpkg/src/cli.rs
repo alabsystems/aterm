@@ -156,11 +156,31 @@ fn levenshtein(a: &str, b: &str) -> usize {
 /// `atpkg` argv0 alias) and by the thin standalone bin. Everything below is
 /// unchanged from the binary era.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
-    let args: Vec<String> = argv
+    let mut args: Vec<String> = argv
         .into_iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    // `--progress-file <path>` — the GUI-only machine-progress opt-in (R5), stripped
+    // BEFORE dispatch so no verb ever sees it as an operand. Recognized only on the
+    // provisioning verbs; a plain terminal `aterm pkg update` never passes it, so the
+    // terminal lanes' stdout is byte-unchanged. The stripped path feeds
+    // [`progress_path`], which the provisioning passes consult.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("seed" | "update" | "install")
+    ) {
+        strip_progress_file_flag(&mut args);
+    }
     let verb = args.first().map(String::as_str);
+    // The HIDDEN pending-program verb (R6): what a laid stub execs. Deliberately
+    // unlisted in help/VERBS (it is machinery, not vocabulary), handled before the
+    // dispatch match so the roster-coherence scraper sees only real verbs — and
+    // BEFORE the store lock: it only reads progress/status and appends one line to
+    // the reorder-only bump file, and it must answer instantly while the installer
+    // HOLDS the store lock.
+    if verb == Some("__pending") {
+        return cmd_pending(args.get(1));
+    }
     // THE single-writer-per-store gate ([`crate::lock`]): every store-MUTATING verb
     // TRY-acquires the store-wide `store.lock` here — at the ONE dispatch edge, so
     // internal verb re-routing (`update <p>` → install) can
@@ -280,6 +300,223 @@ fn cmd_help() -> ExitCode {
 /// everywhere, greppable).
 fn not_installed_fix(name: &str) -> String {
     format!("atpkg: {name} is not installed (fix: aterm pkg install {name})")
+}
+
+/// The `--progress-file` path this invocation carries, if any — set once at the
+/// dispatch edge by [`strip_progress_file_flag`], read by the provisioning passes.
+/// Process-global because the pass that consumes it (`install_default_set`) sits
+/// several call layers below verbs whose signatures are shared with paths that
+/// must never know about it.
+static PROGRESS_FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Remove every `--progress-file <path>` pair from `args`, recording the LAST path
+/// given. Value-missing is tolerated as "no opt-in" rather than an error: the flag
+/// is machinery for the GUI spawn, not user vocabulary, and a broken spawn must
+/// degrade to a progress-less install, never a refused one.
+fn strip_progress_file_flag(args: &mut Vec<String>) {
+    while let Some(i) = args.iter().position(|a| a == "--progress-file") {
+        args.remove(i);
+        if i < args.len() {
+            let path = args.remove(i);
+            let _ = PROGRESS_FILE.set(std::path::PathBuf::from(path));
+        }
+    }
+}
+
+/// Where this invocation's live progress should land, if the GUI opted in.
+fn progress_path() -> Option<&'static std::path::Path> {
+    PROGRESS_FILE.get().map(std::path::PathBuf::as_path)
+}
+
+/// Mark `program` terminal on the live progress pass, if one is running. The ONE
+/// funnel for `done`/`failed`/`skipped` so the overall counter can never double-count
+/// a program (flow marks only non-terminal phases).
+fn note_finished(program: &str, phase: crate::progress::Phase, error: Option<String>) {
+    if let Some(sink) = crate::progress::active() {
+        sink.finished(program, phase, error);
+    }
+}
+
+/// `atpkg __pending <tool>` — the hidden verb a pending-program stub execs (R6).
+///
+/// Reads `progress.json` + `status.toml` under the UNTRUSTED-reader rules, appends
+/// the tool to the reorder-only bump file, prints ONE honest state, and exits 127
+/// (the stub's contract: the tool did not run). It never claims progress it cannot
+/// read, and never claims a bump the installer would silently drop.
+fn cmd_pending(tool: Option<&String>) -> ExitCode {
+    let Some(tool) = tool else {
+        eprintln!("usage: atpkg __pending <tool>");
+        return ExitCode::from(2);
+    };
+    let Some(layout) = layout() else {
+        return ExitCode::from(1);
+    };
+    print_pending_state(&layout, tool);
+    // ALWAYS 127: whatever was printed, the command the user typed did not run.
+    ExitCode::from(127)
+}
+
+/// How long an echoed error line may get before visible elision — generous enough
+/// for every honest FlowError, finite against a hostile record.
+const PENDING_ERROR_CAP: usize = 300;
+
+/// The four honest states (+ the honesty edge), shared verbatim by `__pending` and
+/// `atpkg run`'s pending arm so the three dead ends can never drift apart.
+fn print_pending_state(layout: &crate::store::Layout, tool: &str) {
+    for line in pending_state_lines(layout, tool) {
+        println!("{line}");
+    }
+}
+
+/// [`print_pending_state`]'s body, returning the lines so the four states are
+/// assertable without capturing a process's stdout. SIDE-EFFECTFUL on purpose: the
+/// bump append is part of the state machine (a claimed bump must really have been
+/// written), so the tests exercise message and channel together.
+fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    // The name gate first: only an admitted ToolName is ever echoed back to the TTY
+    // (an unadmitted one could never have a stub OR a shim, so nothing pends).
+    let Some(tn) = crate::store::ToolName::new(tool) else {
+        out.push("atpkg: that is not an installable program name".to_string());
+        return out;
+    };
+    let name = tn.as_str();
+    match crate::stub::describe(name) {
+        Some(what) => out.push(format!("atpkg: {name}: {what} — not installed yet.")),
+        None => out.push(format!(
+            "atpkg: {name}: part of the ALab toolset — not installed yet."
+        )),
+    }
+    let snapshot = crate::progress::read_progress(layout);
+    let now = crate::flow::now_unix().max(0).unsigned_abs();
+    let running = snapshot
+        .as_ref()
+        .is_some_and(|f| crate::progress::snapshot_running(f, now));
+    if let Some(file) = snapshot.as_ref().filter(|_| running) {
+        if file.v != crate::progress::PROGRESS_VERSION {
+            // A NEWER writer's file: render the generic line, never a guess at
+            // fields whose meaning may have changed. The bump file's contract is
+            // versionless (names only), so the bump is still honest.
+            out.push(format!(
+                "atpkg: aterm is installing the toolset now — re-run {name} shortly."
+            ));
+            let _ = crate::progress::append_bump(layout, &tn);
+            return out;
+        }
+        let overall = &file.overall;
+        out.push(format!(
+            "atpkg: aterm is installing your toolchain now ({} of {} done).",
+            overall.programs_done, overall.programs_total
+        ));
+        let Some(row) = file.programs.get(name) else {
+            // THE HONESTY EDGE: a resolved-pass snapshot is readable and does not
+            // plan this program — a compiled-roster stub the signed index no longer
+            // lists. Claiming "bumped" would be a lie the reorder-only intersection
+            // silently swallows; the reconcile removes this stub at pass end.
+            out.push(format!(
+                "atpkg: {name} is no longer part of the default set — nothing is \
+                 scheduled to install it. `aterm pkg install {name}` tries it \
+                 individually."
+            ));
+            return out;
+        };
+        use crate::progress::Phase;
+        match row.phase {
+            Phase::Download => {
+                if row.bytes_total > 0 {
+                    out.push(format!(
+                        "atpkg: {name} is downloading NOW — {:.1} of {:.1} MB ({}%). \
+                         Re-run {name} when it lands.",
+                        row.bytes_done as f64 / 1e6,
+                        row.bytes_total as f64 / 1e6,
+                        row.bytes_done.saturating_mul(100) / row.bytes_total.max(1)
+                    ));
+                } else {
+                    out.push(format!(
+                        "atpkg: {name} is downloading NOW — re-run it when it lands."
+                    ));
+                }
+            }
+            Phase::Verify | Phase::Extract | Phase::Link => {
+                out.push(format!(
+                    "atpkg: {name} is installing NOW ({}) — re-run it in a moment.",
+                    match row.phase {
+                        Phase::Verify => "verifying",
+                        Phase::Extract => "extracting",
+                        _ => "activating",
+                    }
+                ));
+            }
+            Phase::Done => {
+                out.push(format!(
+                    "atpkg: {name} just finished installing — re-run it now."
+                ));
+            }
+            Phase::Failed => {
+                let why = row.error.as_deref().unwrap_or("no recorded reason");
+                out.push(format!(
+                    "atpkg: {name} FAILED to install this pass: {} — fix: aterm pkg \
+                     update retries it; Settings ▸ Packages shows details.",
+                    crate::progress::sanitize_for_tty(why, PENDING_ERROR_CAP)
+                ));
+            }
+            Phase::Queued | Phase::Skipped => {
+                let position = file.queue.iter().position(|q| q == name);
+                let current = file.queue.first().filter(|c| c.as_str() != name);
+                let bumped = crate::progress::append_bump(layout, &tn).is_ok();
+                match (position, current, bumped) {
+                    (Some(p), Some(cur), true) => {
+                        // `cur` came off disk: it is echoed only after its own
+                        // ToolName round-trip (queue names are untrusted).
+                        let cur = crate::store::ToolName::new(cur)
+                            .map_or_else(|| "the current program".to_string(), |t| {
+                                t.as_str().to_string()
+                            });
+                        out.push(format!(
+                            "atpkg: {name} was queued {} of {}; it is now BUMPED to \
+                             install next, after {cur} finishes. Re-run it in a minute.",
+                            p + 1,
+                            file.queue.len()
+                        ));
+                    }
+                    (_, _, true) => {
+                        out.push(format!(
+                            "atpkg: {name} is queued and now BUMPED to install next — \
+                             re-run it in a minute."
+                        ));
+                    }
+                    _ => {
+                        out.push(format!(
+                            "atpkg: {name} is queued — re-run it once the pass reaches it."
+                        ));
+                    }
+                }
+            }
+        }
+        return out;
+    }
+    // NOT RUNNING (no file, stale heartbeat, dead pid, or a terminal snapshot):
+    // only not-running states may render, whatever the snapshot claims. A recorded
+    // failure outranks the generic line — every failure names its next act.
+    if let Some(status) = crate::status::read(layout)
+        && let Some(row) = status.programs.get(name)
+        && row.state.starts_with("error")
+    {
+        out.push(format!(
+            "atpkg: the last install attempt FAILED: {} — fix: aterm pkg update \
+             retries it; Settings ▸ Packages shows details.",
+            crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
+        ));
+        let _ = crate::progress::append_bump(layout, &tn);
+        return out;
+    }
+    out.push(
+        "atpkg: nothing is installing right now — fix: open aterm (it provisions the \
+         toolset on launch), or run: aterm pkg update"
+            .to_string(),
+    );
+    let _ = crate::progress::append_bump(layout, &tn);
+    out
 }
 
 /// After an [`crate::FlowError::Unreachable`] failure line, name the ONE act that
@@ -513,7 +750,15 @@ fn cmd_run(rest: &[String]) -> ExitCode {
         return ExitCode::from(1);
     };
     let Some(target) = crate::which(&layout, tool) else {
-        eprintln!("{}", not_installed_fix(tool));
+        // The third dead end converges on the pending message (R6): when the name is
+        // a laid pending stub, `atpkg run <tool>` gets the same live state + bump the
+        // stub itself prints — not a static "not installed" over a tool that is
+        // literally downloading right now. A non-pending name keeps the classic line.
+        if crate::stub::pending_stub_exists(&layout, tool) {
+            print_pending_state(&layout, tool);
+        } else {
+            eprintln!("{}", not_installed_fix(tool));
+        }
         return ExitCode::from(127);
     };
     let child_path =
@@ -901,6 +1146,9 @@ fn uninstall_one(layout: &crate::store::Layout, program: &str) -> ExitCode {
     }
     match uninstall_and_retire(layout, program) {
         Ok(()) => {
+            // A removed program's pending stub goes with it: `removed` suppresses the
+            // reinstall, so a stub promising "installing" would be a standing lie.
+            crate::stub::remove_stub(layout, program);
             println!("atpkg: uninstalled {program}");
             // Removing a managed program is an EXPLICIT act, so this machine stops being
             // one that keeps the whole set complete — otherwise the next unattended pass
@@ -968,6 +1216,9 @@ fn cmd_uninstall_all() -> ExitCode {
         // re-adopted the machine and installed the whole set.
         clear_adoption(&layout);
         record_decline(&layout);
+        // The decline extends to the pending stubs: a declined machine keeps NO
+        // default-set names on PATH promising an install that will never come.
+        crate::stub::remove_all_stubs(&layout);
         println!(
             "atpkg: removed nothing (nothing installed) — noted that this machine declines \
              the ALab toolset: no later pass installs it (not the first-run seed, not the \
@@ -1012,6 +1263,9 @@ fn cmd_uninstall_all() -> ExitCode {
     // removed.
     clear_adoption(&layout);
     record_decline(&layout);
+    // Same stub discipline as the empty-store branch: `uninstall --all` removes
+    // every pending stub with the toolset it declines.
+    crate::stub::remove_all_stubs(&layout);
     if removed.is_empty() {
         eprintln!("atpkg: removed nothing");
         return ExitCode::from(1);
@@ -1987,13 +2241,18 @@ fn do_install(
         triple: current_triple(),
         installed,
     };
-    let result = crate::install(
+    // `program → pinned asset name` for everything this pass resolves (the program AND its
+    // `requires` pull-ins) — filled even for a member whose download then fails, which is
+    // what lets the pass-end gc below spare that member's `.part` resume state.
+    let mut resolved_assets = std::collections::BTreeMap::new();
+    let result = crate::flow::install_collecting_assets(
         fetcher,
         layout,
         &effective_anchor(layout),
         &req,
         floor,
         now_unix(),
+        &mut resolved_assets,
     );
     match &result {
         Ok(r) => {
@@ -2030,8 +2289,16 @@ fn do_install(
             // some other program the user did not ask about. Repeating that on every single
             // install is how a warning becomes wallpaper — `atpkg gc` and `atpkg doctor` are
             // the verbs whose job is to say it.
+            //
+            // The SPARING form, not plain `run`: this pass holds the verified pinned asset
+            // name for everything it resolved, and a `requires` pull-in whose download
+            // failed (the main install still succeeds — deps are best-effort) has a `.part`
+            // here that plain `run`'s staging sweep would destroy, refetching the dep from
+            // byte 0 next pass. Programs outside the map are swept exactly as before.
             if !r.already_current {
-                let _ = crate::gc::run(layout);
+                let _ = crate::gc::run_keeping_pinned_partials(layout, &|p| {
+                    resolved_assets.get(p).cloned()
+                });
             }
             // Refresh the interactive-shell PATH hook (append-not-prepend, §16). At the CLI
             // edge — not inside flow.rs — so flow's synthetic-layout tests never write the
@@ -2328,6 +2595,11 @@ fn cmd_update_all() -> ExitCode {
     }
     let fetcher = resolve_fetcher(&layout);
     let mut failures = 0u32;
+    // `program → pinned asset name` for everything EITHER lane of this pass resolved —
+    // the pass-end gc's sparing input, so a member whose download failed mid-pass keeps
+    // its `.part` resume state instead of losing it to this pass's own closing sweep.
+    let mut resolved_assets: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     if !installed.is_empty() {
         let floor = build_floor(&layout);
         let report = match crate::apply_channel(
@@ -2370,6 +2642,10 @@ fn cmd_update_all() -> ExitCode {
         };
         // Advance the durable anti-rollback floor to the index we just trusted (§8 gate 3).
         advance_floors(&layout, report.index_build, report.roster_seq);
+        // What the apply resolved, kept for the pass-end gc's sparing closure — a member
+        // whose group aborted on a failed download is in here, and is the reason this
+        // exists (its `.part` is the resume state the next pass continues from).
+        resolved_assets.extend(report.resolved_assets.clone());
         // AND CLEAR THE FAILURE THIS PASS JUST DISPROVED. The `*index*` row is
         // written when a resolve fails and was never removed by anything, so a
         // single transient network error — a hotel wifi captive portal, a laptop
@@ -2419,6 +2695,8 @@ fn cmd_update_all() -> ExitCode {
         );
         failures += net.failures;
         let announced = net.announced;
+        // The net lane's resolutions join the apply lane's for the same sparing closure.
+        resolved_assets.extend(net.resolved_assets);
         let mut arrived: Vec<String> = crate::active_builds(&layout)
             .keys()
             .filter(|k| !before_net.contains_key(k.as_str()))
@@ -2441,7 +2719,15 @@ fn cmd_update_all() -> ExitCode {
     // done). Best-effort; never fails the update. This verb sweeps the WHOLE prefix, so an
     // abstention here is about a program it did try to keep current — reported, or the disk
     // grows after every update with nothing on screen ever mentioning it.
-    let report = crate::gc::run(&layout);
+    //
+    // The SPARING form, not plain `run`: this pass just resolved the current pins, so a
+    // member whose download failed mid-pass keeps its `.part` — otherwise this very sweep
+    // destroyed the resume state and the next 6-hour tick refetched a multi-GB archive
+    // from byte 0 (resume-across-passes survived only a process kill). Programs the pass
+    // resolved nothing for are swept exactly as before; `atpkg gc` still reclaims all.
+    let report = crate::gc::run_keeping_pinned_partials(&layout, &|p| {
+        resolved_assets.get(p).cloned()
+    });
     print_gc_sweeps("update", &report);
     print_gc_abstentions("update", &report);
     // Refresh the interactive-shell PATH hook at the CLI edge (§16), best-effort.
@@ -2558,9 +2844,38 @@ fn cmd_update_all() -> ExitCode {
 struct DefaultSetOutcome {
     failures: u32,
     announced: bool,
+    /// `program → pinned asset name` for every member the pass resolved far enough to
+    /// select an artifact — a member whose download then FAILED included. GC runs at the
+    /// CALLER's edge (the `cmd_update_all` precedent), so this rides the outcome out to
+    /// where the pass-end `gc::run_keeping_pinned_partials` builds its sparing closure.
+    resolved_assets: std::collections::BTreeMap<String, String>,
 }
 
 fn install_default_set(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    anchor: &crate::Anchor,
+    cfg: &crate::config::PackagesConfig,
+    now: i64,
+) -> DefaultSetOutcome {
+    // Live-progress pass ownership (R5): when the GUI opted in via `--progress-file`
+    // and no pass is live yet, this pass IS the "net" pass — begun here so its start
+    // truncates the file, ended here so the terminal snapshot (pid cleared,
+    // `ended_unix` stamped) is written on every exit path. The seed lane begins its
+    // own "seed" pass BEFORE calling in, in which case `begin_pass` declines and the
+    // seed lane keeps ownership.
+    let owned_pass =
+        progress_path().is_some_and(|p| crate::progress::begin_pass(p, "net"));
+    let out = install_default_set_inner(layout, fetcher, anchor, cfg, now);
+    if owned_pass {
+        crate::progress::end_pass();
+    }
+    out
+}
+
+/// [`install_default_set`]'s body, split so pass ownership above cannot leak on any
+/// of the early returns below.
+fn install_default_set_inner(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     anchor: &crate::Anchor,
@@ -2573,7 +2888,11 @@ fn install_default_set(
         Err(e) => {
             eprintln!("atpkg: default-set bootstrap: cannot resolve the signed index: {e}");
             print_unreachable_followup(&e, "aterm pkg install --default-set");
-            return DefaultSetOutcome { failures: 1, announced: false };
+            return DefaultSetOutcome {
+                failures: 1,
+                announced: false,
+                resolved_assets: std::collections::BTreeMap::new(),
+            };
         }
     };
     // Fail-closed diagnostics for `[packages.links]` fetch overrides: a program the
@@ -2597,7 +2916,11 @@ fn install_default_set(
     let Some(ch) = index.channels.iter().find(|c| c.name == cfg.channel()) else {
         let e = crate::FlowError::NoChannel(cfg.channel().to_string());
         eprintln!("atpkg: default-set bootstrap failed: {e}");
-        return DefaultSetOutcome { failures: 1, announced: false };
+        return DefaultSetOutcome {
+            failures: 1,
+            announced: false,
+            resolved_assets: std::collections::BTreeMap::new(),
+        };
     };
     let installed = crate::active_builds(layout);
     let mut wanted = index.installable(cfg.include(), cfg.exclude());
@@ -2609,6 +2932,12 @@ fn install_default_set(
     for p in removed_programs(layout) {
         wanted.remove(&p);
     }
+    // Pending-stub reconcile at the index resolve (R6): the SIGNED set replaces the
+    // compiled roster the adoption-time stubs were laid from — newly listed names
+    // gain stubs (PATH coverage before their bytes move), de-listed/removed/
+    // installed names lose theirs, and every kept stub is rewritten so its embedded
+    // atpkg path survives app relocation/self-update.
+    crate::stub::reconcile(layout, &wanted, &installed);
     // ANNOUNCE BEFORE ACTING — the seed lane's law, now kept on the wire lane
     // too (the block comment at the caller had argued for it while nothing
     // announced). The set named is exactly what the loop below will attempt:
@@ -2641,23 +2970,91 @@ fn install_default_set(
             will_install.join(", ")
         );
     }
+    // The pass's plan, in PLAN ORDER, with each group's freshly-installable members —
+    // materialized once so the priority queue below can permute what remains between
+    // items without ever re-deciding WHAT is planned (reorder-only, §4).
+    let groups = crate::plan_groups(&index, ch);
+    let plan: Vec<(usize, Vec<String>)> = groups
+        .iter()
+        .enumerate()
+        .filter_map(|(i, group)| {
+            let missing: Vec<String> = group
+                .members
+                .iter()
+                .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+                .cloned()
+                .collect();
+            (!missing.is_empty()).then_some((i, missing))
+        })
+        .collect();
+    // Every planned member, for the reorder-only intersection: a bump line naming
+    // anything OUTSIDE this set — unknown, already installed, removed, garbage — is
+    // ignored. The bump file can only permute installs the signed index authorized.
+    let plannable: std::collections::BTreeSet<String> = plan
+        .iter()
+        .flat_map(|(_, missing)| missing.iter().cloned())
+        .collect();
+    // The live-progress plan (R5): per-program signed sizes fetched only when a sink
+    // is live (the GUI lane) — N tiny verified manifest reads fix the overall bar's
+    // denominator honestly before any byte moves. Best-effort: a miss degrades that
+    // row to unmetered, never fails the pass.
+    if let Some(sink) = crate::progress::active() {
+        let planned: Vec<(String, u64)> = plan
+            .iter()
+            .flat_map(|(_, missing)| missing.iter())
+            .map(|m| {
+                let size = crate::flow::planned_artifact_size(
+                    fetcher,
+                    &index,
+                    ch,
+                    m,
+                    current_triple(),
+                )
+                .unwrap_or(0);
+                (m.clone(), size)
+            })
+            .collect();
+        sink.plan(&planned);
+    }
     let mut failures = 0u32;
+    // `program → pinned asset name` for every member either arm below resolves — filled
+    // even when the member's download then fails, and carried out on the outcome so the
+    // CALLER's pass-end gc can spare that member's `.part` resume state.
+    let mut resolved_assets: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     // Every channel-pinned program some group covers (grouped tuple or singleton);
     // wanted members left over are unpinned and fail loudly below.
     let mut pinned_members: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for group in crate::plan_groups(&index, ch) {
+    for group in &groups {
         pinned_members.extend(group.members.iter().cloned());
-        // The members THIS pass would freshly install: wanted (include/exclude-
-        // narrowed) and absent. Installed members are the update apply's job.
-        let missing: Vec<String> = group
-            .members
-            .iter()
-            .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
-            .cloned()
+    }
+    // THE PRIORITY QUEUE (§4): between items, re-read the bump file and stably
+    // re-sort the REMAINDER — bumped items first, in bump (first-mention) order, plan
+    // order as the tiebreak. The current item always finishes completely first
+    // (in-flight bytes are never abandoned); bumping any member bumps its whole
+    // group (the transactional activation is untouched). The bump file is consumed
+    // read-only here and deleted only at a clean pass end.
+    let mut remaining: Vec<(usize, Vec<String>)> = plan;
+    while !remaining.is_empty() {
+        let bump: Vec<String> = crate::progress::read_bump(layout)
+            .into_iter()
+            .filter(|n| plannable.contains(n))
             .collect();
-        if missing.is_empty() {
-            continue;
+        if !bump.is_empty() {
+            resort_bumped(&mut remaining, &bump);
+            if let Some(sink) = crate::progress::active() {
+                for name in &bump {
+                    sink.bumped(name);
+                }
+                let order: Vec<String> = remaining
+                    .iter()
+                    .flat_map(|(_, missing)| missing.iter().cloned())
+                    .collect();
+                sink.queue(&order);
+            }
         }
+        let (gi, missing) = remaining.remove(0);
+        let group = &groups[gi];
         // Dev-linked HARD-SKIP (§13): a singleton skips itself; a coherence tuple with
         // ANY linked member skips WHOLE (can't partial-install a locked group over a
         // dev link) — the same rule as `apply_channel`.
@@ -2672,6 +3069,9 @@ fn install_default_set(
                 }
                 None => println!("atpkg: {} dev-linked — skipped", group.members[0]),
             }
+            for m in &missing {
+                note_finished(m, crate::progress::Phase::Skipped, None);
+            }
             continue;
         }
         match &group.group {
@@ -2679,16 +3079,42 @@ fn install_default_set(
             // resolved above (§7) — see [`bootstrap_group`].
             Some(g) => {
                 failures += bootstrap_group(
-                    layout, fetcher, &index, cfg, g, &group, &wanted, &installed, &missing,
+                    layout,
+                    fetcher,
+                    &index,
+                    cfg,
+                    g,
+                    group,
+                    &wanted,
+                    &installed,
+                    &missing,
+                    &mut resolved_assets,
                 );
             }
             // An ungrouped member can move alone (§7) — see [`bootstrap_singleton`].
             None => {
-                failures +=
-                    bootstrap_singleton(layout, fetcher, anchor, cfg, &group.members[0], now);
+                failures += bootstrap_singleton(
+                    layout,
+                    fetcher,
+                    anchor,
+                    cfg,
+                    &group.members[0],
+                    now,
+                    &mut resolved_assets,
+                );
             }
         }
     }
+    // Clean pass end consumes the bump file: every admitted line was either acted on
+    // or proven outside the plan. A FAILED pass keeps it — the failed program's
+    // priority survives to the retry pass, exactly like its `.part`.
+    if failures == 0 {
+        crate::progress::clear_bump(layout);
+    }
+    // Second stub reconcile, against what ACTUALLY landed: a program whose real
+    // shims do not expose its own name would otherwise keep a stale "installing"
+    // stub until the next pass.
+    crate::stub::reconcile(layout, &wanted, &crate::active_builds(layout));
     // Parity with the per-member install path: a wanted member the channel does not
     // PIN fails loudly as NotPinned — silence would hide a half-published index.
     for program in &wanted {
@@ -2703,7 +3129,28 @@ fn install_default_set(
         eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
         record_bootstrap_error(layout, program, &e);
     }
-    DefaultSetOutcome { failures, announced }
+    DefaultSetOutcome {
+        failures,
+        announced,
+        resolved_assets,
+    }
+}
+
+/// Stably re-sort the remaining plan by the bump file's admitted names: a group
+/// containing ANY bumped member moves to the front (bumping a member bumps the
+/// whole group — the transactional activation stays whole), ordered by the
+/// earliest bump mention among its members, with PLAN ORDER as the tiebreak
+/// (`sort_by_key` is stable). Pure over its inputs, so the reorder-only property —
+/// the output is a PERMUTATION of the input, never new work — is directly testable.
+fn resort_bumped(remaining: &mut [(usize, Vec<String>)], bump: &[String]) {
+    let rank_of = |missing: &[String]| {
+        missing
+            .iter()
+            .filter_map(|m| bump.iter().position(|b| b == m))
+            .min()
+            .unwrap_or(usize::MAX)
+    };
+    remaining.sort_by_key(|(_, missing)| rank_of(missing));
 }
 
 /// The grouped (coherence-tuple) arm of [`install_default_set`]: refuse a config-narrowed
@@ -2715,8 +3162,9 @@ fn install_default_set(
 #[allow(
     clippy::too_many_arguments,
     reason = "the group arm consumes install_default_set's whole resolved context: layout, \
-              fetcher, the ONE verified index, config, the group + its name, and the \
-              wanted/installed/missing member sets the narrowing check and prescan read"
+              fetcher, the ONE verified index, config, the group + its name, the \
+              wanted/installed/missing member sets the narrowing check and prescan read, \
+              and the pass's resolved-asset collector the pass-end gc sparing reads"
 )]
 fn bootstrap_group(
     layout: &crate::store::Layout,
@@ -2728,6 +3176,7 @@ fn bootstrap_group(
     wanted: &std::collections::BTreeSet<String>,
     installed: &std::collections::BTreeMap<String, u64>,
     missing: &[String],
+    resolved_assets: &mut std::collections::BTreeMap<String, String>,
 ) -> u32 {
     // If the narrowing include/exclude leaves part of the tuple absent,
     // refuse the WHOLE group — a deliberately partial tuple is exactly
@@ -2743,6 +3192,9 @@ fn bootstrap_group(
             "atpkg: [packages] include/exclude leaves {narrowed_out:?} out of \
              coherence group '{g}' — a locked tuple installs whole; skipping the group"
         );
+        for m in missing {
+            note_finished(m, crate::progress::Phase::Skipped, None);
+        }
         return 0;
     }
     // Missing-triple prescan: the singleton NoArtifact clean-skip doctrine
@@ -2756,6 +3208,9 @@ fn bootstrap_group(
              (§6 clean skip)",
             current_triple()
         );
+        for m in missing {
+            note_finished(m, crate::progress::Phase::Skipped, None);
+        }
         return 0;
     }
     match crate::flow::bootstrap_group(
@@ -2766,6 +3221,7 @@ fn bootstrap_group(
         current_triple(),
         group,
         installed,
+        resolved_assets,
     ) {
         Ok((crate::TxnOutcome::Applied(_), applied)) => {
             // Advance the durable floor to the ONE index the whole group
@@ -2789,12 +3245,21 @@ fn bootstrap_group(
                     "atpkg: installed {m} build {} (default set, coherence group '{g}')",
                     a.build
                 );
+                note_finished(m, crate::progress::Phase::Done, None);
             }
             0
         }
-        Ok((crate::TxnOutcome::UpToDate, _)) => 0,
+        Ok((crate::TxnOutcome::UpToDate, _)) => {
+            for m in missing {
+                note_finished(m, crate::progress::Phase::Skipped, None);
+            }
+            0
+        }
         Ok((crate::TxnOutcome::Pinned(held), _)) => {
             println!("atpkg: coherence group '{g}' held by local pin {held:?} — skipped");
+            for m in missing {
+                note_finished(m, crate::progress::Phase::Skipped, None);
+            }
             0
         }
         Ok((crate::TxnOutcome::Tombstoned(members), _)) => {
@@ -2802,6 +3267,9 @@ fn bootstrap_group(
                 "atpkg: coherence group '{g}': pins tombstoned for {members:?} — \
                  nothing installed"
             );
+            for m in missing {
+                note_finished(m, crate::progress::Phase::Skipped, None);
+            }
             0
         }
         Ok((
@@ -2838,10 +3306,28 @@ fn bootstrap_group(
                 ),
                 format!("bootstrap group '{g}' aborted at {failed}"),
             );
+            // Honest terminal rows: the member that failed carries the reason; its
+            // siblings did not install either (all-or-nothing), and saying so beats
+            // a row frozen mid-phase forever.
+            for m in missing {
+                let why = if *m == failed {
+                    format!("coherence group '{g}' bootstrap aborted at {failed}")
+                } else {
+                    format!("coherence group '{g}' aborted at {failed} — nothing changed")
+                };
+                note_finished(m, crate::progress::Phase::Failed, Some(why));
+            }
             1
         }
         Err(e) => {
             eprintln!("atpkg: bootstrap of coherence group '{g}' failed: {e} (continuing)");
+            for m in missing {
+                note_finished(
+                    m,
+                    crate::progress::Phase::Failed,
+                    Some(format!("coherence group '{g}' bootstrap failed: {e}")),
+                );
+            }
             1
         }
     }
@@ -2859,6 +3345,7 @@ fn bootstrap_singleton(
     cfg: &crate::config::PackagesConfig,
     program: &str,
     now: i64,
+    resolved_assets: &mut std::collections::BTreeMap<String, String>,
 ) -> u32 {
     let floor = build_floor(layout);
     let req = crate::InstallRequest {
@@ -2867,7 +3354,17 @@ fn bootstrap_singleton(
         triple: current_triple(),
         installed: None,
     };
-    match crate::install(fetcher, layout, anchor, &req, floor, now) {
+    // The collecting form: on the failure arm below there is no report, and the failed
+    // download is exactly the member whose `.part` the caller's pass-end gc must spare.
+    match crate::flow::install_collecting_assets(
+        fetcher,
+        layout,
+        anchor,
+        &req,
+        floor,
+        now,
+        resolved_assets,
+    ) {
         Ok(r) => {
             // Advance the durable floor to the index this install trusted
             // (§8 gate 3).
@@ -2884,30 +3381,36 @@ fn bootstrap_singleton(
                 format!("bootstrap installed {program} build {}", r.build),
             );
             println!("atpkg: installed {program} build {} (default set)", r.build);
+            note_finished(program, crate::progress::Phase::Done, None);
             0
         }
         // Correct non-failure states — skipped quietly-but-visibly:
         Err(crate::FlowError::Linked(p)) => {
             println!("atpkg: {p} dev-linked — skipped");
+            note_finished(program, crate::progress::Phase::Skipped, None);
             0
         }
         Err(crate::FlowError::NoArtifact(t)) => {
             println!("atpkg: {program}: no artifact for {t} — skipped (§6 clean skip)");
+            note_finished(program, crate::progress::Phase::Skipped, None);
             0
         }
         Err(crate::FlowError::AppBundleRefused(_)) => {
             println!(
                 "atpkg: {program}: app-bundle member — managed by the app's own updater, skipped"
             );
+            note_finished(program, crate::progress::Phase::Skipped, None);
             0
         }
         Err(e @ crate::FlowError::Tombstoned(_)) => {
             eprintln!("atpkg: {program}: {e} — nothing installed");
+            note_finished(program, crate::progress::Phase::Skipped, None);
             0
         }
         Err(e) => {
             eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
             record_bootstrap_error(layout, program, &e);
+            note_finished(program, crate::progress::Phase::Failed, Some(e.to_string()));
             1
         }
     }
@@ -2969,7 +3472,14 @@ fn cmd_install_default_set() -> ExitCode {
     // GC + shell-hook refresh once at the CLI edge (the cmd_update_all precedent) — including
     // its disclosure of what the pass abstained on, for the same reason: this verb walks the
     // whole prefix, so a skip here is not about a program the user never mentioned.
-    let report = crate::gc::run(&layout);
+    //
+    // The SPARING form, not plain `run`: a member whose multi-GB download failed mid-pass
+    // keeps its `.part` — this very sweep used to destroy the resume state, so retrying
+    // the bootstrap refetched from byte 0. Programs the pass resolved nothing for are
+    // swept exactly as before; the standalone `atpkg gc` still reclaims everything.
+    let report = crate::gc::run_keeping_pinned_partials(&layout, &|p| {
+        failures_outcome.resolved_assets.get(p).cloned()
+    });
     print_gc_sweeps("install-default-set", &report);
     print_gc_abstentions("install-default-set", &report);
     crate::hooks::refresh(&layout);
@@ -3099,6 +3609,12 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     record_adoption(&layout);
+    // PENDING STUBS AT ADOPTION (R6): the instant this machine wants the toolset,
+    // every default-set name resolves on PATH — BEFORE any question of whether a
+    // seal exists, before a single network byte moves. Running one prints the live
+    // install state (`atpkg __pending`) instead of "command not found". Compiled
+    // roster only; the first index resolve reconciles it against the signed set.
+    crate::stub::lay_adoption_stubs(&layout);
     let Some(seed_dir) = crate::bundled_seed_dir() else {
         // DO NOT PROMISE WHAT THE INDEX CANNOT DELIVER. This used to assert the
         // toolset would be "kept current and complete from here on" without asking
@@ -3218,7 +3734,16 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
         }
     );
     let before = crate::active_builds(&layout);
+    // The SEED progress pass (R5): same writer, `pass: "seed"` — verify/extract/link
+    // phases with no download rows (the fetcher is a local dir; the sealed-seed
+    // lane's bytes are untouched). Owned here so `install_default_set` sees a live
+    // pass and does not begin its own "net" one.
+    let owned_pass =
+        progress_path().is_some_and(|p| crate::progress::begin_pass(p, "seed"));
     let failures = install_default_set(&layout, &fetcher, &anchor, cfg, now_unix()).failures;
+    if owned_pass {
+        crate::progress::end_pass();
+    }
     // New shims must reach interactive shells without a relaunch.
     crate::hooks::refresh(&layout);
     let after = crate::active_builds(&layout);
@@ -4120,7 +4645,12 @@ fn cmd_update_one(program: &String) -> ExitCode {
         // GC after every successful activate — the same policy (and order: GC, then the
         // shell-hook refresh) as `cmd_update_all` and `do_install`, which the ungrouped
         // path below reaches through `cmd_install`. Best-effort; never fails the update.
-        let gc = crate::gc::run(&layout);
+        // The SPARING form, for the same reason as those verbs: a tuple member whose
+        // download failed aborted its group but resolved its pin first, and its `.part`
+        // is the resume state the next attempt continues from.
+        let gc = crate::gc::run_keeping_pinned_partials(&layout, &|p| {
+            report.resolved_assets.get(p).cloned()
+        });
         print_gc_sweeps("update", &gc);
         print_gc_abstentions("update", &gc);
         crate::hooks::refresh(&layout);
@@ -6449,5 +6979,253 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&hand);
         let _ = std::fs::remove_dir_all(&config_wants);
+    }
+
+    // -----------------------------------------------------------------------
+    // `__pending` — the four honest states, the honesty edge, escape stripping
+    // (R6; design §5).
+    // -----------------------------------------------------------------------
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// A live-looking progress snapshot: this test process's pid, a fresh heartbeat.
+    fn live_snapshot(programs: &str, queue: &str) -> String {
+        format!(
+            "{{\"v\":1,\"pid\":{},\"pass\":\"net\",\"heartbeat_unix\":{},\
+             \"overall\":{{\"programs_done\":2,\"programs_total\":9}},\
+             \"queue\":{queue},\"programs\":{programs}}}",
+            std::process::id(),
+            now_secs()
+        )
+    }
+
+    fn bump_contents(l: &crate::store::Layout) -> String {
+        std::fs::read_to_string(l.bump_file()).unwrap_or_default()
+    }
+
+    /// State: NOT STARTED — no progress file, no status row. The honest line names
+    /// both next acts, and the bump is still written so the next pass front-loads
+    /// the program the user actually wanted.
+    #[test]
+    fn pending_not_started_names_the_next_act() {
+        let l = temp_layout("pend-notstarted");
+        let lines = pending_state_lines(&l, "trust");
+        assert!(lines[0].contains("trust:"), "leads with what the tool IS: {lines:?}");
+        assert!(
+            lines.iter().any(|x| x.contains("nothing is installing right now")
+                && x.contains("open aterm")
+                && x.contains("aterm pkg update")),
+            "the not-started state names its fixes: {lines:?}"
+        );
+        assert_eq!(bump_contents(&l), "trust\n", "the wish is recorded for the next pass");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// State: INSTALLING NOW — a live snapshot's download row renders live MB and
+    /// the overall count.
+    #[test]
+    fn pending_installing_now_shows_live_bytes() {
+        let l = temp_layout("pend-installing");
+        std::fs::write(
+            l.progress_file(),
+            live_snapshot(
+                "{\"trust\":{\"phase\":\"download\",\"bytes_done\":4100000,\"bytes_total\":9800000}}",
+                "[\"trust\"]",
+            ),
+        )
+        .unwrap();
+        let lines = pending_state_lines(&l, "trust");
+        assert!(
+            lines.iter().any(|x| x.contains("2 of 9 done")),
+            "overall progress renders: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|x| x.contains("downloading NOW") && x.contains("4.1 of 9.8 MB")),
+            "live MB from the snapshot: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// State: QUEUED — the row is queued behind a current program: position + the
+    /// BUMP claim, and the bump file really carries the name (a claimed bump must
+    /// have been written).
+    #[test]
+    fn pending_queued_bumps_and_says_so() {
+        let l = temp_layout("pend-queued");
+        std::fs::write(
+            l.progress_file(),
+            live_snapshot(
+                "{\"robi\":{\"phase\":\"download\"},\"trust\":{\"phase\":\"queued\"}}",
+                "[\"robi\",\"ty\",\"trust\"]",
+            ),
+        )
+        .unwrap();
+        let lines = pending_state_lines(&l, "trust");
+        assert!(
+            lines.iter().any(|x| x.contains("queued 3 of 3")
+                && x.contains("BUMPED")
+                && x.contains("after robi finishes")),
+            "position + bump + current program: {lines:?}"
+        );
+        assert_eq!(bump_contents(&l), "trust\n");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// State: FAILED — the recorded error surfaces WITH its next act, and control
+    /// characters in it are stripped before the TTY (escape-sequence injection).
+    #[test]
+    fn pending_failed_names_the_error_and_strips_escapes() {
+        let l = temp_layout("pend-failed");
+        record_status(
+            &l,
+            "trust",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: "error: mirror said \u{1b}[2Jno".into(),
+                tree_root: String::new(),
+            },
+            "bootstrap install trust: failed".into(),
+        );
+        let lines = pending_state_lines(&l, "trust");
+        let failed = lines
+            .iter()
+            .find(|x| x.contains("FAILED"))
+            .expect("the failure renders");
+        assert!(failed.contains("mirror said [2Jno"), "escapes stripped: {failed}");
+        assert!(!failed.contains('\u{1b}'), "no ESC byte reaches the TTY");
+        assert!(failed.contains("fix: aterm pkg update"), "every failure names its next act");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A STALE snapshot renders only not-running states: yesterday's "downloading"
+    /// must never be today's claim, however live the file looks otherwise.
+    #[test]
+    fn pending_stale_heartbeat_renders_not_running() {
+        let l = temp_layout("pend-stale");
+        let stale = format!(
+            "{{\"v\":1,\"pid\":{},\"heartbeat_unix\":{},\
+             \"programs\":{{\"trust\":{{\"phase\":\"download\",\"bytes_done\":1}}}}}}",
+            std::process::id(),
+            now_secs() - crate::progress::HEARTBEAT_STALE_SECS - 5
+        );
+        std::fs::write(l.progress_file(), stale).unwrap();
+        let lines = pending_state_lines(&l, "trust");
+        assert!(
+            lines.iter().any(|x| x.contains("nothing is installing right now")),
+            "stale = not running: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|x| x.contains("downloading")),
+            "a dead installer's file never claims live progress: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE HONESTY EDGE: a live resolved-pass snapshot that does NOT plan the
+    /// program says "no longer part of the default set" — and claims NO bump,
+    /// because the reorder-only intersection would silently drop it.
+    #[test]
+    fn pending_delisted_name_is_told_the_truth_and_not_bumped() {
+        let l = temp_layout("pend-delisted");
+        std::fs::write(
+            l.progress_file(),
+            live_snapshot("{\"ty\":{\"phase\":\"download\"}}", "[\"ty\"]"),
+        )
+        .unwrap();
+        let lines = pending_state_lines(&l, "trust");
+        assert!(
+            lines.iter().any(|x| x.contains("no longer part of the default set")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|x| x.contains("BUMPED")),
+            "no bump claim the installer would drop: {lines:?}"
+        );
+        assert_eq!(bump_contents(&l), "", "and no bump was written");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A name the shim gate refuses is never echoed back — the one universally safe
+    /// answer for it.
+    #[test]
+    fn pending_refuses_inadmissible_names() {
+        let l = temp_layout("pend-refuse");
+        let lines = pending_state_lines(&l, "../sudo");
+        assert_eq!(lines, vec!["atpkg: that is not an installable program name".to_string()]);
+        assert_eq!(bump_contents(&l), "");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    // -----------------------------------------------------------------------
+    // The priority queue — reorder-only by construction (design §4).
+    // -----------------------------------------------------------------------
+
+    fn plan_of(groups: &[&[&str]]) -> Vec<(usize, Vec<String>)> {
+        groups
+            .iter()
+            .enumerate()
+            .map(|(i, members)| (i, members.iter().map(|m| (*m).to_string()).collect()))
+            .collect()
+    }
+
+    /// The permutation property: whatever the bump says, the output is a
+    /// rearrangement of the input — never new work, never lost work.
+    #[test]
+    fn resort_bumped_is_a_permutation() {
+        let original = plan_of(&[&["ay"], &["trust", "trust-cg"], &["ty"]]);
+        for bump in [
+            vec![],
+            vec!["ty".to_string()],
+            vec!["nonsense".to_string(), "trust-cg".to_string(), "ty".to_string()],
+            vec!["ay".to_string(), "ay".to_string()],
+        ] {
+            let mut sorted = original.clone();
+            resort_bumped(&mut sorted, &bump);
+            let mut a = original.clone();
+            let mut b = sorted.clone();
+            a.sort();
+            b.sort();
+            assert_eq!(a, b, "bump {bump:?} must only permute the plan");
+        }
+    }
+
+    /// Bumped-first in bump order, plan order as the stable tiebreak; names outside
+    /// the plan have no effect at all.
+    #[test]
+    fn resort_bumped_orders_bumped_first_then_plan_order() {
+        let mut plan = plan_of(&[&["ay"], &["clean"], &["ny"], &["ty"]]);
+        resort_bumped(&mut plan, &["ty".to_string(), "clean".to_string()]);
+        let order: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
+        assert_eq!(order, vec![3, 1, 0, 2], "bump order first, then plan order");
+        // Unknown names are inert — the reorder-only intersection already dropped
+        // anything unplanned, and even raw they cannot move a thing.
+        let mut plan = plan_of(&[&["ay"], &["clean"]]);
+        resort_bumped(&mut plan, &["sudo".to_string(), "zzz".to_string()]);
+        let order: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
+        assert_eq!(order, vec![0, 1]);
+    }
+
+    /// Bumping ANY member bumps its WHOLE group — the tuple stays transactional,
+    /// the queue jump is group-granular.
+    #[test]
+    fn bumping_a_member_bumps_the_whole_group() {
+        let mut plan = plan_of(&[&["ay"], &["trust", "trust-cg", "trust-ir"], &["ty"]]);
+        resort_bumped(&mut plan, &["trust-ir".to_string()]);
+        let order: Vec<usize> = plan.iter().map(|(i, _)| *i).collect();
+        assert_eq!(
+            order,
+            vec![1, 0, 2],
+            "the group containing the bumped member moves whole"
+        );
+        assert_eq!(
+            plan[0].1,
+            vec!["trust".to_string(), "trust-cg".to_string(), "trust-ir".to_string()],
+            "membership untouched — activation stays all-or-nothing"
+        );
     }
 }

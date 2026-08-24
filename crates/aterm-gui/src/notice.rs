@@ -67,11 +67,14 @@ pub(crate) const SHADOW_MARGIN: f32 = 12.0;
 /// The stacked shadow layers as `(spread, dy, alpha)`, widest and faintest last.
 ///
 /// Data rather than a literal inside the loop so [`shadow_stays_inside_its_margin`] can
-/// re-derive the furthest reach from the same numbers the renderer draws. The comment
+/// re-derive the furthest reach from the same numbers the renderer draws.
+/// `pub(crate)`: the provisioning progress card (`app_render::pkg_progress_card`)
+/// draws the same falloff, so the two cards cannot drift apart — and its shadow
+/// inherits this table's proven [`SHADOW_MARGIN`] bound. The comment
 /// beside the loop has always claimed these stay inside [`SHADOW_MARGIN`]; until this
 /// was a table, nothing checked it, and a fourth layer or a bigger spread would have
 /// been cropped by the compositor's paint region with no test to say so.
-const SHADOW_LAYERS: [(f32, f32, u8); 3] = [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
+pub(crate) const SHADOW_LAYERS: [(f32, f32, u8); 3] = [(1.0, 1.0, 0x22), (3.0, 2.5, 0x16), (6.5, 4.5, 0x0C)];
 
 /// The alpha below which the card stops being a click target. The exit tail runs the
 /// card down to nothing, and an all-but-invisible thing that swallows clicks — or worse,
@@ -528,8 +531,9 @@ fn luma(c: [u8; 3]) -> f32 {
 /// Black or white, whichever stays legible ON `fill`. The badge pictogram sits on a
 /// themed disc whose luminance is not knowable ahead of time (the accent is user
 /// configurable and `Celebrate` takes the live cursor colour), so the contrast is
-/// computed rather than assumed.
-fn on_fill(fill: [u8; 3]) -> [u8; 3] {
+/// computed rather than assumed. `pub(crate)` — shared with the provisioning
+/// progress card for the same on-a-computed-fill question.
+pub(crate) fn on_fill(fill: [u8; 3]) -> [u8; 3] {
     if luma(fill) > 140.0 {
         [0x10, 0x12, 0x16]
     } else {
@@ -542,13 +546,17 @@ const BADGE_CONTRAST: f32 = 52.0;
 
 /// `fill` pushed away from `surface` until the two can be told apart.
 ///
+/// `pub(crate)` — shared with the provisioning progress card, whose rainbow
+/// segments and status marks sit on the same elevated surface and owe their
+/// legibility to the same walk.
+///
 /// `Celebrate` takes the LIVE CURSOR COLOUR, which the user owns and which has no
 /// relationship to the card's elevated surface — a dark-grey cursor on a dark card paints
 /// an invisible badge, and the flourish silently becomes a floating pictogram. Rather than
 /// discard the user's colour, it is walked toward white (on a dark card) or black (on a
 /// light one) by the smallest step that clears [`BADGE_CONTRAST`], so the hue survives and
 /// the disc is always seen.
-fn legible_on(fill: [u8; 3], surface: [u8; 3]) -> [u8; 3] {
+pub(crate) fn legible_on(fill: [u8; 3], surface: [u8; 3]) -> [u8; 3] {
     let ls = luma(surface);
     if (luma(fill) - ls).abs() >= BADGE_CONTRAST {
         return fill;
@@ -760,9 +768,11 @@ pub(crate) fn notice_rect(
 /// A fully-saturated rainbow colour at hue `h` turns (0..1 wraps).
 ///
 /// Full saturation and value on purpose: this is party trim, not a UI role, and it is
-/// only ever used for the celebration card's badge and its sparkles — never for text,
-/// a state colour, or anything a reader has to interpret.
-fn rainbow(h: f32) -> [u8; 3] {
+/// only ever used for the celebration card's badge and its sparkles — and, since the
+/// provisioning card landed, its rainbow bar fill and sparkle bursts (`pub(crate)` for
+/// exactly that sharing) — never for text, a state colour, or anything a reader has
+/// to interpret.
+pub(crate) fn rainbow(h: f32) -> [u8; 3] {
     let h = (h.fract() + 1.0).fract() * 6.0;
     let i = h.floor();
     let f = h - i;
@@ -785,20 +795,23 @@ fn rainbow(h: f32) -> [u8; 3] {
 /// How many sparkles ring the celebration card.
 const SPARKLES: usize = 14;
 /// Hue turns per second for the badge and the ring — slow enough to read as a shimmer
-/// rather than a strobe.
-const RAINBOW_TURNS_PER_SEC: f32 = 0.22;
+/// rather than a strobe. `pub(crate)`: the progress card's bar cycles at this same
+/// rate, so the whole product shimmers at one tempo.
+pub(crate) const RAINBOW_TURNS_PER_SEC: f32 = 0.22;
 
 /// How far outside the card the sparkle ring sits, in tray px. Kept well inside
 /// [`SHADOW_MARGIN`] so the compositor's paint region already covers it.
 const SPARKLE_INSET: f32 = 3.0;
-/// Sparkle radius at its dimmest and brightest.
-const SPARKLE_MIN_R: f32 = 0.7;
-const SPARKLE_MAX_R: f32 = 2.1;
+/// Sparkle radius at its dimmest and brightest (`pub(crate)`: the progress card's
+/// completion bursts twinkle between the same bounds).
+pub(crate) const SPARKLE_MIN_R: f32 = 0.7;
+pub(crate) const SPARKLE_MAX_R: f32 = 2.1;
 
 /// A point at fraction `f` (0..1) around the perimeter of a rounded rect, walked as a
 /// plain rectangle — close enough for decorative trim, and unlike a circle it keeps
-/// the spacing even along a long pill.
-fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
+/// the spacing even along a long pill. `pub(crate)` — the progress card's sparkle
+/// rings walk the same perimeter.
+pub(crate) fn perimeter_point(x: f32, y: f32, w: f32, h: f32, f: f32) -> (f32, f32) {
     let per = 2.0 * (w + h);
     let d = (f.fract() + 1.0).fract() * per;
     if d < w {

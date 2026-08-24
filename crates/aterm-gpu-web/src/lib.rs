@@ -2960,6 +2960,9 @@ mod tests {
                 t.set_effects_visibility("hidden")
             }),
             ("note_keystroke", |t| t.note_keystroke()),
+            ("note_typed_char", |t| {
+                let _ = t.note_typed_char('x');
+            }),
             ("set_cursor_glow", |t| {
                 t.set_cursor_glow(true, "lumen", None, None, 300, 8, 1.0, 0.0, false)
             }),
@@ -3682,18 +3685,6 @@ mod tests {
     /// export disciplines: strip sizing, pointer stability, idle rev/rects
     /// stillness, and the 0/0-chrome identity.
     #[test]
-    #[ignore = "RED since 201449c2: the cursor-glow movement-admission gate \
-(cursor_glow.rs 'COLD PROGRAM MOVEMENT IS NOT A TRAIL EVENT') requires a \
-typed-move proof only a host can arm (note_typed_expected / \
-note_committed_cells, driven natively from aterm-gui app_input's \
-CommittedMoveProof capture) — and the WEB hosts were never migrated: their \
-only keystroke seam, note_keystroke, is text-blind and deliberately cancels \
-candidates, so glow/trail spawning is structurally impossible here and this \
-test's splash can never occur. That is a real product regression on the web \
-embeddings, not a test problem: un-ignore by porting the proof capture to \
-the web hosts' process() glue (the proof machinery needs extracting from \
-aterm-gui first). Causally proven 2026-08-22: force-admitting at the one \
-gate line flips this test green with everything else identical."]
     fn spill_exports_surface_band_content_on_the_cpu_face() {
         let Some(mut t) = AtermGpuTerminal::new_from_system(12, 40, 16.0) else {
             return;
@@ -3705,21 +3696,41 @@ gate line flips this test green with everything else identical."]
         let (pad, head) = (12usize, 30usize);
         t.set_chrome(pad as u16, head as u16);
         t.set_cursor_glow(true, "water", None, None, 400, 64, 1.0, 2.0, true);
+        // Seed the just-enabled engines' cursor anchor so the first witness
+        // below has an owner to check against (apply is the anchor authority).
+        fill_frame(&mut t);
         // The glow observes cursor motion frame-to-frame: keystrokes
-        // interleave with frames; the leap-write then spawns the jump splash
-        // whose droplets arc above row 0 into the head band.
-        for ch in [b"a", b"b", b"c"] {
-            t.process(ch);
+        // interleave with frames, each WITNESSED through the committed-char
+        // seam exactly as a JS keydown handler would (RED from 201449c2 until
+        // that seam existed: the movement-admission gate — 'COLD PROGRAM
+        // MOVEMENT IS NOT A TRAIL EVENT' — leaves unwitnessed motion dark, and
+        // note_keystroke is deliberately text-blind). The admitted row-0
+        // splashes then arc water droplets above the grid into the head band.
+        for (ch, bytes) in [('a', b"a"), ('b', b"b"), ('c', b"c")] {
+            assert!(
+                t.note_typed_char(ch),
+                "a witnessed simple scalar must arm movement provenance"
+            );
+            t.process(bytes);
             t.advance_effects(30.0);
             fill_frame(&mut t);
         }
-        t.process(b"\x1b[1;30Hz");
+        // Find a frame whose band coverage is LIVE (nonzero alpha), not merely
+        // rev-ticked: the rev also advances on the ERASE that follows a
+        // droplet's exit, and parity below must sample a frame with something
+        // on it to be non-vacuous. Check-then-advance: the last witnessed
+        // splash is typically still airborne right now.
+        let mut lit_frame = false;
         for _ in 0..40 {
-            t.advance_effects(16.0);
-            fill_frame(&mut t);
-            if t.spill_rev() > 0 && t.spill_rect_count() > 0 {
+            if t.spill_rev() > 0
+                && t.spill_rect_count() > 0
+                && t.spill.rgba().as_chunks::<4>().0.iter().any(|px| px[3] != 0)
+            {
+                lit_frame = true;
                 break;
             }
+            t.advance_effects(16.0);
+            fill_frame(&mut t);
         }
         let (w, h) = t.cpu.frame_size(t.rows, t.cols);
         let grid_h = h - 2 * pad - head;
@@ -3728,6 +3739,7 @@ gate line flips this test green with everything else identical."]
             (w * (pad + head) + w * pad + 2 * pad * grid_h) * 4,
             "spill buffer sized to the four band strips"
         );
+        assert!(lit_frame, "witnessed splash droplets must reach the band live");
         assert!(t.spill_rev() > 0, "splash droplets must reach the band");
         assert!(t.spill_rect_count() > 0, "band content must report rects");
 
@@ -3772,6 +3784,27 @@ gate line flips this test green with everything else identical."]
             off += sw * sh;
         }
         assert!(lit > 0, "the splash must light band pixels (non-vacuous)");
+
+        // AN UNWITNESSED PROGRAM LEAP-WRITE GOES DARK — the movement-admission
+        // gate's whole point ('COLD PROGRAM MOVEMENT IS NOT A TRAIL EVENT'): a
+        // denied relocation retires the live wake in one teardown, so the
+        // airborne droplets vanish and the band drains to zero coverage
+        // instead of a splash following program output. Measured mechanism:
+        // the same leap used to be this test's splash vehicle before
+        // 201449c2 gated it.
+        t.process(b"\x1b[1;30Hz");
+        let mut drained = false;
+        for _ in 0..40 {
+            t.advance_effects(16.0);
+            fill_frame(&mut t);
+            if t.frame_scratch.cursor_glow_add.is_empty()
+                && t.spill.rgba().as_chunks::<4>().0.iter().all(|px| px[3] == 0)
+            {
+                drained = true;
+                break;
+            }
+        }
+        assert!(drained, "an unwitnessed leap retires the wake — cold movement stays dark");
 
         // Pointer stability across an animating content frame.
         let ptr = t.spill_ptr();

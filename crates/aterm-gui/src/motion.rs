@@ -106,6 +106,13 @@ pub(crate) enum MotionEffect {
     /// pure decoration; his tips re-appear on the next show once motion
     /// returns.
     Robi,
+    /// The toolchain-provisioning PROGRESS CARD's decoration
+    /// (`crate::app_render::pkg_progress_card`): the rainbow hue-cycle, the
+    /// completion sparkles, and the cat's walk/bob. 0 ⇒ the card still shows
+    /// and the bar still SNAPS to every new value (it is information, the
+    /// scroll-pill rule) but the hue holds, no sparkle twinkles, and the cat
+    /// stands still — no time-driven frames are emitted at all.
+    PkgProgressCard,
 }
 
 impl MotionEffect {
@@ -115,7 +122,7 @@ impl MotionEffect {
     /// cannot silently skip the reduced-motion invariant. Test-only, like
     /// `seq`: production consumers gate per-effect via [`MotionPolicy`].
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 9] = [
+    pub(crate) const ALL: [Self; 10] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SettingsDemo,
@@ -125,6 +132,7 @@ impl MotionEffect {
         Self::MatrixRain,
         Self::NoticePill,
         Self::Robi,
+        Self::PkgProgressCard,
     ];
 
     /// Stable index of each variant (0..ALL.len()). EXHAUSTIVE match on purpose:
@@ -143,6 +151,7 @@ impl MotionEffect {
             Self::MatrixRain => 6,
             Self::NoticePill => 7,
             Self::Robi => 8,
+            Self::PkgProgressCard => 9,
         }
     }
 }
@@ -178,11 +187,16 @@ pub(crate) enum SeriousEffect {
     SettingsPreview,
     GpuPostFx,
     Robi,
+    /// The provisioning progress card's DECORATION only (rainbow fill,
+    /// sparkles, the cat). The card itself is information — install progress —
+    /// so serious mode strips the party and keeps the plain themed bar, the
+    /// same split the scroll pill draws between information and motion.
+    PkgProgressFx,
 }
 
 impl SeriousEffect {
     #[cfg(test)]
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::TerminalSound,
         Self::CursorTrail,
         Self::CursorGlow,
@@ -195,6 +209,7 @@ impl SeriousEffect {
         Self::SettingsPreview,
         Self::GpuPostFx,
         Self::Robi,
+        Self::PkgProgressFx,
     ];
 
     #[cfg(test)]
@@ -212,6 +227,7 @@ impl SeriousEffect {
             Self::SettingsPreview => 9,
             Self::GpuPostFx => 10,
             Self::Robi => 11,
+            Self::PkgProgressFx => 12,
         }
     }
 }
@@ -245,7 +261,8 @@ impl SeriousModePolicy {
             | SeriousEffect::LevelUp
             | SeriousEffect::SettingsPreview
             | SeriousEffect::GpuPostFx
-            | SeriousEffect::Robi => !self.serious,
+            | SeriousEffect::Robi
+            | SeriousEffect::PkgProgressFx => !self.serious,
         }
     }
 }
@@ -288,7 +305,8 @@ impl MotionPolicy {
                 | MotionEffect::StreamFade
                 | MotionEffect::MatrixRain
                 | MotionEffect::NoticePill
-                | MotionEffect::Robi => 0.0,
+                | MotionEffect::Robi
+                | MotionEffect::PkgProgressCard => 0.0,
             },
         }
     }
@@ -432,7 +450,7 @@ mod tests {
         assert_eq!(MotionMode::parse("bogus"), MotionMode::Auto);
     }
 
-    /// Complete 2x11 truth table for serious mode: every enumerated fun effect
+    /// Complete truth table for serious mode: every enumerated fun effect
     /// is allowed in normal mode and denied in serious mode.  Both rows are
     /// reachable, so the proof cannot pass via a constant result.
     #[test]

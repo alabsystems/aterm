@@ -18,6 +18,9 @@ test-open-probe = []
 # default-features = false keeps the closure wasm32-clean (no disk-tier libc/zstd);
 # the GUI's `bidi` feature unions in via the workspace build without affecting us.
 aterm-core = { path = "../aterm-core", default-features = false }
+# The one char-width authority `note_committed_char` shares with the terminal's
+# own materialization law (handler_write Tier 5) and the native capture seam.
+aterm-grapheme = { workspace = true }
 # The render-boundary overlay types (GlowQuad/WordDecoration/InkCell/SpriteQuad/
 # SceneAtlas) + the comet-beam rasterizer the aurora shares with the renderer.
 aterm-render = { path = "../aterm-render", default-features = false }

@@ -1522,20 +1522,40 @@ fn gate_certified() -> bool {
     all_ok
 }
 
-/// The Trust stage2 tool directory — THE toolchain, resolved the same way
-/// tools/verify.sh and .githooks/pre-push resolve it: `$TRUST_STAGE2_BIN` when
-/// set, else `$HOME/trust/build/host/stage2/bin`, with `build/host`'s target-triple
-/// symlink resolved to a physical path (Trust's drivers reject a symlinked
-/// toolchain path).
+/// THE toolchain, resolved by `aterm_verify::Toolchain` — the SAME code
+/// `tools/verify.sh`'s driver runs, not a second copy of the same rules.
+///
+/// It answers `$TRUST_STAGE2_BIN` when set, else `$HOME/trust/build/host/stage2/bin`,
+/// else a `targo` on PATH, else the sysroot `rustc --print sysroot` names (which
+/// is how a rustup-LINKED pin is reached on a machine with no `$HOME/trust` checkout),
+/// always canonicalised because Trust's drivers reject a symlinked toolchain path.
+///
+/// AND IT CHECKS THE PIN. A directory holding a file called `targo` is not
+/// evidence that it is the fork `rust-toolchain.toml` names; the branded rustc
+/// (`trustc`) beside it is. A candidate that fails is REFUSED, not adopted —
+/// otherwise this verb would lint with a different frontend under the pinned
+/// one's name and print GREEN, which is the accident that put six `-D warnings`
+/// violations on main in the sibling `clean` repo.
+fn trust_toolchain() -> aterm_verify::Toolchain {
+    let root = workspace_root();
+    let home = std::env::var_os("HOME").unwrap_or_default();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    aterm_verify::Toolchain::discover(
+        std::env::var_os("TRUST_STAGE2_BIN")
+            .map(PathBuf::from)
+            .as_deref(),
+        Path::new(&home),
+        &path,
+        aterm_verify::toolchain::pinned_channel(&root).as_deref(),
+    )
+}
+
+/// The directory [`trust_toolchain`] settled on. A REFUSED directory is still
+/// returned — it is what the operator pointed at, and the probes that ask
+/// "is there a `trustc` here?" answer no about it correctly by construction,
+/// since the absence of that very file is why it was refused.
 fn trust_stage2_bin() -> PathBuf {
-    let raw = std::env::var_os("TRUST_STAGE2_BIN").map_or_else(
-        || {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            PathBuf::from(home).join("trust/build/host/stage2/bin")
-        },
-        PathBuf::from,
-    );
-    raw.canonicalize().unwrap_or(raw)
+    trust_toolchain().stage2_dir
 }
 
 /// The two signatures branded Tippy emits when its TOOLCHAIN-IDENTITY guard
@@ -1911,6 +1931,12 @@ trait LintLanes {
 struct LiveLintLanes<'a> {
     root: &'a Path,
     tools: &'a Path,
+    /// Set when `tools` carries a `targo` that is NOT the toolchain
+    /// `rust-toolchain.toml` pins (see [`trust_toolchain`]). The tippy lane
+    /// then answers NOT RUN and says why, instead of linting the workspace with
+    /// whatever frontend that directory happens to hold — the one failure this
+    /// verb must never render as GREEN.
+    pin_refusal: Option<String>,
 }
 
 impl LintLanes for LiveLintLanes<'_> {
@@ -1929,6 +1955,13 @@ impl LintLanes for LiveLintLanes<'_> {
             // from the main build's; one shared dir makes them thrash each
             // other's cache), and tippy's own directory first on PATH so it
             // finds its `tippy-driver`.
+            LintLane::Tippy if self.pin_refusal.is_some() => {
+                eprintln!(
+                    "  tippy: NOT RUN — {}. Nothing was linted; this is not a clean lint.",
+                    self.pin_refusal.as_deref().unwrap_or_default()
+                );
+                LaneVerdict::NotRun
+            }
             LintLane::Tippy => match resolve_tippy(self.tools) {
                 // RETRY THE IDENTITY ABORT, AND ONLY THAT. See
                 // [`TIPPY_IDENTITY_ABORTS`]: the guard can trip on a clean run,
@@ -2099,7 +2132,15 @@ fn gate_lint() -> bool {
 
 fn gate_lint_args(args: &[String]) -> bool {
     let root = workspace_root();
-    let tools = trust_stage2_bin();
+    let toolchain = trust_toolchain();
+    let tools = toolchain.stage2_dir.clone();
+    // A refused directory is one this verb must not lint from. `have_targo`
+    // already answers no for it, so ask the toolchain for its own diagnosis
+    // rather than re-deriving the condition here.
+    let pin_refusal = toolchain
+        .refused
+        .is_some()
+        .then(|| toolchain.missing_targo_label());
     // `--no-fmt` is the push gate's setting, declared at the call site rather
     // than inferred: see `gate_lint_with`.
     let include_fmt = !args.iter().any(|a| a == "--no-fmt");
@@ -2107,6 +2148,7 @@ fn gate_lint_args(args: &[String]) -> bool {
         &mut LiveLintLanes {
             root: &root,
             tools: &tools,
+            pin_refusal,
         },
         include_fmt,
     )
@@ -2898,6 +2940,7 @@ mod tests {
         let mut live = LiveLintLanes {
             root: &root,
             tools: &tools,
+            pin_refusal: None,
         };
         let tippy = live.run(LintLane::Tippy);
         let fmt = live.run(LintLane::Trustfmt);
@@ -2919,6 +2962,55 @@ mod tests {
             "missing guard scripts must not report clean guards"
         );
         assert_eq!(resolve_tippy(&tools), None);
+    }
+
+    /// A `targo-tippy` that is not the PINNED toolchain's must never lint.
+    ///
+    /// The stub directory below is exactly what the golden-path PATH fallback
+    /// used to adopt sight unseen: a `targo`, a `targo-tippy`, and no branded
+    /// `trustc`. `resolve_tippy` finds the linter there — that is the point —
+    /// so the only thing standing between this verb and a GREEN printed over a
+    /// different lint set is the refusal, and this pins that the lane takes it
+    /// BEFORE spawning anything. Mutation: with `pin_refusal: None` the same
+    /// directory runs (the stub exits 0) and the lane answers Clean, so NOT RUN
+    /// here is a reading of the toolchain and not a lane that cannot pass.
+    #[test]
+    fn a_tippy_that_is_not_the_pinned_toolchain_is_not_run() {
+        let tmp = std::env::temp_dir().join(format!("aterm-pin-lane-{}", std::process::id()));
+        let root = tmp.join("root");
+        let tools = tmp.join("impostor");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&tools).expect("impostor");
+        write_exec(&tools.join("targo"), "#!/bin/sh\nexit 0\n");
+        write_exec(&tools.join("targo-tippy"), "#!/bin/sh\nexit 0\n");
+        assert!(
+            resolve_tippy(&tools).is_some(),
+            "the linter IS findable there — the refusal is the only thing stopping it"
+        );
+
+        let mut refused = LiveLintLanes {
+            root: &root,
+            tools: &tools,
+            pin_refusal: Some("not the pinned toolchain".to_string()),
+        };
+        assert_eq!(refused.run(LintLane::Tippy), LaneVerdict::NotRun);
+        assert!(
+            LintLane::Tippy.not_run_blocks(),
+            "and a NOT-RUN tippy blocks the push"
+        );
+
+        let mut unguarded = LiveLintLanes {
+            root: &root,
+            tools: &tools,
+            pin_refusal: None,
+        };
+        assert_eq!(
+            unguarded.run(LintLane::Tippy),
+            LaneVerdict::Clean,
+            "mutation: without the refusal this very directory reports a clean lint"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// THE BUG THIS TASK EXISTS FOR, reproduced against the real lane.
@@ -2952,6 +3044,7 @@ mod tests {
         let mut live = LiveLintLanes {
             root: &root,
             tools: &tools,
+            pin_refusal: None,
         };
         assert_eq!(
             live.run(LintLane::Trustfmt),

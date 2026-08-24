@@ -760,130 +760,17 @@ static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
 ///
 /// An apply deferred here is not an apply lost: the lane retries on its own cadence,
 /// and the install it is waiting for is minutes, not hours.
-static TOOLCHAIN_INSTALL_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Mark a toolchain install in flight for the lifetime of the extracting child.
 ///
-/// Writes a DURABLE marker as well as the in-process flag. The durable half is the
-/// one that works: the apply this guards runs at the top of a SUCCESSOR image's
-/// boot, in a process that never set the flag, so the atomic alone was always false
-/// when the guard read it (2026-08-20 round-9 audit).
-pub fn begin_toolchain_install() {
-    TOOLCHAIN_INSTALL_ACTIVE.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Record the EXTRACTING CHILD'S pid durably, once it exists.
-///
-/// Not ours. The installer outlives us: it is an ordinary spawned process with no
-/// kill-on-parent-death, so quitting aterm mid-install leaves it reparented to
-/// launchd and still reading the sealed payload out of the bundle by path. A marker
-/// carrying our pid went stale the instant we exited, and the next launch's boot
-/// apply — the one this guard exists for — then swapped the bundle out from under a
-/// live extraction (2026-08-20 round-10 audit).
-#[cfg(target_os = "macos")]
-pub fn note_toolchain_install_pid(pid: u32) {
-    let Some(staging) = paths::Staging::resolve() else {
-        return;
-    };
-    let marker = staging.toolchain_install();
-    // NEVER OVERWRITE A LIVE OWNER. One slot, shared by every aterm process, and an
-    // installer outlives the app that started it. A second launch's seed child — which
-    // atpkg turns away in milliseconds because the first still holds the store lock —
-    // used to stamp its own pid here, making the marker its own; it then passed the
-    // teardown's ownership check and deleted the record of the extraction that was
-    // still running. The check added in round 11 could never fire, because the clobber
-    // happened before it (2026-08-20 round-12 audit).
-    //
-    // Yielding is the safe direction: the live owner keeps the guard, and our own
-    // short-lived child needs no protection precisely because it is about to be
-    // refused.
-    if let Ok(text) = std::fs::read_to_string(&marker)
-        && let Ok(existing) = text.trim().parse::<i32>()
-        && existing > 0
-        && existing != pid as i32
-        && unsafe { libc::kill(existing, 0) } == 0
-    {
-        return;
-    }
-    let _ = std::fs::write(&marker, pid.to_string());
-}
-
-/// Non-macOS: no staging dir, no durable marker — the in-process flag is the guard.
-#[cfg(not(target_os = "macos"))]
-pub fn note_toolchain_install_pid(_pid: u32) {}
-
-/// The install is over: drop both the in-process flag and the durable marker.
-#[cfg(target_os = "macos")]
-pub fn end_toolchain_install(pid: Option<u32>) {
-    TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-    let Some(staging) = paths::Staging::resolve() else {
-        return;
-    };
-    let marker = staging.toolchain_install();
-    // ONLY OUR OWN MARKER. It is one slot shared by every aterm process, and an
-    // installer outlives the app that started it: quit mid-install and a second
-    // launch's seed child — refused in milliseconds because the first still holds the
-    // store lock — used to tear down the marker belonging to that live extraction.
-    // The next boot apply then swapped the bundle out from under it, which is exactly
-    // the failure the marker exists to prevent (2026-08-20 round-11 audit).
-    //
-    // A `None` pid means we never got as far as spawning, so we own nothing here.
-    let Some(pid) = pid else {
-        return;
-    };
-    if std::fs::read_to_string(&marker)
-        .ok()
-        .and_then(|t| t.trim().parse::<u32>().ok())
-        != Some(pid)
-    {
-        return;
-    }
-    let _ = std::fs::remove_file(&marker);
-}
-
-/// Non-macOS: no durable marker to tear down — drop the in-process flag only.
-#[cfg(not(target_os = "macos"))]
-pub fn end_toolchain_install(_pid: Option<u32>) {
-    TOOLCHAIN_INSTALL_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-}
-
-/// Whether a toolchain install is reading this bundle's sealed payload right now.
-///
-/// True when this process set the flag, OR when a LIVE process left the durable
-/// marker. A marker whose pid is gone — the installer was killed — is stale and is
-/// removed here rather than blocking updates forever.
-#[cfg(target_os = "macos")]
+/// The marker is written by the READER — atpkg claims it with its own pid at the
+/// seal-fetcher choke point (`aterm_update_core::seal_guard`), so every spawn lane
+/// (the GUI loop, the Settings worker, a user-run CLI) is guarded by construction.
+/// Five rounds of GUI-side choreography (8–12, each patching a race the split
+/// ownership created) were deleted with that move; this probe is the surviving
+/// half, and it self-heals a marker whose pid is gone rather than blocking
+/// updates forever.
 #[must_use]
 pub fn is_toolchain_install_active() -> bool {
-    if TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst) {
-        return true;
-    }
-    let Some(staging) = paths::Staging::resolve() else {
-        return false;
-    };
-    let marker = staging.toolchain_install();
-    let Ok(text) = std::fs::read_to_string(&marker) else {
-        return false;
-    };
-    let Ok(pid) = text.trim().parse::<i32>() else {
-        let _ = std::fs::remove_file(&marker);
-        return false;
-    };
-    // `kill(pid, 0)` asks only "does this process exist and may I signal it".
-    let alive = pid > 0 && unsafe { libc::kill(pid, 0) } == 0;
-    if !alive {
-        let _ = std::fs::remove_file(&marker);
-    }
-    alive
-}
-
-/// Non-macOS: no durable marker — only this process's own flag can say an install
-/// is live.
-#[cfg(not(target_os = "macos"))]
-#[must_use]
-pub fn is_toolchain_install_active() -> bool {
-    TOOLCHAIN_INSTALL_ACTIVE.load(std::sync::atomic::Ordering::SeqCst)
+    aterm_update_core::seal_guard::seal_read_active()
 }
 
 /// Mark this process an uncommitted handoff candidate (`true` at boot when the

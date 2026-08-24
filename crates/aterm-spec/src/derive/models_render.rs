@@ -664,6 +664,14 @@ pub fn chrome_face_gate_model() -> Model {
 /// SAME 3×2×2 input domain × the full governed-effect set over the shipping
 /// resolver — a complete proof, since the domain is finite).
 ///
+/// The model abstracts the amplitude as ONE scalar over the whole governed set
+/// (the per-effect arm is a constant 0 under Reduced), so a NEW governed effect
+/// joins the proof through aterm-gui's `MotionEffect::ALL` + the exhaustive
+/// `amplitude` match, not through an edit here — most recently
+/// `MotionEffect::PkgProgressCard` (the toolchain-provisioning progress card's
+/// rainbow/sparkle/cat trim, 2026-08: Reduced amplitude 0, the bar still snaps
+/// to new values as information).
+///
 /// Scalar projection `<<mode, sys, focused, resolved, policy, amp>>`: `Observe`
 /// nondeterministically picks the three motion facts (`mode ∈ 0..2` =
 /// auto|full|reduced, `sys`/`focused ∈ 0..1`) and marks the decision stale;

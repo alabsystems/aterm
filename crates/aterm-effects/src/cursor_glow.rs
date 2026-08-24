@@ -3373,6 +3373,11 @@ static CUSTOM_EMIT_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 #[derive(Default)]
 pub struct CursorGlow {
     sparks: Vec<Spark>,
+    /// ADMISSION DIAGNOSIS RING: the last [`ADMISSION_LOG_CAP`] content-
+    /// candidate lifecycle events (armed/confirmed/retired + reason +
+    /// generation + endpoints), served by the `trail` control verb. Purely
+    /// diagnostic — written beside decisions, never read by one.
+    admission_log: AdmissionLog,
     /// Resident, bounded swept-cell scratch. Built backward from the landing
     /// point so an outlier cursor jump never walks or allocates the discarded prefix.
     path_scratch: Vec<(i32, i32)>,
@@ -3954,6 +3959,136 @@ pub enum ContentCandidateDecision {
         target: (u16, u16),
     },
     Retired { at: Instant, origin: (u16, u16) },
+}
+
+/// Which lifecycle event one [`AdmissionRecord`] captures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdmissionPhase {
+    /// A content-bound candidate armed with its input-time baseline.
+    Armed,
+    /// [`CursorGlow::confirm_content_candidate`] admitted the candidate.
+    Confirmed,
+    /// The confirm seam retired the candidate; `reason` names why.
+    Retired,
+}
+
+impl AdmissionPhase {
+    /// The wire token the `trail` control verb prints.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Armed => "armed",
+            Self::Confirmed => "confirmed",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+/// One entry of the ADMISSION DIAGNOSIS RING ([`CursorGlow::admission_log`]):
+/// a bounded record of one content-candidate lifecycle event — armed /
+/// confirmed / retired — carrying the confirm seam's reason token, the
+/// candidate's endpoints, and the generation pair the decision compared.
+///
+/// This is DIAGNOSTIC STATE, not admission state: the ring is written beside
+/// the decisions the engine already makes and is never read back by any
+/// admission, morphology, or rendering path. It exists because the rainbow-
+/// trail blackout was diagnosed with `ATERM_TRACE_SPAWN` stderr archaeology;
+/// the `trail` control verb reads this ring so a user report is ONE COMMAND.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdmissionRecord {
+    /// Monotonic per-engine sequence (1-based); gaps mean overwritten entries.
+    pub seq: u64,
+    pub phase: AdmissionPhase,
+    /// The confirm seam's reason token (`confirmed`, `row-mismatch`,
+    /// `generation-skip`, …) or the arming intent's own name for `Armed`.
+    pub reason: &'static str,
+    /// The candidate's intent class (`typed` / `delete` / …).
+    pub intent: &'static str,
+    /// The candidate's input-time clock (its identity in the engine).
+    pub at: Instant,
+    pub origin: (u16, u16),
+    pub target: Option<(u16, u16)>,
+    /// `process_sequence` of the input-time baseline generation, if armed.
+    pub baseline_generation: Option<u32>,
+    /// `process_sequence` of the generation the decision ran against
+    /// (`None` for the arming entry — nothing has been compared yet).
+    pub decided_generation: Option<u32>,
+    /// Alternate-screen bit of the most specific generation above.
+    pub alternate_screen: bool,
+}
+
+impl AdmissionRecord {
+    /// One diagnostic line, the `trail` verb's row shape:
+    /// `admission seq= phase= reason= intent= age_ms= origin=r,c target=r,c|-
+    /// gen_base=n|- gen_cur=n|- alt=0|1`. `age_ms` is relative to `now`, so
+    /// the reader sees "how long ago", not an unanchored instant.
+    #[must_use]
+    pub fn line(&self, now: Instant) -> String {
+        let opt_pos = |p: Option<(u16, u16)>| {
+            p.map_or_else(|| "-".to_string(), |(r, c)| format!("{r},{c}"))
+        };
+        let opt_gen =
+            |g: Option<u32>| g.map_or_else(|| "-".to_string(), |g| g.to_string());
+        format!(
+            "admission seq={} phase={} reason={} intent={} age_ms={:.0} origin={},{} target={} gen_base={} gen_cur={} alt={}",
+            self.seq,
+            self.phase.as_str(),
+            self.reason,
+            self.intent,
+            now.saturating_duration_since(self.at).as_secs_f64() * 1e3,
+            self.origin.0,
+            self.origin.1,
+            opt_pos(self.target),
+            opt_gen(self.baseline_generation),
+            opt_gen(self.decided_generation),
+            u8::from(self.alternate_screen),
+        )
+    }
+}
+
+/// Capacity of the admission diagnosis ring — small and fixed: the verb's
+/// purpose is "what did the last few keystrokes decide", not history.
+pub const ADMISSION_LOG_CAP: usize = 32;
+
+/// The fixed-size drop-oldest ring behind [`CursorGlow::admission_log`].
+/// Resident in the engine (no allocation on the hot path — one slot write per
+/// candidate lifecycle event, which is at most twice per keystroke).
+#[derive(Default)]
+struct AdmissionLog {
+    records: [Option<AdmissionRecord>; ADMISSION_LOG_CAP],
+    /// Next slot to write (== oldest entry once the ring has wrapped).
+    head: usize,
+    /// Total records ever pushed; stamps each record's `seq`.
+    seq: u64,
+}
+
+impl AdmissionLog {
+    fn push(&mut self, mut record: AdmissionRecord) {
+        self.seq += 1;
+        record.seq = self.seq;
+        self.records[self.head] = Some(record);
+        self.head = (self.head + 1) % ADMISSION_LOG_CAP;
+    }
+
+    /// Entries oldest → newest.
+    fn iter(&self) -> impl Iterator<Item = &AdmissionRecord> {
+        self.records[self.head..]
+            .iter()
+            .chain(&self.records[..self.head])
+            .filter_map(Option::as_ref)
+    }
+}
+
+impl GlowMoveIntent {
+    /// The diagnostic name the admission ring records.
+    fn diagnostic_name(self) -> &'static str {
+        match self {
+            Self::Typed(_) => "typed",
+            Self::Delete => "delete",
+            Self::Synthetic => "synthetic",
+            Self::SyntheticTyped => "synthetic-typed",
+        }
+    }
 }
 
 impl GlowMoveCandidate {
@@ -5118,6 +5253,7 @@ impl CursorGlow {
             candidate.baseline_row = Some(baseline_row);
             candidate.baseline_generation = Some(baseline_generation);
         }
+        self.log_armed();
     }
 
     /// HOST KEY-HINT: a NAVIGATION keypress (Ctrl-A/Ctrl-E, Home/End, arrow
@@ -5225,6 +5361,7 @@ impl CursorGlow {
             candidate.baseline_row = Some(baseline_row);
             candidate.baseline_generation = Some(baseline_generation);
         }
+        self.log_armed();
     }
 
     /// Record a main-screen ENTER classifier stamp. It never admits movement:
@@ -6143,6 +6280,75 @@ impl CursorGlow {
         };
     }
 
+    /// The last admission-diagnosis records, OLDEST → NEWEST (at most
+    /// [`ADMISSION_LOG_CAP`]). The read face of the ring the `trail` control
+    /// verb serves; see [`AdmissionRecord`] for what one entry carries.
+    pub fn admission_log(&self) -> impl Iterator<Item = &AdmissionRecord> {
+        self.admission_log.iter()
+    }
+
+    /// Record a freshly ARMED content-bound candidate in the diagnosis ring.
+    /// Called by the arming seams after the candidate's baseline is bound, so
+    /// the ring shows the keystroke even when no decision ever runs (the E5
+    /// burst facet: a superseded cohort retires at ARM time, and the armed
+    /// entry is then the only trace the keystroke leaves).
+    fn log_armed(&mut self) {
+        let Some(candidate) = self.move_candidate else {
+            return;
+        };
+        self.admission_log.push(AdmissionRecord {
+            seq: 0,
+            phase: AdmissionPhase::Armed,
+            reason: "armed",
+            intent: candidate.intent.diagnostic_name(),
+            at: candidate.at,
+            origin: candidate.origin,
+            target: candidate.target,
+            baseline_generation: candidate
+                .baseline_generation
+                .map(|generation| generation.process_sequence),
+            decided_generation: None,
+            alternate_screen: candidate
+                .baseline_generation
+                .is_some_and(|generation| generation.alternate_screen),
+        });
+    }
+
+    /// Record one confirm-seam decision in the diagnosis ring, then emit the
+    /// env-gated stderr trace. `await-echo` is a NON-decision (the candidate
+    /// stays pending for a later frame) and is traced but not ringed, so a
+    /// slow echo cannot flood the ring off one keystroke.
+    fn log_confirm(
+        &mut self,
+        reason: &'static str,
+        candidate: &GlowMoveCandidate,
+        current: ContentGeneration,
+        now: Instant,
+    ) {
+        if reason != "await-echo" {
+            let phase = if reason == "confirmed" {
+                AdmissionPhase::Confirmed
+            } else {
+                AdmissionPhase::Retired
+            };
+            self.admission_log.push(AdmissionRecord {
+                seq: 0,
+                phase,
+                reason,
+                intent: candidate.intent.diagnostic_name(),
+                at: candidate.at,
+                origin: candidate.origin,
+                target: candidate.target,
+                baseline_generation: candidate
+                    .baseline_generation
+                    .map(|generation| generation.process_sequence),
+                decided_generation: Some(current.process_sequence),
+                alternate_screen: current.alternate_screen,
+            });
+        }
+        Self::trace_confirm(reason, candidate, current, now);
+    }
+
     /// The `ATERM_TRACE_SPAWN` gate for the confirm-seam diagnostics below —
     /// the same once-sampled static as the host's `SPAWNSRC` trace, so with
     /// the trace off every decision pays one cached bool load.
@@ -6183,10 +6389,12 @@ impl CursorGlow {
 
     /// Confirm the pending content-bound candidate against the input-time row
     /// snapshot supplied by the host and this coherent render snapshot. Typed
-    /// input must materialize the exact committed cells while every cell it did
-    /// not own stays identical. A deletion must be one exact end-of-line blank
-    /// with every survivor identical. A timestamp or matching landing alone is
-    /// never evidence.
+    /// input must materialize the exact committed cells at the caret while
+    /// every cell BEFORE the caret stays identical — the row at/after the
+    /// caret is the shell's presentation zone (autosuggest, highlight
+    /// extension) and carries no veto. A deletion must be one exact
+    /// end-of-line blank with every survivor identical. A timestamp or
+    /// matching landing alone is never evidence.
     ///
     /// Row equality is CONTENT equality under the implicit-blank lens
     /// ([`padded_probe_cell`]): the host's baseline is tail-filled to the grid
@@ -6200,7 +6408,7 @@ impl CursorGlow {
     ) -> Option<ContentCandidateDecision> {
         let candidate = self.move_candidate?;
         if now.saturating_duration_since(candidate.at).as_secs_f32() > Self::TYPE_HINT_FRESH {
-            Self::trace_confirm("stale", &candidate, current_generation, now);
+            self.log_confirm("stale", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6211,7 +6419,7 @@ impl CursorGlow {
             return None;
         }
         let Some(baseline_generation) = candidate.baseline_generation else {
-            Self::trace_confirm("unbaselined", &candidate, current_generation, now);
+            self.log_confirm("unbaselined", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6221,7 +6429,7 @@ impl CursorGlow {
         if current_generation == baseline_generation {
             // No PTY batch has landed yet. A byte-identical present may precede
             // a delayed echo, so keep the one-shot pending.
-            Self::trace_confirm("await-echo", &candidate, current_generation, now);
+            self.log_confirm("await-echo", &candidate, current_generation, now);
             return None;
         }
         if current_generation.terminal_id != baseline_generation.terminal_id
@@ -6231,7 +6439,7 @@ impl CursorGlow {
         {
             // More than one batch crossed the input boundary. Even if the row
             // now happens to match, causality is no longer attributable.
-            Self::trace_confirm("generation-skip", &candidate, current_generation, now);
+            self.log_confirm("generation-skip", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6242,7 +6450,7 @@ impl CursorGlow {
             // This is already the sole next processing generation. A host
             // that cannot supply its coherent row cannot defer the proof to a
             // later frame and still attribute it to this input.
-            Self::trace_confirm("no-row-probe", &candidate, current_generation, now);
+            self.log_confirm("no-row-probe", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6250,7 +6458,7 @@ impl CursorGlow {
             });
         };
         if candidate.at > current_meta.at {
-            Self::trace_confirm("probe-predates-key", &candidate, current_generation, now);
+            self.log_confirm("probe-predates-key", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6279,21 +6487,78 @@ impl CursorGlow {
                 // grid keeps rows trimmed, every honest echo mismatched on
                 // length alone and the proof retired forever (the ribbon
                 // never lit). Both sides are therefore read through the
-                // implicit-blank lens; the law itself is unweakened — the
-                // typed cells must NEWLY materialize exactly, and every cell
-                // the input did not own must be content-identical.
+                // implicit-blank lens.
+                //
+                // PRESENTATION-ZONE LAW: the exactness frontier for a typed
+                // proof is the CARET, not the row edge. The first shipped law
+                // demanded every unowned cell across the WHOLE row stay
+                // content-identical — and on every real interactive zsh/fish
+                // setup the shell paints a suggestion AFTER the caret
+                // (POSTDISPLAY / autosuggest) in the very echo batch that
+                // materializes the typed cell, so 100% of honest typed
+                // movement retired `row-mismatch` and the ribbon, comet,
+                // landing ring and sparkles all went dark while the
+                // echo-independent key-time spark kept firing (the live
+                // `DIFF` sensor showed every diff column at/after the caret,
+                // all suggestion cells). Cells at/after the caret are the
+                // shell's presentation zone; the causal evidence is the exact
+                // typed cells materializing AT the caret, every cell BEFORE
+                // it untouched, the single attributable generation, and the
+                // cursor landing on the exact predicted target (enforced at
+                // admission). Cold program movement still cannot borrow this
+                // proof: without the expected cells newly appearing at the
+                // caret the candidate retires exactly as before.
+                //
+                // MATERIALIZATION WITNESS FOR BLANKS: a typed SPACE is
+                // content-invisible under the implicit-blank lens — the
+                // tail-filled baseline already reads `' '` at the caret, so
+                // the newly-materialize clause was unsatisfiable and every
+                // word boundary broke the trail chain in EVERY shell (trace:
+                // `expected=[' ']` -> `row-unchanged`). The witness for an
+                // all-blank span is storage growth: the stored row now
+                // materially covers the owned span (`DIFF` showed
+                // `clen 21->22` on a live box), which a swallowed echo on a
+                // trimmed row cannot fake.
                 let width = baseline.len().max(current.len());
                 let changed = probe_rows_content_differ(baseline, current);
-                let owned = start..end;
+                // OVERTYPE WITNESS: retyping a history command under a VISIBLE
+                // autosuggestion is the suggestion's whole point — and there the
+                // typed char EQUALS the ghost char already painted at the caret,
+                // so "newly materialize" was unsatisfiable and the second half
+                // of the owner's blackout survived the first fix (probe:
+                // baseline `$ git status`, caret 4, typed 't' -> Retired). The
+                // witness is the null diff itself: the whole row content-
+                // identical, the expected span already present at the caret,
+                // and the cursor landing on the exact predicted target under an
+                // attributable generation. Cold output can only counterfeit
+                // that by no-op-rewriting the very glyphs the user typed while
+                // advancing exactly onto the predicted cell inside the armed
+                // window — i.e. by being an echo of the keystroke, which is
+                // precisely what this gate exists to admit.
+                // NON-BLANK ONLY: a blank span's "already at the caret" is the
+                // tail-filled lens, not a ghost — for blanks, overtype and a
+                // swallowed echo are indistinguishable here, which is exactly
+                // why the space arm above demands STORAGE GROWTH instead (and a
+                // ghost-painted space satisfies that arm on its own: the
+                // suggestion already materialized the row past the caret).
+                let overtype = !changed
+                    && expected.iter().any(|&cell| cell != ' ')
+                    && expected
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &cell)| padded_probe_cell(baseline, start + k) == cell);
+                let materialized = expected
+                    .iter()
+                    .enumerate()
+                    .any(|(k, &cell)| padded_probe_cell(baseline, start + k) != cell)
+                    || (expected.iter().all(|&cell| cell == ' ') && current.len() >= end)
+                    || overtype;
                 let exact = expected
                     .iter()
                     .enumerate()
                     .all(|(k, &cell)| padded_probe_cell(current, start + k) == cell)
-                    && expected
-                        .iter()
-                        .enumerate()
-                        .any(|(k, &cell)| padded_probe_cell(baseline, start + k) != cell)
-                    && (0..width).filter(|col| !owned.contains(col)).all(|col| {
+                    && materialized
+                    && (0..start).all(|col| {
                         padded_probe_cell(baseline, col) == padded_probe_cell(current, col)
                     });
                 // ATERM_TRACE_SPAWN diff sensor: on a failed typed proof, name
@@ -6357,7 +6622,7 @@ impl CursorGlow {
             // The first post-input processing batch completed without the exact
             // owned diff. This is a mismatch even when another row/title was
             // the only visible mutation; a later batch may not borrow it.
-            Self::trace_confirm(
+            self.log_confirm(
                 if row_changed {
                     "row-mismatch"
                 } else {
@@ -6377,7 +6642,7 @@ impl CursorGlow {
             // The authored bytes changed content but produced no path. This is
             // a completed no-move boundary, not a delayed echo: consume its
             // proof dark so the next unrelated CUP cannot borrow it.
-            Self::trace_confirm("no-move", &candidate, current_generation, now);
+            self.log_confirm("no-move", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
                 at: candidate.at,
@@ -6392,7 +6657,7 @@ impl CursorGlow {
         {
             self.confirmed_delete_span = Some((candidate.at, row, col));
         }
-        Self::trace_confirm("confirmed", &candidate, current_generation, now);
+        self.log_confirm("confirmed", &candidate, current_generation, now);
         Some(ContentCandidateDecision::Confirmed {
             at: candidate.at,
             origin: candidate.origin,
@@ -23688,6 +23953,573 @@ mod tests {
         assert!(
             matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
             "EOL erase that trims storage must confirm: {decision:?}"
+        );
+    }
+
+    /// THE ECHO AS A REAL STYLED SHELL ACTUALLY DELIVERS IT. Interactive
+    /// zsh/fish setups paint a SUGGESTION after the caret (POSTDISPLAY /
+    /// autosuggest) in the very batch that echoes the typed cell, so the
+    /// original whole-row unowned-identity law retired 100% of honest typed
+    /// movement (`CONFIRM reason=row-mismatch`, every diff column at/after
+    /// the caret) — the owner's box sparked on keypress and never grew a
+    /// ribbon. The exactness frontier is the CARET: the typed cells must
+    /// newly materialize there, every cell BEFORE it must be identical, and
+    /// the landing must hit the exact predicted target; the zone at/after
+    /// the caret is the shell's presentation and carries no veto. The typed
+    /// SPACE twin: content-invisible under the implicit-blank lens
+    /// (`expected=[' ']` -> `row-unchanged` in every shell, breaking the
+    /// chain at each word boundary), so an all-blank span accepts the
+    /// storage-growth witness instead. 201449c2's gate stays closed: a
+    /// swallowed echo whose batch only repaints the presentation zone, a
+    /// pre-caret rewrite, and a space whose stored row never grew all retire
+    /// exactly as before.
+    #[test]
+    fn styled_shell_suggestion_echo_confirms_but_cold_presentation_stays_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(240),
+            max_len: 18,
+            color: 0x0050_FA7B,
+            intensity: 0.6,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 13,
+            alternate_screen: false,
+        };
+        // The prompt row as the input side captures it: `$ gi`, caret at
+        // column 4, implicit tail filled to the 12-column grid width.
+        let mut baseline_cells = [' '; 12];
+        baseline_cells[0] = '$';
+        baseline_cells[2] = 'g';
+        baseline_cells[3] = 'i';
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['t']).unwrap();
+        let mut out = Vec::new();
+
+        // OWNER'S CASE: one echo batch materializes the typed 't' at the
+        // caret AND paints an autosuggest tail after it. Pre-caret cells are
+        // untouched; the proof must confirm and BOTH engines must draw.
+        let suggested = ['$', ' ', 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's'];
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 4)), t0, &trail_cfg, &mut trail_out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 5), (2, 4), baseline, generation(10));
+        trail.note_typed_expected(at, expected, (2, 5), (2, 4));
+        glow.observe_row(2, 5, &suggested, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            generation(11),
+        );
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("suggestion-tailed echo did not confirm: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        glow.tick(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            &c,
+            g,
+            &mut glow_out,
+        );
+        trail.tick(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            &trail_cfg,
+            &mut trail_out,
+        );
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "suggestion echo admitted no glow"
+        );
+        assert!(!trail_out.is_empty(), "suggestion echo admitted no classic trail");
+
+        // The confirmed styled echo is the model's ConfirmTypedNext ->
+        // ObserveMove admission, unchanged in the abstraction: the owned
+        // evidence is exact, only the concrete extent of "unowned" moved to
+        // the caret frontier.
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let mut armed = model.init_state();
+        assert!(model.fire("ArmTyped", &mut armed));
+        assert!(model.fire("DeliverStable", &mut armed));
+        let mut confirmed = armed.clone();
+        assert!(model.fire("ConfirmTypedNext", &mut confirmed));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &armed,
+            &confirmed,
+            Some("ConfirmTypedNext"),
+            "styled-shell exact echo with presentation tail",
+        );
+        assert!(ok, "styled echo confirm rejected: {why}");
+        let mut admitted = confirmed.clone();
+        assert!(model.fire("ObserveMove", &mut admitted));
+        assert_eq!(admitted["admitted"], 1, "confirmed styled echo must admit");
+
+        // PROTECTION PIN (cold presentation): a swallowed echo whose batch
+        // only repaints the zone after the caret — the typed cell never
+        // materializes — retires and stays dark. This is the spinner /
+        // concurrent-program shape 201449c2 closed. Lumen here so the dark
+        // assertion reads admission output, not the kitty's resident body.
+        let dark_c = cfg(GlowStyle::Lumen, true);
+        let cold = ['$', ' ', 'g', 'i', ' ', ' ', '|'];
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.tick(Some((2, 4)), t0, &dark_c, g, &mut glow_out);
+        trail.tick(Some((2, 4)), t0, &trail_cfg, &mut trail_out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 5), (2, 4), baseline, generation(20));
+        trail.note_typed_expected(at, expected, (2, 5), (2, 4));
+        glow.observe_row(2, 5, &cold, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            generation(21),
+        );
+        let Some(ContentCandidateDecision::Retired { at, origin }) = decision else {
+            panic!("cold presentation repaint did not retire: {decision:?}");
+        };
+        trail.retire_content_candidate(at, origin);
+        glow.tick(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            &dark_c,
+            g,
+            &mut glow_out,
+        );
+        trail.tick(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            &trail_cfg,
+            &mut trail_out,
+        );
+        assert!(!frame_has_output(&glow_out, &glow), "cold movement lit the glow");
+        assert!(trail_out.is_empty(), "cold movement lit the classic trail");
+
+        // PROTECTION PIN (pre-caret): the same suggestion-tailed echo with a
+        // rewritten prompt cell before the caret is not attributable.
+        let mut prompt_rewritten = suggested;
+        prompt_rewritten[0] = '#';
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 5), (2, 4), baseline, generation(30));
+        glow.observe_row(2, 5, &prompt_rewritten, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            generation(31),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "pre-caret rewrite must retire: {decision:?}"
+        );
+
+        // SPACE: `$ git` + typed space at column 5. The tail-filled baseline
+        // already reads blank there, so the only honest witness is the
+        // stored row growing to cover the caret cell — it must confirm.
+        let mut space_baseline_cells = [' '; 12];
+        space_baseline_cells[0] = '$';
+        space_baseline_cells[2] = 'g';
+        space_baseline_cells[3] = 'i';
+        space_baseline_cells[4] = 't';
+        let space_baseline = ExpectedRowSnapshot::from_slice(&space_baseline_cells).unwrap();
+        let space = ExpectedCellSpan::from_cells([' ']).unwrap();
+        let grown = ['$', ' ', 'g', 'i', 't', ' '];
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, space, (2, 6), (2, 5), space_baseline, generation(40));
+        glow.observe_row(2, 6, &grown, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 6)),
+            at + Duration::from_millis(1),
+            generation(41),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "typed space over implicit blanks must confirm: {decision:?}"
+        );
+
+        // PROTECTION PIN (space): a swallowed space echo — the stored row
+        // never grew over the caret — is not materialization and retires.
+        let ungrown = ['$', ' ', 'g', 'i', 't'];
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, space, (2, 6), (2, 5), space_baseline, generation(50));
+        glow.observe_row(2, 6, &ungrown, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 6)),
+            at + Duration::from_millis(1),
+            generation(51),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "swallowed space echo must retire: {decision:?}"
+        );
+
+        // OVERTYPE WITNESS: retyping along a VISIBLE suggestion — the typed
+        // char already sits at the caret as ghost text, so the row does not
+        // change at all; the null diff plus the exact landing IS the proof.
+        // Baseline `$ git status` (suggestion painted), caret at 4, typing the
+        // 't' the ghost already shows.
+        let painted = ['$', ' ', 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's'];
+        let suggestion_baseline = ExpectedRowSnapshot::from_slice(&painted).unwrap();
+        let typed_t = ExpectedCellSpan::from_cells(['t']).unwrap();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, typed_t, (2, 5), (2, 4), suggestion_baseline, generation(60));
+        glow.observe_row(2, 5, &painted, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            generation(61),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "overtyping a visible suggestion must confirm — the null diff plus the \
+             exact landing is the witness: {decision:?}"
+        );
+
+        // PROTECTION PIN (overtype): the null diff proves nothing unless the
+        // ghost at the caret IS the typed char. Typing a char that DEVIATES
+        // from the visible suggestion with the row (not yet) repainted must
+        // retire — the unchanged row is then a missing echo, not an overtype.
+        // (Off-target landings are rejected one layer up, at admission —
+        // MoveCandidate::admits — which the movement-admission pins cover.)
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        let typed_x = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let suggestion_baseline2 = ExpectedRowSnapshot::from_slice(&painted).unwrap();
+        glow.note_typed_expected(at, typed_x, (2, 5), (2, 4), suggestion_baseline2, generation(70));
+        glow.observe_row(2, 5, &painted, at + Duration::from_millis(1));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            at + Duration::from_millis(1),
+            generation(71),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a deviating keystroke on an unrepainted ghost row must retire: {decision:?}"
+        );
+    }
+
+    /// REFINEMENT BINDING for [`aterm_spec::derive::typed_echo_liveness_model`]
+    /// — the blackout's anti-drift lock. 201449c2's model and the shipped gate
+    /// drifted apart silently: the model proved safety over an idealized echo
+    /// environment while every real shell produced shapes it never contained,
+    /// so the code was safe, mute, and provably "correct". This test makes
+    /// that drift impossible to repeat quietly: for EVERY modeled environment
+    /// shape it drives the real [`CursorGlow::confirm_content_candidate`] and
+    /// asserts the code's decision IS the model's `Decide` transition — the
+    /// projected post-state must be exactly the model's one successor
+    /// (`successors("Decide", pre) == [post]`, the app_documents refinement
+    /// idiom). A future echo law change that confirms or retires differently
+    /// from the model fails here, on the shape it changed.
+    ///
+    /// Shapes bound: plain echo, E1 ghost text (POSTDISPLAY), E3 typed space
+    /// on implicit blanks, E4 overtype of a visible suggestion (the handled,
+    /// liveness-obligated four); E2 split-batch echo and E5 stale-anchor burst
+    /// (the REGISTERED STANDING GAPS — bound as retiring, so fixing either gap
+    /// must update the model in the same change, loudly); cold spinner,
+    /// swallowed echo, deviating keystroke (the safety three).
+    #[test]
+    fn real_confirm_content_candidate_refines_the_typed_echo_liveness_model() {
+        let model = aterm_spec::derive::typed_echo_liveness_model();
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 17,
+            alternate_screen: false,
+        };
+        // The prompt row as the input side captures it: `$ gi`, caret at
+        // column 4, tail-filled to the 12-column grid width.
+        let mut baseline_cells = [' '; 12];
+        baseline_cells[0] = '$';
+        baseline_cells[2] = 'g';
+        baseline_cells[3] = 'i';
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let typed_t = ExpectedCellSpan::from_cells(['t']).unwrap();
+
+        // Walk the model's environment to the pre-`Decide` state for one
+        // shape, validating each adversary step against the derived machine.
+        let env_state = |key: &'static str, echo: &'static str| {
+            let mut state = model.init_state();
+            for action in [key, echo] {
+                let before = state.clone();
+                assert!(model.fire(action, &mut state), "environment step {action}");
+                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &before,
+                    &state,
+                    Some(action),
+                    action,
+                );
+                assert!(ok, "environment step {action} rejected: {why}");
+            }
+            state
+        };
+        // THE BINDING: the real decision, projected onto (confirmed, retired,
+        // settled), must be the model's one `Decide` successor.
+        let assert_refines =
+            |label: &str, pre: &aterm_spec::interp::State, decision: Option<ContentCandidateDecision>| {
+                let mut post = pre.clone();
+                post.insert("settled", 1);
+                post.insert(
+                    "confirmed",
+                    i64::from(matches!(
+                        decision,
+                        Some(ContentCandidateDecision::Confirmed { .. })
+                    )),
+                );
+                post.insert(
+                    "retired",
+                    i64::from(matches!(
+                        decision,
+                        Some(ContentCandidateDecision::Retired { .. })
+                    )),
+                );
+                assert_eq!(
+                    model.successors("Decide", pre).as_slice(),
+                    std::slice::from_ref(&post),
+                    "{label}: the shipping confirm decision must refine Decide"
+                );
+                assert_eq!(
+                    aterm_spec::interp::admits(&model, pre, &post),
+                    Some("Decide"),
+                    "{label}: projected decision transition must be admitted"
+                );
+                for invariant in &model.invariants {
+                    assert!(
+                        model.check_invariant(invariant.name, &post),
+                        "{label}: post-state violates {}::{}: {post:?}",
+                        model.name,
+                        invariant.name
+                    );
+                }
+            };
+        // One armed real candidate: type 't' at (2,4) -> (2,5) over `baseline`.
+        let arm = |seq: u32| {
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+            glow.note_typed_expected(
+                t0 + Duration::from_millis(1),
+                typed_t,
+                (2, 5),
+                (2, 4),
+                baseline,
+                generation(seq),
+            );
+            glow
+        };
+
+        // PLAIN: the echo materializes exactly the typed cell, nothing else.
+        let mut plain_row = baseline_cells;
+        plain_row[4] = 't';
+        let mut glow = arm(10);
+        glow.observe_row(2, 5, &plain_row, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(11));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "plain echo must confirm: {decision:?}"
+        );
+        assert_refines("plain", &env_state("KeyPlainEcho", "EchoPlain"), decision);
+
+        // E1 GHOST TEXT: the same batch paints an autosuggest tail at/after
+        // the caret (the shape that blacked out every zsh-autosuggestions box).
+        let suggested = ['$', ' ', 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's'];
+        let mut glow = arm(20);
+        glow.observe_row(2, 5, &suggested, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(21));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "E1 suggestion-tailed echo must confirm: {decision:?}"
+        );
+        assert_refines("E1 ghost text", &env_state("KeyGhostSuggest", "EchoWithGhostText"), decision);
+
+        // E3 TYPED SPACE: content-invisible under the implicit-blank lens; the
+        // stored row growing over the owned span is the only honest witness.
+        let mut space_baseline_cells = [' '; 12];
+        space_baseline_cells[0] = '$';
+        space_baseline_cells[2] = 'g';
+        space_baseline_cells[3] = 'i';
+        space_baseline_cells[4] = 't';
+        let space_baseline = ExpectedRowSnapshot::from_slice(&space_baseline_cells).unwrap();
+        let space = ExpectedCellSpan::from_cells([' ']).unwrap();
+        let grown = ['$', ' ', 'g', 'i', 't', ' '];
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        glow.note_typed_expected(
+            t0 + Duration::from_millis(1),
+            space,
+            (2, 6),
+            (2, 5),
+            space_baseline,
+            generation(30),
+        );
+        glow.observe_row(2, 6, &grown, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 6)), t0 + Duration::from_millis(2), generation(31));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "E3 typed space over implicit blanks must confirm: {decision:?}"
+        );
+        assert_refines("E3 typed space", &env_state("KeySpaceOnBlanks", "EchoStorageGrowth"), decision);
+
+        // E4 OVERTYPE: retyping under a VISIBLE suggestion — the typed glyph
+        // is already painted at the caret, the echo is a null diff.
+        let ghost_baseline = ExpectedRowSnapshot::from_slice(&suggested).unwrap();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        glow.note_typed_expected(
+            t0 + Duration::from_millis(1),
+            typed_t,
+            (2, 5),
+            (2, 4),
+            ghost_baseline,
+            generation(40),
+        );
+        glow.observe_row(2, 5, &suggested, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(41));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "E4 overtype of a visible suggestion must confirm: {decision:?}"
+        );
+        assert_refines(
+            "E4 overtype",
+            &env_state("KeyOvertypeSuggestion", "EchoNullDiffOvertype"),
+            decision,
+        );
+
+        // E2 SPLIT ECHO — REGISTERED STANDING GAP: the echo's cells land two
+        // generations past the baseline; the strict next-generation law
+        // retires a real echo. Bound as retiring so a future fix of the gap
+        // must update the model in the same change, loudly.
+        let mut glow = arm(50);
+        glow.observe_row(2, 5, &plain_row, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(52));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "E2 split-batch echo retires today (standing gap): {decision:?}"
+        );
+        assert_refines("E2 split echo", &env_state("KeySplitEcho", "EchoSplitBatches"), decision);
+
+        // E5 BURST — REGISTERED STANDING GAP: the only fresh probe predates
+        // the keystroke (several keys between rendered frames), so proof
+        // capture declines the stale anchor.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        glow.observe_row(2, 5, &plain_row, t0 + Duration::from_millis(1));
+        glow.note_typed_expected(
+            t0 + Duration::from_millis(2),
+            typed_t,
+            (2, 5),
+            (2, 4),
+            baseline,
+            generation(60),
+        );
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(3), generation(61));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "E5 stale-anchor burst retires today (standing gap): {decision:?}"
+        );
+        assert_refines("E5 burst", &env_state("KeyBurst", "EchoAfterBurst"), decision);
+        // The other E5 facet: a second unobserved key retires the whole
+        // cohort at arm time — there is then no candidate left to decide.
+        let mut glow = arm(70);
+        glow.note_typed_expected(
+            t0 + Duration::from_millis(2),
+            typed_t,
+            (2, 6),
+            (2, 5),
+            baseline,
+            generation(70),
+        );
+        assert!(
+            !glow.move_candidate_pending(),
+            "two unobserved commits must retire the cohort, not replace the proof"
+        );
+        assert_eq!(
+            glow.confirm_content_candidate(
+                Some((2, 6)),
+                t0 + Duration::from_millis(3),
+                generation(71)
+            ),
+            None,
+            "a retired burst cohort leaves nothing to confirm"
+        );
+
+        // COLD SPINNER (safety): no keystroke, output only — there is no
+        // candidate, and the model's settled decision is neither confirmed
+        // nor retired.
+        let spinner = ['$', ' ', 'g', 'i', ' ', ' ', '|'];
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        glow.observe_row(2, 5, &spinner, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(81));
+        assert_eq!(decision, None, "cold output has no candidate to decide");
+        assert_refines("cold spinner", &env_state("ColdSpinner", "ColdPaint"), decision);
+
+        // SWALLOWED ECHO (safety): the generation crossed but the typed cell
+        // never materialized — the batch was someone else's.
+        let mut glow = arm(90);
+        glow.observe_row(2, 5, &baseline_cells, t0 + Duration::from_millis(2));
+        let decision =
+            glow.confirm_content_candidate(Some((2, 5)), t0 + Duration::from_millis(2), generation(91));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a swallowed echo must retire: {decision:?}"
+        );
+        assert_refines("swallowed echo", &env_state("KeyEchoSwallowed", "UnrelatedBatch"), decision);
+
+        // DEVIATING ECHO (safety): the shell echoed a different glyph at the
+        // caret than the keystroke predicted.
+        let mut deviating_row = baseline_cells;
+        deviating_row[4] = 'x';
+        let mut glow = arm(100);
+        glow.observe_row(2, 5, &deviating_row, t0 + Duration::from_millis(2));
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            t0 + Duration::from_millis(2),
+            generation(101),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a deviating echo must retire: {decision:?}"
+        );
+        assert_refines(
+            "deviating echo",
+            &env_state("KeyDeviatingEcho", "EchoDeviates"),
+            decision,
         );
     }
 

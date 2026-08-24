@@ -81,6 +81,15 @@ pub(crate) const EDIT_ROBI: &str = "robi";
 /// changes the wording, the timing, or what the notice is for, and reduced motion
 /// holds the colours still.
 pub(crate) const EDIT_NOTICE_SPARKLE: &str = "notice_sparkle";
+/// Progress-card party trim (`Config::pkg_progress_effects`, default ON —
+/// user-facing features ship enabled; this is an opt-OUT). The toolchain
+/// install's progress card wears the rainbow-filled bar, per-program completion
+/// sparkles, and the cursor kitty riding the bar's leading edge. Decorative
+/// only: OFF keeps the card fully functional as a plain themed accent bar —
+/// the numbers, phases, queue order, and honest failure states never change.
+/// Reduced motion and serious mode strip the same trim without touching this
+/// preference.
+pub(crate) const EDIT_PKG_PROGRESS_EFFECTS: &str = "pkg_progress_effects";
 /// Ambient-bed toggle (`Config::trail_sound_bed`, default OFF — the owner
 /// dislikes the drone): ON re-enables the continuous per-style background
 /// texture behind the trail notes; OFF gates the synth's bed mixer entirely
@@ -934,6 +943,16 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
          Typography section when per-platform row visibility exists",
     ),
     (
+        "font_subpixel",
+        "the Linux subpixel-RGB text mode (off|rgb|bgr, RFC-linux-subpixel-text stage 1) — \
+         the same platform-gated-row deferral as font_hinting, compounded: this stage is \
+         CPU-compositor-only (the default GPU backend renders grayscale regardless), so a \
+         Settings row would visibly do nothing for most users on ALL THREE platforms. It \
+         is a full config key (aterm.toml, $ATERM_FONT_SUBPIXEL alias, hot-reload); it \
+         joins the Typography section with font_hinting when per-platform (and \
+         per-backend) row visibility exists",
+    ),
+    (
         "tab_band_height",
         "the in-grid tab band's height policy (compact|standard, platform-defaulted: standard \
          on Windows, compact elsewhere). It is INERT on macOS — the platform this Settings \
@@ -1080,6 +1099,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     // Decorative, previewed by the thing itself (the celebration card appears after
     // an update) rather than by the Settings workbench — same rationale as `robi`.
     EDIT_NOTICE_SPARKLE,
+    // Same rationale again: the progress card appears during a real toolchain
+    // install, not in the workbench scene.
+    EDIT_PKG_PROGRESS_EFFECTS,
     // Aural, no pixels — the same rationale as their five siblings above.
     EDIT_TRAIL_SOUND_RIFF,
     EDIT_BELL_SOUND,
@@ -1457,6 +1479,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TONE_MELODY
         | EDIT_ROBI
         | EDIT_NOTICE_SPARKLE
+        | EDIT_PKG_PROGRESS_EFFECTS
         | EDIT_TRAIL_SOUND_BED
         | EDIT_TRAIL_SOUND_RIFF
         | EDIT_BELL_SOUND
@@ -2408,8 +2431,10 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_SERIOUS_MODE
         // The update-celebration sparkles ride the FX page beside serious
         // mode — its "Effect policy" group is where "how much fun is this
-        // terminal allowed to have" questions already live.
+        // terminal allowed to have" questions already live; the provisioning
+        // progress card's trim answers the same question.
         | EDIT_NOTICE_SPARKLE
+        | EDIT_PKG_PROGRESS_EFFECTS
         | EDIT_LOAD_ADAPTIVE_MOTION => Section::Cursor,
         // The rest of the trail/aurora surface (packs — the colour overrides
         // route via the early trail-colour return above) + the stream-fade
@@ -2519,7 +2544,9 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_WALLPAPER | EDIT_WALLPAPER_DIM | EDIT_WALLPAPER_TEXT_TINT => ("Wallpaper", 4),
         // The celebration sparkles ride beside the process-wide effect switch:
         // both answer "how much fun is this terminal allowed to have".
-        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE => ("Effect policy", 0),
+        EDIT_SERIOUS_MODE | EDIT_NOTICE_SPARKLE | EDIT_PKG_PROGRESS_EFFECTS => {
+            ("Effect policy", 0)
+        }
         EDIT_CURSOR_STYLE | EDIT_CURSOR_BLINK => ("Cursor", 0),
         EDIT_CURSOR_TRAIL
         | EDIT_CURSOR_TRAIL_MS
@@ -3190,6 +3217,19 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "rainbow",
             "confetti",
             "badge",
+        ],
+        // "kitty" deliberately absent: the cursor-companion searches
+        // (`wide_search_page_one_lists_native_rows_beside_the_manual_result`
+        // pins the "kitty" roster) belong to the trail/companion settings;
+        // "cat" already lands anyone hunting the walker on the bar.
+        EDIT_PKG_PROGRESS_EFFECTS => &[
+            "progress",
+            "install",
+            "toolchain",
+            "packages",
+            "rainbow",
+            "sparkle",
+            "cat",
         ],
         EDIT_SECURE_KEYBOARD_ENTRY => &[
             "secure",
@@ -4622,6 +4662,18 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_NOTICE_SPARKLE,
             kind: EditKind::Bool,
             seed: Some(cfg.notice_sparkle_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            // The toolchain-install progress card's party trim (rainbow bar,
+            // completion sparkles, the cat). Default ON (opt-OUT); decorative
+            // only — the card's information and behaviour are identical with
+            // it off, and reduced motion / serious mode strip the same trim
+            // without touching this preference.
+            label: "Install-progress rainbow & cat",
+            key: EDIT_PKG_PROGRESS_EFFECTS,
+            kind: EditKind::Bool,
+            seed: Some(cfg.pkg_progress_effects_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {
@@ -7651,6 +7703,7 @@ enabled = true
             super::EDIT_TEMPORAL_RECORDING,
             super::EDIT_TRAIL_SOUND_BED,
             super::EDIT_NOTICE_SPARKLE,
+            super::EDIT_PKG_PROGRESS_EFFECTS,
         ] {
             assert!(
                 matches!(edit_kind(k), EditKind::Bool),

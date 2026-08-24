@@ -299,6 +299,70 @@ pub(crate) fn default_roles(theme: Theme) -> NativeRoles {
     roles(theme, current_preferences())
 }
 
+/// The authored FORCED-chrome seed palette for config `window_theme = light` —
+/// the light counterpart the settings audit found missing: before it existed the
+/// native painter had only theme-derived tokens, so `light` under a dark
+/// terminal theme changed nothing on Linux. libadwaita light is the reference
+/// (`window_bg_color #fafafa`, text `rgba(0,0,0,0.8)`); [`roles`] then derives
+/// the full token set from these seeds through the same OKLCH mix + contrast
+/// conditioning every terminal theme goes through, so the forced pages get the
+/// identical surface/ink discipline instead of a second hand-held ramp.
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+pub(crate) const FORCED_LIGHT_CHROME_BG: u32 = 0x00FA_FAFA;
+/// Dark text for the forced-light chrome (the libadwaita 80 %-black composite).
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+pub(crate) const FORCED_LIGHT_CHROME_FG: u32 = 0x002E_3436;
+/// The authored FORCED-chrome seed palette for config `window_theme = dark`
+/// (libadwaita dark: `window_bg_color #242424`, near-white text).
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+pub(crate) const FORCED_DARK_CHROME_BG: u32 = 0x0024_2424;
+/// Near-white text for the forced-dark chrome.
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+pub(crate) const FORCED_DARK_CHROME_FG: u32 = 0x00ED_EDED;
+
+/// The floor the carried terminal accent is held to against the forced chrome
+/// surface. Deliberately below the 3.0 ink floor: the accent paints RULES and
+/// FILLS (the strip's active underline, selected washes), never body text, and
+/// [`roles`]/`strip_colors` re-floor every ink they derive from it — but a dark
+/// theme's near-white cursor carried verbatim onto the #FAFAFA surface would be
+/// an invisible underline, which is what this catches.
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+const FORCED_CHROME_ACCENT_FLOOR: f32 = 2.2;
+
+/// The [`Theme`] the chrome painters draw from when config
+/// `window_theme = light|dark` forces the side AGAINST the terminal theme's own
+/// darkness (the Linux resolution seam, [`crate::App::chrome_palette_theme`]).
+/// Surfaces and text are the authored constants above; the ACCENT identity
+/// (cursor, and selection as [`roles`]' fallback accent seed) is carried from
+/// the terminal theme — "same accent" per the libadwaita reference — with the
+/// cursor lightness-nudged ([`ensure_contrast`], hue-preserving) so it stays
+/// visible on the forced surface.
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+pub(crate) fn forced_chrome_theme(terminal: Theme, dark: bool) -> Theme {
+    let (bg, fg) = if dark {
+        (FORCED_DARK_CHROME_BG, FORCED_DARK_CHROME_FG)
+    } else {
+        (FORCED_LIGHT_CHROME_BG, FORCED_LIGHT_CHROME_FG)
+    };
+    let cursor = ensure_contrast(
+        packed_rgb(terminal.cursor),
+        packed_rgb(bg),
+        FORCED_CHROME_ACCENT_FLOOR,
+    );
+    Theme {
+        fg,
+        bg,
+        cursor: pack_rgb(cursor),
+        selection: terminal.selection,
+    }
+}
+
+/// Inverse of [`packed_rgb`] (0x00RR_GGBB).
+#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+fn pack_rgb(c: [u8; 3]) -> u32 {
+    (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
+}
+
 fn packed_rgb(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
@@ -584,6 +648,47 @@ mod tests {
             assert!(contrast_ratio(r.success, r.surface) >= 4.5);
             assert_ne!(r.surface, r.elevated);
         }
+    }
+
+    /// The FORCED chrome palettes (`window_theme = light|dark` against the
+    /// terminal theme's own darkness) go through the same [`roles`] pipeline
+    /// as every terminal theme, so they must hold the identical contract — for
+    /// EVERY carried accent, since the terminal theme donates cursor/selection.
+    #[test]
+    fn forced_chrome_themes_meet_the_roles_contract_for_any_carried_accent() {
+        for terminal in THEMES {
+            for dark in [false, true] {
+                let forced = forced_chrome_theme(terminal, dark);
+                // The authored side really is that side, under both classifiers
+                // (the roles split here and the strip's `bg_is_light`).
+                assert_eq!(relative_luminance(packed_rgb(forced.bg)) < 0.42, dark);
+                assert!(
+                    contrast_ratio(packed_rgb(forced.fg), packed_rgb(forced.bg)) >= 7.0,
+                    "authored chrome text is comfortably readable on its own surface"
+                );
+                // The carried accent stays visible on the forced surface.
+                assert!(
+                    contrast_ratio(packed_rgb(forced.cursor), packed_rgb(forced.bg))
+                        >= FORCED_CHROME_ACCENT_FLOOR - 0.01
+                );
+                let r = default_roles(forced);
+                assert!(contrast_ratio(r.text_primary, r.surface) >= 4.5);
+                assert!(contrast_ratio(r.text_secondary, r.surface) >= 4.5);
+                assert!(contrast_ratio(r.text_tertiary, r.surface) >= 3.0);
+                assert!(contrast_ratio(r.accent, r.surface) >= 3.0);
+                assert!(contrast_ratio(r.on_accent, r.accent) >= 4.5);
+                assert!(contrast_ratio(r.danger, r.surface) >= 4.5);
+                assert!(contrast_ratio(r.success, r.surface) >= 4.5);
+                assert_ne!(r.surface, r.elevated);
+            }
+        }
+        // A terminal theme already on the forced side round-trips its accent
+        // identity: the seed constants replace fg/bg but selection is carried
+        // verbatim.
+        let light = forced_chrome_theme(THEMES[1], false);
+        assert_eq!(light.bg, FORCED_LIGHT_CHROME_BG);
+        assert_eq!(light.fg, FORCED_LIGHT_CHROME_FG);
+        assert_eq!(light.selection, THEMES[1].selection);
     }
 
     #[test]

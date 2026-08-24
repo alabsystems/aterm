@@ -616,8 +616,42 @@ pub struct GcReport {
 /// witnessed or not — a fresh install killed mid-extract never got as far as a live build, so
 /// gating it on a witness would leak precisely the case it exists for. Its guard is the claim
 /// union rather than the witness; see the module docs.
+///
+/// This standalone form spares NO staging partials — the user asked for the disk back, and
+/// with no resolved index in hand there is no honest way to tell a live pinned `.part` from
+/// a superseded one. An install/update pass, which DOES hold that knowledge, ends with
+/// [`run_keeping_pinned_partials`] instead so a failed member's resume state survives to the
+/// next pass.
 #[must_use]
 pub fn run(layout: &Layout) -> GcReport {
+    run_keeping_pinned_partials(layout, &|_| None)
+}
+
+/// [`run`], with the staging sweep sparing — per program — the single `.part` whose asset
+/// name matches the program's CURRENT pinned artifact (`pinned_asset` maps a program name
+/// to that asset file name, from the caller's resolved signed index; `None` spares
+/// nothing for that program).
+///
+/// Why: gc runs at the end of every install/update pass, and the staging sweep used to
+/// remove EVERY regular file under `staging/<program>/` — `.part` included — so a program
+/// whose download failed mid-pass lost its resume state to that same pass's closing gc and
+/// the next pass refetched from byte 0. Resume-across-passes survived only a process kill.
+/// The keep rule is `flow::sweep_foreign_partials`' at-most-one bound, expressed as an
+/// exact file-name match (`<pinned asset>.part` — a directory holds at most one file of
+/// that name, so "at most one spared partial per program" holds by construction).
+/// Superseded builds' partials are still swept, and everything spared here remains
+/// reclaimable by the standalone [`run`] — a killed download never permanently strands
+/// bytes.
+///
+/// Trust posture: `pinned_asset` only ever SHRINKS the sweep, never extends it — it can
+/// keep a file the pass was about to finish, but cannot make gc delete anything the plain
+/// sweep would not, follow a symlink (the regular-file check runs first), or touch other
+/// programs' directories.
+#[must_use]
+pub fn run_keeping_pinned_partials(
+    layout: &Layout,
+    pinned_asset: &dyn Fn(&str) -> Option<String>,
+) -> GcReport {
     // FIRST, before any view is computed: put back any tree a swap was killed midway
     // through, so `live_builds`/`authority_claims` see a `current` link that resolves and
     // the sweep below reasons about a store that is whole.
@@ -702,13 +736,26 @@ pub fn run(layout: &Layout) -> GcReport {
             let Ok(entries) = std::fs::read_dir(program.path()) else {
                 continue;
             };
+            // The one file this program's sweep spares: `<pinned asset>.part`, the resume
+            // state the next pass continues from. Exact-name match, so at most one file
+            // per program can ever be spared.
+            let keep = pinned_asset(&name).map(|asset| format!("{asset}.part"));
             let mut gone: Vec<String> = Vec::new();
             for e in entries.filter_map(Result::ok) {
                 // Regular files only: never follow a symlink out of the prefix, and
                 // never recurse into something that is not ours to interpret.
-                if e.file_type().is_ok_and(|t| t.is_file())
-                    && std::fs::remove_file(e.path()).is_ok()
-                    && let Ok(n) = e.file_name().into_string()
+                if !e.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                // A non-UTF-8 name can never be a pinned asset's partial (asset names
+                // come from the signed manifest, which is UTF-8), so it is swept —
+                // unreported, exactly as before.
+                let entry_name = e.file_name().into_string().ok();
+                if keep.is_some() && keep == entry_name {
+                    continue;
+                }
+                if std::fs::remove_file(e.path()).is_ok()
+                    && let Some(n) = entry_name
                 {
                     gone.push(n);
                 }
@@ -1586,6 +1633,63 @@ mod tests {
         // A genuinely superseded build goes.
         assert_eq!(discard_superseded(&l, &witness, 18), Ok(()));
         assert!(!l.build_dir("ay", 18).exists());
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE resume-across-passes survival rule (R4): gc closes every install/update pass,
+    /// so a failed download's `.part` used to die to that same pass's sweep and the next
+    /// pass refetched from byte 0. The pass-closing form spares exactly the pinned
+    /// artifact's partial — superseded partials, finished-asset debris, and other
+    /// programs' files are swept exactly as before.
+    #[test]
+    fn the_pass_closing_sweep_spares_the_live_pinned_partial_only() {
+        let l = layout("staging-keep");
+        let staging = l.staging_dir("ay");
+        std::fs::create_dir_all(&staging).unwrap();
+        let pinned = staging.join("ay-18.tar.zst.part");
+        let superseded = staging.join("ay-17.tar.zst.part");
+        let debris = staging.join("ay-17.tar.zst");
+        let other = l.staging_dir("ny");
+        std::fs::create_dir_all(&other).unwrap();
+        let unpinned = other.join("ny-7.tar.zst.part");
+        for p in [&pinned, &superseded, &debris, &unpinned] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let report = run_keeping_pinned_partials(&l, &|program| {
+            (program == "ay").then(|| "ay-18.tar.zst".to_string())
+        });
+
+        assert!(
+            pinned.exists(),
+            "the pinned partial is the next pass's resume state"
+        );
+        assert!(!superseded.exists(), "a superseded partial is still swept");
+        assert!(!debris.exists(), "a stranded complete asset is still swept");
+        assert!(
+            !unpinned.exists(),
+            "a program the caller pins nothing for is fully swept"
+        );
+        assert_eq!(
+            report.swept_staging,
+            vec![
+                (
+                    "ay".to_string(),
+                    vec!["ay-17.tar.zst".to_string(), "ay-17.tar.zst.part".to_string()]
+                ),
+                ("ny".to_string(), vec!["ny-7.tar.zst.part".to_string()]),
+            ],
+            "the report lists what went, never what was spared"
+        );
+
+        // The standalone verb keeps its full-sweep meaning: the user asked for the disk
+        // back, and everything spared above remains reclaimable — a killed download
+        // never permanently strands bytes.
+        let _ = run(&l);
+        assert!(
+            !pinned.exists(),
+            "a plain `gc` still reclaims the spared partial"
+        );
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 }

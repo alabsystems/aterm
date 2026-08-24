@@ -414,6 +414,36 @@ pub fn install(
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<InstallReport, FlowError> {
+    install_collecting_assets(
+        fetcher,
+        layout,
+        anchor,
+        req,
+        floor,
+        now_unix,
+        &mut BTreeMap::new(),
+    )
+}
+
+/// [`install`], additionally filling `resolved_assets` with `program → pinned asset file
+/// name` for every program (the requested one AND each `requires` pull-in) the pass
+/// resolved far enough to select an artifact.
+///
+/// An OUT-PARAM, not an [`InstallReport`] field, because it must survive the `Err` path:
+/// the program whose download failed mid-transfer is exactly the one whose `<asset>.part`
+/// resume state the caller's pass-end [`crate::gc::run_keeping_pinned_partials`] must
+/// spare — and a failed install returns no report to carry the name. The map only ever
+/// SHRINKS that gc sweep (see the sparing form's trust-posture note), so over-collecting
+/// on the success path is harmless: a finished install has no `.part` left to spare.
+pub fn install_collecting_assets(
+    fetcher: &dyn Fetcher,
+    layout: &Layout,
+    anchor: &Anchor,
+    req: &InstallRequest,
+    floor: BuildFloor,
+    now_unix: i64,
+    resolved_assets: &mut BTreeMap<String, String>,
+) -> Result<InstallReport, FlowError> {
     let mut seen = BTreeSet::new();
     install_inner(
         fetcher,
@@ -423,6 +453,7 @@ pub fn install(
         floor,
         now_unix,
         &mut seen,
+        resolved_assets,
     )
 }
 
@@ -431,9 +462,10 @@ pub fn install(
 /// rather than looping.
 #[allow(
     clippy::too_many_arguments,
-    reason = "install_inner is install plus the recursion cycle-guard set; every other input \
-              is an irreducible dependency of a verified install (fetcher, layout, root key, \
-              the request, and the floor + clock the anti-rollback/freshness gates read)"
+    reason = "install_inner is install plus the recursion cycle-guard set and the resolved-\
+              asset collector; every other input is an irreducible dependency of a verified \
+              install (fetcher, layout, root key, the request, and the floor + clock the \
+              anti-rollback/freshness gates read)"
 )]
 fn install_inner(
     fetcher: &dyn Fetcher,
@@ -443,6 +475,7 @@ fn install_inner(
     floor: BuildFloor,
     now_unix: i64,
     seen: &mut BTreeSet<String>,
+    resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<InstallReport, FlowError> {
     let (channel, program, triple, installed) =
         (req.channel, req.program, req.triple, req.installed);
@@ -549,6 +582,7 @@ fn install_inner(
             floor,
             now_unix,
             seen,
+            resolved_assets,
         ) {
             Ok(r) => {
                 dependencies.push(DepOutcome {
@@ -571,6 +605,11 @@ fn install_inner(
     let artifact = pkg
         .artifact_for(triple)
         .ok_or_else(|| FlowError::NoArtifact(triple.to_string()))?;
+    // The pass's verified answer for this program, recorded BEFORE the download so a
+    // transfer that fails midway still reaches the caller's collector — the pass-end
+    // `gc::run_keeping_pinned_partials` spares exactly these programs' `<asset>.part`
+    // resume files, and the failed download is the one the sparing exists for.
+    resolved_assets.insert(program.to_string(), artifact.asset.clone());
     // Per-member dispatch (§16.4): the tool path installs plain `binary`/`cargo-src`
     // (Shim) AND now `sysroot-bundle` (trust / trust-mc) artifacts. A sysroot-bundle
     // gets bundle-specific wiring ([`apply_sysroot_bundle`]) BEFORE activation plus a
@@ -612,12 +651,20 @@ fn install_inner(
     let _ = std::fs::remove_file(&dl);
     // A resumable transfer KEEPS its own `<asset>.part` across attempts — that is the
     // point — so the one thing that can leak here is a partial for an asset this program
-    // has since moved past. `gc` does reclaim these (its `staging/` sweep removes every
-    // regular file under `staging/<program>/`, `.part` included), but `gc` is a separate
-    // verb a user may never run, so reclaim every OTHER partial now: at most one partial
-    // per program survives between passes, and it is always the one the next attempt
-    // will finish.
+    // has since moved past. `gc` reclaims those too (its `staging/` sweep removes every
+    // regular file under `staging/<program>/` except a caller-named pinned partial, see
+    // `gc::run_keeping_pinned_partials` — the sparing form every install/update pass ends
+    // with, fed the `resolved_assets` this function collects; that wiring is what lets
+    // THIS pinned partial outlive a failed pass at all), but `gc`'s standalone verb is one
+    // a user may never run, so reclaim every OTHER partial now: at most one partial per
+    // program survives between passes, and it is always the one the next attempt will
+    // finish.
     sweep_foreign_partials(&dl);
+    // Live-progress hooks (R5): the download runs in a curl child, so the byte meter
+    // is a sibling `.part` poller against the SIGNED size. Every hook is a no-op
+    // unless a `--progress-file` pass is live.
+    crate::progress::note_build(program, pinned);
+    let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
     if let Err(e) = fetcher.download_for(program, &repo, &artifact.asset, &dl) {
         // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
         // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
@@ -628,6 +675,9 @@ fn install_inner(
         let _ = std::fs::remove_file(&dl);
         return Err(FlowError::Download(e));
     }
+    // The transfer is over either way — stop the poller before the phase moves on.
+    drop(download_watch);
+    crate::progress::note_phase(program, crate::progress::Phase::Verify);
     let build_dir = layout.build_dir(program, pinned);
     // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it and
     // before `activate_channel` can move the links — by abort time the answer is gone. The
@@ -652,9 +702,23 @@ fn install_inner(
     // `staging/` forever — nothing else ever sweeps that directory, since
     // `gc::interrupted_debris` walks `store/` only — and a member that keeps failing keeps
     // leaking, one copy per distinct asset name.
+    // The verify→extract boundary lives inside `verify_and_stage`; the extract scope
+    // credits `write_capped`'s loop to this program, and the first written byte flips
+    // the phase label honestly (see `progress::extract_scope`).
+    let extract_scope =
+        crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let staged = verify_and_stage(artifact, &dl, &build_dir);
+    drop(extract_scope);
     let _ = std::fs::remove_file(&dl);
-    staged.map_err(FlowError::Stage)?;
+    if let Err(e) = staged {
+        // Belt-and-braces: a digest-failing asset must not leave a sibling `.part` to
+        // seed the next attempt (see `discard_sibling_partial` for why this is nearly
+        // vacuous but kept anyway).
+        if matches!(e, StageError::Sha256Mismatch { .. }) {
+            discard_sibling_partial(&dl);
+        }
+        return Err(FlowError::Stage(e));
+    }
 
     // 6b. Sysroot-bundle wiring BEFORE activation (self-contained = no-op).
     if strategy == crate::dispatch::ApplyStrategy::SysrootBundle {
@@ -663,6 +727,7 @@ fn install_inner(
 
     // 7. Activate + shim. The raw manifest `exposes` is admitted ONCE here; `tools` is what
     // actually got a shim and `refused` the sensitive/malformed names that did not.
+    crate::progress::note_phase(program, crate::progress::Phase::Link);
     activate_channel(layout, channel, &build_dir)
         .map_err(|e| FlowError::Activate(e.to_string()))?;
     let (tools, refused) = crate::store::split_exposed(&pkg.exposes);
@@ -839,6 +904,14 @@ pub struct ChannelApplyReport {
     /// Members excluded from this apply because they are dev-linked (§13) — reported so the
     /// CLI can note the skip.
     pub skipped_linked: Vec<String>,
+    /// `program → pinned artifact asset file name` for every member whose release-verified
+    /// manifest this pass resolved far enough to SELECT an artifact — INCLUDING members
+    /// whose download or stage then failed, which is the point: the pass-end
+    /// [`crate::gc::run_keeping_pinned_partials`] spares exactly these programs'
+    /// `<asset>.part` resume files, and the failed member is the one with a partial worth
+    /// sparing. A program absent here gets nothing spared (the safe default — the sparing
+    /// closure only ever SHRINKS the sweep, so an empty map is plain `gc::run`).
+    pub resolved_assets: BTreeMap<String, String>,
 }
 
 /// A member the apply flipped live: its new build + the SIGNED `tree_root` for `atpkg verify`.
@@ -914,6 +987,7 @@ pub fn apply_channel(
     let mut results = Vec::with_capacity(groups.len());
     let mut applied: BTreeMap<String, AppliedMember> = BTreeMap::new();
     let mut skipped_linked: Vec<String> = Vec::new();
+    let mut resolved_assets: BTreeMap<String, String> = BTreeMap::new();
     for group in &groups {
         // Dev-linked HARD-SKIP (§13): a coherence tuple with ANY linked member is skipped
         // whole (can't partial-move a locked group over a dev link).
@@ -930,7 +1004,16 @@ pub fn apply_channel(
             continue;
         }
         if let Some((acted, outcome, group_applied)) = apply_group(
-            fetcher, layout, &index, &ch, channel, triple, group, installed, excluded,
+            fetcher,
+            layout,
+            &index,
+            &ch,
+            channel,
+            triple,
+            group,
+            installed,
+            excluded,
+            &mut resolved_assets,
         ) {
             applied.extend(group_applied);
             results.push((acted, outcome));
@@ -944,6 +1027,7 @@ pub fn apply_channel(
         groups: results,
         applied,
         skipped_linked,
+        resolved_assets,
     })
 }
 
@@ -963,7 +1047,8 @@ pub fn apply_channel(
     clippy::too_many_arguments,
     reason = "the per-group apply needs the same irreducible inputs as apply_channel: the \
               network fetcher, the layout, the verified index + channel, the channel name + \
-              triple selectors, the group, and the installed-build map"
+              triple selectors, the group, the installed-build map, and the caller's \
+              resolved-asset collector the pass-end gc sparing reads"
 )]
 fn apply_group(
     fetcher: &dyn Fetcher,
@@ -975,6 +1060,7 @@ fn apply_group(
     group: &Group,
     installed: &BTreeMap<String, u64>,
     excluded: &[String],
+    resolved_assets: &mut BTreeMap<String, String>,
 ) -> Option<(Group, TxnOutcome, BTreeMap<String, AppliedMember>)> {
     // `update` touches INSTALLED groups only: skip a group with no installed member (that
     // would be a fresh `install`, not an update). A coherence group with even ONE member
@@ -1055,12 +1141,30 @@ fn apply_group(
         // produced an `active` row for the very program the user deleted — a phantom
         // installation in the surface the user is sent to check
         // (2026-08-20 independent derivation).
-        let (outcome, applied) =
-            apply_group_txn(fetcher, layout, index, ch, channel, triple, &present, installed);
+        let (outcome, applied) = apply_group_txn(
+            fetcher,
+            layout,
+            index,
+            ch,
+            channel,
+            triple,
+            &present,
+            installed,
+            resolved_assets,
+        );
         return Some((present, outcome, applied));
     }
-    let (outcome, applied) =
-        apply_group_txn(fetcher, layout, index, ch, channel, triple, group, installed);
+    let (outcome, applied) = apply_group_txn(
+        fetcher,
+        layout,
+        index,
+        ch,
+        channel,
+        triple,
+        group,
+        installed,
+        resolved_assets,
+    );
     Some((group.clone(), outcome, applied))
 }
 
@@ -1073,11 +1177,18 @@ fn apply_group(
 /// The caller resolves + verifies the index ONCE for its whole pass and hands it in, so a
 /// mid-pass index publish can never split a fresh tuple across two index states (§7) —
 /// the hole a per-member `install` loop (which re-resolves each call) cannot close.
+///
+/// `resolved_assets` collects `program → pinned asset file name` for every member the
+/// transaction resolved far enough to select an artifact — a member whose download then
+/// FAILED included, which is the point: the caller's pass-end
+/// [`crate::gc::run_keeping_pinned_partials`] spares that member's `.part` resume state.
+/// An out-param (not part of the return) because it must survive every failure shape.
 #[allow(
     clippy::too_many_arguments,
     reason = "the bootstrap group apply needs the same irreducible inputs as apply_group \
               minus the pre-resolved channel it looks up itself: fetcher, layout, verified \
-              index, channel + triple selectors, the group, and the installed-build map"
+              index, channel + triple selectors, the group, the installed-build map, and \
+              the caller's resolved-asset collector the pass-end gc sparing reads"
 )]
 pub fn bootstrap_group(
     fetcher: &dyn Fetcher,
@@ -1087,6 +1198,7 @@ pub fn bootstrap_group(
     triple: &str,
     group: &Group,
     installed: &BTreeMap<String, u64>,
+    resolved_assets: &mut BTreeMap<String, String>,
 ) -> Result<(TxnOutcome, BTreeMap<String, AppliedMember>), FlowError> {
     let ch = index
         .channels
@@ -1094,7 +1206,15 @@ pub fn bootstrap_group(
         .find(|c| c.name == channel)
         .ok_or_else(|| FlowError::NoChannel(channel.to_string()))?;
     Ok(apply_group_txn(
-        fetcher, layout, index, ch, channel, triple, group, installed,
+        fetcher,
+        layout,
+        index,
+        ch,
+        channel,
+        triple,
+        group,
+        installed,
+        resolved_assets,
     ))
 }
 
@@ -1132,7 +1252,8 @@ pub fn group_missing_triple(
     clippy::too_many_arguments,
     reason = "the per-group apply needs the same irreducible inputs as apply_channel: the \
               network fetcher, the layout, the verified index + channel, the channel name + \
-              triple selectors, the group, and the installed-build map"
+              triple selectors, the group, the installed-build map, and the caller's \
+              resolved-asset collector the pass-end gc sparing reads"
 )]
 fn apply_group_txn(
     fetcher: &dyn Fetcher,
@@ -1143,6 +1264,7 @@ fn apply_group_txn(
     triple: &str,
     group: &Group,
     installed: &BTreeMap<String, u64>,
+    resolved_assets: &mut BTreeMap<String, String>,
 ) -> (TxnOutcome, BTreeMap<String, AppliedMember>) {
     let decisions: Vec<(String, ApplyDecision)> = group
         .members
@@ -1246,6 +1368,7 @@ fn apply_group_txn(
             m,
             triple,
             installed.get(m).copied(),
+            resolved_assets,
         ) {
             Some(s) => {
                 staged.borrow_mut().insert(m.to_string(), s);
@@ -1254,6 +1377,8 @@ fn apply_group_txn(
             None => false,
         },
         &mut |m| {
+            // The flip is the group lane's link phase (label-only, per the schema).
+            crate::progress::note_phase(m, crate::progress::Phase::Link);
             staged
                 .borrow()
                 .get(m)
@@ -1334,6 +1459,24 @@ fn apply_group_txn(
 ///
 /// Deliberately narrow: only regular files whose name ends in `.part`, only in `dl`'s own
 /// directory, never recursive. `dl` itself and any other file are untouched.
+/// Reclaim `dl`'s own sibling `<asset>.part`, if one exists.
+///
+/// The belt-and-braces arm of the digest gate: an asset that just FAILED its signed
+/// sha256 must not leave a partial behind to seed the next attempt — a poisoned prefix
+/// would cost that attempt a full download plus a second guaranteed mismatch. Nearly
+/// vacuous on the resumable lane (the fetcher renamed the `.part` onto the asset before
+/// verify ran, so a mismatch-failing download usually has no sibling partial) — this is
+/// a cheap invariant, not a load-bearing gate; the load-bearing gate is the sha256
+/// check itself, which is untouched.
+fn discard_sibling_partial(dl: &Path) {
+    let Some(name) = dl.file_name() else {
+        return;
+    };
+    let mut part = name.to_os_string();
+    part.push(".part");
+    let _ = std::fs::remove_file(dl.with_file_name(part));
+}
+
 fn sweep_foreign_partials(dl: &Path) {
     let (Some(dir), Some(name)) = (dl.parent(), dl.file_name()) else {
         return;
@@ -1734,12 +1877,23 @@ pub fn apply_program(
             groups: vec![],
             applied: BTreeMap::new(),
             skipped_linked,
+            resolved_assets: BTreeMap::new(),
         });
     }
     let mut results = Vec::new();
     let mut applied: BTreeMap<String, AppliedMember> = BTreeMap::new();
+    let mut resolved_assets: BTreeMap<String, String> = BTreeMap::new();
     if let Some((acted, o, group_applied)) = apply_group(
-        fetcher, layout, &index, &ch, channel, triple, &group, installed, excluded,
+        fetcher,
+        layout,
+        &index,
+        &ch,
+        channel,
+        triple,
+        &group,
+        installed,
+        excluded,
+        &mut resolved_assets,
     ) {
         applied.extend(group_applied);
         results.push((acted, o));
@@ -1751,6 +1905,7 @@ pub fn apply_program(
         groups: results,
         applied,
         skipped_linked: vec![],
+        resolved_assets,
     })
 }
 
@@ -1833,6 +1988,22 @@ pub(crate) fn verified_pkg(
     Some((pinned, repo, pkg))
 }
 
+/// The SIGNED asset size `program`'s pinned build ships for `triple`, or `None` on
+/// any fetch/verify/parse miss. The live-progress plan uses it to fix the overall
+/// bar's denominator honestly BEFORE bytes move (verify-before-parse preserved via
+/// the shared [`verified_pkg`] sequence); a `None` degrades the plan to an
+/// unmetered row, never a failure.
+pub(crate) fn planned_artifact_size(
+    fetcher: &dyn Fetcher,
+    index: &TrustedIndex,
+    ch: &Channel,
+    program: &str,
+    triple: &str,
+) -> Option<u64> {
+    let (_, _, pkg) = verified_pkg(fetcher, index, ch, program)?;
+    Some(pkg.artifact_for(triple)?.size)
+}
+
 /// Recover the SIGNED `tree_root` for a build that is already installed.
 ///
 /// The attestation is recorded when a member is flipped, and a pass that dies inside
@@ -1872,6 +2043,11 @@ pub fn signed_root_for_installed(
 /// build, select the artifact (Shim kinds only — sysroot-bundle fails closed), download, and
 /// `verify_and_stage` into its build dir. NO activation. `Some(Staged)` on success (with the
 /// prior build captured for rollback); `None` on any failure so [`transact`] aborts the group.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "stage_member is the per-member slice of apply_group_txn's irreducible inputs \
+              plus the caller's resolved-asset collector the pass-end gc sparing reads"
+)]
 fn stage_member(
     fetcher: &dyn Fetcher,
     layout: &Layout,
@@ -1880,12 +2056,18 @@ fn stage_member(
     program: &str,
     triple: &str,
     prior_build: Option<u64>,
+    resolved_assets: &mut BTreeMap<String, String>,
 ) -> Option<Staged> {
     let (pinned, repo, pkg) = verified_pkg(fetcher, index, ch, program)?;
     if !pkg.is_for(program) || pkg.build_number != pinned {
         return None;
     }
     let artifact = pkg.artifact_for(triple)?;
+    // The pass's verified answer for this member, recorded BEFORE the download so a
+    // member that fails mid-transfer still reaches the report — the pass-end
+    // `gc::run_keeping_pinned_partials` spares exactly these programs' `<asset>.part`
+    // resume files, and the failed member is the one the sparing exists for.
+    resolved_assets.insert(program.to_string(), artifact.asset.clone());
     // Shim and sysroot-bundle members stage on this path; app-bundle/unknown fail
     // closed (return None → the group aborts), exactly like `install`.
     let reloc = match crate::dispatch::strategy_for(&artifact.kind) {
@@ -1900,16 +2082,28 @@ fn stage_member(
     // Same reason as the singleton path: a stale staging entry can be a hardlink
     // into the sealed registry, and fetching over it corrupts the app bundle.
     let _ = std::fs::remove_file(&dl);
+    // Same strandage bound as the singleton path: at most one partial per program
+    // survives between passes, and it is the one the next attempt will finish.
+    sweep_foreign_partials(&dl);
+    // Live-progress hooks, mirroring the singleton path (no-ops without a live pass).
+    crate::progress::note_build(program, pinned);
+    let download_watch = crate::progress::watch_download(program, &dl, artifact.size);
     if fetcher
         .download_for(program, &repo, &artifact.asset, &dl)
         .is_err()
     {
-        // An aborted transfer still wrote a truncated body here (curl `-o`, no
-        // `--remove-on-error`); the retry re-fetches rather than resumes, so it is dead
-        // weight. Same reclaim as the stage exit below.
+        // An aborted transfer leaves bytes in `<dl>.part`, not at `<dl>`: the production
+        // fetcher promotes the part onto `dl` only on curl success, so `dl` is either
+        // absent or complete. The part is deliberately LEFT for the next attempt to
+        // continue from (`aterm_update_core::download_to_resumable`); `dl` itself is
+        // reclaimed on this exit exactly as on the stage exit below, because a `dir:`
+        // registry's copy lane writes there directly.
         let _ = std::fs::remove_file(&dl);
         return None;
     }
+    // The transfer is over — stop the poller before the phase moves on.
+    drop(download_watch);
+    crate::progress::note_phase(program, crate::progress::Phase::Verify);
     let build_dir = layout.build_dir(program, pinned);
     // Capture "this build is ALREADY live" BEFORE the stage swaps a new tree into it, and
     // before any flip can move the links: on a flip-phase abort `flip_member`/`rollback_member`
@@ -1922,9 +2116,19 @@ fn stage_member(
     // Reclaim the compressed asset on EVERY exit, not just the happy one: a group member
     // that fails to stage otherwise strands its archive in `staging/` forever, and nothing
     // else ever sweeps that directory (`gc::interrupted_debris` walks `store/` only).
+    let extract_scope =
+        crate::progress::extract_scope(program, artifact.cost.disk_installed);
     let staged = verify_and_stage(artifact, &dl, &build_dir);
+    drop(extract_scope);
     let _ = std::fs::remove_file(&dl);
-    staged.ok()?;
+    if let Err(e) = staged {
+        // Same belt-and-braces as the singleton path: a digest-failing asset must not
+        // leave a `.part` to seed the next attempt (see `discard_sibling_partial`).
+        if matches!(e, StageError::Sha256Mismatch { .. }) {
+            discard_sibling_partial(&dl);
+        }
+        return None;
+    }
     Some(Staged {
         build: pinned,
         build_dir,
@@ -2443,6 +2647,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Phase integration (R5): the SAME end-to-end install, run under a live
+    /// `--progress-file` pass. The hooks in `install_inner` must carry the row
+    /// through the honest phase sequence and record the pinned build; the terminal
+    /// snapshot must read "ended" (pid cleared), never a live-looking lie.
+    ///
+    /// The ONE test in this binary that touches the process-global sink (every other
+    /// path runs with it disabled, which is also what keeps this isolated).
+    #[test]
+    fn install_phases_land_in_the_progress_file() {
+        // The process-global sink has a thread owner; every test that begins a
+        // pass serializes on the shared gate (see progress.rs).
+        let _gate = crate::progress::PASS_TEST_GATE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("phases");
+        let fake = fixture(&dir);
+        let layout = layout(&dir);
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        let progress = layout.prefix.join("progress.json");
+        assert!(crate::progress::begin_pass(&progress, "net"));
+        if let Some(sink) = crate::progress::active() {
+            sink.plan(&[("ay".to_string(), 100)]);
+        }
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let report = install(&fake, &layout, &anchor(), &req, fl(0), 0).unwrap();
+        assert_eq!(report.build, 18);
+        if let Some(sink) = crate::progress::active() {
+            sink.finished("ay", crate::progress::Phase::Done, None);
+        }
+        crate::progress::end_pass();
+        let file: crate::progress::ProgressFile =
+            serde_json::from_str(&std::fs::read_to_string(&progress).unwrap()).unwrap();
+        assert_eq!(file.pass, "net");
+        assert_eq!(file.pid, None, "the pass ended — no live pid claim");
+        assert!(file.ended_unix.is_some());
+        let ay = &file.programs["ay"];
+        assert_eq!(ay.phase, crate::progress::Phase::Done);
+        assert_eq!(ay.build, Some(18), "the pinned build was recorded by the flow hook");
+        assert_eq!(file.overall.programs_done, 1);
+        assert!(file.queue.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE GOVERNING STAGING INVARIANT, THROUGH THE REAL INSTALL FLOW: a re-install that
     /// fails to stage must leave the toolchain already on the machine installed, complete,
     /// and on PATH.
@@ -2670,6 +2922,119 @@ mod tests {
             staged_assets(&layout, "ay").is_empty(),
             "and so did the member that staged fine before the abort"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // THE RESUME-ACROSS-PASSES WIRING (R4), update lane: a member whose DOWNLOAD fails
+    // mid-pass reaches `ChannelApplyReport::resolved_assets` anyway — the name is recorded
+    // when the verified manifest selects the artifact, BEFORE any byte moves — so the CLI's
+    // pass-end `gc::run_keeping_pinned_partials`, fed exactly that map, spares the `.part`
+    // the fetcher left and the next pass resumes instead of refetching from byte 0.
+    #[test]
+    fn a_failed_download_survives_its_own_pass_end_gc_and_a_plain_gc_still_sweeps_it() {
+        let dir = scratch("resume-survives-pass-end");
+        let mut fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        // trust's asset is unfetchable: the download fails AFTER its manifest verified —
+        // the window that leaves a `.part` behind in production. `Fake` copies whole
+        // files or fails, so the test seeds the resume bytes the real fetcher would leave.
+        fake.archives.remove("trust-4821.tar.zst");
+        let staging = layout.staging_dir("trust");
+        std::fs::create_dir_all(&staging).unwrap();
+        let part = staging.join("trust-4821.tar.zst.part");
+        std::fs::write(&part, b"resume-bytes").unwrap();
+
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &std::collections::BTreeMap::from([("ay".to_string(), 17u64)]),
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            matches!(report.groups[0].1, TxnOutcome::Aborted { .. }),
+            "PRECONDITION: the failed download aborted the group: {:?}",
+            report.groups[0].1
+        );
+        assert!(part.exists(), "PRECONDITION: the resume state survived the abort");
+        // The FAILED member is in the map — resolution happened before its download —
+        // and so is the sibling that staged fine (harmless: it has no `.part` left).
+        assert_eq!(
+            report.resolved_assets.get("trust").map(String::as_str),
+            Some("trust-4821.tar.zst"),
+            "the failed member's pinned asset name must reach the report"
+        );
+        assert_eq!(
+            report.resolved_assets.get("ay").map(String::as_str),
+            Some("ay-18.tar.zst")
+        );
+
+        // The CLI's pass-end wiring, verbatim: the sparing closure IS the report's map.
+        let _ = crate::gc::run_keeping_pinned_partials(&layout, &|p| {
+            report.resolved_assets.get(p).cloned()
+        });
+        assert!(
+            part.exists(),
+            "the pass-end sweep spares the failed member's resume state"
+        );
+
+        // `uninstall --all` and the standalone `atpkg gc` keep the PLAIN form on purpose
+        // (the user asked for the disk back): everything spared above stays reclaimable.
+        let _ = crate::gc::run(&layout);
+        assert!(!part.exists(), "a plain gc still reclaims the spared partial");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // The same wiring on the singleton lane (`bootstrap_singleton` / `do_install`): a
+    // failed install returns NO report, so the resolved asset rides the collector
+    // out-param — filled before the download, surviving the `Err`.
+    #[test]
+    fn a_failed_singleton_download_still_fills_the_resolved_asset_collector() {
+        let dir = scratch("resume-collector-singleton");
+        let mut fake = fixture(&dir);
+        fake.archives.remove("ay-18.tar.zst");
+        let layout = layout(&dir);
+        let staging = layout.staging_dir("ay");
+        std::fs::create_dir_all(&staging).unwrap();
+        let part = staging.join("ay-18.tar.zst.part");
+        std::fs::write(&part, b"resume-bytes").unwrap();
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+
+        let mut resolved = std::collections::BTreeMap::new();
+        let err = install_collecting_assets(
+            &fake,
+            &layout,
+            &anchor(),
+            &req,
+            fl(0),
+            0,
+            &mut resolved,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FlowError::Download(_)),
+            "PRECONDITION: the download failed: {err:?}"
+        );
+        assert_eq!(
+            resolved.get("ay").map(String::as_str),
+            Some("ay-18.tar.zst"),
+            "the collector must survive the Err path — that is its whole reason to exist"
+        );
+
+        let _ = crate::gc::run_keeping_pinned_partials(&layout, &|p| resolved.get(p).cloned());
+        assert!(part.exists(), "the pass-end sweep spares the resume state");
+        let _ = crate::gc::run(&layout);
+        assert!(!part.exists(), "a plain gc still reclaims it");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4896,6 +5261,95 @@ mod tests {
         assert!(!stale.exists(), "a superseded build's partial is reclaimed");
         assert!(bystander.exists(), "only `.part` files are swept");
         assert!(finished.exists(), "a complete asset is not a partial");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GROUP path holds the same strandage bound as the singleton path: staging a
+    /// member reclaims every foreign partial in that program's staging dir (the mirror
+    /// of [`a_resumable_download_strands_at_most_one_partial_per_program`], driven
+    /// through `apply_channel` so it pins `stage_member`'s call, not just the helper).
+    #[test]
+    fn a_group_member_stage_strands_at_most_one_partial_per_program() {
+        let dir = scratch("group-part-sweep");
+        let fake = group_fixture(&dir);
+        let layout = layout(&dir);
+        let staging = layout.staging_dir("trust");
+        std::fs::create_dir_all(&staging).unwrap();
+        let stale = staging.join("trust-4700.tar.zst.part");
+        let bystander = staging.join("notes.txt");
+        for p in [&stale, &bystander] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let installed = std::collections::BTreeMap::from([("ay".to_string(), 17u64)]);
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(
+            layout.build_dir("trust", 4821).exists(),
+            "reach guard: the group member actually staged — report {report:?}"
+        );
+        assert!(
+            !stale.exists(),
+            "a superseded build's partial is reclaimed on the group path too"
+        );
+        assert!(bystander.exists(), "only `.part` files are swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The digest gate's belt-and-braces arm: an asset that FAILS its signed sha256 also
+    /// takes any sibling `.part` with it, so a poisoned prefix can never seed (and
+    /// re-fail) the next attempt. The next attempt refetches whole.
+    #[test]
+    fn a_sha256_mismatch_discards_the_sibling_partial() {
+        let dir = scratch("sha-part");
+        let fake = fixture(&dir);
+        let layout = layout(&dir);
+        // Corrupt the SOURCE after the manifest signed the honest sha256, so the
+        // downloaded bytes can never match the signed value.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(dir.join("ay-18.tar.zst"))
+                .unwrap();
+            f.write_all(b"poison").unwrap();
+        }
+        let staging = layout.staging_dir("ay");
+        std::fs::create_dir_all(&staging).unwrap();
+        let part = staging.join("ay-18.tar.zst.part");
+        std::fs::write(&part, b"poisoned prefix").unwrap();
+        let req = InstallRequest {
+            channel: "stable",
+            program: "ay",
+            triple: TRIPLE,
+            installed: None,
+        };
+        let err = install(&fake, &layout, &anchor(), &req, fl(0), 0)
+            .expect_err("a corrupted asset must fail the signed digest gate");
+        assert!(
+            matches!(
+                &err,
+                FlowError::Stage(StageError::Sha256Mismatch { .. })
+            ),
+            "reach guard: the failure is the digest gate, not something earlier — {err:?}"
+        );
+        assert!(
+            !part.exists(),
+            "the sibling partial goes with the digest-failing asset"
+        );
+        assert!(
+            !staging.join("ay-18.tar.zst").exists(),
+            "the failed asset itself is reclaimed, as before"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

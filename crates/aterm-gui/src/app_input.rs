@@ -2775,6 +2775,9 @@ impl App {
                         // half-interval paced by `hot_floor`, so the present rate stays
                         // bounded at 2x refresh — the pool-exhaustion guard is untouched.
                         ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
+                        // The classifier's typing evidence: a plain stamp, not
+                        // a pacing deadline (see `WindowState::last_key_at`).
+                        ws.last_key_at = Some(input_now);
                         crate::metrics::note_input();
                         // Stamp the arrival for the `metrics` verb's input→present
                         // slice — the latency a human FEELS when typing. The same

@@ -1788,6 +1788,49 @@ impl SelectionFingerprint {
     }
 }
 
+/// Fold ONE visible pane's selection into [`RepaintKey::pane_selection_fp`].
+///
+/// `RepaintKey` is `Copy`, so it cannot hold a per-pane list; like every sibling
+/// `*_fp` term the early-out only needs the combination to CHANGE whenever any
+/// pane's selection changes. The `index` is mixed in so two panes swapping
+/// selections is not a no-op.
+///
+/// A pane with NO selection contributes NOTHING, so a settled window still folds
+/// to `0` — the documented idle invariant the `frame_latency` present-early-out
+/// benches pin, and what makes this term byte-identical to the pre-all-pane key
+/// on every frame without a selection.
+///
+/// The folded values are the ones that decide what PAINTS: the state and kind,
+/// plus both bound projections the renderer's own row predicates read
+/// (`normalized_bounds` for `Lines`, `side_adjusted_bounds` for the rest — the
+/// latter is where an anchor's `side` lands, which is not otherwise reachable
+/// from outside `aterm-selection`).
+fn fold_pane_selection_fp(
+    acc: u64,
+    index: usize,
+    sel: &aterm_core::selection::TextSelection,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    if !sel.has_selection() {
+        return acc;
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    acc.hash(&mut hasher);
+    index.hash(&mut hasher);
+    // `SelectionState` is not `Hash`; the three states map to three codes.
+    let state_code: u8 = match sel.state() {
+        SelectionState::None => 0,
+        SelectionState::InProgress => 1,
+        SelectionState::Complete => 2,
+    };
+    state_code.hash(&mut hasher);
+    sel.selection_type().hash(&mut hasher);
+    sel.normalized_bounds().hash(&mut hasher);
+    sel.side_adjusted_bounds().hash(&mut hasher);
+    hasher.finish()
+}
+
 /// Everything that affects the PRESENTED frame which the grid damage tracker
 /// does not already cover, plus the grid's own monotonic damage epoch (D-1).
 ///
@@ -1847,8 +1890,19 @@ struct RepaintKey {
     /// early-out; constant `0` when the feature is off / drained-empty (idle =
     /// byte-identical — nothing is added to the D-1 skip path when disabled).
     rain_fp: u64,
-    /// The active text selection fingerprint.
+    /// The active text selection fingerprint — the FOCUSED pane's, compared
+    /// exactly (not hashed).
     selection: SelectionFingerprint,
+    /// EVERY visible pane's selection, folded (see [`fold_pane_selection_fp`]).
+    ///
+    /// The `selection` term above is focused-pane-only, and since every pane's
+    /// selection PAINTS, that alone swallows the frame whenever an unfocused
+    /// pane's selection moves without grid damage — a `select` verb aimed at a
+    /// non-focused session, a focus switch, an eviction clamp. The grid damage
+    /// tracker never sees selection mutations at all (they touch
+    /// `Terminal::text_selection`), so this is the only term that can carry
+    /// them. `0` while no visible pane holds a selection.
+    pane_selection_fp: u64,
     /// Fingerprint of the VISIBLE tab strip (tab count + active index + the active
     /// tab's title), so a tab switch / open / close / title change repaints the
     /// strip even when the terminal grid below is unchanged. Always `0` when
@@ -1922,6 +1976,15 @@ struct RepaintKey {
     /// frame while up. `0` when no celebration is active ⇒ byte-identical to the pre-
     /// celebration path (the idle-repaint invariant: an idle terminal stays at 0% CPU).
     level_up_fp: u64,
+    /// Fingerprint of the toolchain-provisioning PROGRESS CARD state
+    /// ([`PkgProgressUi`]), quantized: it moves on every real data change
+    /// (`Wake::PkgProgress` from the child-scoped tailer) and, while the card is
+    /// ANIMATING (bytes moved within the last second or a completion flourish in
+    /// flight), on each ~16ms frame bucket so the rainbow/sparkle/cat frames are
+    /// never swallowed by the early-out. **`0` whenever the card is hidden** —
+    /// dismissed or no snapshot — so an idle key is byte-identical to the
+    /// no-card path (the FL-1 idle invariant every sibling `*_fp` holds).
+    pkg_progress_fp: u64,
     /// Whether the OS appearance is dark (`App::os_appearance`). The Settings
     /// preview's `window_theme=auto` titlebar mock splits on the LIVE appearance
     /// (`PreviewCtx::system_dark`, hashed into the raster's geom_key), but a flip
@@ -2418,6 +2481,17 @@ enum Wake {
     ToneStatus {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    /// `trail [<n>]` (control socket): read the FOCUSED window's cursor-trail
+    /// ADMISSION DIAGNOSIS ring — the last N armed/confirmed/retired
+    /// content-candidate decisions with their reasons and generations
+    /// ([`App::trail_admissions`]). Pure read of diagnostic state; the
+    /// one-command replacement for the `ATERM_TRACE_SPAWN` stderr hunt that
+    /// diagnosed the rainbow-trail blackout.
+    TrailAdmissions {
+        /// `Some(n)` = only the newest `n` records; `None` = the whole ring.
+        count: Option<usize>,
+        reply: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
+    },
     /// `status` (control socket): the target session's SUBJECT + classified
     /// STATUS record ([`App::session_status_record`]). A main-thread hop rather
     /// than a control-thread read like `meta`, because the classifier's state is
@@ -2826,6 +2900,20 @@ enum Wake {
     /// claims a toolchain the machine does not have, and the failure pill hides the
     /// programs that did arrive.
     PkgSeedPartial { detail: String },
+    /// One parsed-and-classified `<prefix>/progress.json` snapshot from the
+    /// CHILD-SCOPED tailer thread ([`PkgProgressTailer`]) — the machine channel
+    /// the provisioning progress card renders from (§3 of the streaming-batteries
+    /// design). Posted ONLY when the file's content (or the derived running
+    /// verdict) actually changed, at most ~10Hz, and only while an `atpkg`
+    /// seed/update child is alive: no child ⇒ no tailer ⇒ no wakes (FL-1 holds by
+    /// construction). `None` clears the card — posted once at child exit when the
+    /// file vanished or went unreadable after progress had been shown, so a
+    /// stale card can never outlive its data. The snapshot is UNTRUSTED display
+    /// data: it carries no install authority, and the tailer already applied the
+    /// size cap / regular-file / staleness rules ([`read_pkg_progress_snapshot`]).
+    PkgProgress {
+        snapshot: Option<Box<PkgProgressSnapshot>>,
+    },
 }
 
 /// MEM-ACCT-3(b) shed policy: the low scrollback watermark (bytes) to evict down to when
@@ -3897,6 +3985,21 @@ impl Backend {
         }
     }
 
+    /// Install the Linux subpixel-RGB mode (config `font_subpixel` /
+    /// `$ATERM_FONT_SUBPIXEL`, RFC-linux-subpixel-text stage 1) on the live
+    /// renderer. STAGE 1 IS CPU-COMPOSITOR-ONLY: the GPU backend records the
+    /// mode but keeps its grayscale atlas (no invalidation to ride). A CPU
+    /// change repaints via the caller's present-cache invalidation; inert on
+    /// the targets without the subpixel seam.
+    fn set_font_subpixel(&mut self, mode: &str) {
+        match self {
+            Backend::Cpu(r) => {
+                r.set_font_subpixel(mode);
+            }
+            Backend::Gpu(g) => g.set_font_subpixel(mode),
+        }
+    }
+
     /// Install the W9 variable-font instantiation config (`font_variation` /
     /// `font_weight` requests + `font_weight_dark_nudge`) on the live
     /// renderer. A coord change re-rasterizes (CPU glyph caches / GPU atlas
@@ -4366,6 +4469,10 @@ impl BackendSlot {
 
     fn set_font_hinting(&mut self, mode: &str) {
         self.ready_mut().set_font_hinting(mode);
+    }
+
+    fn set_font_subpixel(&mut self, mode: &str) {
+        self.ready_mut().set_font_subpixel(mode);
     }
 
     fn set_selection_inactive(&mut self, inactive: bool) {
@@ -6912,6 +7019,11 @@ struct WindowState {
     /// next present). See the arming site in `App::input` for why a deadline, rather
     /// than the first content present, is the honest correlation.
     input_hot_until: Option<std::time::Instant>,
+    /// When a human last pressed a key in this window. Distinct from
+    /// `input_hot_until` (a short present-pacing deadline): this is the plain
+    /// stamp the session classifier needs to tell live typing from ambient
+    /// output at a prompt.
+    last_key_at: Option<std::time::Instant>,
     /// THIS window's monitor refresh period, re-sampled whenever the window lands
     /// on a different monitor (`None` → the app-wide primary-monitor default in
     /// `App::frame_interval`). A window on a 120 Hz panel then coalesces at 8.3 ms
@@ -8290,6 +8402,7 @@ impl WindowState {
             bootstrap_present_retry_available: true,
             input_hot: false,
             input_hot_until: None,
+            last_key_at: None,
             frame_interval: None,
             monitor: None,
             last_edr_query: None,
@@ -9874,6 +9987,11 @@ struct App {
     /// rebuilds. Live-reloadable. GLOBAL (window-uniform); inert on macOS /
     /// Windows (no hint seam there).
     font_hinting: String,
+    /// EFFECTIVE Linux subpixel-RGB mode (`$ATERM_FONT_SUBPIXEL` > config
+    /// `font_subpixel` > `"off"`, RFC-linux-subpixel-text stage 1). Source of
+    /// truth re-applied after rebuilds. Live-reloadable. GLOBAL
+    /// (window-uniform); inert on macOS / Windows (no subpixel seam there).
+    font_subpixel: String,
     /// W9 variable-font requests (config `font_variation` + `font_weight`,
     /// parsed `(tag, value)` pairs): the source of truth re-applied after
     /// every rebuild ([`apply_font_config_to_backend`]). A change re-instantiates
@@ -10095,6 +10213,12 @@ struct App {
     /// painted into every window; auto-expires. `None` = no celebration. Animates for its
     /// whole life, so it schedules a repaint every frame while up. See [`crate::level_up`].
     level_up: Option<level_up::LevelUp>,
+    /// The toolchain-provisioning PROGRESS CARD state ([`PkgProgressUi`]): the latest
+    /// `Wake::PkgProgress` snapshot from the child-scoped progress tailer plus the
+    /// card's visibility/animation bookkeeping. GLOBAL like `notice` (the pass is
+    /// machine-wide); hidden = every FL-1 term is byte-identical to the no-card path.
+    /// WP4 renders the card from this; WP3 owns the plumbing.
+    pkg_progress: PkgProgressUi,
     /// PROOF-CARRYING DSU (RFC Rung 2): the PERSISTENT "update staged — relaunch to
     /// apply" nudge. GLOBAL like `config_notice`; painted into every window; does NOT
     /// auto-expire (a pending update stays offered until applied or dismissed). `None`
@@ -11741,6 +11865,7 @@ impl App {
             font_thicken: false,
             stem_gamma: Config::default().stem_gamma_or_default(),
             font_hinting: Config::default().font_hinting_or_default(),
+            font_subpixel: Config::default().font_subpixel_or_default(),
             font_variations: Vec::new(),
             font_weight_dark_nudge: 0.0,
             render_knobs: app_config::RenderKnobs::default(),
@@ -11819,6 +11944,7 @@ impl App {
             boot_health_confirmation_retry_at: None,
             seamless_position: None,
             level_up: None,
+            pkg_progress: PkgProgressUi::default(),
             relaunch: None,
             auto_apply_intent: None,
             auto_apply_manual_only: None,
@@ -14716,6 +14842,19 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::LevelUp,
             );
         }
+        // The toolchain-provisioning progress card contributes ~16ms frame wakes
+        // ONLY while it is visible AND animating (bytes moved within the last
+        // second, or a completion flourish in flight) — hidden or settled it folds
+        // NOTHING, so an idle window never wakes for it (FL-1: data updates arrive
+        // solely as `Wake::PkgProgress` from the child-scoped tailer).
+        if let Some(d) = self.pkg_progress.deadline(Instant::now()) {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::PkgProgress,
+            );
+        }
         if let Some(d) = fold_auto_apply_deadline(self.auto_apply_intent, None) {
             fold_owned_deadline(
                 &mut deadline,
@@ -16201,6 +16340,27 @@ impl ApplicationHandler<Wake> for App {
                     );
                 }
             }
+            // Live provisioning progress from the child-scoped tailer (design §3):
+            // store the snapshot and request redraws ONLY on windows that actually
+            // show the card — the packages-projection fan-out discipline. A hidden
+            // card stores data and paints nothing (its RepaintKey term stays 0, so
+            // settled windows stay settled); the visibility EDGE (clear/appear) also
+            // redraws, or the erase frame would be swallowed.
+            Wake::PkgProgress { snapshot } => {
+                let paint_changed = self.pkg_progress.on_snapshot(snapshot, Instant::now());
+                if paint_changed {
+                    // The card is a passive overlay on the FOCUSED window (it never
+                    // creates windows or steals focus), so only focused windows can
+                    // be showing it.
+                    for ws in self.windows.values_mut() {
+                        if ws.focused
+                            && let Some(w) = ws.os_window.as_ref()
+                        {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            }
             // `settings` control verb: drive the native Settings tab and reply its open
             // state. The enum variant keeps the historical wire-facing name only.
             Wake::SpawnSession { cwd, split, reply } => {
@@ -16220,6 +16380,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::ToneStatus { reply } => {
                 let _ = reply.send(self.tone_status());
+            }
+            Wake::TrailAdmissions { count, reply } => {
+                let _ = reply.send(self.trail_admissions(count));
             }
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
@@ -16945,6 +17108,742 @@ fn co_located_atpkg() -> Option<std::path::PathBuf> {
     candidate.is_file().then_some(candidate)
 }
 
+/// One classified reading of `<prefix>/progress.json`: the parsed snapshot plus the
+/// tailer's RUNNING verdict. The verdict is derived, not copied, from the file — a
+/// dead installer's file can never claim live progress (design §3): `running` is true
+/// only when the file names a live writer pid AND its heartbeat is fresh
+/// ([`pkg_progress_running`]). WP4's card and any other reader must render ONLY
+/// not-running states when this is false, regardless of what the phases claim.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PkgProgressSnapshot {
+    /// The parsed progress file — untrusted display data (size-capped,
+    /// symlink-refusing read; malformed/oversized never got this far).
+    pub(crate) file: atpkg::progress::ProgressFile,
+    /// Whether the installer that wrote `file` is running NOW. False ⇒ render
+    /// not-running states only.
+    pub(crate) running: bool,
+}
+
+/// Current unix seconds, saturating at 0 for a clock before the epoch — backward
+/// skew then reads as epoch-stale, which fails to the safe "not running" direction
+/// (the same rule atpkg's own writer uses).
+fn pkg_unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// The RUNNING verdict for one progress snapshot, pure so the staleness laws are
+/// unit-testable: a cleared pid, a heartbeat outside the freshness window in either
+/// direction (dead writer / absurd future stamp), or a dead process all read as NOT
+/// running. `child_pid`/`child_alive` are the tailer's own child — the common writer —
+/// answered without a process probe; a FOREIGN pid (another installer holding the
+/// store flock) is answered by `foreign_alive`, which production backs with a cached
+/// `snapshot_running` probe.
+fn pkg_progress_running(
+    file: &atpkg::progress::ProgressFile,
+    child_pid: u32,
+    child_alive: bool,
+    now_unix: u64,
+    foreign_alive: impl FnOnce(u32) -> bool,
+) -> bool {
+    let Some(pid) = file.pid else {
+        return false;
+    };
+    let stale = atpkg::progress::HEARTBEAT_STALE_SECS;
+    let hb = file.heartbeat_unix;
+    let fresh = hb <= now_unix.saturating_add(stale) && now_unix.saturating_sub(hb) <= stale;
+    if !fresh {
+        return false;
+    }
+    if pid == child_pid { child_alive } else { foreign_alive(pid) }
+}
+
+/// A 2-second cache over the FOREIGN-pid liveness probe
+/// (`atpkg::progress::snapshot_running` spawns `/bin/kill -0`): the tailer polls at
+/// 10Hz, and ten subprocess probes a second for a pid that is not even ours would be
+/// pure waste. The heartbeat window (10s) makes a 2s-stale answer harmless.
+#[derive(Default)]
+struct ForeignProbe {
+    cached: Option<(u32, Instant, bool)>,
+}
+
+impl ForeignProbe {
+    fn alive(&mut self, file: &atpkg::progress::ProgressFile, pid: u32, now_unix: u64) -> bool {
+        if let Some((p, at, ok)) = self.cached
+            && p == pid
+            && at.elapsed() < Duration::from_secs(2)
+        {
+            return ok;
+        }
+        let ok = atpkg::progress::snapshot_running(file, now_unix);
+        self.cached = Some((pid, Instant::now(), ok));
+        ok
+    }
+}
+
+/// One untrusted read of `<prefix>/progress.json` → the classified snapshot, or
+/// `None` when the file is absent, oversized (>256KiB), not a regular file, or
+/// malformed — all treated identically as "no data" (`atpkg::progress::read_progress`
+/// enforces the cap and the symlink-refusing open; nothing is ever partially parsed).
+/// `child_alive` is false only on the tailer's final post-exit read, so a snapshot
+/// whose writer was our own just-dead child is truthfully not-running even while its
+/// heartbeat is still warm.
+fn read_pkg_progress_snapshot(
+    layout: &atpkg::store::Layout,
+    child_pid: u32,
+    child_alive: bool,
+    probe: &mut ForeignProbe,
+) -> Option<PkgProgressSnapshot> {
+    let file = atpkg::progress::read_progress(layout)?;
+    let now_unix = pkg_unix_now();
+    let running = pkg_progress_running(&file, child_pid, child_alive, now_unix, |pid| {
+        probe.alive(&file, pid, now_unix)
+    });
+    Some(PkgProgressSnapshot { file, running })
+}
+
+/// The CHILD-SCOPED sibling progress tailer (design §3). The `atpkg-update` thread
+/// itself BLOCKS reading the child's stdout line-by-line to feed [`parse_seed_line`]
+/// — it cannot tail a file — so this small thread is spawned when (and only when) an
+/// `atpkg` seed/update child spawns, and joined at child exit: it stats/reads
+/// `progress.json` at 10Hz and posts through `post` ONLY when the classified content
+/// changed. No child ⇒ no tailer ⇒ no wakes — the FL-1 invariant is structural, not
+/// scheduled. `post` abstracts the `EventLoopProxy` so the posting discipline is
+/// unit-testable without an OS event loop.
+struct PkgProgressTailer {
+    stop: Arc<AtomicBool>,
+    handle: std::thread::JoinHandle<()>,
+}
+
+impl PkgProgressTailer {
+    fn spawn(
+        layout: atpkg::store::Layout,
+        child_pid: u32,
+        post: impl Fn(Option<Box<PkgProgressSnapshot>>) + Send + 'static,
+    ) -> Option<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("atpkg-progress-tail".into())
+            .spawn(move || {
+                let mut probe = ForeignProbe::default();
+                let mut last_posted: Option<PkgProgressSnapshot> = None;
+                loop {
+                    // Read the flag BEFORE the read, so the post-`finish` final
+                    // iteration observes the child's exit: its snapshot is
+                    // classified with `child_alive = false`, which is what retires
+                    // a still-warm heartbeat from our own dead child truthfully.
+                    let stopping = flag.load(Ordering::Acquire);
+                    match read_pkg_progress_snapshot(&layout, child_pid, !stopping, &mut probe)
+                    {
+                        Some(snap) => {
+                            if last_posted.as_ref() != Some(&snap) {
+                                post(Some(Box::new(snap.clone())));
+                                last_posted = Some(snap);
+                            }
+                        }
+                        None => {
+                            // Mid-run unreadability keeps the last good state (a
+                            // torn write heals on the next poll — never flicker);
+                            // at exit, a vanished file after progress WAS shown
+                            // posts the clear so a stale card cannot outlive its
+                            // data.
+                            if stopping && last_posted.take().is_some() {
+                                post(None);
+                            }
+                        }
+                    }
+                    if stopping {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .ok()?;
+        Some(Self { stop, handle })
+    }
+
+    /// Stop and JOIN — called right after `child.wait()` returns, so the tailer's
+    /// lifetime is provably a subset of the child's plus one final read.
+    fn finish(self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = self.handle.join();
+    }
+}
+
+/// Bump-triggered early passes have a RATE FLOOR (design §4, panel-required): at
+/// most one per 5 minutes, so a user hammering a stub for a permanently failing
+/// program can never drive an unbounded series of network passes. Pure for the test.
+fn bump_pass_allowed(now: Instant, last_trigger: Option<Instant>) -> bool {
+    last_trigger.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(5 * 60))
+}
+
+/// Whether a fresh bump should trigger an early update pass, given the admitted bump
+/// names and the CURRENT pass's progress snapshot: a name whose failure that pass
+/// already recorded does NOT re-trigger (the stub's `failed` state already names the
+/// next act); any bumped name without a recorded failure does. No names ⇒ nothing to
+/// do. Pure for the test; the caller already read both files under the untrusted-
+/// reader rules.
+fn bump_should_trigger(
+    names: &[String],
+    progress: Option<&atpkg::progress::ProgressFile>,
+) -> bool {
+    if names.is_empty() {
+        return false;
+    }
+    let Some(p) = progress else {
+        return true;
+    };
+    names.iter().any(|n| {
+        p.programs
+            .get(n)
+            .is_none_or(|row| row.phase != atpkg::progress::Phase::Failed)
+    })
+}
+
+/// The no-installer bump watch state, carried across the update loop's parks.
+#[derive(Default)]
+struct BumpWatch {
+    /// The bump-file mtime we last ACTED on (triggered, or deliberately declined —
+    /// a failure-only bump is consumed, not retried every 5 seconds).
+    acted_mtime: Option<std::time::SystemTime>,
+    /// When the last bump-TRIGGERED early pass started — the rate floor's clock.
+    last_trigger: Option<Instant>,
+}
+
+/// Park the update loop for `interval`, in 5-second slices that watch
+/// `<prefix>/bump` (design §4): a fresh bump — new mtime, admitted names, rate floor
+/// honored, not a failure the current pass already recorded — RETURNS EARLY, which
+/// the caller turns into an immediate `atpkg update` pass. The 6h cadence itself is
+/// unchanged: with no bump this sleeps the whole interval. A 5s stat in a parked
+/// background thread costs zero frames — FL-1 governs repaints, not worker threads.
+/// The stat is `symlink_metadata` and regular-file-gated like every other read of
+/// this file; a non-regular plant is ignored outright.
+fn sleep_interval_watching_bump(
+    layout: Option<&atpkg::store::Layout>,
+    interval: Duration,
+    watch: &mut BumpWatch,
+) {
+    let end = Instant::now() + interval;
+    loop {
+        let now = Instant::now();
+        let Some(remaining) = end.checked_duration_since(now) else {
+            return;
+        };
+        std::thread::sleep(remaining.min(Duration::from_secs(5)));
+        let Some(l) = layout else {
+            continue;
+        };
+        let Ok(meta) = std::fs::symlink_metadata(l.bump_file()) else {
+            continue;
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        if watch.acted_mtime == Some(mtime) {
+            continue;
+        }
+        if !bump_pass_allowed(Instant::now(), watch.last_trigger) {
+            // Floored: do NOT mark the mtime acted-on — the same bump re-qualifies
+            // once the floor lapses, so a wish made during the cooldown is delayed,
+            // never lost.
+            continue;
+        }
+        let names = atpkg::progress::read_bump(l);
+        let progress = atpkg::progress::read_progress(l);
+        if !bump_should_trigger(&names, progress.as_ref()) {
+            // Nothing actionable (garbage-only file, or every name's failure is
+            // already recorded in the current pass): consume this mtime so the
+            // watch does not re-evaluate it every slice.
+            watch.acted_mtime = Some(mtime);
+            continue;
+        }
+        watch.acted_mtime = Some(mtime);
+        watch.last_trigger = Some(Instant::now());
+        return;
+    }
+}
+
+/// How long after the last observed byte movement the card still counts as
+/// ANIMATING — the window that keeps the rainbow/cat frames flowing between 10Hz
+/// data ticks without ever waking a settled card.
+const PKG_PROGRESS_ACTIVE_WINDOW: Duration = Duration::from_secs(1);
+
+/// The GUI-side provisioning-progress state (design §3/§6 plumbing): the latest
+/// tailer snapshot plus the card's visibility/animation bookkeeping. WP3 owns the
+/// data plumbing and the FL-1 terms ([`RepaintKey::pkg_progress_fp`], the
+/// [`metrics::DeadlineOwner::PkgProgress`] fold); WP4 renders the card from
+/// [`Self::snapshot`] and drives [`Self::dismiss`]/[`Self::reopen`]/[`Self::note_fx`].
+#[derive(Default)]
+pub(crate) struct PkgProgressUi {
+    /// The latest classified snapshot; `None` = no data = hidden.
+    snapshot: Option<Box<PkgProgressSnapshot>>,
+    /// The user dismissed the card for THIS pass. A new pass (different
+    /// `pass`/`started_unix` identity) re-shows — dismissal is per-announcement,
+    /// not forever.
+    dismissed: bool,
+    /// Fixed origin for the animation frame bucket (set at first snapshot), so the
+    /// quantized fingerprint has a stable clock to step against.
+    origin: Option<Instant>,
+    /// When byte progress (download or extract) last advanced — the ANIMATING window's
+    /// input. `None` after a clear.
+    last_bytes_move: Option<Instant>,
+    /// The progress metric behind `last_bytes_move`: (overall bytes, per-program byte
+    /// sum) — the per-program sum catches extract-phase movement, whose bytes ride the
+    /// rows rather than the overall rollup.
+    last_metric: Option<(u64, u64)>,
+    /// A completion flourish (sparkle sweep / celebration) in flight until this
+    /// instant — WP4 latches it via [`Self::note_fx`]; it extends the animating
+    /// window so the flourish's frames are scheduled even after bytes stop.
+    fx_until: Option<Instant>,
+}
+
+impl PkgProgressUi {
+    /// Fold one tailer post in. Returns whether the card's PAINT could have changed
+    /// (it was, or now is, visible) — the caller's redraw-request gate.
+    fn on_snapshot(&mut self, snap: Option<Box<PkgProgressSnapshot>>, now: Instant) -> bool {
+        let was_visible = self.visible();
+        match snap {
+            None => {
+                self.snapshot = None;
+                self.last_bytes_move = None;
+                self.last_metric = None;
+            }
+            Some(s) => {
+                if self.origin.is_none() {
+                    self.origin = Some(now);
+                }
+                // A NEW pass identity re-arms a dismissed card: dismissal answered
+                // one announcement, not all future ones.
+                let new_pass = self.snapshot.as_ref().is_none_or(|old| {
+                    old.file.pass != s.file.pass || old.file.started_unix != s.file.started_unix
+                });
+                if new_pass {
+                    self.dismissed = false;
+                }
+                let metric = (
+                    s.file.overall.bytes_done,
+                    s.file.programs.values().map(|r| r.bytes_done).sum::<u64>(),
+                );
+                if s.running && self.last_metric.is_some_and(|m| m != metric) {
+                    self.last_bytes_move = Some(now);
+                }
+                self.last_metric = Some(metric);
+                self.snapshot = Some(s);
+            }
+        }
+        was_visible || self.visible()
+    }
+
+    /// Whether the card is shown at all. Hidden ⇒ [`Self::fingerprint`] is 0 and
+    /// [`Self::deadline`] folds nothing — byte-identical to the no-card path.
+    pub(crate) fn visible(&self) -> bool {
+        !self.dismissed && self.snapshot.is_some()
+    }
+
+    /// The latest snapshot, for the card's layout (WP4).
+    #[allow(
+        dead_code,
+        reason = "WP4 (the progress card) renders from this; WP3 lands the plumbing first"
+    )]
+    pub(crate) fn snapshot(&self) -> Option<&PkgProgressSnapshot> {
+        self.snapshot.as_deref()
+    }
+
+    /// Dismiss the card (WP4's click seam). Per-pass: a new pass re-shows.
+    #[allow(
+        dead_code,
+        reason = "WP4 (the progress card) wires the dismiss click; WP3 lands the plumbing first"
+    )]
+    pub(crate) fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+
+    /// Reopen a dismissed card (Settings ▸ Packages, WP4).
+    #[allow(
+        dead_code,
+        reason = "WP4 (the progress card) wires the reopen affordance; WP3 lands the plumbing first"
+    )]
+    pub(crate) fn reopen(&mut self) {
+        self.dismissed = false;
+    }
+
+    /// Latch a completion flourish (sparkle sweep / celebration) until `until`, so
+    /// its frames stay scheduled after bytes stop moving (WP4 calls this when a row
+    /// completes).
+    #[allow(
+        dead_code,
+        reason = "WP4 (the progress card) latches its sparkle sweeps here; WP3 lands the plumbing first"
+    )]
+    pub(crate) fn note_fx(&mut self, until: Instant) {
+        if self.fx_until.is_none_or(|held| held < until) {
+            self.fx_until = Some(until);
+        }
+    }
+
+    /// Whether the card is animating NOW: visible AND (bytes moved within the last
+    /// second, or a flourish in flight). This is the ONLY condition under which the
+    /// card contributes frame wakes — a settled or hidden card is deadline-free.
+    fn animating(&self, now: Instant) -> bool {
+        self.visible()
+            && (self
+                .last_bytes_move
+                .is_some_and(|at| now.duration_since(at) <= PKG_PROGRESS_ACTIVE_WINDOW)
+                || self.fx_until.is_some_and(|until| until > now))
+    }
+
+    /// The card's contribution to `about_to_wait`'s single deadline: a ~16ms frame
+    /// wake while animating, nothing otherwise (FL-1: idle = no deadline, no
+    /// repaint — data updates arrive solely as `Wake::PkgProgress`).
+    fn deadline(&self, now: Instant) -> Option<Instant> {
+        self.animating(now).then(|| now + Duration::from_millis(16))
+    }
+
+    /// The [`RepaintKey::pkg_progress_fp`] term: **exactly 0 when hidden** (the
+    /// byte-identical no-card key), else a nonzero FNV-1a over everything the card
+    /// paints from, XOR-stepped by the ~16ms frame bucket while animating so live
+    /// motion is never swallowed by the early-out (and a steady hold does not churn).
+    pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
+        if !self.visible() {
+            return 0;
+        }
+        let Some(snap) = self.snapshot.as_deref() else {
+            return 0;
+        };
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        let mut fold = |bytes: &[u8]| {
+            for &b in bytes {
+                h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        fold(&[u8::from(snap.running)]);
+        fold(&snap.file.v.to_le_bytes());
+        fold(snap.file.pass.as_bytes());
+        let o = snap.file.overall;
+        fold(&o.programs_done.to_le_bytes());
+        fold(&o.programs_total.to_le_bytes());
+        fold(&o.bytes_done.to_le_bytes());
+        fold(&o.bytes_total.to_le_bytes());
+        fold(&[u8::from(snap.file.ended_unix.is_some())]);
+        for name in &snap.file.queue {
+            fold(name.as_bytes());
+            fold(&[0]);
+        }
+        for (name, row) in &snap.file.programs {
+            fold(name.as_bytes());
+            fold(&[0, row.phase as u8, u8::from(row.bumped)]);
+            fold(&row.bytes_done.to_le_bytes());
+            fold(&row.bytes_total.to_le_bytes());
+            fold(&row.build.unwrap_or(0).to_le_bytes());
+            fold(row.error.as_deref().unwrap_or("").as_bytes());
+        }
+        let mut fp = h;
+        if self.animating(now)
+            && let Some(origin) = self.origin
+        {
+            let bucket = now.duration_since(origin).as_millis() / 16;
+            fp ^= u64::try_from(bucket).unwrap_or(u64::MAX).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+        // Never 0 while visible: a card whose content hashed to the hidden
+        // sentinel would have its appearance frame swallowed by the early-out.
+        fp | 1
+    }
+}
+
+#[cfg(test)]
+mod pkg_progress_tests {
+    use super::*;
+    use atpkg::progress::{Overall, Phase, ProgramProgress, ProgressFile};
+
+    fn file_with(pid: Option<u32>, heartbeat_unix: u64) -> ProgressFile {
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "trust".to_string(),
+            ProgramProgress {
+                phase: Phase::Download,
+                bytes_done: 5,
+                bytes_total: 100,
+                build: Some(210),
+                bumped: false,
+                error: None,
+            },
+        );
+        ProgressFile {
+            v: atpkg::progress::PROGRESS_VERSION,
+            pid,
+            pass: "net".to_string(),
+            started_unix: 1,
+            heartbeat_unix,
+            overall: Overall {
+                programs_done: 0,
+                programs_total: 2,
+                bytes_done: 5,
+                bytes_total: 200,
+            },
+            queue: vec!["trust".to_string()],
+            programs,
+            ended_unix: None,
+        }
+    }
+
+    fn snap(running: bool) -> Box<PkgProgressSnapshot> {
+        Box::new(PkgProgressSnapshot {
+            file: file_with(Some(1), pkg_unix_now()),
+            running,
+        })
+    }
+
+    /// FL-1's load-bearing term: the fingerprint is EXACTLY 0 whenever the card
+    /// is hidden — before any data, and after a dismissal — so the RepaintKey is
+    /// byte-identical to the no-card path; visible it is never 0.
+    #[test]
+    fn fingerprint_zero_when_hidden_nonzero_when_visible() {
+        let now = Instant::now();
+        let mut ui = PkgProgressUi::default();
+        assert_eq!(ui.fingerprint(now), 0, "no data ⇒ the hidden sentinel");
+        assert!(ui.on_snapshot(Some(snap(true)), now), "appearing repaints");
+        let fp = ui.fingerprint(now);
+        assert_ne!(fp, 0, "a visible card must move the key");
+        ui.dismiss();
+        assert_eq!(ui.fingerprint(now), 0, "dismissed ⇒ back to the sentinel");
+        assert!(ui.deadline(now).is_none(), "dismissed folds no deadline");
+    }
+
+    /// Dismissal answers ONE announcement: the same pass stays dismissed through
+    /// further data ticks, and a NEW pass identity re-shows the card.
+    #[test]
+    fn dismissal_is_per_pass() {
+        let now = Instant::now();
+        let mut ui = PkgProgressUi::default();
+        ui.on_snapshot(Some(snap(true)), now);
+        ui.dismiss();
+        let mut same_pass = snap(true);
+        same_pass.file.overall.bytes_done = 50;
+        ui.on_snapshot(Some(same_pass), now);
+        assert!(!ui.visible(), "same pass stays dismissed");
+        let mut next_pass = snap(true);
+        next_pass.file.started_unix = 2;
+        ui.on_snapshot(Some(next_pass), now);
+        assert!(ui.visible(), "a new pass re-arms the card");
+    }
+
+    /// The deadline exists ONLY while visible AND active: byte movement opens the
+    /// 1s animating window, its lapse closes it, and a hidden card never folds one
+    /// (idle = no deadline, no repaint).
+    #[test]
+    fn deadline_only_while_visible_and_animating() {
+        let t0 = Instant::now();
+        let mut ui = PkgProgressUi::default();
+        ui.on_snapshot(Some(snap(true)), t0);
+        assert!(
+            ui.deadline(t0).is_none(),
+            "first snapshot proves no movement yet"
+        );
+        let mut moved = snap(true);
+        moved.file.overall.bytes_done = 42;
+        ui.on_snapshot(Some(moved), t0 + Duration::from_millis(100));
+        let mid = t0 + Duration::from_millis(200);
+        assert!(ui.deadline(mid).is_some(), "bytes just moved ⇒ frame wakes");
+        let late = t0 + Duration::from_secs(3);
+        assert!(
+            ui.deadline(late).is_none(),
+            "movement lapsed ⇒ the card settles and folds nothing"
+        );
+        // The flourish latch re-opens the window without byte movement.
+        ui.note_fx(late + Duration::from_millis(500));
+        assert!(ui.deadline(late).is_some(), "flourish in flight ⇒ frames");
+    }
+
+    /// While animating the fingerprint steps with the ~16ms frame bucket (live
+    /// motion is never swallowed); settled, it holds still (no churn).
+    #[test]
+    fn fingerprint_steps_only_while_animating() {
+        let t0 = Instant::now();
+        let mut ui = PkgProgressUi::default();
+        ui.on_snapshot(Some(snap(true)), t0);
+        let mut moved = snap(true);
+        moved.file.overall.bytes_done = 42;
+        ui.on_snapshot(Some(moved), t0 + Duration::from_millis(50));
+        let a = ui.fingerprint(t0 + Duration::from_millis(100));
+        let b = ui.fingerprint(t0 + Duration::from_millis(150));
+        assert_ne!(a, b, "animating frames must not early-out");
+        let s1 = ui.fingerprint(t0 + Duration::from_secs(10));
+        let s2 = ui.fingerprint(t0 + Duration::from_secs(11));
+        assert_eq!(s1, s2, "a settled card holds one fingerprint");
+    }
+
+    /// The staleness laws (design §3): a dead installer's file can never claim
+    /// live progress — cleared pid, stale heartbeat, absurd future heartbeat, and
+    /// an exited child all read NOT running; only fresh + alive reads running.
+    #[test]
+    fn running_verdict_fails_safe() {
+        let now = pkg_unix_now();
+        let fresh = file_with(Some(7), now);
+        assert!(pkg_progress_running(&fresh, 7, true, now, |_| {
+            panic!("own child needs no probe")
+        }));
+        assert!(
+            !pkg_progress_running(&fresh, 7, false, now, |_| panic!("no probe")),
+            "our child exited ⇒ not running even with a warm heartbeat"
+        );
+        let stale = file_with(Some(7), now.saturating_sub(11));
+        assert!(
+            !pkg_progress_running(&stale, 7, true, now, |_| true),
+            "heartbeat >10s old ⇒ not running"
+        );
+        let future = file_with(Some(7), now + 11);
+        assert!(
+            !pkg_progress_running(&future, 7, true, now, |_| true),
+            "an absurd future stamp must not pin the file live"
+        );
+        let ended = file_with(None, now);
+        assert!(
+            !pkg_progress_running(&ended, 7, true, now, |_| true),
+            "cleared pid = clean pass end ⇒ not running"
+        );
+        let foreign = file_with(Some(9), now);
+        assert!(
+            pkg_progress_running(&foreign, 7, true, now, |pid| pid == 9),
+            "a foreign writer is answered by the probe"
+        );
+    }
+
+    /// Malformed and oversized progress files are IGNORED identically — treated
+    /// as absent, never partially parsed, never a crash (untrusted-reader rules).
+    #[test]
+    fn malformed_and_oversized_progress_ignored() {
+        let prefix = std::env::temp_dir().join(format!(
+            "aterm-pkg-progress-bad-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        let mut probe = ForeignProbe::default();
+        assert!(
+            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            "absent file reads as no data"
+        );
+        std::fs::write(layout.progress_file(), b"{not json").unwrap();
+        assert!(
+            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            "malformed reads as no data"
+        );
+        let oversized = " ".repeat(300 * 1024);
+        std::fs::write(layout.progress_file(), oversized).unwrap();
+        assert!(
+            read_pkg_progress_snapshot(&layout, 1, true, &mut probe).is_none(),
+            "oversized reads as no data — never partially parsed"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// The tailer's posting discipline: nothing without a file, one post per
+    /// content change (not per poll), and the join's final read retires our own
+    /// dead child's still-warm heartbeat to not-running.
+    #[test]
+    fn tailer_posts_on_change_only_and_retires_at_exit() {
+        let prefix = std::env::temp_dir().join(format!(
+            "aterm-pkg-progress-tail-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&prefix).unwrap();
+        let layout = atpkg::store::Layout {
+            prefix: prefix.clone(),
+        };
+        // Quiet lane first: no progress file ⇒ zero posts, ever.
+        let (tx, rx) = std::sync::mpsc::channel::<Option<Box<PkgProgressSnapshot>>>();
+        let sender = tx.clone();
+        let quiet = PkgProgressTailer::spawn(layout.clone(), std::process::id(), move |s| {
+            let _ = sender.send(s);
+        })
+        .expect("tailer spawns");
+        std::thread::sleep(Duration::from_millis(250));
+        quiet.finish();
+        assert!(rx.try_recv().is_err(), "no file ⇒ no wakes");
+        // Live lane: one snapshot, one post; unchanged content re-polled ⇒ no
+        // second post; finish ⇒ the final read posts the not-running retirement
+        // (same bytes, flipped verdict).
+        let file = file_with(Some(std::process::id()), pkg_unix_now());
+        std::fs::write(
+            layout.progress_file(),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let sender = tx.clone();
+        let live = PkgProgressTailer::spawn(layout.clone(), std::process::id(), move |s| {
+            let _ = sender.send(s);
+        })
+        .expect("tailer spawns");
+        std::thread::sleep(Duration::from_millis(350));
+        let first = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("one post for the first read")
+            .expect("data, not a clear");
+        assert!(first.running, "fresh heartbeat + our live pid ⇒ running");
+        assert!(
+            rx.try_recv().is_err(),
+            "unchanged content re-polled ⇒ no repeat post"
+        );
+        live.finish();
+        let last = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the final read posts the retirement")
+            .expect("data, not a clear");
+        assert!(
+            !last.running,
+            "child exit retires a still-warm heartbeat to not-running"
+        );
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    /// The bump-triggered early pass rate floor (panel-required): at most one per
+    /// 5 minutes, and a bump whose every program already FAILED in the current
+    /// pass does not re-trigger — while any un-failed name still does.
+    #[test]
+    fn bump_rate_floor_and_failure_filter() {
+        let now = Instant::now();
+        assert!(bump_pass_allowed(now, None), "first trigger is free");
+        assert!(
+            !bump_pass_allowed(now + Duration::from_secs(299), Some(now)),
+            "inside the floor ⇒ refused"
+        );
+        assert!(
+            bump_pass_allowed(now + Duration::from_secs(300), Some(now)),
+            "floor lapsed ⇒ allowed"
+        );
+        let mut failed = file_with(None, 0);
+        failed
+            .programs
+            .get_mut("trust")
+            .expect("fixture row")
+            .phase = Phase::Failed;
+        let names = vec!["trust".to_string()];
+        assert!(
+            !bump_should_trigger(&names, Some(&failed)),
+            "a failure already recorded in the current pass does not re-trigger"
+        );
+        assert!(
+            bump_should_trigger(&names, None),
+            "no pass record ⇒ the wish stands"
+        );
+        let names2 = vec!["trust".to_string(), "robi".to_string()];
+        assert!(
+            bump_should_trigger(&names2, Some(&failed)),
+            "any un-failed name still triggers"
+        );
+        assert!(
+            !bump_should_trigger(&[], Some(&failed)),
+            "no admitted names ⇒ nothing to do"
+        );
+    }
+}
+
 /// Spawn the silent toolchain-update loop: a detached thread that periodically runs the
 /// co-located `atpkg update` so installed managed programs (`trust`/`clean`/…) keep current
 /// (and, with `[packages].auto_install = true`, bootstrap-installs missing default-set
@@ -16991,6 +17890,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(6 * 60 * 60);
+            // The store layout the CHILDREN will also resolve (same config, same
+            // code): where `--progress-file` points, where the bump watch stats.
+            // `None` (no resolvable home) degrades to the pre-progress behavior —
+            // children still run, nothing is tailed.
+            let layout = atpkg::store::resolve_configured();
             // First-run batteries-included SEED (§9.1): if the release cut sealed a
             // signed toolchain registry into the app bundle, this one-shot fills an
             // EMPTY store from it (`crates/atpkg/src/cli.rs` `cmd_seed` — bootstrap-
@@ -17014,18 +17918,17 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // first update tick. It is gone: the update pass moves bytes only for
             // programs whose pin actually drifted, so suppressing it delayed
             // exactly the fetches that were needed. See the update loop below.)
-            // HOLD OFF THE SELF-UPDATER for as long as this child reads the seal.
-            // It extracts gigabytes out of THIS bundle by path, and an automatic
-            // apply mid-extraction swaps the bundle for one whose seal was stripped
-            // (2026-08-20 round-8 audit). Cleared on every exit path below.
+            // THE SELF-UPDATER HOLDS OFF while this child reads the seal — it
+            // extracts gigabytes out of THIS bundle by path, and an automatic
+            // apply mid-extraction swaps the bundle for one whose seal was
+            // stripped (2026-08-20 round-8 audit). No choreography here any
+            // more: the child claims the durable seal-read marker ITSELF, with
+            // its own pid, at the seal-fetcher choke point
+            // (`aterm_update_core::seal_guard`) — which guards a user-run
+            // `atpkg seed` exactly like this spawn, and deleted the five
+            // rounds of begin/note/end patches this block used to carry.
             let mut saw_marker = false;
             let mut saw_start = false;
-            // The durable marker is written AFTER the spawn, with the CHILD's pid —
-            // see `note_toolchain_install_pid`. The in-process flag opens here so the
-            // window between spawn and marker is still covered.
-            aterm_update::begin_toolchain_install();
-            // Remembered out here so the teardown below can prove the marker is ours.
-            let mut installer_pid: Option<u32> = None;
             // STDERR IS CAPTURED, NOT DISCARDED. atpkg refuses some seeds at its own
             // dispatch edge — store-lock contention, an unwritable or symlinked
             // prefix — BEFORE `cmd_seed` runs, so those refusals print only to
@@ -17033,14 +17936,27 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             // raised no event, wrote no status and logged nothing, so a launch that
             // silently did nothing was indistinguishable from one that had nothing
             // to do (2026-08-20 round-8 audit).
-            if let Ok(mut child) = std::process::Command::new(&atpkg)
+            let mut seed_cmd = std::process::Command::new(&atpkg);
+            seed_cmd
                 .arg("seed")
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
-                installer_pid = Some(child.id());
-                aterm_update::note_toolchain_install_pid(child.id());
+                .stderr(std::process::Stdio::piped());
+            if let Some(l) = &layout {
+                // R5 opt-in: machine progress rides the FILE, not stdout — the
+                // marker lines above stay byte-stable, and terminal lanes (which
+                // never pass this flag) are byte-unchanged.
+                seed_cmd.arg("--progress-file").arg(l.progress_file());
+            }
+            if let Ok(mut child) = seed_cmd.spawn() {
+                // CHILD-SCOPED sibling tailer (§3): this thread is about to BLOCK
+                // on the child's stdout for the marker contract, so the file tail
+                // lives in its own small thread, joined right after `wait()`.
+                let tailer = layout.clone().and_then(|l| {
+                    let proxy = proxy.clone();
+                    PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
+                        let _ = proxy.send_event(Wake::PkgProgress { snapshot });
+                    })
+                });
                 let mut refusal = child.stderr.take();
                 if let Some(out) = child.stdout.take() {
                     use std::io::BufRead as _;
@@ -17073,6 +17989,11 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     })
                     .unwrap_or_default();
                 let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                // Child exited: the tailer's lifetime ends here — one final read
+                // (classified not-running) and a join. No child, no tailer, no wakes.
+                if let Some(t) = tailer {
+                    t.finish();
+                }
                 // RETIRE ONLY A CARD THAT WAS ACTUALLY RAISED. `saw_start` is the
                 // whole condition: `atpkg seed` exits quietly and MARKERLESSLY on
                 // every ordinary launch of a provisioned Mac — the seal is reclaimed
@@ -17110,7 +18031,6 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                     );
                 }
             }
-            aterm_update::end_toolchain_install(installer_pid);
             if !run_update_loop {
                 // `auto_update = false`: the batteries went in above, and that
                 // is all this thread was asked to do.
@@ -17139,6 +18059,7 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
             //
             // Cost of being wrong in this direction is one index fetch (~1 KB)
             // on a machine that just downloaded a gigabyte.
+            let mut bump_watch = BumpWatch::default();
             loop {
                 // STREAM this child too. It was spawned with stdout discarded, which
                 // meant the NETWORK provisioning lane reached the user through no
@@ -17149,12 +18070,25 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // and for any machine that updated the app before provisioning. The
                 // markers atpkg already prints (`net-installed:`, and the
                 // seed-unusable class) were being written to /dev/null.
-                if let Ok(mut child) = std::process::Command::new(&atpkg)
+                let mut update_cmd = std::process::Command::new(&atpkg);
+                update_cmd
                     .arg("update")
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                {
+                    .stderr(std::process::Stdio::null());
+                if let Some(l) = &layout {
+                    // Same R5 opt-in as the seed child: rich progress rides the
+                    // file + `Wake::PkgProgress`; stdout keeps only the markers.
+                    update_cmd.arg("--progress-file").arg(l.progress_file());
+                }
+                if let Ok(mut child) = update_cmd.spawn() {
+                    // Child-scoped tailer, exactly as on the seed pass: spawned
+                    // with the child, joined at its exit (FL-1 by construction).
+                    let tailer = layout.clone().and_then(|l| {
+                        let proxy = proxy.clone();
+                        PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
+                            let _ = proxy.send_event(Wake::PkgProgress { snapshot });
+                        })
+                    });
                     if let Some(out) = child.stdout.take() {
                         use std::io::BufRead as _;
                         for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
@@ -17164,11 +18098,24 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                         }
                     }
                     let _ = child.wait();
+                    if let Some(t) = tailer {
+                        t.finish();
+                    }
                 }
                 if interval == 0 {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(interval));
+                // Park for the interval in 5s slices watching `<prefix>/bump`
+                // (design §4): a stub run while NO installer holds the flock can
+                // only wish — this watch is what grants it, turning a fresh bump
+                // into an immediate pass. Rate-floored (one early pass per 5min),
+                // failure-aware (a program the current pass already recorded as
+                // failed does not re-trigger), and the 6h cadence itself stands.
+                sleep_interval_watching_bump(
+                    layout.as_ref(),
+                    Duration::from_secs(interval),
+                    &mut bump_watch,
+                );
             }
         })
         .is_ok()
@@ -18154,7 +19101,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .ok();
     let (startup_font_tx, startup_font_rx) =
         std::sync::mpsc::sync_channel::<StartupFontGeneration>(1);
+    // THE 300 ms PHASE, made visible. The event loop's later `handle.join()` is
+    // the ledger's `backend_finalize` — measured at 300.83 ms median on macOS,
+    // 66.1% of rust_main → first_present, and until these stamps the one phase
+    // with no drill-down at all. The spawn stamp is taken HERE, on the main
+    // thread, so thread creation lands inside the worker's own timeline and so
+    // the ledger can answer the question `backend_finalize_ns` cannot: how much
+    // of this build had already finished by the time the join was reached.
+    crate::metrics::mark_backend_worker_spawn();
     let backend_handle = std::thread::spawn(move || -> (Backend, bool) {
+        let worker_entry = Instant::now();
         let build_cpu = || -> Renderer {
             Renderer::from_system_with_family(family_for_build.as_deref(), font_px, theme)
                 .unwrap_or_else(|| {
@@ -18165,6 +19121,12 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                     )
                 })
         };
+        let prelude_ns = crate::metrics::leg_elapsed_ns(worker_entry);
+        // The renderer build. `aterm_gpu::startup_probe` splits the GPU arm
+        // further (instance / adapter / device, the parallel font thread and the
+        // wait at its join, and every pipeline); the adapter report below is
+        // deliberately inside this leg, and lands in the derived GPU tail.
+        let gpu_build_started = Instant::now();
         let (mut backend, use_gpu) = if want_gpu {
             match aterm_gpu::GpuRenderer::new_with_family(
                 family_for_build.as_deref(),
@@ -18215,19 +19177,39 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         } else {
             (Backend::Cpu(build_cpu()), false)
         };
+        let gpu_build_ns = crate::metrics::leg_elapsed_ns(gpu_build_started);
+        // A NON-ZERO admit wait means the worker out-ran the main thread's
+        // config resolution, not that fonts are slow — the distinction any
+        // "hand the fonts over sooner" proposal has to be sized against.
+        let font_admit_started = Instant::now();
         let startup_fonts = startup_font_rx
             .recv()
             .expect("startup font generation sender dropped before backend publication");
+        let font_admit_ns = crate::metrics::leg_elapsed_ns(font_admit_started);
+        let font_apply_started = Instant::now();
         apply_font_config_to_backend(
             &mut backend,
             &startup_fonts.config,
             &startup_fonts.variations,
             startup_fonts.dark_nudge,
         );
+        let font_apply_ns = crate::metrics::leg_elapsed_ns(font_apply_started);
         // This method is intentionally worker-only: it can read and parse the
         // broad fallback, symbol, and emoji candidates. Publish a sealed,
         // resident generation so the first event-loop turn performs no font I/O.
+        let font_seal_started = Instant::now();
         backend.seal_admitted_font_sources();
+        let font_seal_ns = crate::metrics::leg_elapsed_ns(font_seal_started);
+        // One transaction, then the done stamp: a snapshot can never observe a
+        // finished worker whose legs are still missing.
+        crate::metrics::record_backend_worker_legs(crate::metrics::StartupWorkerLegs {
+            prelude_ns,
+            gpu_build_ns,
+            font_admit_ns,
+            font_apply_ns,
+            font_seal_ns,
+        });
+        crate::metrics::mark_backend_worker_done();
         (backend, use_gpu)
     });
     // Resolve configured face names while the backend worker is constructing
@@ -19143,6 +20125,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         font_thicken: config.font_thicken_or_default(),
         stem_gamma: config.stem_gamma_or_default(),
         font_hinting: config.font_hinting_or_default(),
+        font_subpixel: config.font_subpixel_or_default(),
         font_variations,
         font_weight_dark_nudge: config.font_weight_dark_nudge_or_default(),
         render_knobs: app_config::RenderKnobs::from_config(&config),
@@ -19254,6 +20237,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         boot_health_confirmation_dispatched: false,
         boot_health_confirmation_retry_at: None,
         level_up: None,
+        pkg_progress: PkgProgressUi::default(),
         relaunch: None,
         auto_apply_intent: None,
         auto_apply_manual_only: None,
@@ -22540,17 +23524,30 @@ mod multi_window_tests {
             ws.cols = 100;
         }
         app.resize_panes_scoped(wid, false);
-        // Three tabs x two panes: the shape whose per-pane hand-off count is
-        // what used to become a thread count.
+        // TABS x TWO PANES, sized so the settle hands off MORE jobs than the
+        // pool's ceiling. That sizing is the whole point of the peak assertion
+        // below and it used to be missing: at three tabs x two panes the settle
+        // handed off SIX jobs against a ceiling of `min(cores, 8)`, so
+        // `peak <= ceiling` was satisfiable by the pre-MPT-1 code that spawned
+        // one thread per job. A bound only proves something when the workload
+        // can exceed it.
+        let ceiling = crate::app_render::reflow_worker_ceiling();
+        let tabs = ceiling.div_ceil(2) + 1;
         let _ = app.split_active_stub_tab(wid);
-        for _ in 0..2 {
+        for _ in 0..tabs - 1 {
             let sid = app.next_session_id;
             app.push_stub_tab(wid, stub_session(sid));
             let _ = app.split_active_stub_tab(wid);
         }
         let mut ids: Vec<u64> = app.pool.iter().map(|s| s.id).collect();
         ids.sort_unstable();
-        assert_eq!(ids.len(), 6, "three tabs x two panes");
+        assert_eq!(ids.len(), tabs * 2, "{tabs} tabs x two panes");
+        assert!(
+            ids.len() > ceiling,
+            "this settle hands off {} job(s) against a pool ceiling of {ceiling} — \
+             it cannot distinguish a bounded pool from a thread per job",
+            ids.len()
+        );
 
         // REAL off-screen history in every pane — an empty store re-attaches
         // vacuously and would prove nothing.
@@ -22588,13 +23585,15 @@ mod multi_window_tests {
         // The CONCURRENCY invariant, read from the process-global gauge: it is
         // a high-water mark, so it stays a valid assertion even with other
         // tests' jobs in flight — if ANY instant ever had more workers running
-        // than the bound allows, this fails.
+        // than the bound allows, this fails. THE COUNT that is MPT-1's headline
+        // ("120 OS threads -> 6") is this one: the old hand-off spawned a thread
+        // per job and ran them all at once, so its peak WAS its job count.
         let peak = usize::try_from(crate::app_render::reflow_gauge::snapshot().peak)
             .unwrap_or(usize::MAX);
-        let ceiling = crate::app_render::reflow_worker_ceiling();
         assert!(
             peak <= ceiling,
-            "{peak} reflow workers ran at once, above the pool ceiling {ceiling}"
+            "{peak} reflow workers ran at once, above the pool ceiling {ceiling} — \
+             a settle's concurrency is scaling with the workspace again"
         );
         assert!(app.structural_invariants_ok());
     }
@@ -25048,6 +26047,7 @@ mod early_out_tests {
             // constant-0 sentinel keeps the key byte-identical to the pre-rain path.
             rain_fp: 0,
             selection: SelectionFingerprint::of(term.text_selection()),
+            pane_selection_fp: super::fold_pane_selection_fp(0, 0, term.text_selection()),
             // No tab strip in these unit frames (the disabled-strip sentinel), so the
             // key matches the byte-identical no-strip path.
             tab_strip: 0,
@@ -25077,6 +26077,9 @@ mod early_out_tests {
             notice_fp: 0,
             // No level-up celebration in these unit frames (the no-celebration sentinel).
             level_up_fp: 0,
+            // No provisioning progress card in these unit frames — the hidden
+            // sentinel keeps the key byte-identical to the no-card path.
+            pkg_progress_fp: 0,
             // Fixed OS appearance in these unit frames (a flip is exercised by
             // `os_appearance_flip_repaints`).
             system_dark: false,
@@ -29196,7 +30199,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            133,
+            134,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -30381,6 +31384,13 @@ mod compose_tests {
         dst.selection.complete_selection();
         dst.selection_bg = 0x0012_3456;
         dst.selection_fg = 0x0065_4321;
+        dst.selections.push(aterm_core::render::PaneSelection {
+            selection: dst.selection.clone(),
+            clip: aterm_core::render::SelectionClip::new(0, 1, 0, 2),
+            bg: 0x0012_3456,
+            fg: 0x0065_4321,
+            inactive: true,
+        });
         assert!(
             dst.selection.has_selection(),
             "fixture must seed stale selection state"
@@ -30442,6 +31452,10 @@ mod compose_tests {
                 aterm_core::render::COLOR_UNSET,
             ),
             "divider-only frames carry no stale terminal selection colours"
+        );
+        assert!(
+            dst.selections.is_empty(),
+            "…and no stale PANE selections, which would out-rank the scalars above"
         );
         assert!(
             dst.line_size_spans.iter().all(Vec::is_empty),

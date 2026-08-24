@@ -3920,6 +3920,11 @@ fn build_cell_pipelines(
         immediate_size: 0,
     });
 
+    // Per-pipeline split (crate::startup_probe): which of the twelve cold
+    // shader-compile pairs actually costs, rather than one lump for all of
+    // them. A running mark — the descriptors are 40-line literals and a
+    // closure around each would restate every one.
+    let mut pipeline_mark = web_time::Instant::now();
     let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu bg pipeline"),
         layout: Some(&bg_layout),
@@ -3949,6 +3954,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(0, pipeline_mark);
 
     // Identical to `bg_pipeline` except the blend state: ALPHA_BLENDING for the
     // translucent-cursor fill (see the `cursor_blend_pipeline` field doc).
@@ -3981,6 +3987,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(1, pipeline_mark);
 
     let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu glyph pipeline"),
@@ -4012,6 +4019,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(2, pipeline_mark);
 
     // Colour-emoji pipeline: same layout/vertex/blend as the mono glyph
     // pipeline, but the `fs_glyph_color` fragment samples an RGBA8 atlas
@@ -4047,6 +4055,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(3, pipeline_mark);
 
     // LUMEN aurora pipeline: PREMULTIPLIED ADDITIVE light. Reuses the bg layout +
     // `vs_bg`/`fs_bg` + `BG_ATTRS` verbatim (fs_bg already returns the full vec4);
@@ -4094,6 +4103,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(4, pipeline_mark);
 
     // PHOSPHOR rain halo pipeline: the glow-add twin with the radial falloff
     // shaders + `RainGlowInstance` layout. Same `bg_layout`, One/One blend, and
@@ -4131,6 +4141,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(5, pipeline_mark);
 
     // HaloMode::Over radial-veil pipeline: the rain-glow pipeline with the deco
     // source-over blend state (wgpu::BlendState::ALPHA_BLENDING — the SAME state
@@ -4168,6 +4179,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(6, pipeline_mark);
 
     // EMBERFORGE FirePatch pipelines: the per-pixel fire-field pair. Both run
     // `vs_fire` over the `FireInstance` layout on the SAME additive (Unorm)
@@ -4208,6 +4220,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(7, pipeline_mark);
     let fire_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu fire over pipeline"),
         layout: Some(&bg_layout),
@@ -4237,6 +4250,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(8, pipeline_mark);
 
     // Sparkle-word decoration pipelines: both reuse the glyph layout + `vs_glyph`
     // + `GLYPH_ATTRS` (textured quad sampling the deco coverage atlas in group 1),
@@ -4272,6 +4286,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(9, pipeline_mark);
     let deco_add_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu deco-add pipeline"),
         layout: Some(&glyph_layout),
@@ -4304,6 +4319,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(10, pipeline_mark);
 
     // Shared RGBA8 sprite pipeline for rain, cats, and free sprites.
     let sprite_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -4335,6 +4351,8 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
+    // Last split: the returned mark has no successor to close against.
+    let _ = crate::startup_probe::split_cell_pipeline(11, pipeline_mark);
     (
         bg_pipeline,
         cursor_blend_pipeline,
@@ -4538,20 +4556,39 @@ impl GpuRenderer {
         // thread, then join. They share no state (the font path touches no GPU
         // object), so this is pure scheduling — no work is eliminated, the two
         // legs just overlap, saving ~min(gpu_init, font_load) off cold start.
+        //
+        // BOTH legs are timed (crate::startup_probe): the font leg's own wall
+        // time on its thread, and — the number that decides whether more overlap
+        // would pay — the WAIT this thread pays at the join, i.e. however much of
+        // the font leg did not fit underneath GPU init.
         let family_owned = family.map(String::from);
         let font_handle = std::thread::spawn(move || {
-            let mut cpu = Renderer::from_system_with_family(family_owned.as_deref(), px, theme)?;
+            let font_started = web_time::Instant::now();
             // Warm the printable-ASCII glyph cache here (still off the critical path,
             // overlapping GPU init) so the first frame's atlas build doesn't
             // rasterize them on the hot path. Byte-identical output (cache fill only).
-            cpu.prewarm_ascii();
-            Some(cpu)
+            let cpu = Renderer::from_system_with_family(family_owned.as_deref(), px, theme).map(
+                |mut cpu| {
+                    cpu.prewarm_ascii();
+                    cpu
+                },
+            );
+            crate::startup_probe::record(
+                crate::startup_probe::Leg::FontThread,
+                font_started.elapsed(),
+            );
+            cpu
         });
         let ctx = GpuContext::new()?;
+        let font_join_started = web_time::Instant::now();
         let cpu = font_handle
             .join()
             .map_err(|_| "font-load thread panicked".to_string())?
             .ok_or("no system monospace font")?;
+        crate::startup_probe::record(
+            crate::startup_probe::Leg::FontJoin,
+            font_join_started.elapsed(),
+        );
         Self::from_parts(ctx, cpu, family.map(String::from), theme)
     }
 
@@ -4568,14 +4605,28 @@ impl GpuRenderer {
         theme: Theme,
     ) -> Result<Self, String> {
         let device = &ctx.device;
+        // PIPELINE CONSTRUCTION, timed in groups (crate::startup_probe). This
+        // function builds thirteen render pipelines — 26 shader compiles on
+        // Metal — and was the largest un-sized guess inside the frontend's
+        // `backend_finalize` phase. `PipeTotal` is this whole function; the
+        // groups below partition it, and `build_cell_pipelines` splits its
+        // twelve further, one slot each.
+        let from_parts_started = web_time::Instant::now();
 
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("aterm-gpu shader"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        let shader = crate::startup_probe::timed(crate::startup_probe::Leg::PipeShader, || {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("aterm-gpu shader"),
+                source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            })
         });
 
+        let uniform_atlas_started = web_time::Instant::now();
         let (uniform_buf, uniform_bgl, uniform_bg) = build_uniform_resources(device);
         let (atlas_bgl, sampler) = build_atlas_resources(device);
+        crate::startup_probe::record(
+            crate::startup_probe::Leg::PipeUniformAtlas,
+            uniform_atlas_started.elapsed(),
+        );
         // Single source of truth for every offscreen colour-target format (see
         // crate::format_plan): base OVER/REPLACE + cursor + deco_over passes attach
         // off.view_srgb; the additive glow/deco-add, bloom, and tray passes attach
@@ -4595,28 +4646,39 @@ impl GpuRenderer {
             deco_over_pipeline,
             deco_add_pipeline,
             sprite_over_pipeline,
-        ) = build_cell_pipelines(
-            device,
-            &shader,
-            &uniform_bgl,
-            &atlas_bgl,
-            base_target,
-            additive_target,
-        );
+        ) = crate::startup_probe::timed(crate::startup_probe::Leg::PipeCell, || {
+            build_cell_pipelines(
+                device,
+                &shader,
+                &uniform_bgl,
+                &atlas_bgl,
+                base_target,
+                additive_target,
+            )
+        });
 
         let (blit_shader, blit_bgl, blit_layout, blit_sampler, blit_uniform_buf) =
-            build_blit_resources(device);
+            crate::startup_probe::timed(crate::startup_probe::Leg::PipeBlit, || {
+                build_blit_resources(device)
+            });
 
         let (tray_shader, tray_bgl, tray_layout, tray_sampler, tray_uniform_buf) =
-            build_tray_resources(device);
+            crate::startup_probe::timed(crate::startup_probe::Leg::PipeTray, || {
+                build_tray_resources(device)
+            });
 
         // The bloom composite + extract attach off.view, so they use offscreen_format.
         let (bloom_bgl, bloom_sampler, bloom_pipeline, bloom_uniform_buf) =
-            build_bloom_resources(device, ctx.offscreen_format());
+            crate::startup_probe::timed(crate::startup_probe::Leg::PipeBloom, || {
+                build_bloom_resources(device, ctx.offscreen_format())
+            });
 
-        let vbufs = VertexBuffers::new(device);
+        let vbufs = crate::startup_probe::timed(crate::startup_probe::Leg::PipeVertexBuffers, || {
+            VertexBuffers::new(device)
+        });
 
-        Ok(Self {
+        let pipe_tail_started = web_time::Instant::now();
+        let renderer = Self {
             ctx,
             cpu,
             font_family,
@@ -4705,7 +4767,16 @@ impl GpuRenderer {
             last_instances: 0,
             last_bg_instances: 0,
             last_frame_passes: 0,
-        })
+        };
+        crate::startup_probe::record(
+            crate::startup_probe::Leg::PipeTail,
+            pipe_tail_started.elapsed(),
+        );
+        crate::startup_probe::record(
+            crate::startup_probe::Leg::PipeTotal,
+            from_parts_started.elapsed(),
+        );
+        Ok(renderer)
     }
 
     /// Rebuild the font/theme IN PLACE without recreating the wgpu device — the
@@ -4926,6 +4997,19 @@ impl GpuRenderer {
         if self.cpu.set_font_hinting(mode) {
             self.invalidate_atlas();
         }
+    }
+
+    /// Record the Linux subpixel-RGB mode (config `font_subpixel` /
+    /// `ATERM_FONT_SUBPIXEL`, RFC-linux-subpixel-text stage 1) on the wrapped
+    /// CPU face. STAGE 1 IS CPU-COMPOSITOR-ONLY: this GPU backend keeps its
+    /// R8 grayscale atlas — the shared `GlyphImage` bytes the atlas uploads
+    /// are untouched by the flag, so there is deliberately NO atlas
+    /// invalidation here, and GPU-presented frames render grayscale until
+    /// stage 2 (the dual-source blend seam). The mode is recorded so the
+    /// config round-trips and a later backend fallback to CPU presentation
+    /// honours it.
+    pub fn set_font_subpixel(&mut self, mode: &str) {
+        let _ = self.cpu.set_font_subpixel(mode);
     }
 
     /// Replace just the fg/bg/cursor/selection theme live (host theme change) on both
@@ -11625,37 +11709,22 @@ impl GpuRenderer {
         // else the historical theme_bg (which already carries the M5 glass
         // alpha where that applies).
         let strip_bg = if backdrop_margins_on { margin_bg } else { theme_bg };
-        // The selection band colour for THIS frame. Terminal-owned OSC 17/21
-        // state wins over the static renderer theme; with none in force the CPU
-        // face stays the single source of truth (`effective_selection_bg`), so
-        // every frame without a live selection colour is byte-identical to
-        // before. A LIVE colour re-runs that same active/inactive policy against
-        // the terminal's value — an unfocused pane still applies its explicit
-        // inactive colour or derives the dim band from the live selection/default
-        // backgrounds. Mirrors the CPU `frame_selection_bg` policy.
+        // The selection colours for THIS frame, resolved through the CPU face's
+        // `SelectionPalette` — ONE function applies the policy for both
+        // backends. Terminal-owned OSC 17/19/21 state wins over the static
+        // renderer theme; with none in force the theme policy
+        // (`effective_selection_bg` / the configured `selectionForeground`)
+        // stands, so every frame without live selection colours is
+        // byte-identical to before. A LIVE colour re-runs that same
+        // active/inactive rule against the terminal's value.
+        //
+        // Indexed by `RenderInput::selection_hit`, because a composed split
+        // carries one selection PER PANE with its own colours and its own
+        // focus: hoisting one scalar band colour is exactly what made an
+        // unfocused pane's highlight wear the focused pane's OSC 17.
         // Captured once so the per-cell selection-fg floor below doesn't borrow
         // self inside the loop (where self.cpu is borrowed for glyph-key resolution).
-        let theme_selection = if input.selection_bg == aterm_core::render::COLOR_UNSET {
-            self.cpu.effective_selection_bg()
-        } else {
-            let active_selection = input.selection_bg & 0x00ff_ffff;
-            if self.cpu.selection_inactive() {
-                self.cpu.selection_inactive_bg().unwrap_or_else(|| {
-                    aterm_render::derive_inactive_selection_bg(active_selection, frame_bg)
-                })
-            } else {
-                active_selection
-            }
-        };
-        // OSC 19 selected-text ink likewise wins over the host's static
-        // selectionForeground. UNSET delegates to that configured
-        // explicit/automatic policy; DYNAMIC explicitly selects the automatic
-        // contrast floor.
-        let selection_fg = match input.selection_fg {
-            aterm_core::render::COLOR_DYNAMIC => None,
-            aterm_core::render::COLOR_UNSET => self.cpu.selection_fg(),
-            color => Some(color & 0x00ff_ffff),
-        };
+        let selection_palette = self.cpu.selection_palette(input);
         // Per-cell minimum-contrast floor (read off the CPU face — the single
         // source of truth; `<= 1.0` = off and the floor returns the raw fg,
         // keeping the disabled path byte-identical). Matches the CPU seam.
@@ -11997,7 +12066,12 @@ impl GpuRenderer {
                 let x0u = sat_pos_u16(pad + cx);
                 // A lead cell is wide iff the NEXT cell is its continuation.
                 let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-                let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
+                // WHICH selection paints this cell, not merely whether one does:
+                // its index selects the owning pane's band colour (CPU twin:
+                // `render_row_bg`'s `resolve`).
+                let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+                let selected = hit.is_some();
+                let theme_selection = selection_palette.at_hit(hit).bg;
                 let cell_bg = aterm_render::rgb_to_u32(cell.bg);
                 let default_bg = aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
                 // WALLPAPER: an unselected default-bg cell pushes NO quad — the
@@ -12092,7 +12166,9 @@ impl GpuRenderer {
                         continue;
                     }
                     // An unmaterialized cell holds no wide lead or continuation.
-                    let selected = input.selection_contains_cell(r, c, false, false);
+                    let hit = input.selection_hit(r, c, false, false);
+                    let selected = hit.is_some();
+                    let theme_selection = selection_palette.at_hit(hit).bg;
                     let default_bg =
                         aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg);
                     let color = if selected {
@@ -12310,12 +12386,13 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = input.selection_contains_cell(
-                    r,
-                    c,
-                    cells.get(c + 1).is_some_and(|n| n.wide),
-                    cell.wide,
-                );
+                let hit =
+                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide);
+                let cell_selected = hit.is_some();
+                let aterm_render::SelectionColors {
+                    bg: theme_selection,
+                    fg: selection_fg,
+                } = selection_palette.at_hit(hit);
                 let glyph_color = rgb4_u32(aterm_render::effective_glyph_fg(
                     selection_fg,
                     min_contrast,
@@ -12548,12 +12625,13 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = input.selection_contains_cell(
-                    r,
-                    c,
-                    cells.get(c + 1).is_some_and(|n| n.wide),
-                    cell.wide,
-                );
+                let hit =
+                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide);
+                let cell_selected = hit.is_some();
+                let aterm_render::SelectionColors {
+                    bg: theme_selection,
+                    fg: selection_fg,
+                } = selection_palette.at_hit(hit);
                 let bg_under = if cell_selected {
                     rgb4_u32(theme_selection)
                 } else {
@@ -12854,7 +12932,12 @@ impl GpuRenderer {
                         .at(c as u16)
                         .unwrap_or_else(|| aterm_render::rgb_to_u32(cell.fg)),
                 };
-                let cell_selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
+                let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+                let cell_selected = hit.is_some();
+                let aterm_render::SelectionColors {
+                    bg: theme_selection,
+                    fg: selection_fg,
+                } = selection_palette.at_hit(hit);
                 let ucolor = rgb4_u32(aterm_render::effective_deco_color(
                     selection_fg,
                     min_contrast,
@@ -13270,9 +13353,7 @@ impl GpuRenderer {
                 }
                 // Freeze the additive sparkle over selected cells — identical
                 // per-cell predicate to the CPU `draw_decorations`, so parity holds.
-                if matches!(d.blend, aterm_render::DecoBlend::Add)
-                    && input.selection.has_selection()
-                {
+                if matches!(d.blend, aterm_render::DecoBlend::Add) && input.any_selection() {
                     let row_cells = &input.cells[row];
                     let is_wide_lead = row_cells.get(col + 1).is_some_and(|n| n.wide);
                     let cell_wide = row_cells.get(col).is_some_and(|n| n.wide);

@@ -1098,18 +1098,175 @@ pub(crate) struct TrendSample {
     pub inverted: bool,
 }
 
+// ---------------------------------------------------------------------------
+// MACHINE IDENTITY (W-1). The ledger is a SAME-BOX comparison, so every row has
+// to say which box measured it. It used to say `hostname`, and that silently
+// killed the only guard in this tree that can catch a same-box 2x regression:
+// the machine was renamed m15 -> m21, the live hostname stopped matching any
+// committed row, and `judge_trend` filtered 249 rows down to nothing. The gate
+// went on printing SKIP lines that read as "first run on this box" while every
+// win of a whole campaign landed unprotected.
+//
+// A hostname is a bad machine identity in BOTH directions, and BOTH have
+// already happened to this ledger:
+//   * it RENAMES — m15 -> m21 forked one box's history away from itself; and
+//   * it is SPELLED more than one way on one box — the committed rows carry
+//     `m15-Macbook-M5-Max-128GB-8TB.local` (29 rows) AND
+//     `m15Macb128GB8TB.localdomain` (220 rows), which are one machine under
+//     `.local` and `.localdomain`.
+//
+// WHAT REPLACES IT, and why not the two obvious alternatives:
+//
+//   REJECTED — CHIP + CORE COUNT (`Apple M5 Max` + 18). Stable across renames,
+//   readable, no probe to write, and it SILENTLY MERGES two machines of the
+//   same model. That is strictly worse than the dead gate it would replace: a
+//   dead trend prints SKIP and everyone can see nothing was judged, a merged
+//   trend prints GREEN while holding this box's number against a DIFFERENT
+//   box's best. Refused on that ground alone.
+//
+//   REJECTED — THE RAW PLATFORM UUID as the key. Unique and rename-proof, but
+//   it would land verbatim in a committed file in a published repo, and a
+//   machine UUID is not ours to publish. It is also unreadable in a diff.
+//
+//   CHOSEN — A HARDWARE FINGERPRINT RESOLVED THROUGH AN EXPLICIT COMMITTED
+//   ALIAS TABLE. The fingerprint is a DIGEST of the platform UUID (macOS
+//   IOPlatformUUID, Linux /etc/machine-id, Windows MachineGuid): unique per
+//   machine, untouched by a rename, and non-identifying once digested.
+//   [`boxes_path`] is where a HUMAN writes down "these identities are that
+//   box", so every merge of two identities is an explicit, reviewable claim in
+//   a diff — never an accident of two machines looking alike. An unclaimed
+//   machine still works: it keys itself `box-<digest>`, which collides with
+//   nothing, and the gate prints the exact alias row to paste to give it a
+//   name.
+//
+//   AND THE CLAIM ITSELF IS GUARDED. Every new row records the box's hardware
+//   SHAPE (chip + logical cores). If rows that resolve to one box key disagree
+//   about the CHIP, the alias table is claiming two different machines are one
+//   machine, and the sub-gate REFUSES — it drops the disagreeing rows and goes
+//   red — rather than averaging across them. A dead trend is bad; a trend that
+//   looks alive while comparing two boxes is worse, and this is the line
+//   between them.
+// ---------------------------------------------------------------------------
+
 pub(crate) fn trend_path() -> std::path::PathBuf {
     workspace_root().join("tools/golden/perf-trend.tsv")
 }
 
-// TODO(trend-keying, deferred as >S effort — Wave-0 prescription e): key
-// ledger history by HARDWARE UUID instead of hostname. Hostnames rename
-// (silently forking a box's history) and collide (silently merging two boxes'
-// histories into one bogus reference window). The fix needs a cross-platform
-// probe (macOS: `ioreg -d2 -c IOPlatformExpertDevice` IOPlatformUUID; Linux:
-// /etc/machine-id; Windows: MachineGuid) plus a migration story for the
-// committed ledger's existing hostname-keyed rows — do it as one piece, not a
-// macOS-only half.
+/// The committed alias table: which raw machine identities are which box.
+pub(crate) fn boxes_path() -> std::path::PathBuf {
+    workspace_root().join("tools/golden/perf-boxes.tsv")
+}
+
+/// Who this machine is, as the ledger keys it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MachineId {
+    /// The ledger's box column: a short name from the alias table, or a
+    /// deterministic `box-<digest>` when nothing claims this machine.
+    pub key: String,
+    /// Chip + logical cores (`Apple-M5-Max-18c`). Recorded per row; its CHIP
+    /// half is compared, and a disagreement is what turns a WRONG alias claim
+    /// into a red gate instead of a silent cross-machine merge.
+    pub shape: String,
+    /// The raw tokens this machine answers to, strongest first: `fp:<digest>`
+    /// when a platform UUID could be read, then `host:<hostname>`.
+    pub identities: Vec<String>,
+    /// An alias row explicitly claimed one of [`Self::identities`].
+    pub claimed: bool,
+}
+
+/// FNV-1a 64. Dependency-free and deterministic, which is the whole
+/// requirement: the digest only has to be STABLE for one machine and
+/// non-reversible enough that a committed alias row does not publish the
+/// platform UUID it came from. It is not a security primitive and nothing
+/// downstream treats it as one — a forged fingerprint buys an attacker one
+/// wrong perf-trend comparison on a machine they already own.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    h
+}
+
+/// Alphanumerics kept, runs of anything else collapsed to one `-`, so a chip
+/// string is safe in a TSV column and readable in a diff.
+fn slug(s: &str) -> String {
+    let mut out = String::new();
+    let mut pending_sep = false;
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            if pending_sep && !out.is_empty() {
+                out.push('-');
+            }
+            pending_sep = false;
+            out.push(c);
+        } else {
+            pending_sep = true;
+        }
+    }
+    out
+}
+
+/// The machine's platform UUID, or `None` where none can be read.
+///
+/// Runtime `cfg!` branches rather than `#[cfg]`-gated functions ON PURPOSE:
+/// this file is inside `crates/**`, which the source censuses walk, and a
+/// platform-gated CALL whose CALLEE is gated differently is exactly the
+/// mismatch that reddens main. One function, one body, every probe compiled
+/// everywhere; the ones that cannot apply simply fail to spawn.
+fn platform_uuid() -> Option<String> {
+    if cfg!(target_os = "macos") {
+        let out = Command::new("ioreg")
+            .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let key = "\"IOPlatformUUID\"";
+        let at = text.find(key)? + key.len();
+        let tail = &text[at..];
+        let open = tail.find('"')? + 1;
+        let rest = &tail[open..];
+        let close = rest.find('"')?;
+        return Some(rest[..close].to_string());
+    }
+    if cfg!(target_os = "windows") {
+        let out = Command::new("reg")
+            .args([
+                "query",
+                r"HKLM\SOFTWARE\Microsoft\Cryptography",
+                "/v",
+                "MachineGuid",
+            ])
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        return text
+            .lines()
+            .find(|l| l.contains("MachineGuid"))
+            .and_then(|l| l.split_whitespace().last())
+            .map(str::to_string);
+    }
+    // Linux and the BSDs: the systemd/dbus machine id, whichever exists.
+    for p in ["/etc/machine-id", "/var/lib/dbus/machine-id"] {
+        if let Ok(s) = std::fs::read_to_string(p) {
+            let t = s.trim().to_string();
+            if !t.is_empty() {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+/// The stable, non-identifying machine fingerprint — `None` when no platform
+/// UUID is readable, in which case the hostname is all we have.
+fn platform_fingerprint() -> Option<String> {
+    let raw = platform_uuid()?;
+    let t = raw.trim();
+    (!t.is_empty()).then(|| format!("{:016x}", fnv1a64(t.as_bytes())))
+}
+
 fn hostname() -> String {
     Command::new("hostname")
         .output()
@@ -1117,6 +1274,173 @@ fn hostname() -> String {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown-host".to_string())
+}
+
+/// Chip + logical cores, e.g. `Apple-M5-Max-18c`. Recorded per row so a wrong
+/// alias claim is DETECTABLE; see [`chip_of`] for what is actually compared.
+fn machine_shape() -> String {
+    let chip = if cfg!(target_os = "macos") {
+        Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    } else {
+        std::fs::read_to_string("/proc/cpuinfo").ok().and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("model name"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().to_string())
+        })
+    };
+    let chip = chip.unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let cores = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
+    format!("{}-{cores}c", slug(&chip))
+}
+
+/// The CHIP half of a shape — the shape with a trailing `-<n>c` core count
+/// removed.
+///
+/// WHY ONLY THE CHIP IS COMPARED. The core count is the discriminating half but
+/// it is also the FLAKY half: `available_parallelism` answers with the cgroup /
+/// affinity view, so a run inside a constrained container would report a
+/// different number on the same machine and a strict compare would go red for a
+/// reason that has nothing to do with performance. The chip string does not
+/// move. The core count is still RECORDED — it is in the ledger for a human
+/// reading a surprising row — it just is not what fails the gate.
+pub(crate) fn chip_of(shape: &str) -> &str {
+    let Some(stripped) = shape.strip_suffix('c') else {
+        return shape;
+    };
+    match stripped.rfind('-') {
+        Some(dash)
+            if dash + 1 < stripped.len()
+                && stripped[dash + 1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            &shape[..dash]
+        }
+        _ => shape,
+    }
+}
+
+/// The box an alias table gives `identity` (`fp:<digest>` / `host:<name>`), or
+/// `None` when no row claims it. Pure (unit-tested).
+pub(crate) fn alias_lookup(aliases: &str, identity: &str) -> Option<String> {
+    aliases
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .find_map(|l| {
+            let mut cols = l.split('\t');
+            let key = cols.next()?.trim();
+            let ident = cols.next()?.trim();
+            (ident == identity && !key.is_empty()).then(|| key.to_string())
+        })
+}
+
+/// Every box name the alias table declares. Pure (unit-tested).
+pub(crate) fn alias_boxes(aliases: &str) -> Vec<String> {
+    let mut v: Vec<String> = aliases
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| {
+            let key = l.split('\t').next()?.trim();
+            (!key.is_empty()).then(|| key.to_string())
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// What a ledger row's box column means, resolved through the alias table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BoxRef {
+    /// An alias row claims this token (as `host:<token>`/`fp:<token>`) or
+    /// declares it as a box name outright.
+    Claimed(String),
+    /// Nothing in the alias table mentions it. It stands alone — it is NEVER
+    /// merged into a neighbouring box on a guess.
+    Unclaimed(String),
+}
+
+impl BoxRef {
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            BoxRef::Claimed(k) | BoxRef::Unclaimed(k) => k,
+        }
+    }
+    pub(crate) fn is_claimed(&self) -> bool {
+        matches!(self, BoxRef::Claimed(_))
+    }
+}
+
+/// Resolve one ledger row's box column. Pure (unit-tested).
+///
+/// The column holds either a BOX NAME (rows written since W-1) or a RAW
+/// HOSTNAME (every row written before it). Both resolve here, and an unknown
+/// token resolves to ITSELF — never to whatever box looks closest — so the one
+/// thing this function cannot do is quietly merge two machines.
+pub(crate) fn resolve_ledger_box(aliases: &str, token: &str) -> BoxRef {
+    if let Some(key) = alias_lookup(aliases, &format!("host:{token}")) {
+        return BoxRef::Claimed(key);
+    }
+    if let Some(key) = alias_lookup(aliases, &format!("fp:{token}")) {
+        return BoxRef::Claimed(key);
+    }
+    // `box-<digest>` is, BY CONSTRUCTION, the auto-key of `fp:<digest>` (see
+    // [`default_box_key`]). Resolving it through the fingerprint is what lets a
+    // machine be NAMED after it has already written rows: the operator adds one
+    // `fp:` row and the auto-keyed history it already produced comes with it,
+    // instead of being stranded under a name nobody will ever type again —
+    // which is the same orphaning W-1 exists to end.
+    if let Some(digest) = token.strip_prefix("box-")
+        && let Some(key) = alias_lookup(aliases, &format!("fp:{digest}"))
+    {
+        return BoxRef::Claimed(key);
+    }
+    if alias_boxes(aliases).iter().any(|b| b == token) {
+        return BoxRef::Claimed(token.to_string());
+    }
+    BoxRef::Unclaimed(token.to_string())
+}
+
+/// The key an UNCLAIMED machine gets. Deterministic and collision-free where a
+/// fingerprint exists; falls back to the hostname (with its rename hazard
+/// intact, which is the honest state of a box with no readable platform UUID)
+/// where one does not. Pure (unit-tested).
+pub(crate) fn default_box_key(identities: &[String]) -> String {
+    for i in identities {
+        if let Some(fp) = i.strip_prefix("fp:") {
+            return format!("box-{fp}");
+        }
+    }
+    for i in identities {
+        if let Some(h) = i.strip_prefix("host:") {
+            return format!("host-{}", slug(h));
+        }
+    }
+    "unknown-box".to_string()
+}
+
+/// This machine, resolved against the committed alias table.
+pub(crate) fn machine_id() -> MachineId {
+    let aliases = std::fs::read_to_string(boxes_path()).unwrap_or_default();
+    let mut identities = Vec::new();
+    if let Some(fp) = platform_fingerprint() {
+        identities.push(format!("fp:{fp}"));
+    }
+    identities.push(format!("host:{}", hostname()));
+    let claimed = identities.iter().find_map(|i| alias_lookup(&aliases, i));
+    let key = claimed
+        .clone()
+        .unwrap_or_else(|| default_box_key(&identities));
+    MachineId {
+        key,
+        shape: machine_shape(),
+        identities,
+        claimed: claimed.is_some(),
+    }
 }
 
 fn head_sha() -> String {
@@ -1151,6 +1475,39 @@ fn utc_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// One parsed ledger row. Rows have grown a column twice and the parser
+/// accepts all three widths: 5 (pre-2026-07-22), 6 (+ toolchain), 7 (+ the
+/// box's hardware shape, since W-1).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TrendRow<'a> {
+    pub token: &'a str,
+    pub metric: &'a str,
+    pub value: f64,
+    /// `""` on every row written before the shape column existed.
+    pub shape: &'a str,
+}
+
+/// Parse the ledger, skipping comments, blanks and unparseable rows. Pure
+/// (unit-tested).
+pub(crate) fn trend_ledger_rows(ledger: &str) -> Vec<TrendRow<'_>> {
+    ledger
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .filter_map(|l| {
+            let cols: Vec<&str> = l.split('\t').collect();
+            if cols.len() < 5 {
+                return None;
+            }
+            Some(TrendRow {
+                token: cols[2],
+                metric: cols[3],
+                value: cols[4].parse::<f64>().ok()?,
+                shape: cols.get(6).copied().unwrap_or("").trim(),
+            })
+        })
+        .collect()
+}
+
 /// The trend sub-gate's pure verdict over one run's samples.
 pub(crate) struct TrendJudgment {
     /// Failing `(metric, value, bound, best, inverted)` rows — `bound` is a
@@ -1160,28 +1517,52 @@ pub(crate) struct TrendJudgment {
     /// Metrics with NO same-box history: first run on this box. Reported as
     /// SKIP — never counted into a GREEN claim (Wave-0 prescription e).
     pub skipped: Vec<String>,
+    /// `(token, chip)` pairs that resolve to THIS box but were measured on a
+    /// different CHIP. The alias table is claiming two machines are one; these
+    /// rows are DROPPED from the reference window and the sub-gate goes red.
+    /// Silence here would be the one outcome worse than the dead gate W-1
+    /// fixed: a trend that looks alive while comparing across machines.
+    pub conflicts: Vec<(String, String)>,
 }
 
-/// Judge `samples` against the same-box history in the ledger text. Pure
-/// (unit-tested).
-pub(crate) fn judge_trend(ledger: &str, host: &str, samples: &[TrendSample]) -> TrendJudgment {
+/// Judge `samples` against the same-box history in the ledger text, with
+/// `aliases` deciding which rows are THIS box. Pure (unit-tested).
+pub(crate) fn judge_trend(
+    ledger: &str,
+    aliases: &str,
+    me: &MachineId,
+    samples: &[TrendSample],
+) -> TrendJudgment {
+    let rows = trend_ledger_rows(ledger);
+    let my_chip = chip_of(&me.shape);
+
+    // MINE, and only mine. A row is this box's iff its token resolves to this
+    // box's key; of those, a row whose recorded chip disagrees is a CONFLICT
+    // and is excluded rather than compared against.
+    let mut conflicts: Vec<(String, String)> = Vec::new();
+    let mine: Vec<&TrendRow<'_>> = rows
+        .iter()
+        .filter(|r| resolve_ledger_box(aliases, r.token).key() == me.key)
+        .filter(|r| {
+            if r.shape.is_empty() || chip_of(r.shape) == my_chip {
+                return true;
+            }
+            let entry = (r.token.to_string(), chip_of(r.shape).to_string());
+            if !conflicts.contains(&entry) {
+                conflicts.push(entry);
+            }
+            false
+        })
+        .collect();
+
     let mut breaches = Vec::new();
     let mut skipped = Vec::new();
     for s in samples {
         let metric_key = format!("{}/{}", s.lane, s.metric);
-        let mut history: Vec<f64> = ledger
-            .lines()
-            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
-            .filter_map(|l| {
-                let cols: Vec<&str> = l.split('\t').collect();
-                // date, sha, host, lane/metric, value — older rows have exactly
-                // these 5 columns; newer rows append a toolchain column.
-                if cols.len() >= 5 && cols[2] == host && cols[3] == metric_key {
-                    cols[4].parse::<f64>().ok()
-                } else {
-                    None
-                }
-            })
+        let mut history: Vec<f64> = mine
+            .iter()
+            .filter(|r| r.metric == metric_key)
+            .map(|r| r.value)
             .filter(|v| *v > 0.0)
             .collect();
         let recent = history.split_off(history.len().saturating_sub(TREND_WINDOW));
@@ -1206,7 +1587,11 @@ pub(crate) fn judge_trend(ledger: &str, host: &str, samples: &[TrendSample]) -> 
             }
         }
     }
-    TrendJudgment { breaches, skipped }
+    TrendJudgment {
+        breaches,
+        skipped,
+        conflicts,
+    }
 }
 
 /// Which toolchain builds a lane's measurement binary — recorded per ledger
@@ -1218,18 +1603,25 @@ fn toolchain_lane(lane: &str) -> &'static str {
     if lane == "wasm" { "stable" } else { "trust" }
 }
 
-/// Render `samples` as ledger rows (one metric per line, TSV; the trailing
-/// toolchain column is absent from pre-2026-07-22 rows, which the parser
-/// still accepts).
-pub(crate) fn trend_rows(date: &str, sha: &str, host: &str, samples: &[TrendSample]) -> String {
+/// Render `samples` as ledger rows (one metric per line, TSV). The trailing
+/// toolchain column is absent from pre-2026-07-22 rows and the SHAPE column
+/// from every row before W-1; the parser still accepts both.
+pub(crate) fn trend_rows(
+    date: &str,
+    sha: &str,
+    me: &MachineId,
+    samples: &[TrendSample],
+) -> String {
     let mut s = String::new();
     for sample in samples {
         s.push_str(&format!(
-            "{date}\t{sha}\t{host}\t{}/{}\t{:.3}\t{}\n",
+            "{date}\t{sha}\t{}\t{}/{}\t{:.3}\t{}\t{}\n",
+            me.key,
             sample.lane,
             sample.metric,
             sample.value,
-            toolchain_lane(sample.lane)
+            toolchain_lane(sample.lane),
+            me.shape
         ));
     }
     s
@@ -1238,7 +1630,10 @@ pub(crate) fn trend_rows(date: &str, sha: &str, host: &str, samples: &[TrendSamp
 const TREND_HEADER: &str = "# aterm same-box perf trend ledger (E0, audit 5.6). Appended by every \
 GREEN `gate perf` run;\n# each metric must clear TREND_RATIO x the best of this box's last \
 TREND_WINDOW entries\n# (xtask/src/perf.rs; *_worst_ms metrics are INVERTED — bounded by \
-best-MIN / TREND_RATIO).\n# date\tsha\thost\tlane/metric\tvalue\ttoolchain\n";
+best-MIN / TREND_RATIO).\n# The BOX column is a name from tools/golden/perf-boxes.tsv, which is \
+also where a\n# pre-W-1 hostname is claimed as the box it was measured on. NEVER edit a box name \
+here\n# to merge two machines — add the claim to perf-boxes.tsv, where the chip column keeps \
+it\n# honest.\n# date\tsha\tbox\tlane/metric\tvalue\ttoolchain\tshape\n";
 
 /// The trend sub-gate: compare this run's samples against the same-box
 /// history, and append them when the run is healthy (`lanes_ok`, so a
@@ -1247,28 +1642,81 @@ best-MIN / TREND_RATIO).\n# date\tsha\thost\tlane/metric\tvalue\ttoolchain\n";
 /// fresh box or a fresh checkout.
 pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
     let path = trend_path();
-    let host = hostname();
+    let me = machine_id();
+    let aliases = std::fs::read_to_string(boxes_path()).unwrap_or_default();
     let ledger = std::fs::read_to_string(&path).unwrap_or_default();
-    let TrendJudgment { breaches, skipped } = judge_trend(&ledger, &host, samples);
-    let trend_ok = breaches.is_empty();
+    let TrendJudgment {
+        breaches,
+        skipped,
+        conflicts,
+    } = judge_trend(&ledger, &aliases, &me, samples);
+    let trend_ok = breaches.is_empty() && conflicts.is_empty();
+    let bx = &me.key;
+
+    // AN UNCLAIMED BOX STILL WORKS — it just has no name, and the operator is
+    // told exactly how to give it one. Printing the paste-ready row is the
+    // point: the alias table only stays honest if adding to it is easier than
+    // hand-editing the box column of the ledger.
+    if !me.claimed {
+        eprintln!(
+            "  trend: NOTE — this machine is not named in {}; its rows are keyed `{bx}`.\n         \
+             Add:  {bx}\t{}\t<what this box is>",
+            boxes_path().display(),
+            me.identities.first().map_or("host:?", String::as_str)
+        );
+    }
+
+    // ORPHANS IN THE COMMITTED LEDGER, surfaced where the operator already is.
+    // The merge contract checks this too (see the tripwires in this file's
+    // tests), but the gate is what APPENDS rows, so it is also where a wrong
+    // key is cheapest to notice.
+    let mut orphans: Vec<&str> = trend_ledger_rows(&ledger)
+        .iter()
+        .map(|r| r.token)
+        .filter(|t| !resolve_ledger_box(&aliases, t).is_claimed())
+        .collect();
+    orphans.sort_unstable();
+    orphans.dedup();
+    for token in &orphans {
+        eprintln!(
+            "  trend: NOTE — ledger rows keyed `{token}` are claimed by no row of {}; \
+             they anchor nothing until some box declares them.",
+            boxes_path().display()
+        );
+    }
+
+    // A CONFLICT IS A WRONG CLAIM, NOT A SLOW MACHINE. Loud, and red: an alias
+    // row is asserting that two different machines are one box, and comparing
+    // across them would make the trend look alive while it lied.
+    for (token, chip) in &conflicts {
+        eprintln!(
+            "  trend: FAILED — ledger rows keyed `{token}` resolve to box `{bx}` but were \
+             measured on chip `{chip}`, not `{}`. {} claims two different machines are one \
+             box; those rows were DROPPED from the reference window rather than compared \
+             against. Fix the claim — do not widen it.",
+            chip_of(&me.shape),
+            boxes_path().display()
+        );
+    }
+
     // No-history metrics are SKIP, not GREEN: a first run on a box verified
     // nothing, and saying otherwise is how unmeasured regressions get blessed.
     for metric in &skipped {
         eprintln!(
-            "  trend: SKIP — {metric}: no same-box history on {host} (first run; this \
+            "  trend: SKIP — {metric}: no same-box history on {bx} (first run; this \
              run only SEEDS the reference window, it verifies nothing)."
         );
     }
     let judged = samples.len() - skipped.len();
     if trend_ok && judged == 0 {
         eprintln!(
-            "  trend: SKIP — no metric had same-box history on {host}; nothing was \
+            "  trend: SKIP — no metric had same-box history on {bx}; nothing was \
              judged (seed run, not a pass)."
         );
     } else if trend_ok {
         eprintln!(
             "  trend: GREEN — {judged} metric(s) within same-box trend bounds of this \
-             box's ({host}) recent best ({} skipped, no history).",
+             box's ({bx}) recent best ({} skipped, no history).",
             skipped.len()
         );
     } else {
@@ -1276,14 +1724,14 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
             if *inverted {
                 eprintln!(
                     "  trend: FAILED — {metric} {value:.1} > same-box ceiling {bound:.1} \
-                     (best-of-last-{TREND_WINDOW} {best:.1} / {TREND_RATIO:.2} on {host}; \
+                     (best-of-last-{TREND_WINDOW} {best:.1} / {TREND_RATIO:.2} on {bx}; \
                      lower is better). A same-box latency creep the absolute cap would \
                      have let through."
                 );
             } else {
                 eprintln!(
                     "  trend: FAILED — {metric} {value:.1} < same-box floor {bound:.1} \
-                     (best-of-last-{TREND_WINDOW} {best:.1} x {TREND_RATIO:.2} on {host}). A \
+                     (best-of-last-{TREND_WINDOW} {best:.1} x {TREND_RATIO:.2} on {bx}). A \
                      same-box regression the generous multi-machine floor would have let through."
                 );
             }
@@ -1297,7 +1745,7 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
         } else {
             ledger
         };
-        text.push_str(&trend_rows(&utc_date(), &head_sha(), &host, samples));
+        text.push_str(&trend_rows(&utc_date(), &head_sha(), &me, samples));
         if let Err(e) = std::fs::write(&path, &text) {
             eprintln!("  trend: could not append ledger {}: {e}", path.display());
         } else {
@@ -1627,6 +2075,29 @@ mod tests {
 
     // --- same-box trend ledger ---------------------------------------------
 
+    /// A synthetic box for the pure-judgment tests: a name, and one fixed chip
+    /// so a row this helper writes and a row it judges agree.
+    fn box_id(key: &str) -> MachineId {
+        MachineId {
+            key: key.to_string(),
+            shape: "Test-Chip-8c".to_string(),
+            identities: vec![format!("host:{key}")],
+            claimed: true,
+        }
+    }
+
+    /// [`judge_trend`] with no alias table — the shape every pre-W-1 trend test
+    /// wants, where the ledger's box column IS the box.
+    fn judged(ledger: &str, key: &str, samples: &[TrendSample]) -> TrendJudgment {
+        judge_trend(ledger, "", &box_id(key), samples)
+    }
+
+    /// [`trend_rows`] for a synthetic box.
+    fn rows_for(date: &str, sha: &str, key: &str, samples: &[TrendSample]) -> String {
+        trend_rows(date, sha, &box_id(key), samples)
+    }
+
+
     fn sample(lane: &'static str, metric: &str, value: f64) -> TrendSample {
         TrendSample {
             lane,
@@ -1649,7 +2120,7 @@ mod tests {
         // the bound a CEILING at 18/0.70 ≈ 25.7 ms.
         let mut ledger = String::new();
         for v in [20.0, 18.0, 25.0] {
-            ledger.push_str(&trend_rows(
+            ledger.push_str(&rows_for(
                 "2026-07-22",
                 "abc",
                 "boxA",
@@ -1657,7 +2128,7 @@ mod tests {
             ));
         }
         // 30 ms > ceiling: a same-box latency creep trips.
-        let breaches = judge_trend(
+        let breaches = judged(
             &ledger,
             "boxA",
             &[inverted_sample(
@@ -1672,7 +2143,7 @@ mod tests {
         assert!(breaches[0].4, "breach is flagged inverted");
         // 24 ms is inside the ceiling; getting FASTER (5 ms) never trips.
         for ok_v in [24.0, 5.0] {
-            let ok = judge_trend(
+            let ok = judged(
                 &ledger,
                 "boxA",
                 &[inverted_sample(
@@ -1684,7 +2155,7 @@ mod tests {
             assert!(ok.breaches.is_empty(), "{ok_v} ms must pass");
         }
         // First run on a box: nothing to hold it to — SKIP, not a judged pass.
-        let fresh = judge_trend(
+        let fresh = judged(
             &ledger,
             "boxB",
             &[inverted_sample(
@@ -1699,7 +2170,7 @@ mod tests {
 
     #[test]
     fn trend_first_run_on_a_box_never_blocks_and_reports_skip() {
-        let j = judge_trend("", "boxA", &[sample("throughput", "median_mbps", 100.0)]);
+        let j = judged("", "boxA", &[sample("throughput", "median_mbps", 100.0)]);
         assert!(j.breaches.is_empty());
         // …but it is a SKIP, not a judged metric (Wave-0 e: no history means
         // nothing was verified — the gate must not print GREEN for it).
@@ -1711,7 +2182,7 @@ mod tests {
         // Pre-2026-07-22 ledger rows have no trailing toolchain column; they
         // must keep anchoring the same-box window after the format change.
         let legacy = "2026-07-20\tabc\tboxA\tthroughput/median_mbps\t1000.000\n";
-        let j = judge_trend(
+        let j = judged(
             legacy,
             "boxA",
             &[sample("throughput", "median_mbps", 400.0)],
@@ -1722,14 +2193,14 @@ mod tests {
 
     #[test]
     fn trend_same_box_regression_trips_and_other_boxes_do_not() {
-        let ledger = trend_rows(
+        let ledger = rows_for(
             "2026-07-22",
             "abc",
             "boxA",
             &[sample("throughput", "median_mbps", 1000.0)],
         );
         // 40% of the same-box best: below the 0.70 floor.
-        let breaches = judge_trend(
+        let breaches = judged(
             &ledger,
             "boxA",
             &[sample("throughput", "median_mbps", 400.0)],
@@ -1738,14 +2209,14 @@ mod tests {
         assert_eq!(breaches.len(), 1);
         assert!((breaches[0].2 - 700.0).abs() < 1e-9, "floor is best x 0.70");
         // A DIFFERENT box is not held to boxA's history.
-        let cross = judge_trend(
+        let cross = judged(
             &ledger,
             "boxB",
             &[sample("throughput", "median_mbps", 400.0)],
         );
         assert!(cross.breaches.is_empty());
         // Normal same-box variance passes.
-        let ok = judge_trend(
+        let ok = judged(
             &ledger,
             "boxA",
             &[sample("throughput", "median_mbps", 850.0)],
@@ -1759,14 +2230,14 @@ mod tests {
         // (1000), so a further sag to 650 (>0.70x of 800 but <0.70x of 1000) trips.
         let mut ledger = String::new();
         for v in [1000.0, 900.0, 800.0] {
-            ledger.push_str(&trend_rows(
+            ledger.push_str(&rows_for(
                 "2026-07-22",
                 "abc",
                 "boxA",
                 &[sample("scroll", "scrub_median_rps", v)],
             ));
         }
-        let breaches = judge_trend(
+        let breaches = judged(
             &ledger,
             "boxA",
             &[sample("scroll", "scrub_median_rps", 650.0)],
@@ -1776,21 +2247,21 @@ mod tests {
         // But only the last TREND_WINDOW entries count: bury the 1000 past the
         // window and the reference becomes the recent best.
         let mut long = String::new();
-        long.push_str(&trend_rows(
+        long.push_str(&rows_for(
             "2026-07-22",
             "abc",
             "boxA",
             &[sample("scroll", "scrub_median_rps", 1000.0)],
         ));
         for _ in 0..TREND_WINDOW {
-            long.push_str(&trend_rows(
+            long.push_str(&rows_for(
                 "2026-07-22",
                 "abc",
                 "boxA",
                 &[sample("scroll", "scrub_median_rps", 800.0)],
             ));
         }
-        let windowed = judge_trend(
+        let windowed = judged(
             &long,
             "boxA",
             &[sample("scroll", "scrub_median_rps", 650.0)],
@@ -1803,7 +2274,7 @@ mod tests {
 
     #[test]
     fn trend_rows_round_trip_through_breach_parser() {
-        let rows = trend_rows(
+        let rows = rows_for(
             "2026-07-22",
             "abc123",
             "boxA",
@@ -1811,34 +2282,356 @@ mod tests {
         );
         // Comment lines and the header are ignored by the parser.
         let ledger = format!("{TREND_HEADER}{rows}");
-        let breaches = judge_trend(
+        let breaches = judged(
             &ledger,
             "boxA",
             &[sample("search", "rotating_build_klps", 100.0)],
         )
         .breaches;
         assert_eq!(breaches.len(), 1, "100 < 0.70 x 202.6");
-        let ok = judge_trend(
+        let ok = judged(
             &ledger,
             "boxA",
             &[sample("search", "rotating_build_klps", 200.0)],
         );
         assert!(ok.breaches.is_empty());
         // Rows carry the toolchain lane: native lanes are the Trust toolchain.
-        assert!(rows.trim_end().ends_with("\ttrust"), "row: {rows:?}");
+        assert_eq!(
+            rows.trim_end().split('\t').nth(5),
+            Some("trust"),
+            "row: {rows:?}"
+        );
     }
 
     #[test]
     fn trend_rows_record_the_wasm_stable_toolchain_lane() {
         // The wasm lane's modules are built on upstream stable (Trust has no
         // wasm32 std) — its rows must say so, not claim the Trust toolchain.
-        let rows = trend_rows(
+        let rows = rows_for(
             "2026-07-22",
             "abc",
             "boxA",
             &[sample("wasm", "wasm_cpu_ingest_mixed_mbps", 343.0)],
         );
-        assert!(rows.trim_end().ends_with("\tstable"), "row: {rows:?}");
+        assert_eq!(
+            rows.trim_end().split('\t').nth(5),
+            Some("stable"),
+            "row: {rows:?}"
+        );
+    }
+
+
+    // --- machine identity (W-1) --------------------------------------------
+
+    const ALIASES: &str = "# box\tidentity\tnote\n\
+         m21\tfp:deadbeefdeadbeef\tthe box\n\
+         m21\thost:m21.local\tafter the rename\n\
+         m21\thost:m15.local\tbefore the rename — SAME machine\n\
+         m7\tfp:0123456789abcdef\ta different box\n";
+
+    /// THE W-1 BUG, as a test. A rename used to fork a box's history away from
+    /// itself; both spellings must now land on one key, and a machine the table
+    /// never mentions must land on its own.
+    #[test]
+    fn a_rename_no_longer_forks_a_box_from_its_own_history() {
+        assert_eq!(resolve_ledger_box(ALIASES, "m15.local").key(), "m21");
+        assert_eq!(resolve_ledger_box(ALIASES, "m21.local").key(), "m21");
+        // A box NAME in the column (every row written since W-1) resolves too.
+        assert_eq!(resolve_ledger_box(ALIASES, "m21").key(), "m21");
+        assert!(resolve_ledger_box(ALIASES, "m21").is_claimed());
+        // …and the two hostnames really do reach the same history.
+        let mut ledger = String::new();
+        ledger.push_str("2026-07-22\tabc\tm15.local\tthroughput/median_mbps\t1000.000\n");
+        let me = MachineId {
+            key: "m21".to_string(),
+            shape: "Apple-M5-Max-18c".to_string(),
+            identities: vec!["fp:deadbeefdeadbeef".to_string()],
+            claimed: true,
+        };
+        let j = judge_trend(
+            &ledger,
+            ALIASES,
+            &me,
+            &[sample("throughput", "median_mbps", 400.0)],
+        );
+        assert_eq!(
+            j.breaches.len(),
+            1,
+            "the pre-rename rows must judge the post-rename run"
+        );
+        assert!(j.skipped.is_empty(), "history was found, so nothing skipped");
+    }
+
+    /// THE OTHER HALF, and the one that matters more: an identity nobody
+    /// claimed is NEVER folded into a box that merely looks similar. A merged
+    /// trend is worse than a dead one — it prints GREEN while comparing across
+    /// machines.
+    #[test]
+    fn an_unclaimed_identity_stands_alone_and_is_never_merged() {
+        let r = resolve_ledger_box(ALIASES, "some-other-mac.local");
+        assert_eq!(r.key(), "some-other-mac.local");
+        assert!(!r.is_claimed());
+        // Its rows do not become m21's history.
+        let ledger = "2026-07-22\tabc\tsome-other-mac.local\tthroughput/median_mbps\t1000.000\n";
+        let me = MachineId {
+            key: "m21".to_string(),
+            shape: "Apple-M5-Max-18c".to_string(),
+            identities: vec!["fp:deadbeefdeadbeef".to_string()],
+            claimed: true,
+        };
+        let j = judge_trend(
+            ledger,
+            ALIASES,
+            &me,
+            &[sample("throughput", "median_mbps", 400.0)],
+        );
+        assert!(j.breaches.is_empty());
+        assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
+    }
+
+    /// A box that has already written AUTO-KEYED rows keeps them when a human
+    /// finally names it — `box-<digest>` resolves through the `fp:` row.
+    #[test]
+    fn naming_a_box_adopts_the_rows_it_wrote_before_it_had_a_name() {
+        assert_eq!(
+            resolve_ledger_box(ALIASES, "box-deadbeefdeadbeef").key(),
+            "m21"
+        );
+        assert!(resolve_ledger_box(ALIASES, "box-deadbeefdeadbeef").is_claimed());
+        // An auto key for a fingerprint nobody claimed still stands alone.
+        assert!(!resolve_ledger_box(ALIASES, "box-1111111111111111").is_claimed());
+    }
+
+    /// THE GUARD ON THE CLAIM. If rows under one box name disagree about the
+    /// CHIP, the alias table is claiming two machines are one: those rows are
+    /// dropped from the reference window AND the sub-gate goes red. It must
+    /// never quietly average across them.
+    #[test]
+    fn a_chip_conflict_drops_the_rows_instead_of_comparing_across_machines() {
+        let ledger = "2026-07-22\tabc\tm21\tthroughput/median_mbps\t9000.000\ttrust\tIntel-Core-i9-8c\n";
+        let me = MachineId {
+            key: "m21".to_string(),
+            shape: "Apple-M5-Max-18c".to_string(),
+            identities: vec!["fp:deadbeefdeadbeef".to_string()],
+            claimed: true,
+        };
+        let j = judge_trend(
+            ledger,
+            ALIASES,
+            &me,
+            &[sample("throughput", "median_mbps", 400.0)],
+        );
+        assert_eq!(
+            j.conflicts,
+            vec![("m21".to_string(), "Intel-Core-i9".to_string())]
+        );
+        // The foreign row is NOT the reference — 400 is not judged against 9000.
+        assert!(j.breaches.is_empty());
+        assert_eq!(j.skipped, vec!["throughput/median_mbps"]);
+        // A row on the SAME chip with a different core count is fine: the core
+        // count is recorded, not enforced (cgroup/affinity views move it).
+        let same = "2026-07-22\tabc\tm21\tthroughput/median_mbps\t1000.000\ttrust\tApple-M5-Max-10c\n";
+        let ok = judge_trend(
+            same,
+            ALIASES,
+            &me,
+            &[sample("throughput", "median_mbps", 400.0)],
+        );
+        assert!(ok.conflicts.is_empty());
+        assert_eq!(ok.breaches.len(), 1, "same chip ⇒ still same-box history");
+    }
+
+    #[test]
+    fn chip_of_strips_only_a_trailing_core_count() {
+        assert_eq!(chip_of("Apple-M5-Max-18c"), "Apple-M5-Max");
+        assert_eq!(chip_of("Apple-M5-Max-1c"), "Apple-M5-Max");
+        // Nothing that is not `-<digits>c` is stripped.
+        assert_eq!(chip_of("Apple-M5-Max"), "Apple-M5-Max");
+        assert_eq!(chip_of("weird-c"), "weird-c");
+        assert_eq!(chip_of("weird-xc"), "weird-xc");
+        assert_eq!(chip_of(""), "");
+        assert_eq!(chip_of("c"), "c");
+    }
+
+    #[test]
+    fn default_box_key_prefers_the_fingerprint() {
+        assert_eq!(
+            default_box_key(&["fp:abc".to_string(), "host:x.local".to_string()]),
+            "box-abc"
+        );
+        // No fingerprint: the hostname, slugged — the rename hazard is still
+        // there and that IS the honest state of a box with no platform UUID.
+        assert_eq!(
+            default_box_key(&["host:m21.local".to_string()]),
+            "host-m21-local"
+        );
+        assert_eq!(default_box_key(&[]), "unknown-box");
+    }
+
+    #[test]
+    fn a_seven_column_row_round_trips_with_its_shape() {
+        let me = MachineId {
+            key: "m21".to_string(),
+            shape: "Apple-M5-Max-18c".to_string(),
+            identities: vec!["fp:deadbeefdeadbeef".to_string()],
+            claimed: true,
+        };
+        let rows = trend_rows(
+            "2026-08-23",
+            "abc123",
+            &me,
+            &[sample("throughput", "median_mbps", 500.0)],
+        );
+        let parsed = trend_ledger_rows(&rows);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].token, "m21");
+        assert_eq!(parsed[0].shape, "Apple-M5-Max-18c");
+        assert_eq!(parsed[0].metric, "throughput/median_mbps");
+        // And the legacy widths still parse, with an EMPTY shape rather than a
+        // guessed one.
+        let five = "2026-07-20\tabc\tboxA\tthroughput/median_mbps\t1000.000\n";
+        assert_eq!(trend_ledger_rows(five)[0].shape, "");
+    }
+
+    #[test]
+    fn the_digest_is_stable_and_separates_two_uuids() {
+        // Pinned: a fingerprint that moved would orphan the ledger exactly as
+        // the rename did, and the committed alias rows would stop resolving.
+        assert_eq!(
+            format!("{:016x}", fnv1a64(b"4F2C6182-55E3-51B1-B505-42FD89F13166")),
+            "4d119fc8de0a3b9e"
+        );
+        assert_ne!(fnv1a64(b"a"), fnv1a64(b"b"));
+    }
+
+    // --- THE COMMITTED LEDGER, checked in the merge contract (W-2) ----------
+    //
+    // These three read the REAL tools/golden files. They are pure string work
+    // over two small committed TSVs — microseconds — so they ride `cargo test`
+    // and therefore `tools/verify.sh --fast` at no marginal cost, which is the
+    // only way anything about the perf ledger can be in the merge contract at
+    // all (the MEASURING half of `gate perf` cannot: see the module docs on
+    // `gate_trend`, and the notes in docs/PERF-REGRESSION-DEFENCE.md).
+    //
+    // Between them they would have caught W-1 the day it happened.
+
+    fn committed_ledger() -> String {
+        std::fs::read_to_string(trend_path()).unwrap_or_default()
+    }
+
+    fn committed_aliases() -> String {
+        std::fs::read_to_string(boxes_path()).unwrap_or_default()
+    }
+
+    /// TRIPWIRE 1 — NO ORPHANED IDENTITY. A token in the ledger that no alias
+    /// row claims, whose CHIP is one an already-claimed box uses, is the exact
+    /// signature of a machine that renamed itself and started a second,
+    /// disconnected history. Red, with the fix named.
+    ///
+    /// A genuinely NEW machine (a chip no claimed box has) is NOT red: it may
+    /// contribute rows and be named later, which is the flow `gate_trend`
+    /// prints. This is the difference between a guard and an obstacle.
+    #[test]
+    fn no_committed_ledger_identity_is_an_orphaned_rename() {
+        let ledger = committed_ledger();
+        let aliases = committed_aliases();
+        let rows = trend_ledger_rows(&ledger);
+        let claimed_chips: Vec<&str> = rows
+            .iter()
+            .filter(|r| resolve_ledger_box(&aliases, r.token).is_claimed())
+            .map(|r| chip_of(r.shape))
+            .filter(|c| !c.is_empty())
+            .collect();
+        for r in &rows {
+            let bx = resolve_ledger_box(&aliases, r.token);
+            if bx.is_claimed() {
+                continue;
+            }
+            assert!(
+                !r.shape.is_empty(),
+                "ledger identity `{}` is claimed by no row of {} and carries no chip \
+                 either, so nothing can tell whether it is a new machine or this one \
+                 under a new name. Add it to the alias table.",
+                r.token,
+                boxes_path().display()
+            );
+            assert!(
+                !claimed_chips.contains(&chip_of(r.shape)),
+                "ledger identity `{}` is unclaimed but was measured on `{}` — the same \
+                 chip as a box the alias table already knows. That is what a RENAME looks \
+                 like, and it is how the trend ledger went dead for a month. Either add \
+                 `<box>\\t{}\\t<why>` to {}, or say in that file why it is a different \
+                 machine.",
+                r.token,
+                chip_of(r.shape),
+                r.token,
+                boxes_path().display()
+            );
+        }
+    }
+
+    /// TRIPWIRE 2 — NO CLAIM MERGES TWO MACHINES. One box name, one chip. This
+    /// is the guard on the fix itself: the alias table's whole power is to
+    /// declare two identities equal, and this is what stops that power being
+    /// used to make a number look better.
+    #[test]
+    fn no_committed_box_name_covers_two_different_chips() {
+        let ledger = committed_ledger();
+        let aliases = committed_aliases();
+        let mut seen: Vec<(String, String)> = Vec::new();
+        for r in trend_ledger_rows(&ledger) {
+            if r.shape.is_empty() {
+                continue;
+            }
+            let key = resolve_ledger_box(&aliases, r.token).key().to_string();
+            let chip = chip_of(r.shape).to_string();
+            if let Some((_, prior)) = seen.iter().find(|(k, _)| *k == key) {
+                assert_eq!(
+                    prior,
+                    &chip,
+                    "box `{key}` carries rows from two different chips ({prior} and \
+                     {chip}). {} is claiming two machines are one; a trend that compares \
+                     across them looks alive and lies.",
+                    boxes_path().display()
+                );
+            } else {
+                seen.push((key, chip));
+            }
+        }
+    }
+
+    /// TRIPWIRE 3 — THIS BOX IS NOT ORPHANED FROM ITS OWN HISTORY. If the alias
+    /// table claims THIS machine, the committed ledger must contain rows that
+    /// resolve to it. This is the one that fires on the machine where the
+    /// damage happens, and it is exactly what was silently false for a month.
+    ///
+    /// SELF-SKIPPING BY CONSTRUCTION: a machine no alias row claims has no
+    /// history to be orphaned from, so it returns early rather than reddening
+    /// somebody else's push. That is not a hole — the claim only exists because
+    /// a human wrote it, and writing it is the moment this becomes checkable.
+    #[test]
+    fn this_box_is_not_orphaned_from_its_own_committed_history() {
+        let me = machine_id();
+        if !me.claimed {
+            return;
+        }
+        let ledger = committed_ledger();
+        let aliases = committed_aliases();
+        let mine = trend_ledger_rows(&ledger)
+            .iter()
+            .filter(|r| resolve_ledger_box(&aliases, r.token).key() == me.key)
+            .count();
+        assert!(
+            mine > 0,
+            "{} names this machine `{}` ({}), but not one of the {} committed ledger rows \
+             resolves to it — the trend guard is DEAD on this box and every `gate perf` \
+             run will print SKIP as though it were a fresh machine. That is precisely the \
+             state a hostname rename left this ledger in.",
+            boxes_path().display(),
+            me.key,
+            me.identities.join(" "),
+            trend_ledger_rows(&ledger).len(),
+        );
     }
 
     #[test]

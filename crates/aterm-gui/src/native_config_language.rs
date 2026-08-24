@@ -5279,7 +5279,9 @@ expect_nonce = "pin"
         } else {
             "most state/geometry requests"
         };
-        for message in ["drops every OSC 52 Query", window_ops_phrase] {
+        // The OSC 52 caveat stopped claiming Queries are dropped (the arm
+        // answers now); what it warns about is the read-back it widens.
+        for message in ["READ BACK", window_ops_phrase] {
             let diagnostic = analysis
                 .diagnostics
                 .iter()

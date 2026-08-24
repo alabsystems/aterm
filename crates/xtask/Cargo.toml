@@ -36,6 +36,12 @@ aterm-search = { workspace = true, features = ["spec-anchors"] }
 # so the manual verb and the compile gate cannot diverge. Also provides the shared
 # source-walk helpers (collect_rs_files / is_test_file) every scan gate uses.
 aterm-census = { workspace = true }
+# ONE definition of "which directory is THE toolchain", shared with
+# tools/verify.sh's driver. `gate lint` already refuses to re-derive tippy in
+# shell for this reason; re-deriving the toolchain lookup in Rust is the same
+# split brain one layer down, and it is what let the two copies drift into
+# disagreeing about whether a rustup-linked pin counts.
+aterm-verify = { workspace = true }
 
 [lints]
 workspace = true

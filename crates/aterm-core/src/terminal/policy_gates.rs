@@ -660,6 +660,85 @@ mod tests {
         );
     }
 
+
+    /// AMB-1..4 AS A COUNT — the one thing the equivalence tests above cannot
+    /// see.
+    ///
+    /// Every test in this module compares the compiled table's VERDICT against a
+    /// live evaluation's verdict. That is the right correctness gate and it is
+    /// exactly why none of them can notice the optimization going away: a gate
+    /// site that went back to minting a probe and walking the rule set per
+    /// dispatch would agree with the table on every input and pass all of them
+    /// green, while a DSR/DA flood paid ~40-50 ns per reply again at full parser
+    /// rate — before the rate-limit debit, so even replies that are then dropped
+    /// pay it.
+    ///
+    /// So the count is the instrument: after a policy is installed, a burst of
+    /// covered sequences must reach the bridge ZERO times. This is
+    /// machine-independent and exact, unlike the timing lanes that measured the
+    /// win (51.2 -> 11.3 ns per gate), and it rides `cargo test`.
+    ///
+    /// TWO-SIDED. An UNCOVERED sequence — an XTWINOPS `Ps` past the compiled
+    /// range — must still be evaluated live, so the counter is proven to be
+    /// reading the real path rather than a path the burst never entered. Without
+    /// that half, a counter that had been accidentally disconnected would report
+    /// zero and this test would celebrate.
+    ///
+    /// WHAT IT CANNOT CATCH: `evaluate` itself getting slower. Counts guard the
+    /// structure of a win, never its constant factor.
+    #[test]
+    fn an_installed_policy_costs_no_per_dispatch_evaluation_at_the_compiled_gates() {
+        let mut term = Terminal::new(24, 80);
+        term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
+        // The INSTALL itself compiles the whole table, which is the one place
+        // the evaluation is supposed to happen. Discard that.
+        let compiled = crate::terminal::policy_bridge::take_engine_decisions();
+        assert!(
+            compiled > 0,
+            "installing a policy compiled no gate at all — the fixture is not \
+             reaching the bridge and every zero below would be vacuous"
+        );
+
+        const BURST: usize = 32;
+        for _ in 0..BURST {
+            // The response sink (AMB-2): CPR, the single sink all 31
+            // reply-producing sequences share.
+            term.process(b"\x1b[6n");
+            let _ = term.take_response();
+            // Primary DA — the same sink, a different producer.
+            term.process(b"\x1b[c");
+            let _ = term.take_response();
+            // OSC 52 query and set (AMB-1).
+            term.process(b"\x1b]52;c;?\x07");
+            term.process(b"\x1b]52;c;aGk=\x07");
+            let _ = term.take_response();
+            // A shell-integration mark (AMB-3) and an in-range CSI t (AMB-4).
+            term.process(b"\x1b]133;A\x07");
+            term.process(b"\x1b[18t");
+            let _ = term.take_response();
+        }
+        assert_eq!(
+            crate::terminal::policy_bridge::take_engine_decisions(),
+            0,
+            "{BURST} rounds of covered sequences re-entered the policy bridge. \
+             The fixed capability gates are supposed to be COMPILED once per \
+             policy generation and read as a byte at dispatch; this is the \
+             per-event probe-and-walk the campaign removed, back again. No \
+             verdict changed, so nothing else in this file can see it."
+        );
+
+        // THE OTHER SIDE: a `Ps` past the compiled range is documented to fall
+        // back to a live evaluation, and must still do one.
+        term.process(format!("\x1b[{}t", XTWINOPS_MAX_PS + 1).as_bytes());
+        let _ = term.take_response();
+        assert!(
+            crate::terminal::policy_bridge::take_engine_decisions() > 0,
+            "an out-of-range XTWINOPS Ps did not reach the bridge — the counter \
+             is not reading the live-evaluation path, so the zero above proves \
+             nothing"
+        );
+    }
+
     #[test]
     fn standard_profile_keeps_replying() {
         let mut term = Terminal::new(24, 80);

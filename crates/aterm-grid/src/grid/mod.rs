@@ -86,7 +86,8 @@ pub(in crate::grid) use crate::{KANI_MAX_COLS, KANI_MAX_ROWS};
 #[cfg(any(test, feature = "testing"))]
 pub(in crate::grid) use crate::test_counters::{
     count_reflow_passthrough_lines, count_reflow_row_op, count_ring_fast_materialize,
-    count_row_to_line_cell, count_row_to_line_op, count_scrollback_reflow_sync_lines,
+    count_row_to_line_cell, count_row_to_line_op, count_rows_only_resize_migrated_rows,
+    count_scrollback_reflow_sync_lines, count_viewport_row_materialize,
 };
 
 // Scrollback re-exports for test files migrated from aterm-core (#6556).

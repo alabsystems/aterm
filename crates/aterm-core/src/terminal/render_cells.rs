@@ -1074,6 +1074,12 @@ impl Terminal {
         // frame, never to the terminal snapshot itself. A direct single-pane
         // extraction restores the historical unbounded selection predicate.
         scratch.selection_clip = None;
+        // …and its per-pane list, for the identical reason and with a stronger
+        // consequence: a NON-EMPTY `selections` makes the renderer read the list
+        // INSTEAD of the scalar selection this extraction is about to stamp, so
+        // a composed frame's panes left in a reused scratch would replace this
+        // terminal's highlight wholesale.
+        scratch.selections.clear();
 
         let cur = self.cursor();
         scratch.cursor_row = cur.row as usize;
@@ -1247,6 +1253,13 @@ mod tests {
             vec![crate::render::DefaultBgSpan::new(0, 8, 0x0077_8899)],
         ];
         scratch.selection_clip = Some(crate::render::SelectionClip::new(0, 2, 5, 8));
+        scratch.selections = vec![crate::render::PaneSelection {
+            selection: crate::selection::TextSelection::new(),
+            clip: crate::render::SelectionClip::new(0, 2, 5, 8),
+            bg: 0x0001_0203,
+            fg: 0x0004_0506,
+            inactive: true,
+        }];
 
         term.cell_frame_into(&mut scratch, 2, 8);
 
@@ -1263,6 +1276,10 @@ mod tests {
         assert_eq!(
             scratch.selection_clip, None,
             "a direct terminal snapshot must not inherit a split selection clip"
+        );
+        assert!(
+            scratch.selections.is_empty(),
+            "…nor the per-pane list, which would REPLACE the scalar selection"
         );
     }
 

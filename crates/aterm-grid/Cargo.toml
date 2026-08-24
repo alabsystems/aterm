@@ -68,5 +68,9 @@ harness = false
 name = "scroll_damage"
 harness = false
 
+[[bench]]
+name = "rows_only_resize"
+harness = false
+
 [lints]
 workspace = true

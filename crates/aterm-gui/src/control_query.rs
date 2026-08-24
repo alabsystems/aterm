@@ -543,6 +543,22 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_attach_backend_finalize_ms={:.2} \
          startup_attach_chrome_geometry_ms={:.2} \
          startup_attach_surface_create_ms={:.2} startup_attach_finish_ms={:.2} \
+         startup_worker_schema={} startup_worker_valid={} \
+         startup_worker_total_ms={:.2} startup_worker_overlap_ms={:.2} \
+         startup_worker_after_join_ms={:.2} startup_worker_post_join_ms={:.2} \
+         startup_worker_prelude_ms={:.2} startup_worker_gpu_build_ms={:.2} \
+         startup_worker_font_admit_ms={:.2} startup_worker_font_apply_ms={:.2} \
+         startup_worker_font_seal_ms={:.2} startup_worker_epilogue_ms={:.2} \
+         startup_gpu_schema={} startup_gpu_valid={} \
+         startup_gpu_instance_ms={:.2} startup_gpu_adapter_ms={:.2} \
+         startup_gpu_device_ms={:.2} startup_gpu_context_tail_ms={:.2} \
+         startup_gpu_font_thread_ms={:.2} startup_gpu_font_join_ms={:.2} \
+         startup_gpu_pipelines_ms={:.2} startup_gpu_pipe_shader_ms={:.2} \
+         startup_gpu_pipe_uniform_atlas_ms={:.2} startup_gpu_pipe_cell_ms={:.2} \
+         startup_gpu_pipe_blit_ms={:.2} startup_gpu_pipe_tray_ms={:.2} \
+         startup_gpu_pipe_bloom_ms={:.2} startup_gpu_pipe_vbuf_ms={:.2} \
+         startup_gpu_pipe_tail_ms={:.2} startup_gpu_tail_ms={:.2} \
+         startup_gpu_cell_pipeline_ms={} \
          first_present_ms={:.2} first_visible_ms={:.2}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -613,9 +629,66 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.startup_attach_chrome_geometry_ns),
         ms(m.startup_attach_surface_create_ns),
         ms(m.startup_attach_finish_ns),
+        m.startup_worker_schema,
+        u8::from(m.startup_worker_valid),
+        ms(m.startup_worker_total_ns),
+        ms(m.startup_worker_overlap_ns),
+        ms(m.startup_worker_after_join_ns),
+        ms(m.startup_worker_post_join_ns),
+        ms(m.startup_worker_prelude_ns),
+        ms(m.startup_worker_gpu_build_ns),
+        ms(m.startup_worker_font_admit_ns),
+        ms(m.startup_worker_font_apply_ns),
+        ms(m.startup_worker_font_seal_ns),
+        ms(m.startup_worker_epilogue_ns),
+        m.startup_gpu_schema,
+        u8::from(m.startup_gpu_valid),
+        ms(m.startup_gpu_instance_ns),
+        ms(m.startup_gpu_adapter_ns),
+        ms(m.startup_gpu_device_ns),
+        ms(m.startup_gpu_context_tail_ns),
+        ms(m.startup_gpu_font_thread_ns),
+        ms(m.startup_gpu_font_join_ns),
+        ms(m.startup_gpu_pipelines_ns),
+        ms(m.startup_gpu_pipe_shader_ns),
+        ms(m.startup_gpu_pipe_uniform_atlas_ns),
+        ms(m.startup_gpu_pipe_cell_ns),
+        ms(m.startup_gpu_pipe_blit_ns),
+        ms(m.startup_gpu_pipe_tray_ns),
+        ms(m.startup_gpu_pipe_bloom_ns),
+        ms(m.startup_gpu_pipe_vbuf_ns),
+        ms(m.startup_gpu_pipe_tail_ns),
+        ms(m.startup_gpu_tail_ns),
+        cell_pipeline_pairs(&m.startup_gpu_cell_pipeline_ns),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
     )
+}
+
+/// Render the per-cell-pipeline split as `name:ms` pairs, comma-joined.
+///
+/// ONE self-labelling wire field rather than twelve positional ones: a reader
+/// never has to know `build_cell_pipelines`' order, and adding or removing a
+/// pipeline cannot silently shift someone else's column.
+fn cell_pipeline_pairs(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT]) -> String {
+    aterm_gpu::startup_probe::CELL_PIPELINE_NAMES
+        .iter()
+        .zip(cell_ns.iter())
+        .map(|(name, ns)| format!("{name}:{:.2}", *ns as f64 / 1e6))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same split as a JSON object, so the structured twin stays parseable
+/// without splitting a string.
+fn cell_pipeline_object(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT]) -> String {
+    let body = aterm_gpu::startup_probe::CELL_PIPELINE_NAMES
+        .iter()
+        .zip(cell_ns.iter())
+        .map(|(name, ns)| format!("\"{name}\":{:.2}", *ns as f64 / 1e6))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
 }
 
 /// Structured twin of [`cmd_metrics`]. All scheduler/redraw counters and typed
@@ -720,6 +793,22 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_attach_backend_finalize_ms\":{:.2},\
          \"startup_attach_chrome_geometry_ms\":{:.2},\
          \"startup_attach_surface_create_ms\":{:.2},\"startup_attach_finish_ms\":{:.2},\
+         \"startup_worker_schema\":{},\"startup_worker_valid\":{},\
+         \"startup_worker_total_ms\":{:.2},\"startup_worker_overlap_ms\":{:.2},\
+         \"startup_worker_after_join_ms\":{:.2},\"startup_worker_post_join_ms\":{:.2},\
+         \"startup_worker_prelude_ms\":{:.2},\"startup_worker_gpu_build_ms\":{:.2},\
+         \"startup_worker_font_admit_ms\":{:.2},\"startup_worker_font_apply_ms\":{:.2},\
+         \"startup_worker_font_seal_ms\":{:.2},\"startup_worker_epilogue_ms\":{:.2},\
+         \"startup_gpu_schema\":{},\"startup_gpu_valid\":{},\
+         \"startup_gpu_instance_ms\":{:.2},\"startup_gpu_adapter_ms\":{:.2},\
+         \"startup_gpu_device_ms\":{:.2},\"startup_gpu_context_tail_ms\":{:.2},\
+         \"startup_gpu_font_thread_ms\":{:.2},\"startup_gpu_font_join_ms\":{:.2},\
+         \"startup_gpu_pipelines_ms\":{:.2},\"startup_gpu_pipe_shader_ms\":{:.2},\
+         \"startup_gpu_pipe_uniform_atlas_ms\":{:.2},\"startup_gpu_pipe_cell_ms\":{:.2},\
+         \"startup_gpu_pipe_blit_ms\":{:.2},\"startup_gpu_pipe_tray_ms\":{:.2},\
+         \"startup_gpu_pipe_bloom_ms\":{:.2},\"startup_gpu_pipe_vbuf_ms\":{:.2},\
+         \"startup_gpu_pipe_tail_ms\":{:.2},\"startup_gpu_tail_ms\":{:.2},\
+         \"startup_gpu_cell_pipeline_ms\":{},\
          \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -790,6 +879,37 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.startup_attach_chrome_geometry_ns),
         ms(m.startup_attach_surface_create_ns),
         ms(m.startup_attach_finish_ns),
+        m.startup_worker_schema,
+        m.startup_worker_valid,
+        ms(m.startup_worker_total_ns),
+        ms(m.startup_worker_overlap_ns),
+        ms(m.startup_worker_after_join_ns),
+        ms(m.startup_worker_post_join_ns),
+        ms(m.startup_worker_prelude_ns),
+        ms(m.startup_worker_gpu_build_ns),
+        ms(m.startup_worker_font_admit_ns),
+        ms(m.startup_worker_font_apply_ns),
+        ms(m.startup_worker_font_seal_ns),
+        ms(m.startup_worker_epilogue_ns),
+        m.startup_gpu_schema,
+        m.startup_gpu_valid,
+        ms(m.startup_gpu_instance_ns),
+        ms(m.startup_gpu_adapter_ns),
+        ms(m.startup_gpu_device_ns),
+        ms(m.startup_gpu_context_tail_ns),
+        ms(m.startup_gpu_font_thread_ns),
+        ms(m.startup_gpu_font_join_ns),
+        ms(m.startup_gpu_pipelines_ns),
+        ms(m.startup_gpu_pipe_shader_ns),
+        ms(m.startup_gpu_pipe_uniform_atlas_ns),
+        ms(m.startup_gpu_pipe_cell_ns),
+        ms(m.startup_gpu_pipe_blit_ns),
+        ms(m.startup_gpu_pipe_tray_ns),
+        ms(m.startup_gpu_pipe_bloom_ns),
+        ms(m.startup_gpu_pipe_vbuf_ns),
+        ms(m.startup_gpu_pipe_tail_ns),
+        ms(m.startup_gpu_tail_ns),
+        cell_pipeline_object(&m.startup_gpu_cell_pipeline_ns),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
     ))
@@ -2594,9 +2714,10 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         selection_clip: _, // OMITTED: host-only split composition bounds; engine styled frames have none
         selection_bg: _, // frame "selection_bg" (OSC 17 fixed RGB, else the "default" policy token)
         selection_fg: _, // frame "selection_fg" (OSC 19 fixed RGB, else the "dynamic" auto-contrast token)
-        clusters: _,     // folded into per-cell "glyph" (cell_grapheme)
-        combining: _,    // folded into per-cell "glyph" (cell_grapheme)
-        line_sizes: _,   // frame "line_sizes" (F2)
+        selections: _, // OMITTED: compose-time per-pane selection list, the twin of `selection_clip` above. A styled frame is extracted from ONE Terminal via `cell_frame_into`, which clears it, so the scalar `selection` above is always this frame's whole selection authority.
+        clusters: _,   // folded into per-cell "glyph" (cell_grapheme)
+        combining: _,  // folded into per-cell "glyph" (cell_grapheme)
+        line_sizes: _, // frame "line_sizes" (F2)
         line_size_spans: _, // OMITTED: compose-time per-pane refinement of `line_sizes`. This frame is extracted from ONE Terminal, whose rows are uniform, so it is always empty here; the split-pane composite is not the styled-frame source.
         default_bg_spans: _, // OMITTED: compose-time per-pane refinement of `default_bg`, empty for a single-Terminal frame; each cell already carries its own resolved bg.
         images: _,           // frame "images" (F1)
@@ -3303,6 +3424,26 @@ mod tests {
             "startup_attach_chrome_geometry_ms=",
             "startup_attach_surface_create_ms=",
             "startup_attach_finish_ms=",
+            "startup_worker_schema=",
+            "startup_worker_valid=",
+            "startup_worker_total_ms=",
+            "startup_worker_overlap_ms=",
+            "startup_worker_after_join_ms=",
+            "startup_worker_post_join_ms=",
+            "startup_worker_gpu_build_ms=",
+            "startup_worker_font_seal_ms=",
+            "startup_worker_epilogue_ms=",
+            "startup_gpu_schema=",
+            "startup_gpu_valid=",
+            "startup_gpu_instance_ms=",
+            "startup_gpu_adapter_ms=",
+            "startup_gpu_device_ms=",
+            "startup_gpu_font_thread_ms=",
+            "startup_gpu_font_join_ms=",
+            "startup_gpu_pipelines_ms=",
+            "startup_gpu_pipe_cell_ms=",
+            "startup_gpu_tail_ms=",
+            "startup_gpu_cell_pipeline_ms=",
             "first_present_ms=",
         ] {
             assert!(
@@ -3354,6 +3495,26 @@ mod tests {
             "startup_attach_chrome_geometry_ms",
             "startup_attach_surface_create_ms",
             "startup_attach_finish_ms",
+            "startup_worker_schema",
+            "startup_worker_valid",
+            "startup_worker_total_ms",
+            "startup_worker_overlap_ms",
+            "startup_worker_after_join_ms",
+            "startup_worker_post_join_ms",
+            "startup_worker_gpu_build_ms",
+            "startup_worker_font_seal_ms",
+            "startup_worker_epilogue_ms",
+            "startup_gpu_schema",
+            "startup_gpu_valid",
+            "startup_gpu_instance_ms",
+            "startup_gpu_adapter_ms",
+            "startup_gpu_device_ms",
+            "startup_gpu_font_thread_ms",
+            "startup_gpu_font_join_ms",
+            "startup_gpu_pipelines_ms",
+            "startup_gpu_pipe_cell_ms",
+            "startup_gpu_tail_ms",
+            "startup_gpu_cell_pipeline_ms",
             "first_present_ms",
         ] {
             assert!(

@@ -580,6 +580,16 @@ impl Grid {
     /// Returns `None` (and is exactly [`Grid::resize`]) when the width is
     /// unchanged, reflow is disabled, or no tiered store is attached — in those
     /// cases the resize is already bounded by the viewport.
+    ///
+    /// That last clause is load-bearing and was, for the width-unchanged arm,
+    /// FALSE until `adjust_row_count` grew its rows-only branch: the plain
+    /// resize compared the whole ring against the new VISIBLE row target and
+    /// migrated every ring-resident history row into the store, so a
+    /// window-height drag on a 10,000-line ring cost ~9,999 rows per pane per
+    /// event on this same synchronous path. It is true now because
+    /// `adjust_row_count_rows_only` reclassifies in place; the obligation is
+    /// gated by `tests/reflow/rows_only_cost_bound.rs`, the rows-only sibling of
+    /// the width gate in `tests/reflow/cost_bound.rs`.
     pub fn resize_offloading_scrollback(
         &mut self,
         new_rows: u16,

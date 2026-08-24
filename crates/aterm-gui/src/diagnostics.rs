@@ -359,6 +359,19 @@ pub(crate) fn config_semantic_warnings(
                 // a platform seed), NOT an unknown action — the loader accepts it
                 // silently, so the validator (and the Settings editor's live
                 // diagnostics, which share this pass) must not red-flag it.
+                //
+                // It masks a SEED, though — never a hardcoded built-in. Where
+                // that built-in is compiled in, the conflict caveat is exactly
+                // as true as for any other value, so it still rides (the review
+                // caught `"cmd+c" = "none"` validating fully green on macOS).
+                if let Some(label) = crate::keybinding::builtin_shadow_label(chord) {
+                    warnings.push(ConfigSemanticWarning {
+                        key: "keybindings",
+                        message: format!(
+                            "keybindings: chord {chord:?} unbinds a default but still conflicts with built-in {label}"
+                        ),
+                    });
+                }
             } else if crate::keybinding::Action::parse(action).is_none() {
                 warnings.push(ConfigSemanticWarning {
                     key: "keybindings",
@@ -586,9 +599,14 @@ pub(crate) fn config_semantic_warnings(
         }
     }
     if config.allow_osc52_query == Some(true) {
+        // The Query arm ANSWERS now (own-slot reads, per selection: `c` from the
+        // clipboard slot, `p` from PRIMARY on X11), so the old "every Query is
+        // dropped" line was false. What is still worth saying is what the key
+        // actually widens: a program in the terminal can read back what aterm
+        // itself put on the clipboard.
         warnings.push(ConfigSemanticWarning {
             key: "allow_osc52_query",
-            message: "allow_osc52_query is enabled, but the GUI clipboard callback drops every OSC 52 Query and returns no contents; clipboard reads remain unavailable"
+            message: "allow_osc52_query is enabled: a program in the terminal can READ BACK what aterm placed on the clipboard (own-slot only — never the desktop's clipboard). Leave it off unless a specific tool needs it"
                 .to_string(),
         });
     }
@@ -1659,7 +1677,13 @@ pub(crate) fn list_keybinds() -> String {
 /// behaviour) told the user their working config was broken.
 fn user_keybinding_note(chord: &str, action: &str) -> String {
     if crate::keybinding::is_unbind_action(action) {
-        "  (unbinds a default)".to_string()
+        // An unbind masks a SEED. Where a hardcoded built-in also claims the
+        // chord, that half survives the unbind — say both, or the listing
+        // implies the chord is now free (the review's macOS `cmd+c` case).
+        match crate::keybinding::builtin_shadow_label(chord) {
+            Some(lbl) => format!("  (unbinds a default; still conflicts with {lbl})"),
+            None => "  (unbinds a default)".to_string(),
+        }
     } else if crate::keybinding::Action::parse(action).is_none() {
         "  (UNKNOWN action)".to_string()
     } else if let Some(lbl) = crate::keybinding::builtin_shadow_label(chord) {
@@ -2035,8 +2059,10 @@ palette = ["#112233"]
         assert_eq!(enabled.len(), 2, "{enabled:?}");
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_osc52_query"
-                && warning.message.contains("drops every OSC 52 Query")
-                && warning.message.contains("remain unavailable")
+                // The Query arm answers now; the honest caveat names what the
+                // key widens, and states the own-slot bound.
+                && warning.message.contains("READ BACK")
+                && warning.message.contains("own-slot only")
         }));
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_window_ops"
@@ -2740,6 +2766,19 @@ ink = "rainbow"
     #[test]
     fn user_keybinding_note_labels_unbinds_and_unknowns() {
         assert_eq!(user_keybinding_note("f11", "none"), "  (unbinds a default)");
+        // An unbind over a HARDCODED built-in says both halves — the review's
+        // macOS `cmd+c` case, where the unbind masks a seed the built-in still
+        // owns. Off macOS the suite is compiled out and there is nothing to add.
+        let over_builtin = user_keybinding_note("cmd+c", "none");
+        if crate::keybinding::builtin_shadow_label("cmd+c").is_some() {
+            assert!(
+                over_builtin.contains("unbinds a default")
+                    && over_builtin.contains("still conflicts with"),
+                "an unbind cannot imply the chord is free: {over_builtin}"
+            );
+        } else {
+            assert_eq!(over_builtin, "  (unbinds a default)");
+        }
         assert_eq!(
             user_keybinding_note("ctrl+tab", "unbind"),
             "  (unbinds a default)"

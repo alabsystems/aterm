@@ -743,6 +743,16 @@ impl crate::flow::Fetcher for GithubFetcher {
 /// freshness gate as `github:` (a dir cache holds bytes, not trust).
 pub struct DirFetcher {
     dir: PathBuf,
+    /// Held for the fetcher's lifetime iff `dir` is THIS bundle's sealed seed:
+    /// the durable "a live process is reading the seal" record that keeps the
+    /// self-updater from swapping the bundle out from under a multi-GB
+    /// extraction. Claimed HERE — the one choke point every seal-reading lane
+    /// flows through (`cmd_seed`, and the empty-store bootstrap chain leg the
+    /// network verbs mount) — so a user-run CLI is guarded exactly like the
+    /// GUI's spawn lanes, with the extractor's OWN pid and no cross-process
+    /// choreography (see `aterm_update_core::seal_guard`). `None` for every
+    /// ordinary `dir:` registry, and always off-macOS.
+    _seal_guard: Option<aterm_update_core::seal_guard::SealReadGuard>,
 }
 
 impl DirFetcher {
@@ -750,8 +760,17 @@ impl DirFetcher {
     /// `source_id`).
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
+        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        // Compare canonical-to-canonical: `dir` was just canonicalized, and
+        // the bundle path may reach the seal through a symlinked Resources.
+        let seal = crate::bundled_seed_dir()
+            .map(|seed| std::fs::canonicalize(&seed).unwrap_or(seed))
+            .is_some_and(|seed| seed == dir);
         Self {
-            dir: std::fs::canonicalize(&dir).unwrap_or(dir),
+            dir,
+            _seal_guard: seal
+                .then(aterm_update_core::seal_guard::SealReadGuard::claim)
+                .flatten(),
         }
     }
 }

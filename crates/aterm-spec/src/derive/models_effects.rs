@@ -1858,6 +1858,240 @@ pub fn cursor_move_candidate_model() -> Model {
     }
 }
 
+/// LIVENESS twin of the [`cursor_move_candidate_model`] confirmation seam —
+/// the rainbow-trail blackout's missing half. 201449c2 shipped the movement
+/// admission gate WITH a formal model that proved SAFETY (cold program output
+/// never paints trails) — and nobody stated that a real keystroke with a real
+/// echo ever ADMITS. The model's echo environment was idealized; real shells
+/// produce shapes it never contained, so a gate that provably never lied still
+/// provably never spoke. This model closes that class: an ENVIRONMENT
+/// ADVERSARY whose actions produce every audited echo shape, composed with the
+/// shipped confirmation decision (`CursorGlow::confirm_content_candidate`),
+/// under BOTH obligation families at once.
+///
+/// The adversary's shapes (`shape`), each an audited incident witness:
+///
+///   1 `KeyPlainEcho`         — the textbook echo: the typed glyph
+///       materializes at the caret in the single next processed generation.
+///   2 `KeyGhostSuggest` (E1) — zsh-autosuggestions POSTDISPLAY: the SAME
+///       echo batch also paints ghost text at/after the caret. The caret is
+///       the exactness frontier; post-caret cells are the shell's
+///       presentation zone and carry no veto.
+///   3 `KeySpaceOnBlanks` (E3) — a typed SPACE onto tail-filled implicit
+///       blanks: content-invisible under the implicit-blank lens; the
+///       materialization witness is STORAGE GROWTH of the stored row over the
+///       owned span.
+///   4 `KeyOvertypeSuggestion` (E4) — retyping under a VISIBLE suggestion:
+///       the typed glyph is already painted at the caret, so the echo is a
+///       NULL DIFF; the witness is the expected span already present plus the
+///       exact predicted landing under the one attributable generation.
+///   5 `KeySplitEcho` (E2) — the echo crosses TWO PTY read batches (baseline
+///       + 2, not + 1). REGISTERED STANDING GAP: the strict next-generation
+///       law retires it today (`StandingGapSplitEchoRetiresE2`).
+///   6 `KeyBurst` (E5) — several keys between rendered frames: the proof
+///       anchor is stale (the row probe predates the keystroke), and proof
+///       capture declines. REGISTERED STANDING GAP
+///       (`StandingGapBurstRetiresE5`).
+///   7 `ColdSpinner`          — cold program output, no keystroke at all.
+///   8 `KeyEchoSwallowed`     — the echo never arrives; an unrelated batch
+///       crosses the input boundary instead.
+///   9 `KeyDeviatingEcho`     — the shell echoes something other than the
+///       typed glyph at the caret.
+///
+/// Obligation families:
+///
+///   SAFETY (kept, never traded away for liveness): cold, swallowed, and
+///   deviating shapes never confirm; every confirmation carries an armed
+///   keystroke, its delivered echo, the single attributable generation, a
+///   fresh anchor, an intact pre-caret prefix, and a materialization witness
+///   (`ConfirmIsWitnessed` and the per-shape dark invariants).
+///
+///   LIVENESS (the new family): every settled run over a shape the shipped
+///   code claims to handle — plain, E1, E3, E4 — ends CONFIRMED
+///   (`LivePlainEchoConfirms`, `LiveGhostTextConfirmsE1`,
+///   `LiveBlankSpaceConfirmsE3`, `LiveOvertypeConfirmsE4`), and every run
+///   reaches a decision at all (Tier-0 runs `find_deadlock` with
+///   `settled = 1` as the final predicate — the bounded eventuality).
+///
+///   STANDING GAPS (honest limits, stated as checked facts and reprinted by
+///   the Tier-0 driver — never silently waived): E2 and E5 settle RETIRED by
+///   design today. The strict generation law (split-batch echoes) and the
+///   multi-key stale anchor remain registered follow-ups to the blackout
+///   repair, alongside split-pane arming.
+///
+/// `Buggy = 1` is the 201449c2 confirmation law verbatim: whole-row exactness
+/// (any post-caret change vetoes) and a newly-materialize-only witness (null
+/// diffs and content-invisible blanks cannot testify). That mutant is still
+/// SAFE — every safety invariant above holds at `Buggy = 1` — and that is
+/// precisely the audited defect class: only the LIVENESS family catches it
+/// (E1/E3/E4 settle retired), so a checker that stated safety alone would
+/// have called the mute gate green. Tier-1 binds the real
+/// `CursorGlow::confirm_content_candidate` decision to `Decide` per shape in
+/// `aterm-effects/src/cursor_glow.rs`
+/// (`real_confirm_content_candidate_refines_the_typed_echo_liveness_model`).
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
+// models above) — the MODEL it returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn typed_echo_liveness_model() -> Model {
+    crate::ty_model! {
+        TypedEchoLiveness {
+            const Buggy = 0;
+            var shape = 0;              // 0 unpicked, then the roster above
+            var armed = 0;              // a real typed keystroke armed a candidate
+            var echoed = 0;             // the environment delivered its batch
+            var gen_delta = 0;          // parser generations crossed since baseline
+            var stale_anchor = 0;       // proof capture predates the keystroke (E5)
+            var caret_material = 0;     // expected span present at the caret in the probe
+            var pre_caret_intact = 0;   // every cell BEFORE the caret content-identical
+            var post_caret_changed = 0; // presentation zone painted in the same batch (E1)
+            var content_changed = 0;    // row content differs under the implicit-blank lens
+            var storage_growth = 0;     // stored row grew to cover the owned span (E3)
+            var prepainted = 0;         // expected glyphs already at the caret at input (E4)
+            var confirmed = 0;
+            var retired = 0;
+            var settled = 0;            // the decision is final
+
+            // -- the environment adversary picks one echo shape --------------
+            action KeyPlainEcho when (shape == 0) { shape = 1; armed = 1; }
+            action KeyGhostSuggest when (shape == 0) { shape = 2; armed = 1; }
+            action KeySpaceOnBlanks when (shape == 0) { shape = 3; armed = 1; }
+            action KeyOvertypeSuggestion when (shape == 0) {
+                shape = 4; armed = 1; prepainted = 1;
+            }
+            action KeySplitEcho when (shape == 0) { shape = 5; armed = 1; }
+            action KeyBurst when (shape == 0) { shape = 6; armed = 1; stale_anchor = 1; }
+            action ColdSpinner when (shape == 0) { shape = 7; }
+            action KeyEchoSwallowed when (shape == 0) { shape = 8; armed = 1; }
+            action KeyDeviatingEcho when (shape == 0) { shape = 9; armed = 1; }
+
+            // -- the environment delivers the batch its shape promised -------
+            action EchoPlain when (shape == 1 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1; content_changed = 1;
+            }
+            action EchoWithGhostText when (shape == 2 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1; content_changed = 1; post_caret_changed = 1;
+            }
+            action EchoStorageGrowth when (shape == 3 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1; storage_growth = 1;
+            }
+            action EchoNullDiffOvertype when (shape == 4 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1;
+            }
+            action EchoSplitBatches when (shape == 5 && echoed == 0) {
+                echoed = 1; gen_delta = 2; caret_material = 1;
+                pre_caret_intact = 1; content_changed = 1;
+            }
+            action EchoAfterBurst when (shape == 6 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1; content_changed = 1;
+            }
+            action ColdPaint when (shape == 7 && echoed == 0) {
+                echoed = 1; gen_delta = 1; content_changed = 1;
+                post_caret_changed = 1;
+            }
+            action UnrelatedBatch when (shape == 8 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+            }
+            action EchoDeviates when (shape == 9 && echoed == 0) {
+                echoed = 1; gen_delta = 1; content_changed = 1;
+                pre_caret_intact = 1;
+            }
+
+            // -- the shipped confirmation decision ---------------------------
+            action Decide when (echoed == 1 && settled == 0) {
+                confirmed = if Buggy == 1 {
+                    // 201449c2 verbatim: whole-row exactness (any post-caret
+                    // change vetoes) + newly-materialize-only witness.
+                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && pre_caret_intact == 1 && caret_material == 1
+                        && content_changed == 1 && post_caret_changed == 0
+                        && prepainted == 0
+                    { 1 } else { 0 }
+                } else {
+                    // The shipped fix: caret-frontier exactness + any of the
+                    // three materialization witnesses (content diff, storage
+                    // growth, overtype-null-diff).
+                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && pre_caret_intact == 1 && caret_material == 1
+                        && (content_changed == 1 || storage_growth == 1
+                            || prepainted == 1)
+                    { 1 } else { 0 }
+                };
+                retired = if Buggy == 1 {
+                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && pre_caret_intact == 1 && caret_material == 1
+                        && content_changed == 1 && post_caret_changed == 0
+                        && prepainted == 0
+                    { 0 } else { armed }
+                } else {
+                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && pre_caret_intact == 1 && caret_material == 1
+                        && (content_changed == 1 || storage_growth == 1
+                            || prepainted == 1)
+                    { 0 } else { armed }
+                };
+                settled = 1;
+            }
+
+            // SAFETY — the 201449c2 protections, kept word for word.
+            invariant ColdSpinnerNeverConfirms:
+                if shape == 7 { confirmed == 0 } else { shape <= 9 };
+            invariant SwallowedEchoNeverConfirms:
+                if shape == 8 { confirmed == 0 } else { shape <= 9 };
+            invariant DeviatingEchoNeverConfirms:
+                if shape == 9 { confirmed == 0 } else { shape <= 9 };
+            invariant ConfirmIsWitnessed:
+                if confirmed == 1 {
+                    armed == 1 && echoed == 1 && gen_delta == 1
+                        && stale_anchor == 0 && pre_caret_intact == 1
+                        && caret_material == 1
+                } else { confirmed == 0 };
+            invariant SettledIsDecided:
+                if settled == 1 {
+                    confirmed + retired == armed
+                } else { confirmed == 0 && retired == 0 };
+
+            // LIVENESS — every handled shape's real echo eventually confirms.
+            invariant LivePlainEchoConfirms:
+                if settled == 1 && shape == 1 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveGhostTextConfirmsE1:
+                if settled == 1 && shape == 2 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveBlankSpaceConfirmsE3:
+                if settled == 1 && shape == 3 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveOvertypeConfirmsE4:
+                if settled == 1 && shape == 4 { confirmed == 1 } else { settled <= 1 };
+
+            // REGISTERED STANDING GAPS — checked facts, not aspirations: the
+            // strict generation law (E2) and the multi-key stale anchor (E5)
+            // retire real echoes today. Their Tier-0 driver reprints these as
+            // standing findings on every run; deleting either invariant (or
+            // one starting to fail because the gap was FIXED) must be a loud,
+            // deliberate model edit, not a silent drift.
+            invariant StandingGapSplitEchoRetiresE2:
+                if settled == 1 && shape == 5 {
+                    confirmed == 0 && retired == 1
+                } else { settled <= 1 };
+            invariant StandingGapBurstRetiresE5:
+                if settled == 1 && shape == 6 {
+                    confirmed == 0 && retired == 1
+                } else { settled <= 1 };
+
+            invariant EchoLivenessBounds:
+                shape <= 9 && armed <= 1 && echoed <= 1 && gen_delta <= 2
+                    && stale_anchor <= 1 && caret_material <= 1
+                    && pre_caret_intact <= 1 && post_caret_changed <= 1
+                    && content_changed <= 1 && storage_growth <= 1
+                    && prepainted <= 1 && confirmed <= 1 && retired <= 1
+                    && settled <= 1;
+        }
+    }
+}
+
 /// Cursor-owned pixels/cells live in the active viewport coordinate space.
 /// Entering retained history must immediately suppress the DEC cursor, both
 /// trail engines, every cursor body/companion overlay, and a later Retain

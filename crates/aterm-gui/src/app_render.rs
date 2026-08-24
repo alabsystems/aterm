@@ -24,6 +24,13 @@ use crate::{
     rearm_failed_gpu_recovery, request_recovery_redraw, tab_bar, term_lock,
 };
 
+/// The toolchain-provisioning PROGRESS CARD (design §6). Declared here — with an
+/// explicit `#[path]` keeping the file at its canonical `src/pkg_progress_card.rs`
+/// — because the module list in `lib.rs` is WP3's file and fenced for this work
+/// package; the card is consumed exclusively by this module's splice anyway.
+#[path = "pkg_progress_card.rs"]
+pub(crate) mod pkg_progress_card;
+
 /// LOAD-ADAPTIVE EFFECT SHEDDING (Change #1) tunables. The EMA smoothing weight for
 /// each new real-present cost sample: 0.5 is a light "recent frame vs history"
 /// smoother, with the real debounce carried by the hysteresis-frame counter below.
@@ -3285,7 +3292,8 @@ fn retain_native_leaf_raster(
     width: u32,
     height: u32,
     scale: f32,
-    theme: Theme,
+    chrome_theme: Theme,
+    terminal_theme: Theme,
 ) {
     let effective_damage = cache
         .native
@@ -3294,7 +3302,9 @@ fn retain_native_leaf_raster(
         .map_or(scene.damage, |derived| {
             union_native_render_damage(scene.damage, derived)
         });
-    let tray = scene.compiled.tray(theme, 13.0);
+    let tray = scene
+        .compiled
+        .tray_with_chrome(chrome_theme, terminal_theme, 13.0);
     let patched = match (cache.native.as_mut(), effective_damage) {
         (
             Some(raster),
@@ -3833,6 +3843,7 @@ mod native_damage_tests {
             width,
             height,
             1.0,
+            app.chrome_palette_theme(),
             app.theme,
         );
         let raster = cache.native.as_ref().unwrap();
@@ -5551,6 +5562,15 @@ pub(crate) fn prepend_strip_rows(
     if let Some(clip) = &mut dst.selection_clip {
         clip.translate_rows_down(strip);
     }
+    // Every PANE's selection moves with the splice too, for the same reason and
+    // by the same arithmetic — a split frame's highlights are carried by the
+    // entry list, and translating only the scalar would leave each pane's band
+    // `strip` rows above the cells it belongs to.
+    for pane in &mut dst.selections {
+        pane.selection
+            .translate_rows_for_presentation(i32::try_from(strip).unwrap_or(i32::MAX));
+        pane.clip.translate_rows_down(strip);
+    }
     for t in &mut dst.cursor_trail {
         t.row += strip;
     }
@@ -5645,6 +5665,41 @@ pub(crate) fn prepend_strip_rows(
     dst.snapshot_seq = dst.snapshot_seq.wrapping_add(1);
 }
 
+/// Shrink one frame-space selection clip so an overlay band's rows are excluded,
+/// or `None` when one rectangle cannot express the remainder.
+///
+/// The clip is ONE rectangle, so the complement of the band is only expressible
+/// when the band meets an EDGE of the clip — which is the real shape: the config
+/// notice and the find bar are edge bands. A band strictly INTERIOR to the
+/// selection cannot be excised by a rectangle, so that case fails safe and the
+/// caller drops the selection. Erring toward "not painted" is right: a highlight
+/// shown over chrome would claim the chrome's text is selected.
+fn narrow_clip_below_band(
+    clip: aterm_core::render::SelectionClip,
+    rows: &std::ops::Range<usize>,
+) -> Option<aterm_core::render::SelectionClip> {
+    let band_covers_top = rows.start <= clip.row_start && rows.end > clip.row_start;
+    let band_covers_bottom = rows.start < clip.row_end && rows.end >= clip.row_end;
+    // The band swallows the whole clip: nothing of the selection is visible.
+    if band_covers_top && band_covers_bottom {
+        return None;
+    }
+    let narrowed = if band_covers_top {
+        aterm_core::render::SelectionClip::new(rows.end, clip.row_end, clip.col_start, clip.col_end)
+    } else if band_covers_bottom {
+        aterm_core::render::SelectionClip::new(
+            clip.row_start,
+            rows.start,
+            clip.col_start,
+            clip.col_end,
+        )
+    } else {
+        // Strictly interior — not expressible as one rectangle.
+        return None;
+    };
+    (narrowed.row_start < narrowed.row_end).then_some(narrowed)
+}
+
 /// Remove every host-owned overlay whose painted extent intersects a frame-row
 /// replacement band.
 ///
@@ -5669,7 +5724,8 @@ fn scrub_overlay_row_band(input: &mut RenderInput, rows: std::ops::Range<usize>,
         input.cursor_visible = false;
     }
     // Selection is folded into the renderer's background/glyph passes rather than a
-    // separate quad stream, and a RenderInput carries only one contiguous selection.
+    // separate quad stream, so it cannot be scrubbed by retaining quads: the clip
+    // rectangle each selection carries is the only mask available.
     //
     // SELECTION CUSTODY Phase 2: this used to suppress the snapshot's selection
     // WHOLESALE whenever any selected cell fell under replaced chrome. For an
@@ -5678,63 +5734,114 @@ fn scrub_overlay_row_band(input: &mut RenderInput, rows: std::ops::Range<usize>,
     // that was no longer shown as selected. The highlight looked destroyed and the
     // clipboard disagreed.
     //
-    // Narrow instead of erase: shrink the frame-space `selection_clip` so the band's
-    // rows are excluded and every row OUTSIDE it keeps painting. The clip rectangle
-    // already exists for exactly this kind of masking (split composition uses it to
-    // stop one pane's selection tinting a sibling), so this reuses the renderer's own
+    // Narrow instead of erase: shrink the frame-space clip so the band's rows are
+    // excluded and every row OUTSIDE it keeps painting. The clip rectangle already
+    // exists for exactly this kind of masking (split composition uses it to stop
+    // one pane's selection tinting a sibling), so this reuses the renderer's own
     // mechanism rather than adding a second one.
     //
-    // The clip is ONE rectangle, so the complement of the band is only expressible
-    // when the band meets an edge of the current clip — which is the real shape: the
-    // config notice and the find bar are edge bands. A band strictly INTERIOR to the
-    // selection cannot be excised by a rectangle, so that case keeps the old
-    // fail-safe of dropping the snapshot selection. Erring toward "not painted" is
-    // right: a highlight shown over chrome would claim the chrome's text is selected.
-    let selection_intersects = input.selection.has_selection()
-        && rows.clone().any(|frame_row| {
+    // PER SELECTION, not per snapshot: a composed split frame carries one entry
+    // per selected pane, and the band crosses each pane's box differently — it can
+    // meet one pane's clip at an edge (narrowable) while landing in another's
+    // interior (not narrowable). Doing this per entry means the fail-safe drop
+    // below costs at most ONE pane's highlight instead of every pane's, which is
+    // strictly better than the whole-snapshot drop this replaced.
+    //
+    // Which selections the band actually touches is decided by the renderer's own
+    // per-cell predicate, so "shown as selected" here means exactly what the
+    // rasterizer will paint.
+    let mut scalar_intersects = false;
+    let mut entry_intersects = vec![false; input.selections.len()];
+    if input.any_selection() {
+        // Stop as soon as every selection that COULD be hit has been accounted for —
+        // the `any()` short-circuit the scalar scan this replaced always had.
+        //
+        // Seeded from the entries whose clip rows actually reach the band, not from
+        // the entry count. An entry whose pane box does not touch these rows can
+        // never be hit inside them, so counting it leaves `undecided` permanently
+        // above zero and the scan runs the full band x cols x entries product on
+        // every frame the chrome is up. That is the COMMON case: the find bar and
+        // the config notice are top-edge bands, so in a left/right split only the
+        // panes touching the top rows are reachable at all.
+        let mut undecided = input
+            .selections
+            .iter()
+            .filter(|entry| entry.clip.row_start < rows.end && entry.clip.row_end > rows.start)
+            .count();
+        if input.selections.is_empty() {
+            undecided = 1;
+        }
+        if undecided == 0 {
+            // Nothing reachable — the band cannot touch any selection.
+            return;
+        }
+        let cols = input.cols.min(usize::from(u16::MAX) + 1);
+        'band: for frame_row in rows.clone() {
             let row_cells = input.cells.get(frame_row).map(Vec::as_slice).unwrap_or(&[]);
-            (0..input.cols.min(usize::from(u16::MAX) + 1)).any(|col| {
+            for col in 0..cols {
                 let is_wide_lead = row_cells.get(col + 1).is_some_and(|cell| cell.wide);
                 let is_wide_continuation = row_cells.get(col).is_some_and(|cell| cell.wide);
-                input.selection_contains_cell(frame_row, col, is_wide_lead, is_wide_continuation)
-            })
-        });
-    if selection_intersects {
+                let Some(hit) =
+                    input.selection_hit(frame_row, col, is_wide_lead, is_wide_continuation)
+                else {
+                    continue;
+                };
+                let first = match entry_intersects.get_mut(hit) {
+                    Some(slot) => !std::mem::replace(slot, true),
+                    None => !std::mem::replace(&mut scalar_intersects, true),
+                };
+                if first {
+                    undecided -= 1;
+                    if undecided == 0 {
+                        break 'band;
+                    }
+                }
+            }
+        }
+    }
+    if scalar_intersects {
         // Intersect with any clip already present (a split pane's), never overwrite
         // it — dropping a pane clip here would let this pane's selection tint a
         // sibling for as long as the chrome is up.
         let clip = input.selection_clip.unwrap_or_else(|| {
             aterm_core::render::SelectionClip::new(0, input.rows, 0, input.cols)
         });
-        let band_covers_top = rows.start <= clip.row_start && rows.end > clip.row_start;
-        let band_covers_bottom = rows.start < clip.row_end && rows.end >= clip.row_end;
-        let narrowed = if band_covers_top && band_covers_bottom {
-            // The band swallows the whole clip: nothing of the selection is visible.
-            None
-        } else if band_covers_top {
-            Some(aterm_core::render::SelectionClip::new(
-                rows.end,
-                clip.row_end,
-                clip.col_start,
-                clip.col_end,
-            ))
-        } else if band_covers_bottom {
-            Some(aterm_core::render::SelectionClip::new(
-                clip.row_start,
-                rows.start,
-                clip.col_start,
-                clip.col_end,
-            ))
-        } else {
-            // Strictly interior — not expressible as one rectangle.
-            None
-        };
-        match narrowed {
-            Some(clip) if clip.row_start < clip.row_end => input.selection_clip = Some(clip),
-            _ => {
+        match narrow_clip_below_band(clip, &rows) {
+            Some(clip) => input.selection_clip = Some(clip),
+            None => {
                 input.selection = aterm_core::selection::TextSelection::new();
                 input.selection_clip = None;
             }
+        }
+    }
+    if entry_intersects.iter().any(|&hit| hit) {
+        // Retain-in-place: `swap(kept, i)` with `kept <= i` preserves the entry
+        // order the renderer's first-hit scan and the damage key both read.
+        let mut kept = 0;
+        for (i, &intersects) in entry_intersects.iter().enumerate() {
+            if intersects {
+                match narrow_clip_below_band(input.selections[i].clip, &rows) {
+                    Some(clip) => input.selections[i].clip = clip,
+                    // Strictly interior to THIS pane's box — not expressible as one
+                    // rectangle, so this pane's highlight fails safe and drops. Its
+                    // siblings' entries are untouched.
+                    None => continue,
+                }
+            }
+            input.selections.swap(kept, i);
+            kept += 1;
+        }
+        input.selections.truncate(kept);
+        if kept == 0 {
+            // The list emptied. `selection_row_key` and the per-cell predicate both
+            // FALL BACK to the scalar when `selections` is empty, and a composed
+            // frame stamps the scalar as a duplicate of the FOCUSED pane's entry —
+            // which has just been dropped. Leaving it would resurrect that pane's
+            // UN-NARROWED highlight across the chrome, and flip the damage key
+            // between frames while doing it. The scalar cannot outlive the list it
+            // duplicates.
+            input.selection = aterm_core::selection::TextSelection::new();
+            input.selection_clip = None;
         }
     }
     input
@@ -7221,11 +7328,17 @@ pub(crate) fn fill_divider_grid_cells(
     //
     // The pane-local selection RECTANGLE resets with them: `None` is the UNBOUNDED
     // single-terminal predicate, so inheriting a stale box would let a composed
-    // selection tint siblings and the divider (`project_focused_pane_selection`
+    // selection tint siblings and the divider (`push_pane_selection`
     // re-stamps the focused pane's box after this fill).
     dst.selection_clip = None;
     dst.selection_bg = aterm_core::render::COLOR_UNSET;
     dst.selection_fg = aterm_core::render::COLOR_UNSET;
+    // …and the PER-PANE list the split compositor appends to. This is the one
+    // that must not survive: a non-empty `selections` makes the renderer read
+    // the list INSTEAD of the scalars above, so last frame's panes would keep
+    // painting their highlights over this frame's layout. Each compose path
+    // re-pushes one entry per selected pane after this fill.
+    dst.selections.clear();
     dst.default_bg = aterm_core::render::COLOR_UNSET;
     // …and its twin. A reused scratch that previously held a terminal frame
     // would otherwise carry that frame's foreground into a divider/native/
@@ -8190,30 +8303,47 @@ mod composed_cursor_effect_advance_tests {
     }
 }
 
-/// Project the focused terminal pane's selection into a composed frame.
+/// Project ONE terminal pane's selection into a composed frame.
 ///
 /// Selection anchors live in terminal/logical coordinates, while a pane is
 /// blitted in frame coordinates. The row translation therefore includes both
 /// the pane origin and the source viewport's display offset. The explicit
 /// frame-space clip is load-bearing for linear multi-row selections: their
 /// middle rows otherwise select every column and would tint dividers/siblings.
-/// Live OSC selection colours ride with the same authoritative focused pane.
-pub(crate) fn project_focused_pane_selection(
+/// Live OSC selection colours ride with the pane that owns them.
+///
+/// Called for EVERY terminal leaf, not only the focused one: a selection in an
+/// unfocused split pane is alive (it copies, `select` verbs address it, eviction
+/// clamps it) and used to be invisible, which is the "⌘-C copies text you cannot
+/// see highlighted" hazard the selection-custody design exists to close. Each
+/// pane that HAS a selection appends one [`PaneSelection`] entry — the renderer
+/// reads that list instead of the scalar fields as soon as it is non-empty — and
+/// unfocused panes mark their entry `inactive`, so the focused pane's band stays
+/// the bright one.
+///
+/// The FOCUSED pane additionally stamps the scalar `selection`/`selection_clip`/
+/// colour fields exactly as before, so every single-authority consumer that
+/// predates splits (the introspection model, a frame with no selection at all)
+/// keeps an unchanged anchor.
+///
+/// [`PaneSelection`]: aterm_core::render::PaneSelection
+pub(crate) fn push_pane_selection(
     dst: &mut RenderInput,
     src: &RenderInput,
     row_off: usize,
     col_off: usize,
     pane_rows: usize,
     pane_cols: usize,
+    focused: bool,
 ) {
-    dst.selection.clone_from(&src.selection);
-    let start = dst.selection.start();
-    let end = dst.selection.end();
+    let mut selection = src.selection.clone();
+    let start = selection.start();
+    let end = selection.end();
     let row_delta = i32::try_from(row_off)
         .unwrap_or(i32::MAX)
         .saturating_add(src.display_offset);
     let col_delta = u16::try_from(col_off).unwrap_or(u16::MAX);
-    dst.selection.relocate(
+    selection.relocate(
         start.row.saturating_add(row_delta),
         start.col.saturating_add(col_delta),
         end.row.saturating_add(row_delta),
@@ -8226,20 +8356,35 @@ pub(crate) fn project_focused_pane_selection(
     let col_end = col_off
         .saturating_add(pane_cols.min(src.cols))
         .min(dst.cols);
-    // `None` means the historical UNBOUNDED single-terminal predicate, so an
-    // active selection whose transient pane geometry clips to nothing must
-    // retain an explicit empty rectangle rather than fail open across siblings.
-    dst.selection_clip =
-        src.selection
-            .has_selection()
-            .then_some(aterm_core::render::SelectionClip::new(
-                row_off.min(dst.rows),
-                row_end,
-                col_off.min(dst.cols),
-                col_end,
-            ));
-    dst.selection_bg = src.selection_bg;
-    dst.selection_fg = src.selection_fg;
+    let clip = aterm_core::render::SelectionClip::new(
+        row_off.min(dst.rows),
+        row_end,
+        col_off.min(dst.cols),
+        col_end,
+    );
+    if focused {
+        dst.selection.clone_from(&selection);
+        // `None` means the historical UNBOUNDED single-terminal predicate, so an
+        // active selection whose transient pane geometry clips to nothing must
+        // retain an explicit empty rectangle rather than fail open across siblings.
+        dst.selection_clip = src.selection.has_selection().then_some(clip);
+        dst.selection_bg = src.selection_bg;
+        dst.selection_fg = src.selection_fg;
+    }
+    if src.selection.has_selection() {
+        // A list entry is ALWAYS bounded — an entry with no box would tint its
+        // siblings, and unlike the scalar `selection_clip` there is no
+        // single-terminal reading of "unbounded" available here. A pane clipped
+        // entirely off-frame therefore contributes an EMPTY rectangle, which
+        // fails closed exactly as the scalar path does.
+        dst.selections.push(aterm_core::render::PaneSelection {
+            selection,
+            clip,
+            bg: src.selection_bg,
+            fg: src.selection_fg,
+            inactive: !focused,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -8247,25 +8392,44 @@ mod selection_projection_tests {
     use super::*;
     use aterm_core::selection::{SelectionSide, SelectionType};
 
-    #[test]
-    fn off_frame_focused_pane_selection_fails_closed() {
+    /// A pane-sized snapshot whose whole grid is selected.
+    fn selected_pane(rows: usize, cols: usize) -> RenderInput {
         let mut src = RenderInput::empty();
-        src.rows = 2;
-        src.cols = 2;
+        src.rows = rows;
+        src.cols = cols;
         src.selection
             .start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
-        src.selection.update_selection(1, 1, SelectionSide::Right);
+        src.selection.update_selection(
+            i32::try_from(rows).unwrap() - 1,
+            u16::try_from(cols).unwrap() - 1,
+            SelectionSide::Right,
+        );
         src.selection.complete_selection();
+        src
+    }
 
+    #[test]
+    fn off_frame_focused_pane_selection_fails_closed() {
+        let src = selected_pane(2, 2);
         let mut dst = RenderInput::empty();
         dst.rows = 2;
         dst.cols = 4;
-        project_focused_pane_selection(&mut dst, &src, 0, 8, 2, 2);
+        push_pane_selection(&mut dst, &src, 0, 8, 2, 2, true);
 
         assert_eq!(
             dst.selection_clip,
             Some(aterm_core::render::SelectionClip::new(0, 2, 4, 4)),
             "active but clipped-away selection keeps explicit empty authority"
+        );
+        assert_eq!(
+            dst.selections.len(),
+            1,
+            "an off-frame pane still contributes its entry — bounded, not absent"
+        );
+        assert_eq!(
+            dst.selections[0].clip,
+            aterm_core::render::SelectionClip::new(0, 2, 4, 4),
+            "the entry's box is the same empty rectangle, so it fails closed too"
         );
         for row in 0..dst.rows {
             for col in 0..dst.cols {
@@ -8274,6 +8438,85 @@ mod selection_projection_tests {
                     "off-frame pane selection leaked to frame cell ({row}, {col})"
                 );
             }
+        }
+    }
+
+    /// The point of the change: an UNFOCUSED pane's selection paints, and paints
+    /// only inside its own box.
+    #[test]
+    fn unfocused_pane_selection_paints_inside_its_own_box_only() {
+        let mut dst = RenderInput::empty();
+        dst.rows = 2;
+        dst.cols = 9;
+        // Left pane cols 0..4 (focused, no selection), divider col 4, right pane
+        // cols 5..9 with the whole pane selected.
+        let mut left = RenderInput::empty();
+        left.rows = 2;
+        left.cols = 4;
+        push_pane_selection(&mut dst, &left, 0, 0, 2, 4, true);
+        push_pane_selection(&mut dst, &selected_pane(2, 4), 0, 5, 2, 4, false);
+
+        assert!(
+            !dst.selection.has_selection(),
+            "the focused pane holds no selection, so the scalar anchor stays empty"
+        );
+        assert_eq!(
+            dst.selections.len(),
+            1,
+            "only the selected pane contributes"
+        );
+        assert!(
+            dst.selections[0].inactive,
+            "an unfocused pane's band takes the inactive colour"
+        );
+        for row in 0..dst.rows {
+            for col in 0..dst.cols {
+                assert_eq!(
+                    dst.selection_contains_cell(row, col, false, false),
+                    col >= 5,
+                    "unfocused pane selection painted the wrong cell ({row}, {col})"
+                );
+            }
+        }
+    }
+
+    /// Both panes selected: each paints its own box, the divider between them
+    /// paints neither, and the FOCUSED pane still stamps the scalar anchor the
+    /// single-authority consumers read.
+    #[test]
+    fn both_panes_paint_and_the_focused_one_keeps_the_scalar_anchor() {
+        let mut dst = RenderInput::empty();
+        dst.rows = 2;
+        dst.cols = 9;
+        let mut focused = selected_pane(2, 4);
+        focused.selection_bg = 0x0011_2233;
+        push_pane_selection(&mut dst, &focused, 0, 0, 2, 4, true);
+        let mut sibling = selected_pane(2, 4);
+        sibling.selection_bg = 0x0044_5566;
+        push_pane_selection(&mut dst, &sibling, 0, 5, 2, 4, false);
+
+        assert_eq!(
+            dst.selection_bg, 0x0011_2233,
+            "the scalar colour is the FOCUSED pane's, unchanged"
+        );
+        assert_eq!(dst.selections.len(), 2);
+        assert_eq!(
+            (dst.selections[0].bg, dst.selections[1].bg),
+            (0x0011_2233, 0x0044_5566),
+            "each entry carries its OWN live selection colour"
+        );
+        assert_eq!(
+            (dst.selections[0].inactive, dst.selections[1].inactive),
+            (false, true)
+        );
+        for col in 0..dst.cols {
+            let hit = dst.selection_hit(0, col, false, false);
+            let expected = match col {
+                0..=3 => Some(0),
+                4 => None, // the divider column belongs to no pane
+                _ => Some(1),
+            };
+            assert_eq!(hit, expected, "column {col} resolved to the wrong pane");
         }
     }
 }
@@ -12388,7 +12631,12 @@ impl App {
             trail_color: self.config.cursor_trail_color_u32(),
             trail_accent: self.config.cursor_trail_accent_u32(),
         };
-        let mut modal = overlay.model().tray(&transform.geom, self.theme, ctx);
+        // A native modal floats ON the native page: its panel tokens must come
+        // from the same chrome-resolved palette the page painted with, or a
+        // forced-light Settings page would grow a dark palette card.
+        let mut modal = overlay
+            .model()
+            .tray(&transform.geom, self.chrome_palette_theme(), ctx);
         crate::widget::translate_prims(&mut modal.prims, logical_x, 0.0);
         prims.extend(modal.prims);
         true
@@ -12548,7 +12796,13 @@ impl App {
             .get(&id)
             .is_some_and(|window| window.overlay.is_some());
 
-        let theme = self.theme;
+        // A full native tab is CHROME edge to edge: its backdrop cells, divider
+        // grid and page raster all take the chrome-resolved palette (config
+        // `window_theme` forcing a side on Linux — `chrome_palette_theme`),
+        // while the terminal theme still reaches the page's terminal-content
+        // previews through the tray's split seam below.
+        let theme = self.chrome_palette_theme();
+        let terminal_theme = self.theme;
         // A native app and a modal palette occupy one retained overlay texture. Fold both
         // semantic fingerprints so opening, filtering, selecting, or closing the palette
         // necessarily rebuilds the app-render raster instead of leaving an invisible input
@@ -12599,6 +12853,7 @@ impl App {
                     height,
                     scale,
                     theme,
+                    terminal_theme,
                 );
                 true
             } else {
@@ -12622,7 +12877,7 @@ impl App {
                 // A modal must be lowered after the app in one raster pass: its
                 // translucent edges then blend in the same linear-light space as
                 // the native surface underneath.
-                let mut tray = compiled.tray(theme, 13.0);
+                let mut tray = compiled.tray_with_chrome(theme, terminal_theme, 13.0);
                 tray.prims.extend(prims);
                 (
                     crate::tray_raster::rasterize_tray_pixels(
@@ -12772,7 +13027,11 @@ impl App {
         let mut focused_terminal_session = None;
         let visible: std::collections::BTreeSet<_> =
             plan.leaves.iter().map(|leaf| leaf.view).collect();
-        let native_blank = chrome_band::blank_cell(self.theme);
+        // The cells UNDER a native leaf's raster are that leaf's chrome ground,
+        // so they take the chrome-resolved palette the raster itself paints
+        // with; the divider grid below stays terminal-themed (it separates
+        // terminal panes too).
+        let native_blank = chrome_band::blank_cell(self.chrome_palette_theme());
 
         if let Some(window) = self.windows.get_mut(&id) {
             fill_divider_grid(&mut window.input_scratch, rows, cols, self.theme);
@@ -12890,16 +13149,17 @@ impl App {
                             window.input_scratch.cursor_visible = true;
                         }
                         blit_pane_into(&mut window.input_scratch, &cache.input, row, col, blank);
-                        if leaf.focused {
-                            project_focused_pane_selection(
-                                &mut window.input_scratch,
-                                &cache.input,
-                                row,
-                                col,
-                                sub_rows,
-                                sub_cols,
-                            );
-                        }
+                        // EVERY terminal leaf, focused or not: an unfocused
+                        // pane's selection is live and must paint.
+                        push_pane_selection(
+                            &mut window.input_scratch,
+                            &cache.input,
+                            row,
+                            col,
+                            sub_rows,
+                            sub_cols,
+                            leaf.focused,
+                        );
                         window.leaf_render_cache.insert(leaf.view, cache);
                     }
                     if leaf.focused && !terminal_title.is_empty() {
@@ -12969,6 +13229,7 @@ impl App {
                             leaf_width,
                             leaf_height,
                             scale,
+                            self.chrome_palette_theme(),
                             self.theme,
                         );
                         // A leaf that re-rastered (including a REGIONAL patch of
@@ -13004,7 +13265,11 @@ impl App {
                             w: leaf_width as f32 / scale,
                             h: leaf_height as f32 / scale,
                         });
-                        let mut tray = raster.compiled.tray(self.theme, 13.0);
+                        let mut tray = raster.compiled.tray_with_chrome(
+                            self.chrome_palette_theme(),
+                            self.theme,
+                            13.0,
+                        );
                         crate::widget::translate_prims(&mut tray.prims, logical_x, logical_y);
                         modal_native_prims.extend(tray.prims);
                         modal_native_prims.push(crate::widget::DrawPrim::ClipPop);
@@ -13699,6 +13964,10 @@ impl App {
         self.splice_build_badge(id);
         self.splice_notice(id);
         self.splice_level_up(id);
+        // The provisioning progress card — AFTER splice_notice by contract: it
+        // shares the notice slot and yields to a live pill (see
+        // `splice_pkg_progress` / the pkg_progress_card parity contract).
+        self.splice_pkg_progress(id);
         if !self.compose_native_route_card(id) {
             return;
         }
@@ -13757,6 +14026,10 @@ impl App {
         self.splice_build_badge(id);
         self.splice_notice(id);
         self.splice_level_up(id);
+        // The provisioning progress card — AFTER splice_notice by contract: it
+        // shares the notice slot and yields to a live pill (see
+        // `splice_pkg_progress` / the pkg_progress_card parity contract).
+        self.splice_pkg_progress(id);
         if !self.compose_native_route_card(id) {
             return;
         }
@@ -15861,6 +16134,9 @@ impl App {
                 .level_up
                 .as_ref()
                 .map_or(0, |l| l.fingerprint(frame_started));
+            // Provisioning progress card (WP3 plumbing): 0 when hidden — the key
+            // stays byte-identical to the no-card path (FL-1).
+            let pkg_progress_fp = self.pkg_progress.fingerprint(frame_started);
             let key = RepaintKey {
                 damage_epoch: epoch,
                 grid_top,
@@ -15877,6 +16153,8 @@ impl App {
                 deco_fp,
                 rain_fp,
                 selection: SelectionFingerprint::of(&selection),
+                // One pane, so the fold is over exactly that selection.
+                pane_selection_fp: crate::fold_pane_selection_fp(0, 0, &selection),
                 tab_strip,
                 // C5: the open tab context menu. Read from the SAME window state
                 // `splice_tab_menu` paints from, so the term and the pixels move
@@ -15901,6 +16179,7 @@ impl App {
                 badge_fp,
                 notice_fp,
                 level_up_fp,
+                pkg_progress_fp,
                 // An OS appearance flip must reach the glass: the Settings preview's
                 // auto titlebar mock splits on it and no other term moves (main.rs).
                 system_dark: repaint_system_dark(self.os_appearance),
@@ -16466,6 +16745,10 @@ impl App {
         // pill (the burst momentarily supersedes it). The border glow rides the overlay
         // pass below, not this card. A no-op when no celebration / the arrow has faded.
         self.splice_level_up(id);
+        // The provisioning progress card — AFTER splice_notice by contract: it
+        // shares the notice slot and yields to a live pill (see
+        // `splice_pkg_progress` / the pkg_progress_card parity contract).
+        self.splice_pkg_progress(id);
         self.splice_config_notice(id);
         // The multi-line-paste confirmation is a SECURITY question: it paints
         // over the config notice when both bands are up (same mechanics).
@@ -17899,15 +18182,17 @@ impl App {
                     ws.pane_scratch.cursor_style,
                 ));
             blit_pane_into(&mut ws.input_scratch, &ws.pane_scratch, row, col, blank);
+            // EVERY terminal pane, focused or not (see `push_pane_selection`).
+            push_pane_selection(
+                &mut ws.input_scratch,
+                &ws.pane_scratch,
+                row,
+                col,
+                pane_rows,
+                pane_cols,
+                focused,
+            );
             if focused {
-                project_focused_pane_selection(
-                    &mut ws.input_scratch,
-                    &ws.pane_scratch,
-                    row,
-                    col,
-                    pane_rows,
-                    pane_cols,
-                );
                 match cursor {
                     Some((cursor_row, cursor_col, cursor_style)) => {
                         ws.input_scratch.cursor_row = row + cursor_row;
@@ -18714,6 +18999,10 @@ impl App {
         let mut damage_epoch: u64 = 0;
         let mut focus_selection =
             SelectionFingerprint::of(&aterm_core::selection::TextSelection::new());
+        // Folded over EVERY visible pane below, not just the focused one: every
+        // pane's selection now paints, so a sibling's selection moving with no
+        // grid damage must still reach the present early-out.
+        let mut pane_selection_fp = 0u64;
         // The FOCUSED pane's cursor (pane sub-coords) drives both the repaint-key
         // cursor terms (so a pure move repaints in split panes too) and the
         // aurora. `focus_off` is its window-space origin, used to place the wake.
@@ -18819,13 +19108,15 @@ impl App {
                     .get(&wid)
                     .is_some_and(|w| w.matrix_rain.is_some())
         });
-        for (r, term) in &panes {
+        for (pane_index, (r, term)) in panes.iter().enumerate() {
             let mut term = term_lock(term);
             // Per-pane damage is window-scoped via the per-window `last_present`
             // (read above); the take_damage below is per-session, but the early-out
             // compares against THIS window's key, so a co-viewer window is not
             // starved (it keeps its own last_present and re-folds the same epochs).
             damage_epoch = damage_epoch.wrapping_add(term.damage_epoch());
+            pane_selection_fp =
+                crate::fold_pane_selection_fp(pane_selection_fp, pane_index, term.text_selection());
             if r.session == focus {
                 focus_selection = SelectionFingerprint::of(term.text_selection());
                 let cp = term.cursor();
@@ -19576,6 +19867,9 @@ impl App {
             n.fingerprint(std::time::Instant::now(), self.notice_is_sparkling())
         });
         let level_up_fp = self.level_up.as_ref().map_or(0, |l| l.fingerprint(now));
+        // Provisioning progress card — same term as the single-pane key: the card
+        // is WINDOW chrome over the finished composite; 0 when hidden (FL-1).
+        let pkg_progress_fp = self.pkg_progress.fingerprint(now);
         let key = RepaintKey {
             damage_epoch,
             grid_top,
@@ -19603,6 +19897,7 @@ impl App {
             // byte-identical to the pre-rain compose.
             rain_fp,
             selection: focus_selection,
+            pane_selection_fp,
             tab_strip,
             // C5: same term as the single-pane key — the menu is WINDOW chrome
             // spliced over the finished composite, not a per-pane surface.
@@ -19626,6 +19921,7 @@ impl App {
             badge_fp,
             notice_fp,
             level_up_fp,
+            pkg_progress_fp,
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
         };
@@ -19854,16 +20150,18 @@ impl App {
                 r.col_off as usize,
                 blank,
             );
+            // EVERY terminal pane, focused or not (see `push_pane_selection`).
+            push_pane_selection(
+                &mut ws.input_scratch,
+                &ws.pane_scratch,
+                r.row_off as usize,
+                r.col_off as usize,
+                sub_rows,
+                sub_cols,
+                focused_pane,
+            );
             if focused_pane {
                 focus_title = title;
-                project_focused_pane_selection(
-                    &mut ws.input_scratch,
-                    &ws.pane_scratch,
-                    r.row_off as usize,
-                    r.col_off as usize,
-                    sub_rows,
-                    sub_cols,
-                );
                 match cursor {
                     Some((cr, cc, style)) => {
                         ws.input_scratch.cursor_row = r.row_off as usize + cr;
@@ -20076,9 +20374,14 @@ impl App {
         // honest transitional frame, where extruded card columns would flash the
         // exact glued-slab look the pixel design replaces.
         let extend_top = cfg!(windows) && self.win_head(wid) > 0;
+        // CHROME-resolved, like the strip rows themselves (`chrome_palette_theme`):
+        // the gutters this fills are part of the band, and filling them from the
+        // terminal theme under a forced Linux `window_theme` left a terminal-dark
+        // corner block bolted onto the forced-light band (measured in the first
+        // forced-light capture of this seam).
         self.backend.set_chrome_bleed(
             (strip > 0)
-                .then(|| tab_bar::strip_bleed_tones(self.theme))
+                .then(|| tab_bar::strip_bleed_tones(self.chrome_palette_theme()))
                 .flatten()
                 .map(|(color, seam)| aterm_render::ChromeBleed {
                     rows: strip,
@@ -20194,7 +20497,13 @@ impl App {
             // tab therefore keeps its human title, state, close policy, and New Tab
             // action visible on every semantic host. Native apps keep their typed icon;
             // a terminal is deliberately title-only and recovers the icon width.
-            let theme = self.theme;
+            //
+            // The strip IS chrome, so its tones derive from the chrome-resolved
+            // palette (`chrome_palette_theme`): the terminal theme under Auto,
+            // the forced side under Linux config `window_theme = light|dark` —
+            // the band and the CSD header above it flip together. A
+            // `window_theme` edit invalidates this cache in `reload_config`.
+            let theme = self.chrome_palette_theme();
             // Borrow the reused title buffer out of the window (take/restore) so the
             // paint can read it while `ws.cached_strip_rows`/`tab_segments` are written
             // below; a cache HIT skips this block entirely and never disturbs it.
@@ -21181,7 +21490,17 @@ impl App {
             .as_ref()
             .map(|n| n.fingerprint(now, self.notice_is_sparkling()))
         else {
-            if let Some(ws) = self.windows.get_mut(&wid) {
+            // No notice: clear the slot — UNLESS the provisioning progress card
+            // owns it (even fingerprint, see `pkg_progress_card`'s parity
+            // contract). `splice_pkg_progress` runs right after this splice and
+            // manages its own resident; clearing it here would force a fresh
+            // rasterize of an unchanged card on every redraw.
+            if let Some(ws) = self.windows.get_mut(&wid)
+                && ws
+                    .notice_card
+                    .as_ref()
+                    .is_some_and(|c| !pkg_progress_card::owns_slot(c))
+            {
                 ws.notice_card = None;
             }
             return;
@@ -21293,6 +21612,219 @@ impl App {
         }
     }
 
+    /// Rasterize the TOOLCHAIN-PROVISIONING PROGRESS CARD (design §6) into this
+    /// window's shared notice-slot card. Runs immediately AFTER
+    /// [`Self::splice_notice`] at every call site: a live transient notice owns
+    /// the slot for its 5.4s life (the pill already briefly replaces the badge;
+    /// this card sits one rung below the pill), so by the time this runs the
+    /// slot holds either the pill (odd fp — leave it), our own resident (even
+    /// fp — reuse or refresh), or nothing. Mirrors `splice_notice`'s
+    /// once-per-(fp, geom) rasterize discipline, paint region grown by exactly
+    /// `notice::SHADOW_MARGIN` (the cropped-shadow bug documented there), then
+    /// alpha-blits the cat onto the finished raster (`DrawPrim` has no image
+    /// variant — see `pkg_progress_card::blit_cat`).
+    ///
+    /// FL-1: this function paints ONLY inside redraws that something else
+    /// scheduled (`Wake::PkgProgress` on data change; the WP3 deadline while
+    /// visible AND animating). A settled card early-outs on the resident
+    /// (fp, geom) match; a hidden card costs exactly one clear.
+    pub(crate) fn splice_pkg_progress(&mut self, wid: WindowId) {
+        let now = std::time::Instant::now();
+        let clear_own = |ws: &mut WindowState| {
+            if ws
+                .notice_card
+                .as_ref()
+                .is_some_and(pkg_progress_card::owns_slot)
+            {
+                ws.notice_card = None;
+            }
+        };
+        // The REOPEN affordance: Settings ▸ Packages newly fronted in this
+        // window re-shows a dismissed card (edge law in `packages_screen`).
+        let packages_front = self.active_native_view(wid).is_some_and(|(_, view)| {
+            matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state.route == crate::native_settings::SettingsRoute::Packages
+            )
+        });
+        if pkg_progress_card::note_packages_front(wid.0, packages_front) {
+            self.pkg_progress.reopen();
+        }
+        // THE HELD ANNOUNCEMENT YIELDS TO THE LIVE CARD. `Wake::PkgSeedStarted`
+        // (which the net lane's `net-starting:` also rides) posts a 20-minute
+        // held "⇣ Installing the ALab toolchain…" status pill — a stopgap for
+        // exactly the blindness this card ends. Once a RUNNING snapshot is
+        // here, the card carries strictly more truth (per-program rows, live
+        // bytes, honest phases), so the announcement retires. Matched narrowly
+        // — a non-clickable status pill with that exact opening — so no other
+        // notice is ever eaten; if the announcement's wording drifts, the
+        // failure mode is the OLD behaviour (the pill covers the card for its
+        // hold), never a lost notice. Terminal pills (partial/failed) arrive
+        // AFTER the pass and are new notices — they still take the slot.
+        if self.pkg_progress.visible()
+            && self.pkg_progress.snapshot().is_some_and(|s| s.running)
+            && self.notice.as_ref().is_some_and(|n| {
+                !n.is_update_ready()
+                    && !n.is_level_up()
+                    && !n.is_robi_tip()
+                    && n.text().starts_with("\u{21e3} Installing the ALab toolchain")
+            })
+        {
+            self.notice = None;
+        }
+        // A live transient notice owns the slot — nothing to manage this frame.
+        if self.notice.is_some() {
+            return;
+        }
+        let focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
+        let cols = self.windows.get(&wid).map_or(0, |ws| ws.cols as usize);
+        let Some(snap) = self
+            .pkg_progress
+            .snapshot()
+            .filter(|_| self.pkg_progress.visible() && focused && cols > 0)
+            .cloned()
+        else {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                clear_own(ws);
+            }
+            return;
+        };
+        // Advance the decorative state and forward its two levers BEFORE the
+        // fingerprint is taken, so a freshly-latched flourish steps the frame
+        // bucket this very frame.
+        let fx = pkg_progress_card::advance_fx(&snap, now);
+        if let Some(until) = fx.hold_fx_until {
+            self.pkg_progress.note_fx(until);
+        }
+        if fx.retire {
+            // The cleanly-ended pass's hold elapsed: per-pass dismissal (a new
+            // pass re-shows). The slot clear right here is the erase frame.
+            self.pkg_progress.dismiss();
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                clear_own(ws);
+            }
+            return;
+        }
+        let content_fp = self.pkg_progress.fingerprint(now);
+        if content_fp == 0 {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                clear_own(ws);
+            }
+            return;
+        }
+        // Tint off the live OSC-11 background, like every card splice.
+        let mut theme = self.theme;
+        if let Some(ws) = self.windows.get(&wid) {
+            let live = ws.input_scratch.default_bg;
+            if live != aterm_core::render::COLOR_UNSET {
+                theme.bg = live;
+            }
+        }
+        let (cw, ch) = self.win_cell_size(wid);
+        let pad = self.win_pad(wid) as u32;
+        let pad_top = self.win_pad_top(wid) as u32;
+        let head = self.win_head(wid) as u32;
+        let font_px = self.win_font_px(wid);
+        let clear_rows = self.notice_clear_rows();
+        let amp = self
+            .motion_policy(true)
+            .amplitude(crate::motion::MotionEffect::PkgProgressCard);
+        let fancy = self.config.pkg_progress_effects_or_default()
+            && self
+                .serious_mode_policy()
+                .allows(crate::motion::SeriousEffect::PkgProgressFx);
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        // The cat wears the user's worn kitty identity — the settled-frame
+        // read of the cursor companion's look (coat/iris ramp indices).
+        let look = ws.cursor_cat.static_frame(now).look;
+        let chrome = pkg_progress_card::CardChrome {
+            theme,
+            amp,
+            fancy,
+            coat: look.coat,
+            iris: look.iris,
+        };
+        // The staleness key folds EVERY paint input `content_fp` cannot see
+        // (theme, roles source, amplitude, trim, cat look, geometry), so a
+        // resident raster is provably a pure function of (fp, geom) and can
+        // never go stale across a theme flip or a look change.
+        let geom_key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            cw.hash(&mut h);
+            ch.hash(&mut h);
+            font_px.to_bits().hash(&mut h);
+            cols.hash(&mut h);
+            pad.hash(&mut h);
+            pad_top.hash(&mut h);
+            head.hash(&mut h);
+            clear_rows.to_bits().hash(&mut h);
+            theme.bg.hash(&mut h);
+            theme.fg.hash(&mut h);
+            theme.cursor.hash(&mut h);
+            amp.to_bits().hash(&mut h);
+            fancy.hash(&mut h);
+            look.coat.hash(&mut h);
+            look.iris.hash(&mut h);
+            h.finish()
+        };
+        let slot_fp = pkg_progress_card::slot_fp(content_fp, geom_key);
+        if ws
+            .notice_card
+            .as_ref()
+            .is_some_and(|c| c.fp == slot_fp && c.geom == geom_key)
+        {
+            return;
+        }
+        let geom = crate::settings::SettingsGeom {
+            cw: cw as f32,
+            ch: ch as f32,
+            font_px,
+            cols,
+            panel_rows: 0, // unused: the card self-positions at the top-right
+        };
+        let mut card =
+            pkg_progress_card::pkg_progress_tray(&snap, &geom, &chrome, &fx.view, clear_rows);
+        let tray_w = (cols * cw) as f32;
+        let (card_x, card_y, card_w, card_h) = card.tray.card;
+        // The shadow budget, from the module that draws the shadow (the
+        // splice_notice rule — see the cropped-shadow note there).
+        const PAINT_MARGIN: f32 = crate::notice::SHADOW_MARGIN;
+        let x0 = (card_x - PAINT_MARGIN).max(0.0).floor();
+        let y0 = (card_y - PAINT_MARGIN).max(0.0).floor();
+        let x1 = (card_x + card_w + PAINT_MARGIN).min(tray_w).ceil();
+        let y1 = (card_y + card_h + PAINT_MARGIN).ceil();
+        if x1 <= x0 || y1 <= y0 || card_w <= 0.0 {
+            clear_own(ws);
+            return;
+        }
+        crate::widget::translate_prims(&mut card.tray.prims, -x0, -y0);
+        let (mut rgba, pw, ph) = crate::tray_raster::rasterize_tray(
+            &card.tray.prims,
+            (x1 - x0) as u32,
+            (y1 - y0) as u32,
+            1.0,
+            [0, 0, 0, 0],
+        );
+        // The cat, blitted AFTER the raster in the same raster-local space.
+        if let Some(mut place) = card.cat.take() {
+            place.cx -= x0;
+            place.bottom -= y0;
+            pkg_progress_card::blit_cat(&mut rgba, pw, ph, &place, &chrome);
+        }
+        ws.notice_card = Some(crate::SettingsCard {
+            rgba,
+            pw,
+            ph,
+            dx: pad + x0 as u32,
+            dy: pad_top + head + y0 as u32,
+            fp: slot_fp,
+            geom: geom_key,
+        });
+    }
     /// Rasterize the LEVEL-UP rising up-arrow ([`self.level_up`]) into this window's
     /// paint-only `level_up_card` (composited with priority OVER `notice_card`, UNDER a
     /// modal `settings_card`). No-op ⇒ `level_up_card = None` when no celebration is up OR
@@ -22959,6 +23491,130 @@ mod config_notice_overlay_tests {
     use crate::{App, WindowId};
     use std::time::Instant;
 
+    /// SELECTION CUSTODY: an overlay band narrows each PANE's selection on its
+    /// own, so the fail-safe drop (a band strictly interior to one pane's box,
+    /// which no single rectangle can excise) costs that pane's highlight and not
+    /// its siblings'. Before the per-pane list this had to drop the whole
+    /// snapshot's selection.
+    #[test]
+    fn overlay_band_narrows_each_pane_selection_independently() {
+        use aterm_core::render::{PaneSelection, SelectionClip};
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let pane_selection = |from: (i32, u16), to: (i32, u16), clip: SelectionClip| {
+            let mut selection = aterm_core::selection::TextSelection::new();
+            selection.start_selection(from.0, from.1, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(to.0, to.1, SelectionSide::Right);
+            selection.complete_selection();
+            PaneSelection {
+                selection,
+                clip,
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: false,
+            }
+        };
+
+        let mut input = aterm_render::RenderInput::empty();
+        input.rows = 8;
+        input.cols = 8;
+        input.cells = vec![Vec::new(); 8];
+        // Left pane: selection confined to rows 0..2 — the band below never
+        // touches it. Right pane: selection spans the whole pane, so the band
+        // lands strictly INSIDE its box.
+        input.selections = vec![
+            pane_selection((0, 0), (1, 3), SelectionClip::new(0, 8, 0, 4)),
+            pane_selection((0, 4), (7, 7), SelectionClip::new(0, 8, 4, 8)),
+        ];
+
+        super::scrub_overlay_row_band(&mut input, 3..5, 16);
+
+        assert_eq!(
+            input.selections.len(),
+            1,
+            "only the pane the band actually crosses loses its highlight"
+        );
+        assert_eq!(
+            input.selections[0].clip,
+            SelectionClip::new(0, 8, 0, 4),
+            "the untouched pane keeps its box exactly"
+        );
+        assert!(
+            input.selection_contains_cell(1, 1, false, false),
+            "the untouched pane keeps painting"
+        );
+        assert!(
+            !input.selection_contains_cell(6, 5, false, false),
+            "the crossed pane fails safe below the band"
+        );
+
+        // THE SCALAR MUST NOT OUTLIVE THE LIST IT DUPLICATES.
+        //
+        // A composed frame stamps BOTH the per-pane entry and the scalar
+        // `selection`/`selection_clip` for the FOCUSED pane. `selection_row_key` and
+        // the per-cell predicate both FALL BACK to the scalar when `selections` is
+        // empty — so if the band drops the last entry and the scalar is left
+        // standing, that pane's UN-NARROWED highlight resurrects across the chrome,
+        // and the damage key flips between frames while doing it.
+        //
+        // The fixture below is the one a real composed frame produces and the test
+        // above deliberately is not: one entry, PLUS the matching scalar.
+        let mut composed = aterm_render::RenderInput::empty();
+        composed.rows = 8;
+        composed.cols = 8;
+        composed.cells = vec![Vec::new(); 8];
+        let only = pane_selection((0, 0), (7, 7), SelectionClip::new(0, 8, 0, 8));
+        composed.selection = only.selection.clone();
+        composed.selection_clip = Some(only.clip);
+        composed.selections = vec![only];
+        assert!(
+            composed.selection_contains_cell(6, 5, false, false),
+            "precondition: the pane paints before the scrub"
+        );
+
+        // A band strictly INTERIOR to the only pane's box: not expressible as one
+        // rectangle, so the entry fails safe and drops, emptying the list.
+        super::scrub_overlay_row_band(&mut composed, 3..5, 16);
+
+        assert!(
+            composed.selections.is_empty(),
+            "the only entry drops — an interior band is not narrowable"
+        );
+        assert!(
+            !composed.selection.has_selection(),
+            "…and the scalar it duplicated must go with it, or the fallback path \
+             resurrects the un-narrowed highlight"
+        );
+        for row in 0..8usize {
+            for col in 0..8usize {
+                assert!(
+                    !composed.selection_contains_cell(row, col, false, false),
+                    "nothing may paint as selected after the list empties ({row},{col})"
+                );
+            }
+        }
+
+        // An EDGE band is narrowable, so nothing is dropped at all.
+        let mut edge = aterm_render::RenderInput::empty();
+        edge.rows = 8;
+        edge.cols = 8;
+        edge.cells = vec![Vec::new(); 8];
+        edge.selections = vec![pane_selection(
+            (0, 4),
+            (7, 7),
+            SelectionClip::new(0, 8, 4, 8),
+        )];
+        super::scrub_overlay_row_band(&mut edge, 0..2, 16);
+        assert_eq!(
+            edge.selections.len(),
+            1,
+            "an edge band narrows rather than erases"
+        );
+        assert_eq!(edge.selections[0].clip, SelectionClip::new(2, 8, 4, 8));
+        assert!(!edge.selection_contains_cell(1, 5, false, false));
+        assert!(edge.selection_contains_cell(3, 5, false, false));
+    }
+
     /// Config notice is the final chrome cell layer. Every later renderer
     /// overlay intersecting its replaced rows must be removed, while overlays
     /// wholly below the banner survive.
@@ -23489,7 +24145,10 @@ mod tab_strip_bleed_tests {
         let wid = WindowId(0);
         app.tab_strip_rows = 1;
         app.splice_tab_strip_with(wid, 1);
-        let want = tab_bar::strip_bleed_tones(app.theme);
+        // The bleed is chrome, so it resolves through the same seam as the strip
+        // rows (`chrome_palette_theme`); with default config (window_theme=auto)
+        // this IS `app.theme`, so the assertions below keep their meaning.
+        let want = tab_bar::strip_bleed_tones(app.chrome_palette_theme());
         match (app.backend.chrome_bleed(), want) {
             (Some(bleed), Some((color, seam))) => {
                 assert_eq!(bleed.rows, 1, "exactly the strip's rows are chrome");
@@ -26586,6 +27245,16 @@ mod rain_host_tests {
             .selection
             .update_selection(0, 1, aterm_core::selection::SelectionSide::Right);
         input.selection_clip = Some(aterm_render::SelectionClip::new(0, 1, 0, 2));
+        // …and the per-pane list a split frame carries, which must move by the
+        // same translation: leaving an entry behind puts a pane's band `strip`
+        // rows above the cells it belongs to.
+        input.selections = vec![aterm_core::render::PaneSelection {
+            selection: input.selection.clone(),
+            clip: aterm_render::SelectionClip::new(0, 1, 0, 2),
+            bg: aterm_core::render::COLOR_UNSET,
+            fg: aterm_core::render::COLOR_UNSET,
+            inactive: true,
+        }];
         input.cat_quads.push(aterm_render::SpriteQuad {
             row: 1,
             y: 16,
@@ -26616,6 +27285,21 @@ mod rain_host_tests {
             input.selection_clip,
             Some(aterm_render::SelectionClip::new(2, 3, 0, 2)),
             "the renderer-visible pane clip follows the same strip translation"
+        );
+        assert!(
+            !input.selections[0].selection.contains(0, 0)
+                && input.selections[0].selection.contains(2, 0),
+            "a pane entry's anchors follow terminal row zero too"
+        );
+        assert_eq!(
+            input.selections[0].clip,
+            aterm_render::SelectionClip::new(2, 3, 0, 2),
+            "…and so does its box"
+        );
+        assert!(
+            !input.selection_contains_cell(0, 0, false, false)
+                && input.selection_contains_cell(2, 0, false, false),
+            "the renderer predicate agrees with both halves after the splice"
         );
         for quad in input.cat_quads.iter().chain(&input.rain_quads) {
             assert_eq!(quad.row, 3, "sprite damage tag follows the grid");

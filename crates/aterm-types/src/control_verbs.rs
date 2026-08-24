@@ -545,6 +545,21 @@ pub const VERBS: &[VerbSpec] = &[
          `inferences` separates \"the model ran and said technical\" from \
          \"the model never ran\". The typed window's TEXT is never reported)",
     ),
+    // Read-only observability for the cursor-trail ADMISSION GATE: the last N
+    // armed/confirmed/retired decisions from the engine's fixed-size diagnosis
+    // ring. The one-command face of what the rainbow-trail blackout hunt did
+    // with ATERM_TRACE_SPAWN stderr logs.
+    v(
+        "trail",
+        Read,
+        Lines,
+        App,
+        "trail [<n>]: the focused window's last <n> (default all, ring cap 32) cursor-trail \
+         admission decisions, newest last — one `admission seq= phase=armed|confirmed|retired \
+         reason= intent= age_ms= origin= target= gen_base= gen_cur= alt=` row per decision, \
+         from the engine's fixed-size DIAGNOSTIC ring (reasons are the confirm seam's tokens: \
+         row-mismatch, generation-skip, stale, …). Read-only; typed text is never reported",
+    ),
     v(
         "hover",
         Write,
@@ -923,6 +938,10 @@ mod tests {
         assert_eq!(framing_of("meta", "@s-a meta unset icon"), Status);
         assert_eq!(framing_of("timeline", "timeline"), Lines);
         assert_eq!(framing_of("timeline", "@s-a timeline 10 since=3"), Lines);
+        // The admission-diagnosis ring streams `OK <n>` + n rows, with no
+        // sub-form to change that (`trail 5` is a count, not a mode).
+        assert_eq!(framing_of("trail", "trail"), Lines);
+        assert_eq!(framing_of("trail", "@s-a trail 5"), Lines);
         // The Subject+Status record is ONE versioned status line, with no
         // sub-form to change that.
         assert_eq!(framing_of("status", "status"), Status);

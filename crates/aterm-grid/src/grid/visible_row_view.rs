@@ -337,6 +337,8 @@ impl Grid {
             // Unkeyable (the absolute counter has not advanced past the
             // viewport yet). Read straight through rather than guess a key —
             // an uncacheable row must never share a slot with a real one.
+            #[cfg(any(test, feature = "testing"))]
+            super::count_viewport_row_materialize();
             return self
                 .materialize_scrollback_row_full(rev_idx, cols)
                 .map(Arc::new);
@@ -371,6 +373,16 @@ impl Grid {
         // The memo borrow is taken INSIDE `lookup`/`store` and never held
         // across this materialize, so no read path can re-enter it under a live
         // borrow.
+        //
+        // THE COUNT GATE'S SITE (SCR-1). Counted HERE, on the miss, and not
+        // inside `materialize_scrollback_row_full`: the debug net above
+        // re-materializes on every HIT, so a counter one level down would read
+        // 24-per-repaint in exactly the build a test runs in and the guard
+        // would silently measure nothing. See `test_counters`
+        // (`count_viewport_row_materialize`) and the aterm-core frame test that
+        // pins 24 -> 0.
+        #[cfg(any(test, feature = "testing"))]
+        super::count_viewport_row_materialize();
         let fresh = Arc::new(self.materialize_scrollback_row_full(rev_idx, cols)?);
         self.viewport_cache.store(epoch, abs_row, &fresh);
         Some(fresh)

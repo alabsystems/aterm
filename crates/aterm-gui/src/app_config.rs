@@ -183,6 +183,16 @@ pub(crate) struct Config {
     /// background status, Robi's tips) is unchanged, and reduced motion holds the
     /// hues still so the card is colourful without moving.
     pub(crate) notice_sparkle: Option<bool>,
+    /// PROVISIONING PROGRESS-CARD EFFECTS (`pkg_progress_effects`, default ON —
+    /// user-facing features ship enabled; this is an opt-OUT). The toolchain
+    /// install's progress card wears the house party trim: a rainbow-filled
+    /// bar, sparkles on each completed program, and the cursor kitty riding the
+    /// bar's leading edge. Purely decorative: `false` keeps the card fully
+    /// functional as a plain themed accent bar with text rows — the numbers,
+    /// phases, queue order, dismiss/reopen behaviour and the honest
+    /// not-running/failed states are identical either way. Reduced motion and
+    /// serious mode strip the same trim without touching this preference.
+    pub(crate) pkg_progress_effects: Option<bool>,
     /// SING-ALONG RIFF (`trail_sound_riff`, default ON — user-facing features
     /// ship enabled; this is an opt-OUT).
     ///
@@ -737,6 +747,18 @@ pub(crate) struct Config {
     /// its own grid discipline) and Windows. Hot-reloadable (drops the glyph
     /// atlas).
     pub(crate) font_hinting: Option<String>,
+    /// Linux subpixel-RGB text (RFC-linux-subpixel-text stage 1): `"off"`
+    /// (the DEFAULT — grayscale everywhere, byte-identical to before),
+    /// `"rgb"` (per-channel LCD coverage on horizontal-RGB panels), or
+    /// `"bgr"`. CPU-COMPOSITOR ONLY this stage: the GPU backend renders
+    /// grayscale regardless (run with `gpu = false` / `--cpu` / `$ATERM_CPU`
+    /// to see it), and the CPU path itself falls back to grayscale under
+    /// translucency (`background_opacity < 1`) or a wallpaper, and for
+    /// non-primary-family glyphs. The config alias of the
+    /// `ATERM_FONT_SUBPIXEL` env var, which still takes precedence. ABSENT
+    /// (or an unrecognized spelling) = `"off"`. Inert on macOS (subpixel was
+    /// removed OS-wide) and Windows. Hot-reloadable.
+    pub(crate) font_subpixel: Option<String>,
     /// Line-height multiplier on the cell BOX (W5a): rows space out (or
     /// tighten) WITHOUT changing the glyph size. Clamped 0.8..=2.0; ABSENT =
     /// `1.0` (byte-identical). The added/removed leading splits half above /
@@ -2764,6 +2786,13 @@ impl Config {
         self.notice_sparkle.unwrap_or(true)
     }
 
+    /// Progress-card party trim — rainbow bar, sparkles, the cat — on the
+    /// toolchain-provisioning card (default ON — opt-OUT; see the field doc:
+    /// the card itself stays fully functional when this is off).
+    pub(crate) fn pkg_progress_effects_or_default(&self) -> bool {
+        self.pkg_progress_effects.unwrap_or(true)
+    }
+
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
     /// opt-in; see the field docs: notes/brrrring/bonk/melody unaffected).
     pub(crate) fn trail_sound_bed_or_default(&self) -> bool {
@@ -4102,6 +4131,20 @@ impl Config {
             .filter(|v| !v.trim().is_empty())
             .or_else(|| self.font_hinting.clone())
             .unwrap_or_else(|| "full".to_string())
+    }
+
+    /// EFFECTIVE Linux subpixel-RGB mode with the startup precedence every key
+    /// follows: `$ATERM_FONT_SUBPIXEL` (the env alias) wins over the
+    /// `font_subpixel` config key, which wins over `"off"`. The renderer's own
+    /// parser resolves unrecognized spellings to the default, so this stays a
+    /// plain string hand-off (the setter is the single source of spelling
+    /// truth) — the `font_hinting` discipline exactly.
+    pub(crate) fn font_subpixel_or_default(&self) -> String {
+        std::env::var("ATERM_FONT_SUBPIXEL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| self.font_subpixel.clone())
+            .unwrap_or_else(|| "off".to_string())
     }
 
     /// Line-height multiplier (W5a), default `1.0`, clamped to the sane
@@ -6461,6 +6504,7 @@ struct ReloadRenderSnapshot {
     font_thicken: bool,
     stem_gamma: f32,
     font_hinting: String,
+    font_subpixel: String,
     font_variations: Vec<(u32, f32)>,
     font_weight_dark_nudge: f32,
     render_knobs: RenderKnobs,
@@ -6482,6 +6526,7 @@ impl ReloadRenderSnapshot {
             font_thicken: app.font_thicken,
             stem_gamma: app.stem_gamma,
             font_hinting: app.font_hinting.clone(),
+            font_subpixel: app.font_subpixel.clone(),
             font_variations: app.font_variations.clone(),
             font_weight_dark_nudge: app.font_weight_dark_nudge,
             render_knobs: app.render_knobs,
@@ -6506,6 +6551,7 @@ impl ReloadRenderSnapshot {
         app.font_thicken = self.font_thicken;
         app.stem_gamma = self.stem_gamma;
         app.font_hinting = self.font_hinting;
+        app.font_subpixel = self.font_subpixel;
         app.font_variations = self.font_variations;
         app.font_weight_dark_nudge = self.font_weight_dark_nudge;
         app.render_knobs = self.render_knobs;
@@ -6570,6 +6616,7 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
         font_weight_dark_nudge,
         stem_gamma,
         font_hinting,
+        font_subpixel,
         line_height,
         adjust_baseline,
         adjust_underline_position,
@@ -7283,6 +7330,8 @@ impl App {
         self.backend.set_stem_gamma(self.stem_gamma);
         let hinting = self.font_hinting.clone();
         self.backend.set_font_hinting(&hinting);
+        let subpixel = self.font_subpixel.clone();
+        self.backend.set_font_subpixel(&subpixel);
         self.backend.set_line_height(self.render_knobs.line_height);
         self.backend
             .set_minimum_contrast(self.render_knobs.minimum_contrast);
@@ -8600,6 +8649,29 @@ impl App {
         let new_window_theme = config.window_theme_or_default();
         if new_window_theme != self.window_theme {
             self.window_theme = new_window_theme;
+            // The chrome PAINTERS resolve from this field too (Linux:
+            // `chrome_palette_theme` feeds the tab band's strip tones and the
+            // native pages' role palette), and the strip row cache's
+            // fingerprint carries no theme term — `apply_theme_live` clears it
+            // by hand on a theme swap, so a `window_theme` edit must do the
+            // same or the band stale-serves the old side on a byte-idle grid.
+            // Native page rasters re-lower via the compile stamp (the resolved
+            // chrome theme is a paint-revision term); the present caches are
+            // dropped here so the rebuilt pixels actually reach glass.
+            for ws in self.windows.values_mut() {
+                ws.last_strip_fp = None;
+                ws.last_present = None;
+                ws.cpu_cache.invalidate();
+                if let Some(
+                    PresentTarget::Gpu { window_gpu, .. } | PresentTarget::Virtual { window_gpu },
+                ) = &mut ws.present
+                {
+                    window_gpu.invalidate_present();
+                }
+                if let Some(w) = ws.os_window.as_ref() {
+                    w.request_redraw();
+                }
+            }
         }
         {
             // macOS/Windows receive the raw Light/Dark/Auto policy (Auto keeps
@@ -8807,14 +8879,17 @@ impl App {
         let new_thicken = config.font_thicken_or_default();
         let new_stem_gamma = config.stem_gamma_or_default();
         let new_font_hinting = config.font_hinting_or_default();
+        let new_font_subpixel = config.font_subpixel_or_default();
         let typography_changed = new_blending != self.text_blending
             || new_thicken != self.font_thicken
             || (new_stem_gamma - self.stem_gamma).abs() > f32::EPSILON
-            || new_font_hinting != self.font_hinting;
+            || new_font_hinting != self.font_hinting
+            || new_font_subpixel != self.font_subpixel;
         self.text_blending = new_blending;
         self.font_thicken = new_thicken;
         self.stem_gamma = new_stem_gamma;
         self.font_hinting = new_font_hinting;
+        self.font_subpixel = new_font_subpixel;
         // W5 renderer knobs: PURE diff — one KnobChange per changed key, each
         // routed to exactly one renderer call (`apply_render_knob`). A
         // line_height change alters the CELL GEOMETRY (every window re-grids),
@@ -8953,6 +9028,8 @@ impl App {
                 self.backend.set_stem_gamma(self.stem_gamma);
                 let hinting = self.font_hinting.clone();
                 self.backend.set_font_hinting(&hinting);
+                let subpixel = self.font_subpixel.clone();
+                self.backend.set_font_subpixel(&subpixel);
             }
             // W5: each changed knob → exactly one renderer call (LineHeight is
             // unreachable here — it takes the rebuild branch above).
@@ -8977,6 +9054,8 @@ impl App {
             self.backend.set_stem_gamma(self.stem_gamma);
             let hinting = self.font_hinting.clone();
             self.backend.set_font_hinting(&hinting);
+            let subpixel = self.font_subpixel.clone();
+            self.backend.set_font_subpixel(&subpixel);
             // W5: each changed knob → exactly one renderer call (LineHeight is
             // unreachable here — it takes the rebuild branch above).
             for &change in &knob_changes {

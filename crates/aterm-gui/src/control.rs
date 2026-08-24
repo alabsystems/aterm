@@ -2453,6 +2453,7 @@ fn dispatch_app_verb(
         "invoke" => control_media::cmd_invoke(proxy, rest),
         "rain" => control_media::cmd_rain(proxy, rest),
         "tone" => control_media::cmd_tone(proxy, rest),
+        "trail" => control_media::cmd_trail(proxy, rest),
         "spawn" => control_media::cmd_spawn(proxy, rest),
         "settings" => control_media::cmd_settings_overlay(proxy, rest),
         "tab" => control_input::cmd_tab(proxy, rest),
@@ -5360,6 +5361,12 @@ fn handle(
         // the classifier. Read-only and App-level like `rain status` (`@peer tone`
         // reads the peer's front window).
         "tone" => control_media::cmd_tone(proxy, rest),
+        // `trail [<n>]`: the FOCUSED window's last n cursor-trail admission
+        // decisions from the engine's diagnostic ring — armed/confirmed/retired
+        // + reason + generation + origin/target. Read-only and App-level like
+        // `tone` (`@peer trail` reads the peer's focused window); the
+        // one-command face of the ATERM_TRACE_SPAWN confirm-seam sensor.
+        "trail" => control_media::cmd_trail(proxy, rest),
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
         // so fleet provisioning is a loop of spawn calls, no exec'ing binaries.
@@ -8371,6 +8378,10 @@ mod tests {
                 // `tone` OBSERVES the mood classifier; the knob it reports is
                 // rewritten through `settings` (ConfigWrite), never here.
                 "tone",
+                // `trail` OBSERVES the cursor-trail admission diagnosis ring;
+                // it has no write form at all (the ring is engine-written
+                // diagnostic state beside decisions already made).
+                "trail",
                 "scroll",
                 "select",
                 "ready",
@@ -8441,8 +8452,8 @@ mod tests {
         );
 
         // EXHAUSTIVE: the pinned partitions cover the WHOLE table (no verb left
-        // unclassified). 38 read + 21 write + 1 signal + 1 config + 1 clip + 11 none
-        // = 73 — but the NUMBERS here are prose; the machine-checked truth is the
+        // unclassified). 39 read + 21 write + 1 signal + 1 config + 1 clip + 11 none
+        // = 74 — but the NUMBERS here are prose; the machine-checked truth is the
         // set-equality assertions below plus `pinned == VERBS.len()`.
         let pinned = by_op(Some(Op::ReadScreen)).len()
             + by_op(Some(Op::WriteInput)).len()

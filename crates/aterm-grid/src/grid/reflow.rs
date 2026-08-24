@@ -201,13 +201,17 @@ impl Grid {
         };
 
         // Ring extras and lazy buffer are invalidated by a ring-buffer rebuild
-        // (#4149, #4215) — but a rows-only resize of a RING-ONLY grid does not
-        // rebuild the ring (history is reclassified in place, see
-        // adjust_row_count_ring_only), so its history extras must survive.
-        let rows_only_ring_only = new_cols == old_cols
-            && self.storage.scrollback.is_none()
-            && !self.storage.scrollback_detached_for_reflow;
-        if !rows_only_ring_only {
+        // (#4149, #4215) — but a ROWS-ONLY resize never rebuilds the ring on
+        // ANY grid shape (history is reclassified in place, see
+        // `adjust_row_count_rows_only`), so its history extras must survive.
+        // This gate used to also require a ring-only grid, which is what forced
+        // the tiered path to evacuate the whole ring in order to have somewhere
+        // for the extras to live: with `ring_extras` cleared, ring history rows
+        // could no longer carry their hyperlink/RGB entries, so the only way to
+        // keep them was to materialize every row into the store. Keeping the
+        // side table is what makes the in-place path legal for a tiered grid.
+        let rows_only = new_cols == old_cols;
+        if !rows_only {
             self.storage.ring_extras.clear();
             // Drain lazy buffer: deferred lines reference pre-reflow cell data.
             self.drain_lazy_buffer();
@@ -342,7 +346,7 @@ impl Grid {
         // re-splits the same lines across the live/history boundary, and an
         // ALREADY-ARCHIVED line keeps its absolute number exactly — a shrink
         // pushes the bottom `v - t` viewport rows on top of history
-        // (`adjust_row_count_ring_only`) and a grow reclassifies the `t - v`
+        // (`adjust_row_count_rows_only`) and a grow reclassifies the `t - v`
         // newest history lines as visible; everything deeper is untouched in
         // both. `prev_offset > 0` means the row under the eye IS such a line,
         // which is what makes this anchor exact rather than approximate. A WIDTH
@@ -423,22 +427,34 @@ impl Grid {
         let target = target_rows as usize;
         let old_visible = usize::from(self.storage.visible_rows);
 
-        // A ROWS-ONLY resize of a RING-ONLY grid (no tiered store, not
-        // mid-detach — the wasm engines' shape) must not shed ring history to
-        // fit the viewport: the ring IS retention there. Reclassify viewport
-        // rows against ring history in place instead of the store migration
-        // below. Identity law: same logical buffer (history sequence,
-        // viewport, absolute numbering) as the tiered path produces for the
-        // same resize. Width changes keep the pre-existing machinery (their
-        // ring history rides take_scrollback_lines / restore, and this method
-        // then runs against reflow_columns' freshly rebuilt rows).
-        let has_scrollback =
-            self.storage.scrollback.is_some() || self.storage.scrollback_detached_for_reflow;
-        if !has_scrollback && new_cols == self.storage.cols {
-            return self.adjust_row_count_ring_only(target, new_cols);
+        // A ROWS-ONLY resize must not shed ring history to fit the viewport,
+        // on ANY grid shape. Reclassify viewport rows against ring history in
+        // place instead of the store migration below. Identity law: same
+        // logical buffer (history sequence, viewport, absolute numbering) —
+        // `scrollback_lines()` counts a retained line the same whether it sits
+        // in the ring, the lazy buffer or the store, so relocating the ring
+        // into the store expresses nothing the in-place reclassification does
+        // not. Width changes keep the pre-existing machinery (their ring
+        // history rides take_scrollback_lines / restore, and this method then
+        // runs against reflow_columns' freshly rebuilt rows).
+        //
+        // `self.storage.cols` is still the PRE-resize width here:
+        // `resize_viewport_state` installs `new_cols` only after this returns.
+        if new_cols == self.storage.cols {
+            return self.adjust_row_count_rows_only(target, new_cols);
         }
 
         if self.storage.rows.len() > target {
+            // Bounded-cost obligation, rows-only half (see
+            // `tests/reflow/rows_only_cost_bound.rs`). Unreachable while the
+            // early return above stands — a rows-only resize never enters this
+            // branch — which is exactly what makes it teeth: a regression that
+            // routes rows-only work back through the whole-ring migration
+            // lights this counter up with a history-sized number.
+            #[cfg(any(test, feature = "testing"))]
+            if new_cols == self.storage.cols {
+                super::count_rows_only_resize_migrated_rows(self.storage.rows.len() - target);
+            }
             // Linearize ring buffer so pop/drain operate on logical order.
             let ring_head = self.storage.ring_head;
             if ring_head != 0 {
@@ -553,19 +569,41 @@ impl Grid {
         revealed
     }
 
-    /// Rows-only [`adjust_row_count`](Self::adjust_row_count) for a RING-ONLY
-    /// grid: reclassify viewport rows against ring history in place — never
+    /// Rows-only [`adjust_row_count`](Self::adjust_row_count), for EVERY grid
+    /// shape: reclassify viewport rows against ring history in place — never
     /// shed retention to fit the viewport. The retention cap is enforced like
     /// `scroll_up`'s at-capacity reuse (oldest evicted only past it), so
     /// surviving lines keep their absolute-row identity.
     ///
+    /// WHY THIS IS LEGAL ON A TIERED GRID. A rows-only resize changes no line's
+    /// WIDTH, so no line's wrap topology moves: the only thing that changes is
+    /// where the live/history boundary falls inside the SAME ring. The tiered
+    /// path used to express that by draining the whole ring into the store,
+    /// because it compared the FULL ring length against the new VISIBLE row
+    /// target — at the GUI's 10,000-line ring that is ~9,999 rows materialized
+    /// per pane per event, synchronously, under the caller's lock, on every
+    /// window-height drag / pane split / divider drag / find-bar toggle. It
+    /// bought nothing: `scrollback_lines() == ring + lazy + tiered` counts a
+    /// retained line identically in whichever tier it sits, so the migration
+    /// was pure relocation of an unchanged logical buffer. It also STRANDED the
+    /// evacuated rows' page bytes — `PageStore` is bump-only with no free path
+    /// (`alloc_slice_impl`), and this path never rebuilds, so the 9,999 dropped
+    /// `Row`s' pages were unreclaimable for the process lifetime while the ring
+    /// re-allocated the same bytes as output refilled it.
+    ///
+    /// COST: O(|Δrows|), INDEPENDENT of ring depth. The only rows that leave
+    /// the ring are the ones the shrunken retention cap can no longer hold — at
+    /// most `visible - target` of them — and on a tiered grid those are STAGED
+    /// into the lazy buffer, exactly like `scroll_up`'s at-capacity eviction,
+    /// so retention past the ring is unchanged.
+    ///
     /// Returns the revealed-history count (see [`Self::adjust_row_count`]).
-    fn adjust_row_count_ring_only(&mut self, target: usize, new_cols: u16) -> usize {
+    fn adjust_row_count_rows_only(&mut self, target: usize, new_cols: u16) -> usize {
         let visible = self.storage.visible_rows as usize;
         debug_assert_eq!(
             self.storage.total_lines,
             self.storage.rows.len(),
-            "ring-only grid: every ring row is a retained line"
+            "rows-only resize: every ring row is a retained line"
         );
 
         if target < visible {
@@ -601,16 +639,39 @@ impl Grid {
 
             // Enforce the retention cap: a full ring cannot absorb the
             // demoted rows, so evict the oldest past it — the same
-            // observable effect as scroll_up's at-capacity eviction. (The
-            // dropped rows' page memory is reclaimed on the next rebuild,
-            // like the tiered trim path.)
+            // observable effect as scroll_up's at-capacity eviction. Bounded
+            // by the height delta: `total_lines <= visible + max_scrollback`
+            // on entry, so `excess <= visible - target`. (The dropped rows'
+            // page memory is reclaimed on the next rebuild, like the tiered
+            // trim path.)
             let excess =
                 (self.storage.total_lines - target).saturating_sub(self.storage.max_scrollback);
             if excess > 0 {
-                drop(self.storage.rows.drain(..excess));
-                for _ in 0..excess {
-                    self.storage.ring_extras.pop_front();
+                // Bounded-cost obligation, rows-only half: the rows that
+                // actually leave the ring on a rows-only resize. Must stay
+                // O(height delta), never O(history) — see
+                // `tests/reflow/rows_only_cost_bound.rs`.
+                #[cfg(any(test, feature = "testing"))]
+                super::count_rows_only_resize_migrated_rows(excess);
+                // A tiered store (or one detached for an off-thread reflow)
+                // keeps retention past the ring, so the evicted rows are
+                // STAGED into the lazy buffer rather than dropped — the same
+                // hand-off `scroll_up`'s at-capacity reuse performs, with the
+                // extras moved through their box (`push_row_boxed`) instead of
+                // being re-extracted. Without a store there is nowhere for them
+                // to go and the ring cap IS the retention limit, so they drop.
+                if self.storage.stages_evicted_rows() {
+                    for i in 0..excess {
+                        let extras = self.storage.ring_extras.pop_front().flatten();
+                        let storage = &mut self.storage;
+                        storage.lazy_buffer.push_row_boxed(&storage.rows[i], extras);
+                    }
+                } else {
+                    for _ in 0..excess {
+                        self.storage.ring_extras.pop_front();
+                    }
                 }
+                drop(self.storage.rows.drain(..excess));
                 self.storage.total_lines -= excess;
             }
         } else if target > visible {

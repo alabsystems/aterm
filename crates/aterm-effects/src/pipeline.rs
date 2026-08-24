@@ -671,6 +671,46 @@ impl EffectsPipeline {
         glow_armed
     }
 
+    /// [`Self::note_committed_cells`] for one typed scalar: derive the expected
+    /// cell span from the terminal's OWN width law (`aterm_grapheme` width with
+    /// the live ambiguous-width mode — the same Tier-5 authority the write
+    /// handler materializes by, and the same pairing the native capture seam
+    /// uses), then arm through the shared witness. This is the seam a web
+    /// embedder calls from the SAME keydown/composition handler that dispatched
+    /// the key's bytes — after dispatch, before the echo is fed to the terminal
+    /// — with the retained, last-applied `RenderInput`; the witness's own
+    /// coherence fences fail closed on anything stale.
+    ///
+    /// A scalar with no exact witness shape (control, zero-width, or wider than
+    /// two cells) degrades to [`Self::note_keystroke`] — the text-blind cadence
+    /// consumers still fire, candidates are cancelled, and `false` reports that
+    /// no movement provenance was armed.
+    #[must_use]
+    pub fn note_committed_char(
+        &mut self,
+        term: &mut Terminal,
+        input: &RenderInput,
+        ch: char,
+    ) -> bool {
+        let width = if term.modes().ambiguous_width_double {
+            aterm_grapheme::char_width_cjk(ch)
+        } else {
+            aterm_grapheme::char_width(ch)
+        };
+        let expected = (!ch.is_control() && (1..=2).contains(&width))
+            .then(|| {
+                ExpectedCellSpan::from_cells(
+                    std::iter::once(ch).chain(std::iter::repeat_n('\0', width - 1)),
+                )
+            })
+            .flatten();
+        let Some(expected) = expected else {
+            self.note_keystroke();
+            return false;
+        };
+        self.note_committed_cells(term, input, expected)
+    }
+
     /// Feed the current coherent row into the shared candidate verifier and
     /// mirror its one-shot decision into the classic trail before either engine
     /// observes this frame's cursor delta.

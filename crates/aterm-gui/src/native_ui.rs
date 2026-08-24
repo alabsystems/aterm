@@ -1949,12 +1949,34 @@ impl CompiledUi {
     /// renderer-independent draw vocabulary, so CPU, GPU, and image capture
     /// consume identical pixels. Document apps may later lower large text runs
     /// directly to the retained scene without changing their semantic tree.
+    ///
+    /// One theme plays both parts here — chrome roles AND terminal specimen —
+    /// which is exact whenever chrome follows the terminal. A host forcing the
+    /// chrome side (Linux config `window_theme=light|dark`,
+    /// [`crate::App::chrome_palette_theme`]) must call
+    /// [`Self::tray_with_chrome`] so the Settings preview keeps showing real
+    /// terminal colors on the forced chrome.
     pub(crate) fn tray(
         &self,
         theme: aterm_render::Theme,
         base_px: f32,
     ) -> crate::widget::TrayInput {
-        let roles = crate::settings::Roles::from_theme(theme);
+        self.tray_with_chrome(theme, theme, base_px)
+    }
+
+    /// [`Self::tray`] with the CHROME palette and the TERMINAL theme split: the
+    /// role tokens every control paints with derive from `chrome_theme`, while
+    /// `terminal_theme` reaches only the nodes that display terminal content
+    /// (the Settings appearance preview's live-colors fallback). The two are
+    /// the same value everywhere chrome follows the terminal.
+    pub(crate) fn tray_with_chrome(
+        &self,
+        chrome_theme: aterm_render::Theme,
+        terminal_theme: aterm_render::Theme,
+        base_px: f32,
+    ) -> crate::widget::TrayInput {
+        let theme = terminal_theme;
+        let roles = crate::settings::Roles::from_theme(chrome_theme);
         let mut prims = Vec::with_capacity(self.paint.len() * 5);
         for node in &self.paint {
             prims.push(crate::widget::DrawPrim::ClipPush {

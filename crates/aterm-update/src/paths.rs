@@ -39,27 +39,13 @@ impl Staging {
     /// Resolve (and create, `0700`, ownership-verified) the staging layout.
     /// Returns `None` if `HOME` is unset or the directory cannot be made private.
     pub fn resolve() -> Option<Self> {
-        // TEST/DEMO ISOLATION (2026-08-15): `ATERM_UPDATE_ROOT` overrides the
-        // HOME-keyed base wholesale. Without it, every `cargo test -p
-        // aterm-gui` run drove the REAL per-user ledgers through the real
-        // recorders — ~2,125 of the 2,191 "apply failures" on this machine's
-        // health ledger were the unit suite's fixture strings (current_build
-        // 10, "handoff proof ended TimedOut"), laundered into `update status`
-        // as a persistent streak on a healthy, up-to-date install. The GUI
-        // test harness pins this to a per-process scratch dir; a demo or
-        // rehearsal shell may point it anywhere.
-        let base = match std::env::var_os("ATERM_UPDATE_ROOT") {
-            Some(root) if !root.is_empty() => PathBuf::from(root),
-            _ => {
-                let home = std::env::var_os("HOME")?;
-                PathBuf::from(home)
-                    .join("Library")
-                    .join("Application Support")
-                    .join("aterm")
-            }
-        };
-        let root = base.join("Updates");
-        ensure_private_dir(&root).ok()?;
+        // The base derivation — `ATERM_UPDATE_ROOT` test/demo override first
+        // (2026-08-15: without it every `cargo test -p aterm-gui` run drove
+        // the REAL per-user ledgers), else the HOME-keyed Application Support
+        // base — lives in `aterm_update_core::seal_guard::updates_root` so
+        // the seal-read marker atpkg writes and the staging layout this
+        // struct describes can never disagree about where `Updates/` is.
+        let root = aterm_update_core::seal_guard::updates_root()?;
         let download = root.join("download");
         ensure_private_dir(&download).ok()?;
         Some(Self {
@@ -114,17 +100,6 @@ impl Staging {
     /// overwritten by every request and read immediately; nothing durable lives here.
     pub fn catalog_headers(&self) -> PathBuf {
         self.root.join("catalog.headers")
-    }
-
-    /// The "a toolchain install is reading this bundle" marker, holding the pid of
-    /// the process whose child is extracting.
-    ///
-    /// DURABLE ON PURPOSE. A process-local flag cannot work here: the apply that
-    /// swaps the bundle runs at the top of the SUCCESSOR image's boot, in a process
-    /// that never set anything, so an in-memory atomic is always false exactly when
-    /// it is read (2026-08-20 round-9 audit).
-    pub fn toolchain_install(&self) -> PathBuf {
-        self.root.join("toolchain-install")
     }
 
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`), written beside

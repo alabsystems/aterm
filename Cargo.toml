@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.48.0"
+version = "0.49.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -198,6 +198,12 @@ aterm-sixel = { path = "crates/aterm-sixel" }
 # implementation consumed by `xtask gate mainloop` (manual verb) AND
 # tools/freeze-safety-gate/build.rs (the automatic, build-blocking obligation).
 aterm-census = { path = "crates/aterm-census" }
+# The merge gate's own crate. Depended on ONLY for its toolchain resolution
+# (`aterm_verify::Toolchain`), so `xtask gate lint` and `tools/verify.sh` cannot
+# disagree about which directory THE toolchain is — the same reason `gate lint`
+# shells to that verb rather than re-deriving tippy in shell. Safe to depend on:
+# aterm-verify itself has no dependencies, by charter.
+aterm-verify = { path = "crates/aterm-verify" }
 # (none yet — populated bottom-up)
 
 # --- workspace-wide lint policy (inherited via `[lints] workspace = true`) ---

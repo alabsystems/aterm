@@ -440,6 +440,53 @@ impl App {
         self.window_theme_for_chrome()
     }
 
+    /// The THEME the window's CHROME PAINTERS draw from — the tab band's strip
+    /// tones and the native pages' role palette — as opposed to the terminal
+    /// GRID, which always renders the terminal theme itself.
+    ///
+    /// macOS/Windows return the terminal theme untouched: their titlebar is
+    /// painted by the platform, config `window_theme` already reaches it
+    /// through [`crate::platform::AppRt::window_set_appearance`], and the
+    /// system-owned contract (`automatic_window_chrome_remains_system_owned_…`)
+    /// pins that pass-through — the in-grid painters there keep extending the
+    /// terminal.
+    ///
+    /// Linux is where the config was observably a NO-OP beyond the CSD header
+    /// (2026-08 settings audit): `window_theme = light` flipped only winit's
+    /// decoration variant while the tab band and every native Settings page
+    /// kept painting from the (dark) terminal theme — a light titlebar bolted
+    /// onto a dark chrome body. So on Linux ONLY:
+    ///
+    ///  * `Auto` — the terminal theme, unchanged: chrome extends the terminal,
+    ///    exactly the side [`Self::chrome_theme_for_apprt`] resolves the CSD to,
+    ///    so header, band and pages stay one material;
+    ///  * `Light`/`Dark` matching the terminal theme's own darkness — the
+    ///    terminal theme, unchanged: theme-derived chrome already reads as the
+    ///    forced side, and keeping it preserves the harmony Auto ships;
+    ///  * `Light`/`Dark` AGAINST the terminal theme's darkness — the authored
+    ///    forced palette ([`crate::native_appearance::forced_chrome_theme`]),
+    ///    accent carried from the terminal theme.
+    ///
+    /// The CSD variant, the strip and the native pages all resolve from the one
+    /// `window_theme` field ([`crate::tab_bar::theme_is_dark`] classifying the
+    /// SAME bg this returns), so the three move together by construction.
+    pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
+        #[cfg(target_os = "linux")]
+        {
+            let force_dark = match self.window_theme {
+                crate::app_config::WindowTheme::Auto => return self.theme,
+                crate::app_config::WindowTheme::Light => false,
+                crate::app_config::WindowTheme::Dark => true,
+            };
+            if crate::tab_bar::theme_is_dark(self.theme.bg) == force_dark {
+                return self.theme;
+            }
+            crate::native_appearance::forced_chrome_theme(self.theme, force_dark)
+        }
+        #[cfg(not(target_os = "linux"))]
+        self.theme
+    }
+
     pub(crate) fn front_mut(&mut self) -> Option<&mut WindowState> {
         self.frontmost_window
             .and_then(move |id| self.windows.get_mut(&id))
@@ -1202,11 +1249,38 @@ impl App {
         // Windows-only, deliberately: this platform is where the cost lives
         // (no Dock bounce covers the gap), its chrome calls here are all
         // backend-independent, and its titlebar band is provably 0 (the OS
-        // caption sits outside the client area). macOS measures `head_pts`
-        // from `contentLayoutRect` only after the post-join
-        // fullsize-content + toolbar installs, so an early frame there would
-        // be short one chrome band — adopting this path on macOS means moving
-        // those installs above the join first, a separate change.
+        // caption sits outside the client area).
+        //
+        // macOS WAS TRIED AND MEASURED, AND IS NOT COMING. The old reason
+        // recorded here was that macOS reads `head_pts` off `contentLayoutRect`,
+        // which is 0 until the post-join fullsize-content + toolbar installs, so
+        // an early frame would be short one chrome band unless those installs
+        // moved above the join first. That blocker is real but removable: moved
+        // above the join, the band reads correctly on a still-HIDDEN window
+        // (`head=80` identical across the move, `aterm-ctl dims`), the warm
+        // reveal fires, and it logs "early reveal held … zero resize on glass" —
+        // the exact frame, no jump. What killed it is the SIZE OF THE PRIZE, on
+        // its own metric:
+        //
+        //   rust_main_to_first_visible_ms — warm lane, paired AB/BA, n=20 pairs,
+        //   `start-compare.sh --warm`; POSITIVE = the second binary is faster:
+        //     baseline            → hoist + macOS reveal ON:  −0.18 ms (10w/10l)
+        //     hoist, macOS reveal OFF → the same, ON:         +0.80 ms (12w/8l)
+        //   and the enabler by itself, cold lane, same shape:
+        //     baseline            → hoist alone:              −1.37 ms (6w/14l)
+        //
+        // i.e. nil, against a ~96 ms time-to-visible. The drill-down says why,
+        // and it is not a tuning problem: 8.7 ms moves out of `chrome_geometry`
+        // and 9.3 ms moves into `window_setup`, because the dominant pre-reveal
+        // cost is the `request_inner_size` to the exact frame — and that resize
+        // has to happen BEFORE the window is shown on either path. Revealing
+        // earlier drags the resize earlier with it and arrives at the same
+        // instant. There is no ~300 ms join here to reveal in front of (see the
+        // join note below: 0.01–0.04 ms), macOS already covers the launch gap
+        // with a Dock bounce, and the change would buy that nil at the price of
+        // a second reveal site plus a new visible failure mode (an early frame
+        // that jumps if the cached box ever goes stale). Windows keeps it: there
+        // the same mechanism removes ~300 ms of no window at all.
         //
         // Skips (each keeps today's hidden-until-ready behaviour):
         //   * cold launch — no persisted metrics for this scale/font;
@@ -1329,6 +1403,18 @@ impl App {
         // corrected window size, the present target — needs the real backend. A
         // build panic exits inside `finalize_backend` (launch-fatal, same outcome
         // as the old pre-`run_app` `.expect`).
+        //
+        // ON macOS THIS WAIT IS ALREADY GONE — 0.01–0.04 ms MEASURED
+        // (`startup_attach_backend_finalize_ms`, arena n=20 paired, both warm and
+        // cold). The overlap #7 introduced works so well here that the worker has
+        // finished long before the event-loop thread arrives: window creation
+        // alone (~20 ms) outlasts the entire backend build. Read that number
+        // before proposing to hoist work above this line "to overlap the join" —
+        // there is nothing left to overlap, and work moved across a 0.04 ms wait
+        // only re-books itself from `chrome_geometry` into `window_setup` in the
+        // attach drill-down. The ~300 ms figure that keeps getting quoted for
+        // this join is the WINDOWS one from the early-reveal note above, and it
+        // does not transfer.
         let startup_before_backend_finalize = Instant::now();
         if pending_join {
             self.finalize_backend();
@@ -3560,6 +3646,69 @@ mod tests {
             app.chrome_theme_for_apprt(),
             crate::app_config::WindowTheme::Light,
             "an explicit chrome override remains the operator's word"
+        );
+    }
+
+    /// The Linux CHROME-PAINTER resolution (`chrome_palette_theme`): the theme
+    /// the tab band and the native pages paint from. Auto is the terminal theme
+    /// verbatim; an explicit Light/Dark matching the terminal theme's own side
+    /// keeps the theme-derived chrome; an explicit side AGAINST the terminal
+    /// theme swaps in the authored forced palette with the accent carried over
+    /// — which is what makes `window_theme = light` observable at all on Linux
+    /// (2026-08 settings audit: it used to move only the CSD variant).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_chrome_painters_resolve_window_theme_to_a_real_palette() {
+        let mut app = App::headless_for_test();
+        app.window_theme = crate::app_config::WindowTheme::Auto;
+        let terminal = app.theme;
+        assert!(
+            crate::tab_bar::theme_is_dark(terminal.bg),
+            "precondition: the default terminal theme is dark"
+        );
+        let auto = app.chrome_palette_theme();
+        assert_eq!(
+            (auto.fg, auto.bg, auto.cursor, auto.selection),
+            (
+                terminal.fg,
+                terminal.bg,
+                terminal.cursor,
+                terminal.selection
+            ),
+            "Auto keeps chrome an extension of the terminal theme"
+        );
+
+        // Forcing the side the theme already occupies changes nothing.
+        app.window_theme = crate::app_config::WindowTheme::Dark;
+        let matching = app.chrome_palette_theme();
+        assert_eq!(
+            (matching.fg, matching.bg),
+            (terminal.fg, terminal.bg),
+            "forcing the terminal theme's own side keeps theme-derived chrome"
+        );
+
+        // Forcing AGAINST it swaps in the authored palette, accent carried.
+        app.window_theme = crate::app_config::WindowTheme::Light;
+        let forced = app.chrome_palette_theme();
+        assert_eq!(
+            forced.bg,
+            crate::native_appearance::FORCED_LIGHT_CHROME_BG,
+            "window_theme=light on a dark terminal theme paints the authored light chrome"
+        );
+        assert_eq!(forced.fg, crate::native_appearance::FORCED_LIGHT_CHROME_FG);
+        assert!(
+            !crate::tab_bar::theme_is_dark(forced.bg),
+            "the forced palette classifies as the forced side"
+        );
+        assert_eq!(
+            forced.selection, terminal.selection,
+            "the accent identity is carried from the terminal theme"
+        );
+        // And the CSD variant agrees with the painters' side, so the header,
+        // band and pages can only move together.
+        assert_eq!(
+            app.chrome_theme_for_apprt(),
+            crate::app_config::WindowTheme::Light
         );
     }
 

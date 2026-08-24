@@ -256,7 +256,7 @@ fn row_shrink_after_scrolling_preserves_newest_content() {
 #[test]
 fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     // A rows-only shrink on a RING-ONLY grid reclassifies instead of
-    // trimming (the ring IS retention — see adjust_row_count_ring_only):
+    // trimming (the ring IS retention — see adjust_row_count_rows_only):
     // the demoted bottom row joins history and existing scrollback stays,
     // bounded by the ring cap. (This test previously pinned the old
     // trim-to-viewport behavior, which wiped ring history on every

@@ -126,6 +126,35 @@ pub(super) fn engine_decision_deny_by_default_capability(
     engine_decision_with_wildcard_execute_fallback(engine, sequence, origin, true)
 }
 
+// AMB-1..4 AS A COUNT (test-only). Every fixed capability gate used to REACH
+// this function once per dispatched sequence: build a compile-time-constant
+// probe, then walk the rule set, to reach a verdict that can only change when a
+// policy is installed or swapped. The fix compiles those verdicts ONCE per
+// policy generation into `PolicyGates`, and the dispatch sites now read a byte.
+//
+// Nothing about the VERDICTS changed, which is why the compiled-vs-live
+// equivalence tests next door cannot see a giveback: a gate that went back to
+// evaluating per dispatch would agree with the table on every input and pass
+// every one of them. What moves is how OFTEN this function is entered, so that
+// is what is counted. Entry, not `evaluate`, because the probe construction the
+// caller pays to get here is part of the cost that was removed — and because
+// `clipboard_auth` never had an `is_none()` early-out, so an embedder with NO
+// engine was paying for the constant probe too.
+#[cfg(test)]
+thread_local! {
+    static ENGINE_DECISIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Take (read and reset) the per-dispatch policy-gate evaluation count.
+#[cfg(test)]
+pub(super) fn take_engine_decisions() -> usize {
+    ENGINE_DECISIONS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
 #[inline]
 fn engine_decision_with_wildcard_execute_fallback(
     engine: Option<&PolicyEngine>,
@@ -133,6 +162,8 @@ fn engine_decision_with_wildcard_execute_fallback(
     origin: OriginTag,
     wildcard_execute_falls_back: bool,
 ) -> BridgeDecision {
+    #[cfg(test)]
+    ENGINE_DECISIONS.with(|c| c.set(c.get() + 1));
     let Some(engine) = engine else {
         return BridgeDecision::Fallback;
     };

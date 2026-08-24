@@ -294,6 +294,14 @@ pub fn model_registry() -> Vec<Model> {
         cursor_cat_curse_wince_model(),
         rainbow_move_admission_model(),
         cursor_move_candidate_model(),
+        // The blackout's liveness twin: an environment adversary produces the
+        // audited real-shell echo shapes (plain/E1..E5/cold/swallowed/
+        // deviating) and the settled decision must CONFIRM every handled
+        // shape — safety alone had proven a mute gate green. E2/E5 are
+        // registered standing gaps, stated as invariants and reprinted by the
+        // Tier-0 driver. Tier-1 binds the real confirm_content_candidate in
+        // aterm-effects/src/cursor_glow.rs.
+        typed_echo_liveness_model(),
         cursor_viewport_lifecycle_model(),
         cursor_effect_scroll_model(),
         cursor_scroll_signal_model(),

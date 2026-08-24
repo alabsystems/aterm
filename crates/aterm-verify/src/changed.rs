@@ -1060,6 +1060,7 @@ winit v0.30.0 (/repo/vendor/winit)
             Some(Path::new("/nonexistent")),
             Path::new("/nonexistent"),
             std::ffi::OsStr::new(""),
+            None,
         );
         assert_eq!(
             resolve(Path::new("/"), &tools, OsStr::new(""), "main"),

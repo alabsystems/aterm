@@ -904,6 +904,19 @@ impl SettingsPreviewSpec {
                 let window = match spec.appearance.window_theme.as_str() {
                     "light" => "Light window appearance",
                     "dark" => "Dark window appearance",
+                    // Linux Auto follows the TERMINAL THEME, not a live OS
+                    // appearance feed (`chrome_theme_for_apprt`); announce the
+                    // side the candidate palette actually resolves to.
+                    _ if cfg!(target_os = "linux") => {
+                        if spec
+                            .terminal_theme
+                            .map_or(spec.system_dark, |theme| theme_bg_is_dark(theme.bg))
+                        {
+                            "window appearance that matches the terminal theme, currently Dark"
+                        } else {
+                            "window appearance that matches the terminal theme, currently Light"
+                        }
+                    }
                     _ if spec.system_dark && cfg!(target_os = "macos") => {
                         "window appearance that follows macOS, currently Dark"
                     }
@@ -1487,7 +1500,7 @@ impl SettingsPreviewSpec {
             &spec.font_candidate,
         );
         if spec.scene == PreviewScene::WindowTabs {
-            paint_window_tabs(prims, terminal, &spec, roles);
+            paint_window_tabs(prims, terminal, &spec, roles, terminal_theme);
             prims.push(DrawPrim::ClipPop);
             return;
         }
@@ -1820,6 +1833,28 @@ const fn window_chrome_text_color(light: bool) -> [u8; 3] {
     }
 }
 
+/// The one dark/light classifier for preview terminal palettes — delegates to
+/// [`crate::tab_bar::theme_is_dark`] so the window sample and the real chrome
+/// can never disagree about a theme's side.
+fn theme_bg_is_dark(bg: u32) -> bool {
+    crate::tab_bar::theme_is_dark(bg)
+}
+
+/// The light/dark side the WINDOW SAMPLE paints for the spec's `window_theme`.
+/// Explicit Light/Dark is itself. Auto is the PLATFORM truth: macOS/Windows
+/// follow the live system appearance (`system_dark`), while Linux follows the
+/// candidate TERMINAL THEME's darkness — the resolution the shipping chrome
+/// actually uses there (`chrome_theme_for_apprt`/`chrome_palette_theme`; no
+/// live OS-appearance feed exists under winit's Wayland backend).
+fn window_sample_light(spec: &SettingsPreviewSpec, terminal_theme: Theme) -> bool {
+    match spec.appearance.window_theme.as_str() {
+        "light" => true,
+        "dark" => false,
+        _ if cfg!(target_os = "linux") => !theme_bg_is_dark(terminal_theme.bg),
+        _ => !spec.system_dark,
+    }
+}
+
 const APPEARANCE_SPECIMEN_ROWS: usize = 3;
 const APPEARANCE_SWATCH_BOTTOM_INSET: f32 = 10.0;
 const APPEARANCE_SWATCH_HEIGHT: f32 = 6.0;
@@ -1859,11 +1894,7 @@ fn paint_window_theme_sample(
     spec: &SettingsPreviewSpec,
     terminal_theme: Theme,
 ) {
-    let light = match spec.appearance.window_theme.as_str() {
-        "light" => true,
-        "dark" => false,
-        _ => !spec.system_dark,
-    };
+    let light = window_sample_light(spec, terminal_theme);
     let width = terminal.width.min(112.0);
     let x = terminal.right() - width;
     let fill = if light {
@@ -2253,6 +2284,7 @@ fn paint_window_tabs(
     rect: LogicalRect,
     spec: &SettingsPreviewSpec,
     roles: Roles,
+    terminal_theme: Theme,
 ) {
     // Static, explicitly-authored examples: this demonstrates composition and
     // precedence without pretending a provider is connected. The first session
@@ -2284,11 +2316,7 @@ fn paint_window_tabs(
         " · ",
     );
     let title_h = 19.0;
-    let light = match spec.appearance.window_theme.as_str() {
-        "light" => true,
-        "dark" => false,
-        _ => !spec.system_dark,
-    };
+    let light = window_sample_light(spec, terminal_theme);
     let title_fill = if light {
         [0xE9, 0xEA, 0xEE]
     } else {
@@ -3279,6 +3307,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
     fn automatic_window_samples_follow_the_os_not_the_terminal_palette() {
         // Deliberately pair a dark terminal palette with OS Light, then flip
         // only the host appearance. Auto must repaint both preview scenes.
@@ -3336,6 +3365,70 @@ mod tests {
         );
     }
 
+    /// The Linux twin of the OS-following test above: winit's Wayland backend
+    /// never delivers `ThemeChanged`, so the shipping chrome resolves Auto from
+    /// the TERMINAL THEME's darkness (`chrome_theme_for_apprt` /
+    /// `chrome_palette_theme`) — and the window sample must tell that truth:
+    /// an OS appearance flip moves nothing, a terminal palette flip moves the
+    /// sample titlebar.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn automatic_window_samples_follow_the_terminal_palette_on_linux() {
+        // A light candidate palette, luminance-opposite to NORD.
+        const PAPER: PreviewTerminalTheme =
+            PreviewTerminalTheme::new(0x33_3333, 0xFA_FAFA, 0x35_84E4, 0xD0_D7DE);
+        let dark_palette = SettingsPreviewSpec::appearance(14.0)
+            .with_terminal_theme(NORD)
+            .with_system_dark(false);
+        assert!(
+            dark_palette
+                .semantic_value()
+                .contains("matches the terminal theme, currently Dark"),
+            "Auto's accessible value announces the side the terminal theme resolves to"
+        );
+        // Flip ONLY the host OS appearance: Auto ignores it here — the pixels
+        // must not move (recomputed, so the check cannot be served the first
+        // paint's cached specimen and prove nothing).
+        let os_flip = dark_palette.clone().with_system_dark(true);
+        assert!(
+            os_flip
+                .semantic_value()
+                .contains("matches the terminal theme, currently Dark"),
+            "an OS appearance flip does not move Linux Auto"
+        );
+        assert_eq!(
+            differences(&pixels(dark_palette.clone()), &pixels_recomputed(os_flip)),
+            0
+        );
+        // Flip the TERMINAL palette: Auto follows it.
+        let light_palette = dark_palette.clone().with_terminal_theme(PAPER);
+        assert!(
+            light_palette
+                .semantic_value()
+                .contains("matches the terminal theme, currently Light"),
+            "Auto's accessible value follows a terminal palette change"
+        );
+        assert!(differences(&pixels(dark_palette.clone()), &pixels(light_palette)) > 40);
+
+        // An explicit appearance remains independent of both feeds.
+        let explicit = dark_palette.with_appearance(AppearancePreviewSpec {
+            window_theme: "dark".to_string(),
+            ..AppearancePreviewSpec::default()
+        });
+        let explicit_flip = explicit.clone().with_system_dark(true);
+        assert_eq!(
+            differences(
+                &pixels(explicit.clone()),
+                &pixels_recomputed(explicit_flip.clone())
+            ),
+            0
+        );
+        assert_eq!(
+            explicit.paint_fingerprint(),
+            explicit_flip.paint_fingerprint()
+        );
+    }
+
     #[test]
     fn window_preview_controls_match_the_compiled_platform() {
         let mut prims = Vec::new();
@@ -3345,6 +3438,7 @@ mod tests {
             rect,
             &SettingsPreviewSpec::window_tabs(WindowTabsPreviewSpec::default(), 14.0),
             Roles::from_theme(Theme::default()),
+            Theme::default(),
         );
         let title_x = prims.iter().find_map(|primitive| match primitive {
             DrawPrim::Text { x, s, .. } if s.starts_with("Settings · ") => Some(*x),
@@ -3399,7 +3493,13 @@ mod tests {
                     window_theme: window_theme.to_string(),
                     ..AppearancePreviewSpec::default()
                 });
-            paint_window_tabs(&mut prims, rect, &spec, Roles::from_theme(Theme::default()));
+            paint_window_tabs(
+                &mut prims,
+                rect,
+                &spec,
+                Roles::from_theme(Theme::default()),
+                Theme::default(),
+            );
             let caption = prims.iter().find_map(|primitive| match primitive {
                 DrawPrim::Text { s, color, .. } if s.starts_with("Settings · ") => Some(*color),
                 _ => None,

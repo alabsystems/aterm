@@ -503,6 +503,25 @@ impl Worker {
     }
 }
 
+/// Strip a `"<state> in <place>"` description down to `"<state>"` when `title`
+/// already names that place. Textual and cheap: the state sentence is built by
+/// [`description::idle_prompt_description`] from the same cwd the title's own
+/// rung uses, so a containment test is the exact question ("does the label say
+/// this twice?"). Anything that is not that shape is returned untouched.
+fn shed_place_already_in_title<'a>(title: &str, description: &'a str) -> &'a str {
+    let Some((state, place)) = description.split_once(" in ") else {
+        return description;
+    };
+    if place.is_empty() || state.is_empty() {
+        return description;
+    }
+    // `~/aterm`, `/home/x/aterm` and a bare `aterm` all count as naming it.
+    let names_place = title
+        .rsplit(['/', ' ', ':'])
+        .any(|token| !token.is_empty() && token == place);
+    if names_place { state } else { description }
+}
+
 impl Coordinator {
     pub(crate) fn new(proxy: Option<EventLoopProxy<Wake>>) -> Self {
         let worker_authority_epoch = Arc::new(AtomicU64::new(0));
@@ -1192,6 +1211,13 @@ impl Coordinator {
             .map(str::trim)
             .filter(|description| !description.is_empty())
             .unwrap_or(activity);
+        // REDUNDANCY SHED. The prompt-state sentence names the place ("Ready in
+        // aterm") because a WINDOW title reads as a sentence. A label whose own
+        // title already carries that place says it twice — and on a tab chip the
+        // second copy is what survives truncation, so the strip painted
+        // `…in aterm` while the informative half was cut away. Where the title
+        // already answers "where", the description keeps only the state word.
+        let description = shed_place_already_in_title(slot, description);
         if description.is_empty() && !slot.is_empty() && title_is_presentation_clean(slot) {
             return;
         }
@@ -2231,6 +2257,33 @@ mod tests {
         fn is_open(&mut self) -> bool {
             true
         }
+    }
+
+    #[test]
+    fn the_label_says_where_once() {
+        // A chip's title already carries the place, so the state sentence
+        // sheds it — otherwise truncation keeps the redundant half and the
+        // strip paints `…in aterm` (seen on glass).
+        assert_eq!(
+            shed_place_already_in_title("user@m17-tower: ~/aterm", "Ready in aterm"),
+            "Ready"
+        );
+        assert_eq!(
+            shed_place_already_in_title("~/wave/nn", "Ready in nn"),
+            "Ready"
+        );
+        // A title that does NOT name the place keeps the full sentence: the
+        // "where" would otherwise be lost entirely.
+        assert_eq!(
+            shed_place_already_in_title("cargo build", "Ready in aterm"),
+            "Ready in aterm"
+        );
+        // Not the sentence shape at all — untouched.
+        assert_eq!(
+            shed_place_already_in_title("~/aterm", "Typing a command"),
+            "Typing a command"
+        );
+        assert_eq!(shed_place_already_in_title("~/aterm", "Ready"), "Ready");
     }
 
     #[test]
@@ -3274,6 +3327,9 @@ mod tests {
                 alt_screen: false,
                 content_seq: 1,
                 last_output: None,
+                // A real keystroke: this test drives the LIVE typing marker,
+                // which now needs input evidence, not bare movement.
+                last_input: Some(Instant::now()),
             },
         };
         let t0 = Instant::now();

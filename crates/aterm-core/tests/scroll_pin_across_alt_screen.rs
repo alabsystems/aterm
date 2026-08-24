@@ -19,7 +19,7 @@
 //! The fix repins the grid that was actually pinned. These tests pin the OBSERVABLE
 //! property: the same content is under the eye after the round-trip.
 
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{TIERED_RING_CAP_DEFAULT, Terminal, TerminalBuilder};
 
 /// Seed enough output to build scrollback, then scroll up into it.
 fn scrolled_back(rows: u16, cols: u16, lines: usize) -> Terminal {
@@ -43,6 +43,10 @@ fn scrolled_back(rows: u16, cols: u16, lines: usize) -> Terminal {
 /// buffer — which every fixture here is, at 24 columns and a few dozen lines. On a
 /// deep-history grid a scrolled-back row can be tiered and legitimately read back
 /// as blank; do not lift this helper into such a test without swapping the reader.
+///
+/// The two tiered cases below DO use it — but only at `display_offset == 0`, where
+/// the top visible row is the live screen's own and is always ring-resident by
+/// construction. That is the one place the warning does not bite.
 fn top_row_text(term: &Terminal) -> String {
     let grid = term.grid();
     (0..grid.cols())
@@ -205,8 +209,9 @@ fn a_rows_only_resize_keeps_the_same_line_under_the_eye() {
 /// the reverted failure mode is
 /// `fuzz_process_never_panics::reflow_wide_char_resize_never_panics`, which drives
 /// 30 000 randomised resize/reflow rounds and is the gate the first attempt failed.
-/// A genuine tiered case would need a `TerminalBuilder` with a tiered store
-/// configured, and is worth adding.
+/// A genuine tiered case needs a `TerminalBuilder` with a tiered store configured;
+/// it now exists, immediately below —
+/// `a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history`.
 #[test]
 fn a_rows_only_resize_keeps_the_anchor_through_deep_capped_history() {
     for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5)] {
@@ -243,6 +248,155 @@ fn a_rows_only_resize_keeps_the_anchor_through_deep_capped_history() {
             term.get_line_text(-offset_after, None),
             text_before,
             "{from_rows}->{to_rows} rows: …and the same line must be under the eye"
+        );
+    }
+}
+
+/// A terminal whose history genuinely OFFLOADS: the engine-default tiered store
+/// behind a [`TIERED_RING_CAP_DEFAULT`]-line hot ring, so everything older than
+/// that ring is compressed out of `Grid::cell`'s reach.
+fn tiered_terminal(rows: u16, cols: u16, lines: usize) -> Terminal {
+    let mut term = TerminalBuilder::new()
+        .size(rows, cols)
+        .tiered_scrollback_defaults()
+        .build();
+    for i in 0..lines {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    term
+}
+
+/// The same property on genuinely TIERED history — the case the fixture above
+/// cannot reach, and the exact shape the reverted first attempt was blamed for.
+///
+/// `Terminal::new` keeps raw cells in the ring and the retention cap bites before
+/// anything is offloaded, so that fixture proves nothing about the compressed
+/// store. `tiered_scrollback_defaults()` puts a [`TIERED_RING_CAP_DEFAULT`]-line
+/// hot ring in front of the tiered store, so 20 000 lines leave ~19 000 of them
+/// OFF the ring. Measured here: `scrollback_lines ≈ 19 977`, of which
+/// `tiered_scrollback_lines ≈ 18 977` — and this test asserts that BEFORE it
+/// asserts anything else, because a tiered test that never tiers is vacuous.
+///
+/// The row parked under the eye is then deliberately deeper than the hot ring, so
+/// `Grid::cell(0, 0)` reads `None` — the literal "cell (0,0) inaccessible"
+/// condition that got the anchor reverted. That is not a bug: `Grid::cell` is the
+/// RING accessor, and a viewport parked on offloaded history has no ring row for
+/// it to return. The assertion on it here is a PRECONDITION, pinning that this
+/// fixture really is in the offloaded region; the content oracle is
+/// `get_line_text`, which resolves ring, lazy and tiered alike.
+#[test]
+fn a_rows_only_resize_keeps_the_anchor_through_offloaded_tiered_history() {
+    for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5)] {
+        let mut term = tiered_terminal(from_rows, 80, 20_000);
+
+        // PROVE THE FIXTURE FIRST: history must really have left the ring.
+        // NOTE `tiered_scrollback_lines()` returns `store.line_count() +
+        // lazy_buffer.len()`, so this proves the history left the HOT RING — not
+        // that every one of those lines is compressed. That is the property the
+        // anchor cares about: `Grid::cell` serves the ring, and anything off it is
+        // out of its reach whichever tier holds it.
+        let tiered = term.grid().tiered_scrollback_lines();
+        assert!(
+            tiered > 0,
+            "{from_rows}->{to_rows}: fixture never reached tiered storage \
+             (scrollback_lines={}, tiered={tiered}) — the test would be vacuous",
+            term.grid().scrollback_lines()
+        );
+        let ring_lines = term.grid().scrollback_lines() - tiered;
+        assert!(
+            ring_lines <= TIERED_RING_CAP_DEFAULT,
+            "{from_rows}->{to_rows}: the hot ring should hold at most \
+             {TIERED_RING_CAP_DEFAULT} lines, holds {ring_lines}"
+        );
+
+        term.scroll_to_top();
+        // Off the very top, so a clamp cannot accidentally produce the right answer.
+        term.scroll_display(-200);
+        let offset_before = i32::try_from(term.grid().display_offset()).unwrap();
+        assert!(
+            usize::try_from(offset_before).unwrap() > ring_lines,
+            "{from_rows}->{to_rows}: the eye must be PAST the {ring_lines}-line hot \
+             ring, i.e. on offloaded history, not merely scrolled back"
+        );
+        assert!(
+            term.grid().cell(0, 0).is_none(),
+            "{from_rows}->{to_rows}: the anchored row must be OFFLOADED — if the RING \
+             accessor can still see it, this fixture is not testing the tiers"
+        );
+
+        let anchor_before = term.grid().top_visible_absolute_row();
+        let text_before = term.get_line_text(-offset_before, None);
+        assert!(
+            text_before
+                .as_deref()
+                .is_some_and(|t| t.starts_with("line-")),
+            "{from_rows}->{to_rows}: the resolving reader must find the tiered line"
+        );
+
+        term.resize(to_rows, 80);
+
+        assert_eq!(
+            term.grid().top_visible_absolute_row(),
+            anchor_before,
+            "{from_rows}->{to_rows} rows: the anchored absolute row must not move"
+        );
+        let offset_after = i32::try_from(term.grid().display_offset()).unwrap();
+        assert!(
+            offset_after > 0,
+            "{from_rows}->{to_rows} rows: the reader must still be in history"
+        );
+        assert_eq!(
+            term.get_line_text(-offset_after, None),
+            text_before,
+            "{from_rows}->{to_rows} rows: …and the same TIERED line must be under the eye"
+        );
+    }
+}
+
+/// The `prev_offset > 0` gate, on the tiered fixture: a reader at the LIVE bottom
+/// of a deep tiered session must stay live across a rows-only resize.
+///
+/// This is the half of the gate no SCROLLED-BACK case can see — above offset 0 the
+/// gate is a no-op, so widening it to `prev_offset >= 0` is invisible up there.
+/// `a_live_viewport_stays_live_across_a_rows_only_resize` above already covers that
+/// half on a ring-only grid, and both fail against the widened gate; what THIS case
+/// adds is the same property with 19 000 lines of offloaded history behind it, where
+/// the offset the widened gate demands would land the reader in the compressed
+/// store rather than merely a few rows up.
+/// At offset 0 it re-anchors the live top row, and on a height SHRINK the anchor
+/// arithmetic `d + (v - t)` then demands a positive offset: every window-height
+/// drag would push a tail-following reader into (here, compressed) history. That
+/// is what the resize fuzzers saw, and this is the test that catches it.
+#[test]
+fn a_live_tiered_viewport_stays_live_across_a_rows_only_resize() {
+    for (from_rows, to_rows) in [(24u16, 12u16), (12, 24), (40, 5), (5, 40)] {
+        let mut term = tiered_terminal(from_rows, 80, 20_000);
+        assert!(
+            term.grid().tiered_scrollback_lines() > 0,
+            "{from_rows}->{to_rows}: fixture never reached tiered storage"
+        );
+        assert_eq!(term.grid().display_offset(), 0, "starts live");
+
+        term.resize(to_rows, 80);
+
+        assert_eq!(
+            term.grid().display_offset(),
+            0,
+            "{from_rows}->{to_rows} rows: a tail follower must stay at the live bottom \
+             even with 19 000 lines of tiered history behind it"
+        );
+        // Non-redundant content check: `top_row_text` FOLLOWS the offset (it is the
+        // ring accessor at the viewport), while `get_line_text(0)` is the live
+        // screen's own top row, read scroll-invariantly. They agree only while the
+        // eye is genuinely on the live screen; a re-anchor into history moves the
+        // first and not the second — and on this fixture it moves it onto a
+        // compressed row the ring cannot read at all, so it reads back blank.
+        assert_eq!(
+            top_row_text(&term),
+            term.get_line_text(0, None)
+                .expect("the live top row is readable")
+                .trim_end(),
+            "{from_rows}->{to_rows} rows: the eye must be on the LIVE top row"
         );
     }
 }

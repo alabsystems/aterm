@@ -2145,6 +2145,38 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
+/// `trail [<n>]` -> the FOCUSED window's last `n` cursor-trail ADMISSION
+/// decisions (default: the whole diagnostic ring, cap 32), one
+/// `admission seq= phase= reason= …` row each, newest last
+/// ([`crate::App::trail_admissions`]).
+///
+/// The one-command face of the confirm-seam sensor: the rainbow-trail
+/// blackout was diagnosed with `ATERM_TRACE_SPAWN` stderr logs; this verb
+/// reads the same decisions from the engine's resident ring, so "the trail
+/// went dark" is answered by `aterm-ctl trail` instead of a rebuild-and-hunt.
+/// Read-only, main-thread hop like `tone` (the ring lives in per-window App
+/// state); works headless. `OK <n>` + n rows, the `chrome` framing.
+pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let count = match rest.trim() {
+        "" => None,
+        n => match n.parse::<usize>() {
+            Ok(n) => Some(n),
+            Err(_) => return format!("ERR usage: trail [<n>] (got {n:?})\n"),
+        },
+    };
+    let lines = match call_main(proxy, |tx| Wake::TrailAdmissions { count, reply: tx }) {
+        Ok(Ok(lines)) => lines,
+        Ok(Err(e)) => return format!("ERR {e}\n"),
+        Err(e) => return format!("ERR {e}\n"),
+    };
+    let mut out = format!("OK {}\n", lines.len());
+    for line in lines {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out
+}
+
 /// `status` -> the target session's SUBJECT + classified STATUS record, one
 /// versioned key=value line (RFC: Tab Subject & Status §8).
 ///

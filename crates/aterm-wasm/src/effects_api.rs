@@ -104,6 +104,25 @@ impl AtermTerminal {
         self.effects.note_keystroke();
     }
 
+    /// [`Self::note_keystroke`] upgraded with the typed CHARACTER: the exact
+    /// input-time content witness the movement-admission gate requires before
+    /// glow/trail styles may follow the cursor (movement without one is
+    /// program output and stays dark — the native app's provenance law). Call
+    /// from the SAME JS handler that dispatched this key's bytes to the
+    /// transport — after dispatch, BEFORE the echo is fed to [`Self::process`]
+    /// — and only between renders (the witness is checked against the last
+    /// rendered frame and fails closed on any staleness, so a mistimed call
+    /// costs cosmetics, never correctness). Returns whether movement
+    /// provenance armed; on decline the text-blind keystroke semantics
+    /// (cadence heat, rain freeze, candidate cancellation) still apply.
+    pub fn note_typed_char(&mut self, ch: char) -> bool {
+        // WF-1 frame gate: same rule as `note_keystroke` — the arm can change
+        // what the NEXT render admits while `is_active()` still reads false.
+        self.note_host_visual_change();
+        self.effects
+            .note_committed_char(&mut self.term, &self.frame_scratch, ch)
+    }
+
     /// Configure the LUMEN cursor aurora (additive light in the cursor's
     /// wake). Mirrors the native knobs + clamps: `style` ∈
     /// `lumen|phaser|rainbow kitty|sparkle|fire|laser|beam|water|comet` (unknown →

@@ -37,6 +37,7 @@ pub use aterm_core::render::DefaultBgSpan;
 // (which builds terminals + calls `Terminal::cell_frame` to feed the renderer).
 use aterm_core::terminal::{CursorStyle, RenderCell, UnderlineStyle};
 
+mod admission_cache;
 pub mod chrome_metrics;
 mod colr;
 pub mod deco;
@@ -56,6 +57,8 @@ pub mod ligature_shaping;
 pub mod procedural;
 pub mod scroll_translate;
 pub mod spill;
+#[cfg(all(unix, not(target_os = "macos")))]
+mod subpixel;
 pub mod variation;
 pub mod vibrancy;
 
@@ -656,6 +659,25 @@ impl GlyphImage {
     }
 }
 
+/// LINUX SUBPIXEL stage 1: one per-channel-coverage glyph raster, the overlay
+/// value the CPU blit prefers over [`GlyphImage::Mono`] when the frame gate is
+/// open. Same placement convention as `Mono` (`xmin`/`ymin` baseline-relative,
+/// anchor `(cell_x + xmin, baseline - height - ymin)`) but **3 bytes per
+/// texel** in framebuffer channel order — see [`subpixel::subpixel_glyph_raster`].
+/// Deliberately NOT a [`GlyphImage`] variant: that enum is the shared CPU/GPU
+/// contract (atlas upload, spill, ligature slicing, damage), and stage 1 keeps
+/// every one of those consumers byte-identical.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Debug)]
+struct SubpxImage {
+    width: usize,
+    height: usize,
+    xmin: i32,
+    ymin: i32,
+    /// `width * height * 3` bytes: per-channel coverage, R/G/B framebuffer order.
+    bytes: Vec<u8>,
+}
+
 /// One glyph in a bounded renderer-native semantic text run. `column` is the
 /// terminal cell origin (not a proportional advance); `key` is the exact
 /// primary/styled/fallback/ligature cache identity consumed by both renderers.
@@ -1206,6 +1228,34 @@ pub struct Renderer {
     /// CLEARED on `set_px` (instances are size-specific), like `ct_cache`.
     #[cfg(all(unix, not(target_os = "macos")))]
     hint_bank: hinted::HintBank,
+    /// LINUX SUBPIXEL stage 1 ([`subpixel`], RFC-linux-subpixel-text §4.1):
+    /// panel geometry for per-channel coverage in the CPU compositor
+    /// (`ATERM_FONT_SUBPIXEL` / config `font_subpixel`; DEFAULT `Off`; forced
+    /// `Off` under `ATERM_RASTERIZER=fontdue` so the byte-stable exports never
+    /// fringe). The GPU backend ignores it entirely until stage 2.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    subpix_mode: subpixel::SubpixelMode,
+    /// LCD-target `HintingInstance` memo for the subpixel raster — its OWN
+    /// bank because [`hinted::HintBank`]'s key does not carry the smooth
+    /// target, so one bank must never hold grayscale AND LCD instances for
+    /// the same face+px. Cleared wherever `hint_bank` is.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    subpx_bank: hinted::HintBank,
+    /// Per-channel coverage overlay cache, keyed like [`Self::glyphs`] —
+    /// `None` memoizes "not subpixel-eligible" so ineligible keys don't
+    /// re-attempt every blit. A SEPARATE store on purpose: the shared
+    /// [`GlyphImage`] cache keeps its exact grayscale bytes (the GPU atlas,
+    /// spill accounting, damage model and every golden are untouched), and
+    /// the CPU blit consults this overlay only under the frame gate.
+    /// Cleared wherever `glyphs` is.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    subpx_glyphs: FxHashMap<GlyphKey, Option<SubpxImage>>,
+    /// Frame-scoped gate resolved at the top of `render_core`: subpixel mode
+    /// on AND an opaque frame (`bg_opacity >= 1` and no wallpaper — over an
+    /// unknown backdrop the per-channel fringes stop cancelling, the exact
+    /// reason macOS removed subpixel OS-wide). `false` outside a frame.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    subpx_frame: bool,
     /// The active glyph rasterizer (macOS: CoreText by default, fontdue when forced).
     #[cfg(target_os = "macos")]
     rasterizer: RasterKind,
@@ -1269,6 +1319,22 @@ pub struct Renderer {
     /// and never shared across threads.
     bg_runs_total: std::cell::Cell<u32>,
     bg_runs_at_base: std::cell::Cell<u32>,
+    /// DIAGNOSTIC ONLY (bench/test COUNT GATE — never read by rendering): how
+    /// many background `fill_rect`s the MATERIALIZED prefix of
+    /// [`Renderer::render_row_bg`] actually EMITTED during the last
+    /// [`Renderer::render_core`] — the sparse tail, which `bg_runs_*` does not
+    /// count either, is excluded so the three counters describe one accounting.
+    ///
+    /// WHY THIS ONE EXISTS ALONGSIDE `bg_runs_*`. Those two are computed
+    /// identically on both sides of FRM-1's elision, which is what makes them a
+    /// REACH guard — and exactly what stops them noticing if the elision goes
+    /// away. This counter moves when the elision does: with no wallpaper live,
+    /// `emitted + at_base == total` says every base-coloured run was skipped,
+    /// and a giveback that filled the band twice again would read
+    /// `emitted == total`. The byte-identity gate cannot see that difference —
+    /// painting the same colour twice is byte-identical — so without this,
+    /// FRM-1 has no defender at all.
+    bg_fills_emitted: std::cell::Cell<u32>,
     /// DIAGNOSTIC ONLY (bench/test REACH GUARD — never read by rendering): how
     /// many image-covered cells the last [`Self::render_core`] handed to
     /// [`Self::blit_image_cell`]. It counts CALLS, which no change to what those
@@ -1495,9 +1561,10 @@ pub struct Renderer {
     underline_adjust_thick: i32,
     /// Descender ink-skip (config `underline_skip_descenders`, W7, DEFAULT ON):
     /// zero underline coverage within a 1px dilation of the cell's own
-    /// DESCENDER ink (ink at or below the baseline row), so g/j/p/q/y
+    /// DESCENDER ink (ink strictly below the baseline row), so g/j/p/q/y
     /// descenders are never struck through by the underline. Letter bottoms
-    /// resting ON the baseline are not descenders and never chop the line.
+    /// resting ON the baseline — including the 1px overshoot of round
+    /// bottoms like a/e/u — are not descenders and never chop the line.
     /// Cells with no descender ink render byte-identically either way (the
     /// coverage-monotone invariant, `tests/deco_lines.rs`).
     underline_skip_descenders: bool,
@@ -2766,7 +2833,17 @@ impl FallbackFace {
         // lazy-parse change and 0/2 after. Discovery-path faces are process-wide by
         // nature, so they belong in a process-wide store.
         let bytes = intern_discovered_font_bytes(bytes);
-        if !fontdue_admissible(&bytes, 0) {
+        // The admission verdict is a pure function of the file bytes, so a
+        // path-backed face consults the persistent cache (keyed to the file's
+        // mtime+size identity) before paying the cmap walk — the walk is the
+        // dominant remaining cold-start term (~203 ms on Hiragino alone, the
+        // table below). A pathless face (injection) always walks: there is no
+        // identity to key on, and injected bytes are one-offs by nature.
+        let admissible = match path.as_deref() {
+            Some(p) => admission_cache::admissible_cached(p, 0, || fontdue_admissible(&bytes, 0)),
+            None => fontdue_admissible(&bytes, 0),
+        };
+        if !admissible {
             return Err("face is not admissible as a fontdue font".to_string());
         }
         let norm = face_norm_facts(&bytes, 0);
@@ -3504,6 +3581,10 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
             break;
         }
     }
+    // The verdicts this scan just derived persist NOW, not at the next batch
+    // boundary: the chain build is the scan's natural completion, and a
+    // tail smaller than the flush batch would otherwise re-derive next launch.
+    admission_cache::flush_pending();
     chain
 }
 
@@ -5578,6 +5659,14 @@ impl Renderer {
             hint_mode: hinted::HintMode::from_env(),
             #[cfg(all(unix, not(target_os = "macos")))]
             hint_bank: hinted::HintBank::default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            subpix_mode: subpixel::SubpixelMode::from_env(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            subpx_bank: hinted::HintBank::default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            subpx_glyphs: FxHashMap::default(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            subpx_frame: false,
             #[cfg(target_os = "macos")]
             rasterizer: select_rasterizer(),
             #[cfg(target_os = "macos")]
@@ -5592,6 +5681,7 @@ impl Renderer {
             glyph_plan_row: None,
             bg_runs_total: std::cell::Cell::new(0),
             bg_runs_at_base: std::cell::Cell::new(0),
+            bg_fills_emitted: std::cell::Cell::new(0),
             image_cells: std::cell::Cell::new(0),
             shape_run_scratch: String::new(),
             shape_chars_scratch: Vec::new(),
@@ -6985,6 +7075,12 @@ impl Renderer {
         {
             rebuilt.hint_mode = self.hint_mode;
         }
+        // Subpixel stage 1 rides the same handoff: the rebuild keeps the
+        // live-set mode rather than re-reading the env.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            rebuilt.subpix_mode = self.subpix_mode;
+        }
         Ok(rebuilt)
     }
 
@@ -7096,6 +7192,7 @@ impl Renderer {
         #[cfg(all(unix, not(target_os = "macos")))]
         {
             fork.hint_mode = self.hint_mode;
+            fork.subpix_mode = self.subpix_mode;
         }
         Some(fork)
     }
@@ -7125,6 +7222,11 @@ impl Renderer {
             // the macOS arm below.
             self.glyphs.clear();
             self.keys.clear();
+            // Subpixel off with it: forced-fontdue means "the byte-stable
+            // portable bytes", which per-channel fringes are not.
+            self.subpix_mode = subpixel::SubpixelMode::Off;
+            self.subpx_bank.clear();
+            self.subpx_glyphs.clear();
         }
         #[cfg(target_os = "macos")]
         {
@@ -7284,6 +7386,139 @@ impl Renderer {
         _ch: char,
     ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         None
+    }
+
+    /// LINUX SUBPIXEL stage 1: the memoized per-channel raster for `key`, or
+    /// `None` when the key is outside the stage-1 set (the blit then takes
+    /// the unchanged grayscale path). The `None` is memoized too, so an
+    /// ineligible key costs one map hit per blit, not a re-derivation.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn subpx_image(&mut self, key: GlyphKey) -> Option<&SubpxImage> {
+        if !self.subpx_glyphs.contains_key(&key) {
+            let img = self.subpx_rasterize(key);
+            self.subpx_glyphs.insert(key, img);
+        }
+        self.subpx_glyphs.get(&key).and_then(|o| o.as_ref())
+    }
+
+    /// LINUX SUBPIXEL stage 1 eligibility + raster. The stage-1 set is
+    /// PRIMARY-FAMILY TEXT exactly: a `Mono`-class primary key with no span
+    /// fit (`cell_span == 0` — spanned/VS15 keys take the harmonize clamp the
+    /// subpixel raster does not implement), no variable instance (FONT-2 owns
+    /// those cells), no display-fit synthesis, and — for a styled cell — a
+    /// REAL styled sibling face serving every style bit (synthetic
+    /// embolden/slant operate on 1-byte/texel masks and stay grayscale).
+    /// Fallback faces, procedural fills, emoji, and ligature glyphs all
+    /// decline here. Every `None` is a safe grayscale fallback, the exact
+    /// contract of the [`hinted`] seam this extends.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    fn subpx_rasterize(&mut self, key: GlyphKey) -> Option<SubpxImage> {
+        if !matches!(key.source, FaceId::Primary | FaceId::BoldPrimary)
+            || key.cell_span != 0
+            || self.var_coords.is_some()
+            || self.display_fit.is_some()
+        {
+            return None;
+        }
+        let (bytes, index, gid): (std::sync::Arc<[u8]>, u32, u16) = match key.glyph_class {
+            // The by-ID path — what plain primary text actually takes (keys
+            // are built by gid so a Mac-Roman cmap can't mis-map). The face
+            // is re-derived by the SAME pure policy as the MonoGid rasterize
+            // arm; only picks with NO synthetic residue are eligible.
+            GlyphClass::MonoGid => {
+                // A collapsed-ligature SLICE key re-tiles a wide raster
+                // (`rasterize_ligature_slice`); stage 1 leaves slices grayscale.
+                if key.ch_or_id >> LIG_SLICE_SHIFT != 0 {
+                    return None;
+                }
+                let gid = key.ch_or_id as u16;
+                if key.source == FaceId::BoldPrimary {
+                    // The injected real bold FILE; `key.style` is the residual
+                    // to synthesize, and synthesis stays grayscale.
+                    if key.style.0 != StyleBits::REGULAR.0 {
+                        return None;
+                    }
+                    (self.bold_font_bytes.clone()?, 0, gid)
+                } else if key.style.0 == StyleBits::REGULAR.0 {
+                    (self.rb_primary_bytes.clone()?, 0, gid)
+                } else {
+                    // A styled run glyph: eligible only from a REAL styled
+                    // face serving every bit. A W9 bold INSTANCE
+                    // (`vf_bold_coords`) or any synthetic residue declines.
+                    if key.style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() {
+                        return None;
+                    }
+                    match self.run_face_pick(key.style) {
+                        FacePick::Styled { slot, synthetic }
+                            if synthetic.0 == StyleBits::REGULAR.0 =>
+                        {
+                            let sf = self.styled_faces[slot].as_ref()?;
+                            (sf.bytes.clone(), sf.index, gid)
+                        }
+                        FacePick::InjectedBold { synthetic }
+                            if synthetic.0 == StyleBits::REGULAR.0 =>
+                        {
+                            (self.bold_font_bytes.clone()?, 0, gid)
+                        }
+                        _ => return None,
+                    }
+                }
+            }
+            // The by-CHAR path (the Mono arm's primary/styled-sibling lanes),
+            // gid resolved on the serving face's own Unicode cmap — the
+            // `hinted_primary_char` discipline.
+            GlyphClass::Mono => {
+                if key.source != FaceId::Primary {
+                    return None;
+                }
+                let ch = key.chr()?;
+                let styled =
+                    key.style.contains(StyleBits::BOLD) || key.style.contains(StyleBits::ITALIC);
+                if styled {
+                    self.ensure_styled_faces();
+                    let (slot, remaining) = self.styled_face_slot(ch, key.style)?;
+                    if remaining.0 != StyleBits::REGULAR.0 {
+                        return None;
+                    }
+                    let gid = self.styled_faces[slot]
+                        .as_mut()
+                        .and_then(|sf| sf.unicode_gid(ch))?;
+                    let sf = self.styled_faces[slot].as_ref()?;
+                    (sf.bytes.clone(), sf.index, gid)
+                } else {
+                    let gid = self.primary_unicode_gid(ch)?;
+                    (self.rb_primary_bytes.clone()?, 0, gid)
+                }
+            }
+            GlyphClass::Rgba | GlyphClass::RgbaGid => return None,
+        };
+        // LCD-target hinting unless the operator disabled hinting outright;
+        // a face the instance builder declines rasterizes unhinted (still
+        // subpixel), mirroring FreeType.
+        let hint = if self.hint_mode == hinted::HintMode::Off {
+            None
+        } else {
+            self.subpx_bank.instance_with(
+                bytes.as_ptr() as usize,
+                &bytes,
+                index,
+                self.px,
+                Some(subpixel::lcd_hint_options()),
+            )
+        };
+        let bgr = self.subpix_mode == subpixel::SubpixelMode::Bgr;
+        let (width, height, xmin, ymin, mut b3) =
+            subpixel::subpixel_glyph_raster(&bytes, index, gid, self.px, hint.as_deref(), bgr)?;
+        // The aesthetic stem LUT applies per channel byte — identity by
+        // default on Linux, but the operator knob must not silently die here.
+        stem_darken(&mut b3, &self.stem_lut);
+        Some(SubpxImage {
+            width,
+            height,
+            xmin,
+            ymin,
+            bytes: b3,
+        })
     }
 
     /// W8: rasterize a FALLBACK-face Mono glyph (`Fallback` / `SymbolFallback`
@@ -8153,9 +8388,9 @@ impl Renderer {
 
     /// Enable/disable descender ink-skip (config `underline_skip_descenders`,
     /// W7, DEFAULT ON): underline coverage is zeroed within a 1px dilation of
-    /// the cell's own DESCENDER ink (ink at or below the baseline — letter
-    /// bottoms resting on the baseline never chop the line). Draw-time only
-    /// (no cache invalidation).
+    /// the cell's own DESCENDER ink (ink strictly below the baseline — letter
+    /// bottoms resting on the baseline, round-bottom overshoot included,
+    /// never chop the line). Draw-time only (no cache invalidation).
     pub fn set_underline_skip_descenders(&mut self, on: bool) {
         self.underline_skip_descenders = on;
     }
@@ -8236,6 +8471,12 @@ impl Renderer {
         // Hinting instances likewise (W13): size-specific, rebuild at `px`.
         #[cfg(all(unix, not(target_os = "macos")))]
         self.hint_bank.clear();
+        // Subpixel overlay + its LCD instances: size-specific like the above.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.subpx_bank.clear();
+            self.subpx_glyphs.clear();
+        }
     }
 
     /// LIGHT per-window size switch (W12 mixed-DPI): re-target the active
@@ -8593,44 +8834,33 @@ impl Renderer {
         }
     }
 
-    /// Resolve the selection background for ONE terminal snapshot: the frame's
-    /// LIVE colour (OSC 17 / OSC 21 `selection=`, OSC 117 reset) when the engine
-    /// resolved one, else the configured policy.
-    ///
-    /// `COLOR_UNSET` — every producer that predates live selection colours, and
-    /// every frame where the terminal never set one — delegates WHOLE to
-    /// [`Self::effective_selection_bg`], so the focused/unfocused theming path is
-    /// byte-identical to before. With a live colour the same unfocused rule
-    /// applies to IT: an explicit inactive override still wins, and the derived
-    /// dim is derived from the live pair (selection over the frame's live bg)
-    /// rather than the static theme.
-    #[inline]
-    fn frame_selection_bg(&self, input: &RenderInput) -> u32 {
-        if input.selection_bg == aterm_core::render::COLOR_UNSET {
-            return self.effective_selection_bg();
-        }
-        let active = input.selection_bg & 0x00ff_ffff;
-        if self.selection_inactive {
-            self.selection_inactive_bg
-                .unwrap_or_else(|| derive_inactive_selection_bg(active, self.frame_bg(input)))
-        } else {
-            active
-        }
-    }
-
-    /// Resolve selected-text ink for one snapshot. OSC 19 (and OSC 21
-    /// `selection_foreground=`) is TERMINAL-owned state and therefore takes
-    /// precedence over the renderer's host setting: [`COLOR_DYNAMIC`] asks for the
-    /// automatic WCAG contrast floor (`None`), a concrete colour forces that ink,
-    /// and `COLOR_UNSET` preserves the existing explicit/automatic host policy.
-    ///
-    /// [`COLOR_DYNAMIC`]: aterm_core::render::COLOR_DYNAMIC
-    #[inline]
-    fn frame_selection_fg(&self, input: &RenderInput) -> Option<u32> {
-        match input.selection_fg {
-            aterm_core::render::COLOR_DYNAMIC => None,
-            aterm_core::render::COLOR_UNSET => self.selection_fg,
-            color => Some(color & 0x00ff_ffff),
+    /// This frame's selection colour policy + entries, hoisted ONCE (see
+    /// [`SelectionPalette`]). The GPU backend calls this through its CPU face,
+    /// so both backends resolve every band from one function.
+    #[must_use]
+    pub fn selection_palette<'a>(&self, input: &'a RenderInput) -> SelectionPalette<'a> {
+        let policy = SelectionPolicy {
+            // The ACTIVE no-live-colour band is the theme's, and the INACTIVE
+            // one is what `effective_selection_bg` returns while unfocused —
+            // pre-resolved here so the per-cell lookup on a split frame is a
+            // field read, not a colour derivation per selected cell.
+            unset_active: self.theme.selection,
+            unset_inactive: self.selection_inactive_bg.unwrap_or_else(|| {
+                derive_inactive_selection_bg(self.theme.selection, self.theme.bg)
+            }),
+            inactive: self.selection_inactive,
+            inactive_bg: self.selection_inactive_bg,
+            host_fg: self.selection_fg,
+            frame_bg: self.frame_bg(input),
+        };
+        // The scalar path's colours, resolved once: `selections` empty means the
+        // four scalar fields ARE the frame's whole selection authority.
+        let scalar =
+            resolve_selection_colors(&policy, input.selection_bg, input.selection_fg, false);
+        SelectionPalette {
+            policy,
+            scalar,
+            entries: &input.selections,
         }
     }
 
@@ -9291,6 +9521,9 @@ impl Renderer {
             self.stem_gamma = gamma;
             self.stem_lut = build_stem_lut(gamma);
             self.glyphs.clear();
+            // The LUT bakes into the subpixel overlay's channel bytes too.
+            #[cfg(all(unix, not(target_os = "macos")))]
+            self.subpx_glyphs.clear();
         }
     }
 
@@ -9333,6 +9566,10 @@ impl Renderer {
             self.glyphs.clear();
             self.keys.clear();
             self.styled_keys.clear();
+            // The subpixel raster follows the Off↔hinted boundary of this
+            // mode (LCD-hinted vs unhinted outlines), so its overlay is
+            // mode-specific too.
+            self.subpx_glyphs.clear();
             true
         }
         #[cfg(not(all(unix, not(target_os = "macos"))))]
@@ -9360,6 +9597,62 @@ impl Renderer {
         #[cfg(not(all(unix, not(target_os = "macos"))))]
         {
             "full"
+        }
+    }
+
+    /// Set the Linux subpixel-RGB text mode (config `font_subpixel`, aliased
+    /// by the `ATERM_FONT_SUBPIXEL` env var — the host resolves env > config
+    /// and passes the winner here, the `font_hinting` discipline). Spellings:
+    /// `"off"` (the DEFAULT — and what any unrecognized value resolves to) /
+    /// `"rgb"|"on"|"1"|"true"` / `"bgr"`. STAGE 1 of
+    /// `docs/RFC-linux-subpixel-text.md`: per-channel coverage in the CPU
+    /// compositor only — the GPU backend keeps grayscale (its shared atlas
+    /// bytes are untouched, so no atlas invalidation rides this), and the CPU
+    /// path itself falls back to grayscale per frame under translucency /
+    /// wallpaper and per glyph outside the primary-family text set. Under
+    /// `ATERM_RASTERIZER=fontdue` the mode stays forced off, so the
+    /// golden/parity exports cannot fringe. A change drops only the subpixel
+    /// overlay cache; returns whether the mode changed (the host invalidates
+    /// its per-window present caches on `true` — appearance changed, content
+    /// did not). Inert `false` on macOS (subpixel was removed OS-wide) and
+    /// Windows/wasm (no LCD raster seam).
+    pub fn set_font_subpixel(&mut self, mode: &str) -> bool {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let mode = if hinted::HintMode::fontdue_forced() {
+                subpixel::SubpixelMode::Off
+            } else {
+                subpixel::SubpixelMode::parse(mode)
+            };
+            if mode == self.subpix_mode {
+                return false;
+            }
+            self.subpix_mode = mode;
+            // Rgb↔Bgr re-orders the cached channel bytes; Off keeps the
+            // overlay dead until re-enabled. Either way the overlay is stale.
+            self.subpx_glyphs.clear();
+            true
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            let _ = mode;
+            false
+        }
+    }
+
+    /// The active Linux subpixel mode's canonical spelling (`"off"` / `"rgb"`
+    /// / `"bgr"`) — the [`Self::set_font_subpixel`] round-trip, for change
+    /// detection and diagnostics. Always `"off"` on the targets without the
+    /// subpixel seam.
+    #[must_use]
+    pub fn font_subpixel(&self) -> &'static str {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.subpix_mode.as_str()
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            "off"
         }
     }
 
@@ -10433,6 +10726,11 @@ impl Renderer {
             self.keys.clear();
             self.emoji_keys.clear();
             self.styled_keys.clear();
+            // The subpixel overlay is keyed identically to `glyphs` and grows
+            // in lockstep with it (at most one entry per glyph key), so it
+            // rides the same cap.
+            #[cfg(all(unix, not(target_os = "macos")))]
+            self.subpx_glyphs.clear();
             // Deco (sparkle-word) coverage masks share the glyph-cap discipline so
             // the sprite cache is bounded like every other cache.
             self.deco_masks.borrow_mut().clear();
@@ -10568,6 +10866,7 @@ impl Renderer {
         // render paths below run underneath this entry.
         self.bg_runs_total.set(0);
         self.bg_runs_at_base.set(0);
+        self.bg_fills_emitted.set(0);
         self.image_cells.set(0);
         let (rows, cols) = (input.rows, input.cols);
         let (w, h) = self.frame_size(rows, cols);
@@ -10576,6 +10875,21 @@ impl Renderer {
         // below read one coherent generation. Identity-keyed: a stable frame
         // costs one pointer compare.
         ensure_wallpaper_px(wc, input, w, h);
+        // SUBPIXEL stage-1 frame gate (RFC-linux-subpixel-text §2.5): the
+        // per-channel blit runs only over an OPAQUE frame — full
+        // background_opacity and no wallpaper. Text composites over an
+        // unknown/blended backdrop keep the grayscale path (fringes computed
+        // against the wrong backdrop read as colour casts, the exact failure
+        // that made macOS remove subpixel OS-wide). Both inputs already force
+        // a repaint when they change (opacity via the host's present-cache
+        // invalidation, wallpaper via the input diff), so the gate never
+        // flips inside a cached frame.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            self.subpx_frame = self.subpix_mode != subpixel::SubpixelMode::Off
+                && self.bg_opacity >= 1.0
+                && input.wallpaper.is_none();
+        }
 
         // Decide whether the cached frame can be reused, and if so which rows are
         // dirty, via the ONE shared `compute_dirty_rows` — the SAME function the
@@ -11534,11 +11848,12 @@ struct RowCtx<'a> {
     /// ordinary lines, which is why the per-column seam costs the hot glyph loop
     /// nothing but a hoisted, perfectly-predicted branch.
     uniform: bool,
-    sel_bg: u32,
-    /// Selected-text ink for THIS frame ([`Renderer::frame_selection_fg`]):
-    /// the terminal's live OSC 19 value when it set one, else the host policy.
-    /// `None` is the automatic WCAG contrast floor.
-    sel_fg: Option<u32>,
+    /// THIS frame's selection colours, indexed by the answer
+    /// [`RenderInput::selection_hit`] gives for a cell — one band colour and one
+    /// ink per SELECTION, not per frame, because a split carries a live OSC
+    /// 17/19 state per pane. Borrows `input`; resolving a single-terminal
+    /// frame's index is a field read (see [`SelectionPalette`]).
+    sel: SelectionPalette<'a>,
     bg_t: u32,
     /// The frame-wide live default background. A row with NO pane provenance
     /// (`default_bg_spans[row]` empty — every single-pane frame) resolves every
@@ -11701,8 +12016,11 @@ impl Renderer {
         // Selected cells take the (active or inactive-while-unfocused) selection
         // bg — the terminal's LIVE OSC 17/21 colour when it set one, else the
         // configured theme policy. Selected-text ink follows the same rule.
-        let sel_bg = self.frame_selection_bg(input);
-        let sel_fg = self.frame_selection_fg(input);
+        // PER SELECTION, not per frame: a composed split carries one live OSC
+        // 17/19 state per pane, and its unfocused panes' bands take the inactive
+        // colour, so the colour is resolved from the index the per-cell
+        // predicate returns rather than hoisted to one scalar.
+        let sel = self.selection_palette(input);
         // Background-opacity: ONLY cells whose bg resolved to the DEFAULT bg
         // carry the transmittance byte (SGR-colored bg cells and the selection
         // band stay opaque so text keeps contrast — Ghostty/iTerm semantics).
@@ -11725,8 +12043,7 @@ impl Renderer {
             scale,
             anchor_y,
             uniform,
-            sel_bg,
-            sel_fg,
+            sel,
             bg_t,
             frame_bg,
             uniform_default_bg,
@@ -11775,6 +12092,25 @@ impl Renderer {
         self.image_cells.get()
     }
 
+    /// Background `fill_rect`s the LAST render EMITTED from the materialized
+    /// prefix of [`Self::render_row_bg`] — the outside view of the
+    /// `bg_fills_emitted` diagnostic, and the count FRM-1 moved.
+    ///
+    /// Read it against [`Self::last_bg_runs`]: with no wallpaper live,
+    /// `emitted + at_base == total`. See the field's docs for why the pair alone
+    /// cannot say this.
+    #[must_use]
+    pub fn last_bg_fills(&self) -> u32 {
+        self.bg_fills_emitted.get()
+    }
+
+    /// Record one EMITTED background fill for [`Self::last_bg_fills`].
+    #[inline]
+    fn note_bg_fill(&self) {
+        self.bg_fills_emitted
+            .set(self.bg_fills_emitted.get().saturating_add(1));
+    }
+
     /// Record one resolved background run for [`Self::last_bg_runs`].
     #[inline]
     fn note_bg_run(&self, color: u32, band_base: Option<u32>) {
@@ -11804,7 +12140,7 @@ impl Renderer {
             y0,
             cw,
             uniform,
-            sel_bg,
+            sel,
             bg_t,
             ..
         } = *ctx;
@@ -11839,8 +12175,8 @@ impl Renderer {
         let resolve = |c: usize, cell: &RenderCell| -> Option<u32> {
             // A lead cell is wide iff the NEXT cell is its continuation.
             let is_wide_lead = cells.get(c + 1).is_some_and(|n| n.wide);
-            if input.selection_contains_cell(row, c, is_wide_lead, cell.wide) {
-                Some(sel_bg)
+            if let Some(hit) = input.selection_hit(row, c, is_wide_lead, cell.wide) {
+                Some(sel.at(hit).bg)
             } else {
                 let cell_bg = rgb_to_u32(cell.bg);
                 // "Default bg" is asked of the pane that owns this cell, not of
@@ -11898,6 +12234,7 @@ impl Renderer {
                     // frame-wide default background"), extended to the materialized
                     // PREFIX — which is where the area is.
                     if let Some(color) = run_bg.filter(|_| run_bg != band_base) {
+                        self.note_bg_fill();
                         let x = self.pad + run_start * cw;
                         self.fill_rect(
                             pixels,
@@ -11923,6 +12260,7 @@ impl Renderer {
             if n > 0
                 && let Some(color) = run_bg.filter(|_| run_bg != band_base)
             {
+                self.note_bg_fill();
                 let x = self.pad + run_start * cw;
                 self.fill_rect(
                     pixels,
@@ -11951,6 +12289,12 @@ impl Renderer {
                     // full path's clear covers the whole buffer), so a column that
                     // resolved to the band's own colour has nothing to write.
                     if band_base != Some(color) {
+                        // Counted on the DECISION, not inside the clip: a
+                        // composed row whose column falls outside its pane's run
+                        // box emits no rect, and counting there would make the
+                        // `emitted + at_base == total` identity depend on pane
+                        // geometry rather than on the elision.
+                        self.note_bg_fill();
                         let p = self.mixed_cell_place(input, row, c, y0);
                         if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
                             self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, color);
@@ -11980,8 +12324,8 @@ impl Renderer {
             return;
         }
         for c in materialized..cols {
-            let bg = if input.selection_contains_cell(row, c, false, false) {
-                sel_bg
+            let bg = if let Some(hit) = input.selection_hit(row, c, false, false) {
+                sel.at(hit).bg
             } else {
                 // An implicit tail cell IS its pane's default bg, so under a
                 // wallpaper it shows the backdrop — the base fill already laid
@@ -12049,7 +12393,7 @@ impl Renderer {
             y0,
             cw,
             uniform,
-            sel_bg,
+            sel,
             ..
         } = *ctx;
         // Default background clear < deepest image. Placement follows the same
@@ -12078,8 +12422,8 @@ impl Renderer {
             }
             let is_wide_lead = cells.get(c + 1).is_some_and(|next| next.wide);
             let cell_bg = rgb_to_u32(cell.bg);
-            let cover = if input.selection_contains_cell(r, c, is_wide_lead, cell.wide) {
-                sel_bg
+            let cover = if let Some(hit) = input.selection_hit(r, c, is_wide_lead, cell.wide) {
+                sel.at(hit).bg
             } else if cell_bg != self.cell_default_bg(input, ctx, c) {
                 cell_bg
             } else {
@@ -12106,16 +12450,19 @@ impl Renderer {
             if c < materialized
                 || c >= cols
                 || !kitty_image_is_below_non_default_bg(image.image.z_index)
-                || !input.selection_contains_cell(r, c, false, false)
             {
                 continue;
             }
+            let Some(hit) = input.selection_hit(r, c, false, false) else {
+                continue;
+            };
+            let cover = sel.at(hit).bg;
             if uniform {
-                self.fill_rect(pixels, w, h, pad_x + c * cw, y0, cw, self.cell_h, sel_bg);
+                self.fill_rect(pixels, w, h, pad_x + c * cw, y0, cw, self.cell_h, cover);
             } else {
                 let p = self.mixed_cell_place(input, r, c, y0);
                 if let Some((x, rw)) = clip_span_to_run(p.x, p.w, p.lo, p.hi) {
-                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, sel_bg);
+                    self.fill_rect(pixels, w, h, x, y0, rw, self.cell_h, cover);
                 }
             }
         }
@@ -12186,8 +12533,7 @@ impl Renderer {
             scale,
             anchor_y,
             uniform,
-            sel_bg,
-            sel_fg,
+            sel,
             ..
         } = *ctx;
         // Inline images for THIS row (iTerm2 OSC 1337 `File=` and Kitty
@@ -12314,12 +12660,17 @@ impl Renderer {
                 let key = shade_phase_key(key, x, y0);
                 // Selected cells floor their glyph fg against the selection bg so
                 // colour-on-selection stays legible (GPU mirrors this identically).
-                let selected = input.selection_contains_cell(
-                    r,
-                    c,
-                    cells.get(c + 1).is_some_and(|n| n.wide),
-                    cell.wide,
-                );
+                let hit =
+                    input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide);
+                let selected = hit.is_some();
+                // The band this cell's floors are computed against is the one
+                // its OWN pane paints (`selection_hit`'s index), not a
+                // frame-wide scalar — otherwise a sibling pane's OSC 17 would
+                // set the contrast floor for this pane's selected text.
+                let SelectionColors {
+                    bg: sel_bg,
+                    fg: sel_fg,
+                } = sel.at_hit(hit);
                 // The one shared ink policy (selectionForeground / selection
                 // floor / per-cell minimum contrast) — see `effective_glyph_fg`.
                 // GPU mirrors this via the same free function (parity). The fg
@@ -12490,7 +12841,12 @@ impl Renderer {
             // selected cells get the selection floor against the painted band,
             // unselected ones the per-cell minimum-contrast floor (off by
             // default → byte-identical). GPU mirrors via the same functions.
-            let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
+            let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+            let selected = hit.is_some();
+            let SelectionColors {
+                bg: sel_bg,
+                fg: sel_fg,
+            } = sel.at_hit(hit);
             let ucolor = effective_deco_color(
                 sel_fg,
                 self.min_contrast,
@@ -12609,7 +12965,12 @@ impl Renderer {
                         .at(c as u16)
                         .unwrap_or_else(|| rgb_to_u32(cell.fg)),
                 };
-                let selected = input.selection_contains_cell(r, c, is_wide_lead, cell.wide);
+                let hit = input.selection_hit(r, c, is_wide_lead, cell.wide);
+                let selected = hit.is_some();
+                let SelectionColors {
+                    bg: sel_bg,
+                    fg: sel_fg,
+                } = sel.at_hit(hit);
                 let ucolor = effective_deco_color(
                     sel_fg,
                     self.min_contrast,
@@ -12714,9 +13075,10 @@ impl Renderer {
 
     /// Descender ink-skip (W7): compute the kept x-spans (ABSOLUTE px) of cell
     /// `(r, c)`'s underline after zeroing coverage within a 1px dilation of
-    /// the cell's own DESCENDER ink — ink at or below the baseline row; letter
-    /// bottoms sitting ON the baseline never count (see the probe-bounds
-    /// comment in the body). Returns `false` — and leaves `out`
+    /// the cell's own DESCENDER ink — ink strictly below the baseline row;
+    /// letter bottoms sitting ON the baseline never count, round-bottom
+    /// overshoot included (see the probe-bounds comment in the body).
+    /// Returns `false` — and leaves `out`
     /// unspecified — when no skipping applies (knob off, DEC-scaled row,
     /// image-covered / blank cell, or NO ink intersects the dilated band): the
     /// caller then draws the full span, taking the exact code path of the
@@ -12833,21 +13195,28 @@ impl Renderer {
         };
         // The blit anchors the bitmap at cell row `baseline - height - ymin`
         // (see `Renderer::blit`); probe the band dilated by 1px vertically —
-        // but never above the BASELINE row. Ink at rows < baseline is a letter
-        // BOTTOM sitting on the baseline ('a', 'n', the strip's title text),
-        // not a descender, and at small sizes the underline band starts within
-        // 1px of the baseline, so the unclamped dilation used to classify
-        // EVERY letter as a descender and chop the underline into dashes
-        // (measured at the live 12px: the tab strip's accent underline
-        // survived only in the inter-word gaps). Descender ink — the feature's
-        // whole subject — occupies rows >= baseline (`ymin < 0` glyphs), which
-        // the clamp keeps probing, 1px dilation included, whenever the band
-        // itself sits at or below the baseline (the resolved metrics always
-        // put it there; an operator-adjusted band pushed above the baseline
-        // deliberately overlaps x-height ink everywhere, and carving around
-        // ALL of it would erase the line, so no skip is the honest draw).
+        // but never above the row STRICTLY BELOW the baseline. Ink at rows
+        // <= baseline is a letter sitting ON the baseline: flat bottoms
+        // ('n', the strip's title text) end at `baseline - 1`, and round
+        // bottoms ('a', 'e', 'u') OVERSHOOT — the optical-size compensation
+        // every text face draws — which at 12px rasterizes exactly one AA row
+        // onto the baseline row itself. Neither is a descender. At small
+        // sizes the underline band starts within 1px of the baseline, so the
+        // unclamped dilation used to classify EVERY letter as a descender and
+        // chop the underline into dashes (measured at the live 12px: the tab
+        // strip's accent underline survived only in the inter-word gaps), and
+        // the first clamp — to the baseline row — still chopped it under
+        // every ROUND letter (measured: `nnaeuu` at 12px broke under a/e/u/u,
+        // held under n/n). Descender ink — the feature's whole subject —
+        // reaches rows > baseline (g/y/j/p/q descend ~a quarter em, ~3 rows
+        // at 12px), which the clamp keeps probing, 1px dilation included,
+        // whenever the band sits below the baseline (the resolved metrics
+        // always put it there; an operator-adjusted band pushed above the
+        // baseline deliberately overlaps x-height ink everywhere, and carving
+        // around ALL of it would erase the line, so no skip is the honest
+        // draw).
         let gy0 = baseline - gh as i32 - ymin;
-        let (ylo, yhi) = ((by0 as i32 - 1).max(baseline), by1 as i32 + 1);
+        let (ylo, yhi) = ((by0 as i32 - 1).max(baseline + 1), by1 as i32 + 1);
         ink.clear();
         ink.resize(dw, false);
         // The band filter as LOOP BOUNDS instead of a per-row `continue`:
@@ -13639,7 +14008,7 @@ impl Renderer {
             // selection's own highlight stays stable and copy-targeting is not
             // obscured (the steady paw, alpha-blended, is left alone). Same
             // per-cell predicate the selection highlight uses, so CPU and GPU agree.
-            if matches!(d.blend, DecoBlend::Add) && input.selection.has_selection() {
+            if matches!(d.blend, DecoBlend::Add) && input.any_selection() {
                 let row_cells = &input.cells[row];
                 let is_wide_lead = row_cells.get(col + 1).is_some_and(|n| n.wide);
                 let cell_wide = row_cells.get(col).is_some_and(|n| n.wide);
@@ -14201,6 +14570,40 @@ impl Renderer {
         // remap lives in `fs_glyph` and not `fs_glyph_color`. (Read before
         // `glyph_image` takes the long-lived `&mut self` borrow.)
         let corrected = self.text_blending == TextBlending::LinearCorrected;
+        // LINUX SUBPIXEL stage 1: under the opaque-frame gate, a 1×-scale
+        // eligible glyph blits PER-CHANNEL coverage instead of the grayscale
+        // mask. DECDWL/DECDHL rows stay grayscale (nearest-replicating a
+        // chroma-encoded fringe would paint it at the wrong subpixel), and
+        // every ineligible key falls through to the unchanged path below.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        if self.subpx_frame
+            && scale.xs.max(1) == 1
+            && scale.ys.max(1) == 1
+            && let Some(img) = self.subpx_image(key)
+        {
+                if img.width == 0 || img.height == 0 {
+                    return;
+                }
+                let gx0 = cell_x + img.xmin;
+                let gy0 = cell_y + (baseline - img.height as i32 - img.ymin);
+                blit_subpx_1x(
+                    px,
+                    stride,
+                    gx0,
+                    gy0,
+                    img.width,
+                    img.height,
+                    &img.bytes,
+                    color,
+                    bg,
+                    corrected,
+                    scale.clip_y0,
+                    scale.clip_y1,
+                    scale.clip_x0,
+                    scale.clip_x1,
+                );
+                return;
+        }
         // Lift the corrected-alpha memo bank OUT of `self` (one `Option<Box>`
         // move) so it can be handed to the texel loop ALONGSIDE the `&mut
         // self`-borrowed glyph image — the borrow checker will not split those
@@ -14497,6 +14900,146 @@ fn blit_mono_1x(
             } else {
                 blend(px[idx], color, cov)
             };
+        }
+    }
+}
+
+/// LINUX SUBPIXEL stage 1: everything the per-channel blend derives from
+/// `(fg, bg)` alone, hoisted per blit like [`TextBlendPre`] — but PER CHANNEL,
+/// because the W2 perceptual remap must run against each channel's own linear
+/// value (RFC-linux-subpixel-text §2.4: remapping the three coverages against
+/// the scalar luminance stops the chroma fringes cancelling and text picks up
+/// colour casts on non-neutral backgrounds). `fg_s`/`bg_s` are the exact
+/// byte/255 sRGB encodings (no float round-trip), `fg_l`/`bg_l` their LUT
+/// linearizations; the degenerate guard is per channel too, so e.g. red text
+/// on a red-matched background remaps only the channels that differ.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Copy)]
+struct SubpxChanPre {
+    fg_l: f32,
+    bg_l: f32,
+    fg_s: f32,
+    bg_s: f32,
+    degenerate: bool,
+}
+
+/// The three [`SubpxChanPre`]s (framebuffer order R, G, B) plus the mode bit.
+#[cfg(all(unix, not(target_os = "macos")))]
+struct SubpxBlendPre {
+    corrected: bool,
+    ch: [SubpxChanPre; 3],
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl SubpxBlendPre {
+    fn new(fg: u32, bg: u32, corrected: bool) -> Self {
+        let mk = |sh: u32| {
+            let fb = ((fg >> sh) & 0xff) as usize;
+            let bb = ((bg >> sh) & 0xff) as usize;
+            let fg_l = SRGB_TO_LINEAR_LUT[fb];
+            let bg_l = SRGB_TO_LINEAR_LUT[bb];
+            SubpxChanPre {
+                fg_l,
+                bg_l,
+                fg_s: fb as f32 / 255.0,
+                bg_s: bb as f32 / 255.0,
+                degenerate: (fg_l - bg_l).abs() < TEXT_BLEND_EPS,
+            }
+        };
+        Self {
+            corrected,
+            ch: [mk(16), mk(8), mk(0)],
+        }
+    }
+}
+
+/// LINUX SUBPIXEL stage 1: the per-channel TEXT blend — [`blend_text`]'s twin
+/// with an independent coverage byte per channel. Each channel is an
+/// alpha-over in linear light at its own (optionally W2-remapped) coverage;
+/// the endpoint law holds PER CHANNEL (`t == 0` returns the destination byte
+/// and `t == 255` the fg byte exactly, before any float math). The
+/// transmittance byte attenuates by the GREEN channel's effective coverage —
+/// the luminance-carrying channel, and the dual-source convention the GPU
+/// stage 2 will mirror; under the opaque-frame gate the destination
+/// transmittance is 0, so this is 0 in practice.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn blend_text_subpx(dst: u32, fg: u32, pre: &SubpxBlendPre, cov: [u8; 3]) -> u32 {
+    let ch = |i: usize, sh: u32| -> (u32, f32) {
+        let t = cov[i];
+        let d = (dst >> sh) & 0xff;
+        let f = (fg >> sh) & 0xff;
+        match t {
+            0 => (d, 0.0),
+            255 => (f, 1.0),
+            _ => {
+                let mut a = f32::from(t) / 255.0;
+                let p = &pre.ch[i];
+                if pre.corrected && !p.degenerate {
+                    // `correct_alpha` with the CHANNEL's linear value standing
+                    // in for the luminance — identical formula, same operand
+                    // order, same clamp.
+                    let blend_l = srgb_to_linear(p.fg_s * a + p.bg_s * (1.0 - a));
+                    a = ((blend_l - p.bg_l) / (p.fg_l - p.bg_l)).clamp(0.0, 1.0);
+                }
+                (blend_channel_linear(d, f, a), a)
+            }
+        }
+    };
+    let (r, _) = ch(0, 16);
+    let (g, ag) = ch(1, 8);
+    let (b, _) = ch(2, 0);
+    let tt = (((dst >> 24) & 0xff) as f32 * (1.0 - ag)).round() as u32;
+    (tt << 24) | (r << 16) | (g << 8) | b
+}
+
+/// LINUX SUBPIXEL stage 1: the per-channel-coverage blit leaf — the
+/// [`blit_mono_1x`] shape (same wide-signed per-row window via the proven
+/// [`clip_span`], same clip semantics) over 3-bytes-per-texel coverage.
+/// 1× only: the subpixel path never serves DECDWL/DECDHL scaling.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[allow(clippy::too_many_arguments)]
+fn blit_subpx_1x(
+    px: &mut [u32],
+    stride: usize,
+    gx0: i32,
+    gy0: i32,
+    width: usize,
+    height: usize,
+    bytes: &[u8],
+    color: u32,
+    bg: u32,
+    corrected: bool,
+    clip_y0: i32,
+    clip_y1: i32,
+    clip_x0: i32,
+    clip_x1: i32,
+) {
+    let pre = SubpxBlendPre::new(color, bg, corrected);
+    let px_len = px.len() as i64;
+    let gx = gx0 as i64;
+    let w = width as i64;
+    for j in 0..height {
+        let y = gy0 + j as i32;
+        if y < clip_y0 || y >= clip_y1 || y < 0 {
+            continue;
+        }
+        let yrow = y as i64 * stride as i64;
+        let x_lo = (clip_x0 as i64).max(0);
+        let x_cap = (stride as i64).min(px_len - yrow).min(clip_x1 as i64);
+        let Some((vx0, vx1)) = clip_span(gx, w, x_lo, x_cap) else {
+            continue;
+        };
+        let (i_lo, i_hi) = ((vx0 - gx) as usize, (vx1 - gx) as usize);
+        let row_off = j * width * 3;
+        let base = yrow + gx;
+        for i in i_lo..i_hi {
+            let o = row_off + i * 3;
+            let cov = [bytes[o], bytes[o + 1], bytes[o + 2]];
+            if cov == [0, 0, 0] {
+                continue;
+            }
+            let idx = (base + i as i64) as usize;
+            px[idx] = blend_text_subpx(px[idx], color, &pre, cov);
         }
     }
 }
@@ -15223,7 +15766,7 @@ impl ImageEqMemo {
 /// (row-level AND the per-column runs a composed row carries), or the row's
 /// inline-image placements. (Display-offset is frame-global and
 /// gates the whole damaged path; the selection is diffed separately per row via
-/// [`RenderInput::selection_row_span`], so neither is re-checked here.) Equality here is
+/// [`RenderInput::selection_row_key`], so neither is re-checked here.) Equality here is
 /// exact, so an unchanged row is provably safe to reuse from the cache.
 ///
 /// The image comparison matters now that BOTH renderers draw image PIXELS (the
@@ -15553,7 +16096,7 @@ fn scroll_blittable_content(input: &RenderInput) -> bool {
         && input.nova_add.is_empty()
         && input.rain_quads.is_empty()
         && input.rain_add.is_empty()
-        && !input.selection.has_selection()
+        && !input.any_selection()
 }
 
 /// E7 overshoot-apron reconciliation depth: how many RETAINED rows directly above
@@ -15901,29 +16444,39 @@ pub fn compute_dirty_rows(
     // OWN offset (audit E5: the anchor precheck admits offset-shifted frames;
     // an offset shift moves the live↔viewport mapping even when the selection
     // bytes are equal, so it re-runs this diff too).
+    //
+    // The per-row key is `selection_row_key`, NOT `selection_row_span`. The span
+    // is a HULL over every pane's selection, which is right for the sparse-tail
+    // scan windows that consume it and WRONG here: with two panes selected on
+    // one row, dragging one pane's edge inward leaves the hull's `(lo, hi)`
+    // unmoved, the row compares equal, and the highlight freezes mid-drag in
+    // both the CPU cache and the GPU's scissored offscreen. Over-reporting
+    // widens a scan (harmless) but DESENSITISES an equality diff (a correctness
+    // bug). The key is per ENTRY, in list order, so it cannot merge two panes.
+    //
+    // The key also carries each entry's COLOURS, which folds in what used to be
+    // a second pass over the rows keyed on the scalar `selection_bg`/
+    // `selection_fg`: OSC 17 / OSC 19 (and their OSC 117/119 resets, and OSC 21)
+    // can recolour a selection whose RANGE is stationary, and that scalar
+    // trigger goes lossy the moment colours are per-pane. Rows carrying no
+    // selected cell in either frame still key EMPTY on both sides and stay
+    // clean, so a colour set BEFORE the next drag still gate-hits.
     if prev_input.selection != input.selection
         || prev_input.selection_clip != input.selection_clip
+        || prev_input.selections != input.selections
+        || prev_input.selection_bg != input.selection_bg
+        || prev_input.selection_fg != input.selection_fg
         || prev_input.display_offset != input.display_offset
     {
+        // Two reused buffers for the whole loop: one allocation each, then
+        // `Vec::clear` + push per row (the key is one entry on every
+        // single-terminal frame).
+        let mut prev_key = Vec::new();
+        let mut cur_key = Vec::new();
         for r in 0..rows {
-            if prev_input.selection_row_span(r) != input.selection_row_span(r) {
-                mark_selection_row(dirty, r);
-                any_dirty = true;
-            }
-        }
-    }
-    // OSC 17 / OSC 19 (and their OSC 117/119 resets, and OSC 21) can recolour the
-    // selection while the selected RANGE itself is stationary — `row_differs` and
-    // the span diff above both see nothing. Repaint precisely the rows carrying
-    // selected cells in either snapshot; with no selection at all this marks
-    // nothing, so a colour set BEFORE the next drag still gate-hits.
-    if prev_input.selection_bg != input.selection_bg
-        || prev_input.selection_fg != input.selection_fg
-    {
-        for r in 0..rows {
-            let previous = prev_input.selection_row_span(r);
-            let current = input.selection_row_span(r);
-            if previous.is_some() || current.is_some() {
+            prev_input.selection_row_key(r, &mut prev_key);
+            input.selection_row_key(r, &mut cur_key);
+            if prev_key != cur_key {
                 mark_selection_row(dirty, r);
                 any_dirty = true;
             }
@@ -16678,7 +17231,7 @@ fn ligature_break_cols_into(
     // Break on selection so no shaped run spans a selection-highlight boundary.
     // Frame coords go through the ONE predicate `render_row`'s per-cell fill
     // uses, so the viewport projection and the pane clip cannot drift apart.
-    if input.selection.has_selection() {
+    if input.any_selection() {
         let n = input.cols.min(input.cells.get(r).map_or(0, Vec::len));
         let row_cells = &input.cells[r];
         let selected = |c: usize| {
@@ -17384,6 +17937,143 @@ fn relative_luminance(rgb: u32) -> f32 {
 fn contrast_ratio(a: u32, b: u32) -> f32 {
     let (la, lb) = (relative_luminance(a), relative_luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+/// The two colours ONE selection band paints with, after the renderer's policy
+/// has resolved the terminal's live OSC state against the theme.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionColors {
+    /// The band fill (`0x00RRGGBB`).
+    pub bg: u32,
+    /// The selected-text ink, or `None` for the automatic WCAG contrast floor.
+    pub fg: Option<u32>,
+}
+
+/// The renderer-owned half of selection colour policy, hoisted ONCE per frame.
+///
+/// Everything here is renderer/theme state; the per-entry half (a pane's live
+/// OSC 17/19 values and whether that pane is focused) arrives at resolution
+/// time. Split so ONE function applies the policy for both backends — the CPU
+/// fill and the GPU encode previously reimplemented it side by side, which is
+/// exactly how the ±8 parity gate starts drifting. Private: it is reached only
+/// through [`SelectionPalette`], which is what both backends hold.
+#[derive(Clone, Copy, Debug)]
+struct SelectionPolicy {
+    /// Band colour for an entry with no live OSC 17 that is ACTIVE.
+    unset_active: u32,
+    /// …and for one that is INACTIVE (unfocused window, or unfocused pane).
+    unset_inactive: u32,
+    /// The renderer-wide inactive flag (the WINDOW lost focus): it makes every
+    /// entry inactive regardless of its own flag.
+    inactive: bool,
+    /// The host's explicit inactive band override, if configured.
+    inactive_bg: Option<u32>,
+    /// The host's configured `selectionForeground` (`None` = automatic floor).
+    host_fg: Option<u32>,
+    /// The frame's live default background — the derivation base for an
+    /// inactive band built from a LIVE selection colour.
+    frame_bg: u32,
+}
+
+/// Per-frame selection colour resolver: the [`SelectionPolicy`] plus the frame's
+/// selection entries, answering "what colours does selection index `ix` paint
+/// with?".
+///
+/// Borrows the frame's [`PaneSelection`] slice rather than materializing a
+/// per-frame `Vec`, so building one allocates nothing and the single-terminal
+/// path is a pre-resolved field read — the `<10µs/row` pass-1c budget is
+/// unchanged, and the scalar frame is byte-identical to the two hoisted scalars
+/// this replaced.
+///
+/// [`PaneSelection`]: aterm_core::render::PaneSelection
+#[derive(Clone, Copy)]
+pub struct SelectionPalette<'a> {
+    policy: SelectionPolicy,
+    /// Resolved once: the colours of the SCALAR path (`selections` empty).
+    scalar: SelectionColors,
+    entries: &'a [aterm_core::render::PaneSelection],
+}
+
+impl SelectionPalette<'_> {
+    /// The colours for the selection index [`RenderInput::selection_hit`]
+    /// returned. An out-of-range index (impossible from `selection_hit`) falls
+    /// back to the scalar colours rather than panicking in the rasterizer.
+    ///
+    /// [`RenderInput::selection_hit`]: aterm_core::render::RenderInput::selection_hit
+    #[must_use]
+    #[inline]
+    pub fn at(&self, index: usize) -> SelectionColors {
+        match self.entries.get(index) {
+            Some(entry) => {
+                resolve_selection_colors(&self.policy, entry.bg, entry.fg, entry.inactive)
+            }
+            None => self.scalar,
+        }
+    }
+
+    /// The SCALAR path's colours — what a single-terminal frame's whole
+    /// selection paints with, and the fallback for anything the entry list does
+    /// not describe.
+    #[must_use]
+    #[inline]
+    pub fn scalar(&self) -> SelectionColors {
+        self.scalar
+    }
+
+    /// [`Self::at`] for a `selection_hit` result: on a MISS the colours are
+    /// unused by every caller (the fg floors ignore them when `selected` is
+    /// false), so the scalar answer stands in.
+    #[must_use]
+    #[inline]
+    pub fn at_hit(&self, hit: Option<usize>) -> SelectionColors {
+        match hit {
+            Some(index) => self.at(index),
+            None => self.scalar,
+        }
+    }
+}
+
+/// Apply the selection colour policy to ONE selection's live OSC state.
+///
+/// `COLOR_UNSET` — every producer that predates live selection colours, and
+/// every terminal that never set one — delegates WHOLE to the configured theme
+/// policy, so those frames are byte-identical to before. With a live colour the
+/// same active/inactive rule applies to IT: an explicit inactive override still
+/// wins, and the derived dim comes from the live pair (selection over the
+/// frame's live bg) rather than the static theme. `entry_inactive` is the
+/// per-PANE half of "inactive": in a split, only the focused pane's band is
+/// active, exactly as only a focused window's is.
+#[must_use]
+#[inline]
+fn resolve_selection_colors(
+    policy: &SelectionPolicy,
+    live_bg: u32,
+    live_fg: u32,
+    entry_inactive: bool,
+) -> SelectionColors {
+    let inactive = policy.inactive || entry_inactive;
+    let bg = if live_bg == aterm_core::render::COLOR_UNSET {
+        if inactive {
+            policy.unset_inactive
+        } else {
+            policy.unset_active
+        }
+    } else {
+        let active = live_bg & 0x00ff_ffff;
+        if inactive {
+            policy
+                .inactive_bg
+                .unwrap_or_else(|| derive_inactive_selection_bg(active, policy.frame_bg))
+        } else {
+            active
+        }
+    };
+    let fg = match live_fg {
+        aterm_core::render::COLOR_DYNAMIC => None,
+        aterm_core::render::COLOR_UNSET => policy.host_fg,
+        color => Some(color & 0x00ff_ffff),
+    };
+    SelectionColors { bg, fg }
 }
 
 /// Floor a glyph foreground's contrast against the SELECTION background so selected
@@ -20000,6 +20690,188 @@ mod tests {
         );
         assert!(!dirty[2], "an unrelated row stays cached");
         assert!(decision.any_dirty && !decision.is_gate_hit());
+    }
+
+    /// Build one completed `Simple` selection spanning `(row, lo)..=(row, hi)`.
+    #[cfg(test)]
+    fn one_row_selection(row: i32, lo: u16, hi: u16) -> aterm_core::selection::TextSelection {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+
+        let mut selection = aterm_core::selection::TextSelection::new();
+        selection.start_selection(row, lo, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(row, hi, SelectionSide::Right);
+        selection.complete_selection();
+        selection
+    }
+
+    /// THE FREEZE. Two panes hold selections on the SAME frame row; one pane's
+    /// right edge is dragged inward while the other's is untouched.
+    ///
+    /// The hull over both panes' spans is UNMOVED by that drag — `(0, 15)` before
+    /// and after — so a damage diff keyed on `selection_row_span` calls the two
+    /// frames equal, never marks the row, and the dragged highlight freezes
+    /// mid-gesture in the CPU cache and the GPU's scissored offscreen alike. This
+    /// test pins BOTH halves: that the hull really is unmoved (the trap is real,
+    /// not hypothetical) and that the row is marked dirty anyway, because
+    /// `compute_dirty_rows` keys on the per-entry `selection_row_key`.
+    #[test]
+    fn compute_dirty_rows_marks_a_dragged_pane_selection_a_sibling_hull_hides() {
+        use aterm_core::render::{PaneSelection, SelectionClip};
+
+        let mut term = Terminal::new(4, 16);
+        let left_clip = SelectionClip::new(1, 2, 0, 8);
+        let right_clip = SelectionClip::new(1, 2, 8, 16);
+        let right_pane = PaneSelection {
+            selection: one_row_selection(1, 8, 15),
+            clip: right_clip,
+            bg: aterm_core::render::COLOR_UNSET,
+            fg: aterm_core::render::COLOR_UNSET,
+            inactive: true,
+        };
+
+        let mut prev = term.cell_frame(4, 16);
+        prev.selections = vec![
+            PaneSelection {
+                selection: one_row_selection(1, 0, 7),
+                clip: left_clip,
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: false,
+            },
+            right_pane.clone(),
+        ];
+        let mut cur = prev.clone();
+        // The drag: the LEFT pane's selection now ends at column 3.
+        cur.selections[0].selection = one_row_selection(1, 0, 3);
+
+        assert_eq!(
+            prev.selection_row_span(1),
+            cur.selection_row_span(1),
+            "precondition: the sibling pane pins the hull, so the span diff sees nothing"
+        );
+        assert_ne!(
+            {
+                let mut key = Vec::new();
+                prev.selection_row_key(1, &mut key);
+                key
+            },
+            {
+                let mut key = Vec::new();
+                cur.selection_row_key(1, &mut key);
+                key
+            },
+            "the per-entry key must see the drag the hull hides"
+        );
+        assert!(
+            prev.selection_contains_cell(1, 5, false, false)
+                && !cur.selection_contains_cell(1, 5, false, false),
+            "precondition: column 5 really does stop painting as selected"
+        );
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("a selection-only change must stay on the row-damage path");
+        };
+        assert!(dirty[1], "the dragged row must repaint");
+        assert!(
+            dirty[0],
+            "and its predecessor, for upward glyph-ink overshoot"
+        );
+        assert!(!dirty[2] && !dirty[3], "unrelated rows stay cached");
+        assert!(decision.any_dirty && !decision.is_gate_hit());
+    }
+
+    /// The same lossiness one field over: two panes selected on one row, and only
+    /// the SIBLING's live OSC 17 colour changes. The spans are identical on both
+    /// sides — it is the colours that moved — and the old scalar
+    /// `selection_bg != selection_bg` trigger cannot see a per-pane colour at all.
+    #[test]
+    fn compute_dirty_rows_marks_a_per_pane_selection_recolour() {
+        use aterm_core::render::{PaneSelection, SelectionClip};
+
+        let mut term = Terminal::new(3, 16);
+        let mut prev = term.cell_frame(3, 16);
+        prev.selections = vec![
+            PaneSelection {
+                selection: one_row_selection(1, 0, 7),
+                clip: SelectionClip::new(1, 2, 0, 8),
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: false,
+            },
+            PaneSelection {
+                selection: one_row_selection(1, 8, 15),
+                clip: SelectionClip::new(1, 2, 8, 16),
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: true,
+            },
+        ];
+        let mut cur = prev.clone();
+        cur.selections[1].bg = 0x0011_2233;
+
+        assert_eq!(
+            prev.selection_row_span(1),
+            cur.selection_row_span(1),
+            "precondition: a recolour moves no span"
+        );
+        assert_eq!(
+            prev.selection_bg, cur.selection_bg,
+            "precondition: the SCALAR colour is untouched — it belongs to no pane here"
+        );
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("a selection recolour must stay on the row-damage path");
+        };
+        assert!(
+            dirty[1] && dirty[0],
+            "the recoloured row and its predecessor"
+        );
+        assert!(!dirty[2], "an unselected row stays cached");
+        assert!(decision.any_dirty && !decision.is_gate_hit());
+    }
+
+    /// A settled multi-pane selection must still GATE-HIT: the per-entry key is
+    /// only a damage signal, never a repaint-every-frame one.
+    #[test]
+    fn compute_dirty_rows_gate_hits_on_two_unchanged_pane_selections() {
+        use aterm_core::render::{PaneSelection, SelectionClip};
+
+        let mut term = Terminal::new(3, 16);
+        let mut prev = term.cell_frame(3, 16);
+        prev.selections = vec![
+            PaneSelection {
+                selection: one_row_selection(1, 0, 7),
+                clip: SelectionClip::new(1, 2, 0, 8),
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: false,
+            },
+            PaneSelection {
+                selection: one_row_selection(1, 8, 15),
+                clip: SelectionClip::new(1, 2, 8, 16),
+                bg: aterm_core::render::COLOR_UNSET,
+                fg: aterm_core::render::COLOR_UNSET,
+                inactive: true,
+            },
+        ];
+        let cur = prev.clone();
+
+        let mut dirty = Vec::new();
+        let DirtyDecision::Rows(decision) =
+            compute_dirty_rows(&prev, &cur, false, None, false, None, 16, &mut dirty)
+        else {
+            panic!("an unchanged frame must stay on the row-damage path");
+        };
+        assert!(
+            !decision.any_dirty && decision.is_gate_hit(),
+            "two settled pane selections must not repaint anything"
+        );
     }
 
     #[test]
@@ -25209,24 +26081,27 @@ mod tests {
         input.default_bg = 0x00e0_d0c0;
         input.selection_bg = 0x0060_4020;
         input.selection_fg = 0x0012_3456;
-        assert_eq!(r.frame_selection_bg(&input), input.selection_bg);
-        assert_eq!(r.frame_selection_fg(&input), Some(input.selection_fg));
+        assert_eq!(r.selection_palette(&input).scalar().bg, input.selection_bg);
+        assert_eq!(
+            r.selection_palette(&input).scalar().fg,
+            Some(input.selection_fg)
+        );
         r.set_selection_fg(Some(0x00ab_cdef));
         input.selection_fg = aterm_core::render::COLOR_DYNAMIC;
         assert_eq!(
-            r.frame_selection_fg(&input),
+            r.selection_palette(&input).scalar().fg,
             None,
             "an engine-requested dynamic foreground overrides the renderer setting"
         );
         input.selection_fg = aterm_core::render::COLOR_UNSET;
         assert_eq!(
-            r.frame_selection_fg(&input),
+            r.selection_palette(&input).scalar().fg,
             Some(0x00ab_cdef),
             "an unresolved producer still delegates to the renderer setting"
         );
         input.selection_bg = aterm_core::render::COLOR_UNSET;
         assert_eq!(
-            r.frame_selection_bg(&input),
+            r.selection_palette(&input).scalar().bg,
             r.effective_selection_bg(),
             "an unresolved producer still delegates to the configured policy"
         );
@@ -25234,11 +26109,11 @@ mod tests {
         r.set_selection_inactive(true);
         r.set_selection_inactive_bg(None);
         assert_eq!(
-            r.frame_selection_bg(&input),
+            r.selection_palette(&input).scalar().bg,
             derive_inactive_selection_bg(input.selection_bg, input.default_bg)
         );
         r.set_selection_inactive_bg(Some(custom));
-        assert_eq!(r.frame_selection_bg(&input), custom);
+        assert_eq!(r.selection_palette(&input).scalar().bg, custom);
     }
 
     /// The color-emoji font bytes are interned: injecting the SAME blob twice

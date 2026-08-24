@@ -1728,7 +1728,7 @@ fn paint_strip_impl(
     // `take`n per segment below; a tab this pass skipped (solo, renaming, or a
     // platform with no band) computes its label the shipped way.
     let mut labels = if STRIP_DISTINCT_LABELS {
-        distinct_chip_labels(segments, titles, metadata, paint.rename.map(|edit| edit.tab))
+        distinct_chip_labels(segments, titles, metadata, active, paint.rename.map(|edit| edit.tab))
     } else {
         Vec::new()
     };
@@ -2556,8 +2556,25 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
         start = idx;
         used += w;
     }
+    // WORD BOUNDARY: a tail cut that lands inside a word paints leading
+    // garbage — `…eady in aterm` for `Ready in aterm` reads as noise, not as
+    // a name. Walk forward to the next boundary (space, or one of the
+    // separators titles are built from) when a boundary exists inside the
+    // budget and enough text survives it to still say something. A tail with
+    // no boundary at all (a long path component, a hash) keeps the exact cut:
+    // losing the head of a single token is better than losing the token.
+    let cut = title[start..]
+        .char_indices()
+        .skip(1)
+        .filter(|(_, c)| matches!(c, ' ' | '\u{00b7}' | '/' | ':' | '\u{2014}'))
+        .map(|(i, c)| start + i + c.len_utf8())
+        .find(|&b| {
+            let rest = &title[b..];
+            !rest.trim_start().is_empty() && strip_display_cells(rest) * 2 >= used
+        })
+        .unwrap_or(start);
     let mut out = String::from("…");
-    out.push_str(&title[start..]);
+    out.push_str(title[cut..].trim_start());
     out
 }
 
@@ -2597,13 +2614,43 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// distinguishes nobody — and then cuts at the last word boundary inside the
 /// common head when the remainder fits (`…~/aterm`, the cwd as itself),
 /// falling back to a plain tail cut that fills the span with the most context.
+///
+/// BYTE-IDENTICAL TWINS get their ORDINAL: when several cut tabs carry one
+/// identical title end to end, NO cut can tell them apart — ten shells in one
+/// cwd under pressure rendered ten copies of `…d`, nine meaningless stubs
+/// (measured; the audit's capture). Text cannot distinguish them, so their
+/// POSITION does: each non-active twin is labelled with its 1-based strip
+/// ordinal — `2 · …oml` when the window affords a tail, bare `2` when it
+/// doesn't — the same number `switch_tab_<n>` answers to, so every twin is at
+/// least ADDRESSABLE. The ACTIVE twin is exempt: it is the tab being read, its
+/// pressure window is the reserved wide one, and it keeps as much of the real
+/// title as fits ([`ordinal_chip_label`]).
+///
+/// ONE DIALECT PER STRIP, extended to the PRESSURE case: the cluster rule
+/// above already flips a shared-head FAMILY together, but a pressure strip
+/// (any compressed chip — [`PREFERRED_MIN_TAB_COLS`]) can still seat a flipped
+/// family beside a loner the clusters never caught, mixing `…oml` with `REA…`
+/// chip by chip (the audit's inconsistency). Once any cluster on a pressure
+/// strip flips, the remaining cut loners flip with it — one dialect, and a
+/// loner's tail says at least as much as its head in a three-cell window. A
+/// roomy strip is untouched: distinct heads there keep the familiar head cut.
 fn distinct_chip_labels(
     segments: &[TabSegment],
     titles: &[String],
     metadata: Option<&[TabStripMetadata]>,
+    active: usize,
     renaming: Option<usize>,
 ) -> Vec<Option<String>> {
     let mut labels: Vec<Option<String>> = vec![None; titles.len()];
+    // The strip is UNDER PRESSURE when any chip was compressed below the
+    // legibility floor — `layout_segments` only ever emits such a segment on
+    // its pressure branch (equal shares are floored at
+    // [`PREFERRED_MIN_TAB_COLS`] by the branch condition itself).
+    let pressure = segments.iter().any(|seg| {
+        matches!(seg.kind, TabHit::Select(_))
+            && !seg.solo
+            && seg.end_col.saturating_sub(seg.start_col) < PREFERRED_MIN_TAB_COLS
+    });
     // (tab, its title width budget) for every label the first cut shortened.
     let mut cut: Vec<(usize, usize)> = Vec::new();
     for seg in segments {
@@ -2643,6 +2690,10 @@ fn distinct_chip_labels(
             }
         }
     }
+    // Which cut tabs a cluster relabelled (parallel to `cut`) — the pressure
+    // dialect flip below only touches the loners the clusters never caught.
+    let mut relabelled = vec![false; cut.len()];
+    let mut any_cluster = false;
     for a in 0..cut.len() {
         let root = find(&mut parent, a);
         let members: Vec<usize> = (0..cut.len())
@@ -2652,6 +2703,8 @@ fn distinct_chip_labels(
         if members.len() < 2 {
             continue;
         }
+        any_cluster = true;
+        relabelled[a] = true;
         let (i, avail) = cut[a];
         // Shed the cluster's common RAW-title suffix — shared tail noise.
         // Titles that are byte-identical end to end have no distinguishing
@@ -2680,6 +2733,18 @@ fn distinct_chip_labels(
             .rfind(char::is_whitespace)
             .map_or(head.len(), |p| p + head[p..].chars().next().map_or(1, char::len_utf8));
         let remainder = &core[boundary..];
+        // BYTE-IDENTICAL TWINS: no cut of this title can tell it from the
+        // members it byte-equals, so a non-active twin is labelled by its
+        // ordinal instead — the one thing about it that IS distinct. The
+        // active twin falls through: it keeps as much real title as fits.
+        let twins = members.iter().filter(|&&m| titles[m] == titles[i]).count();
+        if twins >= 2
+            && i != active
+            && let Some(label) = ordinal_chip_label(i, core, remainder, avail)
+        {
+            labels[i] = Some(label);
+            continue;
+        }
         labels[i] = if !remainder.is_empty()
             && strip_display_cells(remainder) <= avail.saturating_sub(1)
         {
@@ -2688,7 +2753,96 @@ fn distinct_chip_labels(
             Some(truncate_title_tail(core, avail))
         };
     }
+    // ONE DIALECT PER STRIP under pressure: a flipped cluster beside a
+    // head-cut loner mixes `…oml` with `REA…` in windows too small for either
+    // to say much — the loners join the strip's dialect. Roomy strips keep
+    // the shipped behaviour: distinct heads stay head-cut there.
+    if pressure && any_cluster {
+        // Every loner's tail candidate is resolved BEFORE any is written,
+        // because the flip must never buy dialect with distinctness: in a
+        // one-visible-cell window `README.md` and `cargo build` both tail-cut
+        // to `…d`, where their head cuts still differed. A candidate that
+        // byte-collides with any other label keeps its head cut instead —
+        // the degenerate corner where only the head dialect distinguishes.
+        let mut flips: Vec<(usize, String)> = Vec::new();
+        for (a, &(i, avail)) in cut.iter().enumerate() {
+            if relabelled[a] {
+                continue;
+            }
+            // A loner can share its ENDING without sharing a head: the
+            // composed ` · Ready` every idle chip carries would tail-cut two
+            // unrelated loners to one identical `…ady` (measured live — the
+            // activity is appended to every title on the strip). Shed the
+            // longest tail this loner shares with at least TWO other cut tabs
+            // — every shared suffix of one title nests inside the next, so
+            // that is simply the second-largest pairwise value; a tail one
+            // other chip happens to end with (the lone `d` of
+            // `build`/`README.md`) is coincidence, not strip furniture. And
+            // shed only when the furniture fills the whole visible keep:
+            // while distinguishing characters still reach the screen, they
+            // outrank a longer fragment of the loner's own text.
+            let mut shared: Vec<usize> = cut
+                .iter()
+                .filter(|&&(j, _)| j != i)
+                .map(|&(j, _)| common_suffix_bytes(&titles[i], &titles[j]))
+                .collect();
+            shared.sort_unstable_by(|a, b| b.cmp(a));
+            let mut suffix = shared.get(1).copied().unwrap_or(0);
+            if suffix >= titles[i].len()
+                || strip_display_cells(&titles[i][titles[i].len() - suffix..])
+                    < avail.saturating_sub(1)
+            {
+                suffix = 0;
+            }
+            let core = &titles[i][..titles[i].len() - suffix];
+            flips.push((i, truncate_title_tail(core, avail)));
+        }
+        for (n, (i, cand)) in flips.iter().enumerate() {
+            let collides = flips
+                .iter()
+                .enumerate()
+                .any(|(m, (_, other))| m != n && other == cand)
+                || labels
+                    .iter()
+                    .enumerate()
+                    .any(|(j, l)| j != *i && l.as_deref() == Some(cand));
+            if !collides {
+                labels[*i] = Some(cand.clone());
+            }
+        }
+    }
     labels
+}
+
+/// The label a byte-identical twin paints: its 1-based strip ordinal — the
+/// number `switch_tab_<n>` already answers to — carrying a tail of the title
+/// when the window affords one (`2 · …oml`), bare (`2`) when it does not.
+/// `core`/`remainder` are the cluster's suffix-shed title and word-boundary
+/// tail, exactly what the family cut would have painted. `None` when even the
+/// digits do not fit `avail`: a clipped ordinal would LIE (a `10` painted as
+/// `1` addresses the wrong tab), so the caller falls back to the family cut.
+fn ordinal_chip_label(tab: usize, core: &str, remainder: &str, avail: usize) -> Option<String> {
+    let digits = (tab + 1).to_string();
+    let digit_cells = strip_display_cells(&digits);
+    if digit_cells > avail {
+        return None;
+    }
+    // ` · ` — the separator composed titles already use — costs 3 cells; a
+    // tail below 2 cells (`…` + one char) says nothing worth the space.
+    let room = avail.saturating_sub(digit_cells + 3);
+    if room >= 2 {
+        let tail = if !remainder.is_empty() && strip_display_cells(remainder) < room {
+            format!("…{remainder}")
+        } else {
+            truncate_title_tail(core, room)
+        };
+        // A width-2 glyph can leave the tail cut with a bare `…` — worth
+        // nothing; the bare ordinal reads better than `2 · …`.
+        if !tail.is_empty() && tail != "…" {
+            return Some(format!("{digits} · {tail}"));
+        }
+    }
+    Some(digits)
 }
 
 /// Byte length of the longest common PREFIX of `a` and `b`, aligned to char
@@ -3016,6 +3170,7 @@ pub(crate) mod pixel_band {
                 input.segments,
                 input.titles,
                 Some(input.metadata),
+                input.active,
                 input.paint.rename.map(|edit| edit.tab),
             )
         } else {
@@ -5817,10 +5972,24 @@ mod tests {
         assert_eq!(truncate_title_tail("abcdef", 1), "…");
         assert_eq!(truncate_title_tail("abcdef", 0), "");
         // The distinguishing shape this cut exists for: the shared prompt
-        // prefix goes, the cwd tail survives.
+        // prefix goes, the cwd tail survives — and the cut lands on a word
+        // boundary, so no orphaned `: ` rides in front of the name.
         assert_eq!(
             truncate_title_tail("user@m17-tower: ~/aterm", 10),
-            "…: ~/aterm"
+            "…~/aterm"
+        );
+        // THE GARBAGE-HEAD DEFECT, seen on glass: a mid-word cut painted
+        // `…eady in aterm` for `Ready in aterm`, which reads as noise rather
+        // than a name. The boundary snap keeps whole words.
+        assert_eq!(truncate_title_tail("Ready in aterm", 13), "…in aterm");
+        assert_eq!(truncate_title_tail("Typing a command", 14), "…a command");
+        // A boundary that would cost more than half the surviving text is
+        // refused: losing the head of a single long token is worse than the
+        // exact cut.
+        assert_eq!(
+            truncate_title_tail("verylongtokenwithoutspaces/x", 12),
+            "…outspaces/x",
+            "the /x tail is too small a survivor to justify the boundary"
         );
         // Wide chars: 日本語 is 6 cells. Budget 5 keeps 本語 (4 cells) + `…`;
         // budget 4 would have to split 本, so it drops it whole and the
@@ -5848,7 +6017,7 @@ mod tests {
         // 80 cols, 4 tabs → ~19-cell shares: every title is cut, and the head
         // cut would hand tabs 0, 1 and 3 one identical label.
         let segments = layout_segments(80, titles.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &titles, None, None);
+        let labels = distinct_chip_labels(&segments, &titles, None, 0, None);
         let resolved: Vec<String> = labels.into_iter().map(Option::unwrap).collect();
         for (i, a) in resolved.iter().enumerate() {
             for (j, b) in resolved.iter().enumerate() {
@@ -5867,26 +6036,33 @@ mod tests {
         assert_eq!(resolved[0], "…~/aterm");
         assert_eq!(resolved[1], "…$HOME/trust");
         assert_eq!(resolved[2], "…~");
-        // Tab 3 is the only one whose remainder is close enough to the share for
-        // the word-boundary cut to be in question, so it is the only expectation
-        // that moves with the band's geometry. On the macOS/Linux share the
-        // remainder is ONE CELL too wide and the cut falls back to the plain tail
-        // fill; the Windows band hands every chip one more cell (its own `+`
-        // reservation and per-chip width floor), the boundary cut lands, and the
-        // `~` the shorter cut has to drop survives. Same tail either way — the
-        // distinguishing cwd — and the four labels stay tellable apart above.
-        #[cfg(windows)]
-        assert_eq!(
-            resolved[3], "…~/aterm/crates",
-            "one more cell than the macOS/Linux share, so the word-boundary cut \
-             lands and keeps the `~`"
-        );
-        #[cfg(not(windows))]
-        assert_eq!(
-            resolved[3], "…/aterm/crates",
-            "a remainder one cell too wide falls back to the plain tail cut, \
-             which fills the span"
-        );
+        // Tab 3 is the only one whose remainder is close enough to the share
+        // for the word-boundary cut to be in question, so it is the only
+        // expectation that moves with the band's geometry — and the mover is
+        // the CHIP-CARD INTERIOR PAD, not the OS: `~/aterm/crates` is exactly
+        // 14 cells, and [`tab_content_layout`] spends one title cell on the
+        // pad only where [`STRIP_CHIP_CARDS`] holds. Pad taken (Linux): the
+        // remainder is a cell too wide, the plain tail cut fills the span.
+        // Padless (macOS — measured here, the word cut lands at avail 15 —
+        // and Windows, whose band hands every chip at least that): the exact
+        // fit keeps the whole cwd, `~` included. Branch on the same const the
+        // layout spends, so each platform asserts its true geometry (runtime,
+        // not `cfg` — this test runs everywhere, per the module's
+        // test-portability rule). Same distinguishing tail either way, and
+        // the four labels stay tellable apart above.
+        if STRIP_CHIP_CARDS {
+            assert_eq!(
+                resolved[3], "…/aterm/crates",
+                "a remainder one cell too wide falls back to the plain tail \
+                 cut, which fills the span"
+            );
+        } else {
+            assert_eq!(
+                resolved[3], "…~/aterm/crates",
+                "a remainder that exactly fits keeps the word-boundary cut, \
+                 `~` included"
+            );
+        }
 
         // A COMPOSED label shares its ENDING too (`title · <activity>` puts one
         // activity summary after every prompt): a naive tail-keep hands four
@@ -5899,7 +6075,7 @@ mod tests {
             "user@m17-tower: ~/aterm/crates · Typing a command".to_string(),
         ];
         let segments = layout_segments(80, composed.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &composed, None, None);
+        let labels = distinct_chip_labels(&segments, &composed, None, 0, None);
         let resolved: Vec<String> = labels.into_iter().map(Option::unwrap).collect();
         assert!(
             resolved[0].ends_with("aterm"),
@@ -5916,7 +6092,7 @@ mod tests {
         // the whole family, so the strip never mixes `…~/aterm` with
         // `user@host: ~/tru…` chip by chip.
         let segments = layout_segments(130, composed.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &composed, None, None);
+        let labels = distinct_chip_labels(&segments, &composed, None, 0, None);
         let resolved: Vec<String> = labels.into_iter().map(Option::unwrap).collect();
         assert_eq!(
             resolved,
@@ -5926,15 +6102,27 @@ mod tests {
 
         // Identical titles end to end have nothing to distinguish them — the
         // suffix shed must not truncate them to nothing (the whole title IS
-        // the common suffix; it is kept instead).
+        // the common suffix; it is kept instead), and no cut can tell the
+        // twins apart, so the non-active one is labelled by its ORDINAL: the
+        // active twin keeps as much title as fits, its sibling becomes
+        // addressable (`switch_tab_2`'s `2`) with the tail the window affords.
         let twins = ["same shell".to_string(), "same shell".to_string()];
         let segments = layout_segments(30, twins.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &twins, None, None);
+        let labels = distinct_chip_labels(&segments, &twins, None, 0, None);
         for label in labels.iter().flatten() {
             assert!(!label.is_empty());
             assert_ne!(label.as_str(), "…", "a bare ellipsis names nothing");
-            assert!(label.contains("shell"), "{label:?} still says what it is");
         }
+        assert_eq!(
+            labels[0].as_deref(),
+            Some("…shell"),
+            "the ACTIVE twin keeps the title — it is the tab being read"
+        );
+        assert_eq!(
+            labels[1].as_deref(),
+            Some("2 · …ell"),
+            "the other twin is addressable by ordinal, tail attached where room allows"
+        );
 
         // Distinct heads stay head-cut: nothing collided, nothing flips.
         let distinct = [
@@ -5942,7 +6130,7 @@ mod tests {
             "beta-service logs".to_string(),
         ];
         let segments = layout_segments(24, distinct.len(), 0, false);
-        let labels = distinct_chip_labels(&segments, &distinct, None, None);
+        let labels = distinct_chip_labels(&segments, &distinct, None, 0, None);
         for (label, raw) in labels.iter().zip(&distinct) {
             let label = label.as_deref().unwrap();
             assert!(
@@ -5975,6 +6163,203 @@ mod tests {
         assert!(
             painted[0].contains("aterm") && painted[1].contains("trust"),
             "the strip shows the tails that differ: {painted:?}"
+        );
+    }
+
+    /// THE TEN-IDENTICAL-TABS DEFECT, measured at the audit's width: ten
+    /// shells in one cwd under the pressure layout rendered `…command` on the
+    /// active chip and NINE copies of `…d` beside it — nine tabs, no way to
+    /// name any of them. Byte-identical titles have no distinguishing text for
+    /// any cut to keep, so a non-active twin is labelled by its 1-based strip
+    /// ORDINAL (the number `switch_tab_<n>` answers to): bare digits in a
+    /// two-cell window, `2 · …nd` where the window affords a tail. The ACTIVE
+    /// twin keeps as much real title as its reserved pressure width fits.
+    #[test]
+    fn byte_identical_tabs_under_pressure_are_addressable_by_ordinal() {
+        let titles: Vec<String> = (0..10)
+            .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+            .collect();
+        // 80 cols, 10 tabs → pressure: the active chip takes 18 cells, every
+        // inactive chip compresses to 6 (a 2-cell title window).
+        let segments = layout_segments(80, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(
+            resolved[0], "…command",
+            "the active twin keeps as much title as its reserved width fits"
+        );
+        for (i, label) in resolved.iter().enumerate().skip(1) {
+            assert_eq!(
+                label,
+                &(i + 1).to_string(),
+                "a two-cell window carries the bare ordinal — tab {i} is \
+                 addressable where `…d` named nothing"
+            );
+        }
+        for (i, a) in resolved.iter().enumerate() {
+            for (j, b) in resolved.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "tabs {i} and {j} must be tellable apart");
+                }
+            }
+        }
+
+        // A wider pressure strip affords each ordinal a tail of the title —
+        // ordinal first (the part that distinguishes), tail as context.
+        let segments = layout_segments(120, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(resolved[1], "2 · …nd");
+        assert_eq!(
+            resolved[9], "10 · …d",
+            "two-digit ordinals spend their extra cell out of the tail's share"
+        );
+
+        // The active tab is a POSITION, not tab 0: mid-strip selection keeps
+        // the title there and hands every other twin its own ordinal — tab 0
+        // included (`switch_tab_1` reaches it, so `1` names it).
+        let segments = layout_segments(80, titles.len(), 4, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 4, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(resolved[4], "…command");
+        assert_eq!(resolved[0], "1");
+        assert_eq!(resolved[9], "10");
+    }
+
+    /// ONE TRUNCATION DIALECT PER PRESSURE STRIP — the audit's inconsistency:
+    /// a flipped tail-cut family (`…oml`) seated beside head-cut loners
+    /// (`REA…`, `car…`) the clusters never caught, two dialects chip by chip
+    /// in windows too small for either to say much. Once any cluster on a
+    /// PRESSURE strip flips, the cut loners flip with it; a roomy strip keeps
+    /// the shipped rule — distinct heads stay head-cut there.
+    #[test]
+    fn a_pressure_strip_speaks_one_truncation_dialect() {
+        let mut titles: Vec<String> =
+            (0..6).map(|_| "Settings.toml".to_string()).collect();
+        titles.push("README.md".to_string()); // loner: shares no head
+        titles.push("Setup.sh".to_string()); // clusters via the `Set` head
+        titles.push("cargo build".to_string()); // loner
+        titles.push("Settings.toml.bak".to_string()); // clusters
+        let segments = layout_segments(100, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        // The active twin's 13-cell window seats the whole title uncut; its
+        // five cut twins are ordinals; every other cut chip — clustered OR
+        // loner — speaks the tail dialect. No `REA…` beside a `…oml`.
+        assert_eq!(
+            resolved,
+            [
+                "Settings.toml",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "….md",
+                "….sh",
+                "…ild",
+                "…bak"
+            ],
+            "one strip, one dialect — and the twins are addressable"
+        );
+
+        // THE LIVE STRIP composes ` · <activity>` onto EVERY chip: two
+        // unrelated loners then share an ending without sharing a head, and a
+        // naive dialect flip would tail-cut both into one identical `…ady`.
+        // The flip sheds the strip-furniture suffix (the tail shared with two
+        // or more other chips) first — but never a one-chip coincidence like
+        // the `d` `build` and `README.md` happen to end with, which would
+        // waste visible cells on `…E.m`.
+        let composed: Vec<String> = [
+            "Settings.toml",
+            "Settings.toml",
+            "Settings.toml",
+            "Settings.toml",
+            "Settings.toml",
+            "Settings.toml",
+            "README.md",
+            "Setup.sh",
+            "cargo build",
+            "Settings.toml.bak",
+        ]
+        .iter()
+        .map(|t| format!("{t} · Ready"))
+        .collect();
+        let segments = layout_segments(100, composed.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &composed, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(
+            resolved,
+            [
+                "…tings.toml",
+                "2",
+                "3",
+                "4",
+                "5",
+                "6",
+                "….md",
+                "….sh",
+                "…ild",
+                "…bak"
+            ],
+            "the composed activity is shed strip-wide, the loners stay tellable"
+        );
+
+        // THE DEGENERATE CORNER: one visible cell per chip. `README.md` and
+        // `cargo build` both tail-cut to `…d` there — the flip would TRADE
+        // distinctness for dialect, which is backwards. Colliding candidates
+        // keep their head cuts (`R…`/`c…`), which still differ; everything
+        // else on the strip stays distinct too.
+        let segments = layout_segments(80, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert_eq!(
+            resolved,
+            ["Settings.toml", "2", "3", "4", "5", "6", "R…", "…h", "c…", "…k"],
+            "distinctness outranks dialect when the tail cut cannot distinguish"
+        );
+        for (i, a) in resolved.iter().enumerate() {
+            for (j, b) in resolved.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "tabs {i} and {j} collide at one visible cell");
+                }
+            }
+        }
+
+        // ROOMY strip, same cluster machinery: the shared-prompt family flips
+        // to tail cuts, but the unrelated loner keeps its familiar head cut —
+        // the flip is the pressure case's rule, not a blanket one.
+        let roomy = [
+            "user@m17-tower: ~/aterm".to_string(),
+            "user@m17-tower: $HOME/trust".to_string(),
+            "user@m17-tower: ~".to_string(),
+            "user@m17-tower: ~/aterm/crates".to_string(),
+            "zzz-not-a-prompt-here".to_string(),
+        ];
+        let segments = layout_segments(80, roomy.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &roomy, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        assert!(
+            resolved[0].starts_with('…') && resolved[1].starts_with('…'),
+            "the family still flips together: {resolved:?}"
+        );
+        assert_eq!(
+            resolved[4], "zzz-not-a…",
+            "a roomy strip's distinct-headed loner keeps the shipped head cut"
         );
     }
 
@@ -6029,15 +6414,17 @@ mod tests {
             "FIXTURE: the per-tab head cut is what collides — without this the \
              test would pass for the wrong reason"
         );
-        // Two genuinely identical titles cannot be told apart by any cut, so the
-        // pass must at least not INVENT a difference; the real work is that a
-        // shared PREFIX no longer eats the distinguishing tail.
+        // Two genuinely identical titles cannot be told apart by any CUT — the
+        // pass answers those with the ordinal labels instead (see
+        // `byte_identical_tabs_under_pressure_are_addressable_by_ordinal`);
+        // the real work here is that a shared PREFIX no longer eats the
+        // distinguishing tail.
         let distinct = [
             "~/aterm · Typing a command".to_string(),
             "$HOME/trust · Typing a command".to_string(),
         ];
         let segments = layout_segments(40, distinct.len(), 0, false);
-        let resolved: Vec<String> = distinct_chip_labels(&segments, &distinct, None, None)
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &distinct, None, 0, None)
             .into_iter()
             .flatten()
             .collect();
@@ -6965,6 +7352,84 @@ mod tests {
             def_inactive >= pin,
             "default-theme inactive label contrast {def_inactive:.2} < {pin:.1}:1 (regressed the readability fix)"
         );
+    }
+
+    /// The FORCED-chrome twin of [`strip_contrast_meets_wcag_aa`]: Linux config
+    /// `window_theme = light|dark` against the terminal theme's own darkness swaps
+    /// the strip's theme for [`crate::native_appearance::forced_chrome_theme`] —
+    /// authored surfaces carrying EVERY bundled scheme's accent — and the same
+    /// ink/surface floors must hold on that palette for every donor scheme, or the
+    /// forced band ships exactly the illegible chrome the floors exist to prevent.
+    /// (The "not self-satisfying" raw-ink identities stay in the sibling: they are
+    /// statements about theme-derived tuning, and here fg/bg are authored constants.)
+    #[test]
+    fn strip_contrast_holds_under_forced_chrome_themes() {
+        use aterm_types::Rgb;
+        let rgb = |c: [u8; 3]| Rgb::new(c[0], c[1], c[2]);
+        assert_eq!(
+            crate::chrome_band::forced_chrome(),
+            None,
+            "the theme-derived strip is only defined with no OS-forced palette"
+        );
+        for name in aterm_types::scheme::builtin_names() {
+            let s = aterm_types::scheme::builtin(name).expect("builtin exists");
+            let tp = s.to_theme_parts();
+            let terminal = Theme {
+                fg: tp.fg,
+                bg: tp.bg,
+                cursor: tp.cursor,
+                selection: tp.selection,
+            };
+            for dark in [false, true] {
+                let forced = crate::native_appearance::forced_chrome_theme(terminal, dark);
+                assert_eq!(
+                    theme_is_dark(forced.bg),
+                    dark,
+                    "{name}: the forced side classifies as the side it forces"
+                );
+                let c = strip_colors(forced);
+                let active = rgb(c.active_fg).contrast(rgb(c.active_bg));
+                let inactive = rgb(c.inactive_fg).contrast(rgb(c.band_bg));
+                assert!(
+                    active >= 3.0,
+                    "{name} forced dark={dark}: active-tab text contrast {active:.2} < 3.0:1"
+                );
+                assert!(
+                    inactive >= 3.0,
+                    "{name} forced dark={dark}: inactive-tab label contrast {inactive:.2} < 3.0:1"
+                );
+                if STRIP_IS_CHROME_BAND {
+                    let hover = rgb(c.hover_fg).contrast(rgb(c.hover_bg));
+                    assert!(
+                        hover >= 3.0,
+                        "{name} forced dark={dark}: hovered label contrast {hover:.2} < 3.0:1"
+                    );
+                }
+                if STRIP_CHIP_CARDS {
+                    let chip = rgb(c.chip_fg).contrast(rgb(c.chip_bg));
+                    let plus = rgb(c.chip_button_fg).contrast(rgb(c.chip_bg));
+                    assert!(
+                        chip >= 3.0,
+                        "{name} forced dark={dark}: quiet-chip label contrast {chip:.2} < 3.0:1"
+                    );
+                    assert!(
+                        plus >= 3.0,
+                        "{name} forced dark={dark}: '+' contrast {plus:.2} < 3.0:1"
+                    );
+                }
+                assert_ne!(
+                    c.active_bg, c.band_bg,
+                    "{name} forced dark={dark}: active card indistinguishable from the band"
+                );
+                // The dim-ceiling property carries over: unfocused labels never
+                // print MORE prominently than full-strength ink.
+                let full = rgb(c.fg).contrast(rgb(c.band_bg));
+                assert!(
+                    inactive <= full + 1e-9,
+                    "{name} forced dark={dark}: the dim was floored past what it dims"
+                );
+            }
+        }
     }
 
     /// The High-Contrast twin of [`strip_contrast_meets_wcag_aa`]: under every stock

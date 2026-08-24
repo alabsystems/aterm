@@ -69,8 +69,8 @@ use aterm_spec::derive::{
     release_key_epoch_transition_model, release_published_identity_model,
     release_publisher_fence_model, release_yank_successor_first_model,
     restore_manifest_single_use_model, ring_model, scroll_glide_model,
-    scrollback_maintenance_lane_model, seamless_nonce_model, self_governor_model,
-    semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
+    scrollback_maintenance_lane_model, seamless_nonce_model, selection_custody_model,
+    self_governor_model, semantic_prewarm_generation_model, semantic_prewarm_handshake_model,
     semantic_prewarm_request_swap_model, serious_mode_intent_queue_model, serious_mode_model,
     session_chrome_expiry_model, session_pool_model, settings_page_scroll_model, shade_phase_model,
     shared_budget_model, snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
@@ -82,7 +82,7 @@ use aterm_spec::derive::{
     title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
-    vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
+    typed_echo_liveness_model, vf_axis_clamp_model, vf_nudge_gate_model, vibrancy_contrast_model,
     video_recording_lifecycle_model, video_tap_slot_model, visible_pad_crop_model,
     watcher_failure_recovery_model, watcher_latch_model, wide_center_model, window_routing_model,
 };
@@ -5561,6 +5561,83 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
     );
 }
 
+/// SELECTION CUSTODY — a highlight is destroyed only by something that destroys the
+/// content it names.
+///
+/// `Buggy = 1` is the literal shipping defect: ANY region damage clears, whether or
+/// not it overlapped the selected rows. That is what made a status bar repainting at
+/// the bottom of the screen destroy a highlight anchored far up in scrollback.
+#[test]
+fn derived_selection_custody_spares_damage_that_missed_the_selection() {
+    let model = selection_custody_model();
+    assert_proves_and_catches(&model);
+
+    // THE REPORTED BUG, as a trace: select high, damage low, highlight survives.
+    let mut spared = model.init_state();
+    for action in ["SelectHigh", "RegionDamageLow"] {
+        assert!(model.fire(action, &mut spared), "{action}: {spared:?}");
+    }
+    assert_eq!(
+        spared["alive"], 1,
+        "damage to rows 0..1 must not touch a selection on rows 2..3"
+    );
+
+    // …and the inverse hole: damage that DID hit must clear, or a copy returns text
+    // the user never selected.
+    let mut hit = model.init_state();
+    for action in ["SelectHigh", "RegionDamageHigh"] {
+        assert!(model.fire(action, &mut hit), "{action}: {hit:?}");
+    }
+    assert_eq!(
+        hit["alive"], 0,
+        "damage to row 3 must clear a selection on 2..3"
+    );
+
+    // Partial eviction TRUNCATES: the head clamps to the floor and says so.
+    let mut evicted = model.init_state();
+    for action in ["SelectLow", "Evict"] {
+        assert!(model.fire(action, &mut evicted), "{action}: {evicted:?}");
+    }
+    assert_eq!(
+        evicted["alive"], 1,
+        "losing the oldest row is not losing the selection"
+    );
+    assert_eq!(evicted["truncated"], 1, "…and the loss is recorded");
+    assert_eq!(
+        evicted["sel_lo"], 1,
+        "…with the head clamped to the new floor"
+    );
+
+    // A bare modifier and ordinary output are both inert.
+    let mut inert = model.init_state();
+    for action in ["SelectHigh", "InertPress", "UniformScroll"] {
+        assert!(model.fire(action, &mut inert), "{action}: {inert:?}");
+    }
+    assert_eq!(
+        inert["alive"], 1,
+        "neither a modifier nor output may take it"
+    );
+
+    // Typing still deselects — the one handover, unchanged.
+    let mut typed = model.init_state();
+    for action in ["SelectHigh", "TypingPress"] {
+        assert!(model.fire(action, &mut typed), "{action}: {typed:?}");
+    }
+    assert_eq!(typed["alive"], 0, "typing still deselects");
+
+    // The buggy variant must violate the DISJOINT arm specifically — proving the
+    // model catches the real defect and not merely some arithmetic slip.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut over_cleared = buggy.init_state();
+    for action in ["SelectHigh", "RegionDamageLow"] {
+        assert!(buggy.fire(action, &mut over_cleared));
+    }
+    assert!(
+        !buggy.check_invariant("DisjointDamagePreserves", &over_cleared),
+        "the shipped sentinel cleared on damage it never touched; the model must say so"
+    );
+}
+
 /// SELECTION CUSTODY — a selection is scoped to the screen it was made on.
 ///
 /// The park is ASYMMETRIC on purpose: entering the alt screen takes the main
@@ -7296,6 +7373,173 @@ fn derived_cursor_move_candidate_proves_and_catches_timestamp_only_admission() {
     assert!(
         !buggy.check_invariant("UnownedContentRewriteRetiresResident", &fresh_buggy),
         "a freshly born segment is resident and must not survive the next unowned generation"
+    );
+}
+
+/// LIVENESS for the movement-admission confirm seam — the rainbow-trail
+/// blackout's lesson made checkable. 201449c2's model proved cold output never
+/// paints trails and nobody stated that a real echo ever ADMITS; every real
+/// interactive shell then produced echo shapes the idealized environment never
+/// contained, and a gate that provably never lied provably never spoke.
+///
+/// This drives [`typed_echo_liveness_model`]'s environment adversary through
+/// BOTH families:
+///   * SAFETY: cold/spinner/swallowed/deviating shapes stay dark (proven at
+///     Buggy=0, and deliberately ALSO at Buggy=1 — the mutant's whole point is
+///     that it is safe and mute).
+///   * LIVENESS: every handled shape (plain, E1 ghost text, E3 typed space on
+///     implicit blanks, E4 overtype) settles CONFIRMED; every run reaches a
+///     decision (`find_deadlock` with `settled = 1` as the final predicate).
+///   * NON-VACUITY: every adversary action fires in the committed variant, so
+///     no obligation is checked over an environment that never happens — the
+///     precise failure mode of the pre-blackout model.
+///   * REGISTERED STANDING GAPS, reprinted on every run and never waived
+///     silently: E2 (split-batch echo vs the strict generation law) and E5
+///     (multi-key stale anchor) settle RETIRED today; they and split-pane
+///     arming remain open follow-ups to the blackout repair.
+///
+/// `Buggy=1` restores the 201449c2 confirmation law verbatim; the catch comes
+/// from the LIVENESS family while every safety invariant still holds — pinned
+/// explicitly below so the model can never quietly degenerate into another
+/// safety-only proof.
+#[test]
+fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
+    let model = typed_echo_liveness_model();
+    assert_proves_and_catches(&model);
+
+    // EVENTUALITY: no reachable wedge short of a settled decision, in either
+    // variant — the mute mutant also settles; its defect is WHICH way.
+    for buggy in [0, 1] {
+        let m = aterm_spec::interp::with_buggy(&model, buggy);
+        let wedge = aterm_spec::interp::find_deadlock(&m, |s| s.get("settled") == Some(&1));
+        assert!(
+            wedge.is_none(),
+            "Buggy={buggy}: a run wedged before deciding: {wedge:?}"
+        );
+    }
+
+    // NON-VACUITY: every environment shape and every decision edge fires.
+    let fired = aterm_spec::interp::fired_actions(&model);
+    for action in [
+        "KeyPlainEcho",
+        "KeyGhostSuggest",
+        "KeySpaceOnBlanks",
+        "KeyOvertypeSuggestion",
+        "KeySplitEcho",
+        "KeyBurst",
+        "ColdSpinner",
+        "KeyEchoSwallowed",
+        "KeyDeviatingEcho",
+        "EchoPlain",
+        "EchoWithGhostText",
+        "EchoStorageGrowth",
+        "EchoNullDiffOvertype",
+        "EchoSplitBatches",
+        "EchoAfterBurst",
+        "ColdPaint",
+        "UnrelatedBatch",
+        "EchoDeviates",
+        "Decide",
+    ] {
+        assert!(
+            fired.contains(action),
+            "{action} never fires — the environment adversary is vacuous"
+        );
+    }
+
+    let run = |m: &Model, key: &str, echo: &str| {
+        let mut s = m.init_state();
+        assert!(m.fire(key, &mut s), "shape pick: {key}");
+        assert!(m.fire(echo, &mut s), "delivery: {echo}");
+        assert!(m.fire("Decide", &mut s), "decision after {echo}");
+        assert_eq!(s["settled"], 1);
+        s
+    };
+
+    // LIVENESS witnesses: each handled shape's echo confirms, concretely.
+    for (key, echo) in [
+        ("KeyPlainEcho", "EchoPlain"),
+        ("KeyGhostSuggest", "EchoWithGhostText"),
+        ("KeySpaceOnBlanks", "EchoStorageGrowth"),
+        ("KeyOvertypeSuggestion", "EchoNullDiffOvertype"),
+    ] {
+        let s = run(&model, key, echo);
+        assert_eq!(s["confirmed"], 1, "{key}: a handled real echo must admit");
+        assert_eq!(s["retired"], 0, "{key}: a confirmed echo is not also retired");
+    }
+
+    // SAFETY witnesses: the 201449c2 protections, concretely dark.
+    for (key, echo) in [
+        ("ColdSpinner", "ColdPaint"),
+        ("KeyEchoSwallowed", "UnrelatedBatch"),
+        ("KeyDeviatingEcho", "EchoDeviates"),
+    ] {
+        let s = run(&model, key, echo);
+        assert_eq!(s["confirmed"], 0, "{key}: must stay dark");
+    }
+
+    // REGISTERED STANDING FINDINGS — reprinted on every run so the honest
+    // limits of the shipped gate cannot fade into an implied "all handled".
+    for (key, echo, finding) in [
+        (
+            "KeySplitEcho",
+            "EchoSplitBatches",
+            "E2: an echo split across two PTY read batches (generation baseline+2) settles \
+             RETIRED — the strict next-generation law is a known liveness gap, follow-up to \
+             the 201449c2 blackout repair",
+        ),
+        (
+            "KeyBurst",
+            "EchoAfterBurst",
+            "E5: several keys between rendered frames leave a stale proof anchor and the \
+             capture declines — known liveness gap, follow-up alongside split-pane arming",
+        ),
+    ] {
+        let s = run(&model, key, echo);
+        assert_eq!(s["confirmed"], 0, "{key}: gap shape must not confirm today");
+        assert_eq!(s["retired"], 1, "{key}: gap shape settles retired, not undecided");
+        eprintln!("STANDING FINDING (registered, unresolved): {finding}");
+    }
+
+    // THE AUDITED DEFECT CLASS, pinned: the 201449c2 law is SAFE and MUTE.
+    // Every safety invariant holds on the mutant's E1/E3/E4 runs; only the
+    // liveness family catches it. A safety-only model calls this gate green.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    for (key, echo, liveness_invariant) in [
+        ("KeyGhostSuggest", "EchoWithGhostText", "LiveGhostTextConfirmsE1"),
+        ("KeySpaceOnBlanks", "EchoStorageGrowth", "LiveBlankSpaceConfirmsE3"),
+        (
+            "KeyOvertypeSuggestion",
+            "EchoNullDiffOvertype",
+            "LiveOvertypeConfirmsE4",
+        ),
+    ] {
+        let s = run(&buggy, key, echo);
+        assert_eq!(s["confirmed"], 0, "{key}: the 201449c2 law retires this echo");
+        for safety in [
+            "ColdSpinnerNeverConfirms",
+            "SwallowedEchoNeverConfirms",
+            "DeviatingEchoNeverConfirms",
+            "ConfirmIsWitnessed",
+            "SettledIsDecided",
+        ] {
+            assert!(
+                buggy.check_invariant(safety, &s),
+                "{key}: the mute mutant must PASS safety `{safety}` — its defect is liveness"
+            );
+        }
+        assert!(
+            !buggy.check_invariant(liveness_invariant, &s),
+            "{key}: only `{liveness_invariant}` catches the mute gate"
+        );
+    }
+    // The plain echo still confirms under the old law: the mutant was not a
+    // dead gate, it was a gate whose environment model missed every real shell.
+    let plain = run(&buggy, "KeyPlainEcho", "EchoPlain");
+    assert_eq!(
+        plain["confirmed"], 1,
+        "the 201449c2 law does confirm the idealized plain echo — that is why \
+         safety testing alone shipped it"
     );
 }
 

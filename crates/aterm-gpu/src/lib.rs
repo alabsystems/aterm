@@ -28,6 +28,9 @@ pub use renderer::{
 };
 /// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
 pub mod video_tap;
+/// COLD-BUILD sub-phase probe: the ns split of the one startup phase the
+/// frontend ledger could only see as a `join()` (see `startup_probe`).
+pub mod startup_probe;
 // TRUST_NATIVE_TLA Phase 2: the GPU-free slice-precondition decision (the real
 // `GpuEncode.tla` `NeverSliceEmpty` gate `InstanceBuf::upload` uses), re-exported so
 // the Tier-1 conformance test can drive the genuine decision headlessly.
@@ -372,7 +375,12 @@ impl GpuContext {
         if dx12_visual_swapchain_requested() {
             desc.backend_options.dx12.presentation_system = wgpu::Dx12SwapchainKind::DxgiFromVisual;
         }
-        let instance = wgpu::Instance::new(desc);
+        // The first timed leg of the cold build: backend enumeration + driver
+        // load. Everything from here to `from_parts` returning is inside the
+        // frontend's single `backend_finalize` number.
+        let instance = startup_probe::timed(startup_probe::Leg::GpuInstance, || {
+            wgpu::Instance::new(desc)
+        });
         #[allow(unused_mut, reason = "mutated only on the Windows visual-swapchain arm")]
         let mut ctx = pollster::block_on(Self::from_instance(instance))?;
         // The visual path is ACTIVE only if the DX12 backend actually won adapter
@@ -411,6 +419,7 @@ impl GpuContext {
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, String> {
+        let adapter_started = web_time::Instant::now();
         let adapter = match adapter_from_env(&instance).await {
             Some(adapter) => adapter,
             None => instance
@@ -423,6 +432,8 @@ impl GpuContext {
                 .map_err(|e| format!("no GPU adapter available: {e}"))?,
         };
         let info = adapter.get_info();
+        startup_probe::record(startup_probe::Leg::GpuAdapter, adapter_started.elapsed());
+        let device_started = web_time::Instant::now();
         // WebGL2 has no compute + lower texture/buffer ceilings, so `Limits::
         // default()` is unsatisfiable there (e.g. max_compute_workgroups_per_
         // dimension default 65535 vs WebGL2's 0) and device request fails. On
@@ -446,6 +457,8 @@ impl GpuContext {
             })
             .await
             .map_err(|e| e.to_string())?;
+        startup_probe::record(startup_probe::Leg::GpuDevice, device_started.elapsed());
+        let context_tail_started = web_time::Instant::now();
         // sRGB texture-VIEW aliasing requires VIEW_FORMATS; absent on GLES/WebGL2.
         let srgb_offscreen = adapter
             .get_downlevel_capabilities()
@@ -468,7 +481,7 @@ impl GpuContext {
                 flag.store(true, std::sync::atomic::Ordering::SeqCst);
             });
         }
-        Ok(Self {
+        let ctx = Self {
             device,
             queue,
             adapter_name: info.name,
@@ -480,7 +493,12 @@ impl GpuContext {
             // Seeded false; ONLY the native `new()` (which owns the descriptor
             // decision) upgrades it — the wasm/web path never has a DComp visual.
             visual_swapchain: false,
-        })
+        };
+        startup_probe::record(
+            startup_probe::Leg::GpuContextTail,
+            context_tail_started.elapsed(),
+        );
+        Ok(ctx)
     }
 
     /// Whether the GPU device has been reported lost since this context was created

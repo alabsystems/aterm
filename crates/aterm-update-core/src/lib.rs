@@ -36,6 +36,7 @@
 pub mod manifest;
 pub mod pins;
 pub mod roster;
+pub mod seal_guard;
 pub mod tag;
 pub mod token;
 

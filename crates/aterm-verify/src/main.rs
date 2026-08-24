@@ -105,7 +105,12 @@ fn resolve_scope(parsed: &cli::Args, root: &Path, env: &EnvSnapshot) -> (Scope, 
         return (Scope::from_option(parsed.scope.clone()), None);
     }
     let base = parsed.base_ref(env.verify_base.as_deref());
-    let tools = Toolchain::discover(env.trust_stage2_bin.as_deref(), &env.home, &env.path);
+    let tools = Toolchain::discover(
+        env.trust_stage2_bin.as_deref(),
+        &env.home,
+        &env.path,
+        aterm_verify::toolchain::pinned_channel(root).as_deref(),
+    );
     let path_env = tools.path_with_stage2_first(&env.path);
     let selection = changed::resolve(root, &tools, &path_env, &base);
     let (scope, report) = changed::stage_report(&base, &selection);

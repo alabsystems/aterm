@@ -293,6 +293,8 @@ const HELP_TAIL: &str = concat!(
     "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
     "              font_hinting (Linux: full | light | native | off;\n",
     "              aliases $ATERM_FONT_HINTING),\n",
+    "              font_subpixel (Linux CPU renderer: off | rgb | bgr;\n",
+    "              aliases $ATERM_FONT_SUBPIXEL),\n",
     "              font_variation [\"wght=450\", ...], font_weight,\n",
     "              font_weight_dark_nudge (variable fonts, e.g. SF Mono),\n",
     "              font_family_bold/_italic/_bold_italic, font_synthetic_style,\n",
@@ -458,6 +460,9 @@ const STARTER_CONFIG: &str = "\
 # font_hinting = \"full\"           # Linux grid fitting: full (crispest, default) | light
 #                                  # (hintslight look) | native (font bytecode) | off;
 #                                  # aliases $ATERM_FONT_HINTING (env wins)
+# font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):
+#                                  # off (default) | rgb | bgr; opaque frames only;
+#                                  # aliases $ATERM_FONT_SUBPIXEL (env wins)
 # font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default = Regular / wght=400)
 # font_weight = 450                # wght shorthand; wins over a font_variation wght entry
 # font_weight_dark_nudge = 0       # extra wght on DARK themes (applied only when grid-safe)

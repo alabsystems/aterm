@@ -681,6 +681,146 @@ impl SelectionClip {
     }
 }
 
+/// ONE pane's selection, already relocated into FRAME coordinates.
+///
+/// A composed split frame has as many live selections as it has panes, and each
+/// carries its own anchors, its own bounding rectangle and its own live OSC
+/// 17/19 colours. The scalar [`RenderInput::selection`] cannot represent that —
+/// it is one selection with one clip — so [`RenderInput::selections`] carries
+/// the per-pane list beside it, exactly as `default_bg_spans` carries the
+/// per-pane refinement of the scalar `default_bg`.
+///
+/// An EMPTY list is the historical scalar path, byte for byte: every
+/// single-terminal frame, wasm, and every direct `cell_frame_into` extraction
+/// leaves it empty and reads the scalars.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PaneSelection {
+    /// The pane's selection with its anchors already moved into FRAME rows and
+    /// columns (pane origin + that pane's `display_offset`).
+    pub selection: TextSelection,
+    /// The pane's half-open frame-space box. Always present: a list entry is
+    /// always bounded, because a pane that does not bound its selection would
+    /// tint its siblings. (The scalar `selection_clip`'s `None` means
+    /// "unbounded", which only a single-terminal frame may ever mean.)
+    pub clip: SelectionClip,
+    /// The pane's LIVE selection background (`0x00RRGGBB`), or [`COLOR_UNSET`]
+    /// to delegate to the renderer's theme policy — same encoding as
+    /// [`RenderInput::selection_bg`], read per ENTRY so an OSC 17 in one pane
+    /// cannot recolour a sibling's band.
+    pub bg: u32,
+    /// The pane's LIVE selected-text foreground, or [`COLOR_UNSET`] /
+    /// [`COLOR_DYNAMIC`] — same encoding as [`RenderInput::selection_fg`].
+    pub fg: u32,
+    /// Whether this pane is UNFOCUSED, so its band takes the renderer's
+    /// inactive selection colour (the same derivation an unfocused WINDOW
+    /// gets). Focus is a per-pane property in a split, and painting every
+    /// pane's selection in the active colour would erase the only cue for which
+    /// highlight the keyboard is about to extend.
+    pub inactive: bool,
+}
+
+/// The per-row, per-entry selection key the renderer's row-damage diff
+/// (`aterm_render::compute_dirty_rows`) compares.
+///
+/// [`RenderInput::selection_row_span`] is a HULL over every entry and therefore
+/// a SCAN WINDOW only: with two panes selected on one row, dragging one pane's
+/// edge inward can leave the hull's `(lo, hi)` unmoved, so an equality diff
+/// built on it would call two visibly different frames equal and freeze the
+/// highlight mid-drag. This key is per ENTRY and carries the colours, so it is
+/// lossless in both dimensions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectionRowKey {
+    /// First selected column on this frame row (inclusive, post-clip).
+    pub lo: u16,
+    /// Last selected column on this frame row (inclusive, post-clip).
+    pub hi: u16,
+    /// The entry's live selection background (or [`COLOR_UNSET`]).
+    pub bg: u32,
+    /// The entry's live selected-text foreground (or [`COLOR_UNSET`] /
+    /// [`COLOR_DYNAMIC`]).
+    pub fg: u32,
+    /// The entry's inactive flag — it selects a different band colour, so two
+    /// otherwise identical spans still render differently.
+    pub inactive: bool,
+}
+
+/// The inclusive selected column span ONE selection puts on ONE frame row.
+///
+/// Extracted verbatim from [`RenderInput::selection_row_span`] so the scalar
+/// path and every [`PaneSelection`] entry derive their span from the SAME
+/// arithmetic — a second copy is how a pane's highlight and its damage band
+/// start disagreeing. `display_offset` is the viewport projection to apply
+/// before consulting the selection (zero for entries, whose anchors the host
+/// already relocated into frame rows).
+fn selection_row_span_of(
+    selection: &TextSelection,
+    clip: Option<SelectionClip>,
+    display_offset: i32,
+    frame_row: usize,
+) -> Option<(u16, u16)> {
+    use crate::selection::SelectionType;
+
+    if !selection.has_selection() {
+        return None;
+    }
+    let selection_row = i32::try_from(frame_row)
+        .unwrap_or(i32::MAX)
+        .saturating_sub(display_offset);
+    let (mut lo, mut hi) = match selection.selection_type() {
+        SelectionType::Lines => {
+            let (start_row, _, end_row, _) = selection.normalized_bounds();
+            if selection_row < start_row || selection_row > end_row {
+                return None;
+            }
+            (0, u16::MAX)
+        }
+        SelectionType::Block => {
+            let (start_row, start_col, end_row, end_col) = selection.side_adjusted_bounds()?;
+            if selection_row < start_row.min(end_row) || selection_row > start_row.max(end_row) {
+                return None;
+            }
+            (
+                start_col.min(end_col).saturating_sub(1),
+                start_col.max(end_col).saturating_add(1),
+            )
+        }
+        _ => {
+            let (start_row, start_col, end_row, end_col) = selection.side_adjusted_bounds()?;
+            if selection_row < start_row || selection_row > end_row {
+                return None;
+            }
+            (
+                if selection_row == start_row {
+                    start_col
+                } else {
+                    0
+                },
+                if selection_row == end_row {
+                    end_col
+                } else {
+                    u16::MAX
+                },
+            )
+        }
+    };
+
+    if let Some(clip) = clip {
+        if frame_row < clip.row_start || frame_row >= clip.row_end || clip.col_start >= clip.col_end
+        {
+            return None;
+        }
+        let clip_lo = u16::try_from(clip.col_start).ok()?;
+        let clip_hi_exclusive = clip.col_end.min(usize::from(u16::MAX).saturating_add(1));
+        if clip_hi_exclusive == 0 {
+            return None;
+        }
+        let clip_hi = u16::try_from(clip_hi_exclusive - 1).unwrap_or(u16::MAX);
+        lo = lo.max(clip_lo);
+        hi = hi.min(clip_hi);
+    }
+    (lo <= hi).then_some((lo, hi))
+}
+
 /// Everything a renderer reads from a `&Terminal` for one frame, snapshotted into
 /// plain owned data — the engine emits it via [`crate::terminal::Terminal::cell_frame_into`].
 ///
@@ -982,6 +1122,22 @@ pub struct RenderInput {
     /// [`COLOR_UNSET`] delegates to the renderer's configured policy;
     /// [`COLOR_DYNAMIC`] explicitly selects the automatic WCAG contrast floor.
     pub selection_fg: u32,
+    /// EVERY visible pane's selection, already relocated into FRAME
+    /// coordinates and each carrying its OWN clip and live colours.
+    ///
+    /// EMPTY is the historical scalar path, byte for byte: the four scalar
+    /// fields above are then the whole authority, which is what every
+    /// single-terminal frame (and every direct `cell_frame_into` extraction)
+    /// produces. A composed split frame fills this instead — one entry per
+    /// pane that HAS a selection — because a split has as many live selections
+    /// as it has panes and no scalar can carry them. Same idiom, same reason,
+    /// as [`default_bg_spans`](Self::default_bg_spans) refining `default_bg`.
+    ///
+    /// The scalars are still stamped from the FOCUSED pane when this list is
+    /// non-empty, so the single-authority consumers that predate splits keep an
+    /// unchanged anchor; every RENDERER predicate reads the list when it is
+    /// non-empty and the scalars only when it is empty.
+    pub selections: Vec<PaneSelection>,
     /// Per-row, sparse emoji grapheme-cluster strings (`term.cluster_row(r)`):
     /// `(col, cluster)` for cells whose combining marks form a ZWJ / skin-tone /
     /// keycap sequence. The renderer shapes each to a single colour glyph; cells
@@ -1249,6 +1405,7 @@ impl Clone for RenderInput {
             selection_clip: self.selection_clip,
             selection_bg: self.selection_bg,
             selection_fg: self.selection_fg,
+            selections: self.selections.clone(),
             clusters: self.clusters.clone(),
             combining: self.combining.clone(),
             line_sizes: self.line_sizes.clone(),
@@ -1322,6 +1479,7 @@ impl Clone for RenderInput {
         self.selection_clip = source.selection_clip;
         self.selection_bg = source.selection_bg;
         self.selection_fg = source.selection_fg;
+        self.selections.clone_from(&source.selections);
         self.clusters.clone_from(&source.clusters);
         self.combining.clone_from(&source.combining);
         self.line_sizes.clone_from(&source.line_sizes);
@@ -1452,6 +1610,7 @@ impl PartialEq for RenderInput {
             && self.selection_clip == other.selection_clip
             && self.selection_bg == other.selection_bg
             && self.selection_fg == other.selection_fg
+            && self.selections == other.selections
             && self.clusters == other.clusters
             && self.combining == other.combining
             && self.line_sizes == other.line_sizes
@@ -1543,6 +1702,7 @@ impl RenderInput {
             selection_clip: None,
             selection_bg: COLOR_UNSET,
             selection_fg: COLOR_UNSET,
+            selections: Vec::new(),
             clusters: Vec::new(),
             combining: Vec::new(),
             line_sizes: Vec::new(),
@@ -1564,12 +1724,84 @@ impl RenderInput {
         }
     }
 
-    /// Whether a frame-space cell is selected after applying both the terminal's
-    /// logical selection and any host composition clip.
+    /// Whether ANY selection is live on this frame — the scalar one or any pane
+    /// entry. The gate every renderer uses before entering selection-aware work
+    /// (the sparkle freeze, the ligature breaks, the E7 scroll-blit veto).
+    #[must_use]
+    #[inline]
+    pub fn any_selection(&self) -> bool {
+        self.selection.has_selection() || !self.selections.is_empty()
+    }
+
+    /// Which selection paints a frame-space cell, as an index usable with
+    /// [`Self::selection_colors_at`] — `None` when the cell is unselected.
     ///
     /// This is the single renderer predicate: CPU and GPU callers pass the frame
     /// row/column they are about to paint, and this method performs the viewport
     /// (`display_offset`) projection before consulting [`TextSelection`].
+    ///
+    /// With [`selections`](Self::selections) EMPTY it is exactly the historical
+    /// scalar test and answers `Some(0)`; with entries present it returns the
+    /// FIRST entry whose clip and selection both accept the cell. Pane clips are
+    /// disjoint by construction (each is its pane's box), so "first" is also
+    /// "only" — the scan order is fixed purely so the answer is deterministic if
+    /// a host ever hands over overlapping boxes.
+    #[must_use]
+    #[inline]
+    pub fn selection_hit(
+        &self,
+        frame_row: usize,
+        frame_col: usize,
+        is_wide: bool,
+        is_wide_continuation: bool,
+    ) -> Option<usize> {
+        if self.selections.is_empty() {
+            // The historical scalar path, in its original order (clip first, so a
+            // clipped-away cell still costs one rectangle test) — this runs per
+            // painted cell on every single-terminal frame.
+            if self
+                .selection_clip
+                .is_some_and(|clip| !clip.contains(frame_row, frame_col))
+            {
+                return None;
+            }
+            let selection_row = i32::try_from(frame_row)
+                .unwrap_or(i32::MAX)
+                .saturating_sub(self.display_offset);
+            let Ok(selection_col) = u16::try_from(frame_col) else {
+                return None;
+            };
+            return self
+                .selection
+                .contains_cell(selection_row, selection_col, is_wide, is_wide_continuation)
+                .then_some(0);
+        }
+        // Entry anchors were relocated into FRAME rows by the host (pane origin +
+        // that pane's own `display_offset`), so no second viewport projection
+        // applies here; a composed frame's own `display_offset` is zero for
+        // exactly this reason.
+        let selection_row = i32::try_from(frame_row).unwrap_or(i32::MAX);
+        let Ok(selection_col) = u16::try_from(frame_col) else {
+            return None;
+        };
+        self.selections.iter().position(|entry| {
+            entry.clip.contains(frame_row, frame_col)
+                && entry.selection.contains_cell(
+                    selection_row,
+                    selection_col,
+                    is_wide,
+                    is_wide_continuation,
+                )
+        })
+    }
+
+    /// Whether a frame-space cell is selected after applying both the terminal's
+    /// logical selection and any host composition clip.
+    ///
+    /// The boolean face of [`Self::selection_hit`] — every caller that paints a
+    /// cell without needing to know WHICH pane owns it. One predicate, two
+    /// backends: CPU/GPU parity holds by construction because both go through
+    /// here.
     #[must_use]
     #[inline]
     pub fn selection_contains_cell(
@@ -1579,99 +1811,103 @@ impl RenderInput {
         is_wide: bool,
         is_wide_continuation: bool,
     ) -> bool {
-        if self
-            .selection_clip
-            .is_some_and(|clip| !clip.contains(frame_row, frame_col))
-        {
-            return false;
+        self.selection_hit(frame_row, frame_col, is_wide, is_wide_continuation)
+            .is_some()
+    }
+
+    /// The `(bg, fg, inactive)` selection colour authority behind the index
+    /// [`Self::selection_hit`] returned — the entry's own live OSC 17/19 state
+    /// in a split, the scalar fields on a single-terminal frame. Colours are
+    /// still RESOLVED by the renderer (theme, active/inactive policy); this only
+    /// says which terminal's values feed that resolution.
+    #[must_use]
+    #[inline]
+    pub fn selection_colors_at(&self, index: usize) -> (u32, u32, bool) {
+        match self.selections.get(index) {
+            Some(entry) => (entry.bg, entry.fg, entry.inactive),
+            None => (self.selection_bg, self.selection_fg, false),
         }
-        let selection_row = i32::try_from(frame_row)
-            .unwrap_or(i32::MAX)
-            .saturating_sub(self.display_offset);
-        let Ok(selection_col) = u16::try_from(frame_col) else {
-            return false;
-        };
-        self.selection
-            .contains_cell(selection_row, selection_col, is_wide, is_wide_continuation)
     }
 
     /// The inclusive selected column span on one FRAME row after applying the
     /// viewport projection and optional split-composition clip.
     ///
+    /// **SCAN WINDOW, not an equality key.** With
+    /// [`selections`](Self::selections) non-empty this is the HULL over every
+    /// pane's span on the row, so two panes selected on one row report one
+    /// merged `(lo, hi)`. That is correct for the only two callers — the CPU and
+    /// GPU sparse-tail guards, which re-test every cell with
+    /// [`Self::selection_contains_cell`] — and WRONG for any diff, because a
+    /// hull can stay fixed while a pane's real span moves inside it. Damage
+    /// diffs use [`Self::selection_row_key`].
+    ///
     /// The span is content-independent and conservatively covers
     /// [`TextSelection`]'s row predicates. Block selections expand one column on
     /// each side before clipping, because a wide lead/continuation can snap one
-    /// adjacent cell into the painted selection. Renderers use it both for
-    /// row-scoped damage and to skip sparse implicit tails on rows the selection
-    /// cannot reach.
+    /// adjacent cell into the painted selection.
     #[must_use]
     pub fn selection_row_span(&self, frame_row: usize) -> Option<(u16, u16)> {
-        use crate::selection::SelectionType;
-
-        if !self.selection.has_selection() {
-            return None;
+        if self.selections.is_empty() {
+            return selection_row_span_of(
+                &self.selection,
+                self.selection_clip,
+                self.display_offset,
+                frame_row,
+            );
         }
-        let selection_row = i32::try_from(frame_row)
-            .unwrap_or(i32::MAX)
-            .saturating_sub(self.display_offset);
-        let (mut lo, mut hi) = match self.selection.selection_type() {
-            SelectionType::Lines => {
-                let (start_row, _, end_row, _) = self.selection.normalized_bounds();
-                if selection_row < start_row || selection_row > end_row {
-                    return None;
-                }
-                (0, u16::MAX)
-            }
-            SelectionType::Block => {
-                let (start_row, start_col, end_row, end_col) =
-                    self.selection.side_adjusted_bounds()?;
-                if selection_row < start_row.min(end_row) || selection_row > start_row.max(end_row)
-                {
-                    return None;
-                }
-                (
-                    start_col.min(end_col).saturating_sub(1),
-                    start_col.max(end_col).saturating_add(1),
-                )
-            }
-            _ => {
-                let (start_row, start_col, end_row, end_col) =
-                    self.selection.side_adjusted_bounds()?;
-                if selection_row < start_row || selection_row > end_row {
-                    return None;
-                }
-                (
-                    if selection_row == start_row {
-                        start_col
-                    } else {
-                        0
-                    },
-                    if selection_row == end_row {
-                        end_col
-                    } else {
-                        u16::MAX
-                    },
-                )
-            }
-        };
+        self.selections
+            .iter()
+            .filter_map(|entry| {
+                selection_row_span_of(&entry.selection, Some(entry.clip), 0, frame_row)
+            })
+            .reduce(|(a_lo, a_hi), (b_lo, b_hi)| (a_lo.min(b_lo), a_hi.max(b_hi)))
+    }
 
-        if let Some(clip) = self.selection_clip {
-            if frame_row < clip.row_start
-                || frame_row >= clip.row_end
-                || clip.col_start >= clip.col_end
+    /// The LOSSLESS per-row selection damage key: one
+    /// [`SelectionRowKey`] per selection that reaches frame row `frame_row`, in
+    /// list order, with the colours that band will paint in.
+    ///
+    /// This is what a damage diff must compare. Unlike
+    /// [`Self::selection_row_span`] it never merges two panes' spans, so
+    /// dragging one pane's edge inward while a sibling holds a selection on the
+    /// same row changes the key even though the hull is unmoved — the frozen
+    /// highlight that a hull-based diff produces. Carrying the colours folds the
+    /// old scalar `selection_bg`/`selection_fg` damage trigger in, which likewise
+    /// goes lossy the moment colours are per-pane.
+    ///
+    /// Writes into `out` (cleared first) so a per-frame diff allocates once.
+    pub fn selection_row_key(&self, frame_row: usize, out: &mut Vec<SelectionRowKey>) {
+        out.clear();
+        if self.selections.is_empty() {
+            if let Some((lo, hi)) = selection_row_span_of(
+                &self.selection,
+                self.selection_clip,
+                self.display_offset,
+                frame_row,
+            ) {
+                out.push(SelectionRowKey {
+                    lo,
+                    hi,
+                    bg: self.selection_bg,
+                    fg: self.selection_fg,
+                    inactive: false,
+                });
+            }
+            return;
+        }
+        for entry in &self.selections {
+            if let Some((lo, hi)) =
+                selection_row_span_of(&entry.selection, Some(entry.clip), 0, frame_row)
             {
-                return None;
+                out.push(SelectionRowKey {
+                    lo,
+                    hi,
+                    bg: entry.bg,
+                    fg: entry.fg,
+                    inactive: entry.inactive,
+                });
             }
-            let clip_lo = u16::try_from(clip.col_start).ok()?;
-            let clip_hi_exclusive = clip.col_end.min(usize::from(u16::MAX).saturating_add(1));
-            if clip_hi_exclusive == 0 {
-                return None;
-            }
-            let clip_hi = u16::try_from(clip_hi_exclusive - 1).unwrap_or(u16::MAX);
-            lo = lo.max(clip_lo);
-            hi = hi.min(clip_hi);
         }
-        (lo <= hi).then_some((lo, hi))
     }
 
     /// Drop every host-owned VISUAL BLING layer, leaving only the terminal cell content
@@ -2362,7 +2598,7 @@ mod line_size_span_tests {
 
 #[cfg(test)]
 mod default_bg_span_tests {
-    use super::{DefaultBgSpan, RenderInput, SelectionClip};
+    use super::{DefaultBgSpan, PaneSelection, RenderInput, SelectionClip};
 
     #[test]
     fn lookup_uses_owning_pane_and_falls_back_for_gaps_or_malformed_spans() {
@@ -2407,6 +2643,13 @@ mod default_bg_span_tests {
         source.selection_bg = 0x0001_0203;
         source.selection_fg = 0x0004_0506;
         source.selection_clip = Some(SelectionClip::new(0, 1, 4, 8));
+        source.selections = vec![PaneSelection {
+            selection: crate::selection::TextSelection::new(),
+            clip: SelectionClip::new(0, 1, 4, 8),
+            bg: 0x0001_0203,
+            fg: 0x0004_0506,
+            inactive: true,
+        }];
         source.default_bg_spans = vec![vec![
             DefaultBgSpan::new(0, 4, 0x0011_2233),
             DefaultBgSpan::new(4, 8, 0x0044_5566),
@@ -2417,15 +2660,24 @@ mod default_bg_span_tests {
         assert_eq!(cloned.selection_bg, source.selection_bg);
         assert_eq!(cloned.selection_fg, source.selection_fg);
         assert_eq!(cloned.selection_clip, source.selection_clip);
+        assert_eq!(cloned.selections, source.selections);
         assert_eq!(cloned, source);
 
         let mut reused = RenderInput::empty();
         reused.default_bg_spans = vec![vec![DefaultBgSpan::new(0, 99, 0x00aa_bbcc)]];
+        reused.selections = vec![PaneSelection {
+            selection: crate::selection::TextSelection::new(),
+            clip: SelectionClip::new(9, 9, 9, 9),
+            bg: 0,
+            fg: 0,
+            inactive: false,
+        }];
         reused.clone_from(&source);
         assert_eq!(reused.default_bg_spans, source.default_bg_spans);
         assert_eq!(reused.selection_bg, source.selection_bg);
         assert_eq!(reused.selection_fg, source.selection_fg);
         assert_eq!(reused.selection_clip, source.selection_clip);
+        assert_eq!(reused.selections, source.selections);
         assert_eq!(reused, source);
 
         let mut changed = source.clone();
@@ -2449,13 +2701,42 @@ mod default_bg_span_tests {
             changed, source,
             "split selection bounds change rendered pixels"
         );
+
+        // Every field of a per-pane entry paints, so every one moves `PartialEq`
+        // — a silent drop here is a stale highlight in the renderer's cached
+        // prior frame, the exact class `clone_from`'s doc records.
+        let mut changed = source.clone();
+        changed.selections[0].clip = SelectionClip::new(0, 1, 5, 8);
+        assert_ne!(changed, source, "a pane's selection box changes pixels");
+
+        let mut changed = source.clone();
+        changed.selections[0].bg ^= 0x0001_0101;
+        assert_ne!(changed, source, "a pane's live selection bg changes pixels");
+
+        let mut changed = source.clone();
+        changed.selections[0].fg ^= 0x0001_0101;
+        assert_ne!(changed, source, "a pane's live selection fg changes pixels");
+
+        let mut changed = source.clone();
+        changed.selections[0].inactive = false;
+        assert_ne!(
+            changed, source,
+            "a pane's focus selects a different band colour"
+        );
+
+        let mut changed = source.clone();
+        changed.selections.clear();
+        assert_ne!(
+            changed, source,
+            "dropping the list hands the frame back to the scalar authority"
+        );
     }
 }
 
 #[cfg(test)]
 mod selection_clip_tests {
-    use super::{RenderInput, SelectionClip};
-    use crate::selection::{SelectionSide, SelectionType};
+    use super::{COLOR_UNSET, PaneSelection, RenderInput, SelectionClip, SelectionRowKey};
+    use crate::selection::{SelectionSide, SelectionType, TextSelection};
 
     #[test]
     fn multiline_selection_is_confined_to_its_frame_rectangle() {
@@ -2489,6 +2770,152 @@ mod selection_clip_tests {
         assert!(
             !input.selection_contains_cell(4, 7, false, false),
             "rows below the focused pane stay unselected"
+        );
+    }
+
+    /// Two panes selected on one frame row: the predicate resolves each cell to
+    /// the pane that owns it, the hull spans BOTH (a scan window), and the
+    /// per-entry key keeps them apart (an equality key).
+    #[test]
+    fn per_pane_selections_resolve_per_cell_while_the_span_is_a_hull() {
+        let pane = |lo: u16, hi: u16, clip: SelectionClip, bg: u32| {
+            let mut selection = TextSelection::new();
+            selection.start_selection(1, lo, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(1, hi, SelectionSide::Right);
+            selection.complete_selection();
+            PaneSelection {
+                selection,
+                clip,
+                bg,
+                fg: COLOR_UNSET,
+                inactive: bg != COLOR_UNSET,
+            }
+        };
+
+        let mut input = RenderInput::empty();
+        input.rows = 3;
+        input.cols = 12;
+        input.selections = vec![
+            pane(0, 3, SelectionClip::new(1, 2, 0, 5), COLOR_UNSET),
+            pane(7, 11, SelectionClip::new(1, 2, 7, 12), 0x0011_2233),
+        ];
+
+        assert_eq!(input.selection_hit(1, 2, false, false), Some(0));
+        assert_eq!(input.selection_hit(1, 9, false, false), Some(1));
+        assert_eq!(
+            input.selection_hit(1, 6, false, false),
+            None,
+            "the divider gap between the two panes belongs to neither"
+        );
+        assert_eq!(
+            input.selection_hit(0, 2, false, false),
+            None,
+            "a row outside both boxes is unselected"
+        );
+        assert_eq!(
+            input.selection_colors_at(1),
+            (0x0011_2233, COLOR_UNSET, true),
+            "colours come from the entry the hit named"
+        );
+
+        assert_eq!(
+            input.selection_row_span(1),
+            Some((0, 11)),
+            "the span is the HULL over both panes — a scan window, not a key"
+        );
+        let mut key = Vec::new();
+        input.selection_row_key(1, &mut key);
+        assert_eq!(
+            key,
+            vec![
+                SelectionRowKey {
+                    lo: 0,
+                    hi: 3,
+                    bg: COLOR_UNSET,
+                    fg: COLOR_UNSET,
+                    inactive: false,
+                },
+                SelectionRowKey {
+                    lo: 7,
+                    hi: 11,
+                    bg: 0x0011_2233,
+                    fg: COLOR_UNSET,
+                    inactive: true,
+                },
+            ],
+            "the key keeps the two panes' spans and colours separate"
+        );
+        input.selection_row_key(2, &mut key);
+        assert!(key.is_empty(), "a row no pane reaches keys empty");
+    }
+
+    /// An EMPTY list is the historical scalar path, byte for byte: the scalar
+    /// selection is still the whole authority, and `any_selection` agrees.
+    #[test]
+    fn an_empty_pane_list_leaves_the_scalar_path_untouched() {
+        let mut input = RenderInput::empty();
+        input.rows = 2;
+        input.cols = 4;
+        input
+            .selection
+            .start_selection(0, 1, SelectionSide::Left, SelectionType::Simple);
+        input.selection.update_selection(0, 2, SelectionSide::Right);
+        input.selection.complete_selection();
+
+        assert!(input.any_selection());
+        assert_eq!(input.selection_hit(0, 1, false, false), Some(0));
+        assert_eq!(input.selection_row_span(0), Some((1, 2)));
+        assert_eq!(
+            input.selection_colors_at(0),
+            (COLOR_UNSET, COLOR_UNSET, false)
+        );
+
+        // A non-empty list REPLACES the scalar authority entirely.
+        input.selections = vec![PaneSelection {
+            selection: TextSelection::new(),
+            clip: SelectionClip::new(0, 2, 0, 4),
+            bg: COLOR_UNSET,
+            fg: COLOR_UNSET,
+            inactive: false,
+        }];
+        assert!(
+            !input.selection_contains_cell(0, 1, false, false),
+            "the list is the authority once it is non-empty"
+        );
+        assert!(input.any_selection(), "…and it still counts as a selection");
+
+        // The LIST clause of `any_selection` on its own — scalar EMPTY, one live
+        // entry. This is the shape a composed frame takes for an UNFOCUSED pane, and
+        // it is what the renderer's frame gates read: `scroll_blittable_content`'s
+        // E7 blit veto, the additive-sparkle freeze, and the ligature-break pass all
+        // ask `any_selection()`. Before the list existed they asked
+        // `selection.has_selection()`, which is FALSE here — so without this clause
+        // an unfocused pane's highlight could be scroll-blitted straight over.
+        let mut list_only = RenderInput::empty();
+        list_only.rows = 2;
+        list_only.cols = 4;
+        assert!(
+            !list_only.any_selection(),
+            "precondition: nothing selected at all"
+        );
+        let mut only = TextSelection::new();
+        only.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+        only.update_selection(0, 2, SelectionSide::Right);
+        only.complete_selection();
+        list_only.selections = vec![PaneSelection {
+            selection: only,
+            clip: SelectionClip::new(0, 2, 0, 4),
+            bg: COLOR_UNSET,
+            fg: COLOR_UNSET,
+            inactive: true,
+        }];
+        assert!(
+            !list_only.selection.has_selection(),
+            "the scalar is empty — only the list carries a selection"
+        );
+        assert!(
+            list_only.any_selection(),
+            "an unfocused pane's selection must still gate the frame-wide passes"
         );
     }
 }

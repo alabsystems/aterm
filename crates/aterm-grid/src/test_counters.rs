@@ -197,10 +197,43 @@ pub(crate) fn take_reflow_passthrough_lines() -> usize {
     })
 }
 
+// Counter for ring rows a ROWS-ONLY resize evacuates out of the grid ring (the
+// second half of the resize bounded-cost obligation — see
+// `tests/reflow/rows_only_cost_bound.rs`).
+//
+// `SCROLLBACK_REFLOW_SYNC_LINES` above instruments the WIDTH reflow only, so a
+// rows-only resize incremented nothing and the gate reported 0 — which reads as
+// proof of O(viewport) when it actually means "not instrumented". It was not:
+// `adjust_row_count` compared the FULL ring length against the new VISIBLE row
+// target, so every rows-only resize (window-height drag, pane split/close,
+// divider drag, find-bar toggle) migrated the entire ring — ~9,999 rows at the
+// GUI's 10,000-line ring — into the tiered store synchronously under the
+// caller's lock. This counter closes that hole: it must stay bounded by the
+// HEIGHT DELTA, never by history.
+thread_local! {
+    static ROWS_ONLY_RESIZE_MIGRATED_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Increment the synchronous-scrollback-reflow counter by `n` (history lines
 /// rewrapped on the caller's thread inside `Grid::resize`).
 pub(crate) fn count_scrollback_reflow_sync_lines(n: usize) {
     SCROLLBACK_REFLOW_SYNC_LINES.with(|c| c.set(c.get() + n));
+}
+
+/// Increment the rows-only-resize migration counter by `n` (ring rows evacuated
+/// out of the ring on the caller's thread inside a rows-only `Grid::resize`).
+pub(crate) fn count_rows_only_resize_migrated_rows(n: usize) {
+    ROWS_ONLY_RESIZE_MIGRATED_ROWS.with(|c| c.set(c.get() + n));
+}
+
+/// Take (read and reset) the rows-only-resize migration count.
+#[cfg(test)]
+pub(crate) fn take_rows_only_resize_migrated_rows() -> usize {
+    ROWS_ONLY_RESIZE_MIGRATED_ROWS.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
 }
 
 /// Take (read and reset) the synchronous-scrollback-reflow line count.
@@ -243,6 +276,43 @@ pub(crate) fn count_ring_fast_materialize() {
 #[cfg(feature = "testing")]
 pub fn take_ring_fast_materialize() -> usize {
     RING_FAST_MATERIALIZE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    })
+}
+
+// Counter for HISTORY ROWS MATERIALIZED from the 3-tier store to answer a
+// scrolled-back viewport read (`Grid::materialized_history_row`) — the SCR-1
+// number, and the one this campaign moved from 24 per repaint to 0.
+//
+// WHAT IS COUNTED, PRECISELY, AND WHY THE DISTINCTION IS THE WHOLE POINT: the
+// MISSES. A memo HIT does not increment, and in debug builds a hit still runs a
+// full re-materialize (the stale-row net in `viewport_row_cache`'s module docs)
+// — so a counter placed one level down, inside
+// `materialize_scrollback_row_full`, would count that net and report 24 in
+// exactly the build a test runs in. It would look like the fix had never
+// landed. This counter sits at the two sites that do REAL work for the frame:
+// the memo miss, and the unkeyable read-through.
+thread_local! {
+    static VIEWPORT_ROW_MATERIALIZE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Increment the scrolled-back history-row materialize counter.
+pub(crate) fn count_viewport_row_materialize() {
+    VIEWPORT_ROW_MATERIALIZE.with(|c| c.set(c.get() + 1));
+}
+
+/// Take (read and reset) the scrolled-back history-row materialize count.
+///
+/// `pub` under the `testing` feature (like its `take_ring_fast_materialize`
+/// sibling, and for the same reason): the claim is about a FRAME, and only a
+/// downstream aterm-core test can drive `Terminal::cell_frame_into` over real
+/// parsed scrollback — which is the only thing that makes "materializations per
+/// frame" a measurement of the product rather than of a fixture.
+#[cfg(feature = "testing")]
+pub fn take_viewport_row_materialize() -> usize {
+    VIEWPORT_ROW_MATERIALIZE.with(|c| {
         let v = c.get();
         c.set(0);
         v

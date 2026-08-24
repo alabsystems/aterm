@@ -767,6 +767,11 @@ fn write_capped(
             hasher.update(chunk);
         }
         f.write_all(chunk)?;
+        // Live-progress meter (R5): this is the ONE in-process byte loop of an
+        // install, so the extract phase's honest byte source is exactly here. One
+        // relaxed atomic load per 64 KiB chunk when no `--progress-file` pass is
+        // live — unmeasurable next to the decompress and the write it sits between.
+        crate::progress::extract_tick(n);
     }
     // Force the sanitized mode even if umask or a pre-existing file loosened it.
     crate::platform::set_mode(dest, mode)?;

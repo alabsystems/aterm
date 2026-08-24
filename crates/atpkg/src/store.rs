@@ -232,6 +232,25 @@ impl Layout {
         self.prefix.join("status.toml")
     }
 
+    /// `progress.json` — the LIVE install-progress snapshot ([`crate::progress`]), the
+    /// in-flight complement to [`Self::status`]'s durable per-pass record. Written only
+    /// by the process holding the store flock (via `--progress-file`); read by the GUI
+    /// card, the pending-program stubs (`atpkg __pending`), and anyone tailing it —
+    /// all under the untrusted-reader rules the progress module documents.
+    #[must_use]
+    pub fn progress_file(&self) -> PathBuf {
+        self.prefix.join("progress.json")
+    }
+
+    /// `bump` — the priority-queue channel ([`crate::progress`]): one program name per
+    /// line, appended by pending-program stubs, consumed by the installer between
+    /// items. Reorder-only by construction — the installer intersects it with the work
+    /// the signed index already planned, so this file can never ADD work.
+    #[must_use]
+    pub fn bump_file(&self) -> PathBuf {
+        self.prefix.join("bump")
+    }
+
     /// `adopted` — the durable marker that this machine RUNS THE ALAB TOOLSET, as a set
     /// rather than as a handful of individually-chosen programs (§11).
     ///

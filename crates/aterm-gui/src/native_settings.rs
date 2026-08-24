@@ -8303,14 +8303,28 @@ fn top_section_card(
             top_card(
                 "system-appearance",
                 "Window appearance",
+                // The Linux sentence tells the Linux truth (2026-08 settings
+                // audit): there is no live OS-appearance feed under winit's
+                // Wayland backend, so Automatic follows the TERMINAL THEME's
+                // darkness (`chrome_theme_for_apprt`), and an explicit Light/
+                // Dark forces the titlebar, the tab band AND these Settings
+                // pages together (`chrome_palette_theme`).
                 detail(
                     if cfg!(target_os = "macos") {
                         "Automatic follows macOS. Light and Dark fix the window; terminal colors stay independent."
+                    } else if cfg!(target_os = "linux") {
+                        // "the window" = titlebar + tab band + native pages
+                        // (`chrome_palette_theme`); enumerating them here
+                        // ellipsized at half-grid widths, so the sentence keeps
+                        // the load-bearing truth: Automatic ≠ the OS.
+                        "Automatic matches the terminal theme. Light and Dark fix the window; terminal colors stay independent."
                     } else {
                         "Automatic follows the system. Light and Dark fix the window; terminal colors stay independent."
                     },
                     if cfg!(target_os = "macos") {
                         "Follow macOS, Light, or Dark."
+                    } else if cfg!(target_os = "linux") {
+                        "Match the terminal, Light, or Dark."
                     } else {
                         "Follow the system, Light, or Dark."
                     },
@@ -9050,6 +9064,10 @@ fn top_settings_page(
                 // instead of ellipsizing (2026-08 settings audit).
                 Some(if cfg!(target_os = "macos") {
                     "Choose colors. Appearance can follow macOS, Light, or Dark."
+                } else if cfg!(target_os = "linux") {
+                    // The Linux truth (2026-08 settings audit): Automatic tracks
+                    // the terminal theme, not a live OS appearance feed.
+                    "Choose colors. Appearance can match the terminal, Light, or Dark."
                 } else {
                     "Choose colors. Appearance can follow your system, Light, or Dark."
                 }),
@@ -16738,7 +16756,18 @@ mod tests {
             (prefs::EDIT_CURSOR_COLOR, "#FF00FF"),
             (prefs::EDIT_SELECTION_COLOR, "#335577"),
             (prefs::EDIT_SELECTION_FOREGROUND, "#00FF66"),
-            (prefs::EDIT_WINDOW_THEME, "dark"),
+            // The candidate must land OPPOSITE the side Auto resolves to, or
+            // the sample titlebar cannot move: on Linux Auto follows the dark
+            // host terminal theme (`window_sample_light`), elsewhere it follows
+            // the host OS appearance, Light in this fixture.
+            (
+                prefs::EDIT_WINDOW_THEME,
+                if cfg!(target_os = "linux") {
+                    "light"
+                } else {
+                    "dark"
+                },
+            ),
             // 10, not 4.5: the default palette is deliberately lifted so every
             // ANSI token already reaches ~4.5:1 on the dark bg (see
             // `aterm_types::color_palette`) — a 4.5 floor is pixel-neutral by
