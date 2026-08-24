@@ -38,7 +38,7 @@ mod edge;
 mod id;
 pub mod sink;
 
-pub use edge::{Edge, EdgeDecision, EdgeTable, EdgeToken, Op, decide_edge};
+pub use edge::{ConnectionKind, Edge, EdgeDecision, EdgeTable, EdgeToken, Op, decide_edge};
 pub use id::{LaunchNonce, SessionId};
 
 /// Lowercase-hex digit for a nibble value (low 4 bits; the mask is a no-op at

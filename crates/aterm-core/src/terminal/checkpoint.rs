@@ -340,17 +340,29 @@ impl Terminal {
     #[must_use]
     pub fn checkpoint_carry(&self, max_history: usize) -> Option<TerminalCheckpoint> {
         self.parser_is_ground()
-            .then(|| self.checkpoint_bounded(max_history))
+            .then(|| self.checkpoint_bounded(max_history, 0))
     }
 
     fn checkpoint_with_scrollback(&self, include_scrollback: bool) -> TerminalCheckpoint {
         // `bounded(MAX)` is exactly the full history and `bounded(0)` exactly the
-        // visible screen, so one parameter expresses every mode and the main and
-        // alt grids can never drift apart in what they capture.
-        self.checkpoint_bounded(if include_scrollback { usize::MAX } else { 0 })
+        // visible screen, so one bound still expresses every mode here. A FULL
+        // checkpoint is in-memory only — it never crosses the handoff wire — so
+        // both grids may carry the same depth, which is what this projection did
+        // before the bounded-carry rewrite.
+        let bound = if include_scrollback { usize::MAX } else { 0 };
+        self.checkpoint_bounded(bound, bound)
     }
 
-    fn checkpoint_bounded(&self, max_history: usize) -> TerminalCheckpoint {
+    /// `inactive_max_history` bounds the INACTIVE grid (`alt_grid`) separately
+    /// from the active one, because the two have different consumers. The
+    /// seamless-handoff wire pins the inactive blob to exactly `rows` records
+    /// (see [`Self::checkpoint_carry`]); an in-memory full checkpoint has no
+    /// such wire and keeps everything.
+    fn checkpoint_bounded(
+        &self,
+        max_history: usize,
+        inactive_max_history: usize,
+    ) -> TerminalCheckpoint {
         debug_assert!(
             self.parser_is_ground(),
             "checkpoint() requires parser_is_ground() (B.3.3)"
@@ -370,12 +382,27 @@ impl Terminal {
         let cursor = GridCursorRepr::capture(&self.grid);
 
         let (alt_grid, alt_cursor) = match &self.alt_grid {
-            Some(alt) => (
-                // The live alternate screen keeps no scrollback, so this is the
-                // visible rows whatever the bound; going through the same accessor
-                // keeps that true by construction rather than by comment.
-                Some(serialize_lines(&alt.checkpoint_lines_bounded(max_history))),
-                Some(GridCursorRepr::capture(alt)),
+            Some(inactive) => (
+                // `alt_grid` is the INACTIVE grid, NOT "the alternate screen":
+                // while the alternate screen is up it holds the SAVED PRIMARY,
+                // scrollback and all (`buffer_api`: "the active grid, or the saved
+                // primary while the alt screen is up"). The wire gives this blob
+                // exactly `rows` records — the single `history_lines` beside it
+                // describes the MAIN blob, so a history carried here is
+                // unrepresentable — and the consumer validates it with
+                // `history = 0`. Projecting it with `max_history` made the whole
+                // capture non-canonical the moment any session sat on the
+                // alternate screen, and the in-session update then refused to
+                // apply, deterministically and forever, on that desk.
+                //
+                // Hence `inactive_max_history`, which the handoff projection pins
+                // to 0 while a full in-memory checkpoint leaves it at the active
+                // grid's bound. The old code shared ONE bound between the two
+                // grids, which is precisely the conflation this fixes.
+                Some(serialize_lines(
+                    &inactive.checkpoint_lines_bounded(inactive_max_history),
+                )),
+                Some(GridCursorRepr::capture(inactive)),
             ),
             None => (None, None),
         };

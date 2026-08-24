@@ -3536,6 +3536,17 @@ mod tests {
     /// it makes the test robust to that without weakening it by one bit — a real
     /// regression still fails all 12 (VERIFIED by removing the cutoff: caught
     /// 6/6).
+    ///
+    /// …and the attempts must be SPREAD, not just counted: 12 back-to-back
+    /// µs-scale attempts complete inside a fraction of one scheduler-starvation
+    /// episode, so under a full verify-gate's fork/IO churn all 12 sampled the
+    /// SAME bad window and the budget bought nothing (OBSERVED in-gate,
+    /// 2026-08-24, while 40/40 standalone runs under pure all-core CPU load
+    /// passed — starvation here comes from runqueue churn, not utilization).
+    /// A failed attempt now sleeps 10 ms before the next, stretching the
+    /// budget across ≥110 ms of wall clock — longer than any starvation
+    /// episode a loaded gate produces — while a real regression, which parks
+    /// deterministically on EVERY attempt, still fails all 12.
     #[test]
     fn drain_more_nonblocking_idle_parser_delivers_without_parking() {
         use std::sync::atomic::AtomicUsize;
@@ -3587,6 +3598,9 @@ mod tests {
                     ok = true;
                     break;
                 }
+                // Decorrelate from the scheduling episode that starved this
+                // attempt (see the ATTEMPT BUDGET note above).
+                std::thread::sleep(std::time::Duration::from_millis(10));
             }
             assert!(
                 ok,

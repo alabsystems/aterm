@@ -43,6 +43,10 @@ use aterm_render::Theme;
 /// geometry below; no installed icon font, Unicode symbol, or external asset can
 /// change what an aterm app tab means.
 pub(crate) use crate::tab_model::TabIconKind;
+/// The connection-mark role (design §4), re-exported beside the icon kind for the
+/// same reason: both renderers consume one typed vocabulary defined on the tab
+/// model, so the strips cannot drift on what a mark means.
+pub(crate) use crate::tab_model::TabConnRole;
 
 /// Canonical non-title presentation metadata consumed by both tab-strip renderers.
 /// Titles remain separate because terminal titles are live OSC state; these fields are
@@ -53,7 +57,20 @@ pub(crate) struct TabStripMetadata {
     pub(crate) dirty: bool,
     pub(crate) busy: bool,
     pub(crate) attention: bool,
+    /// The connection-mark role (design §4). `Option` rather than a bool pair
+    /// because the mark is one shape per role; the `Hash` derive folds it into
+    /// the in-grid strip fingerprint automatically.
+    pub(crate) conn: Option<TabConnRole>,
     pub(crate) closable: bool,
+    /// DRAG-TO-CONNECT drop-target highlight (design §3.2): this tab hosts the
+    /// session under a live connection drag's cursor. App-pushed transient
+    /// presentation, NOT presentation-model state — always `false` from
+    /// [`Self::from_presentation`], stamped by `App::stamp_conn_drop_target`
+    /// after each build, so both renderers (and, via the `Hash` derive, the
+    /// in-grid strip fingerprint) receive it through the one metadata type.
+    /// Not a status mark: it never counts toward `status_count` or the
+    /// connector cell.
+    pub(crate) drop_target: bool,
 }
 
 impl TabStripMetadata {
@@ -65,18 +82,23 @@ impl TabStripMetadata {
             busy: presentation.indicators.busy,
             // The strip draws ONE attention mark, so the two owners fold here.
             attention: presentation.indicators.wants_attention(),
+            conn: presentation.conn,
             closable: presentation.closable,
+            drop_target: false,
         }
     }
 
     #[must_use]
     pub(crate) const fn has_status(self) -> bool {
-        self.dirty || self.busy || self.attention
+        self.dirty || self.busy || self.attention || self.conn.is_some()
     }
 
     #[must_use]
     pub(crate) const fn status_count(self) -> usize {
-        self.dirty as usize + self.busy as usize + self.attention as usize
+        self.dirty as usize
+            + self.busy as usize
+            + self.attention as usize
+            + self.conn.is_some() as usize
     }
 
     #[cfg(test)]
@@ -86,7 +108,9 @@ impl TabStripMetadata {
             dirty: false,
             busy: false,
             attention: false,
+            conn: None,
             closable: true,
+            drop_target: false,
         }
     }
 }
@@ -99,12 +123,17 @@ pub(crate) enum TabStatusKind {
     Dirty,
     Busy,
     Attention,
+    /// A live session connection touches this tab (design §4). Payload-free —
+    /// the const kind array below could not carry a per-tab value — the drawn
+    /// SHAPE comes from [`TabStripMetadata::conn`] at paint time.
+    Connection,
 }
 
-pub(crate) const TAB_STATUS_KINDS: [TabStatusKind; 3] = [
+pub(crate) const TAB_STATUS_KINDS: [TabStatusKind; 4] = [
     TabStatusKind::Dirty,
     TabStatusKind::Busy,
     TabStatusKind::Attention,
+    TabStatusKind::Connection,
 ];
 
 impl TabStripMetadata {
@@ -114,6 +143,7 @@ impl TabStripMetadata {
             TabStatusKind::Dirty => self.dirty,
             TabStatusKind::Busy => self.busy,
             TabStatusKind::Attention => self.attention,
+            TabStatusKind::Connection => self.conn.is_some(),
         }
     }
 }
@@ -126,8 +156,23 @@ pub(crate) fn tab_status_center(ordinal: usize, count: usize) -> f32 {
         0 => 8.0,
         1 => 8.0,
         2 => 5.25 + ordinal.min(1) as f32 * 5.5,
-        _ => 3.5 + ordinal.min(2) as f32 * 4.5,
+        3 => 3.5 + ordinal.min(2) as f32 * 4.5,
+        _ => 2.0 + ordinal.min(3) as f32 * 4.0,
     }
+}
+
+/// Per-shape scale for `count` packed status marks. Four marks sit on a 4-unit
+/// pitch, which cannot hold the full-size shapes (the attention diamond alone
+/// spans 5 units), so EVERY mark shrinks by one shared factor — shapes keep
+/// their relative visual mass and never overlap — rather than any one mark
+/// changing form. At three or fewer the historical full-size geometry is
+/// untouched. Consumed by both renderers, like [`tab_status_center`].
+#[must_use]
+pub(crate) fn tab_status_mark_scale(count: usize) -> f32 {
+    // Largest half-extent is the busy ring's 2.625 (2.0 radius + half its
+    // 1.25 stroke); 0.75 keeps adjacent worst-case pairs clear of the 4-unit
+    // pitch and the edge marks (centres 2.0/14.0) inside the 16-unit box.
+    if count >= 4 { 0.75 } else { 1.0 }
 }
 
 /// One normalized code-native icon primitive in a 16×16 design box.  Lines use
@@ -151,6 +196,11 @@ pub(crate) enum TabIconPrimitive {
         center: [f32; 2],
         radius: f32,
     },
+    /// A FILLED triangle — the connection mark's directional arrows (§4). The
+    /// IR's only filled polygon: `Dot` cannot point and `RoundedRect` only
+    /// strokes, so a solid arrow was inexpressible before this. Hollow
+    /// triangles remain compositions of `Line` (the attention-diamond idiom).
+    Triangle { points: [[f32; 2]; 3] },
 }
 
 pub(crate) const TAB_ICON_DESIGN_SIZE: f32 = 16.0;
@@ -299,6 +349,15 @@ pub enum TabHit {
     /// A staged update is ready — a click on the LEADING update icon (`↻`) applies
     /// it. Shown as an alert only while a build is staged; matches the `+` affordance.
     Update,
+    /// The tab's CONNECTOR — its status-mark cell (design §3.1 [v5]: the whole
+    /// one-cell status group is the connector). This column alone is
+    /// arm-on-press / commit-on-release: release within the movement threshold
+    /// opens the session Connections context menu (never selecting the tab),
+    /// movement past it becomes the drag-to-connect gesture
+    /// (`crate::conn_drag`). Exists only while the segment painted a status
+    /// canvas ([`TabSegment::connector_col`]), so the hit region can never
+    /// outrun the pixels.
+    Connector(usize),
 }
 
 /// One laid-out tab strip segment: a half-open column range `[start_col, end_col)`
@@ -314,7 +373,15 @@ pub struct TabSegment {
     /// The column of the close `x`, if this segment drew one. A click here is a
     /// [`TabHit::Close`]; every other column of the segment is the `kind` action.
     pub close_col: Option<u16>,
-    /// The action a plain (non-close) click on this segment performs.
+    /// The column of the painted STATUS-MARK canvas, if this segment drew one —
+    /// the tab's connection CONNECTOR (design §3.1 [v5], the `close_col`
+    /// precedent). A click here is a [`TabHit::Connector`]. Set only by the
+    /// metadata-aware layout ([`layout_segments_with_metadata`]) from the SAME
+    /// math the painter uses, so hit geometry equals painted geometry by
+    /// construction; the plain [`layout_segments`] leaves it `None`.
+    pub connector_col: Option<u16>,
+    /// The action a plain (non-close, non-connector) click on this segment
+    /// performs.
     pub kind: TabHit,
     /// This is the window's ONLY tab, so it is drawn as the window TITLE — the
     /// name and its description centred on the body background — rather than as a
@@ -565,6 +632,8 @@ const PLAIN_TAB: TabStripMetadata = TabStripMetadata {
     dirty: false,
     busy: false,
     attention: false,
+    conn: None,
+    drop_target: false,
     closable: true,
 };
 
@@ -673,6 +742,7 @@ pub fn layout_segments(
             start_col: 0,
             end_col: UPDATE_W,
             close_col: None,
+            connector_col: None,
             kind: TabHit::Update,
             solo: false,
         });
@@ -751,6 +821,7 @@ pub fn layout_segments(
                 start_col: start,
                 end_col: end,
                 close_col,
+                connector_col: None,
                 kind: TabHit::Select(i),
                 solo,
             });
@@ -764,6 +835,7 @@ pub fn layout_segments(
             start_col: start,
             end_col: start + NEW_TAB_W,
             close_col: None,
+            connector_col: None,
             kind: TabHit::NewTab,
             solo: false,
         });
@@ -785,19 +857,35 @@ pub(crate) fn layout_segments_with_metadata(
 ) -> Vec<TabSegment> {
     let mut segments = layout_segments(cols, tab_count, active, show_update);
     for segment in &mut segments {
-        if let TabHit::Select(index) = segment.kind
-            && metadata.get(index).is_some_and(|item| !item.closable)
-        {
+        let TabHit::Select(index) = segment.kind else {
+            continue;
+        };
+        if metadata.get(index).is_some_and(|item| !item.closable) {
             segment.close_col = None;
         }
+        // The CONNECTOR hit region (design §3.1 [v5]): exactly the status-mark
+        // cell the painter draws, derived from the SAME per-shape math so the
+        // hit region and the pixels cannot drift. Solo band: the marks paint at
+        // the fixed trailing cell (`end_col - 2`, span > 6 — see the solo paint
+        // arm); chips: `tab_content_layout`'s `status_col`.
+        let Some(item) = metadata.get(index).copied().filter(|it| it.has_status()) else {
+            continue;
+        };
+        segment.connector_col = if segment.solo {
+            (segment.end_col.saturating_sub(segment.start_col) > 6)
+                .then(|| segment.end_col.saturating_sub(2))
+        } else {
+            tab_content_layout(segment, item).status_col
+        };
     }
     segments
 }
 
 /// Map a strip click at column `col` to its [`TabHit`], or `None` for a click on
 /// bare strip background (between/after segments). A click on a segment's
-/// `close_col` is a [`TabHit::Close`]; any other column of a tab segment selects
-/// it; the `+` segment opens a tab.
+/// `close_col` is a [`TabHit::Close`], on its `connector_col` a
+/// [`TabHit::Connector`] (the status-mark cell — design §3.1 [v5]); any other
+/// column of a tab segment selects it; the `+` segment opens a tab.
 #[must_use]
 pub fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
     for seg in segments {
@@ -806,6 +894,11 @@ pub fn hit_test(segments: &[TabSegment], col: u16) -> Option<TabHit> {
                 && col == cx
             {
                 return Some(TabHit::Close(i));
+            }
+            if let (Some(cx), TabHit::Select(i)) = (seg.connector_col, seg.kind)
+                && col == cx
+            {
+                return Some(TabHit::Connector(i));
             }
             return Some(seg.kind);
         }
@@ -1742,7 +1835,20 @@ fn paint_strip_impl(
             && !is_active
             && !seg.solo
             && matches!(seg.kind, TabHit::Select(i) if paint.hovered == Some(i));
-        let tab_role = if is_active {
+        // DRAG-TO-CONNECT drop-target highlight (§3.2, App-pushed): the chip
+        // under a live connection drag paints raised + accent-underlined (the
+        // `Update` treatment — already the "this chip wants your pointer"
+        // tone) so the target reads across window boundaries where the OS
+        // cursor alone is ambiguous. Purely paint: hit geometry is untouched.
+        let drop = match seg.kind {
+            TabHit::Select(i) => {
+                metadata.and_then(|items| items.get(i)).is_some_and(|item| item.drop_target)
+            }
+            _ => false,
+        };
+        let tab_role = if drop {
+            StripRole::Update
+        } else if is_active {
             StripRole::Active
         } else if is_hovered {
             StripRole::Hover
@@ -1795,8 +1901,17 @@ fn paint_strip_impl(
             // native strip's solo band, in cells.
             TabHit::Select(i) if seg.solo => {
                 let span = seg.end_col.saturating_sub(seg.start_col);
+                // The lone tab is still a drop target: the whole title band
+                // takes the raised accent-underlined treatment while a drag
+                // hovers this window's session (the chip highlight's solo twin).
+                let band_role = if drop {
+                    StripRole::Update
+                } else {
+                    StripRole::Inactive
+                };
+                let title_role = if drop { StripRole::Update } else { StripRole::Title };
                 for c in seg.start_col..seg.end_col {
-                    put(row, c, ' ', StripRole::Inactive);
+                    put(row, c, ' ', band_role);
                 }
                 let title = titles.get(i).map(String::as_str).unwrap_or("");
                 // EDITING the lone tab: the band becomes one left-aligned field
@@ -1830,10 +1945,10 @@ fn paint_strip_impl(
                         .as_ref()
                         .map_or(0, |s| SOLO_GAP_COLS + strip_display_cells(s));
                 let start = seg.start_col + (span.saturating_sub(width as u16)) / 2;
-                let mut col = put_text(row, start, seg.end_col, &title, StripRole::Title);
+                let mut col = put_text(row, start, seg.end_col, &title, title_role);
                 if let Some(subtitle) = subtitle {
                     col = col.saturating_add(SOLO_GAP_COLS as u16);
-                    put_text(row, col, seg.end_col, &subtitle, StripRole::Inactive);
+                    put_text(row, col, seg.end_col, &subtitle, band_role);
                 }
                 // The lone tab still carries its app icon / state marks, in the
                 // segment's own leading and trailing cells — states are never
@@ -2031,8 +2146,9 @@ fn paint_strip_impl(
                 // Centre the `↻` (U+21BB clockwise open circle arrow) in the 3-cell slot.
                 put(row, seg.start_col + 1, '\u{21bb}', StripRole::Update);
             }
-            // `Close` is never a segment `kind` (only a derived hit on `close_col`).
-            TabHit::Close(_) => {}
+            // `Close` / `Connector` are never a segment `kind` (only derived
+            // hits on `close_col` / `connector_col`).
+            TabHit::Close(_) | TabHit::Connector(_) => {}
         }
     }
     images.sort_unstable_by_key(|(col, _)| *col);
@@ -2043,6 +2159,8 @@ const ICON_RASTER_SIZE: u16 = 32;
 const ICON_SUPERSAMPLE: u16 = 4;
 fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
     let count = metadata.status_count();
+    // Shared shrink for the four-mark packing; 1.0 (bit-exact geometry) below.
+    let s = tab_status_mark_scale(count);
     let mut ordinal = 0usize;
     let mut primitives = Vec::with_capacity(count * 4);
     for kind in TAB_STATUS_KINDS {
@@ -2055,40 +2173,94 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
             // Solid dot = an authored document has unsaved changes.
             TabStatusKind::Dirty => primitives.push(TabIconPrimitive::Dot {
                 center: [x, 8.0],
-                radius: 1.75,
+                radius: 1.75 * s,
             }),
             // Hollow round = work is in progress. RoundedRect gives the deterministic
             // rasterizer a crisp ring without adding a renderer-only circle primitive.
             TabStatusKind::Busy => primitives.push(TabIconPrimitive::RoundedRect {
-                rect: [x - 2.0, 6.0, 4.0, 4.0],
-                radius: 2.0,
-                width: 1.25,
+                rect: [x - 2.0 * s, 8.0 - 2.0 * s, 4.0 * s, 4.0 * s],
+                radius: 2.0 * s,
+                width: 1.25 * s,
             }),
             // Diamond = something completed or otherwise needs the user's attention.
             TabStatusKind::Attention => {
-                let w = 1.15;
+                let w = 1.15 * s;
+                let r = 2.5 * s;
                 primitives.extend([
                     TabIconPrimitive::Line {
-                        from: [x, 5.5],
-                        to: [x + 2.5, 8.0],
+                        from: [x, 8.0 - r],
+                        to: [x + r, 8.0],
                         width: w,
                     },
                     TabIconPrimitive::Line {
-                        from: [x + 2.5, 8.0],
-                        to: [x, 10.5],
+                        from: [x + r, 8.0],
+                        to: [x, 8.0 + r],
                         width: w,
                     },
                     TabIconPrimitive::Line {
-                        from: [x, 10.5],
-                        to: [x - 2.5, 8.0],
+                        from: [x, 8.0 + r],
+                        to: [x - r, 8.0],
                         width: w,
                     },
                     TabIconPrimitive::Line {
-                        from: [x - 2.5, 8.0],
-                        to: [x, 5.5],
+                        from: [x - r, 8.0],
+                        to: [x, 8.0 - r],
                         width: w,
                     },
                 ]);
+            }
+            // The connection mark (§4): outbound = filled up-triangle, inbound
+            // = hollow down-triangle, both = filled hourglass — the diamond's
+            // visual mass (±2.5 wide, ±2.4 tall at full scale).
+            TabStatusKind::Connection => {
+                let Some(role) = metadata.conn else {
+                    // Unreachable behind `has_status_kind`, but the arm stays
+                    // total rather than trusting the gate at a distance.
+                    continue;
+                };
+                let (hw, hh) = (2.5 * s, 2.4 * s);
+                match role {
+                    TabConnRole::Outbound => primitives.push(TabIconPrimitive::Triangle {
+                        points: [[x, 8.0 - hh], [x + hw, 8.0 + hh], [x - hw, 8.0 + hh]],
+                    }),
+                    TabConnRole::Inbound => {
+                        let w = 1.15 * s;
+                        // Corners inset by the half-stroke so the OUTER ink
+                        // silhouette matches the filled outbound triangle and
+                        // the edge-of-canvas mark never clips its round caps.
+                        let (cw, ch) = (hw - w * 0.5, hh - w * 0.5);
+                        primitives.extend([
+                            TabIconPrimitive::Line {
+                                from: [x - cw, 8.0 - ch],
+                                to: [x + cw, 8.0 - ch],
+                                width: w,
+                            },
+                            TabIconPrimitive::Line {
+                                from: [x + cw, 8.0 - ch],
+                                to: [x, 8.0 + ch],
+                                width: w,
+                            },
+                            TabIconPrimitive::Line {
+                                from: [x, 8.0 + ch],
+                                to: [x - cw, 8.0 - ch],
+                                width: w,
+                            },
+                        ]);
+                    }
+                    // Slightly narrower waisted pair so the double fill does
+                    // not read heavier than the single arrows.
+                    TabConnRole::Both => {
+                        let hw = 2.2 * s;
+                        primitives.extend([
+                            TabIconPrimitive::Triangle {
+                                points: [[x - hw, 8.0 - hh], [x + hw, 8.0 - hh], [x, 8.0]],
+                            },
+                            TabIconPrimitive::Triangle {
+                                points: [[x - hw, 8.0 + hh], [x + hw, 8.0 + hh], [x, 8.0]],
+                            },
+                        ]);
+                    }
+                }
             }
         }
     }
@@ -2141,6 +2313,17 @@ fn primitive_covers(primitive: TabIconPrimitive, px: f32, py: f32) -> bool {
         } => rounded_rect_signed_distance(px, py, rect, radius).abs() <= width * 0.5,
         TabIconPrimitive::Dot { center, radius } => {
             (px - center[0]).hypot(py - center[1]) <= radius
+        }
+        TabIconPrimitive::Triangle { points } => {
+            // Inside iff every edge cross-product carries one sign (winding-
+            // agnostic; boundary points count as covered).
+            let edge = |a: [f32; 2], b: [f32; 2]| {
+                (px - b[0]).mul_add(a[1] - b[1], -((a[0] - b[0]) * (py - b[1])))
+            };
+            let d0 = edge(points[0], points[1]);
+            let d1 = edge(points[1], points[2]);
+            let d2 = edge(points[2], points[0]);
+            !((d0 < 0.0 || d1 < 0.0 || d2 < 0.0) && (d0 > 0.0 || d1 > 0.0 || d2 > 0.0))
         }
     }
 }
@@ -2745,13 +2928,38 @@ fn distinct_chip_labels(
             labels[i] = Some(label);
             continue;
         }
-        labels[i] = if !remainder.is_empty()
+        let mut label = if !remainder.is_empty()
             && strip_display_cells(remainder) <= avail.saturating_sub(1)
         {
-            Some(format!("…{remainder}"))
+            format!("…{remainder}")
         } else {
-            Some(truncate_title_tail(core, avail))
+            truncate_title_tail(core, avail)
         };
+        // SURVIVOR CHECK (seen on glass). The cluster's shed uses the suffix
+        // shared by EVERY member, so one member in a different state (`· Typing
+        // a command` beside three `· Ready`s) collapses it to almost nothing —
+        // and the cut then keeps the very furniture the shed exists to remove,
+        // painting `…· Ready` on three chips that name nothing. When the label
+        // survives as pure furniture, re-cut against the suffix this title
+        // shares with the member it reads like.
+        let painted = label.trim_start_matches('…').trim_start().to_string();
+        if !painted.is_empty() {
+            let pair = members
+                .iter()
+                .filter(|&&m| m != i)
+                .map(|&m| common_suffix_bytes(&titles[i], &titles[m]))
+                .filter(|&n| n > 0 && n < titles[i].len())
+                .max()
+                .unwrap_or(0);
+            if pair > 0 && titles[i][titles[i].len() - pair..].trim_start().ends_with(&painted) {
+                let shed = &titles[i][..titles[i].len() - pair];
+                let recut = truncate_title_tail(shed, avail);
+                if !recut.trim_start_matches('…').trim().is_empty() {
+                    label = recut;
+                }
+            }
+        }
+        labels[i] = Some(label);
     }
     // ONE DIALECT PER STRIP under pressure: a flipped cluster beside a
     // head-cut loner mixes `…oml` with `REA…` in windows too small for either
@@ -2787,7 +2995,8 @@ fn distinct_chip_labels(
                 .map(|&(j, _)| common_suffix_bytes(&titles[i], &titles[j]))
                 .collect();
             shared.sort_unstable_by(|a, b| b.cmp(a));
-            let mut suffix = shared.get(1).copied().unwrap_or(0);
+            let furniture = shared.get(1).copied().unwrap_or(0);
+            let mut suffix = furniture;
             if suffix >= titles[i].len()
                 || strip_display_cells(&titles[i][titles[i].len() - suffix..])
                     < avail.saturating_sub(1)
@@ -2795,7 +3004,26 @@ fn distinct_chip_labels(
                 suffix = 0;
             }
             let core = &titles[i][..titles[i].len() - suffix];
-            flips.push((i, truncate_title_tail(core, avail)));
+            let mut cand = truncate_title_tail(core, avail);
+            // SURVIVOR CHECK. The guard above declines to shed while
+            // distinguishing characters still reach the screen — but the cut
+            // itself can land past them (a word-boundary snap moves it
+            // forward), leaving a label that is nothing BUT the shared
+            // furniture: three chips painting `…· Ready` name nothing. When
+            // that happens, shed the furniture after all and re-cut, so this
+            // tab's own text is what survives.
+            if suffix == 0 && furniture > 0 && furniture < titles[i].len() {
+                let painted = cand.trim_start_matches('…').trim_start();
+                let shed_tail = titles[i][titles[i].len() - furniture..].trim_start();
+                if !painted.is_empty() && shed_tail.ends_with(painted) {
+                    let shed_core = &titles[i][..titles[i].len() - furniture];
+                    let recut = truncate_title_tail(shed_core, avail);
+                    if !recut.trim_start_matches('…').trim().is_empty() {
+                        cand = recut;
+                    }
+                }
+            }
+            flips.push((i, cand));
         }
         for (n, (i, cand)) in flips.iter().enumerate() {
             let collides = flips
@@ -5007,6 +5235,127 @@ mod tests {
         }
     }
 
+    /// THE CONNECTOR HIT REGION (design §3.1 [v5]): a chip with status marks
+    /// gains a `connector_col` at EXACTLY the cell the painter puts the status
+    /// canvas on, and that cell hit-tests to [`TabHit::Connector`]; the close
+    /// column keeps winning its own cell, a markless chip mints no connector,
+    /// and the metadata-free base layout never mints one.
+    #[test]
+    fn connector_col_is_the_painted_status_cell_and_hits_connector() {
+        let theme = Theme::default();
+        let mut busy = crate::tab_model::TabPresentation::terminal("a");
+        busy.indicators.busy = true;
+        let metadata = [
+            TabStripMetadata::from_presentation(&busy),
+            TabStripMetadata::from_presentation(&crate::tab_model::TabPresentation::terminal(
+                "b",
+            )),
+        ];
+        let segments = layout_segments_with_metadata(60, 2, &metadata, 0, false);
+        let seg = segments[0];
+        let connector = seg.connector_col.expect("status marks mint a connector");
+        assert_ne!(Some(connector), seg.close_col, "distinct from the close ✕");
+        assert_eq!(hit_test(&segments, connector), Some(TabHit::Connector(0)));
+        assert_eq!(
+            hit_test(&segments, seg.close_col.expect("wide chip has a ✕")),
+            Some(TabHit::Close(0))
+        );
+        assert_eq!(hit_test(&segments, seg.start_col + 1), Some(TabHit::Select(0)));
+        assert_eq!(
+            segments[1].connector_col, None,
+            "a markless chip has no connector; its whole interior selects"
+        );
+        assert_eq!(hit_test(&segments, segments[1].start_col + 3), Some(TabHit::Select(1)));
+
+        // Hit geometry == painted geometry: the status image lands on the SAME
+        // cell the hit region claims.
+        let titles = ["one".to_string(), "two".to_string()];
+        let mut row = vec![blank_cell(theme); 60];
+        let images = paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: None,
+                rename: None,
+            },
+            0,
+            theme,
+            None,
+        );
+        assert!(
+            images.iter().any(|(col, _)| *col == usize::from(connector)),
+            "the status canvas paints exactly on the connector cell"
+        );
+
+        // The metadata-free base layout never mints a connector.
+        assert!(
+            layout_segments(60, 2, 0, false)
+                .iter()
+                .all(|s| s.connector_col.is_none())
+        );
+
+        // The NARROW fallback (§3.1): a chip too narrow to paint its marks
+        // mints no connector either — the whole interior selects and the
+        // context menu is the connect path there.
+        let narrow = layout_segments_with_metadata(9, 3, &[metadata[0]; 3], 0, false);
+        assert!(
+            narrow.iter().all(|s| s.connector_col.is_none()),
+            "narrow chips drop the marks, so they must drop the connector"
+        );
+        assert_eq!(
+            hit_test(&narrow, narrow[0].start_col + 1),
+            Some(TabHit::Select(0))
+        );
+    }
+
+    /// The SOLO band's connector is its fixed trailing status cell (the solo
+    /// paint arm's `end_col - 2`), minted only when the band is wide enough to
+    /// paint marks at all — same predicate, same cell, both surfaces.
+    #[test]
+    fn solo_band_connector_is_the_trailing_status_cell() {
+        let theme = Theme::default();
+        let mut busy = crate::tab_model::TabPresentation::terminal("a");
+        busy.indicators.busy = true;
+        let metadata = [TabStripMetadata::from_presentation(&busy)];
+        let segments = layout_segments_with_metadata(40, 1, &metadata, 0, false);
+        let seg = segments[0];
+        assert!(seg.solo);
+        let connector = seg.connector_col.expect("solo band with marks");
+        assert_eq!(connector, seg.end_col - 2);
+        assert_eq!(hit_test(&segments, connector), Some(TabHit::Connector(0)));
+
+        let titles = ["one".to_string()];
+        let mut row = vec![blank_cell(theme); 40];
+        let images = paint_strip_with_metadata(
+            &mut row,
+            &segments,
+            &titles,
+            &metadata,
+            StripPaint {
+                hovered: None,
+                subtitle: None,
+                rename: None,
+            },
+            0,
+            theme,
+            None,
+        );
+        assert!(
+            images.iter().any(|(col, _)| *col == usize::from(connector)),
+            "the solo status canvas paints on the connector cell"
+        );
+
+        // A markless solo band mints none.
+        let clean = [TabStripMetadata::from_presentation(
+            &crate::tab_model::TabPresentation::terminal("a"),
+        )];
+        let segments = layout_segments_with_metadata(40, 1, &clean, 0, false);
+        assert_eq!(segments[0].connector_col, None);
+    }
+
     /// THE INLINE RENAME FIELD replaces the chip's title span with the find bar's
     /// well: the text verbatim (never ellipsised — you are typing it), a
     /// REVERSE-VIDEO block caret on the edit position, and the selected chip's
@@ -5494,7 +5843,9 @@ mod tests {
                 dirty: true,
                 busy: true,
                 attention: true,
+                conn: Some(TabConnRole::Both),
                 closable: false,
+                drop_target: false,
             },
         ];
         let canonical = layout_segments_with_metadata(80, metadata.len(), &metadata, 0, false);
@@ -5512,10 +5863,18 @@ mod tests {
             hit_test(&canonical, canonical[0].close_col.unwrap()),
             Some(TabHit::Close(0))
         );
+        // The non-closable chip's freed trailing cell is where its status
+        // canvas paints — which since design §3.1 [v5] IS the connector, so
+        // the cell is interactive as Connector, never a dead Select echo.
+        assert_eq!(
+            canonical[1].connector_col,
+            Some(base[1].close_col.unwrap()),
+            "the status canvas takes the freed trailing cell"
+        );
         assert_eq!(
             hit_test(&canonical, base[1].close_col.unwrap()),
-            Some(TabHit::Select(1)),
-            "the old close cell remains part of the full tab select target"
+            Some(TabHit::Connector(1)),
+            "the painted status cell hit-tests as the connector"
         );
     }
 
@@ -5528,7 +5887,9 @@ mod tests {
                 dirty: true,
                 busy: true,
                 attention: true,
+                conn: None,
                 closable: true,
+                drop_target: false,
             },
             TabStripMetadata::clean(TabIconKind::Editor),
         ];
@@ -5645,6 +6006,8 @@ mod tests {
                     dirty: bits & 0b001 != 0,
                     busy: bits & 0b010 != 0,
                     attention: bits & 0b100 != 0,
+                    conn: None,
+                    drop_target: false,
                     closable: true,
                 };
                 let mut images = Vec::new();
@@ -5666,6 +6029,7 @@ mod tests {
                 title: "Settings".to_string(),
                 icon: Some(TabIconKind::Settings),
                 indicators: crate::tab_model::TabIndicators::default(),
+                conn: None,
                 closable: true,
                 tooltip: None,
             },
@@ -5876,7 +6240,9 @@ mod tests {
             dirty: true,
             busy: true,
             attention: true,
+            conn: None,
             closable: true,
+            drop_target: false,
         };
         assert!(metadata.has_status());
         assert_eq!(metadata.status_count(), 3);
@@ -5912,6 +6278,125 @@ mod tests {
         let (pixels, remainder) = raster.as_chunks::<4>();
         assert!(remainder.is_empty(), "tab icon raster has complete pixels");
         assert!(pixels.iter().any(|pixel| pixel[3] != 0));
+    }
+
+    /// The horizontal span a primitive can ink, including stroke width.
+    fn primitive_x_extent(primitive: &TabIconPrimitive) -> (f32, f32) {
+        match *primitive {
+            TabIconPrimitive::Line { from, to, width } => (
+                from[0].min(to[0]) - width * 0.5,
+                from[0].max(to[0]) + width * 0.5,
+            ),
+            TabIconPrimitive::RoundedRect { rect, width, .. } => {
+                (rect[0] - width * 0.5, rect[0] + rect[2] + width * 0.5)
+            }
+            TabIconPrimitive::Dot { center, radius } => (center[0] - radius, center[0] + radius),
+            TabIconPrimitive::Triangle { points } => (
+                points.iter().map(|p| p[0]).fold(f32::INFINITY, f32::min),
+                points.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max),
+            ),
+        }
+    }
+
+    /// Four marks — the connection mark joining dirty/busy/attention — pack the
+    /// one 16-unit canvas on distinct centres, and the shared shrink keeps every
+    /// shape inside its own 4-unit pitch (no overlap, nothing past the box).
+    #[test]
+    fn four_marks_pack_distinct_centers_without_overlap() {
+        let metadata = TabStripMetadata {
+            icon: None,
+            dirty: true,
+            busy: true,
+            attention: true,
+            conn: Some(TabConnRole::Both),
+            closable: true,
+            drop_target: false,
+        };
+        assert!(metadata.has_status_kind(TabStatusKind::Connection));
+        assert_eq!(metadata.status_count(), 4);
+        let centers: Vec<f32> = (0..4).map(|i| tab_status_center(i, 4)).collect();
+        assert_eq!(centers, [2.0, 6.0, 10.0, 14.0]);
+        for pair in centers.windows(2) {
+            assert!(pair[0] < pair[1], "centres stay distinct and ordered");
+        }
+        // Three-or-fewer keeps the historical full-size geometry bit-exact.
+        assert_eq!(tab_status_mark_scale(3), 1.0);
+        assert_eq!(tab_status_mark_scale(4), 0.75);
+        // Kind order is fixed (TAB_STATUS_KINDS), so the flat primitive list
+        // partitions per mark: dot, ring, 4 diamond lines, 2 hourglass fills.
+        let primitives = status_primitives(metadata);
+        assert_eq!(primitives.len(), 1 + 1 + 4 + 2);
+        let pitch_of = [0, 1, 2, 2, 2, 2, 3, 3];
+        for (primitive, mark) in primitives.iter().zip(pitch_of) {
+            let (lo, hi) = primitive_x_extent(primitive);
+            let center = centers[mark];
+            // Shape BODIES stay on their own pitch; only a diamond stroke's
+            // round cap may kiss the boundary (the pre-existing 3-mark spill,
+            // scaled down with everything else).
+            assert!(
+                lo >= center - 2.5 && hi <= center + 2.5,
+                "{primitive:?} escapes its pitch around {center}"
+            );
+            assert!(lo >= 0.0 && hi <= 16.0, "{primitive:?} escapes the canvas");
+        }
+        let raster = rasterize_icon(&primitives, [213, 219, 255]);
+        assert!(raster.as_chunks::<4>().0.iter().any(|pixel| pixel[3] != 0));
+    }
+
+    /// Every connection role draws its own §4 shape from the ONE shared IR the
+    /// in-grid rasterizer consumes (the native strip mirrors the same centres,
+    /// scale, and geometry in `toolbar.rs::paint_identity`): outbound a filled
+    /// up-triangle, inbound a hollow line-built down-triangle, both a filled
+    /// hourglass — pairwise distinct on pixels, like the app icons.
+    #[test]
+    fn connection_role_shapes_are_distinct_and_deterministic() {
+        let conn_only = |role| TabStripMetadata {
+            icon: None,
+            dirty: false,
+            busy: false,
+            attention: false,
+            conn: Some(role),
+            closable: true,
+            drop_target: false,
+        };
+        let outbound = status_primitives(conn_only(TabConnRole::Outbound));
+        assert_eq!(outbound.len(), 1, "outbound is one filled triangle");
+        assert!(matches!(outbound[0], TabIconPrimitive::Triangle { .. }));
+        let inbound = status_primitives(conn_only(TabConnRole::Inbound));
+        assert_eq!(inbound.len(), 3, "inbound is a hollow (line) triangle");
+        assert!(
+            inbound
+                .iter()
+                .all(|primitive| matches!(primitive, TabIconPrimitive::Line { .. }))
+        );
+        let both = status_primitives(conn_only(TabConnRole::Both));
+        assert_eq!(both.len(), 2, "both is an hourglass of two fills");
+        assert!(
+            both.iter()
+                .all(|primitive| matches!(primitive, TabIconPrimitive::Triangle { .. }))
+        );
+        // A lone mark centres like every other lone mark.
+        for primitives in [&outbound, &inbound, &both] {
+            let (lo, hi) = primitives.iter().map(primitive_x_extent).fold(
+                (f32::INFINITY, f32::NEG_INFINITY),
+                |(alo, ahi), (lo, hi)| (alo.min(lo), ahi.max(hi)),
+            );
+            assert!((lo + hi - 16.0).abs() < 0.01, "role mark centres on 8.0");
+        }
+        let rasters: Vec<Vec<u8>> = [&outbound, &inbound, &both]
+            .iter()
+            .map(|primitives| rasterize_icon(primitives, [213, 219, 255]))
+            .collect();
+        assert!(
+            rasters
+                .iter()
+                .all(|r| r.as_chunks::<4>().0.iter().any(|p| p[3] != 0))
+        );
+        for (i, a) in rasters.iter().enumerate() {
+            for b in rasters.iter().skip(i + 1) {
+                assert_ne!(a, b, "role shapes must be tellable apart");
+            }
+        }
     }
 
     /// A narrow strip drops the close `x` (segments below MIN_SEG_WITH_CLOSE) but
@@ -6000,12 +6485,62 @@ mod tests {
         assert_eq!(truncate_title_tail("日本語", 2), "…");
     }
 
+    /// One label pin, BOTH band geometries: the chip-card interior pad
+    /// ([`tab_content_layout`]) costs exactly one title cell, so any pin
+    /// tight enough to sit at the budget edge differs by one glyph between
+    /// the chip-card band (Linux) and the padless bands (macOS/Windows).
+    /// Pin both — asserting only the authoring platform's string is how
+    /// this red shipped three separate times (ddce53ba's twin, 529d172b,
+    /// and the ordinal/loner pins below); 4c78e8e8 fixed the first pair by
+    /// branching in place, and this helper is that fix as a named idiom.
+    fn on_band<'a>(chip_card: &'a str, padless: &'a str) -> &'a str {
+        if STRIP_CHIP_CARDS { chip_card } else { padless }
+    }
+
     /// THE FOUR-IDENTICAL-TABS DEFECT, fixed at the pass that owns it: four
     /// shells whose prompts all set `user@host: <cwd>` must not truncate into
     /// four byte-identical `user@host: …` labels. The distinct pass re-cuts a
     /// colliding label from the TAIL, where the cwd (or the program the title
     /// moved to) actually lives — while a strip of genuinely distinct heads
     /// keeps its familiar head-first cut.
+    #[test]
+    fn a_label_is_never_only_shared_furniture() {
+        // SEEN ON GLASS: with the activity appended to every chip, three tabs
+        // painted `…· Ready` — a label made entirely of the suffix every tab
+        // shares names nothing. Each must show its own place instead.
+        let titles = [
+            "user@m17-tower: ~/aterm · Ready".to_string(),
+            "user@m17-tower: $HOME/trust · Ready".to_string(),
+            "user@m17-tower: ~/ay · Ready".to_string(),
+            "user@m17-tower: /tmp · Typing a command".to_string(),
+        ];
+        let segments = layout_segments(80, titles.len(), 3, false);
+        let labels = distinct_chip_labels(&segments, &titles, None, 3, None);
+        let resolved: Vec<String> = labels
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| l.unwrap_or_else(|| titles[i].clone()))
+            .collect();
+        for (i, label) in resolved.iter().enumerate().take(3) {
+            let painted = label.trim_start_matches('…').trim_start();
+            assert_ne!(
+                painted, "· Ready",
+                "tab {i} paints only the shared furniture: {resolved:?}"
+            );
+            assert!(
+                !painted.is_empty() && painted != "Ready",
+                "tab {i} must name itself, got {label:?} in {resolved:?}"
+            );
+        }
+        for (i, a) in resolved.iter().enumerate() {
+            for (j, b) in resolved.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "tabs {i} and {j} must differ: {resolved:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn colliding_truncated_titles_keep_their_distinguishing_tails() {
         let titles = [
@@ -6050,19 +6585,13 @@ mod tests {
         // not `cfg` — this test runs everywhere, per the module's
         // test-portability rule). Same distinguishing tail either way, and
         // the four labels stay tellable apart above.
-        if STRIP_CHIP_CARDS {
-            assert_eq!(
-                resolved[3], "…/aterm/crates",
-                "a remainder one cell too wide falls back to the plain tail \
-                 cut, which fills the span"
-            );
-        } else {
-            assert_eq!(
-                resolved[3], "…~/aterm/crates",
-                "a remainder that exactly fits keeps the word-boundary cut, \
-                 `~` included"
-            );
-        }
+        assert_eq!(
+            resolved[3],
+            on_band("…/aterm/crates", "…~/aterm/crates"),
+            "chip-card: a remainder one cell too wide falls back to the plain \
+             tail cut; padless: the exact fit keeps the word-boundary cut, \
+             `~` included"
+        );
 
         // A COMPOSED label shares its ENDING too (`title · <activity>` puts one
         // activity summary after every prompt): a naive tail-keep hands four
@@ -6120,7 +6649,7 @@ mod tests {
         );
         assert_eq!(
             labels[1].as_deref(),
-            Some("2 · …ell"),
+            Some(on_band("2 · …ell", "2 · …hell")),
             "the other twin is addressable by ordinal, tail attached where room allows"
         );
 
@@ -6358,7 +6887,8 @@ mod tests {
             "the family still flips together: {resolved:?}"
         );
         assert_eq!(
-            resolved[4], "zzz-not-a…",
+            resolved[4],
+            on_band("zzz-not-a…", "zzz-not-a-…"),
             "a roomy strip's distinct-headed loner keeps the shipped head cut"
         );
     }

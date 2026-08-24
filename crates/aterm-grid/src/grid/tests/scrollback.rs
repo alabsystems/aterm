@@ -529,26 +529,31 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(6, 10, 2, scrollback);
 
-    // Write "Hello" on row 4 with a hyperlink on columns 0-4.
+    // Write "Hello" on row 0 with a hyperlink on columns 0-4, cursor at the
+    // bottom. The shrink anchors at the cursor (audit-2 item 1), so the TOP
+    // rows — the linked one included — are what transit into scrollback now;
+    // the #7783 keying rule this test exists for (extras extracted by their
+    // REAL visible row index, never u16::MAX) guards that transit the same.
     let url: Arc<str> = Arc::from("https://example.com/7783");
-    grid.set_cursor(4, 0);
+    grid.set_cursor(0, 0);
     for c in "Hello".chars() {
         grid.write_char(c);
     }
     for col in 0..5u16 {
         grid.extras_mut()
-            .get_or_create(CellCoord::new(4, col))
+            .get_or_create(CellCoord::new(0, col))
             .set_hyperlink(Some(url.clone()));
     }
+    grid.set_cursor(5, 0);
 
     // Verify the hyperlink is present before resize.
     assert!(
-        grid.extras().row_has_hyperlinks(4),
-        "row 4 should have hyperlinks before resize"
+        grid.extras().row_has_hyperlinks(0),
+        "row 0 should have hyperlinks before resize"
     );
 
-    // Shrink height from 6 to 3. Row 4 (visible) should be pushed to
-    // scrollback via adjust_row_count's from_back path.
+    // Shrink height from 6 to 3: the top rows (the linked row among them)
+    // are demoted into scrollback.
     grid.resize_no_reflow(3, 10);
 
     // The pushed rows should now be in scrollback (lazy buffer or tiered).
@@ -578,7 +583,7 @@ fn height_decrease_preserves_extras_on_pushed_rows() {
     }
     assert!(
         found_hyperlink,
-        "hyperlink on row 4 should survive height decrease into scrollback (#7783)"
+        "hyperlink on the demoted row should survive height decrease into scrollback (#7783)"
     );
     grid.assert_invariants();
 }

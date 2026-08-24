@@ -1236,7 +1236,10 @@ pub(crate) fn take() -> Option<RestoreManifest> {
 //
 // A windowed cold launch sizes its first — hidden — OS window from
 // `seed_cell_px`, a 0.6×/1.2× em heuristic, and keeps it hidden until the
-// backend build joins (~300 ms) because revealing the heuristic size would
+// backend build joins — a wait long enough to be worth hiding on WINDOWS, the
+// one platform that takes the early-reveal path, and 0.01 ms on macOS per the
+// 2026-08-23 arena drill-down; see the platform split in `app_window.rs`'s
+// early-reveal note — because revealing the heuristic size would
 // trade blankness for a visibly JUMPING window. This cache removes the
 // heuristic on every launch after the first: `attach_os_window` persists the
 // REAL cell metrics the finished backend derived, keyed by display scale

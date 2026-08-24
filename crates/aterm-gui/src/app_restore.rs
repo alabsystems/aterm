@@ -538,6 +538,82 @@ impl App {
         self.adopt_orphan_shells_as_tabs();
     }
 
+    /// SEAMLESS CONNECTION RE-MINT (design §1.4#6): re-establish the manifest's
+    /// tokenless `(src, dst, op)` triples through the ONE kind-bounded mint
+    /// helper, now that every handed-off session is registered under its fresh
+    /// launch nonce. One-shot: the carry is drained on entry. Grouped per
+    /// directed pair into the largest [`ConnectionKind`] the carried op set
+    /// proves ([`crate::connections::carried_kind`], never-widen); each mint
+    /// rebuilds the pair's `ConnectionRecord` and emits the standard
+    /// `session_edge` grant events under origin `handoff`. FAIL-SOFT: a triple
+    /// whose endpoint did not survive the swap — or whose op the connection
+    /// vocabulary cannot spell — is dropped silently-but-audited
+    /// (`action=drop origin=handoff`, hex-free); it can only LOSE authority,
+    /// never widen it, and never fails the adoption.
+    pub(crate) fn remint_carried_connections(&mut self) {
+        use aterm_session::SessionId;
+        let carried = std::mem::take(&mut self.pending_conn_carry);
+        if carried.is_empty() {
+            return;
+        }
+        // Group the flat rows per directed pair, preserving the manifest's
+        // `(src, dst, op)` sort so mint/audit order is deterministic.
+        let mut pairs: Vec<((String, String), Vec<String>)> = Vec::new();
+        for row in carried {
+            let key = (row.src, row.dst);
+            match pairs.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, ops)) => ops.push(row.op),
+                None => pairs.push((key, vec![row.op])),
+            }
+        }
+        let mut minted_any = false;
+        for ((src, dst), ops) in pairs {
+            let src = SessionId::new(src);
+            let dst = SessionId::new(dst);
+            // Both endpoints must have survived the swap: dst owns the table
+            // the rows go into; a dead src must stay swept (§1.4#4 — re-minting
+            // its rows would resurrect authority its close dissolved). A
+            // carried self-loop (nothing mints one, but the manifest is data)
+            // takes the same drop path. Clone-then-release: the store guard
+            // drops before any table lock below.
+            let dst_ctx = {
+                let store = self.store.read().unwrap_or_else(|p| p.into_inner());
+                let src_live = store.by_sid(&src).is_some();
+                let dst_ctx = store.by_sid(&dst).map(|h| h.ctx.clone());
+                (src_live && src != dst).then_some(dst_ctx).flatten()
+            };
+            let (kind, dropped) = match &dst_ctx {
+                Some(_) => crate::connections::carried_kind(&ops),
+                None => (None, ops),
+            };
+            for op in &dropped {
+                crate::session_edge_audit::emit(
+                    crate::session_edge_audit::EdgeAction::Drop,
+                    "handoff",
+                    &src,
+                    &dst,
+                    op,
+                );
+            }
+            if let (Some(kind), Some(ctx)) = (kind, dst_ctx) {
+                minted_any |= crate::connections::connect_in(
+                    &self.connections,
+                    &src,
+                    &dst,
+                    &ctx.edges,
+                    &ctx.nonce,
+                    kind,
+                    "handoff",
+                );
+            }
+        }
+        if minted_any {
+            // The tables changed ON the main thread — run the
+            // `Wake::ConnectionsChanged` body directly (marks, map, ❯ count).
+            self.refresh_connection_surfaces();
+        }
+    }
+
     /// Rebuild one consumed [`restore::RestoreManifest`] into live windows/tabs/panes
     /// (adopting handed-off shells where a leaf's `local_id` matches, forking fresh
     /// otherwise). Split out from [`Self::apply_pending_restore`] so the orphan net there
@@ -740,6 +816,7 @@ impl App {
                 &self.session_factory,
                 &proxy,
                 None,
+                None, // not a connected controller spawn
                 Some(adopted),
             ) {
                 Ok(s) => {
@@ -1265,6 +1342,9 @@ impl App {
                             },
                             icon: None,
                             indicators: crate::tab_model::TabIndicators::default(),
+                            // Restored fresh: any prior connection died with
+                            // the old process's tables (§1.4#6).
+                            conn: None,
                             closable: true,
                             tooltip: terminal.cwd.as_ref().map(|cwd| format!("Terminal · {cwd}")),
                         },
@@ -1367,6 +1447,7 @@ impl App {
             &self.session_factory,
             &proxy,
             terminal.cwd.as_deref(),
+            None, // not a connected controller spawn
             adopt,
         )
         .map_err(|error| error.to_string())?;
@@ -1463,6 +1544,7 @@ impl App {
             title: "Settings".to_string(),
             icon: Some(crate::tab_model::TabIconKind::Settings),
             indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
             closable: true,
             tooltip: Some(format!("Settings · {}", route.label())),
         };
@@ -1541,6 +1623,7 @@ impl App {
                         }
                     }),
                     indicators: crate::tab_model::TabIndicators::default(),
+                    conn: None,
                     closable: true,
                     tooltip: Some(format!("{} · {uri}", kind.as_str())),
                 },
@@ -1582,6 +1665,7 @@ impl App {
                 attention: true,
                 ..crate::tab_model::TabIndicators::default()
             },
+            conn: None,
             closable: true,
             tooltip: Some(format!(
                 "{} · {}",
@@ -1939,6 +2023,7 @@ impl App {
                 &self.session_factory,
                 &proxy,
                 leaf.cwd(),
+                None, // not a connected controller spawn
                 adopt,
             ) {
                 Ok(s) => {
@@ -3153,5 +3238,81 @@ mod tests {
         );
         assert_eq!(buffer.viewport_anchor, 0);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The ADOPTION-SIDE RE-MINT (design §1.4#6): carried tokenless triples
+    /// become live rows + a rebuilt `ConnectionRecord` through the one
+    /// kind-bounded helper — while a lone push half, an op the vocabulary
+    /// cannot spell, and a triple whose endpoint did not survive the swap are
+    /// all dropped fail-soft (authority only ever shrinks). One-shot: the
+    /// carry drains, so a second pass is a no-op.
+    #[test]
+    fn remint_carried_connections_remints_kinds_and_drops_the_unmintable() {
+        let carry = |src: &str, dst: &str, op: &str| crate::session_store::ConnectionCarry {
+            src: src.to_string(),
+            dst: dst.to_string(),
+            op: op.to_string(),
+        };
+        let mut app = App::headless_for_test();
+        add_stub(&mut app, 1);
+        let (a, b) = {
+            let g = app.store.read().unwrap();
+            (
+                g.by_local(0).expect("session 0").sid.clone(),
+                g.by_local(1).expect("session 1").sid.clone(),
+            )
+        };
+        app.pending_conn_carry = vec![
+            // A full `both` set a → b: re-mints as ONE Both connection.
+            carry(a.as_str(), b.as_str(), "read-screen"),
+            carry(a.as_str(), b.as_str(), "signal"),
+            carry(a.as_str(), b.as_str(), "write-input"),
+            // A lone push half b → a: NEVER rounded up to a full seat — drops.
+            carry(b.as_str(), a.as_str(), "write-input"),
+            // An op no connection can spell (§1.4#2): drops.
+            carry(a.as_str(), b.as_str(), "config-write"),
+            // An endpoint that did not survive the swap: drops.
+            carry("s-gone", b.as_str(), "read-screen"),
+        ];
+
+        app.remint_carried_connections();
+
+        assert!(app.pending_conn_carry.is_empty(), "the carry drains (one-shot)");
+        // b's table holds exactly the re-minted `both` rows, all src = a.
+        let rows = {
+            let ctx = {
+                let g = app.store.read().unwrap();
+                g.by_sid(&b).unwrap().ctx.clone()
+            };
+            let edges = ctx.edges.lock().unwrap();
+            edges.edges()
+        };
+        assert_eq!(rows.len(), 3, "both = 3 ops, nothing widened: {rows:?}");
+        assert!(rows.iter().all(|e| e.src == a && e.dst == b));
+        // a's table stays EMPTY: the lone half was dropped, not widened.
+        let a_rows = {
+            let ctx = {
+                let g = app.store.read().unwrap();
+                g.by_sid(&a).unwrap().ctx.clone()
+            };
+            let edges = ctx.edges.lock().unwrap();
+            edges.edges()
+        };
+        assert!(a_rows.is_empty(), "the lone push half must not mint: {a_rows:?}");
+        // The record store was REBUILT (dissolution stays pair-precise).
+        {
+            let records = app.connections.records();
+            assert_eq!(records.len(), 1);
+            let rec = records
+                .get(&(a.clone(), b.clone()))
+                .expect("the a → b record is back");
+            assert_eq!(rec.kind(), Some(aterm_session::ConnectionKind::Both));
+        }
+        // And the ❯ count agrees with the map's arrow fold: one connection.
+        assert_eq!(crate::connections::connection_count(&app.store), 1);
+
+        // Second pass: nothing pending, nothing changes.
+        app.remint_carried_connections();
+        assert_eq!(crate::connections::connection_count(&app.store), 1);
     }
 }

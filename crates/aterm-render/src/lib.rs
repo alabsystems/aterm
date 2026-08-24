@@ -15780,6 +15780,46 @@ fn row_differs(a: &RenderInput, b: &RenderInput, r: usize, memo: &mut ImageEqMem
     row_differs_shifted(a, r, b, r, memo)
 }
 
+/// The CELL half of [`row_differs_shifted`]: the three channels one engine row
+/// fill produces together — resolved cells, the sparse emoji-cluster list, and
+/// the combining-mark list. Split out (same clauses, same order, same verdict)
+/// so the D-2 per-row revision can answer exactly this half with a `u64`
+/// compare while the cheap half below is still compared exactly.
+///
+/// These three and ONLY these three are what a row's damage bit vouches for:
+/// they are refilled together by `render_row_into_impl` for a marked row and
+/// skipped together for an unmarked one — the same partition the engine's own
+/// damage-scoped refill already relies on.
+#[inline]
+fn row_cells_differ(a: &RenderInput, ra: usize, b: &RenderInput, rb: usize) -> bool {
+    a.cells[ra] != b.cells[rb]
+        || a.clusters[ra] != b.clusters[rb]
+        || a.combining[ra] != b.combining[rb]
+}
+
+/// The NON-CELL half of [`row_differs_shifted`]: DEC line size (row-level AND
+/// the per-column runs a composed row carries), the per-pane default-background
+/// runs, and the row's inline-image placements.
+///
+/// Every clause here is O(1) or O(runs) — never a per-cell walk — which is why
+/// the D-2 stamp path keeps comparing them EXACTLY instead of delegating to the
+/// revision. That matters most for `images`: an image placement need not mark
+/// row damage to stay fresh (the extras walk refills it unconditionally), so a
+/// revision could not have vouched for it.
+#[inline]
+fn row_meta_differs(
+    a: &RenderInput,
+    ra: usize,
+    b: &RenderInput,
+    rb: usize,
+    memo: &mut ImageEqMemo,
+) -> bool {
+    a.line_sizes[ra] != b.line_sizes[rb]
+        || row_spans(a, ra) != row_spans(b, rb)
+        || default_bg_spans(a, ra) != default_bg_spans(b, rb)
+        || !memo.rows_eq(&a.images[ra], &b.images[rb])
+}
+
 /// Whether row `ra` of `a` differs from row `rb` of `b` in any render-relevant
 /// channel — the SHIFTED twin of [`row_differs`] (same exact per-channel
 /// comparison, but at independent row indices). The E7 whole-row scroll-blit
@@ -15813,13 +15853,70 @@ fn row_differs_shifted(
     rb: usize,
     memo: &mut ImageEqMemo,
 ) -> bool {
-    a.cells[ra] != b.cells[rb]
-        || a.clusters[ra] != b.clusters[rb]
-        || a.combining[ra] != b.combining[rb]
-        || a.line_sizes[ra] != b.line_sizes[rb]
-        || row_spans(a, ra) != row_spans(b, rb)
-        || default_bg_spans(a, ra) != default_bg_spans(b, rb)
-        || !memo.rows_eq(&a.images[ra], &b.images[rb])
+    row_cells_differ(a, ra, b, rb) || row_meta_differs(a, ra, b, rb, memo)
+}
+
+/// Whether the two snapshots' D-2 per-row revision lanes may be compared to
+/// decide the CELL half of the row diff (`row_cells_differ`) — the O(rows) stamp
+/// compare that replaces the O(rows × cols) walk.
+///
+/// The revision's guarantee is narrow on purpose: "a row whose CONTENT changed
+/// has a different stamp, PROVIDED the row still means the same thing". Every
+/// clause below pins one way that provision can fail. All of them are `u64`/bool
+/// compares, so the gate itself costs nothing.
+///
+/// * LANE identity, non-zero and equal. Each terminal mints revisions from its
+///   own clock, so two panes' stamps are numerically unrelated; a shared scratch
+///   that changed hands would otherwise read one pane's revision as the other's.
+///   Zero means "no engine fill vouches for this snapshot" — `RenderInput::empty`,
+///   and every host-composed frame.
+/// * LANE LENGTH equals the frame's row count on BOTH sides. A host that
+///   prepends rows (the in-grid tab strip) shifts every channel EXCEPT this one,
+///   so the mismatch fails the whole frame closed rather than reading row `r`'s
+///   stamp against row `r + strip`'s content.
+/// * NO POST-FILL HOST CELL WRITE (`snapshot_seq == engine_fill_seq`, the
+///   existing DMG-1 token). Stream fade, the IME preedit overlay and prediction
+///   ghosts all write cells the engine never saw and all bump `snapshot_seq` by
+///   the established discipline; the engine's revision cannot vouch for those
+///   rows and must not be asked to.
+/// * ROW IDENTITY: equal `base_y` (a scroll that archives rows marks ONLY the
+///   exposed strip — `mark_scroll_damage` — so the stamps describe rows that
+///   have since slid out from under their indices), equal `absolute_row_revision`
+///   (a protected-footer splice renumbers), equal alt bit (the two screens keep
+///   independent grids AND independent clocks), and `display_offset == 0` on both
+///   sides (the revision lane is indexed by LIVE grid row; only at offset zero do
+///   viewport rows coincide with them).
+/// * LOGICAL row order on both sides: the BiDi reorder permutes a row's columns
+///   in place AFTER the fill, so a stamp taken before it cannot describe the
+///   permuted result.
+///
+/// Anything not listed is either compared exactly anyway (`row_meta_differs`) or
+/// diffed on its own channel further down (selection, cursor, the effect
+/// streams). A `false` here costs exactly the pre-D-2 whole-grid walk.
+/// (Also the REACH PROBE: a bench or oracle asserts this is `true` on the frames
+/// it claims to price, so a fixture that silently never reaches the stamp path
+/// cannot be mistaken for one that does.)
+#[must_use]
+pub fn row_revisions_comparable(prev_input: &RenderInput, input: &RenderInput) -> bool {
+    prev_input.rows == input.rows
+        && prev_input.cols == input.cols
+        && row_stamps_usable(prev_input, input, input.rows)
+}
+
+fn row_stamps_usable(prev_input: &RenderInput, input: &RenderInput, rows: usize) -> bool {
+    prev_input.row_rev_lane != 0
+        && prev_input.row_rev_lane == input.row_rev_lane
+        && prev_input.row_rev.len() == rows
+        && input.row_rev.len() == rows
+        && prev_input.snapshot_seq == prev_input.engine_fill_seq
+        && input.snapshot_seq == input.engine_fill_seq
+        && prev_input.engine_alt == input.engine_alt
+        && prev_input.engine_row_order == aterm_core::render::RowOrder::Logical
+        && input.engine_row_order == aterm_core::render::RowOrder::Logical
+        && prev_input.display_offset == 0
+        && input.display_offset == 0
+        && prev_input.base_y == input.base_y
+        && prev_input.absolute_row_revision == input.absolute_row_revision
 }
 
 /// Mark row `r` dirty if it is in range (a no-op for an out-of-range cursor row).
@@ -16424,8 +16521,38 @@ pub fn compute_dirty_rows(
     // keys ABA-safe; it must NOT be hoisted into cross-frame state.
     let mut image_memo = ImageEqMemo::default();
     let mut any_dirty = false;
+    // D-2: the engine already knows which rows changed. When the two snapshots'
+    // per-row revision lanes are comparable (`row_stamps_usable` pins every way
+    // a stamp could mean something else), the CELL half of the row diff is a
+    // `u64` compare per row instead of a walk over every cell of every row
+    // against a full copy of the previous frame — which, for the UNCHANGED rows
+    // that dominate a typing frame, had to run to the end of every row before it
+    // could conclude "nothing here". The NON-cell half is compared exactly
+    // either way: it is O(1)-per-row and the revision does not vouch for it.
+    //
+    // A stamp of 0 is the NO-STAMP sentinel — a host-built row, or a row no
+    // engine fold has ever vouched for. It means UNKNOWN, never "unchanged", so
+    // that row falls back to the exact content compare and the frame keeps its
+    // exact dirty set instead of failing the whole gate.
+    //
+    // The brute-force arm below is not a legacy path: it is the REFERENCE
+    // semantics this one is checked against (`stamped_dirty_rows_match_the_brute_
+    // force_oracle_over_a_mutation_corpus`), and it is what every frame this gate
+    // refuses still runs.
+    let stamped = row_stamps_usable(prev_input, input, rows);
     for (r, d) in dirty.iter_mut().enumerate() {
-        if row_differs(input, prev_input, r, &mut image_memo) {
+        let differs = if stamped {
+            let (prev_rev, cur_rev) = (prev_input.row_rev[r], input.row_rev[r]);
+            let cells_differ = if prev_rev != 0 && cur_rev != 0 {
+                prev_rev != cur_rev
+            } else {
+                row_cells_differ(input, r, prev_input, r)
+            };
+            cells_differ || row_meta_differs(input, r, prev_input, r, &mut image_memo)
+        } else {
+            row_differs(input, prev_input, r, &mut image_memo)
+        };
+        if differs {
             *d = true;
             any_dirty = true;
         }

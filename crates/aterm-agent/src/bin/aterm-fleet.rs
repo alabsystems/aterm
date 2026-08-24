@@ -6,6 +6,6 @@
 //! `aterm fleet` in-process; this bin exists for dev builds and is NOT
 //! shipped (the bundle carries an argv0 symlink onto `aterm`).
 
-fn main() -> ! {
+fn main() -> std::process::ExitCode {
     aterm_agent::fleet_cli::main_entry(std::env::args_os().skip(1).collect())
 }

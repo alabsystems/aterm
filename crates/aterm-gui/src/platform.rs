@@ -85,7 +85,9 @@ pub(crate) trait AppRt {
     /// glass, without waiting for the event loop to pump a paint message.
     ///
     /// The warm-launch early reveal shows the first window and then BLOCKS the
-    /// event-loop thread joining the backend build (~300 ms). On Windows the
+    /// event-loop thread joining the backend build — a wait that is only long on
+    /// Windows, the one platform that takes this path (the macOS join measures
+    /// 0.01 ms; see `app_window.rs`'s join note). On Windows the
     /// themed erase that makes the revealed window look like the terminal (the
     /// class brush `window_set_background_color` installs) only runs when a
     /// paint/erase message is processed — which the blocked loop will not do,

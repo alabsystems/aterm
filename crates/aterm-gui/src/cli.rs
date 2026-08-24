@@ -272,7 +272,7 @@ const HELP_TAIL: &str = concat!(
     "              title_summary_context_lines, title_summary_include_output,\n",
     "              title_summary_allow_remote, tab_title_format, window_title_format,\n",
     "              tab_status, tab_status_quiet_after_ms, tab_status_dwell_ms,\n",
-    "              tab_status_badge.\n",
+    "              tab_status_badge, tab_connection_badge.\n",
     "  Cursor      serious_mode (mute all sound/decorative effects), motion,\n",
     "              cursor_style, cursor_blink, cursor_trail, cursor_trail_style\n",
     "              (the LUMEN aurora), cursor_trail_color/_accent/_intensity/_radius,\n",
@@ -404,6 +404,7 @@ const STARTER_CONFIG: &str = "\
 # tab_status_quiet_after_ms = 5000 # a silent foreground job becomes \"quiet\" after this, clamped to 500..=120000
 # tab_status_dwell_ms = 750        # hysteresis before a phase is published, clamped to 0..=10000
 # tab_status_badge = true          # project status onto the tab's busy/attention marks
+# tab_connection_badge = true      # mark tabs holding/receiving a session connection (▲ out / ▽ in / hourglass both)
 
 # --- motion / cursor aurora -----------------------------------------------------
 # serious_mode = false            # mute sounds + hide decorative effects; underlying effect settings return when switched off

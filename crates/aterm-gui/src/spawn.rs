@@ -34,13 +34,58 @@ use crate::{
 /// shipped scripts so the two can never drift apart.
 pub(crate) const SHELL_INTEGRATION_LOADED_GUARD: &str = "ATERM_SHELL_INTEGRATION_INSTALLED";
 
+/// The RUNTIME outcome of the most recent shell-integration preparation —
+/// what actually happened, as opposed to the advertised capability constant.
+///
+/// This is load-bearing honesty, not telemetry: the toolchain seed pill
+/// promises "open a new tab to use them", and new tabs get `<prefix>/bin` on
+/// PATH only because the integration loader sources `~/.aterm/shell.d`. When
+/// preparation fails — an unknown shell, an unwritable loader cache — that
+/// promise is a "command not found" in waiting, so the pill composer and
+/// `--diagnose` both read this record instead of assuming success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ShellIntegrationOutcome {
+    /// The loader was written and injected: new tabs source `shell.d`, so the
+    /// ALab tools' PATH hook reaches them.
+    Prepared,
+    /// No integration script exists for this shell (named as selected/`$SHELL`)
+    /// — nothing will ever source `shell.d` in it.
+    UnknownShell(String),
+    /// The loader cache could not be written (the `std::io::Error` text).
+    WriteFailed(String),
+}
+
+/// Last-write-wins record of the most recent preparation attempt. One slot is
+/// enough: every tab of a session uses the same selected shell and the same
+/// loader cache, so the newest attempt is the current truth.
+static SHELL_INTEGRATION_OUTCOME: std::sync::Mutex<Option<ShellIntegrationOutcome>> =
+    std::sync::Mutex::new(None);
+
+/// The recorded runtime outcome, `None` before any integrated spawn was
+/// attempted (e.g. an `-e <cmd>`-only run, where no promise is broken because
+/// no interactive shell exists to type into).
+pub(crate) fn shell_integration_outcome() -> Option<ShellIntegrationOutcome> {
+    SHELL_INTEGRATION_OUTCOME
+        .lock()
+        .expect("shell integration outcome lock")
+        .clone()
+}
+
+fn record_shell_integration_outcome(outcome: ShellIntegrationOutcome) {
+    *SHELL_INTEGRATION_OUTCOME
+        .lock()
+        .expect("shell integration outcome lock") = Some(outcome);
+}
+
 /// Prepare OSC 133/633 shell integration for `$SHELL`: returns the `(key, value)`
 /// environment additions + an optional argv override (bash's `--rcfile`) to
 /// inject into the spawned shell so it emits the command marks the
 /// `blocks`/`blocktext`/`wait` introspection verbs surface, plus the raw
 /// capability nonce for `Terminal::authorize_shell_integration` so ONLY this
 /// shell's marks are trusted. `None` for an unknown shell or on I/O error (the
-/// shell still spawns, just without command-block tracking). Runs in the PARENT,
+/// shell still spawns, just without command-block tracking — and the outcome is
+/// RECORDED, because "no tracking" also means "no `shell.d`, no ALab PATH
+/// hook": see [`ShellIntegrationOutcome`]). Runs in the PARENT,
 /// before spawn — its file I/O is not async-signal-constrained.
 /// Env additions, optional argv override, and the raw capability nonce that
 /// [`prepare_shell_integration`] hands back to the spawn path.
@@ -56,7 +101,35 @@ fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegratio
         Some(h) => si::ShellType::detect(h),
         None => si::ShellType::detect_current(),
     };
-    let mut injection = si::prepare(shell).ok().flatten()?;
+    let mut injection = match si::prepare(shell) {
+        Ok(Some(injection)) => injection,
+        Ok(None) => {
+            // Name the shell the way the USER selected it, so the diagnosis
+            // reads as their own configuration and not our detection guts.
+            let name = shell_hint
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "the default shell".to_string());
+            aterm_log::warn!(
+                "shell integration is not available for {name}: command blocks, cwd \
+                 tracking and the ALab tools' PATH hook (shell.d) will not work in \
+                 this shell — `aterm --diagnose` shows the runtime state"
+            );
+            record_shell_integration_outcome(ShellIntegrationOutcome::UnknownShell(name));
+            return None;
+        }
+        Err(e) => {
+            aterm_log::warn!(
+                "shell integration loader could not be written ({e}): command blocks, \
+                 cwd tracking and the ALab tools' PATH hook (shell.d) will not work — \
+                 `aterm --diagnose` shows the runtime state"
+            );
+            record_shell_integration_outcome(ShellIntegrationOutcome::WriteFailed(e.to_string()));
+            return None;
+        }
+    };
+    record_shell_integration_outcome(ShellIntegrationOutcome::Prepared);
     let nonce = si::generate_nonce();
     si::augment_with_nonce(&mut injection, nonce.hex());
     Some((
@@ -269,6 +342,21 @@ pub(crate) fn provision_child_identity_env(parent_sid: &SessionId) -> Vec<(Strin
     )]
 }
 
+/// PURE: the CONTROLLER-spawn observation hint (session connections §2.3/§6):
+/// `ATERM_OBSERVE_SESSION_ID=<origin sid>`, telling the newborn supervisor's
+/// tooling which session it holds a connection over. IDENTITY ONLY — never a
+/// token (design §1.4#3: the connection's authority lives in the origin's edge
+/// table, its tokens in the process `ConnectionRecord` store). Deny-listed
+/// (`env_sanitize.rs`) so an inherited copy never survives a hop — a grandchild
+/// is not the controller.
+pub(crate) fn provision_observe_env(origin_sid: &SessionId) -> Vec<(String, String)> {
+    use aterm_types::domain::ENV_OBSERVE_SESSION_ID;
+    vec![(
+        ENV_OBSERVE_SESSION_ID.to_string(),
+        origin_sid.as_str().to_string(),
+    )]
+}
+
 pub(crate) fn provision_child_recursion_env(
     _parent_sid: &SessionId,
 ) -> (Vec<(String, String)>, ChildProvision) {
@@ -456,6 +544,11 @@ pub(crate) fn spawn_session(
     // shared `factory`. `None` (session 0, or no cwd known) ⇒ fall back to
     // `factory.cwd` (the `-d <dir>` flag, else the launch directory).
     cwd_override: Option<&str>,
+    // Per-spawn CONTROLLER observation hint (session connections §2.3/§6):
+    // `Some(origin)` injects `ATERM_OBSERVE_SESSION_ID=<origin sid>` into the
+    // newborn's shell env (identity only, see [`provision_observe_env`]).
+    // `None` for every non-connected spawn.
+    observe: Option<&SessionId>,
     // SEAMLESS UPDATE (Rung 1b): `Some(_)` RE-ADOPTS a live shell handed across the update
     // re-exec — reuse its PTY master fd + pid and restore its identity instead of forking a
     // fresh shell. `None` = the normal fork-a-new-shell path (every existing caller).
@@ -507,6 +600,11 @@ pub(crate) fn spawn_session(
     // needs it, since an agent CLI's hooks address the pane through this var.
     if adopt.is_none() {
         env_add.extend(provision_child_identity_env(&self_id));
+        // CONTROLLER spawn: hand the supervisor the sid it observes (identity
+        // only; adoption aside — a re-adopted shell keeps its original env).
+        if let Some(origin) = observe {
+            env_add.extend(provision_observe_env(origin));
+        }
     }
     // A one-shot `-e <cmd>` session never hosts an inner aterm, so skip child
     // recursion provisioning entirely — the injected tokens + the retained
@@ -957,6 +1055,23 @@ mod child_identity_env_tests {
             !k.contains(&ENV_PARENT_SESSION_ID),
             "parent id moved to provision_child_identity_env; emitting it here too \
              would duplicate the key for shell sessions"
+        );
+    }
+
+    /// The CONTROLLER-spawn observation hint is the origin sid and NOTHING
+    /// else (identity only, no token — design §1.4#3), and it is deny-listed
+    /// so an inherited copy never survives a hop (one-hop like the rest of the
+    /// provisioning vars).
+    #[test]
+    fn controller_observe_env_is_the_origin_sid_only_and_one_hop() {
+        use aterm_types::domain::{ENV_OBSERVE_SESSION_ID, is_ai_env_var};
+        let origin = SessionId::generate();
+        let env = super::provision_observe_env(&origin);
+        assert_eq!(keys(&env), vec![ENV_OBSERVE_SESSION_ID]);
+        assert_eq!(env[0].1, origin.as_str());
+        assert!(
+            is_ai_env_var(ENV_OBSERVE_SESSION_ID),
+            "the hint must be stripped on inheritance — a grandchild is not the controller"
         );
     }
 

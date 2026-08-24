@@ -83,15 +83,19 @@ fn rows_only_shrink_preserves_ring_history_and_matches_tiered() {
         "identity law: same history sequence, viewport, and absolute numbering"
     );
 
-    // Spot-pin the shape so the identity cannot drift silently: 21 old
-    // history lines + the 5 demoted bottom rows; viewport = old top rows;
-    // numbering intact (nothing evicted).
+    // Spot-pin the shape so the identity cannot drift silently: the shrink
+    // anchors at the CURSOR (audit-2 item 1) — the top 5 viewport rows are
+    // demoted as the newest history, a pure relabel, so the full reading
+    // order stays exactly the write order (N0..N29 then the cursor's blank
+    // row) and the cursor's line stays visible. The old pin archived the
+    // BOTTOM rows — including the cursor's blank row as manufactured blank
+    // history — and hid N29 from view.
     let (history, viewport, oldest_abs) = logical_buffer(&ring);
     assert_eq!(history.len(), 26);
     assert_eq!(history[0], "N0");
     assert_eq!(history[20], "N20");
-    assert_eq!(&history[21..], ["N26", "N27", "N28", "N29", ""]);
-    assert_eq!(viewport, ["N21", "N22", "N23", "N24", "N25"]);
+    assert_eq!(&history[21..], ["N21", "N22", "N23", "N24", "N25"]);
+    assert_eq!(viewport, ["N26", "N27", "N28", "N29", ""]);
     assert_eq!(
         oldest_abs, 0,
         "no eviction: absolute rows keep their identity"

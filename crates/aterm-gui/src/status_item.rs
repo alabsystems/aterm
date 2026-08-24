@@ -60,6 +60,9 @@ pub enum OperatorAction {
     FocusSession(u64),
     /// Activate a sibling aterm instance's windows (payload: its pid).
     RaiseInstance(u32),
+    /// Open the §5 connection map on the frontmost window, raising it (the
+    /// [`Self::Show`] host+raise shape; design §5.1 macOS entry).
+    ShowConnectionMap,
 }
 
 /// The packed-tag band width for payload-carrying actions: `tag = kind × BAND +
@@ -83,6 +86,7 @@ impl OperatorAction {
             OperatorAction::Start => 1,
             OperatorAction::Show => 2,
             OperatorAction::Stop => 3,
+            OperatorAction::ShowConnectionMap => 4,
             OperatorAction::FocusWindow(id) => packed(1, id),
             OperatorAction::FocusSession(id) => packed(2, id),
             OperatorAction::RaiseInstance(pid) => packed(3, u64::from(pid)),
@@ -95,6 +99,7 @@ impl OperatorAction {
             1 => Some(OperatorAction::Start),
             2 => Some(OperatorAction::Show),
             3 => Some(OperatorAction::Stop),
+            4 => Some(OperatorAction::ShowConnectionMap),
             t if t >= TAG_BAND => {
                 let payload = t % TAG_BAND;
                 let payload_u64 = u64::try_from(payload).ok()?;
@@ -189,6 +194,13 @@ pub struct FleetGlance {
     pub start_available: bool,
     /// Total live sessions in this instance (the operator included).
     pub sessions: usize,
+    /// Live session connections (design §5.1): distinct directed flows across
+    /// the edge tables — exactly the §5 map's arrow count, so the menu number
+    /// and the map it opens can never disagree. Not a session-title fact, so
+    /// [`classify`] leaves it `0` and the glance builder fills it. Recorded
+    /// authority only — NO live-activity term (design DECIDED: lease/watcher
+    /// liveness has no wake funnel and belongs to the map's paint time).
+    pub connections: usize,
     /// Escalating sessions in roster order: `(local_id, display text)`. Typed
     /// `attention` meta escalates (rendered `⚠ <message>`); a `⚠`-prefixed
     /// title still escalates as fallback. Non-empty ⇒ the bar icon badges.
@@ -224,6 +236,17 @@ impl FleetGlance {
         }
     }
 
+    /// The fleet-summary info row: session count with the connections count
+    /// folded beside it (design §5.1 — one row, no separate live term). Pure
+    /// so the label is testable off macOS; both menu builders render it
+    /// verbatim.
+    pub fn sessions_line(&self) -> String {
+        format!(
+            "Sessions: {} \u{b7} Connections: {}",
+            self.sessions, self.connections
+        )
+    }
+
     /// A cheap change fingerprint: the caller refreshes AppKit only when this
     /// string differs from the previous glance's (title drift is frequent; menu
     /// rebuilds should not be). Covers EVERY rendered fact — windows and
@@ -239,6 +262,10 @@ impl FleetGlance {
         fp.push('\u{1f}');
         fp.push(if self.operator_typed { 'T' } else { 't' });
         fp.push(if self.start_available { 'S' } else { 's' });
+        // The connections count is a rendered fact (the sessions row), so it
+        // must move the fingerprint or a mint/revoke would leave a stale menu.
+        fp.push('\u{1f}');
+        fp.push_str(&self.connections.to_string());
         for (id, title) in &self.warnings {
             fp.push('\u{1f}');
             fp.push_str(&id.to_string());
@@ -356,6 +383,8 @@ pub fn classify(rows: &[SessionRow]) -> FleetGlance {
         operator_typed,
         start_available: false,
         sessions: rows.len(),
+        // Not a title fact — the glance builder fills it from the edge fold.
+        connections: 0,
         warnings,
         windows: Vec::new(),
         instances: Vec::new(),
@@ -448,7 +477,14 @@ pub fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
             enabled: true,
         });
     }
-    rows.push(StatusRow::Info(format!("Sessions: {}", glance.sessions)));
+    rows.push(StatusRow::Info(glance.sessions_line()));
+    // The map entry rides beside the count it summarizes (design §5.1); always
+    // present — an empty fabric still opens an honest empty map.
+    rows.push(StatusRow::Action {
+        label: "Show Connection Map".to_string(),
+        action: OperatorAction::ShowConnectionMap,
+        enabled: true,
+    });
 
     if !glance.instances.is_empty() {
         rows.push(StatusRow::Separator);
@@ -726,6 +762,7 @@ mod tests {
             OperatorAction::Start,
             OperatorAction::Show,
             OperatorAction::Stop,
+            OperatorAction::ShowConnectionMap,
         ] {
             assert_eq!(OperatorAction::from_tag(a.tag()), Some(a));
         }
@@ -898,7 +935,15 @@ mod tests {
                     enabled: true,
                 },
                 StatusRow::Separator,
-                StatusRow::Info("Sessions: 0".into()),
+                // The §5.1 sessions row folds the connections count, and the
+                // map entry rides beside the number it summarizes — always
+                // offered, because an empty fabric still opens an honest map.
+                StatusRow::Info("Sessions: 0 \u{b7} Connections: 0".into()),
+                StatusRow::Action {
+                    label: "Show Connection Map".into(),
+                    action: OperatorAction::ShowConnectionMap,
+                    enabled: true,
+                },
             ]
         );
     }
@@ -1039,7 +1084,12 @@ mod tests {
                     action: OperatorAction::FocusSession(2),
                     enabled: true,
                 },
-                StatusRow::Info("Sessions: 2".into()),
+                StatusRow::Info("Sessions: 2 \u{b7} Connections: 0".into()),
+                StatusRow::Action {
+                    label: "Show Connection Map".into(),
+                    action: OperatorAction::ShowConnectionMap,
+                    enabled: true,
+                },
                 StatusRow::Separator,
                 StatusRow::Info("Other aterm instances".into()),
                 StatusRow::Action {
@@ -1070,5 +1120,27 @@ mod tests {
         assert_eq!(OperatorAction::from_tag(0), None);
         // An unknown packed kind decodes to None.
         assert_eq!(OperatorAction::from_tag(4 * 1_000_000_000_000 + 5), None);
+    }
+
+    #[test]
+    fn connections_count_moves_the_fingerprint() {
+        // A mint/revoke changes ONLY the count (no title drifts) — the
+        // fingerprint must still move or the menu serves the stale number.
+        let base = classify(&rows(&[(1, "operator: fleet idle"), (2, "zsh")]));
+        let mut minted = base.clone();
+        minted.connections = 1;
+        assert_ne!(base.fingerprint(), minted.fingerprint());
+        let mut revoked = minted.clone();
+        revoked.connections = 0;
+        assert_eq!(base.fingerprint(), revoked.fingerprint());
+    }
+
+    #[test]
+    fn sessions_line_folds_the_connections_count_beside_the_sessions() {
+        // The menu renders this line verbatim (the §5.1 one-row rule).
+        let mut g = classify(&rows(&[(1, "zsh"), (2, "vim")]));
+        assert_eq!(g.sessions_line(), "Sessions: 2 \u{b7} Connections: 0");
+        g.connections = 3;
+        assert_eq!(g.sessions_line(), "Sessions: 2 \u{b7} Connections: 3");
     }
 }

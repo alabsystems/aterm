@@ -160,6 +160,20 @@ pub struct WindowCarry {
     pub outer_y: Option<i32>,
 }
 
+/// One carried connection edge — the TOKENLESS projection of a live
+/// `(src, dst, op)` row (design §1.4#6). Plain strings on purpose: the wire
+/// spellings ([`aterm_session::SessionId`]`::as_str` / [`aterm_session::Op`]
+/// `::as_str`) ARE the manifest format, and an op the incoming build cannot
+/// parse is dropped-but-audited at re-mint rather than failing the whole
+/// adoption. The bearer token and launch nonce have no field here — the
+/// §1.4#3 "no secrets at rest" FATAL is unrepresentable, not merely checked.
+#[derive(Clone, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ConnectionCarry {
+    pub src: String,
+    pub dst: String,
+    pub op: String,
+}
+
 /// The SEAMLESS-RE-EXEC HANDOFF MANIFEST (proof-carrying DSU, RFC Rung 1a): the
 /// serializable projection of the whole session set that the outgoing process writes
 /// and the incoming (new) binary reads to re-materialize exactly the same tabs — no
@@ -174,6 +188,15 @@ pub struct SessionHandoff {
     /// Window-frame carry (schema-1 additive; absent in pre-carry manifests).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowCarry>,
+    /// CONNECTION CARRY (schema-1 additive, design §1.4#6; absent in
+    /// pre-connections manifests): the tokenless `(src, dst, op)` triple of
+    /// every live cross-session edge at handoff time — exactly what
+    /// `EdgeTable::edges()` enumerates. The incoming process re-mints these
+    /// through the one kind-bounded helper once its adopted sessions are
+    /// registered (fresh tokens under fresh nonces); the old rows die with
+    /// the old process. NEVER a token, NEVER a nonce (§1.4#3).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<ConnectionCarry>,
 }
 
 // ⚠ LOAD-BEARING WIRE FORMAT — DO NOT "CLEAN UP" THIS SERIALIZATION.
@@ -201,11 +224,32 @@ impl SessionHandoff {
     /// store's stable `local_id` order (so restore preserves tab order).
     #[must_use]
     pub fn from_store(store: &SessionStore) -> Self {
+        let handles = store.snapshot();
+        // CONNECTION CARRY (design §1.4#6): every live edge row across every
+        // registered session's table, projected TOKENLESS — the same
+        // `EdgeTable::edges()` fold the `flows` verb aggregates (a row lives
+        // only in its destination's table, so the concatenation has no
+        // duplicates). Each table is a leaf lock (the meta-lock discipline
+        // below — never a `Terminal` lock). Sorted `(src, dst, op)` so the
+        // manifest bytes are stable for a given edge set.
+        let mut connections: Vec<ConnectionCarry> = Vec::new();
+        for h in &handles {
+            let rows = {
+                let edges = h.ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+                edges.edges()
+            };
+            connections.extend(rows.into_iter().map(|e| ConnectionCarry {
+                src: e.src.as_str().to_string(),
+                dst: e.dst.as_str().to_string(),
+                op: e.op.as_str().to_string(),
+            }));
+        }
+        connections.sort_by(|a, b| (&a.src, &a.dst, &a.op).cmp(&(&b.src, &b.dst, &b.op)));
         Self {
             schema: Self::SCHEMA,
             window: None,
-            sessions: store
-                .snapshot()
+            connections,
+            sessions: handles
                 .into_iter()
                 .map(|h| {
                     // Project the operator metadata out of the shared ctx (the
@@ -802,20 +846,43 @@ mod tests {
         let root = handle(0, None);
         let root_sid = root.sid.clone();
         store.register(root);
-        store.register(handle_in_state(
-            2,
-            Some(root_sid.clone()),
-            SessionState::Alive,
-        ));
+        let peer = handle_in_state(2, Some(root_sid.clone()), SessionState::Alive);
+        let peer_sid = peer.sid.clone();
+        let peer_ctx = peer.ctx.clone();
+        store.register(peer);
         store.register(handle_in_state(
             1,
             Some(root_sid.clone()),
             SessionState::Exited,
         ));
         store.set_title(1, "vim");
+        // A live connection root → peer (`both` = pull + push, three rows in the
+        // PEER's table) must ride the manifest as TOKENLESS triples (§1.4#6).
+        {
+            let mut edges = peer_ctx.edges.lock().unwrap();
+            let minted = edges.grant_connection(
+                &root_sid,
+                &peer_sid,
+                aterm_session::ConnectionKind::Both,
+                &peer_ctx.nonce,
+            );
+            assert_eq!(minted.len(), 3, "both mints its exact op set");
+        }
 
         let manifest = SessionHandoff::from_store(&store);
         assert_eq!(manifest.sessions.len(), 3, "every live session is packed");
+        // The carry is exactly the `edges()` enumeration, `(src, dst, op)`-sorted
+        // wire spellings — and nothing else (no token field EXISTS to leak).
+        let carry = |op: &str| ConnectionCarry {
+            src: root_sid.as_str().to_string(),
+            dst: peer_sid.as_str().to_string(),
+            op: op.to_string(),
+        };
+        assert_eq!(
+            manifest.connections,
+            vec![carry("read-screen"), carry("signal"), carry("write-input")],
+            "the three rows one `both` mints, tokenless and sorted"
+        );
         // The identity round-trip the model proves (no loss, no fabrication, ordered).
         assert!(
             manifest.roundtrips(),
@@ -824,8 +891,22 @@ mod tests {
 
         // And explicitly: the parsed manifest re-materializes the exact set.
         let text = manifest.to_toml().unwrap();
+        // §1.4#3 REDACTION PROOF on the printed manifest: an `EdgeToken` is 32
+        // bytes = 64 hex chars; no run of that width may appear anywhere in the
+        // wire (sids are 20 hex, so this scan cannot false-positive on them).
+        assert!(
+            !text
+                .as_bytes()
+                .windows(64)
+                .any(|w| w.iter().all(u8::is_ascii_hexdigit)),
+            "no bearer-token-width hex blob may ride the manifest: {text}"
+        );
         let restored = SessionHandoff::from_toml(&text).expect("parse");
         assert_eq!(restored, manifest);
+        assert_eq!(
+            restored.connections, manifest.connections,
+            "the tokenless triples round-trip verbatim"
+        );
         assert_eq!(
             restored
                 .sessions

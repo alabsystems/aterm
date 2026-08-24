@@ -132,6 +132,21 @@ impl Damage {
         matches!(self, Damage::Full)
     }
 
+    /// This session's MARK-CALL clock (D-2 row-revision fold), or `None` under
+    /// [`Damage::Full`], which keeps no tracker and therefore no clock.
+    ///
+    /// `None` is not "no marks": it means the clock cannot answer, so the fold's
+    /// full arm must re-stamp unconditionally rather than treat the session as
+    /// unchanged. See [`DamageTracker::mark_seq`].
+    #[must_use]
+    #[inline]
+    pub(crate) fn mark_seq(&self) -> Option<u64> {
+        match self {
+            Damage::Full => None,
+            Damage::Partial(tracker) => Some(tracker.mark_seq),
+        }
+    }
+
     /// Check if a row is damaged.
     #[must_use]
     #[inline]

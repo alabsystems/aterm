@@ -26,6 +26,13 @@ pub(crate) struct DiagInfo {
     /// `invalid` state. Read from shipping updater code, not binary text.
     pub update_pin_sha256: String,
     pub renderer_default: &'static str,
+    /// What shell-integration preparation ACTUALLY did for the shell this
+    /// configuration spawns — distinct from the `shell_integration` row in the
+    /// capabilities list, which is the compile-time ADVERTISED capability. An
+    /// unknown shell or an unwritable loader cache reads "NOT ACTIVE" here
+    /// while the advertised row stays checked, and that split is the fact a
+    /// "command not found on the ALab tools" report needs surfaced.
+    pub shell_integration_runtime: String,
     pub features: Vec<(&'static str, bool)>,
     pub capabilities: Vec<(&'static str, bool)>,
     pub config_path: String,
@@ -56,6 +63,7 @@ impl DiagInfo {
         let _ = writeln!(s, "compiler:  {}", self.compiler);
         let _ = writeln!(s, "update-pin-sha256: {}", self.update_pin_sha256);
         let _ = writeln!(s, "renderer:  {}", self.renderer_default);
+        let _ = writeln!(s, "shell-int: {}", self.shell_integration_runtime);
         let _ = writeln!(
             s,
             "config:    {} [{}]",
@@ -130,13 +138,42 @@ fn renderer_label(gpu: bool) -> &'static str {
     if gpu { GPU_BACKEND_LABEL } else { "cpu" }
 }
 
+/// The RUNTIME shell-integration outcome for the shell this configuration
+/// would actually spawn (env > config `shell`, the same funnel as the spawn
+/// path) — probed by running the REAL preparation. That write is idempotent,
+/// memoized, and exactly what every launch performs; it is also the only
+/// honest probe, because "is the loader cache writable" is proven by writing.
+fn shell_integration_runtime(config: &crate::app_config::Config) -> String {
+    use aterm_core::shell_integration as si;
+    let hint = crate::app_config::resolve_shell_override(config);
+    let shell = match hint.as_deref().filter(|s| !s.is_empty()) {
+        Some(h) => si::ShellType::detect(h),
+        None => si::ShellType::detect_current(),
+    };
+    match si::prepare(shell) {
+        Ok(Some(_)) => format!("active ({shell:?} loader prepared)"),
+        Ok(None) => {
+            let name = hint
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("SHELL").ok())
+                .unwrap_or_else(|| "the default shell".to_string());
+            format!(
+                "NOT ACTIVE — no integration for {name}; ALab tools reach new shells \
+                 only via shell.d, so add <prefix>/bin to PATH manually"
+            )
+        }
+        Err(e) => format!("NOT ACTIVE — loader cache unwritable: {e}"),
+    }
+}
+
 /// Collect diagnostics from the live build + environment.
 pub(crate) fn collect() -> DiagInfo {
+    let config = crate::app_config::load_config();
     // Renderer default resolved through the shared funnel (env > config `gpu` >
     // GPU-on default) so the report matches what `main` would actually launch. wgpu
     // negotiates Metal on macOS, Vulkan elsewhere; the live `metrics` verb reports
     // the actually-negotiated backend.
-    let gpu = crate::app_config::resolve_want_gpu(&crate::app_config::load_config());
+    let gpu = crate::app_config::resolve_want_gpu(&config);
     let renderer_default = renderer_label(gpu);
 
     let (config_path, config_exists) = match crate::app_config::config_path() {
@@ -166,6 +203,7 @@ pub(crate) fn collect() -> DiagInfo {
         compiler: crate::build_info::compiler_summary(),
         update_pin_sha256: aterm_update::compiled_update_pin_sha256(),
         renderer_default,
+        shell_integration_runtime: shell_integration_runtime(&config),
         features: vec![
             ("sixel", cfg!(feature = "sixel")),
             ("a11y-appkit", cfg!(feature = "a11y-appkit")),
@@ -599,15 +637,30 @@ pub(crate) fn config_semantic_warnings(
         }
     }
     if config.allow_osc52_query == Some(true) {
-        // The Query arm ANSWERS now (own-slot reads, per selection: `c` from the
-        // clipboard slot, `p` from PRIMARY on X11), so the old "every Query is
-        // dropped" line was false. What is still worth saying is what the key
-        // actually widens: a program in the terminal can read back what aterm
-        // itself put on the clipboard.
+        // The warning states the WIDEST thing the key grants on THIS platform —
+        // informed consent needs the scarier truth, not the reassuring one. On
+        // macOS/Windows the Query arm answers with the SYSTEM pasteboard
+        // (`pbpaste` — the whole point of the knob is remote vim/tmux clipboard
+        // sync, which must see what the user copied in OTHER apps), so the old
+        // "own-slot only — never the desktop's clipboard" line was a false
+        // promise exactly where a password manager's copy is at stake. Linux is
+        // narrower for an implementation reason, not a policy one: a
+        // foreign-owner X11 read is a blocking round-trip inside the terminal
+        // lock, so only aterm's own selections answer today (spawn.rs, the
+        // Query arm) — say that, and no more.
+        let message = if cfg!(target_os = "linux") {
+            "allow_osc52_query is enabled: a program in the terminal can READ the \
+             clipboard selections aterm itself owns (a foreign app's copy is not \
+             readable on X11 today). Leave it off unless a specific tool needs it"
+        } else {
+            "allow_osc52_query is enabled: a program in the terminal can READ the \
+             system clipboard — including text copied in OTHER apps, such as a \
+             password manager. Leave it off unless a specific tool needs it \
+             (e.g. remote vim/tmux clipboard sync)"
+        };
         warnings.push(ConfigSemanticWarning {
             key: "allow_osc52_query",
-            message: "allow_osc52_query is enabled: a program in the terminal can READ BACK what aterm placed on the clipboard (own-slot only — never the desktop's clipboard). Leave it off unless a specific tool needs it"
-                .to_string(),
+            message: message.to_string(),
         });
     }
     if config.allow_window_ops == Some(true) {
@@ -1257,13 +1310,10 @@ pub(crate) fn config_backend_capability_warnings(
         }
     }
     if platform == ConfigCapabilityPlatform::Unsupported {
-        if config.confirm_multiline_paste.is_some() {
-            warnings.push(ConfigSemanticWarning {
-                key: "confirm_multiline_paste",
-                message: "confirm_multiline_paste is parsed and preserved but has no protective effect on this platform because the dialog fallback accepts the paste without prompting; native confirmation is implemented on macOS and Windows"
-                    .to_string(),
-            });
-        }
+        // `confirm_multiline_paste` has NO warning here any more: it is live on
+        // every platform — the macOS sheet, the Windows MessageBoxW, and the
+        // Linux in-window `paste_banner` (the clipboard sweep closed the
+        // audited silent no-op this arm used to describe).
         if config.allow_notifications.is_some() {
             warnings.push(ConfigSemanticWarning {
                 key: "allow_notifications",
@@ -1976,11 +2026,13 @@ mod tests {
             std::collections::BTreeSet::from(["trail_sound_volume", "trail_sounds"]),
             "Windows has dialogs/notifications but no trail-audio consumer"
         );
+        // `confirm_multiline_paste` is deliberately absent: the confirm is
+        // live on every platform (Linux's in-window paste_banner included),
+        // so warning that it "has no protective effect" would be the lie.
         assert_eq!(
             keys(ConfigCapabilityPlatform::Unsupported),
             std::collections::BTreeSet::from([
                 "allow_notifications",
-                "confirm_multiline_paste",
                 "trail_sound_volume",
                 "trail_sounds",
             ])
@@ -2059,10 +2111,17 @@ palette = ["#112233"]
         assert_eq!(enabled.len(), 2, "{enabled:?}");
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_osc52_query"
-                // The Query arm answers now; the honest caveat names what the
-                // key widens, and states the own-slot bound.
-                && warning.message.contains("READ BACK")
-                && warning.message.contains("own-slot only")
+                // The honest caveat states the WIDEST grant on this platform:
+                // the system clipboard off-Linux (that is what the Query arm
+                // answers with — the old "own-slot only" line was a false
+                // promise there), the own-selections bound on X11.
+                && warning.message.contains("READ")
+                && if cfg!(target_os = "linux") {
+                    warning.message.contains("selections aterm itself owns")
+                } else {
+                    warning.message.contains("system clipboard")
+                        && warning.message.contains("OTHER apps")
+                }
         }));
         assert!(enabled.iter().any(|warning| {
             warning.key == "allow_window_ops"
@@ -2646,6 +2705,7 @@ ink = "rainbow"
             update_pin_sha256: "66687aadf862bd776c8fc18b8e9f8e20089714856ee233b3902a591d0d5f2925"
                 .into(),
             renderer_default: "cpu",
+            shell_integration_runtime: "active (Zsh loader prepared)".into(),
             features: vec![("sixel", true), ("accessibility", false)],
             capabilities: vec![("kitty_graphics", true), ("soft_fonts", false)],
             config_path: "/home/u/.config/aterm/aterm.toml".into(),
@@ -2670,6 +2730,26 @@ ink = "rainbow"
             "compiled updater trust pin"
         );
         assert!(r.contains("absent — defaults"), "config absence noted");
+        // The RUNTIME shell-integration line rides beside the advertised
+        // capability row — the split between the two is the diagnosable fact.
+        assert!(
+            r.contains("shell-int: active (Zsh loader prepared)"),
+            "runtime shell-integration outcome line"
+        );
+    }
+
+    /// `collect` probes the REAL preparation, so on a dev machine (a known
+    /// shell, a writable cache) it reports active — and never the advertised
+    /// constant's bare true/false, which is what this line replaced.
+    #[test]
+    fn collect_reports_runtime_shell_integration() {
+        let d = collect();
+        assert!(
+            d.shell_integration_runtime.starts_with("active")
+                || d.shell_integration_runtime.starts_with("NOT ACTIVE"),
+            "the line always states an outcome: {}",
+            d.shell_integration_runtime
+        );
     }
 
     #[test]

@@ -502,7 +502,7 @@ pub enum SandboxPolicy {
 pub use crate::env_sanitize::{
     ENV_DENY_PREFIXES, ENV_DENY_VARS, ENV_EDGE_READ, ENV_EDGE_SIGNAL, ENV_EDGE_TOKENS,
     ENV_EDGE_WRITE, ENV_LAUNCH_NONCE, ENV_NET_CERT, ENV_NET_KEY, ENV_NET_LISTEN,
-    ENV_PARENT_SESSION_ID, ENV_SESSION_ID, is_ai_env_var,
+    ENV_OBSERVE_SESSION_ID, ENV_PARENT_SESSION_ID, ENV_SESSION_ID, is_ai_env_var,
 };
 
 /// Configuration for spawning a new pane.

@@ -8,8 +8,41 @@ use std::collections::VecDeque;
 use std::io;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+
+/// Outcome of one bounded, immediate actuator egress attempt.
+///
+/// Unix PTYs do not make arbitrary-size `write(2)` calls transactional: an
+/// `O_NONBLOCK` write may accept a prefix.  This type keeps that kernel fact in
+/// the API instead of misreporting a partial mutation as either success or a
+/// safe-to-retry refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImmediateWrite {
+    /// The kernel accepted the entire frame during this call.
+    Full,
+    /// This call accepted zero bytes and queued nothing for later delivery.
+    BusyZero,
+    /// A conditional actuator call observed a different attempted-input epoch
+    /// and accepted zero bytes. Unlike generic backpressure, this means another
+    /// producer attempted input after the caller's snapshot, so retrying against
+    /// that snapshot would cross a human/controller interjection.
+    ConflictZero,
+    /// The kernel accepted this prefix immediately.  No tail was queued; the
+    /// action is in-doubt and must never be retried automatically.
+    PartialInDoubt { accepted: usize },
+}
+
+/// Opaque process-local version of all non-empty input attempts against one PTY
+/// sink. The counter advances before a producer can wait for the serialization
+/// lock, so a queued human/controller attempt invalidates an actuator snapshot
+/// even when that producer has not reached the kernel yet.
+///
+/// The value deliberately has no numeric accessor. It is only a compare token;
+/// on exhaustion the guarded path fails closed forever instead of wrapping and
+/// making an old token current again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputEpoch(u64);
 
 /// The ONE place bytes enter a session's PTY master fd. Every writer — the GUI
 /// keyboard, every control verb, the future `keys` forwarder, and the reader
@@ -117,6 +150,9 @@ struct Shared {
     /// writer thread for the fd's sake); the invariant it guards is "one frame at a
     /// time", which a recovered guard still upholds.
     lock: Mutex<()>,
+    /// Every non-empty producer reserves this before it can wait for `lock` or
+    /// touch the PTY. `u64::MAX` is a fail-closed terminal value (never wraps).
+    input_epoch: AtomicU64,
     /// The wedged-tty SPILL buffer (design §6.2's backpressure layer, first
     /// milestone): bytes a non-parking writer could not hand to the kernel without
     /// blocking. While non-empty, EVERY writer appends behind it (global FIFO is
@@ -145,6 +181,15 @@ struct Spill {
 }
 
 impl SinkWriter {
+    /// Largest frame admitted by [`Self::try_write_frame_immediate`].
+    ///
+    /// This is deliberately only large enough for one bounded controller turn
+    /// (the operator accepts at most 16 KiB of text, plus bracketed-paste
+    /// framing).  The immediate path never spills, but keeping its syscall unit
+    /// bounded is still part of the non-parking contract: a caller cannot turn
+    /// it into a bulk-paste path by accident.
+    pub const IMMEDIATE_FRAME_MAX: usize = 16 * 1024 + 32;
+
     /// Wrap a BORROWED PTY master fd: this sink does NOT close it (the caller — or a
     /// `-1` sentinel — retains ownership). The legacy constructor, used by tests and
     /// by sink stubs that don't drive a real PTY.
@@ -337,6 +382,191 @@ impl SinkWriter {
         self.shared.spill_is_empty()
     }
 
+    /// Current attempted-input epoch for this sink.
+    ///
+    /// This observes INPUT attempts, not terminal output. It therefore closes
+    /// human/raw-controller interjection races but cannot by itself make a
+    /// screen classification atomic with a PTY write.
+    #[must_use]
+    pub fn input_epoch(&self) -> InputEpoch {
+        InputEpoch(self.shared.input_epoch.load(Ordering::Acquire))
+    }
+
+    /// Reserve one non-empty input attempt, returning `(previous, reserved)`.
+    /// Exhaustion is permanent and makes conditional actuation fail closed.
+    fn reserve_input_attempt(&self) -> Option<(InputEpoch, InputEpoch)> {
+        self.shared
+            .input_epoch
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| {
+                epoch.checked_add(1)
+            })
+            .ok()
+            .map(|previous| (InputEpoch(previous), InputEpoch(previous + 1)))
+    }
+
+    /// Try to hand one bounded frame to the kernel **now**, without parking and
+    /// without putting any bytes in the detached spill drainer.
+    ///
+    /// This is the fail-closed actuator egress.  It differs intentionally from
+    /// [`Self::write_frame_nonparking`]: that UI-oriented method preserves input
+    /// by spilling when the fd is busy, which means an accepted key may arrive
+    /// much later.  A guarded actuator must instead retain the generation it
+    /// checked immediately before input.  This method therefore returns
+    /// [`ImmediateWrite::BusyZero`] without writing when:
+    ///
+    /// * another frame owns the serialization lock;
+    /// * the spill mutex itself is contended;
+    /// * any older spilled bytes still await delivery; or
+    /// * the non-blocking master has no room.
+    ///
+    /// On every such return, this call has queued nothing and no detached thread
+    /// can later inject this frame.  FIFO is preserved by holding both the fd
+    /// serialization lock and the spill lock across the one non-blocking write:
+    /// older work must be fully gone before this write, and newer writers cannot
+    /// overtake it.
+    ///
+    /// [`ImmediateWrite::PartialInDoubt`] is an immediate kernel short-write,
+    /// not a queued tail.  The caller MUST NOT retry it.  PTY writes do not
+    /// provide a portable transactional all-or-nothing guarantee, so exposing
+    /// the accepted prefix is essential to an honest actuator contract.
+    ///
+    /// Production Unix sessions mark their master `O_NONBLOCK` and call
+    /// [`Self::note_master_nonblocking`] during setup.  If that fact is absent we
+    /// refuse without touching the fd; a single write on a blocking description
+    /// could otherwise park despite a readiness probe.  ConPTY has no equivalent
+    /// non-blocking input primitive, so the Windows implementation below likewise
+    /// refuses without writing.
+    #[cfg(unix)]
+    pub fn try_write_frame_immediate(&self, bytes: &[u8]) -> ImmediateWrite {
+        if bytes.is_empty() {
+            return ImmediateWrite::Full;
+        }
+        // Reserve before every possible wait/refusal. A concurrent conditional
+        // actuator must see even an attempt that ultimately encounters EAGAIN.
+        let _ = self.reserve_input_attempt();
+        self.try_write_frame_immediate_reserved(bytes, None)
+    }
+
+    /// Conditional twin of [`Self::try_write_frame_immediate`]. The caller's
+    /// `expected` token is consumed by this attempt; a full write returns the new
+    /// token to carry into the next step of the same guarded turn.
+    ///
+    /// The decisive epoch check occurs while holding the same fd/spill locks as
+    /// the syscall. Attempts that reserved before this call acquired those locks
+    /// are observed and produce [`ImmediateWrite::ConflictZero`]. Once the check
+    /// linearizes, a later producer is serialized after this frame.
+    #[cfg(unix)]
+    pub fn try_write_frame_immediate_if_epoch(
+        &self,
+        expected: InputEpoch,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, InputEpoch) {
+        if bytes.is_empty() {
+            return (ImmediateWrite::Full, expected);
+        }
+        let Some((previous, reserved)) = self.reserve_input_attempt() else {
+            return (ImmediateWrite::ConflictZero, self.input_epoch());
+        };
+        if previous != expected {
+            return (ImmediateWrite::ConflictZero, reserved);
+        }
+        (
+            self.try_write_frame_immediate_reserved(bytes, Some(reserved)),
+            reserved,
+        )
+    }
+
+    #[cfg(unix)]
+    fn try_write_frame_immediate_reserved(
+        &self,
+        bytes: &[u8],
+        conditional: Option<InputEpoch>,
+    ) -> ImmediateWrite {
+        if bytes.len() > Self::IMMEDIATE_FRAME_MAX {
+            return ImmediateWrite::BusyZero;
+        }
+        if !self.master_nonblocking.load(Ordering::Relaxed) {
+            return ImmediateWrite::BusyZero;
+        }
+
+        // `try_lock` is load-bearing: neither a foreground write nor a spill
+        // drainer may make an actuator call wait outside its foreground bound.
+        // A poisoned mutex is already acquired, so recovering its guard remains
+        // non-parking and preserves the sink's usual poison policy.
+        let fd_guard = match self.shared.lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return ImmediateWrite::BusyZero;
+            }
+        };
+        let spill_guard = match self.shared.spill.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return ImmediateWrite::BusyZero;
+            }
+        };
+        if !spill_guard.buf.is_empty() {
+            return ImmediateWrite::BusyZero;
+        }
+        // This is the conditional operation's linearization point. Any input
+        // attempt that reserved before it invalidates the frame. A producer that
+        // reserves later is ordered after this lock holder.
+        if conditional.is_some_and(|reserved| self.input_epoch() != reserved) {
+            return ImmediateWrite::ConflictZero;
+        }
+
+        // Keep both guards through the syscall.  In particular, a normal writer
+        // cannot observe an empty spill and then race this frame for the fd.
+        let result = match aterm_pty::write_some_nonparking(self.master, bytes) {
+            aterm_pty::NonParkWrite::Wrote(n) if n == bytes.len() => ImmediateWrite::Full,
+            aterm_pty::NonParkWrite::Wrote(n) => ImmediateWrite::PartialInDoubt { accepted: n },
+            aterm_pty::NonParkWrite::Closed
+            | aterm_pty::NonParkWrite::WouldBlock
+            | aterm_pty::NonParkWrite::Fatal(_) => ImmediateWrite::BusyZero,
+        };
+        drop(spill_guard);
+        drop(fd_guard);
+        result
+    }
+
+    /// Windows fail-closed twin of [`Self::try_write_frame_immediate`].
+    ///
+    /// ConPTY input uses a blocking anonymous-pipe write and has no pollable /
+    /// non-blocking operation with which to uphold the immediate contract.  Do
+    /// not silently weaken the actuator deadline: refuse without writing until a
+    /// native bounded primitive exists.
+    #[cfg(windows)]
+    pub fn try_write_frame_immediate(&self, bytes: &[u8]) -> ImmediateWrite {
+        if bytes.is_empty() {
+            return ImmediateWrite::Full;
+        }
+        let _ = self.reserve_input_attempt();
+        ImmediateWrite::BusyZero
+    }
+
+    /// Windows fail-closed conditional twin. ConPTY still has no bounded input
+    /// primitive, but the attempted-input epoch is consumed so a later guarded
+    /// operation cannot mistake this refused attempt for quiescence.
+    #[cfg(windows)]
+    pub fn try_write_frame_immediate_if_epoch(
+        &self,
+        expected: InputEpoch,
+        bytes: &[u8],
+    ) -> (ImmediateWrite, InputEpoch) {
+        if bytes.is_empty() {
+            return (ImmediateWrite::Full, expected);
+        }
+        let Some((previous, reserved)) = self.reserve_input_attempt() else {
+            return (ImmediateWrite::ConflictZero, self.input_epoch());
+        };
+        if previous != expected {
+            return (ImmediateWrite::ConflictZero, reserved);
+        }
+        (ImmediateWrite::BusyZero, reserved)
+    }
+
     /// Write a WHOLE frame atomically with respect to other writers, returning the
     /// number of bytes accepted (`== bytes.len()` on success). Holds the
     /// serialization lock until the frame is either on the wire or handed to the
@@ -367,6 +597,9 @@ impl SinkWriter {
         )
     )]
     pub fn write_frame(&self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() {
+            let _ = self.reserve_input_attempt();
+        }
         // FIFO with any SPILLED bytes: while the wedged-tty spill buffer is
         // non-empty this frame must queue BEHIND it (a direct write would overtake
         // spilled keystrokes), under the SPILL_CAP wait so a paste into a wedged
@@ -540,6 +773,9 @@ impl SinkWriter {
     )]
     #[cfg(unix)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() {
+            let _ = self.reserve_input_attempt();
+        }
         // Only SMALL frames get the non-parking treatment. The UI thread only
         // ever produces small frames (keystrokes / mouse reports / IME commits —
         // tens of bytes); anything larger is paste/bulk from an expendable
@@ -712,6 +948,9 @@ impl SinkWriter {
     /// unix tty input buffer does.
     #[cfg(windows)]
     pub fn write_frame_nonparking(&self, bytes: &[u8]) -> io::Result<usize> {
+        if !bytes.is_empty() {
+            let _ = self.reserve_input_attempt();
+        }
         self.write_frame(bytes)
     }
 
@@ -787,6 +1026,7 @@ impl Shared {
     fn new() -> Self {
         Self {
             lock: Mutex::new(()),
+            input_epoch: AtomicU64::new(0),
             spill: Mutex::new(Spill {
                 buf: VecDeque::new(),
                 draining: false,
@@ -1087,6 +1327,101 @@ mod tests {
         reader.read_exact(&mut buf).expect("read_exact");
         assert_eq!(&buf, b"hello-sink");
         drop(writer);
+    }
+
+    /// A contended fd lock is a zero-byte refusal, not an invitation to spill a
+    /// guarded actuator frame behind the holder.  Once the holder leaves, the
+    /// next distinct frame lands in full; reading exactly that frame proves the
+    /// rejected marker was not injected later.
+    #[test]
+    fn immediate_write_refuses_contention_without_delayed_injection() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        writer.set_nonblocking(true).expect("nonblocking writer");
+        let sink = SinkWriter::new(writer.as_raw_fd());
+        sink.note_master_nonblocking(true);
+
+        let held = sink.shared.lock.lock().unwrap();
+        assert_eq!(
+            sink.try_write_frame_immediate(b"REJECTED"),
+            ImmediateWrite::BusyZero,
+            "try-lock contention must accept zero bytes"
+        );
+        drop(held);
+
+        assert_eq!(
+            sink.try_write_frame_immediate(b"accepted"),
+            ImmediateWrite::Full
+        );
+        let mut got = [0_u8; 8];
+        reader.read_exact(&mut got).expect("read accepted frame");
+        assert_eq!(&got, b"accepted");
+    }
+
+    /// An existing spill is older in the sink's FIFO, so an immediate actuator
+    /// frame must refuse instead of joining the detached drainer.  After the
+    /// wedge clears, only the explicitly spill-tolerant older frame appears;
+    /// the refused marker never arrives later.
+    #[test]
+    fn immediate_write_refuses_spill_without_delayed_injection() {
+        let (mut reader, writer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        writer.set_nonblocking(true).expect("nonblocking writer");
+        let sink = Arc::new(SinkWriter::new(writer.as_raw_fd()));
+        sink.note_master_nonblocking(true);
+
+        let mut filled = 0_usize;
+        loop {
+            match aterm_pty::write_some(writer.as_raw_fd(), &[b'.'; 4096]) {
+                Ok(n) if n > 0 => filled += n,
+                _ => break,
+            }
+        }
+        assert!(filled > 0, "socket send buffer filled");
+        assert_eq!(
+            sink.write_frame_nonparking(b"OLDER").expect("spill older"),
+            5
+        );
+        assert!(!sink.shared.spill_is_empty(), "older frame entered spill");
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            sink.try_write_frame_immediate(b"REJECTED"),
+            ImmediateWrite::BusyZero
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "immediate refusal must not wait for the wedged peer"
+        );
+
+        let mut got = vec![0_u8; filled + 5];
+        reader
+            .read_exact(&mut got)
+            .expect("drain fill and older frame");
+        assert_eq!(&got[filled..], b"OLDER");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let settled = {
+                let spill = sink.shared.spill.lock().unwrap();
+                spill.buf.is_empty() && !spill.draining
+            };
+            if settled {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "spill did not settle");
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+
+        // A later accepted frame is the next and only byte sequence.  If the
+        // refused marker had been queued, it would precede this in FIFO order.
+        assert_eq!(
+            sink.try_write_frame_immediate(b"accepted"),
+            ImmediateWrite::Full
+        );
+        let mut accepted = [0_u8; 8];
+        reader
+            .read_exact(&mut accepted)
+            .expect("read accepted frame");
+        assert_eq!(&accepted, b"accepted");
     }
 
     // REGRESSION (integration audit): a `new_owned` SinkWriter OWNS the fd and closes

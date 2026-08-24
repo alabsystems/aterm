@@ -730,19 +730,21 @@ impl EffectsPipeline {
             let Some((row, col)) = cur else {
                 self.glow.cancel_authored_move_candidate();
                 self.trail.cancel_authored_move_candidate();
-                self.glow
-                    .observe_content_generation(generation, false);
+                let ownership = self
+                    .glow
+                    .observe_content_generation(generation, cur, false);
                 self.trail
-                    .observe_content_generation(generation, false);
+                    .observe_content_generation(generation, ownership);
                 return;
             };
             let Some(render_row) = input.cells.get(usize::from(row)) else {
                 self.glow.cancel_authored_move_candidate();
                 self.trail.cancel_authored_move_candidate();
-                self.glow
-                    .observe_content_generation(generation, false);
+                let ownership = self
+                    .glow
+                    .observe_content_generation(generation, cur, false);
                 self.trail
-                    .observe_content_generation(generation, false);
+                    .observe_content_generation(generation, ownership);
                 return;
             };
             self.candidate_row_scratch.clear();
@@ -770,10 +772,14 @@ impl EffectsPipeline {
         } else {
             false
         };
-        self.glow
-            .observe_content_generation(generation, candidate_confirmed);
+        // ONE ownership verdict, computed by the probe-holding glow engine
+        // and projected verbatim onto the classic trail twin — the same
+        // single-authority seam the native host uses.
+        let ownership = self
+            .glow
+            .observe_content_generation(generation, cur, candidate_confirmed);
         self.trail
-            .observe_content_generation(generation, candidate_confirmed);
+            .observe_content_generation(generation, ownership);
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT

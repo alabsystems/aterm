@@ -69,6 +69,18 @@ mod app_rename;
 mod app_render;
 mod app_search;
 mod app_settings;
+mod app_conn_card;
+/// `App` glue for drag-to-connect (design §3.1–§3.3): arming from the strip
+/// funnel, cursor tracking + cross-window target resolution, the drop-target
+/// highlight pushes, the source-window wire card, and the drop into the
+/// confirm card. The pure gesture core lives in [`conn_drag`].
+mod app_conn_drag;
+/// `App` glue for the connection map (design §5): the fabric snapshot, the
+/// host+raise open, the §2.4 refresh leg, the paint-time lease/watcher stamp,
+/// and the raise/disconnect selection acts. The pure overlay model lives in
+/// [`connection_map`].
+mod app_connection_map;
+mod app_session_picker;
 mod app_tabs;
 /// The seamless update handoff — `apply_staged_update_now`, the unix overlap
 /// worker, the Commit-time admission facts and `finish_update_handoff`. Split
@@ -118,6 +130,19 @@ mod command_registry;
 mod compiler_probe;
 mod config_notice;
 mod config_watcher;
+/// The connection confirm/configure card (design §3.3 + §2.5 — one shared component).
+mod conn_card;
+/// Drag-to-connect's pure gesture core (design §3.1–§3.3): the
+/// armed/dragging/over-target state machine and the screen-space
+/// window-frame registry. No App/winit/AppKit — unit-tested geometry.
+mod conn_drag;
+/// The connection map overlay's pure model (design §5.2): chips grouped by
+/// window, one labeled arrow per flow direction, the layered push projection,
+/// and the raise/disconnect selection machine.
+mod connection_map;
+/// The GUI connection core (§1.4): the process-local `ConnectionRecord` store,
+/// connect/disconnect, the §4.1 mark-role predicate, and the close-time sweep.
+mod connections;
 mod control;
 /// The main-thread redraw conformance gate, for the `aterm-redraw-conformance`
 /// binary. Re-exported here because a `[[bin]]` is its own crate and everything
@@ -245,6 +270,7 @@ mod net_connections;
 mod net_listen;
 mod notice;
 mod notify;
+mod operator_host;
 mod overlay;
 mod packages_screen;
 mod pane;
@@ -285,6 +311,10 @@ mod secure_input;
 mod memory_pressure;
 /// Per-session tooltip/context-menu composer (session-metadata stage 2).
 mod session_chrome;
+/// The session picker overlay (design §2.3/§2.5 — the picker slice).
+mod session_picker;
+/// Hex-free `session_edge` audit events for connection-authority acts (§1.4#5).
+mod session_edge_audit;
 /// Pure, GUI-free status classifier for a session (Tab Subject & Status).
 mod session_status;
 mod session_store;
@@ -1985,6 +2015,12 @@ struct RepaintKey {
     /// dismissed or no snapshot — so an idle key is byte-identical to the
     /// no-card path (the FL-1 idle invariant every sibling `*_fp` holds).
     pkg_progress_fp: u64,
+    /// Fingerprint of the drag-to-connect WIRE on this window ([`conn_drag`],
+    /// design §3.2): the tracked cursor + target, so each motion step of a live
+    /// connection drag re-presents even though it dirties no grid cell. `0`
+    /// whenever no drag renders here (armed-only, native-origin, or another
+    /// window's drag) ⇒ byte-identical to the pre-drag path (idle invariant).
+    conn_wire_fp: u64,
     /// Whether the OS appearance is dark (`App::os_appearance`). The Settings
     /// preview's `window_theme=auto` titlebar mock splits on the LIVE appearance
     /// (`PreviewCtx::system_dark`, hashed into the raster's geom_key), but a flip
@@ -2514,6 +2550,21 @@ enum Wake {
         split: Option<pane::SplitDir>,
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
+    /// `spawn connected=controlled|controller place=window|tab of=<sid>`
+    /// (control socket): the CONNECTED spawn — mint one new session AND the
+    /// `both` session connection binding it to `origin` (design §2.3 presets /
+    /// §6 wire twin; Owner-only via the `escalated_op` fence). A main-thread
+    /// hop like `SpawnSession`; the handler resolves `origin` from the
+    /// registry, refuses `place=window` under headless (`ERR headless`,
+    /// §1.4#7), and replies the newborn's sid.
+    SpawnConnectedSession {
+        kind: connections::ConnectedSpawnKind,
+        place: connections::ConnectedSpawnPlace,
+        origin: aterm_session::SessionId,
+        /// Optional cwd override; `None` defaults to the ORIGIN session's cwd.
+        cwd: Option<String>,
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     /// `@<sid> close` (control socket): retire a session by id — the death half of
     /// `spawn`. Closes the tab hosting the resolved session; replies Ok(()) when the
     /// session is gone, Err(msg) when the target is unknown or the close was refused.
@@ -2521,6 +2572,22 @@ enum Wake {
         session: u64,
         reply: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    /// `raise <sid>` (control socket): raise the window hosting the resolved
+    /// session and select its tab — the wire twin of the session-connections
+    /// menu Show / map Enter (design §6), the `OperatorAction::Show` shape for
+    /// an arbitrary session. Replies Ok(()) after the switch+focus, Err when no
+    /// window hosts the session (headless, or a view the strip no longer shows).
+    RaiseSession {
+        session: u64,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    /// A session-connection AUTHORITY act succeeded on the control thread
+    /// (`connect`/`disconnect`/`grant`/`revoke`): the edge tables changed, so
+    /// every window re-stamps its §4 tab marks through the one strip funnel
+    /// (`refresh_window_tabs` → `stamp_tab_connection_roles`) and repaints.
+    /// Posted at authority-act rate (never per frame); both endpoints of a
+    /// connection may sit in different windows, hence the all-window sweep.
+    ConnectionsChanged,
     SettingsOverlay {
         open: Option<bool>,
         /// `Some(is_open)` after driving the native tab; `None` when there is no front
@@ -2715,10 +2782,9 @@ enum Wake {
     /// runs [`App::dispatch_tab_menu_action`]: `CopySessionId`/`CopyCwd`
     /// resolve the tab's session and write the pasteboard via the shared
     /// `pbcopy` seam; `CloseTab` takes the byte-same body as
-    /// [`Wake::CloseTab`]. Fire-and-forget. macOS-only constructor (the
-    /// strip's `NSMenu` item relay in `toolbar.rs`); the variant exists
-    /// everywhere so `Wake` stays platform-independent.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    /// [`Wake::CloseTab`]. Fire-and-forget. Posted by BOTH menu renderers:
+    /// the macOS strip's `NSMenu` item relay (`toolbar.rs`) and the in-grid
+    /// overlay card's activation (`app_tabs.rs`) — one dispatch authority.
     TabMenuAction {
         window: WindowId,
         tab: tab_model::TabId,
@@ -2730,6 +2796,53 @@ enum Wake {
     /// tracking loop in case a newer proof was armed meanwhile.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TabContextMenuOpening { window: WindowId },
+    /// A per-peer CONNECTION row of a tab's context menu was clicked (design
+    /// §2.2 [v5]): Show / Configure… / Disconnect against `peer_sid`. Not a
+    /// [`Wake::TabMenuAction`] because the act needs a peer ARGUMENT no
+    /// fieldless tag can carry — the native item's tag indexes the strip's
+    /// pop-time row snapshot instead (the `menu_tab` discipline), and the
+    /// decoded row posts here. `tab` is the pop-time stable identity for the
+    /// same stale-menu reasons as `TabMenuAction`; `user_event` runs
+    /// [`App::dispatch_tab_menu_connection`]. Posted by BOTH menu renderers
+    /// (the macOS strip's `NSMenu` relay and the in-grid overlay card).
+    TabMenuConnection {
+        window: WindowId,
+        tab: tab_model::TabId,
+        peer_sid: aterm_session::SessionId,
+        verb: session_chrome::ConnVerb,
+    },
+    /// A NATIVE-strip connector press crossed the §3.1 movement threshold: a
+    /// connection drag begins from `tab` of `window` (design §3.2; the in-grid
+    /// twin arms in-process through the strip funnel and never posts). Carries
+    /// the STABLE pop-agnostic [`tab_model::TabId`] captured at press time —
+    /// the drag lives for seconds and the chip's positional index is re-stamped
+    /// by the strip's diff path. `user_event` runs
+    /// `App::conn_drag_native_begin`. macOS-only constructor.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ConnDragBegin {
+        window: WindowId,
+        tab: tab_model::TabId,
+    },
+    /// Native connector-drag tracking: the cursor is at `(x, y)` in winit
+    /// screen space (physical px, top-left origin — the same space the
+    /// window-frame registry's `inner_position` entries live in, converted on
+    /// the AppKit side by the one flip law `platform.rs` documents).
+    /// `user_event` re-resolves the drop target + highlights. macOS-only
+    /// constructor.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ConnDragTo { window: WindowId, x: f64, y: f64 },
+    /// Native connector-drag release past the threshold: drop at `(x, y)`
+    /// (same space as [`Wake::ConnDragTo`]) — resolve T and open the §3.3
+    /// confirm card, or dissolve over nothing. A release WITHIN the threshold
+    /// posts nothing (the native strip opens its own `NSMenu` in-process).
+    /// macOS-only constructor.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ConnDragDrop { window: WindowId, x: f64, y: f64 },
+    /// Native connector-drag abort (the screen-space conversion failed — a
+    /// window mid-teardown): dissolve the drag, highlight cleanup included,
+    /// minting nothing. macOS-only constructor.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    ConnDragCancel { window: WindowId },
     /// A tab chip was DOUBLE-CLICKED (macOS strip): open the inline pin editor
     /// over that tab. Carries the STABLE [`tab_model::TabId`] captured at the
     /// gesture, for the same reason [`Wake::TabMenuAction`] does — an editor
@@ -7405,6 +7518,16 @@ struct WindowState {
     /// UNDER `settings_card`. `None` when no celebration / the arrow has faded. The border
     /// glow layer rides the drop-overlay pass, not this card. See [`crate::level_up`].
     level_up_card: Option<SettingsCard>,
+    /// The rasterized drag-to-connect WIRE (paint-only, design §3.2): the line
+    /// from this window's pressed connector to the cursor, present only while
+    /// a connection drag from THIS window is in flight and the cursor is over
+    /// it (beyond the source window the pushed chip highlights + the cursor
+    /// carry the signal). Composited with priority OVER `level_up_card`/
+    /// `notice_card`/`badge_card` — the drag is the foreground act for its few
+    /// hundred milliseconds — and UNDER `settings_card` (no modal can be open
+    /// mid-drag anyway: the overlays claim the pointer before the strip). See
+    /// `App::splice_conn_wire`.
+    conn_wire_card: Option<SettingsCard>,
     /// Set by Cmd-W; the loop closes this window after the handler returns
     /// (renamed from the old `App.should_exit`).
     pending_close: bool,
@@ -7419,7 +7542,7 @@ impl WindowState {
     /// Whether the notice card is the one ACTUALLY ON GLASS in this window.
     ///
     /// The paint-only cards share ONE composited slot, in the order
-    /// `settings_card → level_up_card → notice_card → badge_card` (see
+    /// `settings_card → conn_wire_card → level_up_card → notice_card → badge_card` (see
     /// `App::fold_route_card`), so "a notice is armed" and "a notice is visible" are
     /// different facts: `App::notice` is global, its card can be absent in this window
     /// (serious mode, zero columns, a rect the paint region rejected), and even a present
@@ -7432,7 +7555,10 @@ impl WindowState {
     /// burst, or in a window whose card never composited — silently applied the update and
     /// re-execed the whole app.
     pub(crate) fn notice_is_on_glass(&self) -> bool {
-        self.notice_card.is_some() && self.settings_card.is_none() && self.level_up_card.is_none()
+        self.notice_card.is_some()
+            && self.settings_card.is_none()
+            && self.conn_wire_card.is_none()
+            && self.level_up_card.is_none()
     }
 
     /// Whether this window is inside the [`RESIZE_SOUND_QUIET`] window: within
@@ -7465,6 +7591,7 @@ impl WindowState {
         self.route_card
             .as_ref()
             .or(self.settings_card.as_ref())
+            .or(self.conn_wire_card.as_ref())
             .or(self.level_up_card.as_ref())
             .or(self.notice_card.as_ref())
             .or(self.badge_card.as_ref())
@@ -8108,6 +8235,55 @@ impl WindowState {
         }
     }
 
+    /// The connection confirm/configure card for this window, if it is the
+    /// OPEN variant.
+    fn conn_card(&self) -> Option<&crate::conn_card::ConnCardState> {
+        match &self.overlay {
+            Some(crate::overlay::Overlay::ConnCard(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable [`Self::conn_card`].
+    fn conn_card_mut(&mut self) -> Option<&mut crate::conn_card::ConnCardState> {
+        match &mut self.overlay {
+            Some(crate::overlay::Overlay::ConnCard(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// The connection map for this window, if it is the OPEN variant.
+    fn connection_map(&self) -> Option<&crate::connection_map::ConnectionMapState> {
+        match &self.overlay {
+            Some(crate::overlay::Overlay::ConnectionMap(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// Mutable [`Self::connection_map`].
+    fn connection_map_mut(&mut self) -> Option<&mut crate::connection_map::ConnectionMapState> {
+        match &mut self.overlay {
+            Some(crate::overlay::Overlay::ConnectionMap(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    /// The session picker for this window, if it is the OPEN variant.
+    fn session_picker(&self) -> Option<&crate::session_picker::SessionPickerState> {
+        match &self.overlay {
+            Some(crate::overlay::Overlay::SessionPicker(p)) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Mutable [`Self::session_picker`].
+    fn session_picker_mut(&mut self) -> Option<&mut crate::session_picker::SessionPickerState> {
+        match &mut self.overlay {
+            Some(crate::overlay::Overlay::SessionPicker(p)) => Some(p),
+            _ => None,
+        }
+    }
+
     /// The Software Update overlay for this window, if it is the OPEN variant.
     fn update_screen(&self) -> Option<&crate::update_screen::UpdateState> {
         match &self.overlay {
@@ -8467,6 +8643,7 @@ impl WindowState {
             badge_card: None,
             notice_card: None,
             level_up_card: None,
+            conn_wire_card: None,
             pending_close: false,
             wallpaper_scaled: None,
         }
@@ -9797,6 +9974,13 @@ struct App {
     /// one of these (matched shell → adopt in place; leftover → appended so it is never
     /// lost). Empty on a normal launch (no handoff) and after restore runs.
     seamless_adopt: Vec<crate::spawn::Adopted>,
+    /// SEAMLESS CONNECTION CARRY (design §1.4#6): the tokenless `(src, dst, op)`
+    /// triples of the connections live in the outgoing process. Drained by
+    /// [`Self::remint_carried_connections`] once the restore above has placed
+    /// every handed-off shell — re-minted through the one kind-bounded helper
+    /// (fresh tokens under the adopted sessions' fresh nonces), never
+    /// resurrected. Empty on a normal launch and after the re-mint.
+    pending_conn_carry: Vec<crate::session_store::ConnectionCarry>,
     /// OVERLAP HANDOFF (incoming side): the parked parent's readiness-pipe write
     /// channel. `Some` flips this boot into overlap mode — adopted readers are
     /// deferred and [`Self::maybe_signal_handoff_ready`] writes the exact,
@@ -10143,6 +10327,17 @@ struct App {
     /// staleness bound, keeping coarse relative ages honest without turning an
     /// all-tab refresh into unbounded work. See [`App::composed_session_chrome`].
     session_chrome: std::collections::HashMap<u64, session_chrome::CachedChrome>,
+    /// The session-connection record store + §2.4 freshness epoch this App
+    /// reads and mints through — the PROCESS SINGLETON in a real run (the
+    /// control thread's wire verbs share it), a private store under
+    /// `headless_for_test` so parallel tests cannot bump each other's chrome
+    /// cache epochs.
+    connections: connections::ConnectionStore,
+    /// The LIVE drag-to-connect gesture (design §3.1–§3.3), if one is in
+    /// flight — process-global because the drag crosses windows (one mouse,
+    /// one button, at most one gesture). `None` between gestures. See
+    /// [`conn_drag`] (the pure machine) and `app_conn_drag.rs` (the glue).
+    conn_drag: Option<conn_drag::ConnDragState>,
     /// Sessions whose chrome recomposition hit a busy terminal mutex. The normal
     /// title-drift deadline owns retry timing; this bit makes that retry bypass
     /// visible-label coalescing because Activity can change while a Title-only
@@ -10262,6 +10457,10 @@ struct App {
     /// While present, second manual/debug applies are rejected and clean quit is
     /// deferred until the proof completion returns to the main thread.
     pending_update_handoff: Option<PendingUpdateHandoff>,
+    /// Resident operator authority used only to fence process replacement. The
+    /// reversible token is acquired at the final update seam, never retained in
+    /// ordinary rendering/input state.
+    operator_control: Option<operator_host::ControlHandle>,
     /// Monotonic user/output activity identity. A handoff captures it after
     /// parking; any later input/window activity invalidates final Commit and
     /// signals the worker to kill/reap the child before readers resume.
@@ -11893,6 +12092,7 @@ impl App {
             next_window_id: 1,
             pending_restore: None,
             seamless_adopt: Vec::new(),
+            pending_conn_carry: Vec::new(),
             handoff_ready: None,
             handoff_commit: None,
             handoff_reader_gate: None,
@@ -11931,6 +12131,10 @@ impl App {
             pending_deminiaturize_focus: None,
             _toolbars: BTreeMap::new(),
             session_chrome: std::collections::HashMap::new(),
+            // PRIVATE store: parallel test processes/threads must not bump
+            // each other's §2.4 chrome epochs through the process singleton.
+            connections: connections::new_connection_store(),
+            conn_drag: None,
             session_chrome_retry: std::collections::HashSet::new(),
             session_chrome_expiry: SessionChromeExpiryScan::default(),
             title_drift: TitleDrift::default(),
@@ -11952,6 +12156,7 @@ impl App {
             auto_apply_physical_retry: None,
             handoff_preverified: std::sync::Arc::default(),
             pending_update_handoff: None,
+            operator_control: None,
             update_handoff_activity_epoch: 0,
             last_update_activity_at: Instant::now(),
             next_update_handoff_id: 1,
@@ -12146,6 +12351,7 @@ impl App {
             &self.session_factory,
             &proxy,
             cwd.as_deref(),
+            None, // not a connected controller spawn
             None, // fresh shell (not a seamless-update adoption)
         ) {
             Ok(session) => {
@@ -14205,6 +14411,19 @@ impl ApplicationHandler<Wake> for App {
             self.apply_pending_restore(el);
             self.request_redraw_all_windows();
         }
+        // SEAMLESS CONNECTION RE-MINT (design §1.4#6): once the restore above has
+        // drained — every handed-off shell placed AND registered — re-establish
+        // the carried tokenless triples through the one kind-bounded mint helper.
+        // Ordered AFTER the drain (same park, next check) so no triple is judged
+        // against a half-populated registry (an early judgement would drop
+        // honestly-live authority). One-shot: the carry drains on entry.
+        if self.first_present_done
+            && self.pending_restore.is_none()
+            && self.seamless_adopt.is_empty()
+            && !self.pending_conn_carry.is_empty()
+        {
+            self.remint_carried_connections();
+        }
         // Rollback reader reattachment is an event-loop-owned liveness
         // obligation. A prior attach may have found a still-draining handle or
         // hit a fallible resource allocation; retry at the monotonic deadline
@@ -15907,6 +16126,23 @@ impl ApplicationHandler<Wake> for App {
             Wake::TabContextMenuOpening { window } => {
                 self.cancel_tab_surface_cursor_move_candidate(Some(window));
             }
+            // A per-peer connection row (Show / Configure… / Disconnect) of a
+            // tab's context menu, resolved against the pop-time stable tab id
+            // exactly like `TabMenuAction`. No rename divert: none of the
+            // connection verbs are editing commands, and each settles nothing.
+            Wake::TabMenuConnection {
+                window,
+                tab,
+                peer_sid,
+                verb,
+            } => self.dispatch_tab_menu_connection(window, tab, &peer_sid, verb),
+            // The native strip's connector drag (design §3.1–§3.3): begin /
+            // track / drop / abort, all running the SAME state machine and
+            // target resolution as the in-grid gesture (`app_conn_drag.rs`).
+            Wake::ConnDragBegin { window, tab } => self.conn_drag_native_begin(window, tab),
+            Wake::ConnDragTo { window, x, y } => self.conn_drag_native_to(window, x, y),
+            Wake::ConnDragDrop { window, x, y } => self.conn_drag_native_drop(window, x, y),
+            Wake::ConnDragCancel { window } => self.conn_drag_native_cancel(window),
             // A tab chip was double-clicked: open the inline pin editor over that
             // tab's FOCUSED pane's session, resolved from the stable id here.
             Wake::BeginSessionRename { window, tab } => {
@@ -16330,7 +16566,22 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::PkgSeed { installed, pending } => {
                 if !installed.is_empty() {
-                    self.surface_nonmodal_update_status(&seed_pill_text(&installed));
+                    // The pill reads the RUNTIME shell-integration outcome so an
+                    // unknown-shell / unwritable-cache user is not promised tools
+                    // a new tab cannot deliver; the specific reason goes to the
+                    // log (the pill points at Settings instead).
+                    let si = crate::spawn::shell_integration_outcome();
+                    if let Some(
+                        outcome @ (crate::spawn::ShellIntegrationOutcome::UnknownShell(_)
+                        | crate::spawn::ShellIntegrationOutcome::WriteFailed(_)),
+                    ) = &si
+                    {
+                        aterm_log::warn!(
+                            "toolchain installed but shell integration is not active \
+                             ({outcome:?}) — the PATH hook will not reach new tabs"
+                        );
+                    }
+                    self.surface_nonmodal_update_status(&seed_pill_text(&installed, si.as_ref()));
                 } else if let Some(tail) = pending {
                     // `[packages].seed_install = false`: offer, don't act. The full
                     // roster stays in the log; the pill points at the switch.
@@ -16368,6 +16619,34 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::CloseSession { session, reply } => {
                 let _ = reply.send(self.close_session_by_id(session));
+            }
+            // `raise <sid>`: the `OperatorAction::Show` switch+focus shape for an
+            // arbitrary session — find the window hosting it, select its tab,
+            // focus the window (`App::raise_session_by_id`). A registered session
+            // no window shows (headless) reports honestly instead of silently
+            // succeeding.
+            Wake::RaiseSession { session, reply } => {
+                let _ = reply.send(self.raise_session_by_id(session));
+            }
+            // A connection-authority act succeeded on the control thread: the §4
+            // marks read the edge tables only through the strip funnel, so every
+            // window re-stamps + repaints. Authority-act rate, all windows (the
+            // two endpoints may live in different windows).
+            Wake::ConnectionsChanged => self.refresh_connection_surfaces(),
+            // `spawn connected=…` (control socket): the CONNECTED-spawn wire
+            // form — spawn the newborn at `place`, mint the `both` session
+            // connection with `origin`, reply `OK <sid>` (design §6; the
+            // `ERR headless` check runs inside, before any create).
+            Wake::SpawnConnectedSession {
+                kind,
+                place,
+                origin,
+                cwd,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.spawn_connected_session(el, kind, place, &origin, cwd, "wire"),
+                );
             }
             Wake::SetSettingsField { key, value, reply } => {
                 self.queue_control_settings_field(key, value, reply);
@@ -17947,7 +18226,15 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // never pass this flag) are byte-unchanged.
                 seed_cmd.arg("--progress-file").arg(l.progress_file());
             }
-            if let Ok(mut child) = seed_cmd.spawn() {
+            // A failed SPAWN gets a voice too: `if let Ok` alone meant a bundle
+            // whose co-located atpkg cannot exec produced literally nothing —
+            // no log line, no pill, no status — on the one launch whose whole
+            // job was laying the toolchain down.
+            let seed_spawn = seed_cmd.spawn();
+            if let Err(error) = &seed_spawn {
+                aterm_log::warn!("could not launch atpkg seed: {error}");
+            }
+            if let Ok(mut child) = seed_spawn {
                 // CHILD-SCOPED sibling tailer (§3): this thread is about to BLOCK
                 // on the child's stdout for the marker contract, so the file tail
                 // lives in its own small thread, joined right after `wait()`.
@@ -18071,35 +18358,96 @@ fn spawn_pkg_update_check(config: &Config, proxy: EventLoopProxy<Wake>) -> bool 
                 // markers atpkg already prints (`net-installed:`, and the
                 // seed-unusable class) were being written to /dev/null.
                 let mut update_cmd = std::process::Command::new(&atpkg);
+                // STDERR IS CAPTURED HERE TOO — the seed pass learned this in
+                // round 8 and this lane never did: atpkg's CLI-edge refusals
+                // (store-lock contention, an unwritable prefix) print only to
+                // stderr and emit no marker, so with stderr on /dev/null and
+                // the exit status discarded, six-hourly provisioning could
+                // fail forever with zero evidence anywhere. On the lean
+                // install this lane IS how the toolchain arrives.
                 update_cmd
                     .arg("update")
                     .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null());
+                    .stderr(std::process::Stdio::piped());
                 if let Some(l) = &layout {
                     // Same R5 opt-in as the seed child: rich progress rides the
                     // file + `Wake::PkgProgress`; stdout keeps only the markers.
                     update_cmd.arg("--progress-file").arg(l.progress_file());
                 }
-                if let Ok(mut child) = update_cmd.spawn() {
-                    // Child-scoped tailer, exactly as on the seed pass: spawned
-                    // with the child, joined at its exit (FL-1 by construction).
-                    let tailer = layout.clone().and_then(|l| {
-                        let proxy = proxy.clone();
-                        PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
-                            let _ = proxy.send_event(Wake::PkgProgress { snapshot });
-                        })
-                    });
-                    if let Some(out) = child.stdout.take() {
-                        use std::io::BufRead as _;
-                        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
-                            if let Some(event) = parse_seed_line(&line) {
-                                let _ = proxy.send_event(event);
+                match update_cmd.spawn() {
+                    Ok(mut child) => {
+                        // Child-scoped tailer, exactly as on the seed pass: spawned
+                        // with the child, joined at its exit (FL-1 by construction).
+                        let tailer = layout.clone().and_then(|l| {
+                            let proxy = proxy.clone();
+                            PkgProgressTailer::spawn(l, child.id(), move |snapshot| {
+                                let _ = proxy.send_event(Wake::PkgProgress { snapshot });
+                            })
+                        });
+                        let mut refusal = child.stderr.take();
+                        // The same announcement bookkeeping as the seed pass:
+                        // `net-starting:` OPENS a held card (it rides the
+                        // PkgSeedStarted arm), and a child that dies after
+                        // opening it must still answer it — or the card sits
+                        // for its full hold with the failure recorded nowhere.
+                        let mut saw_start = false;
+                        let mut saw_marker = false;
+                        if let Some(out) = child.stdout.take() {
+                            use std::io::BufRead as _;
+                            for line in
+                                std::io::BufReader::new(out).lines().map_while(Result::ok)
+                            {
+                                if let Some(event) = parse_seed_line(&line) {
+                                    if matches!(event, Wake::PkgSeedStarted { .. }) {
+                                        saw_start = true;
+                                    } else {
+                                        saw_marker = true;
+                                    }
+                                    let _ = proxy.send_event(event);
+                                }
                             }
                         }
+                        let said = refusal
+                            .as_mut()
+                            .map(|pipe| {
+                                use std::io::Read as _;
+                                let mut text = String::new();
+                                let _ = pipe.read_to_string(&mut text);
+                                text
+                            })
+                            .unwrap_or_default();
+                        let ok = child.wait().map(|s| s.success()).unwrap_or(false);
+                        if let Some(t) = tailer {
+                            t.finish();
+                        }
+                        if saw_start && !saw_marker {
+                            let _ = proxy.send_event(Wake::PkgSeedFailed {
+                                detail: if said.trim().is_empty() {
+                                    "atpkg ended without saying what happened".to_string()
+                                } else {
+                                    said.trim().to_string()
+                                },
+                            });
+                        }
+                        // A markerless non-zero exit is the CLI-edge refusal —
+                        // the quiet steady state ("everything up to date",
+                        // exit 0, no marker) stays quiet.
+                        if !ok && !saw_marker {
+                            let why = said.trim();
+                            aterm_log::warn!(
+                                "the ALab toolchain update pass did not run: {}",
+                                if why.is_empty() {
+                                    "atpkg exited without saying why"
+                                } else {
+                                    why
+                                }
+                            );
+                        }
                     }
-                    let _ = child.wait();
-                    if let Some(t) = tailer {
-                        t.finish();
+                    Err(error) => {
+                        // A bundle whose co-located atpkg cannot exec is a
+                        // provisioning outage, not a quiet tick.
+                        aterm_log::warn!("could not launch atpkg update: {error}");
                     }
                 }
                 if interval == 0 {
@@ -18214,7 +18562,10 @@ fn parse_seed_line(line: &str) -> Option<Wake> {
 /// the UI thread). The leading "✓" is deliberate: the notice renderer tints the
 /// FIRST character with the accent colour, so without a marker the "A" of
 /// "ALab" would be tinted alone and the word would read as "A Lab".
-fn seed_pill_text(installed: &[String]) -> String {
+fn seed_pill_text(
+    installed: &[String],
+    shell_integration: Option<&crate::spawn::ShellIntegrationOutcome>,
+) -> String {
     // Cap the roster so the pill stays a pill: ≤5 names, then an ellipsis
     // standing in for the rest.
     let mut names = installed
@@ -18233,7 +18584,23 @@ fn seed_pill_text(installed: &[String]) -> String {
     // NOT have <prefix>/bin on PATH: typing `ay` gives "command not found". Claiming
     // "installed" and delivering that is the product's worst possible first
     // impression, and one clause converts it into a correct one.
-    format!("✓ ALab toolchain installed: {names} — open a new tab to use them")
+    //
+    // …UNLESS a new tab would not help either. The clause above is only true
+    // because the integration loader sources `shell.d` at shell startup; when
+    // this run's preparation FAILED (unknown shell, unwritable loader cache —
+    // the recorded runtime outcome, not the advertised capability), a new tab
+    // gets no PATH hook and the promise is a "command not found" in waiting.
+    // Say what is actually true instead, and point at the fix surface.
+    use crate::spawn::ShellIntegrationOutcome as Si;
+    match shell_integration {
+        Some(Si::UnknownShell(_) | Si::WriteFailed(_)) => format!(
+            "✓ ALab toolchain installed: {names} — but this shell isn't hooked up to \
+             them; see Settings ▸ Packages"
+        ),
+        Some(Si::Prepared) | None => {
+            format!("✓ ALab toolchain installed: {names} — open a new tab to use them")
+        }
+    }
 }
 
 /// The seed-marker contract with atpkg (`cmd_seed`'s two stable stdout lines):
@@ -18289,30 +18656,63 @@ mod seed_marker_tests {
                 .map(|s| (*s).to_string())
                 .collect()
         };
+        use crate::spawn::ShellIntegrationOutcome as Si;
         // ≤5: every name, no ellipsis.
         assert_eq!(
-            seed_pill_text(&names(3)),
+            seed_pill_text(&names(3), Some(&Si::Prepared)),
             "✓ ALab toolchain installed: ay, clean, ny — open a new tab to use them"
         );
         assert_eq!(
-            seed_pill_text(&names(5)),
+            seed_pill_text(&names(5), Some(&Si::Prepared)),
             "✓ ALab toolchain installed: ay, clean, ny, trust, ty — open a new tab to use them"
         );
         // >5: exactly five, then the ellipsis.
         assert_eq!(
-            seed_pill_text(&names(6)),
+            seed_pill_text(&names(6), Some(&Si::Prepared)),
             "✓ ALab toolchain installed: ay, clean, ny, trust, ty… — open a new tab to use them"
         );
         // The PATH caveat is load-bearing, not decoration: shell.d is written after
         // this install, but aterm's integration sourced it at shell startup, so the
         // window showing this pill cannot run the tools yet.
         assert!(
-            seed_pill_text(&names(1)).contains("open a new tab"),
+            seed_pill_text(&names(1), None).contains("open a new tab"),
             "the pill must not claim tools the current shell cannot run"
         );
         // The marker glyph must lead — the renderer tints the FIRST char, so
         // losing it makes "ALab" render as "A Lab".
-        assert!(seed_pill_text(&names(1)).starts_with("✓ "));
+        assert!(seed_pill_text(&names(1), None).starts_with("✓ "));
+    }
+
+    /// The "open a new tab" clause is only true when the integration loader
+    /// will actually source `shell.d` there. A recorded runtime failure —
+    /// unknown shell, unwritable loader cache — flips the pill to the honest
+    /// claim: installed, not reachable, and where to look. An UNRECORDED
+    /// outcome (`None` — no interactive spawn attempted) keeps the optimistic
+    /// clause: with no evidence of failure, "new tab" remains the best truth.
+    #[test]
+    fn pill_stops_promising_a_new_tab_when_integration_failed() {
+        use crate::spawn::ShellIntegrationOutcome as Si;
+        let installed = vec!["ay".to_string()];
+        for failed in [
+            Si::UnknownShell("fish".into()),
+            Si::WriteFailed("read-only cache".into()),
+        ] {
+            let pill = seed_pill_text(&installed, Some(&failed));
+            assert!(
+                !pill.contains("open a new tab"),
+                "a failed integration must not promise a working tab: {pill}"
+            );
+            assert!(
+                pill.contains("Settings ▸ Packages"),
+                "the honest pill still points at the fix surface: {pill}"
+            );
+            assert!(pill.starts_with("✓ "), "install DID succeed: {pill}");
+            assert!(pill.contains("ay"), "the roster survives: {pill}");
+        }
+        assert!(
+            seed_pill_text(&installed, None).contains("open a new tab"),
+            "no recorded attempt is not evidence of failure"
+        );
     }
 
     /// The contract is now TYPE-CHECKED, not string-matched: these prefixes are
@@ -18748,6 +19148,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // producing a digest the parent cannot match.
     let seamless_target = seamless::take_target_identity();
     let seamless_window = incoming_handoff.window;
+    // Tokenless carried connection triples (design §1.4#6): parked on the App
+    // and re-minted once every handed-off session is registered (`about_to_wait`
+    // runs `remint_carried_connections` after the restore drains).
+    let seamless_conn_carry = incoming_handoff.connections;
     let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
     // OVERLAP HANDOFF: the parked parent's readiness-pipe write fd (consume +
     // clear, same single-threaded env discipline as `take_incoming` above). Its
@@ -19101,10 +19505,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .ok();
     let (startup_font_tx, startup_font_rx) =
         std::sync::mpsc::sync_channel::<StartupFontGeneration>(1);
-    // THE 300 ms PHASE, made visible. The event loop's later `handle.join()` is
-    // the ledger's `backend_finalize` — measured at 300.83 ms median on macOS,
-    // 66.1% of rust_main → first_present, and until these stamps the one phase
-    // with no drill-down at all. The spawn stamp is taken HERE, on the main
+    // THE PHASE THAT WAS BELIEVED TO BE 300 ms, made visible. The event loop's
+    // later `handle.join()` is the ledger's `backend_finalize` — recorded at
+    // 300.83 ms median on macOS on 2026-07-30 (66.1% of rust_main →
+    // first_present) and, until these stamps, the one phase with no drill-down
+    // at all. Drilled in on 2026-08-23 it reads 0.01 ms median / 0.02 ms max
+    // over 40 fresh processes, with the worker already finished at the join in
+    // every sample: the big phase was a measurement gap, not a cost
+    // (`docs/measured/arena/2026-08-23-start-backend-finalize-drilldown-dev-smoke.md`,
+    // M5 Max DEV-SMOKE). These stamps are what showed that, and what would show
+    // it changing. The spawn stamp is taken HERE, on the main
     // thread, so thread creation lands inside the worker's own timeline and so
     // the ledger can answer the question `backend_finalize_ns` cannot: how much
     // of this build had already finished by the time the join was reached.
@@ -19693,6 +20103,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         &session_factory,
         &proxy,
         restore_cwd0.as_deref(),
+        None, // not a connected controller spawn
         adopt0,
     )
     .unwrap_or_else(|e| fatal_launch_error(headless, &format!("spawn failed: {e}")));
@@ -19838,6 +20249,35 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // registers here; the GUI's `Wake::Output` hook notifies it. Created BEFORE
     // the control thread so a subscribe is serviceable from the first request.
     let subscribers = subscribe::new_registry();
+    // The embedded operator observer and durable queue share this process's store
+    // and wake registry. Its stable per-profile identity contains no launch SID,
+    // so cold restart reopens the same WAL/allowlist. The durable kernel lock makes
+    // another live process with the same profile a fail-closed standby. Queue
+    // opening happens on the observer/control workers, never on the winit thread.
+    // The embedded operator is DEFAULT-OFF and opt-in: `$ATERM_OPERATOR=1` starts
+    // it, `$ATERM_NO_OPERATOR` overrides that. Without the opt-in there is no
+    // observer thread, no durable state directory, and every operator verb
+    // answers `ERR operator unavailable` off the already-shipped `None` path.
+    // An empty allowlist is the default, so default-on would have delivered no
+    // observation to anyone while putting an experimental resident subsystem in
+    // every process — and in the update path — of every user.
+    let (mut operator_runtime, operator_control) = if !operator_host::enabled_by_environment() {
+        aterm_log::info!("embedded operator not enabled ($ATERM_OPERATOR is unset)");
+        (None, None)
+    } else {
+        match operator_host::start_default(
+            store.clone(),
+            subscribers.clone(),
+            session_factory.notify_tx.clone(),
+        ) {
+            Ok((runtime, control)) => (Some(runtime), Some(control)),
+            Err(error) => {
+                aterm_log::warn!("{error}; operator observation disabled");
+                eprintln!("aterm-gui: {error}; operator observation disabled");
+                (None, None)
+            }
+        }
+    };
     let image_queue: control::ImageQueue = Arc::new(Mutex::new(VecDeque::new()));
     // Set to `true` by `control::spawn` ONLY after its listener binds. Gates the
     // graceful-exit cleanup below so an instance that refused a live socket (or
@@ -19858,6 +20298,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 // never races the stale sweep (vs. writing it here pre-bind).
                 Some((session0.ctx.self_id.clone(), session0.ctx.nonce)),
                 sock_bound.clone(),
+                operator_control.clone(),
             );
             Some(plan)
         }
@@ -20161,6 +20602,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // SEAMLESS: the handed-off shells still to place (session 0 already took the first
         // leaf's). Empty on a normal launch. `apply_pending_restore` drains it.
         seamless_adopt,
+        pending_conn_carry: seamless_conn_carry,
         handoff_ready,
         handoff_commit,
         handoff_reader_gate,
@@ -20223,6 +20665,11 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // Composed tab-chrome (tooltip + context menu) cache, filled on the
         // first strip refresh that sees each session.
         session_chrome: std::collections::HashMap::new(),
+        // The PROCESS SINGLETON: the control thread's wire verbs mint into
+        // and bump the same table this App composes menus from.
+        connections: connections::connections(),
+        // No connector drag in flight at startup.
+        conn_drag: None,
         session_chrome_retry: std::collections::HashSet::new(),
         session_chrome_expiry: SessionChromeExpiryScan::default(),
         // Title/cwd drift debouncer — empty until the first drift is observed.
@@ -20245,6 +20692,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_physical_retry: None,
         handoff_preverified: std::sync::Arc::default(),
         pending_update_handoff: None,
+        operator_control: operator_control.clone(),
         update_handoff_activity_epoch: 0,
         last_update_activity_at: Instant::now(),
         next_update_handoff_id: 1,
@@ -20312,6 +20760,19 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     watchdog::start();
     metrics::mark_gui_ready_for_winit();
     event_loop.run_app(&mut app).expect("run");
+    // The control listener can outlive the event loop through the remaining
+    // persistence/video teardown. Fence it before stopping the observer: once
+    // this returns, no new operator claim/manage/proposal or final PTY egress can
+    // begin, and any egress that won the gate has completed its bounded syscall.
+    if let Some(control) = operator_control.as_ref() {
+        control.begin_shutdown();
+    }
+    // The production exit seam deliberately forgets `app` and calls process::exit,
+    // so RAII cannot own this lifecycle. Stop and join while normal teardown is
+    // still executable; the worker never runs on or blocks the winit thread.
+    if let Some(mut runtime) = operator_runtime.take() {
+        runtime.shutdown_and_join();
+    }
     // The event loop is gone: no recording can produce another present or
     // completion. Answer its client and remove the pre-created directory before
     // the deliberate `mem::forget(app)` final-exit seam.
@@ -22113,6 +22574,7 @@ mod multi_window_tests {
             title: "Settings".to_string(),
             icon: Some(crate::tab_model::TabIconKind::Settings),
             indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
             closable: true,
             tooltip: Some("aterm Settings".to_string()),
         };
@@ -26080,6 +26542,8 @@ mod early_out_tests {
             // No provisioning progress card in these unit frames — the hidden
             // sentinel keeps the key byte-identical to the no-card path.
             pkg_progress_fp: 0,
+            // No connection drag in these unit frames (the no-drag sentinel).
+            conn_wire_fp: 0,
             // Fixed OS appearance in these unit frames (a flip is exercised by
             // `os_appearance_flip_repaints`).
             system_dark: false,
@@ -28558,12 +29022,14 @@ mod session_pool_tests {
 /// (`aterm-spec/tests/derived_ring_ty.rs`) — that proves the *design* of the
 /// create/close→exit + never-reuse routing sound, but nothing ties it to the
 /// `App` code that actually runs. This test closes that gap: it drives the genuine
-/// shipping `App` window seams (`insert_logical_window` = a real `CreateWindow`,
-/// `close_window_logical` = a real `CloseWindow`, with the production
-/// windows/pool/frontmost/`CloseOutcome` bookkeeping), projects each reachable
-/// `App` state onto the spec variables `<<win_count, frontmost, next_id, exited>>`,
-/// and asks the real `ty` binary to confirm every observed transition is one the
-/// spec's `Next` admits. This is the "Tier 1" layer of
+/// shipping `App` window seams (`insert_logical_window` = a real `CreateWindow` —
+/// and the shared logical minting seam the `spawn connected= place=window`
+/// `ConnectedCreateWindow` mint routes through, `raise_session_by_id` = a real
+/// `RaiseSession`, `close_window_logical` = a real `CloseWindow`, with the
+/// production windows/pool/frontmost/`CloseOutcome` bookkeeping), projects each
+/// reachable `App` state onto the spec variables
+/// `<<win_count, frontmost, next_id, exited>>`, and asks the real `ty` binary to
+/// confirm every observed transition is one the spec's `Next` admits. This is the "Tier 1" layer of
 /// `docs/RFC-ty-embed-derived-tla.md`: model <-> executable.
 ///
 /// SINGLE SOURCE — the spec here is NOT hand-written: it is generated from
@@ -28729,6 +29195,52 @@ mod window_routing_conformance {
         );
         validated += 1;
 
+        // --- ConnectedCreateWindow: a 4th window validated against the
+        // session-connections mint arm (design §9, `spawn connected= place=window`).
+        // The connected seam itself (`create_window_internal_connected`) needs a
+        // real `ActiveEventLoop`, so headless Tier-1 drives the SAME logical
+        // minting bookkeeping it routes through (`create_window_logical` →
+        // `install_window_state`, here via the test seam) and validates the
+        // minted transition against the `ConnectedCreateWindow` arm — whose
+        // extra hosted-origin guard (`win_count > 0`, the precheck's live-origin
+        // fact) holds with three live windows. The origin-RESOLUTION half is
+        // pinned by `connected_spawn_tests` (precheck refusals); this validates
+        // the mint. Non-vacuity is carried by negative control (d).
+        let prev = next;
+        let sid3 = app.next_session_id;
+        let _wid3 = app.insert_logical_window(stub_session(sid3), 24, 80);
+        assert!(
+            app.structural_invariants_ok(),
+            "invariants hold after the connected window mint"
+        );
+        let next = project(&app, false);
+        let (ok, out) = validate_transition("ConnectedCreateWindow", prev, next);
+        assert!(
+            ok,
+            "real connected window mint {prev:?} -> {next:?} must conform to \
+             ConnectedCreateWindow\n--- ty ---\n{out}"
+        );
+        validated += 1;
+
+        // --- RaiseSession: raise the FIRST window's session (session 0) while the
+        // frontmost is the newest window — the REAL `raise <sid>` seam
+        // (`raise_session_by_id`: find the host window, select its tab, focus the
+        // window). Headless there is no OS window to focus, so the projected step
+        // may be the model-admitted `frontmost' = frontmost` stutter (the OS-focus
+        // re-point is a windowed concern); what this validates is that the raise
+        // act NEVER mints, destroys, or exits — every admissible re-point lands on
+        // an already-allocated id. Non-vacuity is carried by negative control (c).
+        let prev = next;
+        app.raise_session_by_id(0)
+            .expect("session 0 is hosted by the first window");
+        let next = project(&app, false);
+        let (ok, out) = validate_transition("RaiseSession", prev, next);
+        assert!(
+            ok,
+            "real RaiseSession {prev:?} -> {next:?} must conform\n--- ty ---\n{out}"
+        );
+        validated += 1;
+
         // --- CloseWindow: a NON-last window (WindowId(0)). A survivor remains, so
         // the app stays and exited is unchanged (still false).
         let prev = next;
@@ -28831,11 +29343,39 @@ mod window_routing_conformance {
              — exiting while a window remains violates ExitIffEmpty\n--- ty ---\n{o}"
         );
 
+        // (c) RAISE TO AN UNALLOCATED ID — a RaiseSession that re-points frontmost
+        // AT the allocation frontier (`frontmost' = next_id`). FrontmostAllocated
+        // forbids a future/reused id; the act's `\in 1..(next_id - 1)` fan-out
+        // excludes it, so this MUST be rejected — without it the RaiseSession
+        // binding would accept a stale re-point onto a never-minted window.
+        let prev_raise = [2, 1, 3, 0];
+        let next_raise = [2, 3, 3, 0]; // frontmost -> 3 = next_id (unallocated)
+        let (ok, o) = validate_transition("RaiseSession", prev_raise, next_raise);
+        assert!(
+            !ok,
+            "NEGATIVE CONTROL (raise to unallocated) {prev_raise:?} -> {next_raise:?} MUST be \
+             rejected — frontmost may never re-point to a future/unallocated id\n--- ty ---\n{o}"
+        );
+
+        // (d) CONNECTED MINT AFTER EXIT — a ConnectedCreateWindow from the exited,
+        // empty state. The act's hosted-origin guard (`win_count > 0 /\ exited = 0`)
+        // forbids it: with no live window there is no hosted origin to spawn from.
+        let prev_dead = [0, 0, 2, 1];
+        let next_dead = [1, 2, 3, 1]; // a mint out of the exited state
+        let (ok, o) = validate_transition("ConnectedCreateWindow", prev_dead, next_dead);
+        assert!(
+            !ok,
+            "NEGATIVE CONTROL (connected mint after exit) {prev_dead:?} -> {next_dead:?} MUST be \
+             rejected — a connected window mint requires a live hosted origin\n--- ty ---\n{o}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
         eprintln!(
             "App window-routing Tier-1 conformance: {validated} real transitions \
-             (2 CreateWindow + the close-down-to-exit chain) strictly validated against the \
-             WindowRouting spec; negative controls (missed exit, early exit) both rejected."
+             (2 CreateWindow + the ConnectedCreateWindow mint + a RaiseSession + the \
+             close-down-to-exit chain) strictly validated against the WindowRouting spec; \
+             negative controls (missed exit, early exit, raise-to-unallocated, \
+             mint-after-exit) all rejected."
         );
     }
 }
@@ -30199,7 +30739,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            134,
+            139,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -30233,7 +30773,7 @@ mod spec_xref_gate {
         assert_eq!(
             classify_spec_link(Some(1), &live_report),
             Some(SpecLinkDisposition::ExplicitDesignOnly),
-            "the real 133-machine DesignOnly report shape must classify honestly"
+            "the real 138-machine DesignOnly report shape must classify honestly"
         );
     }
 
@@ -30603,13 +31143,15 @@ mod spec_xref_gate {
             assert_eq!(
                 wr.ratio(),
                 1.0,
-                "window_routing must be fully bound (CreateWindow + CloseWindow both anchored); \
-                 uncovered = {:?}",
+                "window_routing must be fully bound (CreateWindow + CloseWindow + \
+                 ConnectedCreateWindow + RaiseSession all anchored); uncovered = {:?}",
                 wr.uncovered
             );
             assert_eq!(
-                wr.total_actions, 2,
-                "window_routing has 2 actions (CreateWindow, CloseWindow), found {}",
+                wr.total_actions, 4,
+                "window_routing has 4 actions (CreateWindow, CloseWindow, \
+                 ConnectedCreateWindow, RaiseSession — the session-connections acts, \
+                 design §9), found {}",
                 wr.total_actions
             );
         }

@@ -3259,7 +3259,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · GPU renderer only; parsed and preserved but inert while the CPU renderer is active"
         }
         crate::prefs::EDIT_CONFIRM_MULTILINE_PASTE => {
-            " · prompts only for unbracketed multiline paste; bracketed paste bypasses the dialog · native confirmation is implemented on macOS and Windows; other platforms currently accept without prompting"
+            " · prompts only for unbracketed multiline paste; bracketed paste bypasses the dialog · live on every platform: the macOS sheet, the Windows dialog, and the Linux in-window banner"
         }
         crate::prefs::EDIT_OPTION_AS_META => {
             " · true sends ESC-prefixed Meta on every platform; false forwards OS-composed text when available while non-text Alt chords remain encoded"
@@ -3268,7 +3268,11 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
         }
         crate::prefs::EDIT_ALLOW_OSC52_QUERY => {
-            " · the GUI drops every OSC 52 Query callback and cannot return clipboard contents; true is currently inert"
+            if cfg!(target_os = "linux") {
+                " · an authorized query reads back only the clipboard selections aterm itself owns (a foreign app's X11 selection is not readable today); rate/budget gates still apply"
+            } else {
+                " · an authorized query reads the SYSTEM clipboard — including text copied in other apps — which is what remote vim/tmux clipboard sync needs; rate/budget gates still apply"
+            }
         }
         crate::prefs::EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
@@ -5279,9 +5283,15 @@ expect_nonce = "pin"
         } else {
             "most state/geometry requests"
         };
-        // The OSC 52 caveat stopped claiming Queries are dropped (the arm
-        // answers now); what it warns about is the read-back it widens.
-        for message in ["READ BACK", window_ops_phrase] {
+        // The OSC 52 caveat states the widest grant per platform: the system
+        // clipboard off-Linux (what the Query arm answers with), the
+        // own-selections bound on X11.
+        let osc52_phrase = if cfg!(target_os = "linux") {
+            "selections aterm itself owns"
+        } else {
+            "system clipboard"
+        };
+        for message in [osc52_phrase, window_ops_phrase] {
             let diagnostic = analysis
                 .diagnostics
                 .iter()
@@ -5303,7 +5313,7 @@ expect_nonce = "pin"
         assert!(help_for("lines").contains("default 24"));
         assert!(
             help_for("confirm_multiline_paste")
-                .contains("other platforms currently accept without prompting")
+                .contains("live on every platform")
         );
         assert!(
             help_for("allow_notifications")
@@ -5313,10 +5323,18 @@ expect_nonce = "pin"
         assert!(help_for("update.owner").contains("in-app updates are macOS-only"));
         assert!(help_for("update.auto_apply").contains("macOS-only"));
         assert!(help_for(crate::prefs::EDIT_MOTION).contains(crate::prefs::motion_auto_help()));
-        assert!(
-            help_for(crate::prefs::EDIT_ALLOW_OSC52_QUERY)
-                .contains("cannot return clipboard contents")
-        );
+        // The query help is platform-split and states the WIDEST grant: the
+        // system clipboard off-Linux (what the Query arm actually answers
+        // with), the own-selections bound on X11. "cannot return clipboard
+        // contents" was two generations stale — the arm answers since the
+        // OSC 52 read landed.
+        assert!(help_for(crate::prefs::EDIT_ALLOW_OSC52_QUERY).contains(
+            if cfg!(target_os = "linux") {
+                "selections aterm itself owns"
+            } else {
+                "reads the SYSTEM clipboard"
+            }
+        ));
         assert!(
             help_for(crate::prefs::EDIT_ALLOW_WINDOW_OPS)
                 .contains("window-title and text-grid-size")
@@ -5347,10 +5365,18 @@ confirm_multiline_paste = true\nallow_notifications = true\n";
             ),
             &mut analysis,
         );
+        // `confirm_multiline_paste` earns NO platform warning any more: the
+        // confirm is live everywhere (Linux's in-window paste_banner included).
+        assert!(
+            !analysis
+                .diagnostics
+                .iter()
+                .any(|warning| warning.message.starts_with("confirm_multiline_paste")),
+            "a live-everywhere key must not carry a platform warning"
+        );
         for (key, token) in [
             ("trail_sounds", "true"),
             ("trail_sound_volume", "0.4"),
-            ("confirm_multiline_paste", "true"),
             ("allow_notifications", "true"),
         ] {
             let warning = analysis

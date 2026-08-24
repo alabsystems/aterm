@@ -57,9 +57,11 @@ use aterm_spec::derive::{
     native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
     native_update_status_reconciliation_model, native_update_worker_queue_model,
     native_updater_model, net_capability_grant_model, net_dial_after_grant_model, nova_phase_model,
-    one_shot_peek_model, pad_absorption_model, pane_tree_model, path_feed_snapshot_model,
-    per_window_metrics_model, predictive_echo_visibility_model, present_retry_model,
-    presentation_gate_model, presented_frame_tap_model, press_custody_model, proxy_forward_model,
+    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
+    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
+    pad_absorption_model, pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
+    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
+    presented_frame_tap_model, press_custody_model, proxy_forward_model,
     rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_move_admission_model, rainbow_terminus_admission_model, read_image_seq_model,
@@ -155,9 +157,89 @@ fn assert_proves_and_catches(m: &Model) {
     tier0_or_skip(verify::prove_and_catch_tiered(m, m.name));
 }
 
+/// Operator models are registered model-checking inputs, not one-off examples:
+/// every committed action must be reachable, both constant settings must stay
+/// exhaustively bounded, and a work-in-progress state must always have a next
+/// step. `is_final` excludes only the model's explicit work-complete terminal.
+fn assert_operator_model_shape(
+    model: &Model,
+    is_final: impl Fn(&aterm_spec::interp::State) -> bool,
+) {
+    let registered = aterm_spec::xref::model_registry()
+        .into_iter()
+        .any(|candidate| candidate.name == model.name);
+    assert!(
+        registered,
+        "{} must resolve through the global spec↔source registry",
+        model.name
+    );
+
+    verify::audit_dead_negative_controls(model, &[]).unwrap_or_else(|reason| {
+        panic!(
+            "{} must have full committed-config action coverage: {reason}",
+            model.name
+        )
+    });
+
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    let declared: std::collections::BTreeSet<_> =
+        model.actions.iter().map(|action| action.name).collect();
+    let buggy_fired = aterm_spec::interp::fired_actions(&buggy);
+    assert_eq!(
+        buggy_fired, declared,
+        "{} must remain bounded and exercise every action at Buggy=1",
+        model.name
+    );
+
+    let deadlock =
+        aterm_spec::interp::find_deadlock(&aterm_spec::interp::with_buggy(model, 0), is_final);
+    assert!(
+        deadlock.is_none(),
+        "{} must not wedge before its legitimate terminal: {deadlock:?}",
+        model.name
+    );
+}
+
 #[test]
 fn derived_subscribe_proves_and_catches_silent_loss() {
     assert_proves_and_catches(&subscribe_model());
+}
+
+#[test]
+fn derived_operator_event_delivery_proves_and_catches_stale_claim() {
+    let model = operator_event_delivery_model();
+    assert_operator_model_shape(&model, |state| state[&"phase"] == 2 || state[&"phase"] == 5);
+    assert_proves_and_catches(&model);
+}
+
+#[test]
+fn derived_operator_wal_actuator_proves_and_catches_interjection_or_replay() {
+    let model = operator_wal_actuator_model();
+    assert_operator_model_shape(&model, |state| state[&"phase"] == 4);
+    assert_proves_and_catches(&model);
+}
+
+#[test]
+fn derived_operator_resync_cursor_proves_and_catches_silent_loss() {
+    let model = operator_resync_cursor_model();
+    assert_operator_model_shape(&model, |_| false);
+    assert_proves_and_catches(&model);
+}
+
+#[test]
+fn derived_operator_leadership_proves_and_catches_split_brain() {
+    let model = operator_leadership_model();
+    assert_operator_model_shape(&model, |state| {
+        state[&"a_live"] == 0 && state[&"b_live"] == 0 && state[&"epoch"] == 3
+    });
+    assert_proves_and_catches(&model);
+}
+
+#[test]
+fn derived_operator_fleet_fault_proves_and_catches_blocked_egress() {
+    let model = operator_fleet_fault_model();
+    assert_operator_model_shape(&model, |_| false);
+    assert_proves_and_catches(&model);
 }
 
 #[test]
@@ -7388,7 +7470,9 @@ fn derived_cursor_move_candidate_proves_and_catches_timestamp_only_admission() {
 ///     Buggy=0, and deliberately ALSO at Buggy=1 — the mutant's whole point is
 ///     that it is safe and mute).
 ///   * LIVENESS: every handled shape (plain, E1 ghost text, E3 typed space on
-///     implicit blanks, E4 overtype) settles CONFIRMED; every run reaches a
+///     implicit blanks, E4 overtype, and shape 10's unblinked-alt echo — the
+///     audit's named full-repaint/no-probe blind spot, closed by the
+///     ContentOnly probe repair) settles CONFIRMED; every run reaches a
 ///     decision (`find_deadlock` with `settled = 1` as the final predicate).
 ///   * NON-VACUITY: every adversary action fires in the committed variant, so
 ///     no obligation is checked over an environment that never happens — the
@@ -7430,6 +7514,7 @@ fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
         "ColdSpinner",
         "KeyEchoSwallowed",
         "KeyDeviatingEcho",
+        "KeyUnblinkedAltEcho",
         "EchoPlain",
         "EchoWithGhostText",
         "EchoStorageGrowth",
@@ -7439,6 +7524,7 @@ fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
         "ColdPaint",
         "UnrelatedBatch",
         "EchoDeviates",
+        "EchoOnUnblinkedAlt",
         "Decide",
     ] {
         assert!(
@@ -7462,6 +7548,7 @@ fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
         ("KeyGhostSuggest", "EchoWithGhostText"),
         ("KeySpaceOnBlanks", "EchoStorageGrowth"),
         ("KeyOvertypeSuggestion", "EchoNullDiffOvertype"),
+        ("KeyUnblinkedAltEcho", "EchoOnUnblinkedAlt"),
     ] {
         let s = run(&model, key, echo);
         assert_eq!(s["confirmed"], 1, "{key}: a handled real echo must admit");
@@ -7513,13 +7600,24 @@ fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
             "EchoNullDiffOvertype",
             "LiveOvertypeConfirmsE4",
         ),
+        // Shape 10 — the probe-starving alt host of `Buggy = 1`: the echo is
+        // the textbook plain shape, but the pre-fix host withheld the row
+        // probe on every unblinked-alt frame (less /-search, vi insert, the
+        // ESC 7/ESC 8 streamer TUI), so the proof retired `no-row-probe`.
+        // Safe and mute, exactly like the 201449c2 law itself.
+        (
+            "KeyUnblinkedAltEcho",
+            "EchoOnUnblinkedAlt",
+            "LiveUnblinkedAltEchoConfirms",
+        ),
     ] {
         let s = run(&buggy, key, echo);
-        assert_eq!(s["confirmed"], 0, "{key}: the 201449c2 law retires this echo");
+        assert_eq!(s["confirmed"], 0, "{key}: the pre-fix system retires this echo");
         for safety in [
             "ColdSpinnerNeverConfirms",
             "SwallowedEchoNeverConfirms",
             "DeviatingEchoNeverConfirms",
+            "WithheldProbeNeverConfirms",
             "ConfirmIsWitnessed",
             "SettledIsDecided",
         ] {

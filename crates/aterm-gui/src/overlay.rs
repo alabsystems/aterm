@@ -19,7 +19,10 @@
 use aterm_render::Theme;
 
 use crate::about::AboutState;
+use crate::conn_card::ConnCardState;
+use crate::connection_map::ConnectionMapState;
 use crate::palette::PaletteState;
+use crate::session_picker::SessionPickerState;
 use crate::settings::{PreviewCtx, SettingsGeom, SettingsState};
 use crate::update_screen::UpdateState;
 use crate::widget::TrayInput;
@@ -141,6 +144,68 @@ impl OverlayModel for PaletteState {
     }
 }
 
+impl OverlayModel for ConnCardState {
+    fn fingerprint(&self) -> u64 {
+        ConnCardState::fingerprint(self)
+    }
+    fn wanted_rows(&self, avail: usize) -> usize {
+        // Anchored like the tab menu — `conn_card_layout` sizes the card.
+        ConnCardState::wanted_rows(self, avail)
+    }
+    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+        crate::conn_card::conn_card_tray(self, geom, theme)
+    }
+    fn scroll_extent(&self) -> (usize, usize, usize) {
+        ConnCardState::scroll_extent(self)
+    }
+    #[cfg(feature = "a11y-accesskit")]
+    fn a11y(&self) -> accesskit::TreeUpdate {
+        crate::conn_card::conn_card_a11y(self)
+    }
+}
+
+impl OverlayModel for ConnectionMapState {
+    fn fingerprint(&self) -> u64 {
+        ConnectionMapState::fingerprint(self)
+    }
+    fn wanted_rows(&self, avail: usize) -> usize {
+        // Floats centred like the palette: the tray spans the whole viewport
+        // and `map_layout` content-sizes the card within it.
+        avail
+    }
+    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+        crate::connection_map::map_tray(self, geom, theme)
+    }
+    fn scroll_extent(&self) -> (usize, usize, usize) {
+        ConnectionMapState::scroll_extent(self)
+    }
+    #[cfg(feature = "a11y-accesskit")]
+    fn a11y(&self) -> accesskit::TreeUpdate {
+        crate::connection_map::map_a11y(self)
+    }
+}
+
+impl OverlayModel for SessionPickerState {
+    fn fingerprint(&self) -> u64 {
+        SessionPickerState::fingerprint(self)
+    }
+    fn wanted_rows(&self, avail: usize) -> usize {
+        // Floats centred like the palette: the tray spans the whole viewport
+        // and `picker_layout` content-sizes the card within it.
+        avail
+    }
+    fn tray(&self, geom: &SettingsGeom, theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+        crate::session_picker::picker_tray(self, geom, theme)
+    }
+    fn scroll_extent(&self) -> (usize, usize, usize) {
+        SessionPickerState::scroll_extent(self)
+    }
+    #[cfg(feature = "a11y-accesskit")]
+    fn a11y(&self) -> accesskit::TreeUpdate {
+        crate::session_picker::picker_a11y(self)
+    }
+}
+
 /// Which surface a live [`Overlay`] holds — a cheap tag for the input gate + the
 /// `settings_card` cache key (so two surfaces never share a cache line).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -152,6 +217,14 @@ pub(crate) enum OverlayKind {
     Palette,
     #[cfg(test)]
     Update,
+    /// The anchored connection confirm/configure card (design §3.3 + §2.5).
+    ConnCard,
+    /// The session picker (design §2.3/§2.5 — the connect/configure/disconnect
+    /// choose-a-session surface).
+    SessionPicker,
+    /// The connection map (design §5.2 — the whole instance's aggregated
+    /// fabric, Owner-gated per §5.3).
+    ConnectionMap,
 }
 
 impl OverlayKind {
@@ -167,6 +240,9 @@ impl OverlayKind {
             OverlayKind::Palette => "menu",
             #[cfg(test)]
             OverlayKind::Update => "update",
+            OverlayKind::ConnCard => "conn-card",
+            OverlayKind::SessionPicker => "session-picker",
+            OverlayKind::ConnectionMap => "connections",
         }
     }
 }
@@ -188,6 +264,18 @@ pub(crate) enum Overlay {
     /// Software Update is the native Settings `/updates` route.
     #[cfg(test)]
     Update(UpdateState),
+    /// The connection confirm/configure card (design §3.3 + §2.5) — ONE shared
+    /// component behind the drop popover and the Configure… sheet, anchored
+    /// like the tab menu. Native macOS hosts this same card in the content
+    /// view; there is no separate AppKit sheet.
+    ConnCard(ConnCardState),
+    /// The session picker (design §2.3/§2.5) — palette-style filter over the
+    /// live registry; its selection opens the ConnCard (or disconnects).
+    SessionPicker(SessionPickerState),
+    /// The connection map (design §5.2) — sessions as chips grouped by
+    /// window, one labeled arrow per flow direction, the layered push
+    /// projection; every read of it is Owner-gated on the wire (§5.3).
+    ConnectionMap(ConnectionMapState),
 }
 
 impl Overlay {
@@ -207,6 +295,9 @@ impl Overlay {
             Overlay::Palette(_) => 3,
             #[cfg(test)]
             Overlay::Update(_) => 4,
+            Overlay::ConnCard(_) => 5,
+            Overlay::SessionPicker(_) => 6,
+            Overlay::ConnectionMap(_) => 7,
         };
         (tag.rotate_left(56) ^ inner) | 1
     }
@@ -222,6 +313,9 @@ impl Overlay {
             Overlay::Palette(p) => p,
             #[cfg(test)]
             Overlay::Update(u) => u,
+            Overlay::ConnCard(c) => c,
+            Overlay::SessionPicker(p) => p,
+            Overlay::ConnectionMap(m) => m,
         }
     }
 
@@ -239,6 +333,9 @@ impl Overlay {
             Overlay::Palette(p) => p,
             #[cfg(test)]
             Overlay::Update(u) => u,
+            Overlay::ConnCard(c) => c,
+            Overlay::SessionPicker(p) => p,
+            Overlay::ConnectionMap(m) => m,
         }
     }
 
@@ -252,6 +349,9 @@ impl Overlay {
             Overlay::Palette(_) => OverlayKind::Palette,
             #[cfg(test)]
             Overlay::Update(_) => OverlayKind::Update,
+            Overlay::ConnCard(_) => OverlayKind::ConnCard,
+            Overlay::SessionPicker(_) => OverlayKind::SessionPicker,
+            Overlay::ConnectionMap(_) => OverlayKind::ConnectionMap,
         }
     }
 
@@ -332,6 +432,29 @@ mod tests {
             Overlay::About(AboutState::new()),
             Overlay::Palette(PaletteState::new()),
             Overlay::Update(UpdateState::from_status(1, "1.0", None, false)),
+            Overlay::ConnCard(ConnCardState::new(
+                crate::WindowId(0),
+                aterm_session::SessionId::new("s-a"),
+                "a".to_string(),
+                aterm_session::SessionId::new("s-b"),
+                "b".to_string(),
+                crate::conn_card::PairKinds::default(),
+                "menu",
+                0,
+                1,
+            )),
+            Overlay::SessionPicker(SessionPickerState::new(
+                crate::WindowId(0),
+                aterm_session::SessionId::new("s-a"),
+                "a".to_string(),
+                crate::session_picker::PickerIntent::Connect,
+                Vec::new(),
+            )),
+            Overlay::ConnectionMap(ConnectionMapState::new(
+                crate::WindowId(0),
+                Vec::new(),
+                Vec::new(),
+            )),
         ];
         for o in &cases {
             let line = o.status_line();

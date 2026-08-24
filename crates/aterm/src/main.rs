@@ -73,7 +73,7 @@ fn main() -> ExitCode {
     match alias_route(argv0, &first) {
         AliasRoute::Ctl => return aterm_ctl::main_entry(rest),
         AliasRoute::Pkg => return atpkg::cli::main_entry(rest),
-        AliasRoute::Fleet => aterm_agent::fleet_cli::main_entry(rest),
+        AliasRoute::Fleet => return aterm_agent::fleet_cli::main_entry(rest),
         AliasRoute::Drive => return aterm_agent::drive_cli::main_entry(rest),
         AliasRoute::AliasWindowVerb => return window_verb(&first, &rest[1..]),
         AliasRoute::AliasWindow => return gui_alias_entry(rest),
@@ -97,6 +97,11 @@ fn main() -> ExitCode {
         let forwarded = rest[1..].to_vec();
         return match verb {
             aterm_cli::Verb::Ctl => aterm_ctl::main_entry(forwarded),
+            // Session connections (SESSION_CONNECTIONS.md §6.1): the human
+            // front door for the standing pull/push wiring — presentation over
+            // the same control-socket verbs `ctl` speaks, hence it lives in
+            // aterm-ctl and routes here beside its sibling.
+            aterm_cli::Verb::Conn => aterm_ctl::conn_main_entry(forwarded),
             aterm_cli::Verb::Pkg => atpkg::cli::main_entry(forwarded),
             aterm_cli::Verb::Fleet => aterm_agent::fleet_cli::main_entry(forwarded),
             aterm_cli::Verb::Drive => aterm_agent::drive_cli::main_entry(forwarded),

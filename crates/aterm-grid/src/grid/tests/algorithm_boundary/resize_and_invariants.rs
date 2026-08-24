@@ -236,20 +236,24 @@ fn row_shrink_after_scrolling_preserves_newest_content() {
     grid.write_char('X');
     grid.set_cursor(4, 0);
     grid.write_char('Y');
-    // Now visible: C, D, E, X, Y  (ring_head != 0)
-    // Shrink from 5 to 3 rows. With scrollback=0, no scrollback to trim,
-    // so bottom rows are removed. Should keep top 3: C, D, E.
+    // Now visible: C, D, E, X, Y  (ring_head != 0), cursor on the Y row.
+    // Shrink from 5 to 3 rows. The shrink anchors at the CURSOR (audit-2
+    // item 1): no trailing blanks below it, so the TOP rows C, D are demoted
+    // toward history — and with scrollback=0 the retention cap immediately
+    // evicts them. What survives is the newest content, cursor line included.
+    // (This test once pinned the opposite — keeping C, D, E and DISCARDING
+    // the just-written X, Y — which its own name contradicts.)
     grid.resize_with_reflow_mode(3, 10, ReflowMode::Enabled);
     assert_eq!(grid.rows(), 3);
     for row in 0..3 {
         grid.row(row)
             .expect("row should be accessible after shrink");
     }
-    // With no scrollback, shrink removes from bottom (X, Y discarded).
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'C');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'D');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'E');
-    assert!(grid.cursor_row() < 3);
+    assert_eq!(grid.cell(0, 0).unwrap().char(), 'E');
+    assert_eq!(grid.cell(1, 0).unwrap().char(), 'X');
+    assert_eq!(grid.cell(2, 0).unwrap().char(), 'Y');
+    // The cursor followed its line up: it sat on the Y row and still does.
+    assert_eq!(grid.cursor_row(), 2);
     grid.assert_invariants();
 }
 
@@ -280,19 +284,22 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
     grid.set_cursor(3, 0);
     grid.write_char('Z');
     // Ring buffer: 4 visible + 3 scrollback = 7 rows total
-    // Logical order: A, B, C (scrollback), D, X, Y, Z (visible)
-    // Shrink visible to 3 rows: the bottom visible row Z is demoted to the
-    // newest history line (#7662's bottom-push), everything else stays.
-    // Result: history [A, B, C, Z] (exactly at the cap of 4), visible [D, X, Y].
+    // Logical order: A, B, C (scrollback), D, X, Y, Z (visible), cursor on Z.
+    // Shrink visible to 3 rows: the shrink anchors at the CURSOR (audit-2
+    // item 1) — no trailing blanks below it, so the TOP visible row D is
+    // demoted as the newest history line, a pure relabel that preserves
+    // reading order end to end: A, B, C, D above X, Y, Z.
+    // Result: history [A, B, C, D] (exactly at the cap of 4), visible [X, Y, Z].
     grid.resize_with_reflow_mode(3, 10, ReflowMode::Enabled);
     assert_eq!(grid.rows(), 3);
     for row in 0..3 {
         grid.row(row).expect("row should be accessible");
     }
-    assert_eq!(grid.cell(0, 0).unwrap().char(), 'D');
-    assert_eq!(grid.cell(1, 0).unwrap().char(), 'X');
-    assert_eq!(grid.cell(2, 0).unwrap().char(), 'Y');
-    // History retained (nothing evicted: 4 lines fit the cap of 4).
+    assert_eq!(grid.cell(0, 0).unwrap().char(), 'X');
+    assert_eq!(grid.cell(1, 0).unwrap().char(), 'Y');
+    assert_eq!(grid.cell(2, 0).unwrap().char(), 'Z');
+    // History retained (nothing evicted: 4 lines fit the cap of 4), and the
+    // scroll-up reading order is exactly the write order.
     assert_eq!(grid.scrollback_lines(), 4);
     let history: Vec<String> = (0..4)
         .map(|i| {
@@ -301,7 +308,7 @@ fn row_shrink_with_scrollback_retains_history_within_the_ring_cap() {
                 .unwrap_or_default()
         })
         .collect();
-    assert_eq!(history, ["A", "B", "C", "Z"]);
+    assert_eq!(history, ["A", "B", "C", "D"]);
     grid.assert_invariants();
 }
 

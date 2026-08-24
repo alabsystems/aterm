@@ -74,6 +74,41 @@ impl Op {
     }
 }
 
+/// The connection vocabulary the UX and wire mint in (design §1.4#2, §7) — a
+/// deliberately SMALLER language than [`Op`]. The contract is human fidelity:
+/// **push** is the full human seat — keystrokes *plus* the out-of-band
+/// Ctrl-C-class signal ([`Op::WriteInput`] + [`Op::Signal`], never one without
+/// the other, because a driver who can type but not interrupt is not a human
+/// seat); **pull** is the rendered screen exactly as a human would read it
+/// ([`Op::ReadScreen`]). There is NO kind spelling `ConfigWrite` /
+/// `ClipboardWrite` / `DeriveLoop`, so a connection can never mint those
+/// strictly greater authorities — unrepresentable, not merely unchecked.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ConnectionKind {
+    /// Read the destination's rendered surface — what a human at that terminal
+    /// sees, and nothing more.
+    Pull,
+    /// Drive the destination as a human would sit at it: inject input and
+    /// signal its foreground process group.
+    Push,
+    /// Both directions of authority over the destination: pull + push.
+    Both,
+}
+
+impl ConnectionKind {
+    /// The exact ops this kind mints — the closed mapping
+    /// [`EdgeTable::grant_connection`] draws from, so a connection is by
+    /// construction unable to express any op outside these slices.
+    #[must_use]
+    pub fn ops(&self) -> &'static [Op] {
+        match self {
+            ConnectionKind::Pull => &[Op::ReadScreen],
+            ConnectionKind::Push => &[Op::WriteInput, Op::Signal],
+            ConnectionKind::Both => &[Op::ReadScreen, Op::WriteInput, Op::Signal],
+        }
+    }
+}
+
 /// A directed authority edge `src → dst` for one [`Op`]. There is no graph object
 /// and no traversal: this is just a labelled row.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -195,6 +230,32 @@ impl EdgeTable {
         token
     }
 
+    /// Mint one edge per op of `kind` from `src` into this (the DESTINATION's)
+    /// table, returning the `(op, token)` pairs for delivery to the source — the
+    /// ONE connection mint path (design §1.4#2; the §6 `connect` verb and the UI
+    /// both land here). Ops come solely from [`ConnectionKind::ops`], so a
+    /// connection cannot express `ConfigWrite`/`ClipboardWrite`/`DeriveLoop` —
+    /// there is no raw-op parameter to smuggle one through. A self-loop
+    /// (`src == dst`) is REFUSED — nothing minted, empty `Vec` — in the table's
+    /// fail-closed idiom: connections-to-self are a non-goal (§1.5) and must not
+    /// become authority by accident.
+    #[must_use]
+    pub fn grant_connection(
+        &mut self,
+        src: &SessionId,
+        dst: &SessionId,
+        kind: ConnectionKind,
+        nonce: &LaunchNonce,
+    ) -> Vec<(Op, EdgeToken)> {
+        if src == dst {
+            return Vec::new();
+        }
+        kind.ops()
+            .iter()
+            .map(|&op| (op, self.grant(src.clone(), dst.clone(), op, *nonce)))
+            .collect()
+    }
+
     /// Record a PRE-MINTED token (e.g. one provisioned by the launcher with the
     /// `control_auth` file discipline). Returns `false` (and records nothing) if the
     /// token already exists — minting must never silently overwrite a live edge.
@@ -232,6 +293,37 @@ impl EdgeTable {
         self.rows.remove(token).is_some()
     }
 
+    /// Remove EVERY row whose src is `src` (any op), returning how many were
+    /// dropped — the source-death sweep (design §1.4#4). This is a security
+    /// OBLIGATION, not a convenience: each row's nonce is the DESTINATION's, so
+    /// a destination restart fails closed automatically, but a dead SOURCE's
+    /// tokens stay live against a still-running destination — and the token
+    /// hexes are deliberately non-enumerable (see [`EdgeTable::edges`]), so
+    /// without this sweep those orphaned edges could never be revoked.
+    pub fn revoke_src(&mut self, src: &SessionId) -> usize {
+        self.revoke_src_ops(src, None)
+    }
+
+    /// [`EdgeTable::revoke_src`] with an OP filter (design §1.4#4 [v5]): remove
+    /// every row whose src is `src` AND whose op is in `ops` (`None` = any op —
+    /// the bare sweep above is this call's sugar). This is what makes KIND-level
+    /// partial disconnects expressible against rows whose token hex was never
+    /// recorded (a wire `grant` mints no `ConnectionRecord`): the §6
+    /// `disconnect … kind=` verb can revoke exactly the push half while keeping
+    /// pull, which a bare sweep could not promise.
+    // Skip: `HashMap::retain` runs no allocation — only the derived Hash/Eq of
+    // `EdgeToken([u8; 32])`, `SessionId` equality, and a slice `contains` over
+    // `Op` (Copy, panic-free) — same keyed-op tier as `revoke` above.
+    // `saturating_sub` keeps the count obligation-free; retain never grows the
+    // map, so it is behavior-identical to plain subtraction.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn revoke_src_ops(&mut self, src: &SessionId, ops: Option<&[Op]>) -> usize {
+        let before = self.rows.len();
+        self.rows
+            .retain(|_, e| e.src != *src || ops.is_some_and(|ops| !ops.contains(&e.op)));
+        before.saturating_sub(self.rows.len())
+    }
+
     /// Resolve a presented token to the OP it authorizes, IF it is a live edge whose
     /// dst and launch-nonce match `dst`/`nonce` — the fail-closed lookup the `ctl`
     /// auth handshake uses to scope a connection to a single op. `None` on any miss
@@ -257,6 +349,19 @@ impl EdgeTable {
     #[must_use]
     pub fn src_of(&self, token: &EdgeToken) -> Option<&SessionId> {
         self.rows.get(token).map(|e| &e.src)
+    }
+
+    /// The full `(src, dst, op)` identity bound to a token — what the audit
+    /// seam records at revocation time (the row is gone after
+    /// [`EdgeTable::revoke`], so its identity must be read first). Like
+    /// [`EdgeTable::edges`], this exposes the row identity and never a token.
+    #[must_use]
+    pub fn edge_of(&self, token: &EdgeToken) -> Option<Edge> {
+        self.rows.get(token).map(|e| Edge {
+            src: e.src.clone(),
+            dst: e.dst.clone(),
+            op: e.op,
+        })
     }
 
     /// A clone of every live edge as `(src, dst, op)` triples — the introspection
@@ -470,6 +575,27 @@ mod tests {
     }
 
     #[test]
+    fn edge_of_reads_the_row_identity_without_the_token() {
+        let (a, b, nonce) = ids();
+        let mut tbl = EdgeTable::new();
+        let tok = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
+        // A live token resolves to exactly its (src, dst, op) identity — the
+        // triple the audit seam records before `revoke` deletes the row.
+        assert_eq!(
+            tbl.edge_of(&tok),
+            Some(Edge {
+                src: a,
+                dst: b,
+                op: Op::Signal
+            })
+        );
+        // An unknown (or revoked) token resolves to nothing — fail closed.
+        assert_eq!(tbl.edge_of(&EdgeToken::generate()), None);
+        tbl.revoke(&tok);
+        assert_eq!(tbl.edge_of(&tok), None);
+    }
+
+    #[test]
     fn authority_does_not_flow_along_a_cycle_or_self_loop() {
         let a = SessionId::new("s-a");
         let b = SessionId::new("s-b");
@@ -496,5 +622,139 @@ mod tests {
         let mut tbl_self = EdgeTable::new();
         let tok_aa = tbl_self.grant(a.clone(), a.clone(), Op::WriteInput, na);
         assert!(decide_edge(&tbl_self, &tok_aa, &a, Op::WriteInput, &na).is_permitted());
+    }
+
+    #[test]
+    fn revoke_src_sweeps_exactly_the_matching_source() {
+        let (a, b, nonce) = ids();
+        let c = SessionId::new("s-c");
+        let mut tbl = EdgeTable::new();
+        let t1 = tbl.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
+        let t2 = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
+        let t3 = tbl.grant(c.clone(), b.clone(), Op::WriteInput, nonce);
+
+        // Sweeping A drops BOTH of A's rows (any op) and counts them; C's row
+        // — same dst, different src — survives untouched.
+        assert_eq!(tbl.revoke_src(&a), 2);
+        assert_eq!(
+            decide_edge(&tbl, &t1, &b, Op::ReadScreen, &nonce),
+            EdgeDecision::Deny
+        );
+        assert_eq!(
+            decide_edge(&tbl, &t2, &b, Op::WriteInput, &nonce),
+            EdgeDecision::Deny
+        );
+        assert!(decide_edge(&tbl, &t3, &b, Op::WriteInput, &nonce).is_permitted());
+
+        // A second sweep of the now-absent source removes nothing.
+        assert_eq!(tbl.revoke_src(&a), 0);
+        assert_eq!(tbl.len(), 1);
+    }
+
+    #[test]
+    fn revoke_src_ops_filters_by_op() {
+        let (a, b, nonce) = ids();
+        let c = SessionId::new("s-c");
+        let mut tbl = EdgeTable::new();
+        let read = tbl.grant(a.clone(), b.clone(), Op::ReadScreen, nonce);
+        let write = tbl.grant(a.clone(), b.clone(), Op::WriteInput, nonce);
+        let sig = tbl.grant(a.clone(), b.clone(), Op::Signal, nonce);
+        let other = tbl.grant(c.clone(), b.clone(), Op::WriteInput, nonce);
+
+        // The push half (write-input + signal) sweeps; pull survives — the
+        // kind-level partial disconnect a bare `revoke_src` could not express.
+        assert_eq!(
+            tbl.revoke_src_ops(&a, Some(&[Op::WriteInput, Op::Signal])),
+            2
+        );
+        assert!(decide_edge(&tbl, &read, &b, Op::ReadScreen, &nonce).is_permitted());
+        assert_eq!(
+            decide_edge(&tbl, &write, &b, Op::WriteInput, &nonce),
+            EdgeDecision::Deny
+        );
+        assert_eq!(
+            decide_edge(&tbl, &sig, &b, Op::Signal, &nonce),
+            EdgeDecision::Deny
+        );
+        // A different source's row of a filtered op is untouched.
+        assert!(decide_edge(&tbl, &other, &b, Op::WriteInput, &nonce).is_permitted());
+
+        // A filter matching nothing removes nothing; `None` is the bare sweep.
+        assert_eq!(tbl.revoke_src_ops(&a, Some(&[Op::Signal])), 0);
+        assert_eq!(tbl.revoke_src_ops(&a, None), 1);
+        assert_eq!(tbl.len(), 1, "only the foreign source's row remains");
+    }
+
+    #[test]
+    fn connection_kind_ops_are_the_closed_human_fidelity_mapping() {
+        assert_eq!(ConnectionKind::Pull.ops(), [Op::ReadScreen]);
+        assert_eq!(ConnectionKind::Push.ops(), [Op::WriteInput, Op::Signal]);
+        assert_eq!(
+            ConnectionKind::Both.ops(),
+            [Op::ReadScreen, Op::WriteInput, Op::Signal]
+        );
+        // The greater authorities are unreachable through ANY kind.
+        for kind in [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both] {
+            for op in [Op::ConfigWrite, Op::ClipboardWrite, Op::DeriveLoop] {
+                assert!(
+                    !kind.ops().contains(&op),
+                    "{kind:?} must not express {op:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn grant_connection_mints_exactly_the_kinds_ops() {
+        let (a, b, nonce) = ids();
+
+        // Pull mints exactly the one read edge.
+        let mut tbl = EdgeTable::new();
+        let pulled = tbl.grant_connection(&a, &b, ConnectionKind::Pull, &nonce);
+        assert_eq!(pulled.len(), 1);
+        assert_eq!(pulled[0].0, Op::ReadScreen);
+        assert_eq!(tbl.len(), 1, "one row per minted op, nothing extra");
+
+        // Both mints exactly the three human-fidelity ops.
+        let mut tbl = EdgeTable::new();
+        let both = tbl.grant_connection(&a, &b, ConnectionKind::Both, &nonce);
+        let ops: Vec<Op> = both.iter().map(|(op, _)| *op).collect();
+        assert_eq!(ops, [Op::ReadScreen, Op::WriteInput, Op::Signal]);
+        assert_eq!(tbl.len(), 3);
+    }
+
+    #[test]
+    fn grant_connection_refuses_a_self_loop() {
+        let (a, _b, nonce) = ids();
+        let mut tbl = EdgeTable::new();
+        for kind in [ConnectionKind::Pull, ConnectionKind::Push, ConnectionKind::Both] {
+            assert!(
+                tbl.grant_connection(&a, &a, kind, &nonce).is_empty(),
+                "{kind:?} self-loop must mint nothing"
+            );
+        }
+        assert!(tbl.is_empty(), "a refused self-loop leaves no row behind");
+    }
+
+    #[test]
+    fn grant_connection_tokens_authorize_and_revoke_src_kills_them() {
+        let (a, b, nonce) = ids();
+        let mut tbl = EdgeTable::new();
+        let minted = tbl.grant_connection(&a, &b, ConnectionKind::Push, &nonce);
+        assert_eq!(minted.len(), 2);
+
+        // Each minted token is a real, live edge: it authorizes its own op.
+        for (op, tok) in &minted {
+            assert!(decide_edge(&tbl, tok, &b, *op, &nonce).is_permitted());
+        }
+
+        // Source death sweeps the whole connection; every token now denies.
+        assert_eq!(tbl.revoke_src(&a), 2);
+        for (op, tok) in &minted {
+            assert_eq!(
+                decide_edge(&tbl, tok, &b, *op, &nonce),
+                EdgeDecision::Deny
+            );
+        }
     }
 }

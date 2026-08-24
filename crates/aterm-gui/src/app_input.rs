@@ -227,7 +227,12 @@ fn native_settings_route_for_aux(
         AuxTarget::Prefs => Some(SettingsRoute::Home),
         AuxTarget::About => Some(SettingsRoute::About),
         AuxTarget::Update => Some(SettingsRoute::SoftwareUpdate),
-        AuxTarget::Front | AuxTarget::Menu => None,
+        AuxTarget::Front
+        | AuxTarget::Menu
+        | AuxTarget::TabMenu
+        | AuxTarget::ConnCard
+        | AuxTarget::SessionPicker
+        | AuxTarget::Connections => None,
     }
 }
 
@@ -538,8 +543,9 @@ pub(crate) mod paste_order {
 /// never told OK for bytes that did not land (the input-path reply-fidelity contract).
 pub(crate) fn egress_to_outcome(e: input::Egress) -> InputOutcome {
     match e {
-        input::Egress::Reported(input::Delivery::Failed) => InputOutcome::WriteFailed,
-        _ => InputOutcome::Ok,
+        input::Egress::Reported(input::Delivery::Full | input::Delivery::FullAt { .. })
+        | input::Egress::TrackingOff { .. } => InputOutcome::Ok,
+        input::Egress::Reported(_) => InputOutcome::WriteFailed,
     }
 }
 
@@ -2303,6 +2309,13 @@ impl App {
                     .map(|o| o.kind())
                 {
                     Some(OverlayKind::Palette) => self.palette_input_event(wid, &ev),
+                    Some(OverlayKind::ConnCard) => self.conn_card_input_event(wid, &ev),
+                    Some(OverlayKind::SessionPicker) => {
+                        self.session_picker_input_event(wid, &ev);
+                    }
+                    Some(OverlayKind::ConnectionMap) => {
+                        self.connection_map_input_event(wid, &ev);
+                    }
                     #[cfg(test)]
                     Some(OverlayKind::About) => self.about_input_event(wid, &ev),
                     #[cfg(test)]
@@ -6679,6 +6692,9 @@ impl App {
             .map(|o| o.kind())
         {
             Some(OverlayKind::Palette) => self.on_key_palette_mode(wid, ev),
+            Some(OverlayKind::ConnCard) => self.on_key_conn_card_mode(wid, ev),
+            Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
+            Some(OverlayKind::ConnectionMap) => self.on_key_connection_map_mode(wid, ev),
             #[cfg(test)]
             Some(OverlayKind::About) => self.on_key_about_mode(wid, ev),
             #[cfg(test)]
@@ -8033,6 +8049,74 @@ impl App {
             // window (same live grid in two windows). `dispatch_menu_action` already
             // has `el`, so the logical attach + OS-window create run directly.
             MenuAction::ViewSessionInNewWindow => self.open_active_session_in_new_window(el),
+            // File ▸ the session-connection spawn presets (design §2.3): the
+            // ORIGIN is the FOCUSED session of the frontmost window (the S of
+            // the §2.3 rows; the items grey out over a native tab, so the
+            // no-session case is a defensive no-op). `dispatch_menu_action`
+            // already has `el`, so the spawn+mint runs directly; failures are
+            // logged — a menu click has no reply channel.
+            MenuAction::NewControlledWindow
+            | MenuAction::NewControlledTab
+            | MenuAction::NewControllerWindow
+            | MenuAction::NewControllerTab => {
+                use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+                let origin = self
+                    .frontmost_window
+                    .and_then(|w| self.front_terminal(w))
+                    .and_then(|t| self.pool.get(t.session))
+                    .map(|s| s.ctx.self_id.clone());
+                let Some(origin) = origin else {
+                    aterm_log::info!("connected spawn {action:?} dropped: no focused session");
+                    return;
+                };
+                let (kind, place) = match action {
+                    MenuAction::NewControlledWindow => {
+                        (ConnectedSpawnKind::Controlled, ConnectedSpawnPlace::Window)
+                    }
+                    MenuAction::NewControlledTab => {
+                        (ConnectedSpawnKind::Controlled, ConnectedSpawnPlace::Tab)
+                    }
+                    MenuAction::NewControllerWindow => {
+                        (ConnectedSpawnKind::Controller, ConnectedSpawnPlace::Window)
+                    }
+                    _ => (ConnectedSpawnKind::Controller, ConnectedSpawnPlace::Tab),
+                };
+                if let Err(e) = self.spawn_connected_session(el, kind, place, &origin, None, "ui")
+                {
+                    aterm_log::warn!("connected spawn {action:?} failed: {e}");
+                }
+            }
+            // The connection ids (design §2.3): invoked WITHOUT a tab context
+            // (palette / `invoke`), the SUBJECT is the frontmost window's
+            // FRONT session — the same "front tab is the subject" convention
+            // as the copies; the tab-strip context menu posts
+            // `Wake::TabMenuAction` instead, which carries the exact clicked
+            // tab into `dispatch_tab_menu_action`'s connection arm.
+            // `session.connect_to` opens the PICKER; configure/disconnect open
+            // the sheet with one peer, the picker with several (never guess).
+            MenuAction::ConnectToSession
+            | MenuAction::ConfigureConnection
+            | MenuAction::DisconnectSession => {
+                let subject = self
+                    .frontmost_window
+                    .and_then(|w| self.front_terminal(w))
+                    .and_then(|t| self.pool.get(t.session))
+                    .map(|s| s.ctx.self_id.clone());
+                let (Some(wid), Some(subject)) = (self.frontmost_window, subject) else {
+                    aterm_log::info!("connection id {action:?} dropped: no focused session");
+                    return;
+                };
+                self.open_connection_ui(wid, subject, action);
+            }
+            // The connection MAP (`view.connections`, design §5.1 host+raise):
+            // opened on the frontmost window, which comes forward with it (the
+            // `OperatorAction::Show` shape). No window resolvable ⇒ a logged
+            // no-op (the palette-enter precedent).
+            MenuAction::ShowConnectionMap => {
+                if let Err(e) = self.open_connection_map() {
+                    aterm_log::info!("connection map: {e}");
+                }
+            }
             MenuAction::CloseTab => {
                 // Same rule as Cmd-W: close the frontmost window's active tab; when
                 // that was its LAST tab, escalate to closing THAT window (which exits
@@ -8226,7 +8310,102 @@ impl App {
                 }
                 self.escalate_pending_close(el);
             }
+            // The connection ids from the tab context menu act on the CLICKED
+            // tab's session — resolved FRESH here (the Copy* discipline), so
+            // the picker/sheet's subject is the tab the menu popped on, never
+            // the front tab the plain dispatcher would guess.
+            MenuAction::ConnectToSession
+            | MenuAction::ConfigureConnection
+            | MenuAction::DisconnectSession => {
+                let subject = self
+                    .tab_terminal_session(window, index)
+                    .and_then(|session| self.pool.get(session))
+                    .map(|s| s.ctx.self_id.clone());
+                let Some(subject) = subject else {
+                    aterm_log::info!("connection id {action:?} dropped: the tab has no session");
+                    return;
+                };
+                self.open_connection_ui(window, subject, action);
+            }
             other => self.dispatch_menu_action(el, other),
+        }
+    }
+
+    /// Dispatch one per-peer CONNECTION row click from a tab's context menu —
+    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }` (design §2.2
+    /// [v5]). `tab` is the pop-time STABLE id, re-resolved here under the same
+    /// no-positional-guess contract as [`Self::dispatch_tab_menu_action`]; the
+    /// subject session ("S") is that tab's terminal session, `peer_sid` the
+    /// row's snapshot peer.
+    ///
+    /// * `Show` raises the PEER (window focus + tab select) through the same
+    ///   body as the `raise` wire verb ([`Self::raise_session_by_id`]).
+    /// * `Configure` opens the §2.5 sheet — the shared confirm/configure card
+    ///   ([`Self::open_confirm_card`]) — pre-filled from the LIVE pair state,
+    ///   origin `menu`; Confirm applies through the declarative `connect`
+    ///   set-semantics seam and pokes the §2.4 freshness funnel.
+    /// * `Disconnect` dissolves BOTH directions of the S↔peer pair through
+    ///   [`crate::connections::disconnect_kind_in`] (origin `ui`): recorded
+    ///   halves pair-precisely by held token, unrecorded wire-grant rows via
+    ///   the op-filtered sweep. Rows TOWARD an unregistered foreign peer died
+    ///   with its table, so only the inbound half exists to dissolve then.
+    ///   The refresh runs unconditionally — the menu said "connected", so
+    ///   even a nothing-to-revoke race should recompose to the truth.
+    pub(crate) fn dispatch_tab_menu_connection(
+        &mut self,
+        window: WindowId,
+        tab: crate::tab_model::TabId,
+        peer_sid: &aterm_session::SessionId,
+        verb: crate::session_chrome::ConnVerb,
+    ) {
+        use crate::session_chrome::ConnVerb;
+        let Some(index) = self.tab_index_for_id(window, tab) else {
+            aterm_log::info!(
+                "tab connection {verb:?} dropped: tab {tab} no longer exists in its window"
+            );
+            return;
+        };
+        match verb {
+            ConnVerb::Show => {
+                let peer_local = {
+                    let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+                    g.by_sid(peer_sid).map(|h| h.local_id)
+                };
+                let raised = peer_local
+                    .ok_or_else(|| "no such session".to_string())
+                    .and_then(|local| self.raise_session_by_id(local));
+                if let Err(e) = raised {
+                    aterm_log::info!("show connection peer {}: {e}", peer_sid.as_str());
+                }
+            }
+            ConnVerb::Configure => {
+                let subject = self
+                    .tab_terminal_session(window, index)
+                    .and_then(|session| self.pool.get(session))
+                    .map(|s| s.ctx.self_id.clone());
+                let Some(subject) = subject else {
+                    aterm_log::info!("configure dropped: the clicked tab has no session");
+                    return;
+                };
+                let _ = self.open_confirm_card(window, subject, peer_sid.clone(), None, "menu");
+            }
+            ConnVerb::Disconnect => {
+                let Some(session) = self.tab_terminal_session(window, index) else {
+                    aterm_log::info!("disconnect dropped: the clicked tab has no session");
+                    return;
+                };
+                let sid = {
+                    let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+                    g.by_local(session).map(|h| h.sid.clone())
+                };
+                let Some(sid) = sid else {
+                    aterm_log::info!("disconnect dropped: the clicked session is unregistered");
+                    return;
+                };
+                // Both directions of the S↔peer pair, through the SAME seam
+                // the picker's Disconnect intent uses (refresh included).
+                self.disconnect_pair(&sid, peer_sid, "ui");
+            }
         }
     }
 
@@ -8330,9 +8509,37 @@ impl App {
                 self.palette_enter();
                 Ok(())
             }
+            AuxTarget::TabMenu => {
+                // The in-grid session context menu, opened for the FRONT
+                // window's ACTIVE tab (the wire caller has no chip to press)
+                // through the same `open_active_tab_context_menu` the Menu key
+                // takes; `controls tab-menu` / `image` then read it. A native
+                // active tab, or a window with the strip off, has no session
+                // menu — the open refuses instead of showing nothing.
+                let Some(wid) = self.frontmost_window else {
+                    return Err("no front window to open the tab menu on".to_string());
+                };
+                if self.open_active_tab_context_menu(wid) {
+                    Ok(())
+                } else {
+                    Err("the active tab has no session context menu".to_string())
+                }
+            }
+            // The connection MAP (design §5.1): `open connections` — Owner-only
+            // at the dispatch (§5.3) — opens it on the frontmost window WITH
+            // raise/focus (the `OperatorAction::Show` shape); `controls
+            // connections` / `window connections` then read it.
+            AuxTarget::Connections => self.open_connection_map(),
             AuxTarget::Front => {
                 Err("the front terminal window is already open (use window/chrome)".to_string())
             }
+            // The confirm card and the picker need a PAIR/SUBJECT argument only
+            // the UI gestures (menu row, picker choice, drag) carry — there is
+            // no wire `open` form; `cmd_open` rejects them before this arm.
+            AuxTarget::ConnCard | AuxTarget::SessionPicker => Err(format!(
+                "{} opens from its UI gesture, not the wire",
+                target.keyword()
+            )),
             AuxTarget::Prefs | AuxTarget::About | AuxTarget::Update => {
                 Err("native Settings alias routing failed".to_string())
             }
@@ -8354,6 +8561,31 @@ impl App {
             }
             AuxTarget::Menu => {
                 self.palette_exit();
+                Ok(())
+            }
+            AuxTarget::TabMenu => {
+                if let Some(wid) = self.frontmost_window {
+                    self.close_tab_menu(wid);
+                }
+                Ok(())
+            }
+            // Symmetric transient exits (idempotent like the tab menu's).
+            AuxTarget::ConnCard => {
+                if let Some(wid) = self.frontmost_window {
+                    self.conn_card_exit(wid);
+                }
+                Ok(())
+            }
+            AuxTarget::SessionPicker => {
+                if let Some(wid) = self.frontmost_window {
+                    self.session_picker_exit(wid);
+                }
+                Ok(())
+            }
+            AuxTarget::Connections => {
+                if let Some(wid) = self.frontmost_window {
+                    self.connection_map_exit(wid);
+                }
                 Ok(())
             }
             // `Front` is the terminal itself and is not a closable app surface here.

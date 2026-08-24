@@ -10,9 +10,12 @@
 use std::sync::{Arc, Mutex};
 
 use aterm_core::terminal::Terminal;
-use aterm_session::{EdgeToken, Op, SessionId};
+use aterm_session::{ConnectionKind, EdgeToken, Op, SessionId};
+use winit::event_loop::EventLoopProxy;
 
 use super::{Scope, json_ok, json_str_field, pct_encode};
+use crate::Wake;
+use crate::session_edge_audit::{self, EdgeAction};
 use crate::session_store::Store;
 use crate::session_timeline::{
     MetaEdit, MetaField, MetaWriteError, apply_meta_value, write_session_meta,
@@ -346,6 +349,15 @@ pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
 /// An unknown target id yields `ERR no such session\n` (fail-closed). An EXPLICIT
 /// `<sid>` argument is Owner-only (a scoped Edge gets `ERR denied`); the no-arg
 /// form is scoped to the already-gated resolved session.
+///
+/// For OWNER scope only, session-connection DISCOVERY rows follow the child
+/// rows (design §6): `pushes` / `pushed-by` / `pulls` / `pulled-by`, one per
+/// connected peer, in the same `<kind> <sid> <state> <title>` shape. Direction
+/// per peer is classified from the edge ops (`write-input` present ⇒ pushes,
+/// else pulls); outbound rows scan OTHER sessions' tables, which is exactly why
+/// a scoped edge gets NONE of these rows (the `sessions`-is-Owner-only
+/// disclosure rationale — a scoped caller reads its own inbound table via
+/// `edges`). `parent`/`child` stay lineage, untouched.
 pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &str) -> String {
     // Target sid: an explicit argument (Owner-only — arbitrary-node enumeration),
     // else the resolved session's own id (already gated by the dispatch).
@@ -394,6 +406,76 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
         .filter(|h| h.parent.as_ref() == Some(&target_sid))
     {
         body.push_str(&line("child", h));
+    }
+    // Session-connection rows, OWNER ONLY (see the doc above). Each peer's
+    // table is locked briefly against the already-released snapshot (the
+    // connections-module discipline: no store lock across a table lock).
+    if scope == Scope::Owner {
+        // OUTBOUND (this node → peer): rows live in each PEER's table with
+        // src == target. Snapshot order keeps peers local-id sorted.
+        let (mut pushes, mut pulls) = (Vec::new(), Vec::new());
+        for h in &snapshot {
+            if h.sid == target_sid {
+                continue;
+            }
+            let rows = {
+                let edges = h.ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+                edges.edges()
+            };
+            let ops: Vec<Op> = rows
+                .iter()
+                .filter(|e| e.src == target_sid && e.dst == h.sid)
+                .map(|e| e.op)
+                .collect();
+            if ops.is_empty() {
+                continue;
+            }
+            if ops.contains(&Op::WriteInput) {
+                pushes.push(h);
+            } else {
+                pulls.push(h);
+            }
+        }
+        // INBOUND (peer → this node): rows in the TARGET's own table, grouped
+        // by src. A src may be foreign (wire-granted, never registered): its
+        // row still prints, `unknown -` for state/title (the absent-parent
+        // idiom), sorted by sid for a stable listing.
+        let mut inbound: Vec<(SessionId, bool)> = Vec::new();
+        {
+            let rows = {
+                let edges = node.ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+                edges.edges()
+            };
+            for e in rows {
+                if e.src == e.dst || e.dst != target_sid {
+                    continue;
+                }
+                let write = e.op == Op::WriteInput;
+                match inbound.iter_mut().find(|(s, _)| *s == e.src) {
+                    Some((_, w)) => *w |= write,
+                    None => inbound.push((e.src, write)),
+                }
+            }
+            inbound.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        }
+        let peer_line = |kind: &str, sid: &SessionId| {
+            snapshot.iter().find(|h| h.sid == *sid).map_or_else(
+                || format!("{kind} {} unknown -\n", sid.as_str()),
+                |h| line(kind, h),
+            )
+        };
+        for h in &pushes {
+            body.push_str(&line("pushes", h));
+        }
+        for (sid, _) in inbound.iter().filter(|(_, write)| *write) {
+            body.push_str(&peer_line("pushed-by", sid));
+        }
+        for h in &pulls {
+            body.push_str(&line("pulls", h));
+        }
+        for (sid, _) in inbound.iter().filter(|(_, write)| !*write) {
+            body.push_str(&peer_line("pulled-by", sid));
+        }
     }
     format!("OK {}\n{body}", body.lines().count())
 }
@@ -719,7 +801,9 @@ pub(crate) struct TurnIo<'a> {
     /// Deliver the message text into the target's input path with PASTE
     /// semantics (control bytes stripped by `format_paste`; bracketed-paste
     /// framing only when the app itself enabled the mode).
-    pub paste: &'a dyn Fn(&str),
+    /// `false` means the bounded egress did not accept the complete paste; the
+    /// turn stops before submit and the durable operator marks its intent in-doubt.
+    pub paste: &'a dyn Fn(&str) -> bool,
     /// Press a named key (the `key` verb vocabulary, e.g. "enter"). `false`
     /// means the name did not parse — reported as a usage error.
     pub press: &'a dyn Fn(&str) -> bool,
@@ -764,10 +848,12 @@ pub(crate) struct TurnIo<'a> {
 /// The gesture vocabulary is app-agnostic on purpose: nothing here knows what
 /// program is driven. Claude Code, codex, a shell, emacs (`submit=none` types
 /// without submitting; any `key`-verb name may be the submit key) — anything in
-/// a PTY holds a conversation through the exact surface a human uses. A human
-/// typing INTO the target mid-turn simply extends the same content stream: the
-/// settle watcher keeps resetting, and the returned screen contains whatever
-/// both parties produced — interjection is a designed property, not a race.
+/// a PTY holds a conversation through the exact surface a human uses. For an
+/// ordinary interactive `turn`, a human typing INTO the target mid-turn simply
+/// extends the same content stream: the settle watcher keeps resetting, and the
+/// returned screen contains whatever both parties produced. The durable operator
+/// uses the guarded twin below, which instead aborts before submit when any
+/// foreign PTY input attempt interjects.
 ///
 /// SETTLE (phase 3) defaults to GLOBAL idle — no content change for `idle_ms` —
 /// which assumes the app STOPS painting when done. A periodically-repainting TUI
@@ -788,6 +874,41 @@ pub(crate) fn cmd_turn(
     subscribers: &crate::subscribe::Subscribers,
     ctx: &SessionCtx,
     io: &TurnIo<'_>,
+) -> String {
+    let mut allow_preflight = || Ok(());
+    let mut allow_submit = || Ok(());
+    cmd_turn_guarded(
+        term,
+        store,
+        session,
+        rest,
+        subscribers,
+        ctx,
+        io,
+        &mut allow_preflight,
+        &mut allow_submit,
+        None,
+    )
+}
+
+/// `turn` with last-moment validation hooks. `preflight` runs after the exclusive
+/// turn lease is held and before any watcher is armed or input is emitted.
+/// `pre_submit` runs after paste echo-settle and immediately before every submit
+/// press. The embedded operator uses both plus its sink epoch to prevent a human
+/// or raw controller interjection from turning a previously-safe paste into an
+/// unsafe Enter.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn cmd_turn_guarded(
+    term: &Arc<Mutex<Terminal>>,
+    store: &Store,
+    session: u64,
+    rest: &str,
+    subscribers: &crate::subscribe::Subscribers,
+    ctx: &SessionCtx,
+    io: &TurnIo<'_>,
+    preflight: &mut dyn FnMut() -> Result<(), String>,
+    pre_submit: &mut dyn FnMut() -> Result<(), String>,
+    ledger_text_override: Option<&str>,
 ) -> String {
     use std::time::{Duration, Instant};
 
@@ -829,6 +950,10 @@ pub(crate) fn cmd_turn(
             Some((t, rest)) => (t, rest.trim_start()),
             None => (text, ""),
         };
+        if tok == "--" {
+            text = tail;
+            break;
+        }
         let Some((k, v)) = tok.split_once('=') else {
             break;
         };
@@ -924,6 +1049,11 @@ pub(crate) fn cmd_turn(
         id: turn_id,
     };
 
+    if let Err(error) = preflight() {
+        let error = error.trim_end_matches(['\r', '\n']);
+        return format!("ERR {error}\n");
+    }
+
     let now0 = Instant::now();
     let started_ms = crate::turn_ledger::now_ms();
     let deadline = now0 + Duration::from_millis(timeout_ms);
@@ -992,7 +1122,9 @@ pub(crate) fn cmd_turn(
 
     // ── phase 1: type. Paste semantics; the seam strips control bytes. ──
     if !text.is_empty() {
-        (io.paste)(text);
+        if !(io.paste)(text) {
+            return "ERR paste delivery failed\n".to_string();
+        }
         // Echo settle: the editor ingested + painted the burst. Cap the phase so
         // an app that is ALREADY animating (mid-turn spinner) cannot stall us.
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
@@ -1044,6 +1176,15 @@ pub(crate) fn cmd_turn(
             let Some(mut id) = arm(WatcherSpec::SeqAdvanced { after }) else {
                 return "ERR watcher budget full\n".to_string();
             };
+            // The watcher must be armed before input, but the guard remains the
+            // final operation before the press. For the durable operator this
+            // re-reads live non-approval state and checks its attempted-input
+            // epoch; generic turns pass an allow hook and retain their behavior.
+            if let Err(error) = pre_submit() {
+                term_lock(term).watch_disarm(id);
+                let error = error.trim_end_matches(['\r', '\n']);
+                return format!("ERR {error}\n");
+            }
             if !(io.press)(&submit) {
                 term_lock(term).watch_disarm(id);
                 return USAGE.to_string();
@@ -1160,7 +1301,10 @@ pub(crate) fn cmd_turn(
             dur_ms,
             submitted,
             status,
-            text: crate::turn_ledger::clamp_text(text),
+            // Durable operator proposals may contain sensitive model/context
+            // text. Their caller supplies a fixed redaction marker; ordinary
+            // interactive turns retain the historical submitted-text ledger.
+            text: crate::turn_ledger::clamp_text(ledger_text_override.unwrap_or(text)),
             screen_hash,
             seq,
         });
@@ -1565,24 +1709,314 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     let Some(op) = Op::parse(op_s) else {
         return "ERR unknown op\n".to_string();
     };
-    let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
-    let tok = edges.grant(SessionId::new(src), ctx.self_id.clone(), op, ctx.nonce);
+    let src = SessionId::new(src);
+    let tok = {
+        let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+        edges.grant(src.clone(), ctx.self_id.clone(), op, ctx.nonce)
+    };
+    // Audit the act (§1.4#5) OFF the table lock: the logger sink has its own
+    // mutex and must never nest inside `ctx.edges`.
+    session_edge_audit::emit(EdgeAction::Grant, "wire", &src, &ctx.self_id, op.as_str());
     format!("OK {}\n", tok.to_hex())
 }
 
-/// `revoke <edge-hex>` -> remove an edge. Owner-only.
+/// `revoke <edge-hex>` -> remove one edge by its bearer token. `revoke
+/// src=<sid>` -> sweep EVERY edge from that source (any op) and reply
+/// `OK <removed>` — the wire dissolution primitive (design §1.4#4/§6): token
+/// hexes are deliberately non-enumerable, so the sweep is the only way to
+/// dissolve edges whose hex is lost. Owner-only; both forms fail closed with
+/// `ERR no such edge` when nothing matches. Each successful act emits one
+/// `session_edge` audit event (§1.4#5).
 pub(crate) fn cmd_revoke(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
     if scope != Scope::Owner {
         return "ERR denied\n".to_string();
     }
-    let Some(tok) = EdgeToken::from_hex(rest.trim()) else {
+    let rest = rest.trim();
+    if let Some(src) = rest.strip_prefix("src=") {
+        if src.is_empty() {
+            return "ERR usage: revoke <edge-hex> | revoke src=<sid>\n".to_string();
+        }
+        let src = SessionId::new(src);
+        let removed = {
+            let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+            edges.revoke_src(&src)
+        };
+        if removed == 0 {
+            return "ERR no such edge\n".to_string();
+        }
+        // ONE event for the whole sweep: `op=*` (every op the source held).
+        session_edge_audit::emit(EdgeAction::RevokeSrc, "wire", &src, &ctx.self_id, "*");
+        return format!("OK {removed}\n");
+    }
+    let Some(tok) = EdgeToken::from_hex(rest) else {
         return "ERR bad token\n".to_string();
     };
-    let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
-    if edges.revoke(&tok) {
-        "OK\n".to_string()
-    } else {
-        "ERR no such edge\n".to_string()
+    let removed = {
+        let mut edges = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
+        // Read the row's (src, dst, op) identity BEFORE removal — the audit
+        // event describes the edge, and after `revoke` the row is gone.
+        let row = edges.edge_of(&tok);
+        if edges.revoke(&tok) { row } else { None }
+    };
+    let Some(edge) = removed else {
+        return "ERR no such edge\n".to_string();
+    };
+    session_edge_audit::emit(EdgeAction::Revoke, "wire", &edge.src, &edge.dst, edge.op.as_str());
+    "OK\n".to_string()
+}
+
+/// Parse the `dst=<sid> src=<sid> [kind=pull|push|both]` grammar shared by
+/// `connect` and `disconnect`. `kind` is `None` when absent — each verb applies
+/// its own default (`connect` ⇒ `both`, the §1.2 default connection;
+/// `disconnect` ⇒ the whole connection). Any unknown token, empty value, or
+/// missing endpoint is `Err` (the caller's usage string) — an authority-minting
+/// argument gets no guessed default.
+fn parse_connection_args(
+    rest: &str,
+) -> Result<(SessionId, SessionId, Option<ConnectionKind>), ()> {
+    let (mut dst, mut src, mut kind) = (None, None, None);
+    for tok in rest.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("dst=") {
+            if v.is_empty() {
+                return Err(());
+            }
+            dst = Some(SessionId::new(v));
+        } else if let Some(v) = tok.strip_prefix("src=") {
+            if v.is_empty() {
+                return Err(());
+            }
+            src = Some(SessionId::new(v));
+        } else if let Some(v) = tok.strip_prefix("kind=") {
+            kind = Some(match v {
+                "pull" => ConnectionKind::Pull,
+                "push" => ConnectionKind::Push,
+                "both" => ConnectionKind::Both,
+                _ => return Err(()),
+            });
+        } else {
+            return Err(());
+        }
+    }
+    match (dst, src) {
+        (Some(dst), Some(src)) => Ok((dst, src, kind)),
+        _ => Err(()),
+    }
+}
+
+/// `connect dst=<sid> src=<sid> [kind=pull|push|both]` against the process-wide
+/// connection store. See [`cmd_connect_in`].
+pub(crate) fn cmd_connect(store: &Store, scope: Scope, rest: &str) -> String {
+    cmd_connect_in(&crate::connections::connections(), store, scope, rest)
+}
+
+/// The §6 `connect` verb: declaratively SET the session connection `src → dst`
+/// to exactly `kind` (default `both`) through the [`crate::connections`] seam —
+/// one atomic mint+revoke transition, audited on `session_edge` with origin
+/// `wire`. Owner-only (also enforced by the dispatch's `OwnerOnly` table gate).
+///
+/// `dst` must be a LIVE registered session (its table + nonce are the mint
+/// target); `src` may be ANY sid — the shipping `grant` contract, since the
+/// source presents the token later and an unknown src simply never connects —
+/// but a self-loop is refused (§1.5). Reply, caller-is-the-deliverer (the
+/// `grant` principle, not its one-hex grammar): one Status line naming only the
+/// LIVE ops — `OK read-screen=<hex> write-input=<hex> signal=<hex>`. A
+/// declarative no-op (the connection already IS `kind`) replies the current
+/// set the same way: the record's original tokens stay live, so re-deriving
+/// the reply from the record covers both paths with no token churn.
+pub(crate) fn cmd_connect_in(
+    conn: &crate::connections::ConnectionStore,
+    store: &Store,
+    scope: Scope,
+    rest: &str,
+) -> String {
+    if scope != Scope::Owner {
+        return "ERR denied\n".to_string();
+    }
+    let Ok((dst, src, kind)) = parse_connection_args(rest) else {
+        return "ERR usage: connect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
+    };
+    let kind = kind.unwrap_or(ConnectionKind::Both);
+    if src == dst {
+        return "ERR self-loop\n".to_string();
+    }
+    // Resolve the DESTINATION from the registry (clone-then-release: the ctx
+    // Arc is lifted out before any table lock). A dead session's table would
+    // mint rows its nonce already fails closed — refuse honestly instead.
+    let dst_ctx = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        match g.by_sid(&dst) {
+            None => return "ERR no such session\n".to_string(),
+            Some(h) if matches!(h.state, crate::session_store::SessionState::Exited) => {
+                return "ERR exited\n".to_string();
+            }
+            Some(h) => h.ctx.clone(),
+        }
+    };
+    if !crate::connections::connect_in(
+        conn,
+        &src,
+        &dst,
+        &dst_ctx.edges,
+        &dst_ctx.nonce,
+        kind,
+        "wire",
+    ) {
+        // `connect_in` refuses only a self-loop, checked above; keep the
+        // fail-closed reply rather than an unreachable! on a future refusal.
+        return "ERR self-loop\n".to_string();
+    }
+    let tokens = conn
+        .records()
+        .get(&(src, dst))
+        .map(|r| r.tokens.clone())
+        .unwrap_or_default();
+    let mut out = String::from("OK");
+    for (op, tok) in &tokens {
+        out.push_str(&format!(" {}={}", op.as_str(), tok.to_hex()));
+    }
+    out.push('\n');
+    out
+}
+
+/// `disconnect dst=<sid> src=<sid> [kind=…]` against the process-wide
+/// connection store. See [`cmd_disconnect_in`].
+pub(crate) fn cmd_disconnect(store: &Store, scope: Scope, rest: &str) -> String {
+    cmd_disconnect_in(&crate::connections::connections(), store, scope, rest)
+}
+
+/// The §6 `disconnect` verb: dissolve the session connection `src → dst`,
+/// KIND-FILTERED when `kind=` is given (`disconnect … kind=pull` revokes only
+/// the pull half). Owner-only. Recorded connections dissolve pair-precisely by
+/// held token; wire-granted rows with no record fall back to the op-filtered
+/// source sweep — see [`crate::connections::disconnect_kind_in`]. Reply
+/// `OK <revoked>`; an unknown pair (no record AND nothing swept) fails closed
+/// with `ERR no such connection`. Unlike `connect`, an Exited-but-registered
+/// dst is a legal target: dissolution is first-class (§1.4#4) and needs no
+/// liveness.
+pub(crate) fn cmd_disconnect_in(
+    conn: &crate::connections::ConnectionStore,
+    store: &Store,
+    scope: Scope,
+    rest: &str,
+) -> String {
+    if scope != Scope::Owner {
+        return "ERR denied\n".to_string();
+    }
+    let Ok((dst, src, kind)) = parse_connection_args(rest) else {
+        return "ERR usage: disconnect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
+    };
+    if src == dst {
+        // A self-loop is never a connection; refusing here also keeps the
+        // fallback sweep from eating raw self-granted rows by accident.
+        return "ERR self-loop\n".to_string();
+    }
+    let dst_ctx = {
+        let g = store.read().unwrap_or_else(|p| p.into_inner());
+        match g.by_sid(&dst) {
+            Some(h) => h.ctx.clone(),
+            None => return "ERR no such session\n".to_string(),
+        }
+    };
+    match crate::connections::disconnect_kind_in(conn, &src, &dst, &dst_ctx.edges, kind, "wire") {
+        Some(n) => format!("OK {n}\n"),
+        None => "ERR no such connection\n".to_string(),
+    }
+}
+
+/// `flows [--json]` -> the instance's AGGREGATED session-connection graph
+/// (design §5.3/§6): every live edge row across EVERY registered session's
+/// table, `OK <n>\n` + one `<src> <dst> <op>` line per row, sorted by
+/// `(src, dst, op)`. Owner-only — the aggregated view discloses the whole
+/// fabric, the same rationale as `sessions`. `--json` groups per directed pair
+/// in the `cmd_edges_json` style: `{"flows":[{"src":..,"dst":..,"ops":[..]}]}`.
+/// Collection reuses the [`crate::connections`] snapshot discipline (registry
+/// snapshot first, each table locked briefly, no store lock held across a
+/// table lock).
+pub(crate) fn cmd_flows(store: &Store, scope: Scope, rest: &str) -> String {
+    if scope != Scope::Owner {
+        return "ERR denied\n".to_string();
+    }
+    let mut json = false;
+    for tok in rest.split_whitespace() {
+        match tok {
+            "--json" | "json" => json = true,
+            _ => return "ERR usage: flows [--json]\n".to_string(),
+        }
+    }
+    let edges = crate::connections::all_edges(store);
+    if json {
+        // Grouped per (src, dst): the sort above makes pairs consecutive. The
+        // op tokens are the closed `Op::as_str` vocabulary (no escaping
+        // needed); sids go through `json_str_field` like `edges --json`.
+        let mut items: Vec<String> = Vec::new();
+        let mut i = 0;
+        while i < edges.len() {
+            let (src, dst) = (edges[i].src.clone(), edges[i].dst.clone());
+            let mut ops: Vec<String> = Vec::new();
+            while i < edges.len() && edges[i].src == src && edges[i].dst == dst {
+                ops.push(format!("\"{}\"", edges[i].op.as_str()));
+                i += 1;
+            }
+            items.push(format!(
+                "{{{},{},\"ops\":[{}]}}",
+                json_str_field("src", src.as_str()),
+                json_str_field("dst", dst.as_str()),
+                ops.join(","),
+            ));
+        }
+        return json_ok(&format!("{{\"flows\":[{}]}}", items.join(",")));
+    }
+    let mut out = format!("OK {}\n", edges.len());
+    for e in &edges {
+        out.push_str(&format!(
+            "{} {} {}\n",
+            e.src.as_str(),
+            e.dst.as_str(),
+            e.op.as_str()
+        ));
+    }
+    out
+}
+
+/// Resolve the `raise <sid>` argument against the registry — the pure,
+/// headless-testable half of [`cmd_raise`] (the proxy hop cannot run off the
+/// event loop; `pub(super)` for exactly that test). Exactly one sid token; an
+/// unknown sid fails closed.
+pub(super) fn raise_target(store: &Store, rest: &str) -> Result<u64, String> {
+    let mut toks = rest.split_whitespace();
+    let (Some(sid), None) = (toks.next(), toks.next()) else {
+        return Err("ERR usage: raise <sid>\n".to_string());
+    };
+    let g = store.read().unwrap_or_else(|p| p.into_inner());
+    match g.by_sid(&SessionId::new(sid)) {
+        Some(h) => Ok(h.local_id),
+        None => Err("ERR no such session\n".to_string()),
+    }
+}
+
+/// `raise <sid>` -> raise the window hosting that session and select its tab —
+/// the wire twin of the menu Show / map Enter (design §6; no shipping verb can
+/// do this: `tab` drives only the front window, `focus` is a PTY focus event).
+/// Owner-only. Main-thread hop like `spawn` (window/tab state is `App`-owned):
+/// the event loop runs the `OperatorAction::Show` switch+focus shape for the
+/// resolved session and reports whether any window hosts it.
+pub(crate) fn cmd_raise(
+    proxy: &EventLoopProxy<Wake>,
+    store: &Store,
+    scope: Scope,
+    rest: &str,
+) -> String {
+    if scope != Scope::Owner {
+        return "ERR denied\n".to_string();
+    }
+    let session = match raise_target(store, rest) {
+        Ok(session) => session,
+        Err(e) => return e,
+    };
+    match super::control_media::call_main(proxy, |reply| Wake::RaiseSession { session, reply }) {
+        Ok(Ok(())) => "OK\n".to_string(),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
     }
 }
 

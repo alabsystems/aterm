@@ -110,6 +110,17 @@ fn sh_single_quote(s: &str) -> String {
 /// installed tool.
 #[must_use]
 fn stub_content(tool: &ToolName, atpkg: &Path) -> String {
+    if cfg!(windows) {
+        stub_content_cmd(tool, atpkg)
+    } else {
+        stub_content_sh(tool, atpkg)
+    }
+}
+
+/// The POSIX `/bin/sh` stub body (macOS/Linux — the shim there is a plain
+/// executable file).
+#[must_use]
+fn stub_content_sh(tool: &ToolName, atpkg: &Path) -> String {
     let name = sh_single_quote(tool.as_str());
     let mut s = String::from("#!/bin/sh\n");
     s.push_str(STUB_MARKER);
@@ -125,15 +136,63 @@ fn stub_content(tool: &ToolName, atpkg: &Path) -> String {
     s
 }
 
+/// The batch twin: on Windows the shim slot is `bin/<tool>.cmd`
+/// ([`crate::store::ToolName::shim_file`]), and this module used to lay a
+/// `#!/bin/sh` body into it — cmd.exe then read POSIX shell as batch and the
+/// "pending" promise rendered as `'#!' is not recognized…` garbage. Same
+/// three fallbacks as the sh body, batch-spelled; the marker rides a `rem`
+/// line ([`is_pending_stub`] accepts both spellings) so recognition, rewrite
+/// and removal keep working on the file cmd.exe can actually run. `exit /b
+/// 127` throughout — the stub contract is "the tool did not run" regardless
+/// of which fallback answered. Tool names are `ToolName`-vetted and the atpkg
+/// path rides plain double quotes, the exact conventions of the real `.cmd`
+/// shim writer (`platform::cmd_shim_content`).
+#[must_use]
+fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
+    let name = tool.as_str();
+    let atpkg = atpkg.to_string_lossy();
+    let mut s = String::from("@echo off\r\nrem ");
+    s.push_str(STUB_MARKER);
+    s.push_str("\r\nrem Replaced by the real shim when the program installs.\r\n");
+    s.push_str(&format!(
+        "if exist \"{atpkg}\" (\r\n  \"{atpkg}\" __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
+    ));
+    s.push_str(&format!(
+        "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
+    ));
+    s.push_str(&format!("echo {STUB_UNREACHABLE_MSG} 1>&2\r\nexit /b 127\r\n"));
+    s
+}
+
+/// Whether `name` can ride a batch script without becoming syntax:
+/// [`crate::store::shim_allowed`] admits quotes, `%`, carets and ampersands —
+/// the sh body neutralizes those with single-quoting, but cmd.exe has no
+/// robust equivalent (`%VAR%` expands even inside double quotes). A name that
+/// cannot be embedded inertly gets NO stub on Windows (fail closed: a missing
+/// courtesy stub costs one "command not found"; an injectable script costs
+/// arbitrary execution under the user's account). Real roster names are
+/// `[a-z0-9-]` and all pass.
+#[must_use]
+fn cmd_stub_name_safe(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|c| matches!(c, '"' | '%' | '^' | '&' | '<' | '>' | '|' | '!' | '\r' | '\n'))
+}
+
 /// The co-located `atpkg` alias beside the running executable — fallback 1's
 /// embedded path. Canonicalized so an argv0 alias (`atpkg` → `aterm`) or a
 /// `~/.local/bin` symlink resolves to the real bundle before the sibling join.
 fn embedded_atpkg_path() -> std::path::PathBuf {
+    // `EXE_SUFFIX` (".exe" on Windows, "" elsewhere): a bare `atpkg` join
+    // embedded a path that exists on no Windows install — the same probe bug
+    // the GUI's co-located resolver fixed — so fallback 1 always missed there
+    // and every stub run leaned on PATH luck.
+    let atpkg = format!("atpkg{}", std::env::consts::EXE_SUFFIX);
     std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .ok()
-        .and_then(|exe| exe.parent().map(|d| d.join("atpkg")))
-        .unwrap_or_else(|| std::path::PathBuf::from("atpkg"))
+        .and_then(|exe| exe.parent().map(|d| d.join(&atpkg)))
+        .unwrap_or_else(|| std::path::PathBuf::from(atpkg))
 }
 
 /// Whether the file at `path` is a pending stub THIS module wrote — the recognition
@@ -142,9 +201,18 @@ fn embedded_atpkg_path() -> std::path::PathBuf {
 #[must_use]
 pub fn is_pending_stub(path: &Path) -> bool {
     // A real Unix-era symlink shim is not even a regular file; the bounded reader
-    // refuses it before content is considered.
-    crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024)
-        .is_ok_and(|text| text.lines().any(|l| l.trim() == STUB_MARKER))
+    // refuses it before content is considered. Both marker spellings are
+    // recognized on every platform — the bare sh line and the batch `rem`
+    // line — so a store migrated across platforms (or a stub laid by the old
+    // sh-everywhere writer on Windows) still reconciles instead of squatting.
+    crate::metadata_io::read_bounded_regular_utf8(path, 64 * 1024).is_ok_and(|text| {
+        text.lines().any(|l| {
+            let l = l.trim();
+            l == STUB_MARKER
+                || l.strip_prefix("rem ")
+                    .is_some_and(|rest| rest.trim() == STUB_MARKER)
+        })
+    })
 }
 
 /// Whether `tool` currently resolves to a pending stub in this layout — the front
@@ -160,6 +228,10 @@ pub fn pending_stub_exists(layout: &Layout, tool: &str) -> bool {
 /// wins and the write is a clean no-op — the stub is the lowest-precedence occupant
 /// of the name.
 pub fn write_pending_stub(layout: &Layout, tool: &ToolName) -> io::Result<()> {
+    if cfg!(windows) && !cmd_stub_name_safe(tool.as_str()) {
+        // See `cmd_stub_name_safe`: no inert embedding exists, so no stub.
+        return Ok(());
+    }
     let shim = layout.shim(tool);
     match std::fs::symlink_metadata(&shim) {
         Err(_) => {} // absent: ours to claim
@@ -327,7 +399,10 @@ mod tests {
     /// mistake a stub for an installed tool.
     #[test]
     fn stub_content_shape_and_shim_invisibility() {
-        let body = stub_content(&tool("trust"), Path::new("/Apps/aterm.app/Contents/MacOS/atpkg"));
+        // The sh body directly — `stub_content` dispatches by compile target,
+        // and this shape must stay pinned from every build host.
+        let body =
+            stub_content_sh(&tool("trust"), Path::new("/Apps/aterm.app/Contents/MacOS/atpkg"));
         assert!(body.starts_with("#!/bin/sh\n"));
         assert!(body.contains(STUB_MARKER));
         let atpkg_pos = body.find("[ -x \"$ATPKG\" ]").unwrap();
@@ -345,9 +420,70 @@ mod tests {
         );
         // Quote-safety: a name with an embedded quote cannot break out.
         let nasty = ToolName::new("a'b").expect("shim_allowed admits quotes");
-        let body = stub_content(&nasty, Path::new("/x'y/atpkg"));
+        let body = stub_content_sh(&nasty, Path::new("/x'y/atpkg"));
         assert!(body.contains("__pending 'a'\\''b'"));
         assert!(body.contains("ATPKG='/x'\\''y/atpkg'"));
+    }
+
+    /// The batch twin's shape: what cmd.exe actually runs on Windows, where
+    /// the shim slot is `<tool>.cmd` — the old sh-everywhere writer put
+    /// `#!/bin/sh` there and the pending promise rendered as `'#!' is not
+    /// recognized…` garbage. Pinned from every build host (pure string).
+    #[test]
+    fn cmd_stub_shape_marker_and_safety() {
+        let body = stub_content_cmd(
+            &tool("trust"),
+            Path::new(r"C:\Program Files\aterm\atpkg.exe"),
+        );
+        assert!(body.starts_with("@echo off\r\n"), "batch, not sh: {body}");
+        assert!(!body.contains("#!/bin/sh"), "no POSIX in a .cmd file");
+        let exist = body.find("if exist").unwrap();
+        let where_probe = body.find("where atpkg").unwrap();
+        let static_msg = body.find("package manager is not reachable").unwrap();
+        assert!(
+            exist < where_probe && where_probe < static_msg,
+            "fallbacks in order"
+        );
+        assert!(body.contains("__pending \"trust\""));
+        assert!(body.matches("exit /b 127").count() >= 3, "every arm exits 127");
+        // Recognition round-trips through the `rem` spelling.
+        assert!(
+            body.lines().any(|l| l
+                .trim()
+                .strip_prefix("rem ")
+                .is_some_and(|r| r.trim() == STUB_MARKER)),
+            "the marker rides a rem line"
+        );
+
+        // The batch-hostility gate: sh can neutralize these, batch cannot —
+        // and `shim_allowed` admits them, so the WRITE must refuse.
+        for hostile in ["a%b", "a\"b", "a&b", "a^b", "a|b", "a<b", "a!b"] {
+            assert!(
+                !cmd_stub_name_safe(hostile),
+                "{hostile:?} has no inert batch embedding"
+            );
+        }
+        for fine in ["trust", "ay", "clean-2", "a'b", "a b"] {
+            assert!(cmd_stub_name_safe(fine), "{fine:?} is batch-inert quoted");
+        }
+    }
+
+    /// A stub written with the batch marker is still a stub to every consumer:
+    /// recognition (and therefore rewrite/removal/reconcile) must accept both
+    /// spellings on both platforms, or a store migrated across platforms
+    /// squats its own bin dir.
+    #[test]
+    fn rem_marker_recognition_round_trips() {
+        let dir = std::env::temp_dir().join(format!("atpkg-stub-rem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trust.cmd");
+        std::fs::write(
+            &path,
+            stub_content_cmd(&tool("trust"), Path::new(r"C:\x\atpkg.exe")),
+        )
+        .unwrap();
+        assert!(is_pending_stub(&path), "batch stub recognized");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Laid stub → recognized; real-shim install lands OVER it via temp+rename with

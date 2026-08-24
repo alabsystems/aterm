@@ -10,6 +10,26 @@ pub struct DamageTracker {
     pub(crate) row_bits: Vec<u64>,
     /// Per-row column damage bounds: (min_col, max_col) if damaged.
     row_bounds: Vec<RowDamageBounds>,
+    /// Monotone count of MARK CALLS made on this tracker (D-2 row-revision
+    /// clock). Bumped by every `mark_*` entry point below — including a mark
+    /// that sets no new bit, which is exactly the case the bitset itself
+    /// cannot report.
+    ///
+    /// WHY IT MUST COUNT REDUNDANT MARKS: the per-row revision fold
+    /// (`GridPresentation::fold_row_revisions`) stamps a row when the row is
+    /// damaged, and must be able to tell "this row's bit has been set since the
+    /// last fold, unchanged" from "this row was written AGAIN since the last
+    /// fold". The bitset is identical in both cases. Without this counter a
+    /// second write to an already-damaged row, straddling a fold, would leave
+    /// two snapshots carrying the SAME revision for a row whose content
+    /// differs — a stale frame on the user's screen.
+    ///
+    /// SURVIVES `clear`: the counter is a monotone clock, not damage state, so
+    /// resetting the session must not rewind it (a rewind would make a later
+    /// mark compare equal to a pre-reset fold). `Damage::Full` has no tracker
+    /// and therefore no counter, which is why the fold's full arm re-stamps
+    /// unconditionally instead of consulting it.
+    pub(crate) mark_seq: u64,
 }
 
 /// Column damage bounds for a single row.
@@ -31,12 +51,14 @@ impl DamageTracker {
         Self {
             row_bits: vec![0; num_words],
             row_bounds: vec![RowDamageBounds::default(); rows as usize],
+            mark_seq: 0,
         }
     }
 
     /// Mark a single row as fully damaged.
     #[inline]
     pub(crate) fn mark_row(&mut self, row: u16) {
+        self.mark_seq = self.mark_seq.wrapping_add(1);
         let row = row as usize;
         if row < self.row_bounds.len() {
             let word = row / 64;
@@ -64,6 +86,7 @@ impl DamageTracker {
     /// avoids the redundant bounds check, bit OR, and branch.
     #[inline]
     pub(crate) fn mark_wide_cell(&mut self, row: u16, col: u16) {
+        self.mark_seq = self.mark_seq.wrapping_add(1);
         let row_idx = row as usize;
         if row_idx < self.row_bounds.len() {
             let word = row_idx / 64;
@@ -85,6 +108,7 @@ impl DamageTracker {
     /// Mark a specific cell as damaged.
     #[inline]
     pub(crate) fn mark_cell(&mut self, row: u16, col: u16) {
+        self.mark_seq = self.mark_seq.wrapping_add(1);
         let row_idx = row as usize;
         if row_idx < self.row_bounds.len() {
             let word = row_idx / 64;

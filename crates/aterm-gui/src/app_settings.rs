@@ -408,6 +408,7 @@ impl App {
                 title: "Settings".to_string(),
                 icon: Some(crate::tab_model::TabIconKind::Settings),
                 indicators: crate::tab_model::TabIndicators::default(),
+                conn: None,
                 closable: true,
                 tooltip: Some(format!("Settings · {}", route.label())),
             };
@@ -1806,6 +1807,122 @@ impl App {
                     _ => {}
                 }
             }
+            OverlayKind::ConnCard => {
+                if req.action != accesskit::Action::Click {
+                    return;
+                }
+                let Some(hit) = crate::conn_card::ConnCardState::a11y_hit(req.target_node) else {
+                    return;
+                };
+                match hit {
+                    crate::conn_card::ConnCardHit::Confirm => self.conn_card_confirm(wid),
+                    crate::conn_card::ConnCardHit::Cancel => self.conn_card_exit(wid),
+                    // The chooser nodes cycle their own value (a screen reader
+                    // clicks the row it hears).
+                    crate::conn_card::ConnCardHit::Direction(_)
+                    | crate::conn_card::ConnCardHit::Kind(_) => {
+                        let row = match hit {
+                            crate::conn_card::ConnCardHit::Direction(_) => {
+                                crate::conn_card::CardRow::Direction
+                            }
+                            _ => crate::conn_card::CardRow::Kind,
+                        };
+                        if let Some(c) = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|ws| ws.conn_card_mut())
+                        {
+                            c.cycle_row(row, 1);
+                        }
+                        self.overlay_a11y_update();
+                        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                        {
+                            w.request_redraw();
+                        }
+                    }
+                }
+            }
+            // The session picker — the palette's id scheme verbatim: Focus
+            // moves the cursor, Click chooses; stale-epoch nodes decode to
+            // nothing.
+            OverlayKind::SessionPicker => {
+                let Some(idx) = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|ws| ws.session_picker())
+                    .and_then(|picker| picker.a11y_filtered_index(req.target_node))
+                else {
+                    return; // root / list container carries no row action
+                };
+                match req.action {
+                    accesskit::Action::Focus => {
+                        if let Some(p) = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|ws| ws.session_picker_mut())
+                        {
+                            p.select(idx);
+                        }
+                        self.overlay_a11y_update();
+                        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                        {
+                            w.request_redraw();
+                        }
+                    }
+                    accesskit::Action::Click => {
+                        if let Some(p) = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|ws| ws.session_picker_mut())
+                        {
+                            p.select(idx);
+                        }
+                        self.session_picker_activate(wid);
+                    }
+                    _ => {}
+                }
+            }
+            // The connection map — the palette's id scheme over its chip/arrow
+            // items: Focus moves the cursor, Click selects then activates
+            // (chip raises; a flow runs the inline confirm two-step, so a
+            // screen-reader Click can never disconnect unconfirmed).
+            OverlayKind::ConnectionMap => {
+                let Some(idx) = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|ws| ws.connection_map())
+                    .and_then(|map| map.a11y_item_index(req.target_node))
+                else {
+                    return; // root / list container carries no row action
+                };
+                match req.action {
+                    accesskit::Action::Focus => {
+                        if let Some(m) = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|ws| ws.connection_map_mut())
+                        {
+                            m.select(idx);
+                        }
+                        self.overlay_a11y_update();
+                        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref())
+                        {
+                            w.request_redraw();
+                        }
+                    }
+                    accesskit::Action::Click => {
+                        if let Some(m) = self
+                            .windows
+                            .get_mut(&wid)
+                            .and_then(|ws| ws.connection_map_mut())
+                        {
+                            m.select(idx);
+                        }
+                        self.connection_map_activate(wid);
+                    }
+                    _ => {}
+                }
+            }
         }
     }
 }
@@ -2157,6 +2274,7 @@ mod tests {
                 title: "Native".to_string(),
                 icon: Some(crate::tab_model::TabIconKind::Recovery),
                 indicators: crate::tab_model::TabIndicators::default(),
+                conn: None,
                 closable: true,
                 tooltip: None,
             },

@@ -1592,6 +1592,7 @@ struct PushCursors {
     adopt_seq: u64,
 }
 
+#[cfg(test)]
 pub fn push_loop<W: Write>(
     registry: &Subscribers,
     store: &Store,
@@ -1599,6 +1600,26 @@ pub fn push_loop<W: Write>(
     scopes: PushScopes,
     opts: PushOptions,
     writer: &mut W,
+) {
+    push_loop_with_peer_probe(registry, store, targets, scopes, opts, writer, || false);
+}
+
+/// The production push loop with an explicit peer-liveness probe.
+///
+/// A push-only connection can remain completely quiet for hours. A dead reader
+/// therefore cannot be discovered by waiting for the next write: doing so pins a
+/// reserved subscription worker forever when the target is quiet. `peer_gone` is
+/// sampled on every bounded liveness wake and must be non-blocking (or tightly
+/// bounded). The control-socket host supplies a read-side EOF/HUP probe; the
+/// generic [`push_loop`] wrapper keeps in-memory/test writers source-compatible.
+pub fn push_loop_with_peer_probe<W: Write, P: FnMut() -> bool>(
+    registry: &Subscribers,
+    store: &Store,
+    targets: &[ResolvedTarget],
+    scopes: PushScopes,
+    opts: PushOptions,
+    writer: &mut W,
+    mut peer_gone: P,
 ) {
     // `adopt` is deliberately NOT unpacked here: adoption is decided per wake
     // inside `pump`, which receives the whole `scopes` value. Naming it in this
@@ -1662,6 +1683,7 @@ pub fn push_loop<W: Write>(
         &opts,
         &mut cursors,
         &mut egress,
+        &mut peer_gone,
     );
 }
 
@@ -1673,7 +1695,11 @@ pub fn push_loop<W: Write>(
 /// `if writer.write_all(..).is_err() { return; }` the old body carried — the shape
 /// that let each write site disagree about whether it stamped, flushed or drained.
 /// (It cannot be `push_loop` itself: `Gone` is private and `push_loop` is `pub`.)
-fn pump<W: Write>(
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the internal pump borrows each independently-owned subscription cursor and the nonblocking peer probe"
+)]
+fn pump<W: Write, P: FnMut() -> bool>(
     store: &Store,
     sub: &mut Subscription,
     watches: &mut Vec<Watch>,
@@ -1681,6 +1707,7 @@ fn pump<W: Write>(
     opts: &PushOptions,
     cursors: &mut PushCursors,
     egress: &mut Egress<'_, W>,
+    peer_gone: &mut P,
 ) -> Result<(), Gone> {
     // The same authority set `push_loop` was handed, carried whole rather than
     // re-split into the two tokens this body happens to read today: a later wake
@@ -1734,6 +1761,13 @@ fn pump<W: Write>(
         // waits on us regardless (single-slot notify), so this interval only bounds
         // OUR own liveness, not the producer's.
         let woke = sub.wait(Duration::from_millis(250));
+        // A quiet stream performs no writes, so only the socket's read-side
+        // EOF/HUP can release its reserved worker after the reader disappears.
+        // The client contract keeps its write half open for the subscription's
+        // lifetime; any byte or EOF on this push-only channel ends the stream.
+        if peer_gone() {
+            return Err(Gone);
+        }
         egress.begin_wake();
 
         // CLOSINGS FIRST. A target deregistered from the store (its pane closed) must

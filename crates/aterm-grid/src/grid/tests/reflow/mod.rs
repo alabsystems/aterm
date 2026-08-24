@@ -12,6 +12,7 @@ mod performance;
 mod protected_cells;
 mod regressions;
 mod rows_only_cost_bound;
+mod rows_only_identity;
 mod rows_only_ring_retention;
 mod wide_chars;
 mod width_sweep;

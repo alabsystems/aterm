@@ -121,6 +121,7 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
+        no_paint_smoke: false,
         lease: None,
         fence: None,
         notes_section: "0.55.0".into(),

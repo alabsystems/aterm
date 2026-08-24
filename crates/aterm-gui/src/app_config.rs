@@ -661,6 +661,13 @@ pub(crate) struct Config {
     /// (the record stays readable through the `status` verb and the tooltip) and
     /// only stops the tab chrome from marking itself.
     pub(crate) tab_status_badge: Option<bool>,
+    /// Whether a session's live connection role (Session Connections §4) draws
+    /// the fourth tab status mark (▲ outbound / ▽ inbound / hourglass both).
+    /// Default ON. Turning this off hides the MARK only: the connections
+    /// themselves, their audit trail, and the wire/introspection surfaces
+    /// (`chrome` states, `edges`) stay live — authority must never be quieter
+    /// than the chrome showing it.
+    pub(crate) tab_connection_badge: Option<bool>,
     /// BiDi (right-to-left) text handling: `"implicit"` (default — automatic
     /// per-line UAX#9 reordering, so Hebrew/Arabic display in visual order),
     /// `"disabled"` (keep logical order), or `"explicit"` (app-controlled). Maps to
@@ -2706,6 +2713,13 @@ impl Config {
     /// while the chrome stays quiet.
     pub(crate) fn tab_status_badge_or_default(&self) -> bool {
         self.tab_status_badge.unwrap_or(true)
+    }
+
+    /// Whether the connection role marks the tab (Session Connections §4).
+    /// Opt-OUT like every user-facing feature; hides only the mark — see the
+    /// field doc.
+    pub(crate) fn tab_connection_badge_or_default(&self) -> bool {
+        self.tab_connection_badge.unwrap_or(true)
     }
 
     /// Stall threshold, bounded so a mistyped value can neither call every job
@@ -9717,6 +9731,9 @@ window_title_format = "description"
         );
         assert!(!cfg("tab_status = false").tab_status_or_default());
         assert!(!cfg("tab_status_badge = false").tab_status_badge_or_default());
+        // The connection mark is opt-OUT like its status siblings.
+        assert!(default.tab_connection_badge_or_default());
+        assert!(!cfg("tab_connection_badge = false").tab_connection_badge_or_default());
     }
 
     /// The observation budget is DERIVED, not configured: it must never be

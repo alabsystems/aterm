@@ -1181,6 +1181,43 @@ impl Terminal {
         scratch.engine_alt = self.is_alternate_screen();
         scratch.engine_fill_seq = scratch.snapshot_seq;
 
+        // D-2 PER-ROW REVISION LANE. The grid already knows which rows changed;
+        // publish that fact instead of letting every consumer re-derive it by
+        // comparing every cell of every row against a full copy of the previous
+        // frame. `row_revisions` folds the CURRENT damage session first, so the
+        // stamps describe the exact grid state the cells above were read from.
+        //
+        // Copied per row rather than aliased because the snapshot outlives the
+        // lock. `rows` is the SNAPSHOT's row count, which a host may later grow
+        // (a spliced tab strip); the lane is stamped at the engine's row count
+        // and any host that re-shapes the rows leaves the length mismatched,
+        // which the consumer reads as "do not trust" — fail closed.
+        scratch.row_rev.clear();
+        {
+            let revisions = self.grid_mut().row_revisions();
+            scratch.row_rev.extend_from_slice(revisions);
+        }
+        scratch.row_rev.resize(rows, 0);
+        // The engine fill vouches for the lane — EXCEPT on a `Damage::Full`
+        // session, which publishes no lane at all.
+        //
+        // WHY FULL IS EXCLUDED: `Damage::Full` keeps no tracker and therefore no
+        // mark clock, so the fold cannot tell a repeated read of one full session
+        // from a session that took another write in between. Its only sound
+        // answer is to re-stamp every row on every fold — which would make two
+        // extracts of an IDENTICAL full-damage screen (a standalone renderer that
+        // never consumes damage does exactly this) compare as a whole-screen
+        // repaint instead of the gate hit they are. Publishing no lane hands
+        // those frames back to the exact whole-grid compare, which gets both the
+        // gate hit AND the change right. Full-damage frames repaint everything
+        // anyway, so the compare they pay for is not a cost this lane was ever
+        // going to save.
+        scratch.row_rev_lane = if self.grid().damage().is_full() {
+            0
+        } else {
+            self.extract_identity
+        };
+
         // BiDi visual reordering (feature `bidi`): permute each row into visual
         // order so RTL runs display correctly on BOTH renderers and in the
         // `image` capture. No-op for pure-LTR frames and when the feature is off

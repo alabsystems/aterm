@@ -99,6 +99,55 @@ GOTCHAS
         body: None, // generated — see `introspection_page()`
     },
     Topic {
+        name: "conn",
+        tagline: "session connections — wire sessions to pull/push each other",
+        body: Some(
+            r#"conn — session connections: standing pull/push wiring between terminal sessions
+(`aterm conn`, the CLI face of the Session Connections fabric).
+
+WHAT IT IS
+  A CONNECTION lets one session drive another as a human could, at minimum: PUSH lands
+  as keystrokes on the peer's PTY (plus the ^C signal a human's ctrl-C raises), PULL
+  reads what a human would see (the rendered screen, blocks, cursor). Kinds: pull,
+  push, or both (the default). Connections are per-SESSION authority rows — op-scoped,
+  revocable, audited on the session_edge log — never a tool API, which is why a
+  supervisor session can drive ANY interactive tool unmodified. `aterm conn` manages
+  the standing wiring; the pull/push verbs themselves live on `aterm ctl`
+  (turn / text / await — see `aterm help introspection`).
+
+KEY USAGE
+  aterm conn                 THIS session's connections: ⇥ outgoing, ⇤ incoming, ⇆ both
+  aterm conn ls [--json]     every session connection in the instance
+  aterm conn add @<sid>      take control of a session (@self -> peer, both);
+                             --to-me inverts (invite a controller); --from <sel> wires
+                             any third-party pair; --kind pull|push|both narrows it
+  aterm conn set @<sid> --kind ...   declaratively reconfigure (exact set semantics)
+  aterm conn rm @<sid> [--kind ...]  disconnect (kind-filtered ok)
+  aterm conn spawn controlled|controller [--tab|--window] [--of <sel>]
+                             spawn a new session pre-wired `both` (controller: the
+                             newborn supervises --of, and its shell receives
+                             ATERM_OBSERVE_SESSION_ID naming its charge)
+  aterm conn show @<sid>     raise the peer's window + tab;   aterm conn map   the GUI map
+
+WHEN TO REACH FOR IT
+  The unattended-operator story: start a worker session (any coding agent), then
+  `aterm conn spawn controller` from inside it — the newborn supervisor holds
+  pull+push over the worker and drives it with `aterm ctl @<worker> turn '...'`
+  whenever it needs an answer or a prod. Reach for `conn` whenever "which session is
+  wired to which" is the question, or to add/dissolve that wiring from a shell.
+
+GOTCHAS
+  * Peers are SELECTORS (@self / @<sid> / @<local-id>) — never titles (ambiguous).
+    Outside an aterm session the @self forms refuse and name $ATERM_PARENT_SESSION_ID;
+    everything else targets the latest instance, exactly like `aterm ctl`.
+  * Owner-authority only: the verbs ride the instance token beside the control socket
+    (same user). A connection is standing wiring — dissolve it with `conn rm`, close
+    either endpoint, or the GUI Disconnect; a cold restart dissolves by design.
+  * `conn` is presentation over the wire verbs (connect / disconnect / flows / raise) —
+    `aterm ctl connect dst=... src=...` is the same act, byte-for-byte."#,
+        ),
+    },
+    Topic {
         name: "agents",
         tagline: "make coding agents aterm-aware — the 3-line primer installer",
         body: Some(
@@ -232,7 +281,7 @@ PLUMBING (producer / operator / dev — a first hour never needs these)
 WHEN TO REACH FOR IT
   To manage the published CLI toolchain — install / update / pin / verify — or to see
   what's installed. The managed tools do their own work; atpkg is what lays them down.
-  Distinct from `cargo ship`/aterm-release (which CUTS aterm.app itself).
+  Distinct from `targo --unverified ship`/aterm-release (which CUTS aterm.app itself).
 
 GOTCHAS (in the order they bite)
   * PATH: the managed tools are on PATH only in shells started inside aterm (shell.d
@@ -244,7 +293,7 @@ GOTCHAS (in the order they bite)
     window-only. Headless or CLI-only usage updates NOTHING automatically — run
     `aterm pkg update` explicitly, or drive it from a scheduler (launchd/cron).
   * The root anchor is COMPILED IN — a committed constant (aterm-update-core::pins), not a
-    build env var — so a plain `cargo build` is fully armed. The kill switch is
+    build env var — so a plain `targo --unverified build` is fully armed. The kill switch is
     ATPKG_DISABLE: set it and the network verbs (install/update/rollback) refuse with
     exit 1; local read/maintenance verbs (list/which/run/doctor/verify/...) still work.
   * Channel is hard-wired to "stable" today, and the roster `aterm pkg --help` prints is
@@ -310,7 +359,7 @@ WHAT IT IS
   jobs: SMT -> `ay`, bounded model checking -> trust-mc, NN-verification runtime -> ny
   (clean only hosts proofs ABOUT those algorithms).
 
-KEY USAGE  (not on PATH here — run `cargo run --locked -p clean --bin clean -- <SUB>`)
+KEY USAGE  (not on PATH here — run `targo --unverified run --locked -p clean --bin clean -- <SUB>`)
   clean features [--search X]    discover the real CLI (registered feature descriptors)
   clean check <file.lean> [--json]   parse -> elaborate -> trusted kernel; accept/reject
   clean export-cert / kernel cert verify   emit / re-check a .cleancert proof bundle
@@ -344,7 +393,7 @@ WHAT IT IS
   symbolic (BMC/IC3/PDR via `ay`) and hardware (AIGER/BTOR2) backends. Soundness-first:
   when uncertain it abstains rather than emit a wrong verdict.
 
-KEY USAGE  (not on PATH — `cargo build --release -p tla-cli` -> ./target/release/ty)
+KEY USAGE  (not on PATH — `targo --unverified build --release -p tla-cli` -> ./target/release/ty)
   ty check Spec.tla --config Spec.cfg [--workers N] [--output json]
                                  explicit-state model checking (the TLC replacement)
   ty prove Spec.tla [--theorem NAME]   deductive proving (discharge THEOREM obligations)
@@ -379,7 +428,7 @@ WHAT IT IS
   for SAT, ay-chc-cert for CHC) so a false `unsat` cannot hide. The `trust` pipeline
   vendors ay and re-checks its Alethe in a kernel.
 
-KEY USAGE  (needs the `cli` feature: `cargo run -p ay --features cli -- <file>`)
+KEY USAGE  (needs the `cli` feature: `targo --unverified run -p ay --features cli -- <file>`)
   ay FILE                      solve, auto-detecting format (.cnf DIMACS / HORN CHC / SMT-LIB2);
                                on unsat, writes a proof cert next to the input
   ay --z3-mode -in             read SMT-LIB2 from stdin as a Z3-style drop-in (incremental)
@@ -417,7 +466,7 @@ WHAT IT IS
   rounding) — what my/nn call "gamma-crown". On eligible nets it ships an exact-rational,
   machine-checkable `<model>.cert.json` proof sidecar.
 
-KEY USAGE  (not on PATH — `cargo run --release -p ny-cli -- <SUB>`)
+KEY USAGE  (not on PATH — `targo --unverified run --release -p ny-cli -- <SUB>`)
   ny verify model.onnx -p prop.vnnlib --method alpha [--require-sound] [--json]
                                fast sound over-approximation (may say unknown)
   ny beta-crown model.onnx -p prop.vnnlib [--timeout N]
@@ -434,7 +483,7 @@ WHEN TO REACH FOR IT
   dedicated verifier; my/nn are frameworks that consume it; ay is the solver it delegates to.
 
 GOTCHAS
-  * Default workspace check must exclude the Python crate: `cargo check --workspace
+  * Default workspace check must exclude the Python crate: `targo --unverified check --workspace
     --exclude ny-python`. MIP needs `--features mip`.
   * Soundness is opt-OUT: `--allow-unsound-gpu-crown` trades correctness for speed and can
     flip a violated instance to Verified — never use it when the verdict must be trusted.
@@ -456,7 +505,7 @@ WHAT IT IS
   bounds via ny, z4 SMT) is surfaced as optional report hooks. Metal (Apple GPU) is the
   only production backend.
 
-KEY USAGE  (not on PATH — `cargo run -p my-cli -- <SUB>`; macOS + Metal required)
+KEY USAGE  (not on PATH — `targo --unverified run -p my-cli -- <SUB>`; macOS + Metal required)
   my convert graph.json weights.safetensors [--optimize normal|aggressive] [--verify bounds|full]
                                compile exported artifacts -> Metal model + ConvertReport
   my convert model.pt --from-pytorch --model-spec module:Class --input-shape 1 3 224 224
@@ -493,7 +542,7 @@ WHAT IT IS
   (types -> ny bounds -> ay SMT) on top of compiled Metal inference. Same convert/compile/
   run/optimize CLI shape as `my`, one version behind.
 
-KEY USAGE  (not on PATH — `cargo run -p nn-cli -- <SUB>`; macOS + Metal required)
+KEY USAGE  (not on PATH — `targo --unverified run -p nn-cli -- <SUB>`; macOS + Metal required)
   nn convert graph.json weights.safetensors [--optimize ...] [--verify bounds|full]
                                compile pre-exported artifacts -> Metal model + ConvertReport
   nn compile ... --output model.nnc    persist a .nnc plan (+ report)
@@ -506,8 +555,8 @@ WHEN TO REACH FOR IT
   bounds and `ay` for raw solving. nn and my are sibling framework iterations.
 
 GOTCHAS
-  * NEVER run a bare workspace `cargo test` here — it has kernel-panicked the machine (OOM);
-    several test binaries are enormous. Use `cargo nextest run` (honors the single-threaded
+  * NEVER run a bare workspace `targo --unverified test` here — it has kernel-panicked the machine (OOM);
+    several test binaries are enormous. Use `targo --unverified nextest run` (honors the single-threaded
     `heavy` group) or scripts/test-capped.sh; the biggest GPU tests are #[ignore]'d.
   * Same intake rule as `my`: pre-exported torch.export graph.json + safetensors, not raw
     ONNX/.pt. `--verify` is a report request, feature-gated."#,
@@ -538,10 +587,14 @@ fn overview_page() -> String {
             "ctl <args>",
             "introspect & drive any terminal (read / keys / turn / subscribe / image)",
         ),
+        (
+            "conn [<cmd>]",
+            "session connections — see & wire which sessions pull/push each other",
+        ),
         ("pkg <args>", "install / update / verify the toolchain"),
         (
             "fleet <args>",
-            "federate many sessions' events; dispatch commands back",
+            "opt-in durable attention queue + guarded turns; legacy federation",
         ),
         (
             "drive <args>",
@@ -598,7 +651,10 @@ THE MOVES (an AI's loop is see -> decide -> drive -> observe)
   OBSERVE aterm ctl @sid await idle <ms> | await match <re> | ready | wait
   WATCH   aterm ctl subscribe @a,@b,@c events     (the whole fleet on ONE fd, low-rate)
   FLEET   aterm ctl ls        (every session of every instance: pid sid state)
-          aterm fleet events | exec   (federate N sessions -> one NDJSON stream; dispatch back)
+          aterm fleet status | manage <sid> | next   (durable operator; empty allowlist)
+          aterm fleet propose < proposal.json        (Owner-only guarded interactive turn)
+          aterm fleet events | exec                  (legacy NDJSON federation/dispatch)
+          EXPERIMENTAL and OFF by default; ATERM_OPERATOR=1 opts in (docs/OPERATOR-EMBEDDED.md)
   RECALL  aterm ctl @sid history [<n>]      (per-turn record + deterministic screen hash)
 
 HOW TO USE IT
@@ -690,7 +746,7 @@ fn agent_page(sid: Option<&str>) -> String {
          * No git hooks and no CI anywhere in this toolchain, by owner mandate — gating is\n    \
          inline/optional in the tools (e.g. `targo trust check`, `clean audit`, `ty ... gate`).\n  \
          * Each tool's own AGENTS.md/CLAUDE.md rules win in its repo (e.g. never a bare\n    \
-         `cargo test` in nn; always `--locked` in clean).\n",
+         `targo --unverified test` in nn; always `--locked` in clean).\n",
     );
     s.push_str(
         "\nGO DEEPER\n  aterm help                 the command map for the whole toolchain\n",
@@ -907,7 +963,7 @@ mod tests {
     #[test]
     fn atpkg_topic_states_the_compiled_anchor_and_the_window_scoped_update_loop() {
         // FINDING (root anchor): the root key is a committed constant
-        // (aterm-update-core::pins) — the stale "a plain cargo build bakes no root key"
+        // (aterm-update-core::pins) — the stale "a plain targo --unverified build bakes no root key"
         // claim must be gone, and the ATPKG_DISABLE kill switch documented.
         let (page, code) = render(Some("atpkg"), None);
         assert_eq!(code, 0);
@@ -962,6 +1018,8 @@ mod tests {
             ("fleet", "control protocol"),
             ("drive", "control protocol"),
             ("pkg", "package manager"),
+            // `conn` is its own topic (the session-connections front door).
+            ("conn", "session connections"),
         ] {
             let (page, code) = render(Some(verb), None);
             assert_eq!(code, 0, "`aterm help {verb}` must resolve, not 404");
@@ -970,5 +1028,19 @@ mod tests {
                 "`aterm help {verb}` should route to the page covering it"
             );
         }
+    }
+
+    #[test]
+    fn fleet_help_exposes_the_opt_in_operator_and_empty_authority_boundary() {
+        let (page, code) = render(Some("fleet"), None);
+        assert_eq!(code, 0);
+        assert!(page.contains("aterm fleet status"), "{page}");
+        assert!(page.contains("empty allowlist"), "{page}");
+        assert!(page.contains("guarded interactive turn"), "{page}");
+        // An experimental resident subsystem is opt-in, and the page has to say
+        // both that it is experimental and how to turn it on — otherwise the
+        // feature is undiscoverable and its status is a source-only claim.
+        assert!(page.contains("EXPERIMENTAL"), "{page}");
+        assert!(page.contains("ATERM_OPERATOR=1"), "{page}");
     }
 }

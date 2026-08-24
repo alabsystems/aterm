@@ -103,6 +103,11 @@ pub(crate) enum NoticeKind {
     /// bubble half of his show. Not clickable; it fades like every notice. The bank
     /// is `&'static`, so the variant borrows rather than clones.
     RobiTip { text: &'static str },
+    /// The session-connections FIRST-USE notice (design §1.4#8): shown once per
+    /// config lifetime on the first UI-originated connect, naming the authority
+    /// created and the undo (`connections::first_use_notice_text`). Not
+    /// clickable; the authored text already carries the caption grammar.
+    SessionConnection { text: String },
 }
 
 /// A single transient, self-expiring notice.
@@ -184,6 +189,15 @@ impl TransientNotice {
             kind: NoticeKind::RobiTip { text },
             spawned: now,
             anchor,
+            ttl: TTL,
+        }
+    }
+
+    pub(crate) fn session_connection(text: String, now: Instant) -> Self {
+        Self {
+            kind: NoticeKind::SessionConnection { text },
+            spawned: now,
+            anchor: None,
             ttl: TTL,
         }
     }
@@ -320,6 +334,10 @@ impl TransientNotice {
                 3u8.hash(&mut h);
                 text.hash(&mut h);
             }
+            NoticeKind::SessionConnection { text } => {
+                4u8.hash(&mut h);
+                text.hash(&mut h);
+            }
         }
         // Quantize BOTH animated quantities so a moving card re-rasterizes on each step
         // while a held one hashes stable. 48 steps over a ≤0.8s ramp is finer than the
@@ -383,6 +401,9 @@ impl TransientNotice {
             // (no separator), so narrow windows elide it instead of dropping
             // the half that carries the advice.
             NoticeKind::RobiTip { text } => format!("\u{2699} {text}"),
+            // Authored in `connections::first_use_notice_text`, already in the
+            // `"<marker> <title> — <detail>"` grammar this module documents.
+            NoticeKind::SessionConnection { text } => text.clone(),
         }
     }
 }
@@ -503,6 +524,9 @@ impl Tone {
             // legibility-conditioned below): friendly, and never mistakable
             // for the actionable accent.
             NoticeKind::RobiTip { .. } => Self::Celebrate,
+            // The first-use disclosure informs (authority + undo); it asks for
+            // no press, so it must not wear the actionable badge.
+            NoticeKind::SessionConnection { .. } => Self::Quiet,
         }
     }
 

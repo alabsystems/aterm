@@ -11,6 +11,11 @@
 //! both binaries depend on it (alongside the `control_socket` shared-protocol
 //! module).
 
+/// Maximum schema-1 operator proposal body accepted by both the control client
+/// and server. Keeping this admission bound in the shared protocol crate avoids
+/// streaming a body after the server has already rejected and closed the frame.
+pub const MAX_OPERATOR_PROPOSAL_BYTES: usize = 64 * 1024;
+
 /// A verb's authority class. Neutral here so this crate needn't depend on the
 /// server's `aterm-session`; the server maps it to its `Op`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -573,7 +578,7 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "spawn [cwd=<path>] [split=<v|h>]: mint a new tab (or split the focused pane), reply OK <sid>",
+        "spawn [connected=controlled|controller place=window|tab of=<sid>] [cwd=<path>] [split=<v|h>]: mint a new session (a tab, or split the focused pane), reply OK <sid> - immediately addressable. connected= also mints a `both` session connection with of=<sid> (controlled: of= drives the newborn; controller: the newborn drives of=, its shell gets ATERM_OBSERVE_SESSION_ID) - Owner-only, of= mandatory, place=window is `ERR headless` with no GUI",
     ),
     v(
         "close",
@@ -617,6 +622,22 @@ pub const VERBS: &[VerbSpec] = &[
     // keeps its `Read` op-class (a fleet-wide presence readout) yet is Owner-gated:
     // op-class and scope-gate are orthogonal, which is exactly why `access` is a
     // separate field.
+    va(
+        "operator",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "embedded opt-in operator: status|inspect|manage|unmanage|next|extend|ack|reconcile|clear-fault (Owner-only)",
+    ),
+    va(
+        "operator-propose-bin",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "length-prefixed JSON proposal on stdin for the embedded operator actuator (Owner-only)",
+    ),
     va(
         "sessions",
         Owner,
@@ -681,7 +702,42 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         OwnerOnly,
-        "revoke a cross-session edge (Owner only)",
+        "revoke a cross-session edge: revoke <edge-hex> removes one; revoke src=<sid> sweeps every edge from that source and replies OK <removed> (Owner only)",
+    ),
+    // Session connections (design §6): the connection-grain verbs over the
+    // `grant`/`revoke` op-level primitives. All Owner-only, all self-scoped —
+    // the endpoints ride as `dst=`/`src=` ARGUMENTS, never a selector.
+    va(
+        "connect",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "connect dst=<sid> src=<sid> [kind=pull|push|both]: declaratively SET the session connection src->dst (mint the missing ops, revoke the excess, so the rows equal exactly kind; default both), reply `OK read-screen=<hex> write-input=<hex> signal=<hex>` with only the minted ops present (Owner only)",
+    ),
+    va(
+        "disconnect",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "disconnect dst=<sid> src=<sid> [kind=pull|push|both]: dissolve the session connection src->dst (kind-filtered ok: kind=pull revokes only the pull half), reply OK <removed> (Owner only)",
+    ),
+    va(
+        "flows",
+        Owner,
+        Lines,
+        Meta,
+        OwnerOnly,
+        "the instance's aggregated session-connection graph: OK <n> + one `<src> <dst> <op>` row per live edge across EVERY session's table (--json groups per pair: {\"flows\":[{src,dst,ops:[..]}]}). Owner-only",
+    ),
+    va(
+        "raise",
+        Owner,
+        Status,
+        Meta,
+        OwnerOnly,
+        "raise <sid>: raise the window hosting that session and select its tab (the session-connection Show twin; Owner only)",
     ),
     va(
         "dial",
@@ -978,6 +1034,27 @@ mod tests {
         assert!(spec("image").unwrap().help.contains("image --meta"));
     }
 
+    /// The §6 terminology rule: the catalog uses "connection" for BOTH network
+    /// dials and session fabric, so the connection-grain verbs must say
+    /// "session connection" and the dial rows "network-drive connection" —
+    /// one help catalog never overloads the bare word.
+    #[test]
+    fn connection_help_terminology_never_overloads_the_bare_word() {
+        for v in ["connect", "disconnect", "flows", "raise", "spawn"] {
+            assert!(
+                spec(v).unwrap().help.contains("session connection")
+                    || spec(v).unwrap().help.contains("session-connection"),
+                "{v} help must say \"session connection\""
+            );
+        }
+        for v in ["dial-list", "dial-token"] {
+            assert!(
+                spec(v).unwrap().help.contains("network-drive connection"),
+                "{v} help must say \"network-drive connection\""
+            );
+        }
+    }
+
     /// The `Access` exceptions are the single source of truth for the scope gate the
     /// dispatch used to hardcode. Pin BOTH sets exactly so the table↔dispatch binding
     /// is total: a verb cannot become owner-only / any-scope-meta without being
@@ -992,11 +1069,17 @@ mod tests {
         assert_eq!(
             owner_only,
             [
+                "operator",
+                "operator-propose-bin",
                 "sessions",
                 "who",
                 "whoami",
                 "grant",
                 "revoke",
+                "connect",
+                "disconnect",
+                "flows",
+                "raise",
                 "dial",
                 "dial-list",
                 "dial-token",

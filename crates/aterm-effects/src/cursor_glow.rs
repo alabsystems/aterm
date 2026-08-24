@@ -33,7 +33,9 @@ use crate::effect_util::{
 };
 use crate::trail_sweep::{line_cells_tail, row_sweep_cells, wrap_fold_cells};
 use crate::typing_momentum::TypingMomentum;
-use crate::cursor_trail::{ContentGeneration, ExpectedCellSpan, ExpectedRowSnapshot};
+use crate::cursor_trail::{
+    ContentGeneration, ExpectedCellSpan, ExpectedRowSnapshot, GenerationOwnership,
+};
 // Trail Packs — the user-generated custom trail params driven by `emit_custom`.
 // Re-exported here so the resolved `TrailParams` rides `GlowConfig` inline.
 pub use crate::trail_pack::TrailParams;
@@ -3198,10 +3200,40 @@ enum NbrProbe {
     Probed,
 }
 
+/// Which detector families may consume one row probe — the repair for the
+/// alt-screen `no-row-probe` retire class: on `less` /-search typing, `vi`
+/// insert mode, and a per-key-echo TUI whose concurrent streamer writes at
+/// another row via cursor save/restore (ESC 7/ESC 8), the repaint-blink epoch
+/// never advances, so the host's old alt-screen probe gate
+/// (`probe_ok = !alt || blink_recent`) WITHHELD the row probe entirely and
+/// every honest typed keystroke's admission retired `no-row-probe` — zero
+/// confirms, zero spawns, zero ink. The probe's CONTENT is exactly as
+/// authentic in those shapes as anywhere else; the only thing unsound there
+/// is the kill/poof INFERENCE ("kill hint + row shrink = erase"), because a
+/// plain alt-screen app runs REGION SCROLLS that slide content through the
+/// cursor row (Ctrl-U pages, it does not kill — the adversarial review that
+/// installed the old gate). So the host now always captures and marks the
+/// trust class instead of withholding the probe.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProbeTrust {
+    /// Primary screen, or an alt-screen app inside the repaint-blink window
+    /// (a DECTCEM hide within a DEC-2026 synchronized update — Claude Code's
+    /// per-keystroke repaint bracket): every consumer may read it, the
+    /// kill/poof detector included.
+    Full,
+    /// Alt screen without repaint-blink evidence (less, vi, the ESC 7/ESC 8
+    /// streamer shape): EXACT content proofs only — the typed/delete confirm
+    /// and the unowned-steady anchor attestation, which compare content and
+    /// fail closed on any difference. Every kill/poof branch must refuse it,
+    /// or a Ctrl-U page scroll paired with a fresh kill hint puffs phantom
+    /// smoke off rows the program merely scrolled.
+    ContentOnly,
+}
+
 /// Metadata for one cursor-row content probe ([`CursorGlow::observe_row`]):
 /// which row was sampled, where the caret sat, the row's FILL (one past the
-/// last non-blank column), and when. The chars themselves ride the double
-/// buffer (`row_cur`/`row_prev`).
+/// last non-blank column), when, and its [`ProbeTrust`] class. The chars
+/// themselves ride the double buffer (`row_cur`/`row_prev`).
 #[derive(Clone, Copy)]
 struct RowProbe {
     row: u16,
@@ -3218,6 +3250,10 @@ struct RowProbe {
     above: NbrProbe,
     /// What the host told us about the row BELOW `row`.
     below: NbrProbe,
+    /// Which detector families may read this probe (see [`ProbeTrust`]).
+    /// Rides the metadata and rotates with it, so a kill branch can never
+    /// pair a full-trust `cur` against a content-only `prev` unnoticed.
+    trust: ProbeTrust,
 }
 
 fn captured_probe_row<'a>(
@@ -5851,18 +5887,31 @@ impl CursorGlow {
     /// content candidate confirmed this frame. A scroll without a parser batch
     /// remains translatable; a parser batch that also scrolls fails closed.
     /// The first observation silently establishes the baseline.
+    ///
+    /// THE FENCE IS PROPORTIONATE (v0.49.0 regression): an unowned batch that
+    /// provably left the coordinate space, the cursor anchor, AND the probed
+    /// anchor row intact retires only the hint/candidate cohort and KEEPS the
+    /// resident light — a busy alt-screen TUI (Claude Code: spinner + token
+    /// streaming, several unowned batches per second at an untouched caret)
+    /// otherwise wipes the ribbon, comet, and companion faster than any
+    /// admitted spawn can be composited, while spawns stay gated by the same
+    /// content proof as ever (cold output can never BUY light). Anything the
+    /// batch could have invalidated — identity change, a relocated cursor, a
+    /// rewritten or unattested anchor row — still fails closed wholesale.
+    /// The returned verdict is the ONE authority the host projects onto the
+    /// classic trail twin and the cursor companion, so the three consumers
+    /// cannot diverge.
     pub fn observe_content_generation(
         &mut self,
         generation: ContentGeneration,
+        current_cursor: Option<(u16, u16)>,
         exact_candidate_confirmed: bool,
-    ) -> bool {
-        let changed = self
-            .last_content_generation
-            .is_some_and(|previous| previous != generation);
+    ) -> GenerationOwnership {
+        let previous = self.last_content_generation;
         self.last_content_generation = Some(generation);
-        if !changed {
-            return false;
-        }
+        let Some(previous) = previous.filter(|&previous| previous != generation) else {
+            return GenerationOwnership::Steady;
+        };
         self.unsettle();
         if exact_candidate_confirmed {
             // The exact proof may spawn fresh geometry below, but it does not
@@ -5871,10 +5920,44 @@ impl CursorGlow {
             // the one-shot candidate, its Backspace span, and its key-time
             // audio dedup credit for the imminent admitted spawn.
             self.clear_visual_geometry();
-        } else {
-            self.clear_denied_move_visuals();
+            return GenerationOwnership::Owned;
         }
-        true
+        let identity_held = previous.terminal_id == generation.terminal_id
+            && previous.alternate_screen == generation.alternate_screen;
+        // A hidden cursor is NOT relocation evidence — Claude Code hides the
+        // cursor inside its per-keystroke DEC-2026 repaint bracket, so `None`
+        // frames are the alt screen's steady state. An engine with no anchor
+        // of its own holds no positioned light a relocation could strand.
+        let anchor_held = match (current_cursor, self.cursor_anchor()) {
+            (Some(cursor), Some(anchor)) => cursor == anchor,
+            (None, _) | (_, None) => true,
+        };
+        if identity_held && anchor_held && self.probed_anchor_row_steady() {
+            self.revoke_unowned_hints();
+            return GenerationOwnership::UnownedSteady;
+        }
+        self.clear_denied_move_visuals();
+        if identity_held && anchor_held {
+            GenerationOwnership::UnownedRewrite
+        } else {
+            GenerationOwnership::UnownedRelocation
+        }
+    }
+
+    /// Whether this frame's row probe PROVES an unowned batch left the anchor
+    /// row's content intact: both probe slots present (`row_prev` — the last
+    /// probed frame's presented truth — and `row_cur`, captured under this
+    /// frame's terminal lock AFTER the batch landed), the same row, compared
+    /// under the implicit-blank content lens (raw slice length is a storage
+    /// artifact, never counter-evidence — the sparse-storage law of the
+    /// confirm proof). A frame without both probes cannot attest anything and
+    /// fails closed.
+    fn probed_anchor_row_steady(&self) -> bool {
+        let (Some(previous), Some(current)) = (self.row_prev_meta, self.row_cur_meta) else {
+            return false;
+        };
+        previous.row == current.row
+            && !probe_rows_content_differ(&self.row_prev, &self.row_cur)
     }
 
     /// Revoke the movement candidate and classifier cohort armed by the input
@@ -6219,6 +6302,26 @@ impl CursorGlow {
     /// skipping a frame (scrolled back, split pane unwired, headless) simply
     /// leaves the previous probe in place and the poof detector idle.
     pub fn observe_row(&mut self, row: u16, caret: u16, cols: &[char], now: Instant) {
+        self.observe_row_with_trust(row, caret, cols, now, ProbeTrust::Full);
+    }
+
+    /// [`Self::observe_row`] with an explicit [`ProbeTrust`] class.
+    /// `ContentOnly` is the alt-screen-without-repaint-blink capture (`less`
+    /// /-search typing, `vi` insert mode, the ESC 7/ESC 8 streamer TUI): it
+    /// feeds the EXACT content proofs — the typed/delete confirm and the
+    /// unowned-steady anchor attestation — while every kill/poof branch
+    /// refuses it. Before this seam existed the host simply withheld the
+    /// probe on those screens and every honest typed keystroke retired
+    /// `no-row-probe`; the fix makes the probe AVAILABLE without widening
+    /// the kill license one bit.
+    pub fn observe_row_with_trust(
+        &mut self,
+        row: u16,
+        caret: u16,
+        cols: &[char],
+        now: Instant,
+        trust: ProbeTrust,
+    ) {
         self.unsettle();
         self.row_cur.clear();
         self.row_cur.extend_from_slice(cols);
@@ -6240,6 +6343,7 @@ impl CursorGlow {
             // displaced stars take the safe in-cell fallback.
             above: NbrProbe::Unprobed,
             below: NbrProbe::Unprobed,
+            trust,
         });
     }
 
@@ -6449,7 +6553,11 @@ impl CursorGlow {
         let Some(current_meta) = self.row_cur_meta else {
             // This is already the sole next processing generation. A host
             // that cannot supply its coherent row cannot defer the proof to a
-            // later frame and still attribute it to this input.
+            // later frame and still attribute it to this input. (Hosts now
+            // supply a ContentOnly probe even on a plain alt screen — see
+            // [`ProbeTrust`] — so this retire is the fail-closed answer for a
+            // host that truly has no probe, not the standing fate of every
+            // less//vi//ESC 7-streamer keystroke it used to be.)
             self.log_confirm("no-row-probe", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
@@ -6849,7 +6957,11 @@ impl CursorGlow {
     /// fallback falls back to its timed grace.
     fn poof_erase_witnessed(&self) -> bool {
         match (self.bs_baseline, self.row_cur_meta) {
-            (Some((brow, bfill)), Some(cur)) => cur.row == brow && cur.fill < bfill,
+            (Some((brow, bfill)), Some(cur)) => {
+                // A ContentOnly probe (plain alt screen) is no erase witness:
+                // the shrink may be a region scroll (see [`ProbeTrust`]).
+                cur.trust == ProbeTrust::Full && cur.row == brow && cur.fill < bfill
+            }
             _ => false,
         }
     }
@@ -6953,6 +7065,23 @@ impl CursorGlow {
         self.rainbow.clear_admission();
         self.sound_cues.clear();
         self.clear_keyed_clicks();
+        self.revoke_unowned_hints();
+        self.last_poof = None;
+        self.row_cur.clear();
+        self.row_prev.clear();
+        self.row_cur_meta = None;
+        self.row_prev_meta = None;
+        self.clear_neighbor_rows();
+    }
+
+    /// Revoke the full input-classifier cohort: every one-shot hint, the
+    /// exact candidate, and the Backspace deletion proof. This is the
+    /// fail-closed half EVERY unowned generation change applies, whether or
+    /// not the resident light survives it (the proportionate-fence retained
+    /// path calls only this). Visual geometry, admission credits, audio
+    /// dedup, and the row probes are deliberately not touched here — the
+    /// wholesale teardowns layer those on top.
+    fn revoke_unowned_hints(&mut self) {
         self.quench_hint = None;
         self.nav_hint = None;
         self.type_hint = None;
@@ -6967,12 +7096,6 @@ impl CursorGlow {
         self.bs_poof_hint = None;
         self.bs_baseline = None;
         self.confirmed_delete_span = None;
-        self.last_poof = None;
-        self.row_cur.clear();
-        self.row_prev.clear();
-        self.row_cur_meta = None;
-        self.row_prev_meta = None;
-        self.clear_neighbor_rows();
     }
 
     /// Clear output-bearing geometry and the per-frame accessor caches, while
@@ -11392,6 +11515,12 @@ impl CursorGlow {
             && gap_ok
             && !poofed
             && let (Some(prev), Some(cur)) = (self.row_prev_meta, self.row_cur_meta)
+            // A ContentOnly probe (plain alt screen — no repaint blink) carries
+            // no kill license: Ctrl-U there is a page scroll, and the region
+            // scroll shrinking the probed row is not an erase (see
+            // [`ProbeTrust`]). Both halves of the diff must be full-trust.
+            && prev.trust == ProbeTrust::Full
+            && cur.trust == ProbeTrust::Full
             && prev.row == cur.row
             && cur.fill < prev.fill
             && now.saturating_duration_since(prev.at).as_secs_f32() <= Self::POOF_PROBE_STALE
@@ -11520,6 +11649,9 @@ impl CursorGlow {
                     now.saturating_duration_since(t).as_secs_f32() >= Self::POOF_FALLBACK_GRACE
                 }))
             && let Some(cur) = self.row_cur_meta
+            // Same trust law as the span branch: a plain-alt ContentOnly probe
+            // cannot anchor the caret fallback either (see [`ProbeTrust`]).
+            && cur.trust == ProbeTrust::Full
         {
             let c0 = cur.caret;
             self.spawn_poof(cur.row, c0, c0 + 3, 3, now, cfg, geom, true);
@@ -18735,7 +18867,7 @@ fn rainbow_slab_at(bands: &[u32; 6], t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cursor_trail::{CursorTrail, TrailConfig};
+    use crate::cursor_trail::{CursorTrail, GenerationOwnership, TrailConfig};
 
     #[test]
     fn swept_path_retains_only_the_bounded_landing_suffix() {
@@ -24521,6 +24653,504 @@ mod tests {
             &env_state("KeyDeviatingEcho", "EchoDeviates"),
             decision,
         );
+
+        // SHAPE 10 — UNBLINKED-ALT ECHO (the audit's named full-repaint/
+        // no-probe blind spot, closed): the same textbook echo, but on a
+        // PLAIN alt screen with no repaint blink (`less` /-search typing,
+        // `vi` insert mode, the ESC 7/ESC 8 streamer TUI). The fixed host
+        // ships a ContentOnly probe and the exact proof confirms over it.
+        let alt_generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 17,
+            alternate_screen: true,
+        };
+        let arm_alt = |seq: u32| {
+            let mut glow = CursorGlow::default();
+            glow.note_context(true);
+            let mut out = Vec::new();
+            glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+            glow.note_typed_expected(
+                t0 + Duration::from_millis(1),
+                typed_t,
+                (2, 5),
+                (2, 4),
+                baseline,
+                alt_generation(seq),
+            );
+            glow
+        };
+        let mut glow = arm_alt(110);
+        glow.observe_row_with_trust(
+            2,
+            5,
+            &plain_row,
+            t0 + Duration::from_millis(2),
+            ProbeTrust::ContentOnly,
+        );
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            t0 + Duration::from_millis(2),
+            alt_generation(111),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "shape 10: an unblinked-alt echo must confirm over a ContentOnly probe: {decision:?}"
+        );
+        assert_refines(
+            "unblinked-alt echo",
+            &env_state("KeyUnblinkedAltEcho", "EchoOnUnblinkedAlt"),
+            decision,
+        );
+        // The PRE-FIX host facet (`Buggy = 1`'s probe starvation), fail-closed
+        // at the engine: a frame with NO probe still retires `no-row-probe` —
+        // the fix made the probe AVAILABLE, it did not weaken the proof.
+        let mut glow = arm_alt(120);
+        let decision = glow.confirm_content_candidate(
+            Some((2, 5)),
+            t0 + Duration::from_millis(2),
+            alt_generation(121),
+        );
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a probe-less unblinked-alt frame stays fail-closed: {decision:?}"
+        );
+    }
+
+    /// THE `no-row-probe` RETIRE CLASS, LESS-SHAPE PIN: typing at the bottom
+    /// search line of a PLAIN alt-screen pager (`less`, typing `/abc`) — no
+    /// repaint blink, so the host's probe arrives ContentOnly. The honest
+    /// echo ARMS and CONFIRMS; the swallowed twin retires; cold output
+    /// decides nothing. Before the [`ProbeTrust`] seam the host withheld the
+    /// probe here and every one of these keystrokes retired `no-row-probe`.
+    #[test]
+    fn unblinked_alt_search_line_typing_confirms_over_a_content_only_probe() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 5,
+            alternate_screen: true,
+        };
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        // `/ab` typed at less's bottom line (row 5 of the 6-row grid), caret
+        // after the 'b'; the keystroke is 'c'.
+        let mut baseline_cells = [' '; 40];
+        for (i, ch) in "/ab".chars().enumerate() {
+            baseline_cells[i] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let typed_c = ExpectedCellSpan::from_cells(['c']).unwrap();
+        let key = t0 + Duration::from_millis(1);
+        let echo = key + Duration::from_millis(8);
+        let arm = |seq: u32| {
+            let mut glow = CursorGlow::default();
+            glow.note_context(true);
+            let mut out = Vec::new();
+            glow.tick(Some((5, 3)), t0, &c, g, &mut out);
+            glow.note_typed_expected(key, typed_c, (5, 4), (5, 3), baseline, generation(seq));
+            glow
+        };
+        let mut glow = arm(10);
+        glow.observe_row_with_trust(5, 4, &row("/abc"), echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((5, 4)), echo, generation(11));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "less-shape search typing must confirm over the ContentOnly probe: {decision:?}"
+        );
+
+        // SWALLOWED twin: the generation crossed but the caret cell never
+        // materialized — the exact proof retires exactly as on the primary
+        // screen. Trust widens probe AVAILABILITY, never the proof.
+        let mut glow = arm(20);
+        glow.observe_row_with_trust(5, 4, &row("/ab"), echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((5, 4)), echo, generation(21));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a swallowed less-shape echo must retire: {decision:?}"
+        );
+
+        // COLD twin: program output with no keystroke has no candidate to
+        // decide — a ContentOnly probe buys availability, never light.
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let mut out = Vec::new();
+        glow.tick(Some((5, 3)), t0, &c, g, &mut out);
+        glow.observe_row_with_trust(5, 4, &row("/abq"), echo, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.confirm_content_candidate(Some((5, 4)), echo, generation(31)),
+            None,
+            "cold output over a ContentOnly probe decides nothing"
+        );
+    }
+
+    /// THE ESC 7/ESC 8 STREAMER SHAPE: a per-key-echo alt-screen TUI whose
+    /// concurrent streamer saves the cursor, writes a status row elsewhere
+    /// every 150 ms, and restores it — no repaint blink, so every probe is
+    /// ContentOnly. The keystroke's admission confirms on its echo frame, the
+    /// streamer's interleaved UNOWNED batches prove the input row steady and
+    /// keep earned light (the ownership fence's UnownedSteady law, now
+    /// provable on a plain alt screen because the probe exists), and a
+    /// streamer that clobbers the input row still retires everything.
+    #[test]
+    fn esc7_esc8_streamer_keystroke_confirms_and_unowned_stream_stays_steady() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 6,
+            alternate_screen: true,
+        };
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        let mut baseline_cells = [' '; 40];
+        for (i, ch) in "> hi".chars().enumerate() {
+            baseline_cells[i] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let typed_x = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        // Frame A: idle input row, cursor at the caret.
+        glow.observe_row_with_trust(2, 4, &row("> hi"), t0, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(generation(40), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        // Frame A2: the streamer's 150 ms batch lands at ANOTHER row (ESC 7 /
+        // write / ESC 8 in one write, so the presented cursor never moved).
+        // The consecutive ContentOnly probes prove the input row intact —
+        // UnownedSteady, where the probe-less host could only fail closed
+        // into UnownedRewrite and strand every earned visual.
+        let stream1 = t0 + Duration::from_millis(150);
+        glow.observe_row_with_trust(2, 4, &row("> hi"), stream1, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(generation(41), Some((2, 4)), false),
+            GenerationOwnership::UnownedSteady,
+            "the streamer's off-row batch must prove the input row steady"
+        );
+        glow.tick(Some((2, 4)), stream1, &c, g, &mut out);
+        // The keystroke, baselined on the streamer's generation.
+        let key = stream1 + Duration::from_millis(10);
+        glow.note_typed_expected(key, typed_x, (2, 5), (2, 4), baseline, generation(41));
+        // Frame B: the echo batch. The probe is back on the input row (one
+        // write = one batch), the caret cell materialized — CONFIRMED. This
+        // exact frame retired `reason=no-row-probe` before the ProbeTrust
+        // seam existed, for every one of the harness's 10 keystrokes.
+        let echo = key + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 5, &row("> hix"), echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo, generation(42));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "streamer-shape keystroke must confirm on its echo frame: {decision:?}"
+        );
+        assert_eq!(
+            glow.observe_content_generation(generation(42), Some((2, 5)), true),
+            GenerationOwnership::Owned
+        );
+        glow.tick(Some((2, 5)), echo, &c, g, &mut out);
+        // Frame C: the next streamer batch — earned light survives it.
+        let stream2 = echo + Duration::from_millis(150);
+        glow.observe_row_with_trust(2, 5, &row("> hix"), stream2, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(generation(43), Some((2, 5)), false),
+            GenerationOwnership::UnownedSteady,
+            "the streamer between keystrokes must not strand the earned ink"
+        );
+        glow.tick(Some((2, 5)), stream2, &c, g, &mut out);
+        // NEGATIVE CONTROL: a streamer that rewrites the INPUT row is a real
+        // invalidation — the fence retires exactly as before the fix.
+        let clobber = stream2 + Duration::from_millis(150);
+        glow.observe_row_with_trust(2, 5, &row("!! panic"), clobber, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(generation(44), Some((2, 5)), false),
+            GenerationOwnership::UnownedRewrite,
+            "a clobbered input row still retires — ContentOnly is not a steadiness waiver"
+        );
+    }
+
+    /// A MID-SAVE FRAME DEFERS, IT DOES NOT RETIRE: if a presented frame
+    /// catches the streamer between ESC 7 and ESC 8, the probe is on the
+    /// STREAMER's row — the candidate's row proof simply isn't answerable
+    /// this frame, so the one-shot stays pending and confirms on the next
+    /// frame, when the cursor (and probe) are back on the input row. This is
+    /// the bounded probe hold the repair relies on: recapture on the confirm
+    /// frame, never a weakened proof.
+    #[test]
+    fn esc7_mid_save_frame_defers_the_typed_proof_to_the_restore_frame() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        let mut baseline_cells = [' '; 40];
+        for (i, ch) in "> hi".chars().enumerate() {
+            baseline_cells[i] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let typed_x = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        let key = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(key, typed_x, (2, 5), (2, 4), baseline, generation(50));
+        // Mid-save frame: the echo landed (generation 51) but the probe rode
+        // the streamer's row 0 — not the candidate's row, not adjacent-known.
+        let mid = key + Duration::from_millis(8);
+        glow.observe_row_with_trust(0, 12, &row("[stream 001]"), mid, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.confirm_content_candidate(Some((0, 12)), mid, generation(51)),
+            None,
+            "a probe on the streamer's row defers the proof, it does not retire it"
+        );
+        assert!(
+            glow.move_candidate_pending(),
+            "the one-shot candidate survives the mid-save frame"
+        );
+        // Restore frame: same generation, probe back on the input row.
+        let restored = mid + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 5, &row("> hix"), restored, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), restored, generation(51));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "the restore frame's recaptured probe completes the proof: {decision:?}"
+        );
+    }
+
+    /// THE PHANTOM-POOF FENCE HOLDS: a ContentOnly probe (plain alt screen)
+    /// never licenses the kill/poof detector. Ctrl-U in `less`/`vi` is a page
+    /// scroll — the region scroll shrinks the probed row without erasing
+    /// anything — and the OLD protection was to withhold the probe entirely.
+    /// Now the probe flows for the confirm proof, and the poof branches must
+    /// refuse it: same kill hint, same shrink, zero vapor. The Full-trust
+    /// twin (a real shell kill) still poofs, so this pin cannot pass
+    /// vacuously.
+    #[test]
+    fn content_only_probes_never_license_a_kill_poof() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        // Plain-alt shape: ContentOnly probes, a fresh kill hint, and a
+        // page-scroll shrink of the cursor row.
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        glow.observe_row_with_trust(2, 7, &row("$ hello world"), t0, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 7)), t0, &c, g, &mut out);
+        glow.note_kill(t0 + Duration::from_millis(30), true);
+        let t1 = t0 + Duration::from_millis(46);
+        glow.observe_row_with_trust(2, 7, &row("$ h"), t1, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 7)), t1, &c, g, &mut out);
+        assert!(
+            glow.vapor.is_empty(),
+            "a ContentOnly shrink must not poof — Ctrl-U paged, it did not kill"
+        );
+        // …and waiting out the caret fallback's grace buys the hint nothing.
+        let t2 = t0 + Duration::from_millis(180);
+        glow.observe_row_with_trust(2, 7, &row("$ h"), t2, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 7)), t2, &c, g, &mut out);
+        assert!(
+            glow.vapor.is_empty(),
+            "the caret fallback must refuse a ContentOnly probe too"
+        );
+        // NON-VACUITY: the identical gesture over FULL-trust probes (primary
+        // screen / blinking TUI) still answers with smoke.
+        let mut glow = CursorGlow::default();
+        glow.observe_row(2, 7, &row("$ hello world"), t0);
+        glow.tick(Some((2, 7)), t0, &c, g, &mut out);
+        glow.note_kill(t0 + Duration::from_millis(30), true);
+        glow.observe_row(2, 7, &row("$ h"), t1);
+        glow.tick(Some((2, 7)), t1, &c, g, &mut out);
+        assert!(
+            !glow.vapor.is_empty(),
+            "the same shrink under Full trust still poofs — the fence, not the feature, moved"
+        );
+    }
+
+    /// PAINT-SIDE PIN for the v0.49.0 alt-screen blackout: a confirmed typed
+    /// admission on the ALTERNATE screen forges light, and the unowned
+    /// output-only batches a busy TUI lands at an untouched caret (Claude
+    /// Code: spinner + token streaming, several per second) must NOT destroy
+    /// it. The proportionate fence retains resident light exactly when the
+    /// batch provably left the coordinate space, the cursor anchor, and the
+    /// probed anchor row intact; a batch that rewrites the lit row or
+    /// relocates the cursor still retires everything, so cold output can
+    /// never buy light — it merely stops destroying it.
+    #[test]
+    fn alt_screen_light_survives_proven_steady_unowned_batches() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 9,
+            alternate_screen: true,
+        };
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        glow.note_context(true);
+        trail.note_context(true);
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 2)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(30), Some((2, 2)), false),
+            GenerationOwnership::Steady
+        );
+        trail.observe_content_generation(generation(30), GenerationOwnership::Steady);
+
+        // One real keystroke: exact typed candidate, echo at generation 31.
+        let baseline_cells = [' '; 12];
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let typed_at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(typed_at, expected, (2, 3), (2, 2), baseline, generation(30));
+        trail.note_typed_expected(typed_at, expected, (2, 3), (2, 2));
+        let mut echoed = baseline_cells;
+        echoed[2] = 'x';
+        glow.observe_row(2, 3, &echoed, typed_at);
+        let decision = glow.confirm_content_candidate(Some((2, 3)), typed_at, generation(31));
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("alt-screen exact typed echo did not confirm: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        assert_eq!(
+            glow.observe_content_generation(generation(31), Some(target), true),
+            GenerationOwnership::Owned
+        );
+        trail.observe_content_generation(generation(31), GenerationOwnership::Owned);
+        glow.tick(Some(target), typed_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), typed_at, &trail_cfg, &mut trail_out);
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "confirmed alt-screen admission forges nonempty effect prims"
+        );
+        assert!(!trail_out.is_empty());
+
+        // An unowned spinner/stream batch at the untouched caret: the fresh
+        // probe pair attests the anchor row identical, the cursor anchor is
+        // unmoved, the identity held — resident light SURVIVES and the next
+        // tick still composites nonempty prims.
+        let stream_at = typed_at + Duration::from_millis(20);
+        glow.observe_row(2, 3, &echoed, stream_at);
+        assert_eq!(
+            glow.observe_content_generation(generation(32), Some(target), false),
+            GenerationOwnership::UnownedSteady
+        );
+        trail.observe_content_generation(generation(32), GenerationOwnership::UnownedSteady);
+        glow.tick(Some(target), stream_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), stream_at, &trail_cfg, &mut trail_out);
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "a proven-steady unowned batch must not wipe resident light"
+        );
+        assert!(
+            !trail_out.is_empty(),
+            "the classic comet survives the proven-steady batch too"
+        );
+
+        // NEGATIVE CONTROL (cold-output protection): a batch that rewrites
+        // the probed anchor row retires the light exactly as before.
+        let rewrite_at = stream_at + Duration::from_millis(20);
+        let mut rewritten = echoed;
+        rewritten[3] = '#';
+        glow.observe_row(2, 3, &rewritten, rewrite_at);
+        assert_eq!(
+            glow.observe_content_generation(generation(33), Some(target), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        trail.observe_content_generation(generation(33), GenerationOwnership::UnownedRewrite);
+        glow.tick(Some(target), rewrite_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), rewrite_at, &trail_cfg, &mut trail_out);
+        assert!(
+            !frame_has_output(&glow_out, &glow),
+            "a rewrite beneath the light still retires it"
+        );
+        assert!(trail_out.is_empty());
+
+        // ...and an unowned RELOCATION is the wholesale fence plus the
+        // companion-grounding verdict the host acts on.
+        assert_eq!(
+            glow.observe_content_generation(generation(34), Some((7, 60)), false),
+            GenerationOwnership::UnownedRelocation
+        );
+        trail.observe_content_generation(generation(34), GenerationOwnership::UnownedRelocation);
+
+        // Tier-1 bind: the model's proven-steady unowned batch keeps resident
+        // light charged while still consuming any in-flight candidate, and a
+        // forged wholesale wipe on that same transition is rejected.
+        let model = aterm_spec::derive::cursor_move_candidate_model();
+        let source = model.init_state();
+        let mut charged = source.clone();
+        assert!(model.fire("ChargeResident", &mut charged));
+        let mut steady = charged.clone();
+        assert!(model.fire("UnownedSteadyBatch", &mut steady));
+        assert_eq!(steady["resident_charged"], 1);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &steady,
+            Some("UnownedSteadyBatch"),
+            "real proven-steady unowned batch keeps resident light",
+        );
+        assert!(ok, "steady-batch retention rejected: {why}");
+        let mut wiped = steady.clone();
+        wiped.insert("resident_charged", 0);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &charged,
+            &wiped,
+            Some("UnownedSteadyBatch"),
+            "forged wholesale wipe on a proven-steady batch",
+        );
+        assert!(
+            !ok,
+            "a proven-steady batch must not retire resident light"
+        );
+        let mut interrupted = source;
+        assert!(model.fire("ArmTyped", &mut interrupted));
+        assert!(model.fire("DeliverStable", &mut interrupted));
+        assert!(model.fire("UnownedSteadyBatch", &mut interrupted));
+        assert_eq!(interrupted["phase"], 4);
+        assert!(
+            !model.fire("ConfirmTypedNext", &mut interrupted),
+            "retention still revokes the candidate cohort fail-closed"
+        );
     }
 
     /// A parser batch can rewrite a lit cell without moving the cursor. Every
@@ -24552,8 +25182,12 @@ mod tests {
         let mut trail_out = Vec::new();
         glow.tick(Some((2, 1)), t0, &c, g, &mut glow_out);
         trail.tick(Some((2, 1)), t0, &trail_cfg, &mut trail_out);
-        assert!(!glow.observe_content_generation(generation(10), false));
-        assert!(!trail.observe_content_generation(generation(10), false));
+        assert_eq!(
+            glow.observe_content_generation(generation(10), Some((2, 1)), false),
+            GenerationOwnership::Steady,
+            "the first observation is a silent baseline"
+        );
+        trail.observe_content_generation(generation(10), GenerationOwnership::Steady);
 
         // Charge genuinely resident light in generation 10.
         let charged_at = t0 + Duration::from_millis(1);
@@ -24588,8 +25222,11 @@ mod tests {
             panic!("exact next-generation edit did not confirm: {decision:?}");
         };
         trail.confirm_content_candidate(at, origin, target);
-        assert!(glow.observe_content_generation(generation(11), true));
-        assert!(trail.observe_content_generation(generation(11), true));
+        assert_eq!(
+            glow.observe_content_generation(generation(11), Some((2, 3)), true),
+            GenerationOwnership::Owned
+        );
+        trail.observe_content_generation(generation(11), GenerationOwnership::Owned);
         assert!(
             !frame_has_output(&[], &glow) && !trail.is_active(),
             "exact evidence retires every pre-existing visual before fresh spawn"
@@ -24602,18 +25239,26 @@ mod tests {
 
         // Animation within the same terminal generation remains live.
         let settle = typed_at + Duration::from_millis(20);
-        assert!(!glow.observe_content_generation(generation(11), false));
-        assert!(!trail.observe_content_generation(generation(11), false));
+        assert_eq!(
+            glow.observe_content_generation(generation(11), Some(target), false),
+            GenerationOwnership::Steady
+        );
+        trail.observe_content_generation(generation(11), GenerationOwnership::Steady);
         glow.tick(Some(target), settle, &c, g, &mut glow_out);
         trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
         assert!(frame_has_output(&glow_out, &glow));
         assert!(!trail_out.is_empty());
 
         // A same-cursor status/title/spinner batch is not owned by any input
-        // proof. It clears the old light immediately, before another cell can
-        // inherit the segment.
-        assert!(glow.observe_content_generation(generation(12), false));
-        assert!(trail.observe_content_generation(generation(12), false));
+        // proof, and with NO fresh probe pair this frame it cannot be attested
+        // steady either: it clears the old light immediately, before another
+        // cell can inherit the segment (the fail-closed default of the
+        // proportionate fence).
+        assert_eq!(
+            glow.observe_content_generation(generation(12), Some(target), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        trail.observe_content_generation(generation(12), GenerationOwnership::UnownedRewrite);
         glow.tick(Some(target), settle, &c, g, &mut glow_out);
         trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
         assert!(!frame_has_output(&glow_out, &glow));
@@ -24629,8 +25274,15 @@ mod tests {
         assert!(frame_has_output(&glow_out, &glow) && !trail_out.is_empty());
         glow.note_scroll(1);
         trail.note_scroll(1);
-        assert!(glow.observe_content_generation(generation(13), false));
-        assert!(trail.observe_content_generation(generation(13), false));
+        let scrolled = glow.observe_content_generation(generation(13), Some((2, 4)), false);
+        assert!(
+            matches!(
+                scrolled,
+                GenerationOwnership::UnownedRewrite | GenerationOwnership::UnownedRelocation
+            ),
+            "a parser batch that also scrolls fails closed: {scrolled:?}"
+        );
+        trail.observe_content_generation(generation(13), scrolled);
         glow.tick(Some((2, 4)), settle, &c, g, &mut glow_out);
         trail.tick(Some((2, 4)), settle, &trail_cfg, &mut trail_out);
         assert!(!frame_has_output(&glow_out, &glow) && trail_out.is_empty());

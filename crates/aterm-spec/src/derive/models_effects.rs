@@ -1553,10 +1553,14 @@ pub fn rainbow_move_admission_model() -> Model {
 /// unobserved event, scroll, hidden/same-cell completion, expiry, or any source /
 /// target mismatch consumes the candidate dark.
 /// Resident light is independently charged/projected: a coherent next frame
-/// may retain it, final-extraction drift suppresses it, and any unowned parser
-/// generation retires it even when the cursor did not move. An exact authored
-/// generation also retires every prior resident pool before its admitted move
-/// forges fresh geometry; its row proof cannot certify older light elsewhere.
+/// may retain it, final-extraction drift suppresses it, and an unowned parser
+/// generation retires it — even at an unmoved cursor — UNLESS the batch is
+/// proven steady at the anchor (same terminal/screen identity, cursor anchor
+/// unmoved, probed anchor row content-identical), in which case the light
+/// survives while the candidate cohort still revokes fail-closed
+/// (`UnownedSteadyBatch`). An exact authored generation also retires every
+/// prior resident pool before its admitted move forges fresh geometry; its
+/// row proof cannot certify older light elsewhere.
 ///
 /// `Buggy=1` is the historical timestamp-alone mutant: a fresh, geometrically
 /// matching typed candidate admits without content evidence. `EvidenceRequired`
@@ -1610,6 +1614,20 @@ pub fn cursor_move_candidate_model() -> Model {
             ) {
                 final_checked = 0; final_generation_match = 0;
                 projection = 0; resident_projection = 0;
+            }
+            action UnownedSteadyBatch when (
+                resident_charged == 1 || (phase > 0 && phase <= 3)
+            ) {
+                // An unowned batch PROVEN steady at the anchor: same
+                // terminal/screen identity, cursor anchor unmoved, probed
+                // anchor row content-identical under the implicit-blank lens.
+                // Resident light survives (the fence is proportionate); the
+                // hint/candidate cohort still revokes fail-closed exactly
+                // like the rewrite fence, so retention never admits or
+                // births anything.
+                candidate_rewrite = if phase > 0 && phase <= 3 { 1 } else { 0 };
+                phase = if phase > 0 && phase <= 3 { 4 } else { phase };
+                admitted = 0; birth = 0; projection = 0;
             }
             action UnownedContentRewrite when (
                 resident_charged == 1 || (phase > 0 && phase <= 3)
@@ -1897,6 +1915,15 @@ pub fn cursor_move_candidate_model() -> Model {
 ///       crosses the input boundary instead.
 ///   9 `KeyDeviatingEcho`     — the shell echoes something other than the
 ///       typed glyph at the caret.
+///  10 `KeyUnblinkedAltEcho`  — a per-key echo on a PLAIN alt screen with no
+///       repaint blink (`less` /-search typing, `vi` insert mode, a TUI whose
+///       ESC 7/ESC 8 streamer writes at another row): the echo itself is the
+///       textbook plain shape, but the PRE-FIX host withheld the row probe
+///       there (`probe_ok = !alt || blink_recent`), so the proof retired
+///       `no-row-probe` on every honest keystroke — the audit's named
+///       blind spot (the full-repaint/no-probe shape). The fixed host ships
+///       a ContentOnly probe instead; a host that truly has no probe still
+///       retires (fail-closed).
 ///
 /// Obligation families:
 ///
@@ -1907,9 +1934,10 @@ pub fn cursor_move_candidate_model() -> Model {
 ///   (`ConfirmIsWitnessed` and the per-shape dark invariants).
 ///
 ///   LIVENESS (the new family): every settled run over a shape the shipped
-///   code claims to handle — plain, E1, E3, E4 — ends CONFIRMED
-///   (`LivePlainEchoConfirms`, `LiveGhostTextConfirmsE1`,
-///   `LiveBlankSpaceConfirmsE3`, `LiveOvertypeConfirmsE4`), and every run
+///   code claims to handle — plain, E1, E3, E4, and the unblinked-alt echo —
+///   ends CONFIRMED (`LivePlainEchoConfirms`, `LiveGhostTextConfirmsE1`,
+///   `LiveBlankSpaceConfirmsE3`, `LiveOvertypeConfirmsE4`,
+///   `LiveUnblinkedAltEchoConfirms`), and every run
 ///   reaches a decision at all (Tier-0 runs `find_deadlock` with
 ///   `settled = 1` as the final predicate — the bounded eventuality).
 ///
@@ -1919,9 +1947,12 @@ pub fn cursor_move_candidate_model() -> Model {
 ///   multi-key stale anchor remain registered follow-ups to the blackout
 ///   repair, alongside split-pane arming.
 ///
-/// `Buggy = 1` is the 201449c2 confirmation law verbatim: whole-row exactness
-/// (any post-caret change vetoes) and a newly-materialize-only witness (null
-/// diffs and content-invisible blanks cannot testify). That mutant is still
+/// `Buggy = 1` is the pre-fix SYSTEM: the 201449c2 confirmation law verbatim
+/// — whole-row exactness (any post-caret change vetoes) and a
+/// newly-materialize-only witness (null diffs and content-invisible blanks
+/// cannot testify) — composed with the probe-starving alt host (shape 10's
+/// delivery withholds the row probe exactly as the old
+/// `probe_ok = !alt || blink_recent` gate did). That mutant is still
 /// SAFE — every safety invariant above holds at `Buggy = 1` — and that is
 /// precisely the audited defect class: only the LIVENESS family catches it
 /// (E1/E3/E4 settle retired), so a checker that stated safety alone would
@@ -1948,6 +1979,7 @@ pub fn typed_echo_liveness_model() -> Model {
             var content_changed = 0;    // row content differs under the implicit-blank lens
             var storage_growth = 0;     // stored row grew to cover the owned span (E3)
             var prepainted = 0;         // expected glyphs already at the caret at input (E4)
+            var probe_withheld = 0;     // the host supplied NO row probe this frame (10)
             var confirmed = 0;
             var retired = 0;
             var settled = 0;            // the decision is final
@@ -1964,6 +1996,7 @@ pub fn typed_echo_liveness_model() -> Model {
             action ColdSpinner when (shape == 0) { shape = 7; }
             action KeyEchoSwallowed when (shape == 0) { shape = 8; armed = 1; }
             action KeyDeviatingEcho when (shape == 0) { shape = 9; armed = 1; }
+            action KeyUnblinkedAltEcho when (shape == 0) { shape = 10; armed = 1; }
 
             // -- the environment delivers the batch its shape promised -------
             action EchoPlain when (shape == 1 && echoed == 0) {
@@ -2001,13 +2034,26 @@ pub fn typed_echo_liveness_model() -> Model {
                 echoed = 1; gen_delta = 1; content_changed = 1;
                 pre_caret_intact = 1;
             }
+            // Shape 10's echo IS the textbook plain echo; what differs is the
+            // HOST: pre-fix (`Buggy = 1`) it withheld the alt-screen row probe
+            // (no repaint blink ⇒ `probe_ok` false), post-fix it ships a
+            // ContentOnly probe, so only the fixed system can prove the echo.
+            action EchoOnUnblinkedAlt when (shape == 10 && echoed == 0) {
+                echoed = 1; gen_delta = 1; caret_material = 1;
+                pre_caret_intact = 1; content_changed = 1;
+                probe_withheld = if Buggy == 1 { 1 } else { 0 };
+            }
 
             // -- the shipped confirmation decision ---------------------------
             action Decide when (echoed == 1 && settled == 0) {
                 confirmed = if Buggy == 1 {
                     // 201449c2 verbatim: whole-row exactness (any post-caret
-                    // change vetoes) + newly-materialize-only witness.
+                    // change vetoes) + newly-materialize-only witness. A
+                    // withheld probe retires in BOTH laws (`no-row-probe` is
+                    // fail-closed today too); what Buggy=1 adds is the HOST
+                    // that withholds it on every unblinked-alt frame.
                     if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && probe_withheld == 0
                         && pre_caret_intact == 1 && caret_material == 1
                         && content_changed == 1 && post_caret_changed == 0
                         && prepainted == 0
@@ -2015,8 +2061,11 @@ pub fn typed_echo_liveness_model() -> Model {
                 } else {
                     // The shipped fix: caret-frontier exactness + any of the
                     // three materialization witnesses (content diff, storage
-                    // growth, overtype-null-diff).
+                    // growth, overtype-null-diff) — over a probe the host
+                    // actually supplied (ContentOnly suffices; see
+                    // `ProbeTrust` in aterm-effects).
                     if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && probe_withheld == 0
                         && pre_caret_intact == 1 && caret_material == 1
                         && (content_changed == 1 || storage_growth == 1
                             || prepainted == 1)
@@ -2024,12 +2073,14 @@ pub fn typed_echo_liveness_model() -> Model {
                 };
                 retired = if Buggy == 1 {
                     if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && probe_withheld == 0
                         && pre_caret_intact == 1 && caret_material == 1
                         && content_changed == 1 && post_caret_changed == 0
                         && prepainted == 0
                     { 0 } else { armed }
                 } else {
                     if armed == 1 && gen_delta == 1 && stale_anchor == 0
+                        && probe_withheld == 0
                         && pre_caret_intact == 1 && caret_material == 1
                         && (content_changed == 1 || storage_growth == 1
                             || prepainted == 1)
@@ -2040,11 +2091,16 @@ pub fn typed_echo_liveness_model() -> Model {
 
             // SAFETY — the 201449c2 protections, kept word for word.
             invariant ColdSpinnerNeverConfirms:
-                if shape == 7 { confirmed == 0 } else { shape <= 9 };
+                if shape == 7 { confirmed == 0 } else { shape <= 10 };
             invariant SwallowedEchoNeverConfirms:
-                if shape == 8 { confirmed == 0 } else { shape <= 9 };
+                if shape == 8 { confirmed == 0 } else { shape <= 10 };
             invariant DeviatingEchoNeverConfirms:
-                if shape == 9 { confirmed == 0 } else { shape <= 9 };
+                if shape == 9 { confirmed == 0 } else { shape <= 10 };
+            invariant WithheldProbeNeverConfirms:
+                // FAIL-CLOSED, kept by the fix: making the probe AVAILABLE is
+                // the repair — a frame whose row cannot be probed still
+                // retires, in the fixed law and the mutant alike.
+                if probe_withheld == 1 { confirmed == 0 } else { probe_withheld == 0 };
             invariant ConfirmIsWitnessed:
                 if confirmed == 1 {
                     armed == 1 && echoed == 1 && gen_delta == 1
@@ -2065,6 +2121,15 @@ pub fn typed_echo_liveness_model() -> Model {
                 if settled == 1 && shape == 3 { confirmed == 1 } else { settled <= 1 };
             invariant LiveOvertypeConfirmsE4:
                 if settled == 1 && shape == 4 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveUnblinkedAltEchoConfirms:
+                // THE BLIND SPOT, CLOSED: a plain per-key echo on an
+                // unblinked alt screen (less /-search, vi insert, the
+                // ESC 7/ESC 8 streamer TUI) confirms — the fixed host ships
+                // the ContentOnly probe the proof needs. At Buggy=1 the
+                // probe-starving host retires it (`no-row-probe`), and ONLY
+                // this liveness obligation catches that: every safety
+                // invariant above holds on the mute mutant.
+                if settled == 1 && shape == 10 { confirmed == 1 } else { settled <= 1 };
 
             // REGISTERED STANDING GAPS — checked facts, not aspirations: the
             // strict generation law (E2) and the multi-key stale anchor (E5)
@@ -2082,11 +2147,12 @@ pub fn typed_echo_liveness_model() -> Model {
                 } else { settled <= 1 };
 
             invariant EchoLivenessBounds:
-                shape <= 9 && armed <= 1 && echoed <= 1 && gen_delta <= 2
+                shape <= 10 && armed <= 1 && echoed <= 1 && gen_delta <= 2
                     && stale_anchor <= 1 && caret_material <= 1
                     && pre_caret_intact <= 1 && post_caret_changed <= 1
                     && content_changed <= 1 && storage_growth <= 1
-                    && prepainted <= 1 && confirmed <= 1 && retired <= 1
+                    && prepainted <= 1 && probe_withheld <= 1
+                    && confirmed <= 1 && retired <= 1
                     && settled <= 1;
         }
     }

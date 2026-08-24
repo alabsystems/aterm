@@ -68,6 +68,11 @@ pub struct CutOptions {
     pub rehearse: Option<String>,
     /// Ship a single-arch build (explicit opt-out of universal, decision 18).
     pub arm64_only: bool,
+    /// `--no-paint-smoke`: skip the self-check's paint smoke (the ten-keystroke
+    /// pixel proof against the just-built bundle). An EMERGENCY escape, refused
+    /// on a notarized real cut unless [`NO_PAINT_SMOKE_ACK_VAR`] carries the
+    /// exact acknowledgement — see [`paint_smoke_policy`].
+    pub no_paint_smoke: bool,
     /// `--strand-pre-roster-clients`: the operator asserts that no client running a
     /// build older than the machine roster is left in the field, so this cut may be
     /// signed by a key that is on the roster but in no shipped keyset.
@@ -5724,6 +5729,10 @@ pub struct CutCtx {
     pub mirror_create_issued: bool,
     pub mirror_upload_intents: Vec<String>,
     pub kind: CutKind,
+    /// `--no-paint-smoke`, carried to `step_selfcheck`. Never journaled: a
+    /// resume re-earns the paint proof (and the CLI refuses the flag there,
+    /// like every other cut flag).
+    pub no_paint_smoke: bool,
     /// Present only for a real cut while its remote owner ref is held.
     pub lease: Option<ReleaseLeaseGuard>,
     /// Unique per-invocation token; two same-claim resumes cannot share it.
@@ -7194,10 +7203,19 @@ fn reconstruct_roster_assets(
         manifest.roster_seq,
     )?;
     refuse_roster_downgrade(dist, incoming_seq)?;
-    fs::write(dist.join(roster::ROSTER_ASSET), &roster_bytes)
-        .map_err(|error| Error::new(format!("reconstruct machine roster: {error}")))?;
-    fs::write(dist.join(roster::ROSTER_SIG_ASSET), &roster_sig)
-        .map_err(|error| Error::new(format!("reconstruct machine roster signature: {error}")))?;
+    // Through the roster PAIR's writer lock and redo transaction, not two bare writes:
+    // this is the same `dist/aterm-machines.toml` + `.sig` that `cargo ship provision`
+    // seeds and the mint re-signs, and a death between two `fs::write`s left exactly the
+    // torn pair — new document, old signature — that no client verifies and every
+    // operator reads as a bad phrase. `crate::provision::publish_proven_pair` takes the
+    // lock for this one write; the bytes were proved under the pinned paper master by
+    // `verify_published_roster` above.
+    crate::provision::publish_proven_pair(
+        &dist.join(roster::ROSTER_ASSET),
+        &roster_bytes,
+        &roster_sig,
+    )
+    .map_err(|error| Error::new(format!("reconstruct machine roster: {error}")))?;
     step(
         "recover",
         &format!(
@@ -7512,6 +7530,9 @@ fn recover_published_cut(
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
+        // Recovery re-runs no build/selfcheck step (all are journaled done),
+        // so there is no smoke left to skip.
+        no_paint_smoke: false,
         lease: Some(lease),
         fence: Some(fence),
         notes_section: version.to_string(),
@@ -8089,6 +8110,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
         kind,
+        no_paint_smoke: opts.no_paint_smoke,
         lease: None,
         fence: None,
         journal: None,
@@ -8270,6 +8292,8 @@ fn resume_cut(
         mirror_create_issued: journal.mirror_create_issued,
         mirror_upload_intents: journal.mirror_upload_intents.clone(),
         kind: CutKind::Real,
+        // Never journaled: a resumed self-check re-earns the paint proof.
+        no_paint_smoke: false,
         lease,
         fence,
         journal: Some(journal),
@@ -9302,6 +9326,166 @@ pub fn selfcheck_signing(
     Ok(" · Tier APPLE: TeamIdentifier + stapled ticket + Gatekeeper on .app and .dmg")
 }
 
+// ---------------------------------------------------------------------------
+// The cut's PAINT SMOKE — ten keystrokes against the just-built bundle
+// (2026-08-24 blackout audit, docs/RELEASE-PROOF-DISCIPLINE.md)
+// ---------------------------------------------------------------------------
+
+/// `--no-paint-smoke`: the emergency escape from the self-check's paint smoke.
+///
+/// An ESCAPE, not a setting — v0.48.0 and v0.49.0 shipped the rainbow cursor
+/// trail dark past green gates precisely because no gate ever looked at a
+/// shipped artifact's pixels, so the smoke this flag skips is the one check
+/// standing between "the pipeline confirms" and "the feature works". On a
+/// notarized real cut it is refused outright unless the operator ALSO sets
+/// [`NO_PAINT_SMOKE_ACK_VAR`] to [`NO_PAINT_SMOKE_ACK_VALUE`] — an
+/// acknowledgement whose spelling says what is being accepted.
+pub const NO_PAINT_SMOKE_FLAG: &str = "--no-paint-smoke";
+/// The env acknowledgement `--no-paint-smoke` requires on a notarized real cut.
+pub const NO_PAINT_SMOKE_ACK_VAR: &str = "ATERM_NO_PAINT_SMOKE_ACK";
+/// The exact required value — strict, like every env switch here: a value that
+/// names the risk cannot be set by accident, and `=0` never means "yes".
+pub const NO_PAINT_SMOKE_ACK_VALUE: &str = "this-cut-may-ship-dark";
+
+/// The paint probe seam: launch the just-built bundle's binary headless, drive
+/// the fake-Claude shape with real keystrokes over its own control socket,
+/// record ~3s of pixels, and scan for effect ink.
+///
+/// A trait for exactly the reason [`Packager`] and [`sign::AppleTools`] are:
+/// the real probe launches a GUI process and records video, which no unit test
+/// can afford, and the sequence that calls it is where a mutation is invisible
+/// and expensive — `if false`-ing the call site ships the next dark release.
+/// The recording fakes in tests/paint_smoke.rs drive the real decision code
+/// and assert what it DID, in what ORDER.
+pub trait PaintProbe {
+    /// `Ok(report)` = the effect painted (the probe's one-line measurement,
+    /// which the transcript prints so the claim carries its evidence).
+    /// `Err(why)` = it did not, or nothing could be proven — the CALLER owns
+    /// the verdict words; this is only the measurement.
+    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, String>;
+}
+
+/// The real probe: `tools/paint-conformance/paint_probe.sh` — the SAME driver
+/// and scanner the CI paint-conformance matrix runs, so the cut's smoke and
+/// the matrix cannot drift apart. Budgeted at ~20s inside the script itself
+/// (watchdog included): a paint proof that can hang is a gate nobody runs.
+pub struct RealPaintProbe {
+    pub repo: PathBuf,
+}
+
+impl PaintProbe for RealPaintProbe {
+    fn paint(&self, bundle_binary: &Path) -> std::result::Result<String, String> {
+        let script = self.repo.join("tools/paint-conformance/paint_probe.sh");
+        if !script.is_file() {
+            return Err(format!(
+                "paint probe missing ({}) — nothing was proven about paint",
+                script.display()
+            ));
+        }
+        let out = Command::new(&script)
+            .arg(bundle_binary)
+            .args(["--shape", "fake-claude"])
+            .args(["--keys", "r,a,i,n,b,o,w,space,o,n"])
+            .args(["--record", "3", "--expect", "ink", "--budget", "25"])
+            .output()
+            .map_err(|e| format!("could not spawn {}: {e}", script.display()))?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = stdout
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("PAINT"))
+            .unwrap_or("<no PAINT report line>")
+            .to_string();
+        match out.status.code() {
+            Some(0) => Ok(report),
+            // 1 = the expectation failed, 2 = could not run; both refuse the
+            // cut (could-not-run is NOT a pass — the exact vacuity the audit
+            // found), under words the caller composes.
+            Some(1 | 2) => Err(report),
+            code => Err(format!(
+                "paint probe died abnormally (exit {code:?}; the protocol is 0/1/2): {report}"
+            )),
+        }
+    }
+}
+
+/// The `--no-paint-smoke` policy: `Ok(None)` = the smoke runs; `Ok(Some(words))`
+/// = skipped, with the transcript line that says so out loud; `Err` = the skip
+/// is REFUSED (a notarized real cut without the explicit acknowledgement).
+///
+/// Pure and separated from the probe so tests/paint_smoke.rs can drive every
+/// arm without launching anything.
+pub fn paint_smoke_policy(
+    kind: CutKind,
+    notarized_claim: bool,
+    skip_requested: bool,
+    ack: Option<&str>,
+) -> Result<Option<String>> {
+    if !skip_requested {
+        return Ok(None);
+    }
+    if kind == CutKind::Real && notarized_claim {
+        if ack != Some(NO_PAINT_SMOKE_ACK_VALUE) {
+            return Err(Error::new(format!(
+                "{NO_PAINT_SMOKE_FLAG} on a notarized real cut is refused: this is the check \
+                 that would have stopped v0.48.0/v0.49.0 shipping the rainbow trail dark \
+                 (docs/RELEASE-PROOF-DISCIPLINE.md). If this is a genuine emergency, say so \
+                 explicitly: {NO_PAINT_SMOKE_ACK_VAR}={NO_PAINT_SMOKE_ACK_VALUE}"
+            )));
+        }
+        return Ok(Some(format!(
+            "SKIPPED by {NO_PAINT_SMOKE_FLAG} + {NO_PAINT_SMOKE_ACK_VAR} — this notarized cut \
+             ships with NO pixel proof of its flagship effect"
+        )));
+    }
+    Ok(Some(format!(
+        "SKIPPED by {NO_PAINT_SMOKE_FLAG} — this cut ships with NO pixel proof of its \
+         flagship effect"
+    )))
+}
+
+/// The self-check's two artifact probes, IN ORDER: the paint smoke against the
+/// just-built bundle FIRST, the codesign/Tier-APPLE gate second.
+///
+/// One extracted unit for the same reason [`notarize_and_package`] is one: the
+/// ORDER is the property. The smoke must judge the bundle before the signing
+/// verdict is pronounced — a cut that fails to paint must die without spending
+/// a single Apple tool spawn, and no transcript may carry the signing claim
+/// for an artifact whose flagship effect was never seen to paint. Both notes
+/// are these functions' RETURN VALUES, so neither claim can be printed without
+/// its check having passed (the [`selfcheck_signing`] rule, extended).
+///
+/// tests/paint_smoke.rs drives this with recording fakes across both seams and
+/// fails under exactly the mutations that would resurrect the blackout:
+/// `if false`-ing the probe call, reordering it after the signing gate, or
+/// downgrading a probe failure to a warning.
+#[allow(clippy::too_many_arguments)]
+pub fn selfcheck_paint_then_signing(
+    kind: CutKind,
+    team: &str,
+    app: &Path,
+    dmg: &Path,
+    skip_requested: bool,
+    ack: Option<&str>,
+    probe: &dyn PaintProbe,
+    tools: &dyn sign::AppleTools,
+) -> Result<(String, &'static str)> {
+    let paint_note = match paint_smoke_policy(kind, !team.is_empty(), skip_requested, ack)? {
+        Some(skip_words) => skip_words,
+        None => match probe.paint(&app.join("Contents/MacOS/aterm")) {
+            Ok(report) => format!("10 keys, fake-Claude shape, ink asserted \u{2014} {report}"),
+            Err(why) => {
+                return Err(Error::new(format!(
+                    "self-check failed: the shipped artifact does not paint its flagship \
+                     effect \u{2014} see docs/RELEASE-PROOF-DISCIPLINE.md ({why})"
+                )));
+            }
+        },
+    };
+    let apple_note = selfcheck_signing(team, app, dmg, tools)?;
+    Ok((paint_note, apple_note))
+}
+
 /// Step "selfcheck" (spec §7 step 4): triple build-number agreement
 /// (binary == plist == manifest == n), DMG digest, codesign, the shared +
 /// vendored-v0.25 manifest proof, and the client-rule monotonic check.
@@ -9579,10 +9763,26 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         }
     }
 
-    // codesign + Tier APPLE (spec §7 step 4), iff the manifest CLAIMS a team.
-    // The suffix is the verdict's own words — see `selfcheck_signing`.
+    // The paint smoke, then codesign + Tier APPLE (spec §7 step 4, the tier
+    // iff the manifest CLAIMS a team) — one ordered unit, so the bundle is seen
+    // to PAINT before any signing verdict is pronounced and before any
+    // publish-facing step runs. Each suffix is its own verdict's words — see
+    // `selfcheck_paint_then_signing` / `selfcheck_signing`.
     let team = manifest.team_id.clone().unwrap_or_default();
-    let apple_note = selfcheck_signing(&team, &app, &ctx.dmg_path(), &sign::RealAppleTools)?;
+    let ack = std::env::var(NO_PAINT_SMOKE_ACK_VAR).ok();
+    let (paint_note, apple_note) = selfcheck_paint_then_signing(
+        ctx.kind,
+        &team,
+        &app,
+        &ctx.dmg_path(),
+        ctx.no_paint_smoke,
+        ack.as_deref(),
+        &RealPaintProbe {
+            repo: ctx.repo.clone(),
+        },
+        &sign::RealAppleTools,
+    )?;
+    step("paint", &paint_note);
     step(
         "selfcheck",
         &format!(
@@ -11511,6 +11711,7 @@ mod roster_wiring_tests {
             mirror_create_issued: false,
             mirror_upload_intents: Vec::new(),
             kind: CutKind::Real,
+            no_paint_smoke: false,
             lease: None,
             fence: None,
             journal: None,

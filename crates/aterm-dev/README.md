@@ -8,7 +8,7 @@ dev/ops utility scripts.
 
 `aterm-dev` does not reimplement any of the underlying logic (cargo-deny, Kani,
 codex, the release cutter, …). Each subcommand resolves the workspace root and
-execs the existing, battle-tested tool — `ship` forwards to the `cargo ship`
+execs the existing, battle-tested tool — `ship` forwards to the `targo --unverified ship`
 alias (crate `aterm-release`), the rest to their repo scripts — forwarding
 every extra argument and propagating the exit code. The value it adds is a
 single, grouped, polished `--help` so a human or an AI can discover the
@@ -33,7 +33,7 @@ and exits `1`.
 
 | Command | Wraps | Description |
 | --- | --- | --- |
-| `ship` | `cargo ship` (crate `aterm-release`) | Release cutter passthrough: `cut` / `status` / `verify` / `yank` — the whole build → sign → publish → verify pipeline is `aterm-dev ship cut` (see `docs/RELEASING.md`) |
+| `ship` | `targo --unverified ship` (crate `aterm-release`) | Release cutter passthrough: `cut` / `status` / `verify` / `yank` — the whole build → sign → publish → verify pipeline is `aterm-dev ship cut` (see `docs/RELEASING.md`) |
 
 ### Quality & Verify
 

@@ -1404,6 +1404,12 @@ mod tests {
     #[test]
     fn derived_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
+            // Entered the closure with the embedded operator: aterm-gui now
+            // depends on aterm-agent for the durable queue/WAL, and aterm-agent
+            // on aterm-ctl for the one-binary fleet client. Both are normal
+            // [dependencies] edges, so both crates are GUI process code and
+            // their locks belong in the census.
+            "crates/aterm-agent/src",
             "crates/aterm-alloc/src",
             "crates/aterm-bidi/src",
             "crates/aterm-bits/src",
@@ -1417,6 +1423,7 @@ mod tests {
             // whole crate is process code.
             "crates/aterm-control/src",
             "crates/aterm-core/src",
+            "crates/aterm-ctl/src",
             "crates/aterm-effects/src",
             "crates/aterm-error/src",
             "crates/aterm-ffi-types/src",

@@ -204,6 +204,19 @@ fn cursor_cutout_gpu_matches_cpu() {
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
         return;
     };
+    // 日 is not in the JetBrains fixture, so each renderer spawns its OWN
+    // background CJK fallback parse — and these are two independent Renderer
+    // instances (the CPU one, and the GPU's wrapped CPU face) whose parses
+    // land at different times. Idle, the whole test outruns both parses and
+    // compares tofu==tofu; under machine load, exactly one side's parse can
+    // land mid-test and one frame shows the real 日 against the other's
+    // provisional `.notdef` — a delta-229 "divergence" at the 日 cells,
+    // blamed on whichever cursor case was running (proven 2026-08-24:
+    // 8/30 failures at full-core load, 0 with these two lines). The rule
+    // every sibling parity suite already follows: CJK pixel tests block on
+    // lazy fallbacks.
+    cpu.debug_block_on_lazy_fallbacks();
+    gpu.debug_block_on_lazy_fallbacks();
 
     let (rows, cols) = (1usize, 12usize);
     // '=>' at cols 1-2; wide 日 lead+continuation at cols 5-6 (same row the CPU

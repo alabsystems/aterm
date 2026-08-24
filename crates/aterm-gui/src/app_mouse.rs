@@ -786,12 +786,23 @@ impl App {
     ///
     /// The focused pane keeps absolute priority, so a window whose focused pane
     /// has a selection behaves exactly as it always did; the fallback runs only
-    /// where the old code returned nothing at all.
+    /// where the focused pane holds NO selection at all — not merely where its
+    /// selection resolves to empty text, which is a different and much larger set.
     pub(crate) fn window_selection_text(&self, wid: WindowId) -> Option<String> {
-        if let Some(terminal) = self.front_terminal(wid)
-            && let Some(text) = term_lock(&terminal.term).selection_to_string()
-        {
-            return Some(text);
+        // OWNERSHIP is decided by `has_selection()`, never by whether the selection
+        // RESOLVES to text. `selection_to_string_capped` returns `None` when the
+        // resolved text is empty, and every row is trailing-trimmed — so a real,
+        // PAINTED selection over blank or trailing-whitespace cells resolves to
+        // `None`. Gating the early return on the text would let that fall through to
+        // a sibling and hand back a pane the user never touched: a silent
+        // wrong-copy, fired automatically on every drag because `copy_on_select`
+        // defaults on. A pane that holds a selection answers for this window, even
+        // when the honest answer is "nothing to copy".
+        if let Some(terminal) = self.front_terminal(wid) {
+            let term = term_lock(&terminal.term);
+            if term.text_selection().has_selection() {
+                return term.selection_to_string();
+            }
         }
         let plan = self.active_visible_leaf_plan(wid)?;
         for leaf in &plan.leaves {
@@ -803,8 +814,12 @@ impl App {
             let Some(session) = self.pool.get(view.session) else {
                 continue;
             };
-            if let Some(text) = term_lock(&session.term).selection_to_string() {
-                return Some(text);
+            // Same rule for the siblings: the first pane that HOLDS a selection is
+            // the answer, so the scan cannot skip past a whitespace-only highlight
+            // to a further pane's text.
+            let term = term_lock(&session.term);
+            if term.text_selection().has_selection() {
+                return term.selection_to_string();
             }
         }
         None
@@ -1279,7 +1294,11 @@ impl App {
                 .get(&wid)
                 .map(|ws| ws.tab_segments.as_slice())?;
             match crate::tab_bar::hit_test(segs, col)? {
-                crate::tab_bar::TabHit::Select(index) => Some(index),
+                // The connector (status-mark cell) is part of its chip, so
+                // hovering it must not drop the chip's hover state — that cell
+                // hovered as Select before design §3.1 [v5] made it a hit.
+                crate::tab_bar::TabHit::Select(index)
+                | crate::tab_bar::TabHit::Connector(index) => Some(index),
                 // The `+` and the `↻` are not tabs; the pointer is in the strip but
                 // on no tab, so nothing reveals a `✕`.
                 _ => None,
@@ -1934,6 +1953,20 @@ impl App {
                 w.request_redraw();
             }
         }
+        // DRAG-TO-CONNECT (design §3.1–§3.3): while the connector gesture is
+        // armed or dragging from THIS window, motion belongs to it — the §3.1
+        // threshold, target tracking, and the wire all read the stream here.
+        // Checked before every other motion layer: the press that armed it was
+        // already swallowed by the strip, so nothing below may see the drag.
+        // (Native-origin drags track through `Wake::ConnDragTo`, not winit.)
+        if self
+            .conn_drag
+            .as_ref()
+            .is_some_and(|d| !d.native && d.src_window == wid)
+        {
+            self.conn_drag_motion(wid, x, y);
+            return;
+        }
         // Derive the window's pointer geometry ONCE for the whole event. Every
         // consumer below used to re-derive it (4× on the macOS default, 8–10× with
         // the in-grid strip on and a selection drag live), and each derivation
@@ -1960,6 +1993,20 @@ impl App {
             // intervening motion) must not act on the pre-open cell.
             self.refresh_mouse_cell(wid, geom, x, y);
             self.track_tab_menu_hover(wid, x, y);
+            return;
+        }
+        // The connection confirm/configure card and the session picker: the
+        // same one-slot modal boundary.
+        if self.conn_card_claims_pointer(wid) {
+            self.conn_card_pointer_motion(wid, x, y);
+            return;
+        }
+        if self.session_picker_claims_pointer(wid) {
+            self.session_picker_pointer_motion(wid, x, y);
+            return;
+        }
+        if self.connection_map_claims_pointer(wid) {
+            self.connection_map_pointer_motion(wid, x, y);
             return;
         }
         // SETTINGS COLOUR-WHEEL DRAG: while the popover's disk or value slider is
@@ -2716,6 +2763,23 @@ impl App {
         // FSM that yields the authoritative `click_count`. These stay in the
         // handler; the seam consumes `click_count`/`side` as DATA.
         let pressed = state == ElementState::Pressed;
+        // DRAG-TO-CONNECT (design §3.1–§3.3): a live winit-origin connector
+        // gesture owns the left button — the RELEASE is its commit (§3.1:
+        // in-place ⇒ menu, past the threshold ⇒ drop/cancel), checked before
+        // every modal/native boundary below so none of them can eat it. A left
+        // PRESS while one is somehow still armed means the release was lost
+        // (focus steal mid-gesture): dissolve defensively, then let the press
+        // proceed normally. Native-origin drags settle via their own wakes.
+        if button == WinitMouseButton::Left
+            && self.conn_drag.as_ref().is_some_and(|d| !d.native)
+        {
+            if pressed {
+                self.conn_drag_abort();
+            } else {
+                self.conn_drag_release();
+                return;
+            }
+        }
         if self.palette_claims_pointer(wid) {
             let (x, y) = self
                 .windows
@@ -2766,6 +2830,63 @@ impl App {
                 // when the menu popped — the same belt the Settings/About modals
                 // wear, or a divider/selection drag would keep tracking motion
                 // the gate above is no longer delivering.
+                self.settle_pointer_drags(wid);
+            }
+            return;
+        }
+        // CONNECTION CONFIRM/CONFIGURE CARD: the same modal boundary — left
+        // press/release drive the chips + Confirm/Cancel; every other gesture
+        // is swallowed (§3.3: nothing under the card can see the click).
+        if self.conn_card_claims_pointer(wid) {
+            let (x, y) = self
+                .windows
+                .get(&wid)
+                .map_or((0.0, 0.0), |window| window.last_cursor_px);
+            if button == WinitMouseButton::Left {
+                if pressed {
+                    self.conn_card_pointer_press(wid, x, y);
+                } else {
+                    self.conn_card_pointer_release(wid, x, y);
+                }
+            }
+            if !pressed {
+                self.settle_pointer_drags(wid);
+            }
+            return;
+        }
+        // SESSION PICKER: same boundary; left press/release choose a row.
+        if self.session_picker_claims_pointer(wid) {
+            let (x, y) = self
+                .windows
+                .get(&wid)
+                .map_or((0.0, 0.0), |window| window.last_cursor_px);
+            if button == WinitMouseButton::Left {
+                if pressed {
+                    self.session_picker_pointer_press(wid, x, y);
+                } else {
+                    self.session_picker_pointer_release(wid, x, y);
+                }
+            }
+            if !pressed {
+                self.settle_pointer_drags(wid);
+            }
+            return;
+        }
+        // CONNECTION MAP: same boundary; left press/release activate a chip
+        // (raise) or a flow row (the inline disconnect confirm two-step).
+        if self.connection_map_claims_pointer(wid) {
+            let (x, y) = self
+                .windows
+                .get(&wid)
+                .map_or((0.0, 0.0), |window| window.last_cursor_px);
+            if button == WinitMouseButton::Left {
+                if pressed {
+                    self.connection_map_pointer_press(wid, x, y);
+                } else {
+                    self.connection_map_pointer_release(wid, x, y);
+                }
+            }
+            if !pressed {
                 self.settle_pointer_drags(wid);
             }
             return;
@@ -3580,6 +3701,9 @@ impl App {
         // so do HORIZONTAL ones over the palette / a native view — the terminal
         // seam is the only consumer with an answer for that axis (audit I7).
         let palette = self.palette_claims_pointer(wid);
+        let conn_card = self.conn_card_claims_pointer(wid);
+        let session_picker = self.session_picker_claims_pointer(wid);
+        let connection_map = self.connection_map_claims_pointer(wid);
         let Some((dir, lines)) = self.wheel_notches(wid, delta) else {
             return;
         };
@@ -3602,15 +3726,32 @@ impl App {
         // RIGHT answer for a gesture the user really made — but they are new
         // observable effects, so they are named here rather than implied away.
         let vertical_up = dir.vertical_up();
-        if vertical_up.is_none() && (palette || self.active_native_view(wid).is_some()) {
+        if vertical_up.is_none()
+            && (palette
+                || conn_card
+                || session_picker
+                || connection_map
+                || self.active_native_view(wid).is_some())
+        {
             return;
         }
         if let Some(up) = vertical_up {
+            let signed = if up { -(lines as isize) } else { lines as isize };
             if palette {
-                self.palette_pointer_wheel(
-                    wid,
-                    if up { -(lines as isize) } else { lines as isize },
-                );
+                self.palette_pointer_wheel(wid, signed);
+                return;
+            }
+            // The confirm/configure card has no scroll model: the modal still
+            // swallows the wheel (never a scroll-through layer).
+            if conn_card {
+                return;
+            }
+            if session_picker {
+                self.session_picker_pointer_wheel(wid, signed);
+                return;
+            }
+            if connection_map {
+                self.connection_map_pointer_wheel(wid, signed);
                 return;
             }
             if self.active_native_view(wid).is_some() {

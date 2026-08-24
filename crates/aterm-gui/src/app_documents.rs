@@ -2587,6 +2587,7 @@ impl App {
                 AppKind::Recovery => crate::tab_model::TabIconKind::Recovery,
             }),
             indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
             closable: true,
             // The tooltip carries the EXACT URI this tab was opened with. The
             // grant's canonical form (symlinks resolved — `/private/var/…` on

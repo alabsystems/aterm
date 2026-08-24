@@ -28,8 +28,15 @@ fn key(s: &State) -> Vec<(&'static str, i64)> {
 #[test]
 fn window_routing_twin_holds_invariants_over_all_reachable_states() {
     let m = window_routing_model();
-    // The two real lifecycle actions in the model (Cmd-N / CloseRequested).
-    let actions = ["CreateWindow", "CloseWindow"];
+    // The four real acts in the model: the two lifecycle actions (Cmd-N /
+    // CloseRequested) plus the session-connections acts (the `spawn connected=
+    // place=window` mint and the `raise <sid>` focus re-point, design §9).
+    let actions = [
+        "CreateWindow",
+        "CloseWindow",
+        "ConnectedCreateWindow",
+        "RaiseSession",
+    ];
     let invariants = ["ExitIffEmpty", "FrontmostLive", "FrontmostAllocated"];
 
     let init = m.init_state();

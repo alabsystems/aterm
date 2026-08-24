@@ -112,73 +112,109 @@ pub fn run_provision(repo: &Path, id: &str, check_only: bool) -> Result<()> {
     }
     let roster_path = repo.join("dist").join(roster::ROSTER_ASSET);
     let kept_path = kept_roster_path(&home);
-    // dist/ is gitignored and `git clean -xdf` sweeps it — but the generation a mint
-    // writes is re-signed LOCALLY and is published only by a later cut, so between the
-    // two it can exist nowhere else on earth. Losing it leaves a machine whose key no
-    // roster names, and the only remedy this tool could offer was "restore from the
-    // machine holding the newest generation", which names no machine on a one- or
-    // two-machine fleet. So a proven copy is kept beside the key it authorizes (below),
-    // and dist/ is restored from it here — re-verified under the paper master by
-    // `read_local_candidate`, exactly like any other pair. A restore is a WRITE into
-    // dist/, so `--check` declines it for the same reason it declines `install_pair`.
-    if !check_only && restore_kept_pair(&kept_path, &roster_path)? {
-        step(
-            "roster",
-            &format!("dist/ was empty — restored this machine's copy from {}", kept_path.display()),
-        );
-    }
-    let local = read_local_candidate(&roster_path)?;
-    let fetched = fetch_channel_candidate(&slug);
-    let seeded_from_channel = local.is_none() && fetched.is_ok();
-    // A MINT MUST SEE THE CHANNEL. "The fetch failed" is not "the channel has no
-    // roster": a 429/403/timeout on the anonymous asset path says nothing about
-    // what generation the fleet is on, and minting from a stale local pair while a
-    // peer has already published the next generation forks the lineage — two
-    // master-signed documents at one number, each de-authorizing the other's
-    // successors (2026-08-19 round-3 audit). Only a clean 404 (no roster published
-    // yet) lets a mint proceed from the local pair alone.
-    let channel_unreadable = match &fetched {
-        Err(e) if !e.starts_with(NO_CHANNEL_ROSTER) => Some(e.clone()),
-        _ => None,
-    };
-    if let Some(why) = channel_unreadable.as_ref() {
-        // Said HERE, at phase 1, so `--check` shows it and the real run refuses before
-        // the acquiring phases (an Apple identity, a notary profile) are spent on a
-        // mint that will be refused anyway.
-        step(
-            "roster",
-            &format!(
-                "the public channel could not be read ({why}); a mint will be REFUSED until it \
-                 answers — auditing the rest, minting nothing"
-            ),
-        );
-    }
-    let (chosen, install, how) = choose_candidate(&roster_path, &slug, local, fetched)?;
-    if install && !check_only {
-        install_pair(&roster_path, &chosen)?;
-    }
-    // `how` describes the DECISION, not the write, because under `--check` there is no
-    // write and the line was claiming one ("seeded from the latest channel release") on a
-    // run whose banner says "no writes".
-    step(
-        "roster",
-        &if install && check_only {
-            format!("{how} — not written (--check)")
+    // ---- the roster phase's WRITER LOCK -------------------------------------------
+    // Everything from here to the end of the block below reads and writes the same
+    // `dist/aterm-machines.toml` + `.sig` pair the in-process mint re-signs later, so it
+    // is serialized against exactly the same writers and published through the same redo
+    // transaction (see `lock_roster_pair` and `write_pair`). Taking it here also
+    // completes forward whatever a previous run's death left committed, BEFORE
+    // `read_local_candidate` looks at the pair — a torn pair is otherwise this phase's
+    // hard stop, and "the roster did not verify" is the sentence that sends an operator
+    // to re-check a paper phrase that was never wrong.
+    //
+    // The block is a block so that the guard's lifetime is bounded by eye: `flock` is per
+    // open file description, so holding it into `mint()` — whose `write_rest` takes the
+    // same lock on the same path — would deadlock this process against itself.
+    let (chosen, channel_unreadable) = {
+        let roster_lock = if check_only {
+            // `--check` promises no writes, and completing a redo transaction IS a write, so
+            // this mode may not take the writer lock. It applies the reader's refusal
+            // instead: a pending transaction is REPORTED, with the command that repairs it.
+            // So it does not serialize against a concurrent writer, and does not pretend
+            // to — an audit reads what is on disk at the moment it looks, and one that
+            // blocked behind a mint would be a worse audit, not a safer one.
+            atpkg_keys::provision::refuse_pending_roster_transaction(&utf8_path(&roster_path)?)
+                .map_err(Error::new)?;
+            None
         } else {
-            how
-        },
-    );
-    if seeded_from_channel {
-        // The one thing a channel seed cannot see: an incumbent machine holding an
-        // UNPUBLISHED roster edit. Joining the older public generation would mint a
-        // same-sequence fork that de-authorizes the incumbent's — so the residual is
-        // stated before the mint, where stopping is still free.
+            Some(lock_roster_pair(&roster_path)?)
+        };
+        // dist/ is gitignored and `git clean -xdf` sweeps it — but the generation a mint
+        // writes is re-signed LOCALLY and is published only by a later cut, so between the
+        // two it can exist nowhere else on earth. Losing it leaves a machine whose key no
+        // roster names, and the only remedy this tool could offer was "restore from the
+        // machine holding the newest generation", which names no machine on a one- or
+        // two-machine fleet. So a proven copy is kept beside the key it authorizes (below),
+        // and dist/ is restored from it here — re-verified under the paper master by
+        // `read_local_candidate`, exactly like any other pair. A restore is a WRITE into
+        // dist/, so `--check` declines it for the same reason it declines `install_pair`.
+        if let Some(lock) = roster_lock.as_ref()
+            && restore_kept_pair(lock, &kept_path, &roster_path)?
+        {
+            step(
+                "roster",
+                &format!(
+                    "dist/ was empty — restored this machine's copy from {}",
+                    kept_path.display()
+                ),
+            );
+        }
+        let local = read_local_candidate(&roster_path)?;
+        let fetched = fetch_channel_candidate(&slug);
+        let seeded_from_channel = local.is_none() && fetched.is_ok();
+        // A MINT MUST SEE THE CHANNEL. "The fetch failed" is not "the channel has no
+        // roster": a 429/403/timeout on the anonymous asset path says nothing about
+        // what generation the fleet is on, and minting from a stale local pair while a
+        // peer has already published the next generation forks the lineage — two
+        // master-signed documents at one number, each de-authorizing the other's
+        // successors (2026-08-19 round-3 audit). Only a clean 404 (no roster published
+        // yet) lets a mint proceed from the local pair alone.
+        let channel_unreadable = match &fetched {
+            Err(e) if !e.starts_with(NO_CHANNEL_ROSTER) => Some(e.clone()),
+            _ => None,
+        };
+        if let Some(why) = channel_unreadable.as_ref() {
+            // Said HERE, at phase 1, so `--check` shows it and the real run refuses before
+            // the acquiring phases (an Apple identity, a notary profile) are spent on a
+            // mint that will be refused anyway.
+            step(
+                "roster",
+                &format!(
+                    "the public channel could not be read ({why}); a mint will be REFUSED until it \
+                     answers — auditing the rest, minting nothing"
+                ),
+            );
+        }
+        let (chosen, install, how) = choose_candidate(&roster_path, &slug, local, fetched)?;
+        if install && let Some(lock) = roster_lock.as_ref() {
+            install_pair(lock, &roster_path, &chosen)?;
+        }
+        // `how` describes the DECISION, not the write, because under `--check` there is no
+        // write and the line was claiming one ("seeded from the latest channel release") on a
+        // run whose banner says "no writes".
         step(
-            "",
-            "note: the channel cannot show an incumbent's UNPUBLISHED roster edit — if \
-             one exists, STOP and copy that machine's dist/ pair here instead",
+            "roster",
+            &if install && check_only {
+                format!("{how} — not written (--check)")
+            } else {
+                how
+            },
         );
-    }
+        if seeded_from_channel {
+            // The one thing a channel seed cannot see: an incumbent machine holding an
+            // UNPUBLISHED roster edit. Joining the older public generation would mint a
+            // same-sequence fork that de-authorizes the incumbent's — so the residual is
+            // stated before the mint, where stopping is still free.
+            step(
+                "",
+                "note: the channel cannot show an incumbent's UNPUBLISHED roster edit — if \
+                 one exists, STOP and copy that machine's dist/ pair here instead",
+            );
+        }
+        (chosen, channel_unreadable)
+    };
+    // The roster writer lock is released HERE, at the end of the phase that took it, and
+    // deliberately before `mint()`.
 
     // ---- what this machine already is ---------------------------------------------
     // No phase header, and no line on success. Every failure here is a hard `Err` carrying
@@ -1181,30 +1217,120 @@ fn choose_candidate(
     }
 }
 
-/// Write the chosen pair into `dist/`: BOTH halves staged and fsynced first, then the
-/// signature promoted, then the body — so at every instant the on-disk pair is either
-/// the old document, unverifiable (torn, self-healing: the next run hard-stops on it
-/// and the operator re-copies or removes), or the new document. Never a silently
-/// half-new pair.
+/// Take the roster pair's WRITER lock — the same `flock` rendezvous, on the same path,
+/// that every `atpkg-keys` roster ceremony takes — and complete forward any redo
+/// transaction a previous run's death left committed.
+///
+/// This verb writes the roster pair BEFORE it mints (phase 1 seeds `dist/` from the kept
+/// copy or the channel; the mint re-signs the same two files 400 lines later), so
+/// "the transaction layer protects the mint" was never enough: a death between phase 1's
+/// two renames left the new document beside the old signature with NO committed
+/// transaction, which is the one state nothing downstream can repair and every operator
+/// misreads as a mistyped phrase. Routing these writes through the same lock closes it,
+/// and taking the lock at the top of the phase means what this run READS is already a
+/// pair some earlier death cannot have torn.
+///
+/// The guard is scoped to its phase and never held into [`mint`]: `flock` is per open
+/// file description, so this process taking the same lock a second time — which
+/// `atpkg_keys::provision::write_rest` does — would block forever on itself.
 #[cfg(unix)]
-fn install_pair(roster_path: &Path, c: &Candidate) -> Result<()> {
-    write_pair(roster_path, &c.bytes, &c.sig)
+fn lock_roster_pair(roster_path: &Path) -> Result<atpkg_keys::provision::RosterLock> {
+    atpkg_keys::provision::lock_roster(&utf8_path(roster_path)?).map_err(Error::new)
+}
+
+/// The pair a write is about to REPLACE, read under the lock that guards it: the redo
+/// transaction's recorded predecessor and its compare-and-swap premise in one.
+///
+/// `None` is both halves absent — a first write. One half present is refused rather than
+/// overwritten: it is the torn state this layer exists to eliminate, so if the layer did
+/// not put it there, something outside it did, and the front half may be the only copy
+/// of an incumbent's unpublished generation ([`read_local_candidate`] refuses it for the
+/// same reason, in the same phase).
+#[cfg(unix)]
+fn pair_premise(roster_path: &Path) -> Result<Option<atpkg_keys::provision::RosterSnapshot>> {
+    let sig_path = machines::RosterDocument::signature_path(roster_path);
+    match (std::fs::read(roster_path), std::fs::read(&sig_path)) {
+        (Ok(raw), Ok(sig)) => Ok(Some(atpkg_keys::provision::RosterSnapshot { raw, sig })),
+        (Err(body), Err(signature))
+            if body.kind() == std::io::ErrorKind::NotFound
+                && signature.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(None)
+        }
+        _ => Err(Error::new(format!(
+            "the roster pair at {} is missing one half or unreadable; restore BOTH \
+             files (or remove both) before this pair is replaced",
+            roster_path.display()
+        ))),
+    }
+}
+
+/// Write the chosen pair into `dist/` under the caller's roster lock.
+#[cfg(unix)]
+fn install_pair(
+    lock: &atpkg_keys::provision::RosterLock,
+    roster_path: &Path,
+    c: &Candidate,
+) -> Result<()> {
+    write_pair(lock, roster_path, &c.bytes, &c.sig)
 }
 
 /// The write itself, over bytes that some caller has already proven — `install_pair` for
 /// an admitted candidate, [`keep_roster_pair`] for a pair `authorize_cut` just accepted.
+///
+/// It publishes through `atpkg-keys`' redo transaction: the complete new pair and the
+/// exact predecessor it replaces are fsynced into a staging directory and published by
+/// ONE rename, and only then do the two canonical names move. Before that rename a crash
+/// loses litter; after it, the next run to take this lock installs the exact signed pair
+/// — which is the guarantee staging-then-two-renames could state for each FILE and never
+/// for the PAIR.
 #[cfg(unix)]
-fn write_pair(roster_path: &Path, bytes: &[u8], sig: &[u8]) -> Result<()> {
+fn write_pair(
+    lock: &atpkg_keys::provision::RosterLock,
+    roster_path: &Path,
+    bytes: &[u8],
+    sig: &[u8],
+) -> Result<()> {
     if let Some(dir) = roster_path.parent() {
         std::fs::create_dir_all(dir)
             .map_err(|e| Error::new(format!("create {}: {e}", dir.display())))?;
     }
-    let sig_path = machines::RosterDocument::signature_path(roster_path);
-    let staged_body = stage(roster_path, bytes)?;
-    let staged_sig = stage(&sig_path, sig)?;
-    promote(&staged_sig, &sig_path)?;
-    promote(&staged_body, roster_path)?;
-    Ok(())
+    let path = utf8_path(roster_path)?;
+    let expected = pair_premise(roster_path)?;
+    atpkg_keys::provision::publish_roster_locked(lock, &path, expected.as_ref(), bytes, sig)
+        .map_err(Error::new)
+}
+
+/// Publish a roster pair that the CALLER has already proven, taking the pair's writer
+/// lock for the duration of this one write.
+///
+/// The locked [`write_pair`] is the form a phase uses when it reads, decides and writes
+/// under ONE lock. This is for the writer that has no such span — `cargo ship recover`
+/// rewriting `dist/` from an already-published release — so that it, too, publishes
+/// through the redo transaction instead of two bare `write`s that a death can tear.
+/// Never call it while another roster lock is held in this process: `flock` is per open
+/// file description and would block on itself.
+#[cfg(unix)]
+pub(crate) fn publish_proven_pair(roster_path: &Path, bytes: &[u8], sig: &[u8]) -> Result<()> {
+    let lock = lock_roster_pair(roster_path)?;
+    write_pair(&lock, roster_path, bytes, sig)
+}
+
+/// The roster transaction layer is `atpkg-keys`, which is POSIX-only (the master phrase
+/// comes from `/dev/tty`), so a non-POSIX build gets the per-file discipline and an
+/// honest statement that the PAIR window is open there. Nothing in this workspace cuts,
+/// provisions or recovers a release off POSIX.
+#[cfg(not(unix))]
+pub(crate) fn publish_proven_pair(
+    roster_path: &std::path::Path,
+    bytes: &[u8],
+    sig: &[u8],
+) -> crate::ledger::Result<()> {
+    let mut sig_path = roster_path.as_os_str().to_owned();
+    sig_path.push(".sig");
+    std::fs::write(roster_path, bytes)
+        .and_then(|()| std::fs::write(std::path::PathBuf::from(sig_path), sig))
+        .map_err(|e| crate::ledger::Error::new(format!("write {}: {e}", roster_path.display())))
 }
 
 /// This machine's durable copy of the roster generation its key is named in — beside the
@@ -1221,6 +1347,18 @@ fn kept_roster_path(home: &str) -> PathBuf {
 #[cfg(unix)]
 fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
     let doc = machines::RosterDocument::read(roster_path)?;
+    // The KEPT pair's own lock, taken before this function reads it, so the compare that
+    // decides "already identical" and the write that follows cannot straddle another
+    // process's copy. Only one roster lock is ever held at a time in this verb: `dist/`'s
+    // was released at the end of phase 1, and the pair being copied FROM was proved by
+    // `authorize_cut` in this process moments ago.
+    //
+    // A TORN kept copy is now refused by `write_pair`'s premise rather than overwritten,
+    // and that is the right way round: the no-downgrade rule below needs BOTH halves to
+    // read a generation, so a copy missing one cannot be compared — and overwriting it
+    // blind is exactly how the only witness to a newer generation would be destroyed.
+    // The refusal is a line on the transcript, not a failed run.
+    let kept_lock = lock_roster_pair(kept_path)?;
     if let Ok(kept) = machines::RosterDocument::read(kept_path) {
         if kept.bytes == doc.bytes && kept.signature == doc.signature {
             return Ok(false);
@@ -1246,7 +1384,7 @@ fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
             return Ok(false);
         }
     }
-    write_pair(kept_path, &doc.bytes, &doc.signature)?;
+    write_pair(&kept_lock, kept_path, &doc.bytes, &doc.signature)?;
     Ok(true)
 }
 
@@ -1260,36 +1398,19 @@ fn keep_roster_pair(roster_path: &Path, kept_path: &Path) -> Result<bool> {
 /// way. It is re-admitted under `PAPER_MASTER_PUBKEYS` before it is written, exactly like
 /// a pair fetched from the channel.
 #[cfg(unix)]
-fn restore_kept_pair(kept_path: &Path, roster_path: &Path) -> Result<bool> {
+fn restore_kept_pair(
+    lock: &atpkg_keys::provision::RosterLock,
+    kept_path: &Path,
+    roster_path: &Path,
+) -> Result<bool> {
     if roster_path.exists() || machines::RosterDocument::signature_path(roster_path).exists() {
         return Ok(false);
     }
     let Ok(Some(kept)) = read_local_candidate(kept_path) else {
         return Ok(false);
     };
-    install_pair(roster_path, &kept)?;
+    install_pair(lock, roster_path, &kept)?;
     Ok(true)
-}
-
-/// Write `bytes` to a staged sibling of `path` and fsync it.
-#[cfg(unix)]
-fn stage(path: &Path, bytes: &[u8]) -> Result<PathBuf> {
-    use std::io::Write as _;
-    let mut staged = path.as_os_str().to_owned();
-    staged.push(".provision.tmp");
-    let staged = PathBuf::from(staged);
-    let mut f = std::fs::File::create(&staged)
-        .map_err(|e| Error::new(format!("create {}: {e}", staged.display())))?;
-    f.write_all(bytes)
-        .and_then(|()| f.sync_all())
-        .map_err(|e| Error::new(format!("write {}: {e}", staged.display())))?;
-    Ok(staged)
-}
-
-#[cfg(unix)]
-fn promote(staged: &Path, path: &Path) -> Result<()> {
-    std::fs::rename(staged, path)
-        .map_err(|e| Error::new(format!("rename {} into place: {e}", staged.display())))
 }
 
 /// One audit line: proven, missing-with-remedy, or impossible on this host. A `Skip`
@@ -1412,6 +1533,21 @@ fn verifiers_check(bin: &Path) -> Check {
 /// is never replaced. `--check` reports the remedy without writing, like every
 /// other no-writes path.
 #[cfg(unix)]
+/// The remedy for "the driver is there, its directory is not on PATH", written once
+/// because both checks in [`doc_tool_check`] hand out the identical one.
+///
+/// PERSISTENTLY. "add <dir> to PATH" gets done with an `export` that dies with the
+/// shell, so the next run reports the identical gap and the operator concludes the tool
+/// is wrong about the machine. Say the durable form, and say why it has to be durable.
+fn path_persist_fix(dir: &Path) -> String {
+    format!(
+        "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
+         it has to persist: a plain `cargo test`'s doctest lane resolves \
+         `trustdoc` from PATH, in whatever shell it runs in",
+        d = dir.display()
+    )
+}
+
 fn doc_tool_check(home: &str, check_only: bool) -> Check {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     if let Some(found) = resolve_on_path("trustdoc", &path_var) {
@@ -1429,16 +1565,7 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
                 "{} is a working doc driver, but its directory is not on PATH",
                 farm.display()
             ),
-            // PERSISTENTLY. "add <dir> to PATH" gets done with an `export` that dies
-            // with the shell, so the next run reports the identical gap and the operator
-            // concludes the tool is wrong about the machine. Say the durable form, and
-            // say why it has to be durable.
-            fix: format!(
-                "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
-                 it has to persist: a plain `cargo test`'s doctest lane resolves \
-                 `trustdoc` from PATH, in whatever shell it runs in",
-                d = farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
-            ),
+            fix: path_persist_fix(farm.parent().unwrap_or(Path::new("~/.local/bin"))),
         };
     }
     let stage2 = match gates::trust_stage2_bin() {
@@ -1489,16 +1616,7 @@ fn doc_tool_check(home: &str, check_only: bool) -> Check {
                 farm.display(),
                 target.display()
             ),
-            // PERSISTENTLY. "add <dir> to PATH" gets done with an `export` that dies
-            // with the shell, so the next run reports the identical gap and the operator
-            // concludes the tool is wrong about the machine. Say the durable form, and
-            // say why it has to be durable.
-            fix: format!(
-                "echo 'export PATH=\"{d}:$PATH\"' >> ~/.zshrc && exec zsh\n\
-                 it has to persist: a plain `cargo test`'s doctest lane resolves \
-                 `trustdoc` from PATH, in whatever shell it runs in",
-                d = farm.parent().unwrap_or(Path::new("~/.local/bin")).display()
-            ),
+            fix: path_persist_fix(farm.parent().unwrap_or(Path::new("~/.local/bin"))),
         }
     }
 }
@@ -1535,14 +1653,17 @@ fn executable(p: &Path) -> bool {
 /// symlink loop) proves nothing about the target's existence, so those refuse
 /// too rather than destroy a link that may be live.
 ///
-/// The write is stage-and-promote (the `install_pair` discipline): the new
-/// symlink is born complete under a staged name and RENAMED into place, so the
-/// farm entry is never half-made and a dangling link is replaced in one atomic
-/// step rather than a delete-then-create window. The classify→promote gap is
-/// the residual a single-operator `~/.local/bin` accepts — an entry someone
-/// races into that gap is either replaced by the promote or fails it (a
-/// raced-in directory makes the rename error), never half-made; the same
-/// residual `install_pair` documents for `dist/`.
+/// The write is stage-and-promote: the new symlink is born complete under a
+/// staged name and RENAMED into place, so the farm entry is never half-made and
+/// a dangling link is replaced in one atomic step rather than a
+/// delete-then-create window. The classify→promote gap is the residual a
+/// single-operator `~/.local/bin` accepts — an entry someone races into that gap
+/// is either replaced by the promote or fails it (a raced-in directory makes the
+/// rename error), never half-made.
+///
+/// One link is ONE name, so one rename is the whole story. The roster PAIR is
+/// two names and no syscall renames two at once, which is why it publishes
+/// through the redo transaction instead of this discipline (see [`write_pair`]).
 #[cfg(unix)]
 fn link_farm(farm: &Path, target: &Path) -> std::result::Result<(), String> {
     match std::fs::symlink_metadata(farm) {
@@ -2492,13 +2613,16 @@ mod tests {
         let dist = dir.join("dist").join("aterm-machines.toml");
         let home = dir.join("home");
         let kept = kept_roster_path(home.to_str().unwrap());
+        // The phase's own writer lock, held across its reads and writes exactly as
+        // `run_provision` holds it — a `dist/` write cannot be spelled without one.
+        let lock = lock_roster_pair(&dist).unwrap();
 
         // Nothing kept, nothing local: a no-op, not an error.
-        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
 
         let (master, bytes, sig) = signed_candidate(6);
         let c = admit_candidate(&[&master], bytes, sig).unwrap();
-        install_pair(&dist, &c).unwrap();
+        install_pair(&lock, &dist, &c).unwrap();
 
         // The pair `authorize_cut` accepted is copied beside the key it authorizes…
         assert!(keep_roster_pair(&dist, &kept).unwrap());
@@ -2512,7 +2636,26 @@ mod tests {
         assert!(!keep_roster_pair(&dist, &kept).unwrap());
 
         // dist/ still holds a pair, so nothing is restored over it.
-        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
+
+        // A TORN kept copy is REFUSED, not overwritten. The no-downgrade rule needs both
+        // halves to read a generation, so a copy missing one cannot be compared — and
+        // replacing it blind is exactly how the only witness to a newer generation would
+        // be destroyed. The refusal names both files and the run continues.
+        let kept_sig = machines::RosterDocument::signature_path(&kept);
+        let sig_bytes = std::fs::read(&kept_sig).unwrap();
+        std::fs::remove_file(&kept_sig).unwrap();
+        let refused = keep_roster_pair(&dist, &kept).unwrap_err().to_string();
+        assert!(
+            refused.contains("missing one half or unreadable"),
+            "{refused}"
+        );
+        assert!(!kept_sig.exists(), "a refused copy wrote nothing");
+        std::fs::write(&kept_sig, &sig_bytes).unwrap();
+        assert!(
+            !keep_roster_pair(&dist, &kept).unwrap(),
+            "and it is whole again"
+        );
 
         // Swept. The kept copy is re-admitted under `PAPER_MASTER_PUBKEYS` before it is
         // written — this fixture is signed by a synthetic master, so it is IGNORED rather
@@ -2520,12 +2663,12 @@ mod tests {
         // a source, and a cache that cannot be proven is not one.
         std::fs::remove_file(&dist).unwrap();
         std::fs::remove_file(machines::RosterDocument::signature_path(&dist)).unwrap();
-        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
         assert!(!dist.exists());
 
         // A torn kept copy is ignored for the same reason, and never propagated.
         std::fs::remove_file(machines::RosterDocument::signature_path(&kept)).unwrap();
-        assert!(!restore_kept_pair(&kept, &dist).unwrap());
+        assert!(!restore_kept_pair(&lock, &kept, &dist).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2631,6 +2774,104 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A PROCESS DEATH IN PHASE 1 CONVERGES FORWARD.
+    ///
+    /// `cargo ship provision` writes the roster pair TWICE: phase 1 seeds `dist/` from
+    /// the kept copy or the channel, and the in-process mint re-signs the same two files
+    /// at the end of the same run. Protecting only the mint therefore left the window
+    /// open in the write that happens FIRST — a death between phase 1's two renames left
+    /// seq N+1's document beside seq N's signature, with no transaction for any later run
+    /// to complete, on a gitignored file `git checkout` cannot restore and every operator
+    /// reads as a mistyped phrase.
+    ///
+    /// The crash below is the REAL commit path, stopped: `commit_roster_pair` is what
+    /// `write_pair` calls, and dropping its handle instead of completing it is what a
+    /// killed process leaves, byte for byte. Writing one canonical half by hand is the
+    /// rename that landed before the death.
+    ///
+    /// MUTATION: drop `lock_roster_pair` from phase 1, or give `write_pair` back a bare
+    /// stage-both-then-rename-both, and the torn pair below is never repaired — every
+    /// later run hard-stops in `read_local_candidate` instead.
+    #[test]
+    fn a_death_between_the_phase_one_pair_renames_recovers_forward() {
+        let dir =
+            std::env::temp_dir().join(format!("provision-phase1-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dist = dir.join("dist").join("aterm-machines.toml");
+        let sig_path = machines::RosterDocument::signature_path(&dist);
+
+        // Phase 1's ordinary write, under the phase's own lock.
+        let (master, six, six_sig) = signed_candidate(6);
+        let chosen = admit_candidate(&[&master], six.clone(), six_sig.clone()).unwrap();
+        let lock = lock_roster_pair(&dist).expect("the phase's writer lock");
+        install_pair(&lock, &dist, &chosen).expect("phase 1 installs the chosen pair");
+        assert_eq!(std::fs::read(&dist).unwrap(), six);
+        assert_eq!(std::fs::read(&sig_path).unwrap(), six_sig);
+
+        // THE CRASH: seq 7 committed durably and whole, then the process dies with one
+        // canonical rename done and the other not.
+        let (_, seven, seven_sig) = signed_candidate(7);
+        let premise = atpkg_keys::provision::RosterSnapshot {
+            raw: six.clone(),
+            sig: six_sig.clone(),
+        };
+        let committed = atpkg_keys::provision::commit_roster_pair(
+            &lock,
+            dist.to_str().unwrap(),
+            Some(&premise),
+            &seven,
+            &seven_sig,
+        )
+        .expect("the redo transaction commits");
+        let transaction = committed.transaction_path().to_string();
+        drop(committed);
+        std::fs::write(&dist, &seven).unwrap();
+        drop(lock);
+
+        // The state that used to be permanent: both halves present, from two different
+        // generations, verifying as nothing.
+        let torn = machines::RosterDocument::read(&dist).expect("both halves are present");
+        assert_eq!(torn.bytes, seven);
+        assert_eq!(torn.signature, six_sig);
+        assert!(
+            admit_candidate(&[&master], torn.bytes, torn.signature).is_err(),
+            "a torn pair is exactly what no client — and no operator — can make sense of"
+        );
+        assert!(
+            std::path::Path::new(&transaction).exists(),
+            "the redo log committed before either rename, so it survived the death"
+        );
+
+        // The next run's phase 1 takes the same lock, and taking it IS the recovery: the
+        // exact committed pair is installed before anything is allowed to read it.
+        let lock = lock_roster_pair(&dist).expect("the phase-1 lock replays the committed redo");
+        assert_eq!(std::fs::read(&dist).unwrap(), seven);
+        assert_eq!(std::fs::read(&sig_path).unwrap(), seven_sig);
+        let recovered = machines::RosterDocument::read(&dist).expect("a whole pair");
+        assert_eq!(
+            admit_candidate(&[&master], recovered.bytes, recovered.signature)
+                .expect("the recovered pair verifies")
+                .roster
+                .roster_seq,
+            7,
+            "forward, not sideways: the generation the dead run signed"
+        );
+        assert!(
+            !std::path::Path::new(&transaction).exists(),
+            "a completed transaction is retired, so it cannot replay a second time"
+        );
+
+        // NEGATIVE CONTROL: the phase writes normally over the recovered pair, and leaves
+        // no transaction behind when nothing goes wrong.
+        let (_, eight, eight_sig) = signed_candidate(8);
+        write_pair(&lock, &dist, &eight, &eight_sig).expect("phase 1 writes on");
+        assert_eq!(std::fs::read(&dist).unwrap(), eight);
+        assert_eq!(std::fs::read(&sig_path).unwrap(), eight_sig);
+        assert!(!std::path::Path::new(&transaction).exists());
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn install_pair_writes_the_pair_and_a_rerun_admits_it() {
         let dir = std::env::temp_dir().join(format!("provision-pair-{}", std::process::id()));
@@ -2638,7 +2879,8 @@ mod tests {
         let path = dir.join("aterm-machines.toml");
         let (master, bytes, sig) = signed_candidate(6);
         let c = admit_candidate(&[&master], bytes, sig).unwrap();
-        install_pair(&path, &c).expect("install");
+        let lock = lock_roster_pair(&path).expect("the pair's writer lock");
+        install_pair(&lock, &path, &c).expect("install");
         let doc = machines::RosterDocument::read(&path).expect("pair on disk");
         let again = admit_candidate(&[&master], doc.bytes, doc.signature).expect("re-admits");
         assert_eq!(again.roster.roster_seq, 6);

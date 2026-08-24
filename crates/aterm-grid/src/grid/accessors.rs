@@ -941,6 +941,23 @@ impl Grid {
         self.storage.clear_damage(visible_rows);
     }
 
+    /// D-2 PER-ROW CONTENT REVISIONS for the VISIBLE rows, current as of this
+    /// call (the pending damage session is folded in first).
+    ///
+    /// `rev[r]` changes whenever visible row `r`'s content changed since an
+    /// earlier read; `0` means "no fold has ever vouched for this row", which a
+    /// consumer must read as UNKNOWN and answer by comparing content. See
+    /// [`GridPresentationState::row_rev`](crate::state::GridPresentationState::row_rev)
+    /// for the exact contract and for the row-identity conditions a consumer
+    /// must pin before comparing two reads.
+    ///
+    /// `&mut self` because the fold latches; the grid's CONTENT is untouched.
+    pub fn row_revisions(&mut self) -> &[u64] {
+        let visible_rows = self.storage.visible_rows();
+        self.storage.presentation.fold_row_revisions(visible_rows);
+        &self.storage.presentation.row_rev
+    }
+
     /// Mark the cursor cell as damaged.
     pub fn mark_cursor_damage(&mut self) {
         let cursor = self.storage.cursor();

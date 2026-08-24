@@ -30,6 +30,9 @@
 //! > returns `None` for it.) This crate is the rich policy on top of that floor,
 //! > not a substitute for it.
 
+/// Durable, thread-safe state machine for the embedded fleet operator.
+pub mod operator;
+
 use std::io::{Read, Write};
 use std::time::Duration;
 

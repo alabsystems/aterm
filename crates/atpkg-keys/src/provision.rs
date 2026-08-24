@@ -66,14 +66,22 @@
 //!    phrase between the two: a master that is armed but never printed is unrecoverable,
 //!    while a phrase printed against a durable anchor can always be finished with `join`.
 //!
+//! # THE ROSTER IS A PAIR, AND A CRASH USED TO BE ABLE TO TEAR IT
+//!
+//! Phase 3's roster half is not one write but two — `aterm-machines.toml` and its
+//! detached `.sig`, meaningful only together — so it gets its own machinery: one
+//! crash-released advisory lock every writer takes ([`lock_roster`]) and a durable redo
+//! transaction under it ([`publish_roster_locked`]). The section comment above that layer
+//! is where its reasoning lives.
+//!
 //! # It does not commit, and it does not push
 //!
 //! Deliberately. Arming a trust anchor is a reviewed act, so the tool edits the working
 //! tree and tells the operator to read the diff. [`render_report`] says so in the output.
 
 use crate::fsio::{
-    concat, create_secret_file, ensure_parent_dir, read_bytes, write_all_to, write_bytes,
-    write_bytes_atomic,
+    concat, ensure_parent_dir, read_bytes, sync_parent, write_bytes, write_bytes_atomic,
+    write_owner_file_create_new,
 };
 use crate::master::MasterSeed;
 use crate::pins_edit::{
@@ -279,6 +287,11 @@ pub fn load_roster(
     now: u64,
     expect: RosterExpectation,
 ) -> Result<(Roster, Option<RosterSnapshot>), String> {
+    // BEFORE the pair is read at all: while a transaction is pending, the two files on
+    // disk may be a torn pair, and the failure that surfaces from reading one is
+    // "signature did not verify" — the mistyped-phrase diagnosis this whole layer exists
+    // to stop an operator chasing.
+    refuse_pending_roster_transaction(path)?;
     let sig_path = concat(&[path, ".sig"]);
     if std::fs::metadata(path).is_err() {
         if std::fs::metadata(&sig_path).is_ok() {
@@ -339,69 +352,715 @@ pub fn load_roster(
     Ok((roster, Some(RosterSnapshot { raw, sig })))
 }
 
-/// Emit an already-signed roster and its detached signature, failing AS A PAIR: on any
-/// error return, the pair on disk is a consistent one — the previous roster with its
-/// previous signature (or nothing at all, for a first publish) — never a new document
-/// beside a stale signature.
+// ---------------------------------------------------------------------------
+// THE ROSTER PAIR'S CRASH-SAFE TRANSACTION LAYER
+// ---------------------------------------------------------------------------
+//
+// The roster is TWO files — `aterm-machines.toml` and its detached
+// `aterm-machines.toml.sig` — that are only meaningful together. Per-file atomicity
+// (stage + fsync + rename, see [`crate::fsio::write_bytes_atomic`]) makes each FILE
+// whole; it cannot make the PAIR consistent, because there is no syscall that renames
+// two names at once. Staging both before promoting either narrows the window to the two
+// renames, and an error path between them can roll the document back — but a PROCESS
+// DEATH or a power loss cannot run an error path. The state it leaves is the new
+// document beside the old signature: refused by every client as "signature did not
+// verify", misdiagnosed by every operator as a mistyped phrase, on a file `git checkout`
+// cannot restore because `dist/` is gitignored.
+//
+// So the pair is published through a REDO LOG instead. The complete new pair — and the
+// exact predecessor it replaces — is written into a staging directory, fsynced, and
+// published under one fixed name by a single `rename(2)`. That rename is the commit
+// point: before it, nothing canonical has moved and a crash loses only litter; after
+// it, the exact signed pair is on disk and every later run replays it forward. Replay
+// happens on LOCK ACQUISITION, before any reader may look at the pair, so no caller can
+// observe a torn pair at all.
+//
+// Recording the PREDECESSOR is what makes replay safe rather than reckless. A recovering
+// run compares each canonical half against that predecessor and against the target: if a
+// half is neither, something else authoritative landed while this machine was down (a
+// copy from another machine, a newer join), and replaying would silently destroy it. In
+// that case the transaction is left in place and the operator reconciles deliberately.
+
+/// The ONE fixed name a committed roster transaction takes. Fixed because it is a
+/// rendezvous: recovery must be able to FIND it without knowing which run wrote it.
+fn roster_txn_path(path: &str) -> String {
+    concat(&[path, ".atpkg-keys.txn"])
+}
+
+/// Refuse to READ a roster while a committed transaction is still pending.
 ///
-/// Per-file atomicity (temp + fsync + rename) cannot deliver that by itself: it makes
-/// each FILE whole, not the PAIR consistent. So both files are staged completely before
-/// either is promoted, the document is promoted first, and a failure promoting the
-/// signature ROLLS THE DOCUMENT BACK to its previous bytes (or removes it, when there
-/// were none). The residual this honestly leaves is a CRASH between the two renames —
-/// error paths restore, a process death cannot — and the recovery for that torn state is
-/// to copy `aterm-machines.toml` + `.sig` back from another machine or from the latest
-/// release's assets (git cannot restore them: `dist/` is gitignored).
-pub fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
-    let _ = ensure_parent_dir(path);
-    let sig_path = concat(&[path, ".sig"]);
-    // The previous document, held for the rollback. `None` = first publish.
-    let previous = read_bytes(path).ok();
-
-    // Stage BOTH files to fsync'd siblings before promoting EITHER: a staging failure
-    // (full disk, permissions) leaves the published pair untouched.
-    let body_tmp = crate::fsio::stage_sibling_temp(path, bytes)
-        .map_err(|e| concat(&["write ", path, ": ", &e.to_string()]))?;
-    let sig_tmp = match crate::fsio::stage_sibling_temp(&sig_path, sig) {
-        Ok(tmp) => tmp,
-        Err(e) => {
-            let _ = std::fs::remove_file(&body_tmp);
-            return Err(concat(&["write ", &sig_path, ": ", &e.to_string()]));
-        }
-    };
-
-    // Promote the document first...
-    if let Err(e) = crate::fsio::promote_staged(&body_tmp, path) {
-        let _ = std::fs::remove_file(&sig_tmp);
-        return Err(concat(&["write ", path, ": ", &e.to_string()]));
-    }
-    // ...then its signature — and if THAT fails, the disk holds the new document beside
-    // the old signature, which every verifier refuses as "signature did not verify" and
-    // misdiagnoses as a mistyped phrase. Roll the document back so the pair stays the
-    // one that was published before this run.
-    if let Err(e) = crate::fsio::promote_staged(&sig_tmp, &sig_path) {
-        let restored = match &previous {
-            Some(old) => write_bytes_atomic(path, old).is_ok(),
-            None => std::fs::remove_file(path).is_ok(),
-        };
-        return Err(concat(&[
-            "write ",
-            &sig_path,
+/// Recovery is a WRITE, performed only by [`lock_roster`], so a reader cannot fix this —
+/// but it must not paper over it either. Between a crash and the next writer, the two
+/// canonical files may be a torn pair, and a reader that proceeds reports "does not
+/// verify under the master you typed": an operator sent to re-check a paper phrase that
+/// was never wrong.
+///
+/// Public because the readers are not all in this crate: `cargo ship provision --check`
+/// audits the same pair and promises to write nothing, so it may not take the writer
+/// lock (acquiring it REPAIRS) — it applies this refusal instead, and reports.
+pub fn refuse_pending_roster_transaction(path: &str) -> Result<(), String> {
+    let transaction = roster_txn_path(path);
+    match std::fs::symlink_metadata(&transaction) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(concat(&[
+            "a durable interrupted roster transaction exists at ",
+            &transaction,
+            ". Reading never replays it — recovery is a write, and only the roster writer \
+             lock may perform it. Run any roster command (`setup`, `join`, \
+             `machine-revoke`) to complete the exact signed pair forward, then retry. The \
+             pair on disk is NOT authoritative until that happens, and your master phrase \
+             is not what is wrong.",
+        ])),
+        Err(e) => Err(concat(&[
+            "inspect roster transaction path ",
+            &transaction,
             ": ",
             &e.to_string(),
-            if restored {
-                " — the roster document was ROLLED BACK to its previous bytes, so the \
-                 published pair is the one from before this run"
-            } else {
-                " — AND the roster document could not be rolled back: the pair on disk \
-                 is now a new document beside the previous signature, which no client \
-                 will verify. Restore both files by copying `aterm-machines.toml` and \
-                 `aterm-machines.toml.sig` from another machine or from the latest \
-                 release's assets (git cannot restore them; dist/ is gitignored)"
-            },
+        ])),
+    }
+}
+
+/// Write one member of a staged transaction: owner-only, never over an existing name,
+/// and flushed to the device before the caller may fsync the directory that will publish
+/// it.
+fn write_txn_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // `append(true)` rather than `write(true)` for the FFI-summary reason spelled out in
+    // [`crate::fsio`]; byte-identical for a `create_new` file written once.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+/// Commit a complete roster transition to one durable redo directory, returning its path.
+///
+/// The fixed name appears only after the expected predecessor, both target halves, and
+/// the staging directory itself have been fsynced — so the commit `rename` publishes a
+/// directory that is already whole on the device. Persisting the predecessor is what
+/// lets [`complete_roster_transaction`] tell an interrupted transition apart from a
+/// newer pair that landed while this process was down.
+fn begin_roster_transaction(
+    path: &str,
+    expected: Option<&RosterSnapshot>,
+    bytes: &[u8],
+    sig: &[u8],
+) -> Result<String, String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let committed = roster_txn_path(path);
+    match std::fs::symlink_metadata(&committed) {
+        Ok(_) => {
+            return Err(concat(&[
+                "a prior roster transaction still exists at ",
+                &committed,
+                "; acquire the roster lock to recover it before starting another",
+            ]));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(concat(&[
+                "inspect roster transaction path ",
+                &committed,
+                ": ",
+                &e.to_string(),
+            ]));
+        }
+    }
+    // The STAGING name is unique (pid + clock + attempt), never the fixed one: a run that
+    // dies mid-staging must leave litter, not something recovery would replay.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string();
+    let mut attempt = 0u64;
+    let staged = loop {
+        let candidate = concat(&[
+            path,
+            ".atpkg-keys.",
+            &std::process::id().to_string(),
+            ".",
+            &now,
+            ".",
+            &attempt.to_string(),
+            ".txn",
+        ]);
+        match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
+            Ok(()) => break candidate,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                attempt = attempt.wrapping_add(1);
+            }
+            Err(e) => {
+                return Err(concat(&[
+                    "stage roster transaction beside ",
+                    path,
+                    ": ",
+                    &e.to_string(),
+                ]));
+            }
+        }
+    };
+    let body_path = std::path::Path::new(&staged).join("body");
+    let sig_path = std::path::Path::new(&staged).join("sig");
+    let predecessor_state = std::path::Path::new(&staged).join("predecessor-state");
+    let predecessor_body = std::path::Path::new(&staged).join("predecessor-body");
+    let predecessor_sig = std::path::Path::new(&staged).join("predecessor-sig");
+    let staged_result = write_txn_file(
+        &predecessor_state,
+        if expected.is_some() {
+            b"present\n"
+        } else {
+            b"missing\n"
+        },
+    )
+    .and_then(|()| match expected {
+        Some(snapshot) => write_txn_file(&predecessor_body, &snapshot.raw)
+            .and_then(|()| write_txn_file(&predecessor_sig, &snapshot.sig)),
+        None => Ok(()),
+    })
+    .and_then(|()| write_txn_file(&body_path, bytes))
+    .and_then(|()| write_txn_file(&sig_path, sig))
+    .and_then(|()| std::fs::File::open(&staged)?.sync_all());
+    if let Err(e) = staged_result {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(concat(&[
+            "write staged roster transaction ",
+            &staged,
+            ": ",
+            &e.to_string(),
         ]));
     }
+    // THE COMMIT POINT. One rename of a whole directory, then the parent fsync that makes
+    // the new name itself survive a power loss.
+    if let Err(e) = std::fs::rename(&staged, &committed).and_then(|()| sync_parent(&committed)) {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(concat(&[
+            "commit roster redo transaction ",
+            &committed,
+            ": ",
+            &e.to_string(),
+        ]));
+    }
+    Ok(committed)
+}
+
+/// `Some(bytes)` if the file is there, `None` if it is genuinely absent — and an ERROR
+/// for anything else, because "unreadable" must never be scored as "absent" by the
+/// predecessor comparison below.
+fn read_optional_bytes(path: &str) -> Result<Option<Vec<u8>>, String> {
+    match read_bytes(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(concat(&[
+            "inspect roster transaction premise ",
+            path,
+            ": ",
+            &e.to_string(),
+        ])),
+    }
+}
+
+/// The pair a committed transaction expected to replace: `None` when it was published
+/// over nothing (a first roster), `Some` for its exact previous bytes.
+fn transaction_predecessor(transaction: &str) -> Result<Option<RosterSnapshot>, String> {
+    let state_path = std::path::Path::new(transaction).join("predecessor-state");
+    let state_path = state_path
+        .to_str()
+        .ok_or("roster transaction predecessor-state path is not UTF-8")?;
+    let state = read_bytes(state_path).map_err(|e| {
+        concat(&[
+            "recover roster transaction ",
+            transaction,
+            ": read predecessor state: ",
+            &e.to_string(),
+        ])
+    })?;
+    match state.as_slice() {
+        b"missing\n" => Ok(None),
+        b"present\n" => {
+            let body_path = std::path::Path::new(transaction).join("predecessor-body");
+            let sig_path = std::path::Path::new(transaction).join("predecessor-sig");
+            let body_path = body_path
+                .to_str()
+                .ok_or("roster transaction predecessor-body path is not UTF-8")?;
+            let sig_path = sig_path
+                .to_str()
+                .ok_or("roster transaction predecessor-signature path is not UTF-8")?;
+            let raw = read_bytes(body_path).map_err(|e| {
+                concat(&[
+                    "recover roster transaction ",
+                    transaction,
+                    ": read predecessor body: ",
+                    &e.to_string(),
+                ])
+            })?;
+            let sig = read_bytes(sig_path).map_err(|e| {
+                concat(&[
+                    "recover roster transaction ",
+                    transaction,
+                    ": read predecessor signature: ",
+                    &e.to_string(),
+                ])
+            })?;
+            Ok(Some(RosterSnapshot { raw, sig }))
+        }
+        _ => Err(concat(&[
+            "roster transaction ",
+            transaction,
+            " has an invalid predecessor-state marker; leave it in place and investigate",
+        ])),
+    }
+}
+
+/// Is this canonical half one the transaction is entitled to overwrite — either the
+/// predecessor it recorded, or the target it is trying to install (the crash landed
+/// after this half's rename)? Anything else is a THIRD state nobody in this transaction
+/// wrote, and replaying over it would destroy it.
+fn transaction_half_is_known(
+    current: Option<&[u8]>,
+    predecessor: Option<&[u8]>,
+    target: &[u8],
+) -> bool {
+    current == predecessor || current == Some(target)
+}
+
+/// Drop a completed transaction's fixed name, so nothing replays it a second time.
+///
+/// The rename-then-fsync-then-delete order is deliberate: once the FIXED name is durably
+/// gone, the leftover directory is inert, and its best-effort removal cannot leave a
+/// half-deleted transaction under a name recovery still trusts.
+fn retire_roster_transaction(transaction: &str) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let retired = concat(&[
+        transaction,
+        ".retired.",
+        &std::process::id().to_string(),
+        ".",
+        &now.to_string(),
+    ]);
+    std::fs::rename(transaction, &retired).map_err(|e| {
+        concat(&[
+            "retire completed roster transaction ",
+            transaction,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    sync_parent(transaction).map_err(|e| {
+        concat(&[
+            "persist retirement of completed roster transaction ",
+            transaction,
+            ": ",
+            &e.to_string(),
+            "; the canonical pair is complete, but leave the retired directory in place",
+        ])
+    })?;
+    let _ = std::fs::remove_dir_all(&retired);
+    let _ = sync_parent(&retired);
     Ok(())
+}
+
+/// Complete a committed pair FORWARD, if one is pending.
+///
+/// This runs on every write-lock acquisition before the caller may read the roster, so a
+/// process death after either canonical rename converges on the exact signed pair the
+/// redo directory preserved. It is idempotent: replaying a pair that is already fully
+/// installed rewrites the same bytes and retires the transaction.
+fn complete_roster_transaction(path: &str) -> Result<(), String> {
+    let transaction = roster_txn_path(path);
+    match std::fs::symlink_metadata(&transaction) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(concat(&[
+                "inspect roster transaction path ",
+                &transaction,
+                ": ",
+                &e.to_string(),
+            ]));
+        }
+    }
+    let body_source = std::path::Path::new(&transaction).join("body");
+    let sig_source = std::path::Path::new(&transaction).join("sig");
+    let body_source = body_source
+        .to_str()
+        .ok_or("roster transaction body path is not UTF-8")?;
+    let sig_source = sig_source
+        .to_str()
+        .ok_or("roster transaction signature path is not UTF-8")?;
+    let bytes = read_bytes(body_source).map_err(|e| {
+        concat(&[
+            "recover roster transaction ",
+            &transaction,
+            ": read body: ",
+            &e.to_string(),
+        ])
+    })?;
+    let sig = read_bytes(sig_source).map_err(|e| {
+        concat(&[
+            "recover roster transaction ",
+            &transaction,
+            ": read signature: ",
+            &e.to_string(),
+        ])
+    })?;
+    let predecessor = transaction_predecessor(&transaction)?;
+    let sig_path = concat(&[path, ".sig"]);
+    let current_body = read_optional_bytes(path)?;
+    let current_sig = read_optional_bytes(&sig_path)?;
+    let predecessor_body = predecessor.as_ref().map(|snapshot| snapshot.raw.as_slice());
+    let predecessor_sig = predecessor.as_ref().map(|snapshot| snapshot.sig.as_slice());
+    if !transaction_half_is_known(current_body.as_deref(), predecessor_body, &bytes)
+        || !transaction_half_is_known(current_sig.as_deref(), predecessor_sig, &sig)
+    {
+        return Err(concat(&[
+            "roster transaction ",
+            &transaction,
+            " cannot be replayed: the canonical pair is neither its exact predecessor, a \
+             partial target, nor its exact target. A newer or unrelated authoritative pair \
+             may have landed while the transaction was interrupted. Nothing was overwritten; \
+             preserve all files and reconcile deliberately.",
+        ]));
+    }
+    write_bytes_atomic(path, &bytes).map_err(|e| {
+        concat(&[
+            "complete roster body from durable transaction ",
+            &transaction,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    write_bytes_atomic(&sig_path, &sig).map_err(|e| {
+        concat(&[
+            "complete roster signature from durable transaction ",
+            &transaction,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    // Retirement is only legitimate once the pair is PROVED installed: retiring on the
+    // strength of two Ok returns would drop the redo log on the word of the same
+    // filesystem that just lost the pair.
+    if read_bytes(path).ok().as_deref() != Some(bytes.as_slice())
+        || read_bytes(&sig_path).ok().as_deref() != Some(sig.as_slice())
+    {
+        return Err(concat(&[
+            "roster transaction ",
+            &transaction,
+            " did not reproduce its exact pair; leave it in place and investigate",
+        ]));
+    }
+    retire_roster_transaction(&transaction)
+}
+
+/// How a [`RosterLock`] holds its `flock`: a writer's managed rendezvous (created if
+/// absent, transaction replayed on acquisition) or a read-only claim on one that must
+/// already exist.
+enum RosterGuard {
+    Managed { _guard: aterm_update_core::FileLock },
+    Existing { _file: std::fs::File },
+}
+
+/// The advisory lock a roster writer holds across its whole read → edit → sign →
+/// publish sequence.
+///
+/// Without it, two runs could each read sequence N, each sign N+1, and each pass a
+/// compare-then-publish premise check in the gap before the other's rename — a
+/// same-sequence fork the monotonic ratchet cannot see, in which the second publish
+/// silently de-authorizes the machine the first one added. `flock` is released by the
+/// kernel when the file closes, INCLUDING on a crash, so serializing here does not buy a
+/// stale-lock recovery ceremony.
+///
+/// # Which writers take it
+///
+/// Named, not asserted, because "every writer" is a claim about code this crate cannot
+/// see, and a doc that states an invariant the workspace does not hold is worse than one
+/// that states the boundary. As of this commit, every writer of a roster PAIR that ships
+/// in this workspace's binaries goes through this lock and the redo transaction behind it
+/// (test fixtures elsewhere write pair bytes directly, and are not writers of anybody's
+/// roster):
+///
+/// * `atpkg-keys setup` / `join` — [`write_rest`], which takes the lock before its
+///   premise check and holds it through publication;
+/// * `atpkg-keys machine-revoke` — one lock across read, revoke and publish;
+/// * `cargo ship provision` — its PHASE 1 roster seeding (the kept-copy restore, the
+///   channel/dist install, and the kept copy written after `authorize_cut`) takes it in
+///   `aterm-release`'s `provision::lock_roster_pair`, and drops it before the in-process
+///   mint re-takes it in `write_rest`; and
+/// * `cargo ship recover` — the `reconstruct_roster_assets` rewrite of `dist/` from an
+///   already-published release.
+///
+/// It is `flock`, so it serializes those writers across PROCESSES; it is per open file
+/// description, so a single process that takes it twice blocks on itself. Callers that
+/// only observe take [`lock_roster_read_only`], or apply
+/// [`refuse_pending_roster_transaction`] alone when no rendezvous need exist.
+pub struct RosterLock {
+    path: String,
+    _guard: RosterGuard,
+}
+
+impl RosterLock {
+    /// Compare the guarded pair with the exact bytes the caller read (`None` = the
+    /// caller planned a FIRST roster, so both halves must still be absent).
+    ///
+    /// Deliberately a method on the live guard: it is impossible to run this
+    /// compare-and-swap without first holding the serialization that makes it mean
+    /// something.
+    pub fn assert_snapshot(&self, expected: Option<&RosterSnapshot>) -> Result<(), String> {
+        let sig_path = concat(&[&self.path, ".sig"]);
+        match expected {
+            Some(snapshot) => {
+                let body_now = read_bytes(&self.path);
+                let sig_now = read_bytes(&sig_path);
+                if body_now.as_deref().ok() != Some(snapshot.raw.as_slice())
+                    || sig_now.as_deref().ok() != Some(snapshot.sig.as_slice())
+                {
+                    return Err(concat(&[
+                        &self.path,
+                        " (or its .sig) CHANGED ON DISK since this run read it — another \
+                         join/mint/revoke, or a copy from another machine, landed in \
+                         between. The document this run signed extends the OLDER pair, so \
+                         publishing it now would fork the lineage: two rosters at the same \
+                         sequence de-authorize each other's machines silently. Re-run this \
+                         command against what the file says now; if several machines are \
+                         being provisioned from one copy, serialize the joins through one \
+                         machine at a time.",
+                    ]));
+                }
+            }
+            None => {
+                let body_absent = match std::fs::symlink_metadata(&self.path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Ok(_) => false,
+                    Err(e) => {
+                        return Err(concat(&[
+                            "inspect fresh-roster premise ",
+                            &self.path,
+                            ": ",
+                            &e.to_string(),
+                        ]));
+                    }
+                };
+                let sig_absent = match std::fs::symlink_metadata(&sig_path) {
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                    Ok(_) => false,
+                    Err(e) => {
+                        return Err(concat(&[
+                            "inspect fresh-roster premise ",
+                            &sig_path,
+                            ": ",
+                            &e.to_string(),
+                        ]));
+                    }
+                };
+                if !body_absent || !sig_absent {
+                    return Err(concat(&[
+                        "a roster pair APPEARED at ",
+                        &self.path,
+                        " while this run was in flight — this run planned the FIRST roster \
+                         for a fresh master, and writing it over one that now exists would \
+                         fork the lineage. Work out where that roster came from before \
+                         re-running.",
+                    ]));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Take the roster's writer lock, replaying any committed transaction FORWARD before
+/// returning — so the caller's very first read already sees a consistent pair.
+pub fn lock_roster(path: &str) -> Result<RosterLock, String> {
+    let lock_path = concat(&[path, ".lock"]);
+    ensure_parent_dir(&lock_path).map_err(|e| {
+        concat(&[
+            "create the roster-lock directory for ",
+            &lock_path,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    let guard = aterm_update_core::FileLock::acquire(std::path::Path::new(&lock_path))
+        .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
+    complete_roster_transaction(path)?;
+    Ok(RosterLock {
+        path: path.to_string(),
+        _guard: RosterGuard::Managed { _guard: guard },
+    })
+}
+
+/// Claim an ALREADY-ESTABLISHED roster rendezvous without creating or repairing
+/// anything — for callers that only observe.
+///
+/// An observer must REPORT an interrupted redo transaction, never complete one as a side
+/// effect of looking: recovery is a write, and a caller that promised to write nothing
+/// may not perform it.
+pub fn lock_roster_read_only(path: &str) -> Result<RosterLock, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let lock_path = concat(&[path, ".lock"]);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(false)
+        .open(&lock_path)
+        .map_err(|e| {
+            concat(&[
+                "open existing roster lock ",
+                &lock_path,
+                " without creating it: ",
+                &e.to_string(),
+            ])
+        })?;
+    file.lock()
+        .map_err(|e| concat(&["lock roster ", path, ": ", &e.to_string()]))?;
+
+    // Refuse a raced unlink/replacement after open. Normal roster tooling never deletes
+    // this rendezvous, but a read-only claim must not sit locking an orphaned inode while
+    // a writer creates and locks a new path under the same name.
+    let opened = file.metadata().map_err(|e| {
+        concat(&[
+            "inspect opened roster lock ",
+            &lock_path,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    let current = std::fs::symlink_metadata(&lock_path).map_err(|e| {
+        concat(&[
+            "re-check existing roster lock ",
+            &lock_path,
+            ": ",
+            &e.to_string(),
+        ])
+    })?;
+    if opened.dev() != current.dev() || opened.ino() != current.ino() {
+        return Err(concat(&[
+            "the roster lock ",
+            &lock_path,
+            " was replaced while a read-only claim acquired it; nothing was written, retry",
+        ]));
+    }
+
+    refuse_pending_roster_transaction(path)?;
+    Ok(RosterLock {
+        path: path.to_string(),
+        _guard: RosterGuard::Existing { _file: file },
+    })
+}
+
+/// Lock, read the pair, and publish — the whole sequence in one call.
+///
+/// Only the tests use this: a real mutation must hold ONE lock across its own read,
+/// edit, sign and publish, which is [`publish_roster_locked`]. Kept because the
+/// transaction layer's properties are stated over a publish, and stating them through
+/// the full provisioning pipeline would test four other things at once.
+#[cfg(test)]
+fn publish_roster(path: &str, bytes: &[u8], sig: &[u8]) -> Result<(), String> {
+    let lock = lock_roster(path)?;
+    let sig_path = concat(&[path, ".sig"]);
+    let expected = match (read_bytes(path), read_bytes(&sig_path)) {
+        (Ok(raw), Ok(sig)) => Some(RosterSnapshot { raw, sig }),
+        (Err(body), Err(signature))
+            if body.kind() == std::io::ErrorKind::NotFound
+                && signature.kind() == std::io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        _ => {
+            return Err(concat(&[
+                "the roster pair at ",
+                path,
+                " is missing one half or unreadable; restore both files before publishing",
+            ]));
+        }
+    };
+    publish_roster_locked(&lock, path, expected.as_ref(), bytes, sig)
+}
+
+/// A roster transition that is DURABLY COMMITTED but not yet installed under the two
+/// canonical names — the state a process death between the commit and the renames
+/// leaves on disk, as a value.
+///
+/// Reaching it costs nothing: [`publish_roster_locked`] is exactly
+/// [`commit_roster_pair`] followed by [`CommittedRoster::complete`]. Naming the commit
+/// point is what lets the property be STATED — every recovery message in this layer
+/// turns on which side of it a failure landed — and it is the only honest way for a
+/// crate that publishes rosters through this layer (`aterm-release`, whose `cargo ship
+/// provision` seeds the same pair) to prove its own crash recovery: dropping this value
+/// instead of completing it is what a killed process leaves, byte for byte, produced by
+/// the real commit path rather than a hand-built replica of the on-disk layout.
+#[must_use = "a committed roster transaction that is never completed leaves the pair for \
+              the next writer to recover; drop it deliberately or call complete()"]
+pub struct CommittedRoster {
+    path: String,
+    transaction: String,
+}
+
+impl CommittedRoster {
+    /// The redo directory holding the exact signed pair — the path recovery advice names.
+    #[must_use]
+    pub fn transaction_path(&self) -> &str {
+        &self.transaction
+    }
+
+    /// Install both canonical halves from the commit and retire it.
+    pub fn complete(self) -> Result<(), String> {
+        complete_roster_transaction(&self.path).map_err(|e| {
+            concat(&[
+                &e,
+                "\nThe exact new roster pair remains durably recoverable at ",
+                &self.transaction,
+                ". Remove any filesystem obstruction and rerun any roster command; taking \
+                 the roster lock completes it forward before reading.",
+            ])
+        })
+    }
+}
+
+/// Check the caller's premise and COMMIT the new pair to the redo log, without touching
+/// either canonical name yet.
+///
+/// `expected` is the pair the caller read under this same lock; it is both the CAS
+/// premise and the predecessor the redo transaction records for crash recovery.
+pub fn commit_roster_pair(
+    lock: &RosterLock,
+    path: &str,
+    expected: Option<&RosterSnapshot>,
+    bytes: &[u8],
+    sig: &[u8],
+) -> Result<CommittedRoster, String> {
+    if lock.path != path {
+        return Err("the roster lock does not guard the roster being published".to_string());
+    }
+    lock.assert_snapshot(expected)?;
+    let _ = ensure_parent_dir(path);
+    let transaction = begin_roster_transaction(path, expected, bytes, sig)?;
+    Ok(CommittedRoster {
+        path: path.to_string(),
+        transaction,
+    })
+}
+
+/// Publish an already-signed pair while the caller holds the roster lock across its own
+/// read → edit → CAS sequence. This is the form every roster mutation uses.
+pub fn publish_roster_locked(
+    lock: &RosterLock,
+    path: &str,
+    expected: Option<&RosterSnapshot>,
+    bytes: &[u8],
+    sig: &[u8],
+) -> Result<(), String> {
+    commit_roster_pair(lock, path, expected, bytes, sig)?.complete()
 }
 
 /// The state a verb has proved BEFORE any secret exists. Produced by [`preflight`],
@@ -1000,66 +1659,50 @@ impl std::fmt::Debug for Report {
 /// Reversed, the worst case is a machine that holds a key nothing has authorized yet. No
 /// signed document says anything untrue, and the recovery is two commands the error message
 /// names. `create_new` still guarantees an existing key is never clobbered.
+///
+/// The roster half now runs under [`lock_roster`], so the recovery advice branches on the
+/// redo transaction's commit point: before it, undo the key; after it, KEEP the key,
+/// because the pair that authorizes it is durable and the next run installs it.
 pub fn write_rest(planned: Planned) -> Result<Report, String> {
-    // THE ROSTER'S PREMISE CHECK, first and before ANY write — the same rule `write_pins`
-    // applies to the anchor file, for the same reason: the signed roster this run built
-    // extends the pair `plan` read, and this repository has other agents and other
-    // sessions. Two runs that both read seq N and both publish seq N+1 produce a
-    // same-sequence fork the monotonic ratchet cannot see, and the last writer silently
-    // de-authorizes the machine the first one added. A pair that moved (or appeared,
-    // when this run planned fresh) is a refusal, not a merge.
-    let sig_path = concat(&[&planned.paths.roster, ".sig"]);
-    match &planned.roster_snapshot {
-        Some(snapshot) => {
-            let body_now = read_bytes(&planned.paths.roster);
-            let sig_now = read_bytes(&sig_path);
-            let unchanged = body_now.as_deref().ok() == Some(snapshot.raw.as_slice())
-                && sig_now.as_deref().ok() == Some(snapshot.sig.as_slice());
-            if !unchanged {
-                return Err(concat(&[
-                    &planned.paths.roster,
-                    " (or its .sig) CHANGED ON DISK since this run read it — another \
-                     join/mint/revoke, or a copy from another machine, landed in between. \
-                     This run's roster was signed over the OLDER pair, so publishing it \
-                     now would fork the lineage: two rosters at the same sequence \
-                     de-authorize each other's machines silently. NOTHING HAS BEEN \
-                     WRITTEN. Re-run this command against what the file says now; if \
-                     several machines are being provisioned from one copy, serialize the \
-                     joins through one machine at a time.",
-                ]));
-            }
-        }
-        None => {
-            // Planned fresh (`setup`): the pair must STILL be absent, or some other run
-            // started the lineage first and this one would fork it at sequence parity.
-            if std::fs::metadata(&planned.paths.roster).is_ok()
-                || std::fs::metadata(&sig_path).is_ok()
-            {
-                return Err(concat(&[
-                    "a roster APPEARED at ",
-                    &planned.paths.roster,
-                    " while this run was in flight — this run planned the FIRST roster \
-                     for a fresh master, and writing it over one that now exists would \
-                     fork the lineage. NOTHING HAS BEEN WRITTEN. Work out where that \
-                     roster came from before re-running.",
-                ]));
-            }
-        }
-    }
+    // ONE crash-released advisory lock, taken BEFORE the premise check and held through
+    // both roster promotions. Every roster writer takes this same lock, which is what
+    // closes the compare-then-publish race the old inline check could not: two runs that
+    // both read sequence N could both pass their own check in the gap before the other's
+    // rename, and produce two seq N+1 lineages. Taking it also completes any redo
+    // transaction a previous run's death left committed, so the premise this run checks
+    // is a consistent pair and not a torn one.
+    let roster_lock = lock_roster(&planned.paths.roster)?;
+
+    // THE ROSTER'S PREMISE CHECK — the same rule `write_pins` applies to the anchor file,
+    // for the same reason: the signed roster this run built extends the pair `plan` read,
+    // and this repository has other agents and other sessions. The guard owns the
+    // compare-and-swap, so a pair that moved (or appeared, when this run planned fresh)
+    // refuses before either local identity file is written.
+    roster_lock
+        .assert_snapshot(planned.roster_snapshot.as_ref())
+        .map_err(|e| {
+            concat(&[
+                &e,
+                " NOTHING HAS BEEN WRITTEN: this machine's key does not exist yet.",
+            ])
+        })?;
     // Defensive: preflight created this directory before any secret existed. Doing it again
     // costs a syscall and covers the caller who assembled a `Planned` without going through
     // preflight — which the library's own tests do.
     let _ = ensure_parent_dir(&planned.paths.key);
-    let mut f = create_secret_file(&planned.paths.key).map_err(|e| {
+    // Whole, 0600, fsynced, and never over an existing key — all four at once, because a
+    // key that exists under its final name but is empty after a power loss is
+    // indistinguishable from one the roster is about to authorize.
+    write_owner_file_create_new(&planned.paths.key, &planned.machine_pkcs8).map_err(|e| {
         concat(&[
-            "create ",
+            "atomically create and sync ",
             &planned.paths.key,
             " (refusing to overwrite an existing key): ",
             &e.to_string(),
+            ". No roster was written, so nothing authorizes this machine; if a complete \
+             key now exists, move it aside before retrying",
         ])
     })?;
-    write_all_to(&mut f, &planned.machine_pkcs8)
-        .map_err(|e| concat(&["write ", &planned.paths.key, ": ", &e.to_string()]))?;
 
     let mut record = String::from("id = \"");
     record.push_str(&planned.id);
@@ -1071,30 +1714,61 @@ pub fn write_rest(planned: Planned) -> Result<Report, String> {
     let _ = ensure_parent_dir(&planned.paths.machine_pub);
     let _ = write_bytes(&planned.paths.machine_pub, record.as_bytes());
 
-    // The roster last. If it fails, the machine holds a key that no roster names —
-    // recoverable, but only if the operator is told exactly what to undo. NOTE the
-    // wording: `publish_roster` fails as a pair (its own error says whether the on-disk
-    // roster was rolled back or is torn), so this wrapper must not claim the roster
-    // "was NOT updated" — it may have been replaced and restored — and `git` can never
-    // recover it, because the roster lives under gitignored `dist/`.
-    publish_roster(
+    // The roster last, under the lock this function already holds. The redo transaction's
+    // commit is the line the recovery advice turns on: BEFORE it, nothing canonical moved
+    // and this machine simply holds an unauthorized key; AFTER it, the exact signed pair
+    // is durable and the operator must KEEP the key rather than undo it. The old wording
+    // could not make that distinction and told every failure to `rm` the key — which,
+    // after a committed transaction, deletes the private half of a machine the recovered
+    // roster authorizes.
+    publish_roster_locked(
+        &roster_lock,
         &planned.paths.roster,
+        planned.roster_snapshot.as_ref(),
         &planned.roster_bytes,
         &planned.roster_sig,
     )
     .map_err(|e| {
-        concat(&[
-            &e,
-            "\nNothing authorizes this machine yet (the message above says what state \
-             the roster pair is in; if it needs restoring, copy `aterm-machines.toml` \
-             and `aterm-machines.toml.sig` from another machine or from the latest \
-             release's assets — git cannot restore them). This machine's key file DOES \
-             exist; undo it before retrying, or the retry will mint a second key: `rm ",
-            &planned.paths.key,
-            "` (and `git checkout -- ",
-            &planned.paths.pins,
-            "` if this run armed the master anchor).",
-        ])
+        let transaction = roster_txn_path(&planned.paths.roster);
+        let roster_sig_path = concat(&[&planned.paths.roster, ".sig"]);
+        let pair_is_target = read_bytes(&planned.paths.roster).ok().as_deref()
+            == Some(planned.roster_bytes.as_slice())
+            && read_bytes(&roster_sig_path).ok().as_deref() == Some(planned.roster_sig.as_slice());
+        match std::fs::symlink_metadata(&transaction) {
+            Ok(_) => concat(&[
+                &e,
+                "\nThe roster update HAS a durable redo transaction, so the exact signed \
+                 pair is recoverable: KEEP this machine's key file. Clear the filesystem \
+                 obstruction named above, then run any roster command — taking the roster \
+                 lock completes the pair forward before reading it.",
+            ]),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound && pair_is_target => concat(&[
+                &e,
+                "\nThe exact target roster pair IS installed, even though retiring the \
+                 transaction could not be confirmed: KEEP this machine's key file and do \
+                 NOT mint again. Rerun once the durability error above is fixed.",
+            ]),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => concat(&[
+                &e,
+                "\nNothing authorizes this machine yet: no redo transaction was committed, \
+                 so the roster pair is still the one from before this run. This machine's \
+                 key file DOES exist; undo it before retrying, or the retry will mint a \
+                 second key: `rm ",
+                &planned.paths.key,
+                "` (and `git checkout -- ",
+                &planned.paths.pins,
+                "` if this run armed the master anchor).",
+            ]),
+            Err(err) => concat(&[
+                &e,
+                "\nCould not inspect the possible redo transaction at ",
+                &transaction,
+                ": ",
+                &err.to_string(),
+                ". KEEP this machine's key file and investigate; do not mint again until \
+                 the transaction state is known.",
+            ]),
+        }
     })?;
 
     let machine_is_committed_head =
@@ -1657,16 +2331,20 @@ mod tests {
         run_setup(&control, "m3").expect("the same pipeline, unraced, completes");
     }
 
-    /// A SIGNATURE THAT CANNOT PUBLISH ROLLS THE DOCUMENT BACK. Per-file atomicity
-    /// cannot make the PAIR consistent: before this held, a failure between the two
-    /// renames left the NEW document beside the OLD signature — refused by every
-    /// verifier as "signature did not verify" and misdiagnosed as a mistyped phrase,
-    /// on a file `git checkout` cannot restore (dist/ is gitignored).
+    /// A BROKEN SIGNATURE TARGET LEAVES THE DOCUMENT WHERE IT WAS. Per-file atomicity
+    /// cannot make the PAIR consistent: before the transaction layer, a failure between
+    /// the two renames left the NEW document beside the OLD signature — refused by every
+    /// verifier as "signature did not verify" and misdiagnosed as a mistyped phrase, on a
+    /// file `git checkout` cannot restore (dist/ is gitignored). The guarded publisher
+    /// reads BOTH halves under its lock first, so a directory squatting on one target is
+    /// a premise failure and the document never moves at all — there is nothing to roll
+    /// back.
     ///
-    /// MUTATION: revert `publish_roster` to two sequential `write_bytes_atomic` calls
-    /// and the roll-back assertion fails — the new body survives beside the stale sig.
+    /// MUTATION: let a publisher proceed without the pair it claims to extend — drop the
+    /// premise read and `assert_snapshot`, and promote the two halves in sequence — and
+    /// "NEW BODY" lands beside a signature no client can verify.
     #[test]
-    fn a_failed_signature_publish_rolls_the_roster_document_back() {
+    fn a_broken_signature_target_leaves_the_roster_document_unchanged() {
         let dir = scratch("pair-rollback");
         let paths = paths_in(&dir);
         write_fixture(&paths);
@@ -1680,11 +2358,11 @@ mod tests {
         std::fs::remove_file(&sig_path).unwrap();
         std::fs::create_dir(&sig_path).unwrap();
         let err = publish_roster(&paths.roster, b"NEW BODY", b"NEW SIG").unwrap_err();
-        assert!(err.contains("ROLLED BACK"), "{err}");
+        assert!(err.contains("missing one half or unreadable"), "{err}");
         assert_eq!(
             std::fs::read(&paths.roster).unwrap(),
             old_body,
-            "the document must be rolled back to the pair's previous bytes"
+            "the document must still be the pair's previous bytes"
         );
         std::fs::remove_dir(&sig_path).unwrap();
         std::fs::write(&sig_path, &old_sig).unwrap();
@@ -1698,14 +2376,14 @@ mod tests {
             "the pair left behind by a failed publish must be the consistent old one"
         );
 
-        // A FIRST publish that fails the same way retracts the document instead: no
+        // A FIRST publish with the same obstruction likewise writes neither half: no
         // half-pair is left to misdiagnose.
         let fresh = scratch("pair-rollback-fresh");
         let fresh_roster = fresh.join("aterm-machines.toml").to_str().unwrap().to_string();
         let fresh_sig = concat(&[&fresh_roster, ".sig"]);
         std::fs::create_dir(&fresh_sig).unwrap();
         let err = publish_roster(&fresh_roster, b"BODY", b"SIG").unwrap_err();
-        assert!(err.contains("ROLLED BACK"), "{err}");
+        assert!(err.contains("missing one half or unreadable"), "{err}");
         assert!(
             !std::path::Path::new(&fresh_roster).exists(),
             "a first publish that failed leaves nothing, not a signatureless document"
@@ -1716,6 +2394,200 @@ mod tests {
         publish_roster(&fresh_roster, b"BODY", b"SIG").expect("publish with nothing in the way");
         assert_eq!(std::fs::read(&fresh_roster).unwrap(), b"BODY");
         assert_eq!(std::fs::read(&fresh_sig).unwrap(), b"SIG");
+    }
+
+    /// A CRASH BETWEEN THE TWO RENAMES CONVERGES FORWARD, NOT SIDEWAYS. This is the
+    /// exact state per-file atomicity could not prevent and no error path could repair:
+    /// the new document on disk beside the old signature, with the process gone. The
+    /// committed redo directory holds the whole pair, and the next lock acquisition
+    /// installs it — before the caller is allowed to read anything.
+    ///
+    /// The crash is simulated by doing what the publisher does (commit the transaction,
+    /// promote the body) and then simply not finishing.
+    ///
+    /// MUTATION: drop the `complete_roster_transaction` call from `lock_roster` and the
+    /// signature stays at "old sig" — a pair no client will verify.
+    #[test]
+    fn a_committed_roster_transaction_recovers_forward_after_a_body_only_crash() {
+        let dir = scratch("pair-redo-recovery");
+        let roster = dir.join("aterm-machines.toml");
+        let roster = roster.to_str().unwrap();
+        let sig_path = concat(&[roster, ".sig"]);
+        std::fs::write(roster, b"old body").unwrap();
+        std::fs::write(&sig_path, b"old sig").unwrap();
+
+        let predecessor = RosterSnapshot {
+            raw: b"old body".to_vec(),
+            sig: b"old sig".to_vec(),
+        };
+        let transaction =
+            begin_roster_transaction(roster, Some(&predecessor), b"new body", b"new sig").unwrap();
+        write_bytes_atomic(roster, b"new body").unwrap();
+        assert_eq!(
+            std::fs::read(&sig_path).unwrap(),
+            b"old sig",
+            "the premise: a torn pair, which is what a verifier refuses"
+        );
+
+        let _lock = lock_roster(roster).expect("lock acquisition replays the committed redo");
+        assert_eq!(std::fs::read(roster).unwrap(), b"new body");
+        assert_eq!(std::fs::read(&sig_path).unwrap(), b"new sig");
+        assert!(
+            !std::path::Path::new(&transaction).exists(),
+            "a completed transaction is retired, so it cannot replay a second time"
+        );
+    }
+
+    /// RECOVERY NEVER OVERWRITES A PAIR IT DID NOT WRITE. A redo log that replayed
+    /// unconditionally would be worse than the torn pair it fixes: the machine comes back
+    /// up days later, the operator has already copied a NEWER roster across from another
+    /// machine, and replay silently destroys it — de-authorizing every machine joined
+    /// since. The recorded predecessor is what makes that distinguishable: a canonical
+    /// half that is neither the predecessor nor the target is a third state nobody in
+    /// this transaction wrote.
+    ///
+    /// MUTATION: make `transaction_half_is_known` return `true` and the newer pair is
+    /// overwritten by the interrupted one.
+    #[test]
+    fn redo_recovery_never_overwrites_a_newer_or_unrelated_pair() {
+        let dir = scratch("pair-redo-cas");
+        let roster = dir.join("aterm-machines.toml");
+        let roster = roster.to_str().unwrap();
+        let sig_path = concat(&[roster, ".sig"]);
+        std::fs::write(roster, b"old body").unwrap();
+        std::fs::write(&sig_path, b"old sig").unwrap();
+        drop(lock_roster(roster).expect("establish the writer rendezvous"));
+
+        let predecessor = RosterSnapshot {
+            raw: b"old body".to_vec(),
+            sig: b"old sig".to_vec(),
+        };
+        let transaction = begin_roster_transaction(
+            roster,
+            Some(&predecessor),
+            b"interrupted body",
+            b"interrupted sig",
+        )
+        .unwrap();
+        // While this machine was down, an authoritative pair arrived from elsewhere.
+        std::fs::write(roster, b"newer body").unwrap();
+        std::fs::write(&sig_path, b"newer sig").unwrap();
+
+        let err = lock_roster(roster)
+            .err()
+            .expect("replay over an unrelated pair is refused");
+        assert!(err.contains("newer or unrelated"), "{err}");
+        assert_eq!(std::fs::read(roster).unwrap(), b"newer body");
+        assert_eq!(std::fs::read(&sig_path).unwrap(), b"newer sig");
+        assert!(
+            std::path::Path::new(&transaction).exists(),
+            "the evidence stays on disk for the operator to reconcile"
+        );
+    }
+
+    /// AN OBSERVER OBSERVES. Recovery is a WRITE, and completing a redo transaction as a
+    /// side effect of looking would make a read-only caller install a roster nobody asked
+    /// it to install. The read-only claim therefore refuses to create the rendezvous file
+    /// and refuses to replay a pending transaction — it reports it instead.
+    ///
+    /// MUTATION: give `lock_roster_read_only` `create(true)`, or let it call
+    /// `complete_roster_transaction`, and one of the two refusals below becomes a success
+    /// that mutated the tree.
+    #[test]
+    fn check_only_lock_never_creates_or_recovers_roster_state() {
+        let dir = scratch("read-only-roster-lock");
+        let roster = dir.join("aterm-machines.toml");
+        let roster = roster.to_str().unwrap();
+        let lock_path = concat(&[roster, ".lock"]);
+        let sig_path = concat(&[roster, ".sig"]);
+
+        let err = lock_roster_read_only(roster)
+            .err()
+            .expect("an absent rendezvous is refused, not created");
+        assert!(err.contains("without creating it"), "{err}");
+        assert!(
+            !std::path::Path::new(&lock_path).exists(),
+            "an observer left no rendezvous file behind"
+        );
+
+        std::fs::write(roster, b"old body").unwrap();
+        std::fs::write(&sig_path, b"old sig").unwrap();
+        drop(lock_roster(roster).expect("establish the writer rendezvous"));
+        // NEGATIVE CONTROL: with a rendezvous and no pending transaction, it succeeds —
+        // so the refusals here are the policy and not a broken lock.
+        drop(lock_roster_read_only(roster).expect("an existing clean rendezvous is readable"));
+
+        let predecessor = RosterSnapshot {
+            raw: b"old body".to_vec(),
+            sig: b"old sig".to_vec(),
+        };
+        let transaction =
+            begin_roster_transaction(roster, Some(&predecessor), b"new body", b"new sig").unwrap();
+        let err = lock_roster_read_only(roster)
+            .err()
+            .expect("a pending transaction is reported, not replayed");
+        assert!(err.contains("never replays"), "{err}");
+        assert_eq!(std::fs::read(roster).unwrap(), b"old body");
+        assert_eq!(std::fs::read(&sig_path).unwrap(), b"old sig");
+        assert!(std::path::Path::new(&transaction).exists());
+    }
+
+    /// A PENDING TRANSACTION IS NAMED, NOT MISDIAGNOSED AS A MISTYPED PHRASE. Recovery
+    /// runs on the WRITER lock, and `join` reads the roster (in `plan`) before it ever
+    /// takes that lock — so without this refusal the first thing an operator sees after a
+    /// crashed publish is "does not verify under the master you typed", against a torn
+    /// pair and a paper phrase that was never wrong.
+    ///
+    /// MUTATION: drop the `refuse_pending_roster_transaction` call from `load_roster` and
+    /// the signature diagnosis comes back.
+    #[test]
+    fn a_pending_roster_transaction_is_named_instead_of_a_mistyped_phrase() {
+        let dir = scratch("pending-txn-read");
+        let paths = paths_in(&dir);
+        write_fixture(&paths);
+        run_setup(&paths, "m3").expect("setup publishes the first pair");
+        let master_pub = seed_of(PAPER).pubkey_b64().unwrap();
+        let sig_path = concat(&[&paths.roster, ".sig"]);
+
+        // The crash: a committed transaction, its body promoted, its signature not.
+        let predecessor = RosterSnapshot {
+            raw: std::fs::read(&paths.roster).unwrap(),
+            sig: std::fs::read(&sig_path).unwrap(),
+        };
+        begin_roster_transaction(&paths.roster, Some(&predecessor), b"new body", b"new sig")
+            .unwrap();
+        write_bytes_atomic(&paths.roster, b"new body").unwrap();
+
+        let err = load_roster(
+            &paths.roster,
+            &master_pub,
+            NOW,
+            RosterExpectation::MustExist,
+        )
+        .unwrap_err();
+        assert!(err.contains("interrupted roster transaction"), "{err}");
+        assert!(err.contains("is not what is wrong"), "{err}");
+        assert!(
+            !err.contains("does not verify under the master you typed"),
+            "the phrase must not be blamed for a torn pair: {err}"
+        );
+
+        // NEGATIVE CONTROL: once a writer completes it forward, the same read succeeds.
+        drop(lock_roster(&paths.roster).expect("the writer lock recovers the pair"));
+        assert_eq!(std::fs::read(&paths.roster).unwrap(), b"new body");
+        assert_eq!(std::fs::read(&sig_path).unwrap(), b"new sig");
+        let err = load_roster(
+            &paths.roster,
+            &master_pub,
+            NOW,
+            RosterExpectation::MustExist,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("does not verify under the master you typed"),
+            "the recovered pair is read normally — and this fixture's bytes are not a \
+             real roster, so the ordinary signature refusal is what should surface: {err}"
+        );
     }
 
     /// `plan` RE-PROVES THE ANCHOR FOR `join` — the orchestrator's `verify_master` call
@@ -1822,8 +2694,11 @@ mod tests {
         let pre = preflight(Verb::Setup, "m3", HEAD_ID, &paths).expect("preflight");
         let planned = plan(pre, &seed_of(PAPER), NOW).expect("plan");
         write_pins(&planned).expect("the anchor is written");
-        // Preflight created this directory; take the write permission away now, so the
-        // roster publish is the one step that fails.
+        // Preflight created this directory; pre-create the persistent advisory-lock inode
+        // (opening an EXISTING file needs no directory write permission), then take the
+        // write permission away so staging the roster transaction is the one step that
+        // fails.
+        std::fs::write(concat(&[&paths.roster, ".lock"]), b"").unwrap();
         std::fs::set_permissions(&roster_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = write_rest(planned);
         std::fs::set_permissions(&roster_dir, std::fs::Permissions::from_mode(0o700)).unwrap();

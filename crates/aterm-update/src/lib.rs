@@ -173,6 +173,13 @@ fn read_ledger_text(path: &std::path::Path) -> Option<String> {
 /// env keys) is defined on. A newtype here would break that call site.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 
+/// Re-exported for every OTHER lane that re-launches aterm forwarding its own
+/// argv (the GUI's cold-exec/seamless/Windows successor spawns): strip the
+/// leading `--window` mode pins so no relaunch path can re-grow the argv the
+/// boot swap deliberately pins exactly once. See the function's own doc for
+/// the accumulation this closes.
+pub use install::reexec_forwarded_args;
+
 /// The Apple Developer **Team ID** for the OPTIONAL Tier APPLE anchor, baked in at
 /// compile time from `ATERM_EXPECTED_TEAM_ID`. Empty (the default) does **not** disable
 /// the updater — it just skips the codesign/notarization anchor, leaving the

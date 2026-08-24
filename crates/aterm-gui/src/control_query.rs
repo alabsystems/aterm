@@ -521,6 +521,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          perf_reduced={} shed_transitions={} wake_heals={} \
          last_redraw_total_ms={:.2} max_redraw_total_ms={:.2} \
          redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
+         frame_refills_scoped={} frame_refills_full={} \
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
          present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
@@ -588,6 +589,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.redraw_early_outs,
         m.redraw_sync_holds,
         m.redraw_retry_gated,
+        m.frame_refills_scoped,
+        m.frame_refills_full,
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -770,7 +773,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"sync_rel_timeout\":{},\"sync_holding\":{},\"perf_reduced\":{},\
          \"shed_transitions\":{},\"wake_heals\":{},\"last_redraw_total_ms\":{:.2},\
          \"max_redraw_total_ms\":{:.2},\"redraw_attempts\":{},\"redraw_early_outs\":{},\
-         \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\"pre_present_attempts\":{},\
+         \"redraw_sync_holds\":{},\"redraw_retry_gated\":{},\
+         \"frame_refills_scoped\":{},\"frame_refills_full\":{},\"pre_present_attempts\":{},\
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
          \"max_pre_present_ms\":{:.2},\"present_drops\":{},\
          \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
@@ -838,6 +842,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.redraw_early_outs,
         m.redraw_sync_holds,
         m.redraw_retry_gated,
+        m.frame_refills_scoped,
+        m.frame_refills_full,
         m.pre_present_attempts,
         ms(m.last_pre_present_ns),
         ms(m.pre_present_total_ns),
@@ -2741,6 +2747,12 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         engine_fill_seq: _,
         engine_alt: _,
         engine_row_order: _,
+        // D-2 per-row revision lane: the same law as the carrier tokens above.
+        // It is the engine's "which rows changed" fact, not pixels — a wire
+        // frame that carried it would report two byte-identical screens as
+        // different every time the revision advanced.
+        row_rev: _,
+        row_rev_lane: _,
     } = ri;
 }
 
@@ -3398,6 +3410,8 @@ mod tests {
         for field in [
             "redraw_attempts=",
             "redraw_retry_gated=",
+            "frame_refills_scoped=",
+            "frame_refills_full=",
             "last_pre_present_ms=",
             "pre_present_total_ms=",
             "last_present_drop_reason=",
@@ -3461,6 +3475,8 @@ mod tests {
             "redraw_attempts",
             "redraw_early_outs",
             "redraw_retry_gated",
+            "frame_refills_scoped",
+            "frame_refills_full",
             "pre_present_attempts",
             "last_pre_present_ms",
             "pre_present_total_ms",

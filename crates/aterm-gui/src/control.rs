@@ -40,12 +40,15 @@ use aterm_uds::{CtlListener, CtlStream};
 
 use aterm_containment::log_denial;
 use aterm_core::terminal::{CursorStyle, Terminal};
+use aterm_session::sink::InputEpoch;
 use aterm_session::{EdgeToken, Op, SessionId, decide_edge};
+use serde::Deserialize;
+use sha2::{Digest as _, Sha256};
 use winit::event_loop::EventLoopProxy;
 
 use crate::control_auth::{self, AuthOutcome};
 use crate::input::{
-    Egress, EgressMode, InputEvent, InputOutcome, ScrollIntent, Source, seam_egress,
+    Delivery, Egress, EgressMode, InputEvent, InputOutcome, ScrollIntent, Source, seam_egress,
 };
 use crate::session_store::Store;
 use crate::subscribe::{self, InstanceStreams, PushOptions, PushScopes, Requested, Subscribers};
@@ -522,16 +525,48 @@ fn escalated_op(verb: &str, rest: &str) -> Option<Escalation> {
         "act" if aterm_types::app_inspection::parse_act(rest).is_ok() => {
             Some(Escalation::Op(Op::ConfigWrite))
         }
+        // A CONNECTED spawn (`spawn connected=… of=<sid>`) MINTS session-connection
+        // authority over an arbitrary origin — Owner-only, the belt-and-suspenders
+        // fence beside the App-target gate (design §5.3/§6): no fine op expresses
+        // "may create standing authority between sessions". A plain `spawn [cwd=…]`
+        // mints nothing and keeps its base WriteInput class.
+        // Classified with `split_quoted_tokens` -- the SAME tokenizer
+        // `parse_spawn_args` uses -- not `split_whitespace`. A fence that splits
+        // differently than the parser it fences has a spelling that walks past it:
+        // `spawn "connected=controller" of=<sid>` parses as a connected spawn while
+        // a whitespace split sees a token beginning with `"`. Unparseable input
+        // escalates too, so the fence is never weaker than the parser.
+        "spawn"
+            if control_media::split_quoted_tokens(rest)
+                .is_none_or(|tokens| tokens.iter().any(|t| t.starts_with("connected="))) =>
+        {
+            Some(Escalation::OwnerOnly)
+        }
+        // Every surface rendering the AGGREGATED connection graph carries the same
+        // Owner gate as `flows` (design §5.3): `open connections` raises the map,
+        // `controls connections` reads it as text, `window connections` captures it
+        // — all disclose the whole fabric to a scoped edge otherwise. Classified by
+        // the TARGET TOKEN only (the `open prefs close` rule above), so the
+        // `close`-variant dismiss escalates identically.
+        "open" | "controls" | "window"
+            if rest.split_whitespace().next() == Some("connections") =>
+        {
+            Some(Escalation::OwnerOnly)
+        }
         "open" => match crate::app_introspect::AuxTarget::parse(
             rest.split_whitespace().next().unwrap_or(""),
         ) {
             // The Settings tab flips default-OFF security knobs => ConfigWrite.
             Some(crate::app_introspect::AuxTarget::Prefs) => Some(Escalation::Op(Op::ConfigWrite)),
-            // Raising the PALETTE (a gateway to every action) or the SOFTWARE-UPDATE
-            // overlay (the re-exec surface) matches the OwnerOnly `invoke` twins, so
-            // a scoped edge cannot open either through the `open` seam.
+            // Raising the PALETTE (a gateway to every action), the SOFTWARE-UPDATE
+            // overlay (the re-exec surface), or the in-grid TAB MENU (a gateway to
+            // the session context actions, connection rows included) matches the
+            // OwnerOnly `invoke` twins, so a scoped edge cannot open any of them
+            // through the `open` seam.
             Some(
-                crate::app_introspect::AuxTarget::Menu | crate::app_introspect::AuxTarget::Update,
+                crate::app_introspect::AuxTarget::Menu
+                | crate::app_introspect::AuxTarget::TabMenu
+                | crate::app_introspect::AuxTarget::Update,
             ) => Some(Escalation::OwnerOnly),
             _ => None,
         },
@@ -1699,6 +1734,7 @@ struct ControlWorkerContext {
     token: Arc<String>,
     sock_dir: std::path::PathBuf,
     subscriptions: Arc<SubscriptionDispatch>,
+    operator: Option<crate::operator_host::ControlHandle>,
 }
 
 impl ControlWorkerContext {
@@ -1713,11 +1749,12 @@ impl ControlWorkerContext {
             self.token.as_str(),
             &self.sock_dir,
             &self.subscriptions,
+            self.operator.as_ref(),
         );
     }
 
     fn serve_subscription(&self, mut job: SubscriptionJob) {
-        run_subscribe(
+        run_subscribe_socket(
             &job.line,
             &self.active,
             &self.store,
@@ -1829,6 +1866,7 @@ pub fn spawn(
     // actually own them. Without this an instance that refused a live socket (or
     // failed to bind) would still delete another live instance's shared files on exit.
     bound: Arc<AtomicBool>,
+    operator: Option<crate::operator_host::ControlHandle>,
 ) {
     std::thread::spawn(move || {
         let sock_path = plan.sock_path.clone();
@@ -1968,6 +2006,7 @@ pub fn spawn(
             token: token.clone(),
             sock_dir: sock_dir.clone(),
             subscriptions: subscription_dispatch.clone(),
+            operator: operator.clone(),
         });
         let workers = spawn_control_workers(&connection_dispatch, &worker_context);
         connection_dispatch.set_capacity(workers);
@@ -3019,6 +3058,7 @@ fn serve(
     token: &str,
     sock_dir: &std::path::Path,
     subscriptions: &SubscriptionDispatch,
+    operator: Option<&crate::operator_host::ControlHandle>,
 ) {
     match serve_borrowed(
         &stream,
@@ -3029,6 +3069,7 @@ fn serve(
         queue,
         token,
         sock_dir,
+        operator,
     ) {
         ServeDisposition::Close => {
             // On macOS a peer-vanished AF_UNIX close can linger in the kernel.
@@ -3052,6 +3093,7 @@ fn serve_borrowed(
     queue: &ImageQueue,
     token: &str,
     sock_dir: &std::path::Path,
+    operator: Option<&crate::operator_host::ControlHandle>,
 ) -> ServeDisposition {
     // Bound the UNAUTHENTICATED phase: `read_request_line` has no deadline of its
     // own, so a same-uid peer that connects and then goes silent would park this
@@ -3143,6 +3185,7 @@ fn serve_borrowed(
             proxy,
             queue,
             sock_dir,
+            operator,
         )
     {
         return disposition;
@@ -3161,6 +3204,7 @@ fn serve_borrowed(
             proxy,
             queue,
             sock_dir,
+            operator,
         ) {
             return disposition;
         }
@@ -3189,7 +3233,32 @@ fn serve_request_line(
     proxy: &EventLoopProxy<Wake>,
     queue: &ImageQueue,
     sock_dir: &std::path::Path,
+    operator: Option<&crate::operator_host::ControlHandle>,
 ) -> Option<ServeDisposition> {
+    // Embedded operator verbs are self-scoped Owner operations. Intercept them
+    // before cross-process proxying so `@other operator...` cannot redirect the
+    // instance's queue authority to a child socket.
+    if let Some((selector, rest)) = operator_command_request(&line) {
+        let response = if !matches!(scope, Scope::Owner)
+            || !matches!(selector, None | Some(Selector::SelfTok))
+        {
+            "ERR denied\n".to_string()
+        } else if let Some(operator) = operator {
+            operator.command(store, rest)
+        } else {
+            "ERR operator unavailable\n".to_string()
+        };
+        if writer.write_all(response.as_bytes()).is_err() || writer.flush().is_err() {
+            return Some(ServeDisposition::Close);
+        }
+        return None;
+    }
+    if binary_frame_verb(&line) == Some("operator-propose-bin") {
+        if !run_operator_proposal_bin(&line, reader, scope, operator, store, subscribers, writer) {
+            return Some(ServeDisposition::Close);
+        }
+        return None;
+    }
     // Cross-process forward (Item 5b): relay a `@<child-sid>` we spawned but
     // don't host to the child's socket; the relay then owns the connection.
     if try_proxy_forward(&line, scope, store, sock_dir, stream, reader) {
@@ -3215,6 +3284,9 @@ fn serve_request_line(
     // applies paste semantics. Both authorize EXACTLY like `feed` (WriteInput) via
     // the normal `@<selector>` + op gate inside `run_feed_bin`.
     if let Some(bin_verb) = binary_frame_verb(&line) {
+        // The operator's own binary frame never reaches this generic path: it
+        // is dispatched by the operator host, which owns the guarded actuator.
+        debug_assert_ne!(bin_verb, "operator-propose-bin");
         let mut dispatch_front_input =
             |event, session| post_input_reply_to(proxy, Op::WriteInput, vec![event], session);
         let mut cancel_candidate = |session| front_routed_candidate_cancel(proxy, session);
@@ -3367,10 +3439,27 @@ fn is_subscribe_line(line: &str) -> bool {
     matches!(line.split_whitespace().next(), Some("subscribe"))
 }
 
+fn operator_command_request(line: &str) -> Option<(Option<Selector>, &str)> {
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let (selector, command) = match line.split_once(char::is_whitespace) {
+        Some((first, tail)) if first.starts_with('@') => {
+            (Some(Selector::parse(&first[1..])), tail.trim_start())
+        }
+        None if line.starts_with('@') => (Some(Selector::parse(&line[1..])), ""),
+        _ => (None, line),
+    };
+    let (verb, rest) = command
+        .split_once(char::is_whitespace)
+        .map_or((command, ""), |(verb, rest)| (verb, rest.trim_start()));
+    (verb == "operator").then_some((selector, rest))
+}
+
 /// The maximum `feed-bin` payload accepted in one frame (256 KiB) — large enough
 /// for a bracketed-paste or a control burst, bounded so a hostile/garbled length
 /// cannot make the server `read_exact` an unbounded payload.
 const MAX_FEED_BIN: usize = 256 * 1024;
+/// A schema-1 proposal contains bounded terminal text, not an arbitrary paste.
+const MAX_OPERATOR_PROPOSAL: usize = aterm_types::control_verbs::MAX_OPERATOR_PROPOSAL_BYTES;
 
 /// Maximum number of `@<sel>` targets accepted in one `subscribe` request. Each
 /// accepted target installs a `ByteFanout` slot that the producer's PTY reader
@@ -3399,6 +3488,7 @@ fn binary_frame_verb(line: &str) -> Option<&'static str> {
     match tok {
         Some("feed-bin") => Some("feed-bin"),
         Some("paste-bin") => Some("paste-bin"),
+        Some("operator-propose-bin") => Some("operator-propose-bin"),
         _ => None,
     }
 }
@@ -3481,6 +3571,682 @@ fn parse_feed_bin(line: &str, verb: &str) -> FeedBinFrame {
         return FeedBinFrame::TooLarge;
     }
     FeedBinFrame::Ok(selector, n)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorProposalWire {
+    schema: u64,
+    event_id: u64,
+    claim_token: String,
+    sid: String,
+    generation: OperatorGenerationWire,
+    action: OperatorActionWire,
+    expectation: OperatorExpectationWire,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorGenerationWire {
+    lifecycle_epoch: u64,
+    alternate_screen: bool,
+    content_seq: u64,
+    fingerprint: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorActionWire {
+    kind: String,
+    text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OperatorExpectationWire {
+    kind: String,
+    deadline_ms: u64,
+}
+
+struct OperatorProposal {
+    event_id: aterm_agent::operator::EventId,
+    token: aterm_agent::operator::ClaimToken,
+    sid: String,
+    generation: aterm_agent::operator::EventGeneration,
+    text: String,
+    action_hash: String,
+}
+
+fn decode_operator_proposal(payload: &[u8]) -> Result<OperatorProposal, String> {
+    let wire: OperatorProposalWire = serde_json::from_slice(payload)
+        .map_err(|error| format!("invalid proposal JSON: {error}"))?;
+    if wire.schema != 1 {
+        return Err("unsupported proposal schema".to_string());
+    }
+    if wire.action.kind != "turn" || wire.expectation.kind != "busy_then_attention" {
+        return Err("unsupported operator action or expectation".to_string());
+    }
+    if wire.action.text.is_empty() || wire.action.text.len() > 16 * 1024 {
+        return Err("turn text must contain 1..=16384 bytes".to_string());
+    }
+    if wire.action.text.chars().any(char::is_control) {
+        return Err("turn text contains unsupported control bytes".to_string());
+    }
+    if wire.action.text.trim() != wire.action.text {
+        return Err("turn text must not have leading or trailing whitespace".to_string());
+    }
+    if looks_like_operator_approval_response(&wire.action.text) {
+        return Err("approval and permission responses are human-only".to_string());
+    }
+    if !(1..=600_000).contains(&wire.expectation.deadline_ms) {
+        return Err("deadline_ms must be in 1..=600000".to_string());
+    }
+    let fingerprint = decode_hex_32(&wire.generation.fingerprint)
+        .ok_or_else(|| "generation fingerprint must be 64 lowercase hex characters".to_string())?;
+    let event_id = aterm_agent::operator::EventId::from_wire(wire.event_id)
+        .map_err(|error| error.to_string())?;
+    let token = aterm_agent::operator::ClaimToken::from_wire(&wire.claim_token)
+        .map_err(|error| error.to_string())?;
+    let generation = aterm_agent::operator::EventGeneration::new(
+        wire.generation.lifecycle_epoch,
+        wire.generation.alternate_screen,
+        wire.generation.content_seq,
+        fingerprint,
+    );
+    let mut digest = Sha256::new();
+    digest.update(b"aterm.operator.turn.v1\0");
+    digest.update((wire.action.text.len() as u64).to_le_bytes());
+    digest.update(wire.action.text.as_bytes());
+    digest.update(wire.expectation.deadline_ms.to_le_bytes());
+    let action_hash = hex_lower(&digest.finalize());
+    Ok(OperatorProposal {
+        event_id,
+        token,
+        sid: wire.sid,
+        generation,
+        text: wire.action.text,
+        action_hash,
+    })
+}
+
+fn looks_like_operator_approval_response(text: &str) -> bool {
+    if text.trim().is_empty() {
+        return true;
+    }
+    text.lines().any(|line| approval_answer(line.trim()))
+}
+
+fn approval_answer(answer: &str) -> bool {
+    let answer = answer.to_ascii_lowercase();
+    answer.parse::<u32>().is_ok()
+        || matches!(
+            answer.as_str(),
+            "y" | "yes"
+                | "n"
+                | "no"
+                | "allow"
+                | "approve"
+                | "approved"
+                | "deny"
+                | "denied"
+                | "reject"
+                | "rejected"
+                | "enter"
+                | "escape"
+                | "esc"
+                | "ctrl-c"
+        )
+}
+
+fn decode_hex_32(value: &str) -> Option<[u8; 32]> {
+    if value.len() != 64
+        || value
+            .as_bytes()
+            .iter()
+            .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+    {
+        return None;
+    }
+    let mut out = [0_u8; 32];
+    for (index, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        out[index] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn validate_operator_claim(
+    queue: &aterm_agent::operator::DurableQueue,
+    proposal: &OperatorProposal,
+) -> Result<(), String> {
+    use aterm_agent::operator::{AttentionCondition, EventStatus};
+
+    let snapshot = queue
+        .snapshot(proposal.event_id)
+        .map_err(|error| error.to_string())?;
+    if snapshot.sid != proposal.sid || snapshot.generation != proposal.generation {
+        return Err("proposal does not match the claimed event generation".to_string());
+    }
+    if snapshot.condition != AttentionCondition::Ready || snapshot.escalated {
+        return Err("only a non-escalated ready event may actuate".to_string());
+    }
+    match snapshot.status {
+        EventStatus::Delivered { token, .. } if token == proposal.token => Ok(()),
+        _ => Err("proposal claim is stale or no longer delivered".to_string()),
+    }
+}
+
+/// Validate the same claimed event on either side of `begin_action`. Before the
+/// durable append it must still be Delivered; after the append the exact same
+/// token/hash must be ActionInFlight. No unrelated in-flight intent is admitted.
+fn validate_operator_action_state(
+    queue: &aterm_agent::operator::DurableQueue,
+    proposal: &OperatorProposal,
+    require_intent: bool,
+) -> Result<(), String> {
+    use aterm_agent::operator::{AttentionCondition, EventStatus};
+
+    let snapshot = queue
+        .snapshot(proposal.event_id)
+        .map_err(|error| error.to_string())?;
+    if snapshot.sid != proposal.sid || snapshot.generation != proposal.generation {
+        return Err("proposal does not match the claimed event generation".to_string());
+    }
+    if snapshot.condition != AttentionCondition::Ready || snapshot.escalated {
+        return Err("only a non-escalated ready event may actuate".to_string());
+    }
+    match snapshot.status {
+        EventStatus::Delivered { token, .. } if !require_intent && token == proposal.token => {
+            Ok(())
+        }
+        EventStatus::ActionInFlight {
+            token,
+            action_class,
+            action_hash,
+            ..
+        } if token == proposal.token
+            && action_class == "turn"
+            && action_hash == proposal.action_hash =>
+        {
+            Ok(())
+        }
+        EventStatus::Delivered { .. } if require_intent => {
+            Err("operator action intent is not durable".to_string())
+        }
+        _ => Err("proposal claim or durable action intent is stale".to_string()),
+    }
+}
+
+/// Revalidate every live fact the actuator relies on, bracketing the screen read
+/// with the sink's attempted-input epoch. The second epoch read catches input
+/// that arrived while the snapshot was being classified; the conditional sink
+/// write catches anything that arrives after this function returns.
+fn validate_operator_live(
+    operator: &crate::operator_host::ControlHandle,
+    queue: &aterm_agent::operator::DurableQueue,
+    proposal: &OperatorProposal,
+    store: &Store,
+    sink: &aterm_session::sink::SinkWriter,
+    expected_epoch: InputEpoch,
+) -> Result<(), String> {
+    use crate::session_store::SessionState;
+
+    operator.ensure_accepting_new_work()?;
+    validate_operator_action_state(queue, proposal, false)?;
+    if sink.input_epoch() != expected_epoch {
+        return Err("target input interjected".to_string());
+    }
+    let live = operator.current_snapshot(store, &proposal.sid)?;
+    if live.state != SessionState::Alive || live.generation != proposal.generation {
+        return Err("target generation changed before input".to_string());
+    }
+    // Defense in depth: a delivered Ready may have been strengthened by a
+    // later coalesced approval observation. The live presentation always wins.
+    if crate::operator_host::looks_like_approval(&live.evidence) {
+        return Err("approval-shaped screens are human-only".to_string());
+    }
+    if sink.input_epoch() != expected_epoch {
+        return Err("target input interjected".to_string());
+    }
+    Ok(())
+}
+
+/// Capture the post-paste screen identity after echo settle. Unlike the initial
+/// preflight, this deliberately does not compare content_seq/fingerprint with
+/// the claimed Ready event: the operator's own paste is expected to change both.
+/// The returned identity is compared again while holding the terminal lock across
+/// the Enter syscall.
+fn capture_operator_submit_generation(
+    operator: &crate::operator_host::ControlHandle,
+    queue: &aterm_agent::operator::DurableQueue,
+    proposal: &OperatorProposal,
+    store: &Store,
+    sink: &aterm_session::sink::SinkWriter,
+    expected_epoch: InputEpoch,
+) -> Result<aterm_agent::operator::EventGeneration, String> {
+    use crate::session_store::SessionState;
+
+    operator.ensure_accepting_new_work()?;
+    validate_operator_action_state(queue, proposal, true)?;
+    if sink.input_epoch() != expected_epoch {
+        return Err("target input interjected".to_string());
+    }
+    let live = operator.current_snapshot(store, &proposal.sid)?;
+    if live.state != SessionState::Alive
+        || live.generation.lifecycle_epoch != proposal.generation.lifecycle_epoch
+        || live.generation.alternate_screen != proposal.generation.alternate_screen
+    {
+        return Err("target lifecycle changed before submit".to_string());
+    }
+    if crate::operator_host::looks_like_approval(&live.evidence) {
+        return Err("approval-shaped screens are human-only".to_string());
+    }
+    if sink.input_epoch() != expected_epoch {
+        return Err("target input interjected".to_string());
+    }
+    Ok(live.generation)
+}
+
+fn run_operator_proposal(
+    payload: &[u8],
+    operator: &crate::operator_host::ControlHandle,
+    store: &Store,
+    subscribers: &Subscribers,
+) -> String {
+    if let Err(error) = operator.ensure_accepting_new_work() {
+        return format!("ERR {error}\n");
+    }
+    let proposal = match decode_operator_proposal(payload) {
+        Ok(proposal) => proposal,
+        Err(error) => return format!("ERR {error}\n"),
+    };
+    // Keep process replacement from crossing the proposal's durable-intent /
+    // PTY-egress / durable-result transaction. The reversible update fence
+    // refuses while this token exists; every return path drops it.
+    let _action_activity = match operator.begin_action_activity() {
+        Ok(activity) => activity,
+        Err(error) => return format!("ERR {error}\n"),
+    };
+    let queue = match operator.queue() {
+        Ok(queue) => queue,
+        Err(error) => return format!("ERR {error}\n"),
+    };
+    if let Err(error) = validate_operator_claim(&queue, &proposal) {
+        return format!("ERR {error}\n");
+    }
+    let target = {
+        let guard = store
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.by_sid(&SessionId::new(&proposal.sid)).cloned()
+    };
+    let Some(target) =
+        target.filter(|target| target.state == crate::session_store::SessionState::Alive)
+    else {
+        return "ERR target session is not alive\n".to_string();
+    };
+    // Capture before the first live screen read. An input attempt after this
+    // point can never be silently adopted as part of the operator's baseline.
+    let input_epoch = std::cell::Cell::new(target.ctx.sink.input_epoch());
+    let submit_generation = std::cell::Cell::new(None);
+    if let Err(error) = validate_operator_live(
+        operator,
+        &queue,
+        &proposal,
+        store,
+        &target.ctx.sink,
+        input_epoch.get(),
+    ) {
+        return format!("ERR {error}\n");
+    }
+
+    // Operator actuation deliberately uses only paste semantics plus one named
+    // Enter press. It never exposes the raw send/key/control vocabulary.
+    let input_failure = std::cell::Cell::new(None::<OperatorInputFailure>);
+    let paste = |text: &str| {
+        let delivery = operator
+            .with_actuation_permit(
+                &queue,
+                proposal.event_id,
+                &proposal.token,
+                &proposal.sid,
+                &proposal.action_hash,
+                || {
+                    operator_input_if_epoch(
+                        &target.term,
+                        &target.ctx,
+                        Some(operator_paste_event(text)),
+                        input_epoch.get(),
+                        OperatorTerminalFence::Exact(proposal.generation),
+                    )
+                },
+            )
+            .unwrap_or(Delivery::ConflictZero);
+        match delivery {
+            Delivery::FullAt { epoch } => {
+                input_epoch.set(epoch);
+                true
+            }
+            delivery => {
+                input_failure.set(Some(OperatorInputFailure {
+                    stage: OperatorInputStage::Paste,
+                    delivery,
+                }));
+                false
+            }
+        }
+    };
+    let press = |name: &str| {
+        if name != "enter" {
+            return false;
+        }
+        let Some(generation) = submit_generation.get() else {
+            return false;
+        };
+        let delivery = operator
+            .with_actuation_permit(
+                &queue,
+                proposal.event_id,
+                &proposal.token,
+                &proposal.sid,
+                &proposal.action_hash,
+                || {
+                    operator_input_if_epoch(
+                        &target.term,
+                        &target.ctx,
+                        parse_key(name),
+                        input_epoch.get(),
+                        OperatorTerminalFence::Exact(generation),
+                    )
+                },
+            )
+            .unwrap_or(Delivery::ConflictZero);
+        match delivery {
+            Delivery::FullAt { epoch } => {
+                input_epoch.set(epoch);
+                true
+            }
+            delivery => {
+                input_failure.set(Some(OperatorInputFailure {
+                    stage: OperatorInputStage::Submit,
+                    delivery,
+                }));
+                false
+            }
+        }
+    };
+    let validate = || -> Result<(), String> {
+        validate_operator_live(
+            operator,
+            &queue,
+            &proposal,
+            store,
+            &target.ctx.sink,
+            input_epoch.get(),
+        )
+    };
+    // `expectation.deadline_ms` is client-advisory metadata describing when that
+    // client plans to inspect downstream state. The resident service does not
+    // schedule or wait to that deadline, and it never expands the foreground
+    // actuator budget. One proposal occupies an ordinary control lane for at
+    // most nine seconds of turn orchestration.
+    let turn_request = format!(
+        "idle=750 timeout=9000 submit_window=1500 presses=1 submit_verify=seq -- {}",
+        proposal.text
+    );
+    let response = operator_action_transaction(
+        &queue,
+        proposal.event_id,
+        &proposal.token,
+        &proposal.action_hash,
+        validate,
+        |preflight| {
+            let mut pre_submit = || {
+                let generation = capture_operator_submit_generation(
+                    operator,
+                    &queue,
+                    &proposal,
+                    store,
+                    &target.ctx.sink,
+                    input_epoch.get(),
+                )?;
+                submit_generation.set(Some(generation));
+                Ok(())
+            };
+            let response = control_session::cmd_turn_guarded(
+                &target.term,
+                store,
+                target.local_id,
+                &turn_request,
+                subscribers,
+                &target.ctx,
+                &control_session::TurnIo {
+                    paste: &paste,
+                    press: &press,
+                },
+                preflight,
+                &mut pre_submit,
+                Some("[operator action]"),
+            );
+            input_failure
+                .get()
+                .map_or(response, OperatorInputFailure::response)
+        },
+    );
+    operator.notify();
+    response
+}
+
+/// Proposal text is JSON data, not `operator` command-line syntax. In
+/// particular a trailing two-byte `\n` remains two literal bytes; only the
+/// interactive text `paste` verb applies its convenience expansion.
+fn operator_paste_event(text: &str) -> InputEvent {
+    InputEvent::Paste(text.to_string())
+}
+
+/// Execute one proposed side effect behind its durable intent transaction.
+///
+/// The executor receives the exact preflight it must call at its own final
+/// pre-mutation seam (`cmd_turn_guarded` does so after taking the turn lease).
+/// Preflight validates both before and after the durable intent append/fsync:
+/// input or state that changes while durability is established therefore stops
+/// before paste. Tests inject a counting executor through this same production
+/// helper to bind WAL-before-mutation, exactly-once, and no-retry behavior.
+fn operator_action_transaction<V, E>(
+    queue: &aterm_agent::operator::DurableQueue,
+    event_id: aterm_agent::operator::EventId,
+    token: &aterm_agent::operator::ClaimToken,
+    action_hash: &str,
+    mut validate: V,
+    execute_once: E,
+) -> String
+where
+    V: FnMut() -> Result<(), String>,
+    E: FnOnce(&mut dyn FnMut() -> Result<(), String>) -> String,
+{
+    use aterm_agent::operator::Resolution;
+
+    let mut intent_started = false;
+    let mut preflight = || -> Result<(), String> {
+        validate()?;
+        queue
+            .begin_action(event_id, token, "turn", action_hash)
+            .map_err(|error| error.to_string())?;
+        intent_started = true;
+        // The WAL fsync is intentionally inside the validation sandwich. A
+        // human/controller may type, or an approval prompt may appear, while the
+        // durable write is in flight; never paste from the pre-fsync snapshot.
+        validate()?;
+        Ok(())
+    };
+    let response = execute_once(&mut preflight);
+    if !intent_started {
+        return response;
+    }
+    let summary = operator_result_summary(&response);
+    let submitted = summary
+        .split_whitespace()
+        .any(|field| field == "submitted=1");
+    if !submitted {
+        let reason = format!("turn submission/result ambiguous: {summary}");
+        let _ = queue.mark_action_in_doubt(event_id, token, &reason);
+        return format!("ERR operator action in doubt: {summary}\n");
+    }
+    match queue.finish_action(event_id, token, action_hash, &summary, Resolution::Acted) {
+        // Never return cmd_turn's screen body. The durable summary admits only a
+        // fixed set of scalar fields, and the wire reply is rebuilt from it.
+        Ok(_) => compact_operator_success(&summary),
+        Err(error) => {
+            // Error strings are generated by the queue and contain identifiers,
+            // never terminal rows or proposal text.
+            let reason = format!("could not persist turn result: {error}");
+            let _ = queue.mark_action_in_doubt(event_id, token, &reason);
+            format!("ERR operator action in doubt: {error}\n")
+        }
+    }
+}
+
+fn compact_operator_success(summary: &str) -> String {
+    let metadata = summary
+        .strip_prefix("turn ")
+        .unwrap_or("result=unavailable");
+    format!("OK operator action=turn outcome=acted {metadata}\n")
+}
+
+fn operator_result_summary(response: &str) -> String {
+    let status = response.lines().next().unwrap_or("ERR missing turn result");
+    if let Some(summary) = operator_input_error_summary(status) {
+        return summary;
+    }
+    let mut fields = status.split_whitespace();
+    if fields.next() != Some("OK")
+        || fields
+            .next()
+            .is_none_or(|rows| rows.parse::<usize>().is_err())
+        || fields.next() != Some("turn")
+    {
+        return "turn result unavailable".to_string();
+    }
+    let admitted = fields
+        .filter(|field| {
+            ["submitted=", "status=", "seq=", "id=", "dur_ms=", "hash="]
+                .iter()
+                .any(|prefix| field.starts_with(prefix))
+                && field
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'=' | b'-' | b'_'))
+        })
+        .collect::<Vec<_>>();
+    format!("turn {}", admitted.join(" "))
+}
+
+/// Admit only the service-generated operator-input error grammar into the WAL
+/// summary.  This retains the safety-critical zero-vs-partial distinction while
+/// excluding proposal text and terminal evidence from the durable reason.
+fn operator_input_error_summary(status: &str) -> Option<String> {
+    let mut fields = status.split_whitespace();
+    if fields.next() != Some("ERR")
+        || fields.next() != Some("operator")
+        || fields.next() != Some("input")
+    {
+        return None;
+    }
+    let stage = match fields.next()? {
+        "paste" => "paste",
+        "submit" => "submit",
+        _ => return None,
+    };
+    match fields.next()? {
+        "busy-zero" if fields.next().is_none() => {
+            Some(format!("turn input={stage} outcome=busy-zero"))
+        }
+        "conflict-zero" if fields.next().is_none() => {
+            Some(format!("turn input={stage} outcome=conflict-zero"))
+        }
+        "partial" => {
+            let accepted = fields.next()?.strip_prefix("accepted=")?;
+            let accepted = accepted.parse::<usize>().ok()?;
+            if accepted == 0 || fields.next().is_some() {
+                return None;
+            }
+            Some(format!(
+                "turn input={stage} outcome=partial accepted={accepted}"
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn run_operator_proposal_bin<W: Write>(
+    line: &str,
+    reader: &mut impl BufRead,
+    scope: Scope,
+    operator: Option<&crate::operator_host::ControlHandle>,
+    store: &Store,
+    subscribers: &Subscribers,
+    writer: &mut W,
+) -> bool {
+    let (selector, n) = match parse_feed_bin(line, "operator-propose-bin") {
+        FeedBinFrame::Ok(selector, n) => (selector, n),
+        FeedBinFrame::Malformed => {
+            let _ = writer.write_all(b"ERR usage: operator-propose-bin <n> then <n> JSON bytes\n");
+            let _ = writer.flush();
+            return true;
+        }
+        FeedBinFrame::TooLarge => {
+            let _ = writer.write_all(b"ERR operator-propose-bin too large\n");
+            let _ = writer.flush();
+            return false;
+        }
+    };
+    // These failures make the announced frame unusable. Refuse and CLOSE before
+    // touching its body: reading attacker-chosen bytes after an authority,
+    // routing, availability, or operator-specific size failure needlessly parks
+    // a scarce control lane and contradicts the fail-closed framing contract.
+    let pre_body_error = if !matches!(scope, Scope::Owner) || selector.is_some() {
+        Some("ERR denied\n")
+    } else if operator.is_none() {
+        Some("ERR operator unavailable\n")
+    } else if n > MAX_OPERATOR_PROPOSAL {
+        Some("ERR operator proposal too large\n")
+    } else {
+        None
+    };
+    if let Some(error) = pre_body_error {
+        let _ = writer.write_all(error.as_bytes());
+        let _ = writer.flush();
+        return false;
+    }
+    let mut payload = vec![0_u8; n];
+    let body_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    if read_exact_authenticated_until(reader, &mut payload, body_deadline).is_err() {
+        let _ = writer.write_all(b"ERR operator proposal body timeout\n");
+        let _ = writer.flush();
+        return false;
+    }
+    let response = run_operator_proposal(
+        &payload,
+        operator.expect("availability checked before body read"),
+        store,
+        subscribers,
+    );
+    writer.write_all(response.as_bytes()).is_ok() && writer.flush().is_ok()
 }
 
 /// Handle a `feed-bin <n>\n<bytes>` (or `@<sel> feed-bin <n>\n<bytes>`) frame: read
@@ -3821,6 +4587,35 @@ fn read_exact_authenticated(reader: &mut impl Read, payload: &mut [u8]) -> std::
     Ok(())
 }
 
+/// Proposal frames occupy an ordinary RPC lane and therefore have an absolute
+/// body deadline in addition to the socket's liveness timeout ticks. On expiry
+/// the caller closes the now-partial frame; it must never resume line dispatch.
+fn read_exact_authenticated_until(
+    reader: &mut impl Read,
+    payload: &mut [u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    let mut filled = 0;
+    while filled < payload.len() {
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        match reader.read(&mut payload[filled..]) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(read) => filled += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::WouldBlock
+                ) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 /// AUTHORIZE a `subscribe` request and, on success, FLIP this connection to push
 /// mode by running the subscriber push loop (which never returns to the poll loop).
 ///
@@ -3849,6 +4644,7 @@ fn write_err<W: Write>(writer: &mut W, msg: &[u8]) {
     let _ = writer.flush();
 }
 
+#[cfg(test)]
 fn run_subscribe<W: Write>(
     line: &str,
     active: &ActiveHandle,
@@ -3856,6 +4652,67 @@ fn run_subscribe<W: Write>(
     subscribers: &Subscribers,
     scope: Scope,
     writer: &mut W,
+) {
+    run_subscribe_with_peer_probe(line, active, store, subscribers, scope, writer, || false);
+}
+
+/// Run a production socket subscription with read-side disconnect detection.
+///
+/// The protocol becomes push-only after the subscribe acknowledgement. Its client
+/// MUST keep the write/send half open and send no more bytes; EOF, an unexpected
+/// byte, or a read error therefore all mean the peer is gone. The one-millisecond
+/// read timeout keeps each 250ms liveness probe bounded on both Unix and Windows.
+fn run_subscribe_socket(
+    line: &str,
+    active: &ActiveHandle,
+    store: &Store,
+    subscribers: &Subscribers,
+    scope: Scope,
+    writer: &mut CtlStream,
+) {
+    let Ok(probe) = writer.try_clone() else {
+        return;
+    };
+    if probe
+        .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+        .is_err()
+    {
+        return;
+    }
+    run_subscribe_with_peer_probe(line, active, store, subscribers, scope, writer, move || {
+        subscription_peer_gone(&probe)
+    });
+}
+
+fn subscription_peer_gone(stream: &CtlStream) -> bool {
+    use std::io::Read as _;
+
+    let mut stream = stream;
+    let mut byte = [0_u8; 1];
+    match stream.read(&mut byte) {
+        Ok(0) | Ok(_) => true,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+fn run_subscribe_with_peer_probe<W: Write, P: FnMut() -> bool>(
+    line: &str,
+    active: &ActiveHandle,
+    store: &Store,
+    subscribers: &Subscribers,
+    scope: Scope,
+    writer: &mut W,
+    peer_gone: P,
 ) {
     let line = line.strip_suffix('\r').unwrap_or(line);
     // Strip the verb; the remainder is `@<sel>[,<sel>...] <streams> [since=<seq>]`.
@@ -4132,7 +4989,7 @@ fn run_subscribe<W: Write>(
     if writer.flush().is_err() {
         return;
     }
-    subscribe::push_loop(
+    subscribe::push_loop_with_peer_probe(
         subscribers,
         store,
         &targets,
@@ -4149,6 +5006,7 @@ fn run_subscribe<W: Write>(
             timestamps: req.timestamps,
         },
         writer,
+        peer_gone,
     );
 }
 
@@ -4301,6 +5159,26 @@ fn front_drive_escalation(
     }
 }
 
+/// Post the connections REPAINT POKE after a successful connection-authority
+/// act on the control thread (`connect`/`disconnect`/`grant`/`revoke`, design
+/// §6: new verbs "poke the repaint funnel"). The edge tables changed but no
+/// funnel epoch moved, so without this the §4 tab marks would show the old
+/// state until the next unrelated strip refresh. Keyed on the `OK` reply —
+/// a refused/failed act changed nothing. Fire-and-forget (the `Wake::redraw`
+/// idiom): a gone event loop only costs the repaint.
+fn poke_connections_on_ok(proxy: &EventLoopProxy<Wake>, resp: String) -> String {
+    if resp.starts_with("OK") {
+        // Advance the §2.4 freshness epoch BEFORE the wake: the wake's
+        // refresh recomposes the tab chrome through its cache gate, and the
+        // `grant`/`revoke` verbs mutate tables WITHOUT touching the record
+        // store — this poke is their only bump site. (`connect`/`disconnect`
+        // already bumped in-store; a double bump only re-misses the cache.)
+        crate::connections::connections().bump_revision();
+        let _ = proxy.send_event(Wake::ConnectionsChanged);
+    }
+    resp
+}
+
 fn front_drive_denial(surface: FrontControlSurface) -> String {
     match surface {
         FrontControlSurface::Overlay(kind) => format!(
@@ -4346,6 +5224,140 @@ fn cross_input(
             "OK\n".to_string()
         }
         None => err.to_string(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperatorInputStage {
+    Paste,
+    Submit,
+}
+
+impl OperatorInputStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Paste => "paste",
+            Self::Submit => "submit",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperatorInputFailure {
+    stage: OperatorInputStage,
+    delivery: Delivery,
+}
+
+impl OperatorInputFailure {
+    /// Sanitized control reply: stage + kernel count only, never proposal or
+    /// screen text.  `operator_result_summary` admits this exact grammar into the
+    /// durable in-doubt reason so recovery retains zero-vs-partial evidence.
+    fn response(self) -> String {
+        match self.delivery {
+            Delivery::PartialInDoubt { accepted } => format!(
+                "ERR operator input {} partial accepted={accepted}\n",
+                self.stage.as_str()
+            ),
+            Delivery::BusyZero | Delivery::Failed => {
+                format!("ERR operator input {} busy-zero\n", self.stage.as_str())
+            }
+            Delivery::ConflictZero => {
+                format!("ERR operator input {} conflict-zero\n", self.stage.as_str())
+            }
+            Delivery::Full | Delivery::FullAt { .. } => {
+                "ERR operator input internal-full\n".to_string()
+            }
+        }
+    }
+}
+
+/// Guarded operator egress: one immediate bounded frame, never spill/park. The
+/// typed outcome is retained until the transaction layer has durably classified
+/// a zero-byte refusal versus a partial kernel mutation. Neither is retried.
+#[cfg(test)]
+fn operator_input(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: Option<InputEvent>,
+) -> Delivery {
+    let Some(ev) = ev else {
+        return Delivery::BusyZero;
+    };
+    match seam_egress(term, &ctx.sink, &ev, EgressMode::TryImmediate) {
+        Egress::Reported(delivery) => delivery,
+        Egress::TrackingOff { .. } => Delivery::BusyZero,
+    }
+}
+
+/// Epoch-conditional operator egress. A successful frame returns the exact
+/// advanced epoch as [`Delivery::FullAt`]; a foreign attempt returns
+/// [`Delivery::ConflictZero`] and this event contributes no PTY bytes. The
+/// terminal's bounded screen generation is compared and approval-classified
+/// while its lock remains held across the conditional sink syscall. Thus output
+/// applied by the reader cannot change the checked presentation between compare
+/// and paste/Enter.
+#[derive(Clone, Copy)]
+enum OperatorTerminalFence {
+    Exact(aterm_agent::operator::EventGeneration),
+}
+
+fn operator_input_if_epoch(
+    term: &Arc<Mutex<Terminal>>,
+    ctx: &SessionCtx,
+    ev: Option<InputEvent>,
+    expected: InputEpoch,
+    terminal_fence: OperatorTerminalFence,
+) -> Delivery {
+    let Some(ev) = ev else {
+        return Delivery::BusyZero;
+    };
+    // This is inside the host actuation gate in production. A blocking terminal
+    // acquisition here would let output/reflow hold fleet-fault, unmanagement,
+    // and shutdown behind an unbounded wait. Refuse with zero bytes instead.
+    let terminal = match term.try_lock() {
+        Ok(terminal) => terminal,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return Delivery::BusyZero,
+    };
+    let OperatorTerminalFence::Exact(expected_generation) = terminal_fence;
+    let evidence = crate::operator_host::terminal_evidence(&terminal);
+    let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+    if terminal.is_alternate_screen() != expected_generation.alternate_screen
+        || terminal.content_seq() != expected_generation.content_seq
+        || fingerprint != expected_generation.fingerprint
+        || crate::operator_host::looks_like_approval(&evidence)
+    {
+        return Delivery::ConflictZero;
+    }
+    let bytes = match ev {
+        InputEvent::Paste(text) => terminal.format_paste(&text),
+        InputEvent::Key {
+            key,
+            mods,
+            base_layout,
+            event_type,
+        } => aterm_types::keyboard::encode_key_with_layout(
+            &key,
+            mods,
+            terminal.keyboard_mode(),
+            event_type,
+            base_layout,
+        ),
+        _ => return Delivery::BusyZero,
+    };
+    if bytes.is_empty() {
+        return Delivery::FullAt { epoch: expected };
+    }
+    let (outcome, epoch) = ctx
+        .sink
+        .try_write_frame_immediate_if_epoch(expected, &bytes);
+    match outcome {
+        aterm_session::sink::ImmediateWrite::Full => Delivery::FullAt { epoch },
+        aterm_session::sink::ImmediateWrite::BusyZero => Delivery::BusyZero,
+        aterm_session::sink::ImmediateWrite::ConflictZero => Delivery::ConflictZero,
+        aterm_session::sink::ImmediateWrite::PartialInDoubt { accepted } => {
+            Delivery::PartialInDoubt { accepted }
+        }
     }
 }
 
@@ -4834,10 +5846,35 @@ fn handle(
             return "ERR denied\n".to_string();
         }
         return match verb {
+            // Production intercepts these before generic dispatch because it owns
+            // the durable handle and (for propose) the following binary frame.
+            "operator" | "operator-propose-bin" => "ERR operator unavailable\n".to_string(),
             "sessions" => control_session::cmd_sessions(self_ctx, store),
             "who" => control_session::cmd_who(store, subscribers),
-            "grant" => control_session::cmd_grant(self_ctx, scope, rest),
-            "revoke" => control_session::cmd_revoke(self_ctx, scope, rest),
+            // The op-level authority primitives and their connection-grain twins
+            // (design §6) share the repaint poke: a successful act moves the §4
+            // tab marks, which no funnel epoch would otherwise notice.
+            "grant" => {
+                poke_connections_on_ok(proxy, control_session::cmd_grant(self_ctx, scope, rest))
+            }
+            "revoke" => {
+                poke_connections_on_ok(proxy, control_session::cmd_revoke(self_ctx, scope, rest))
+            }
+            // `connect`/`disconnect`: the declarative session-connection verbs.
+            // Self-scoped like `grant` (the endpoints ride as `dst=`/`src=`
+            // arguments); they take the STORE to resolve both endpoints and act
+            // on the destination's table through the connections seam.
+            "connect" => {
+                poke_connections_on_ok(proxy, control_session::cmd_connect(store, scope, rest))
+            }
+            "disconnect" => {
+                poke_connections_on_ok(proxy, control_session::cmd_disconnect(store, scope, rest))
+            }
+            // `flows`: the aggregated connection graph (pure read, no poke).
+            "flows" => control_session::cmd_flows(store, scope, rest),
+            // `raise <sid>`: raise the hosting window + select the tab (a
+            // main-thread hop; window/tab state is App-owned).
+            "raise" => control_session::cmd_raise(proxy, store, scope, rest),
             "whoami" => control_session::cmd_whoami(self_ctx, scope),
             // Network-drive meta verbs. `dial <name>` itself is handled earlier in
             // the serve loop (it takes over the connection); these are its
@@ -5127,12 +6164,13 @@ fn handle(
                 // paste/key, so paste/Return movement provenance, input
                 // ordering and every other host side effect stay intact.
                 let paste = |text: &str| {
-                    let _ = front_routed_input(
+                    front_routed_input(
                         proxy,
                         session,
                         Some(InputEvent::Paste(control_input::paste_text(text))),
                         "ERR\n",
-                    );
+                    )
+                    .starts_with("OK")
                 };
                 let press = |name: &str| {
                     front_routed_input(proxy, session, parse_key(name), "ERR\n").starts_with("OK")
@@ -5151,12 +6189,13 @@ fn handle(
                 )
             } else if turn_input_route(is_cross, targets_front) == TurnInputRoute::Background {
                 let paste = |text: &str| {
-                    let _ = cross_input(
+                    cross_input(
                         term,
                         ctx,
                         Some(InputEvent::Paste(control_input::paste_text(text))),
                         "ERR\n",
-                    );
+                    )
+                    .starts_with("OK")
                 };
                 let press =
                     |name: &str| cross_input(term, ctx, parse_key(name), "ERR\n").starts_with("OK");
@@ -5173,9 +6212,7 @@ fn handle(
                     },
                 )
             } else {
-                let paste = |text: &str| {
-                    let _ = control_input::cmd_paste(proxy, text);
-                };
+                let paste = |text: &str| control_input::cmd_paste(proxy, text).starts_with("OK");
                 let press = |name: &str| control_input::cmd_key(proxy, name).starts_with("OK");
                 control_session::cmd_turn(
                     term,
@@ -6091,8 +7128,9 @@ mod tests {
     #[cfg(unix)]
     use super::control_selection::{cmd_select, cmd_selection};
     use super::control_session::{
-        TurnIo, cmd_cast, cmd_edges, cmd_edges_json, cmd_family, cmd_grant, cmd_lease, cmd_meta,
-        cmd_ready, cmd_revoke, cmd_sessions, cmd_timeline, cmd_turn, cmd_who, cmd_whoami,
+        TurnIo, cmd_cast, cmd_connect_in, cmd_disconnect_in, cmd_edges, cmd_edges_json,
+        cmd_family, cmd_flows, cmd_grant, cmd_lease, cmd_meta, cmd_ready, cmd_revoke,
+        cmd_sessions, cmd_timeline, cmd_turn, cmd_who, cmd_whoami, raise_target,
     };
     use super::*;
     use crate::TabAction;
@@ -6105,6 +7143,1043 @@ mod tests {
     use std::io::Read;
     #[cfg(unix)]
     use std::os::unix::io::FromRawFd;
+
+    #[test]
+    fn operator_proposal_schema_is_closed_and_human_approvals_are_rejected() {
+        let valid = br#"{
+            "schema":1,
+            "event_id":7,
+            "claim_token":"0000000000000000000000000000000000000000000000000000000000000000",
+            "sid":"s-test",
+            "generation":{"lifecycle_epoch":3,"alternate_screen":false,"content_seq":9,"fingerprint":"0000000000000000000000000000000000000000000000000000000000000000"},
+            "action":{"kind":"turn","text":"Continue and summarize the result."},
+            "expectation":{"kind":"busy_then_attention","deadline_ms":300000}
+        }"#;
+        assert!(decode_operator_proposal(valid).is_ok());
+
+        let approval = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("Continue and summarize the result.", "yes");
+        assert!(
+            decode_operator_proposal(approval.as_bytes())
+                .err()
+                .unwrap()
+                .contains("human-only")
+        );
+        let unknown = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("\"schema\":1,", "\"schema\":1,\"extra\":true,");
+        assert!(decode_operator_proposal(unknown.as_bytes()).is_err());
+
+        for disallowed in [r"line\nbreak", r"line\tbreak", " leading", "trailing "] {
+            let proposal = String::from_utf8(valid.to_vec())
+                .unwrap()
+                .replace("Continue and summarize the result.", disallowed);
+            assert!(
+                decode_operator_proposal(proposal.as_bytes()).is_err(),
+                "operator text {disallowed:?} must fail before any egress"
+            );
+        }
+
+        // JSON `\\n` decodes to a literal backslash+n pair. Unlike the interactive
+        // `paste` verb, the structured operator path preserves those exact bytes.
+        let literal = r"Continue literally: \\n";
+        let proposal = String::from_utf8(valid.to_vec())
+            .unwrap()
+            .replace("Continue and summarize the result.", literal);
+        let decoded = decode_operator_proposal(proposal.as_bytes()).unwrap();
+        assert_eq!(decoded.text, r"Continue literally: \n");
+        assert_eq!(
+            operator_paste_event(&decoded.text),
+            InputEvent::Paste(r"Continue literally: \n".to_string())
+        );
+        assert_ne!(
+            control_input::paste_text(&decoded.text),
+            decoded.text,
+            "regression control: interactive paste would expand the literal suffix"
+        );
+    }
+
+    #[test]
+    fn operator_proposal_rejections_close_without_reading_body() {
+        struct NoBodyRead;
+
+        impl std::io::Read for NoBodyRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+                panic!("operator proposal rejection attempted to read its body")
+            }
+        }
+
+        impl std::io::BufRead for NoBodyRead {
+            fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                panic!("operator proposal rejection attempted to buffer its body")
+            }
+
+            fn consume(&mut self, _amount: usize) {}
+        }
+
+        let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(1);
+        let operator = crate::operator_host::ControlHandle::new(
+            "test-proposal-pre-body".to_string(),
+            notify_tx,
+        );
+        let store = crate::session_store::new_store();
+        let subscribers = crate::subscribe::new_registry();
+
+        let assert_rejected = |line: &str,
+                               scope: Scope,
+                               operator: Option<&crate::operator_host::ControlHandle>,
+                               expected: &str| {
+            let mut reader = NoBodyRead;
+            let mut output = Vec::new();
+            assert!(
+                !run_operator_proposal_bin(
+                    line,
+                    &mut reader,
+                    scope,
+                    operator,
+                    &store,
+                    &subscribers,
+                    &mut output,
+                ),
+                "an unread announced body makes the connection unrecoverable"
+            );
+            assert_eq!(String::from_utf8(output).unwrap(), expected);
+        };
+
+        assert_rejected(
+            "operator-propose-bin 4",
+            Scope::Edge(EdgeToken::generate()),
+            Some(&operator),
+            "ERR denied\n",
+        );
+        assert_rejected(
+            "@. operator-propose-bin 4",
+            Scope::Owner,
+            Some(&operator),
+            "ERR denied\n",
+        );
+        assert_rejected(
+            "operator-propose-bin 4",
+            Scope::Owner,
+            None,
+            "ERR operator unavailable\n",
+        );
+        assert_rejected(
+            &format!("operator-propose-bin {}", MAX_OPERATOR_PROPOSAL + 1),
+            Scope::Owner,
+            Some(&operator),
+            "ERR operator proposal too large\n",
+        );
+
+        operator
+            .inject_fleet_fault_for_test(aterm_agent::operator::FleetFaultReason::ObserverPanicked);
+        let response = run_operator_proposal(b"not even JSON", &operator, &store, &subscribers);
+        assert!(response.contains("fleet faulted"), "{response}");
+        assert!(response.contains("observer-panicked"), "{response}");
+        assert!(
+            !response.contains("invalid proposal JSON"),
+            "fleet fault must reject before proposal parsing or any action"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn guarded_turn_redacts_operator_text_while_generic_turn_keeps_text() {
+        let store = crate::session_store::new_store();
+        let (operator_target, _operator_rx) = pipe_session(68);
+        store.write().unwrap().register(operator_target.clone());
+        let subscribers = subscribe::new_registry();
+        let secret = "credential-like proposal body";
+        let paste = |text: &str| {
+            assert_eq!(text, secret);
+            true
+        };
+        let press = |_: &str| panic!("submit=none must not press");
+        let mut preflight = || Ok(());
+        let mut pre_submit = || Ok(());
+        let response = control_session::cmd_turn_guarded(
+            &operator_target.term,
+            &store,
+            operator_target.local_id,
+            &format!("idle=1 timeout=1000 submit=none -- {secret}"),
+            &subscribers,
+            &operator_target.ctx,
+            &control_session::TurnIo {
+                paste: &paste,
+                press: &press,
+            },
+            &mut preflight,
+            &mut pre_submit,
+            Some("[operator action]"),
+        );
+        assert!(response.starts_with("OK "), "{response}");
+        let operator_history = control_session::cmd_history(&operator_target.ctx, "");
+        assert!(!operator_history.contains(secret));
+        assert!(
+            operator_target
+                .ctx
+                .turns
+                .lock()
+                .unwrap()
+                .since(None)
+                .all(|record| record.text == "[operator action]")
+        );
+
+        let (generic_target, _generic_rx) = pipe_session(69);
+        store.write().unwrap().register(generic_target.clone());
+        let generic = control_session::cmd_turn(
+            &generic_target.term,
+            &store,
+            generic_target.local_id,
+            &format!("idle=1 timeout=1000 submit=none -- {secret}"),
+            &subscribers,
+            &generic_target.ctx,
+            &control_session::TurnIo {
+                paste: &paste,
+                press: &press,
+            },
+        );
+        assert!(generic.starts_with("OK "), "{generic}");
+        assert_eq!(
+            generic_target
+                .ctx
+                .turns
+                .lock()
+                .unwrap()
+                .since(None)
+                .last()
+                .map(|record| record.text.as_str()),
+            Some(secret),
+            "ordinary turn ledger behavior changed"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn foreign_input_between_operator_paste_and_submit_emits_no_enter() {
+        use std::collections::BTreeMap;
+        use std::io::Read as _;
+
+        use aterm_agent::operator::{
+            AttentionCondition, DurableQueue, EventGeneration, EventStatus, NewEvent, QueueConfig,
+        };
+        use aterm_spec::derive::operator_wal_actuator_model;
+        use aterm_spec::verify;
+
+        let store = crate::session_store::new_store();
+        let (target, mut reader) = pipe_session(70);
+        store.write().unwrap().register(target.clone());
+        aterm_pty::set_nonblocking(target.master, true).expect("nonblocking test master");
+        target.ctx.sink.note_master_nonblocking(true);
+
+        let unique = format!(
+            "aterm-operator-interjection-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&directory);
+        let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
+        queue.manage_sid("s-interjection").unwrap();
+        let fingerprint: [u8; 32] = Sha256::digest(b"ready").into();
+        queue
+            .enqueue(NewEvent::new(
+                "s-interjection",
+                EventGeneration::new(1, false, 1, fingerprint),
+                AttentionCondition::Ready,
+                "ready",
+            ))
+            .unwrap();
+        let claim = queue.claim().unwrap().unwrap();
+
+        let epoch = std::cell::Cell::new(target.ctx.sink.input_epoch());
+        let initial_terminal_generation = {
+            let terminal = term_lock(&target.term);
+            let evidence = crate::operator_host::terminal_evidence(&terminal);
+            EventGeneration::new(
+                0,
+                terminal.is_alternate_screen(),
+                terminal.content_seq(),
+                Sha256::digest(evidence.as_bytes()).into(),
+            )
+        };
+        let paste = |text: &str| {
+            let delivered = operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                Some(InputEvent::Paste(text.to_string())),
+                epoch.get(),
+                OperatorTerminalFence::Exact(initial_terminal_generation),
+            );
+            let Delivery::FullAt { epoch: advanced } = delivered else {
+                panic!("operator paste failed unexpectedly: {delivered:?}");
+            };
+            epoch.set(advanced);
+            // Deterministic human/raw-controller interjection after paste and
+            // before cmd_turn_guarded reaches its submit hook.
+            assert_eq!(target.ctx.sink.write_frame(b"human").unwrap(), 5);
+            true
+        };
+        let presses = std::sync::atomic::AtomicUsize::new(0);
+        let press = |_: &str| {
+            presses.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let validate_epoch = || {
+            if target.ctx.sink.input_epoch() == epoch.get() {
+                Ok(())
+            } else {
+                Err("target input interjected".to_string())
+            }
+        };
+        let response = operator_action_transaction(
+            &queue,
+            claim.event.id,
+            &claim.token,
+            &"22".repeat(32),
+            validate_epoch,
+            |preflight| {
+                let mut pre_submit = || {
+                    if target.ctx.sink.input_epoch() == epoch.get() {
+                        Ok(())
+                    } else {
+                        Err("target input interjected".to_string())
+                    }
+                };
+                control_session::cmd_turn_guarded(
+                    &target.term,
+                    &store,
+                    target.local_id,
+                    "idle=1 timeout=1000 presses=1 -- operator",
+                    &subscribe::new_registry(),
+                    &target.ctx,
+                    &control_session::TurnIo {
+                        paste: &paste,
+                        press: &press,
+                    },
+                    preflight,
+                    &mut pre_submit,
+                    Some("[operator action]"),
+                )
+            },
+        );
+        assert!(
+            response.starts_with("ERR operator action in doubt"),
+            "{response}"
+        );
+        assert_eq!(presses.load(Ordering::SeqCst), 0, "Enter was attempted");
+        assert!(matches!(
+            queue.snapshot(claim.event.id).unwrap().status,
+            EventStatus::InDoubt { .. }
+        ));
+
+        // Tier-1 bind the real conditional sink/write + durable transaction to
+        // the extended actuator model. The forged submit across the same foreign
+        // epoch is the non-vacuous negative control.
+        let project = |before: &BTreeMap<&'static str, i64>, changes: &[(&'static str, i64)]| {
+            let mut after = before.clone();
+            for (name, value) in changes {
+                after.insert(*name, *value);
+            }
+            after
+        };
+        let assert_step = |before: &BTreeMap<&'static str, i64>,
+                           after: &BTreeMap<&'static str, i64>,
+                           action: &str| {
+            let model = operator_wal_actuator_model();
+            let (accepted, diagnostics) = verify::validate_transition_tiered(
+                &model,
+                &[("Buggy", 0)],
+                before,
+                after,
+                Some(action),
+                "operator real interjection fence",
+            );
+            assert!(accepted, "{action} rejected\n{diagnostics}");
+        };
+        let model = operator_wal_actuator_model();
+        let initial = model.init_state();
+        let intent = project(&initial, &[("phase", 1), ("intent_durable", 1)]);
+        let pasted = project(
+            &intent,
+            &[
+                ("phase", 2),
+                ("mutations", 1),
+                ("input_epoch", 1),
+                ("expected_epoch", 1),
+            ],
+        );
+        let interjected = project(&pasted, &[("input_epoch", 2), ("interjected", 1)]);
+        let rejected = project(&interjected, &[("phase", 3), ("in_doubt", 1)]);
+        assert_step(&initial, &intent, "PersistIntent");
+        assert_step(&intent, &pasted, "MutateOnce");
+        assert_step(&pasted, &interjected, "ForeignInput");
+        assert_step(&interjected, &rejected, "RejectInterjectedSubmit");
+        let forged_submit = project(&interjected, &[("submit_writes", 1)]);
+        let (accepted, diagnostics) = verify::validate_transition_tiered(
+            &model,
+            &[("Buggy", 0)],
+            &interjected,
+            &forged_submit,
+            Some("RejectInterjectedSubmit"),
+            "operator interjection submit negative control",
+        );
+        assert!(
+            !accepted,
+            "foreign-input submit negative control was admitted\n{diagnostics}"
+        );
+
+        let mut landed = [0_u8; 13];
+        reader.read_exact(&mut landed).expect("paste + human input");
+        assert_eq!(&landed, b"operatorhuman");
+        assert!(
+            drain_pipe(&reader).is_empty(),
+            "guarded Enter must never arrive late"
+        );
+        drop(queue);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn input_change_during_intent_fsync_stops_before_paste() {
+        use aterm_agent::operator::{
+            AttentionCondition, DurableQueue, EventGeneration, EventStatus, NewEvent, QueueConfig,
+        };
+
+        let unique = format!(
+            "aterm-operator-post-wal-fence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&directory);
+        let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
+        queue.manage_sid("s-post-wal").unwrap();
+        let fingerprint: [u8; 32] = Sha256::digest(b"ready").into();
+        queue
+            .enqueue(NewEvent::new(
+                "s-post-wal",
+                EventGeneration::new(1, false, 1, fingerprint),
+                AttentionCondition::Ready,
+                "ready",
+            ))
+            .unwrap();
+        let claim = queue.claim().unwrap().unwrap();
+
+        let validations = std::sync::atomic::AtomicUsize::new(0);
+        let pastes = std::sync::atomic::AtomicUsize::new(0);
+        let response = operator_action_transaction(
+            &queue,
+            claim.event.id,
+            &claim.token,
+            &"33".repeat(32),
+            || {
+                let call = validations.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    Ok(())
+                } else {
+                    // Deterministic stand-in for an epoch/state change while
+                    // begin_action's durable append + fsync was in flight.
+                    Err("target input interjected during intent persistence".to_string())
+                }
+            },
+            |preflight| match preflight() {
+                Ok(()) => {
+                    pastes.fetch_add(1, Ordering::SeqCst);
+                    "OK 0 turn submitted=1 status=settled\n".to_string()
+                }
+                Err(error) => format!("ERR {error}\n"),
+            },
+        );
+        assert!(
+            response.starts_with("ERR operator action in doubt"),
+            "{response}"
+        );
+        assert_eq!(validations.load(Ordering::SeqCst), 2);
+        assert_eq!(pastes.load(Ordering::SeqCst), 0, "paste crossed WAL fsync");
+        assert!(matches!(
+            queue.snapshot(claim.event.id).unwrap().status,
+            EventStatus::InDoubt { .. }
+        ));
+        drop(queue);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn echoed_operator_paste_captures_post_paste_generation_and_submits_once() {
+        use std::io::Read as _;
+
+        use aterm_agent::operator::{
+            AttentionCondition, DurableQueue, EventGeneration, EventStatus, NewEvent, QueueConfig,
+            Resolution,
+        };
+
+        let store = crate::session_store::new_store();
+        let (target, mut reader) = pipe_session(73);
+        store.write().unwrap().register(target.clone());
+        aterm_pty::set_nonblocking(target.master, true).expect("nonblocking test master");
+        target.ctx.sink.note_master_nonblocking(true);
+        term_lock(&target.term).process(b"ready> ");
+
+        let initial_generation = {
+            let terminal = term_lock(&target.term);
+            let evidence = crate::operator_host::terminal_evidence(&terminal);
+            EventGeneration::new(
+                0,
+                terminal.is_alternate_screen(),
+                terminal.content_seq(),
+                Sha256::digest(evidence.as_bytes()).into(),
+            )
+        };
+        let initial_evidence = {
+            let terminal = term_lock(&target.term);
+            crate::operator_host::terminal_evidence(&terminal)
+        };
+        let unique = format!(
+            "aterm-operator-echo-fence-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&directory);
+        let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
+        queue.manage_sid("s-echo").unwrap();
+        queue
+            .enqueue(NewEvent::new(
+                "s-echo",
+                initial_generation,
+                AttentionCondition::Ready,
+                initial_evidence,
+            ))
+            .unwrap();
+        let claim = queue.claim().unwrap().unwrap();
+        let proposal = OperatorProposal {
+            event_id: claim.event.id,
+            token: claim.token.clone(),
+            sid: "s-echo".to_string(),
+            generation: initial_generation,
+            text: "continue work".to_string(),
+            action_hash: "44".repeat(32),
+        };
+
+        let epoch = std::cell::Cell::new(target.ctx.sink.input_epoch());
+        let submit_generation = std::cell::Cell::new(None);
+        let paste = |text: &str| {
+            let delivery = operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                Some(InputEvent::Paste(text.to_string())),
+                epoch.get(),
+                OperatorTerminalFence::Exact(proposal.generation),
+            );
+            let Delivery::FullAt { epoch: advanced } = delivery else {
+                panic!("paste did not land: {delivery:?}");
+            };
+            epoch.set(advanced);
+            // Realistic editor echo: this is OUTPUT, so it advances the terminal
+            // generation without touching the attempted-input epoch.
+            term_lock(&target.term).process(text.as_bytes());
+            true
+        };
+        let presses = std::sync::atomic::AtomicUsize::new(0);
+        let press = |name: &str| {
+            assert_eq!(name, "enter");
+            let generation = submit_generation.get().expect("post-paste capture");
+            let delivery = operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                parse_key(name),
+                epoch.get(),
+                OperatorTerminalFence::Exact(generation),
+            );
+            let Delivery::FullAt { epoch: advanced } = delivery else {
+                panic!("submit did not land: {delivery:?}");
+            };
+            epoch.set(advanced);
+            presses.fetch_add(1, Ordering::SeqCst);
+            term_lock(&target.term).process(b"\r\nresponse\r\n");
+            true
+        };
+        let validate = || {
+            validate_operator_action_state(&queue, &proposal, false)?;
+            if target.ctx.sink.input_epoch() != epoch.get() {
+                return Err("target input interjected".to_string());
+            }
+            let terminal = term_lock(&target.term);
+            let evidence = crate::operator_host::terminal_evidence(&terminal);
+            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+            if terminal.content_seq() != proposal.generation.content_seq
+                || fingerprint != proposal.generation.fingerprint
+            {
+                return Err("target changed before paste".to_string());
+            }
+            Ok(())
+        };
+        let response = operator_action_transaction(
+            &queue,
+            claim.event.id,
+            &claim.token,
+            &proposal.action_hash,
+            validate,
+            |preflight| {
+                let mut pre_submit = || {
+                    validate_operator_action_state(&queue, &proposal, true)?;
+                    if target.ctx.sink.input_epoch() != epoch.get() {
+                        return Err("target input interjected".to_string());
+                    }
+                    let terminal = term_lock(&target.term);
+                    let evidence = crate::operator_host::terminal_evidence(&terminal);
+                    if crate::operator_host::looks_like_approval(&evidence) {
+                        return Err("approval-shaped screens are human-only".to_string());
+                    }
+                    let generation = EventGeneration::new(
+                        proposal.generation.lifecycle_epoch,
+                        terminal.is_alternate_screen(),
+                        terminal.content_seq(),
+                        Sha256::digest(evidence.as_bytes()).into(),
+                    );
+                    assert_ne!(
+                        generation, proposal.generation,
+                        "echo must create a distinct post-paste generation"
+                    );
+                    submit_generation.set(Some(generation));
+                    Ok(())
+                };
+                control_session::cmd_turn_guarded(
+                    &target.term,
+                    &store,
+                    target.local_id,
+                    "idle=1 timeout=1000 presses=1 submit_verify=seq -- continue work",
+                    &subscribe::new_registry(),
+                    &target.ctx,
+                    &control_session::TurnIo {
+                        paste: &paste,
+                        press: &press,
+                    },
+                    preflight,
+                    &mut pre_submit,
+                    Some("[operator action]"),
+                )
+            },
+        );
+        assert!(response.starts_with("OK "), "{response}");
+        assert!(response.contains("submitted=1"), "{response}");
+        assert_eq!(presses.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            queue.snapshot(claim.event.id).unwrap().status,
+            EventStatus::Resolved {
+                resolution: Resolution::Acted,
+                ..
+            }
+        ));
+        let mut landed = vec![0_u8; proposal.text.len() + 1];
+        reader.read_exact(&mut landed).expect("paste plus Enter");
+        let mut expected = proposal.text.as_bytes().to_vec();
+        expected.push(b'\r');
+        assert_eq!(landed, expected);
+        assert!(drain_pipe(&reader).is_empty(), "more than one Enter landed");
+        drop(queue);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn output_change_after_submit_capture_is_rejected_under_terminal_lock() {
+        use aterm_agent::operator::EventGeneration;
+
+        let (target, reader) = pipe_session(74);
+        aterm_pty::set_nonblocking(target.master, true).expect("nonblocking test master");
+        target.ctx.sink.note_master_nonblocking(true);
+        term_lock(&target.term).process(b"safe post-paste draft");
+        let epoch = target.ctx.sink.input_epoch();
+        let captured = {
+            let terminal = term_lock(&target.term);
+            let evidence = crate::operator_host::terminal_evidence(&terminal);
+            EventGeneration::new(
+                0,
+                terminal.is_alternate_screen(),
+                terminal.content_seq(),
+                Sha256::digest(evidence.as_bytes()).into(),
+            )
+        };
+
+        // Output arrives after pre-submit captured the safe generation. The final
+        // compare and key encoding share the terminal lock, so Enter contributes
+        // zero bytes instead of acting on the new approval presentation.
+        term_lock(&target.term).process(b"\r\nAllow this command? [y/N]");
+        assert_eq!(
+            operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                parse_key("enter"),
+                epoch,
+                OperatorTerminalFence::Exact(captured),
+            ),
+            Delivery::ConflictZero
+        );
+        assert!(drain_pipe(&reader).is_empty(), "Enter reached the PTY");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn contended_terminal_at_final_egress_refuses_immediately_without_sink_write() {
+        use aterm_agent::operator::EventGeneration;
+
+        let (target, reader) = pipe_session(75);
+        aterm_pty::set_nonblocking(target.master, true).expect("nonblocking test master");
+        target.ctx.sink.note_master_nonblocking(true);
+        let epoch = target.ctx.sink.input_epoch();
+        let terminal_guard = term_lock(&target.term);
+        let evidence = crate::operator_host::terminal_evidence(&terminal_guard);
+        let generation = EventGeneration::new(
+            0,
+            terminal_guard.is_alternate_screen(),
+            terminal_guard.content_seq(),
+            Sha256::digest(evidence.as_bytes()).into(),
+        );
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            operator_input_if_epoch(
+                &target.term,
+                &target.ctx,
+                parse_key("enter"),
+                epoch,
+                OperatorTerminalFence::Exact(generation),
+            ),
+            Delivery::BusyZero
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "final egress waited on the terminal lock"
+        );
+        assert_eq!(target.ctx.sink.input_epoch(), epoch);
+        drop(terminal_guard);
+        assert!(drain_pipe(&reader).is_empty(), "Enter reached the PTY");
+    }
+
+    #[test]
+    fn operator_action_transaction_is_wal_first_exactly_once_and_never_retries() {
+        use std::collections::BTreeMap;
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        use aterm_agent::operator::{
+            AttentionCondition, DurableQueue, EventGeneration, EventStatus, NewEvent, QueueConfig,
+            Resolution,
+        };
+        use aterm_spec::derive::{Model, operator_wal_actuator_model};
+        use aterm_spec::verify;
+
+        type State = BTreeMap<&'static str, i64>;
+
+        fn state_after(before: &State, changes: &[(&'static str, i64)]) -> State {
+            let mut after = before.clone();
+            for (name, value) in changes {
+                after.insert(name, *value);
+            }
+            after
+        }
+
+        fn assert_transition(
+            model: &Model,
+            before: &State,
+            after: &State,
+            action: &str,
+            label: &str,
+        ) {
+            let (accepted, diagnostics) = verify::validate_transition_tiered(
+                model,
+                &[("Buggy", 0)],
+                before,
+                after,
+                Some(action),
+                label,
+            );
+            assert!(
+                accepted,
+                "shipping {label} transition must be admitted as {action}\n{diagnostics}"
+            );
+        }
+
+        let unique = format!(
+            "aterm-operator-transaction-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&directory);
+        let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
+        queue.manage_sid("s-test").unwrap();
+
+        let claim = |evidence: &str, seq: u64| {
+            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+            queue
+                .enqueue(NewEvent::new(
+                    "s-test",
+                    EventGeneration::new(1, false, seq, fingerprint),
+                    AttentionCondition::Ready,
+                    evidence,
+                ))
+                .unwrap();
+            queue.claim().unwrap().unwrap()
+        };
+
+        let first = claim("ready one", 1);
+        let action_hash = "11".repeat(32);
+        let mutations = std::sync::atomic::AtomicUsize::new(0);
+        let model = operator_wal_actuator_model();
+        let initial = model.init_state();
+        let intent = state_after(&initial, &[("phase", 1), ("intent_durable", 1)]);
+        let mutated = state_after(
+            &intent,
+            &[
+                ("phase", 2),
+                ("mutations", 1),
+                ("input_epoch", 1),
+                ("expected_epoch", 1),
+            ],
+        );
+        let submitted = state_after(&mutated, &[("submit_writes", 1)]);
+        let response = operator_action_transaction(
+            &queue,
+            first.event.id,
+            &first.token,
+            &action_hash,
+            || Ok(()),
+            |preflight| {
+                preflight().unwrap();
+                assert!(matches!(
+                    queue.snapshot(first.event.id).unwrap().status,
+                    EventStatus::ActionInFlight { .. }
+                ));
+                assert_transition(
+                    &model,
+                    &initial,
+                    &intent,
+                    "PersistIntent",
+                    "operator actuator durable preflight",
+                );
+                mutations.fetch_add(1, Ordering::SeqCst);
+                assert_transition(
+                    &model,
+                    &intent,
+                    &mutated,
+                    "MutateOnce",
+                    "operator actuator terminal input",
+                );
+                assert_transition(
+                    &model,
+                    &mutated,
+                    &submitted,
+                    "GuardedSubmit",
+                    "operator actuator epoch-guarded submit",
+                );
+                "OK 1 turn submitted=1 status=settled seq=1 id=1 dur_ms=1 hash=abc\nsecret settled screen row\n".to_string()
+            },
+        );
+        assert!(response.starts_with("OK "));
+        assert!(response.contains("outcome=acted"), "{response}");
+        assert!(
+            !response.contains("secret settled screen row"),
+            "operator reply leaked cmd_turn screen: {response}"
+        );
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            queue.snapshot(first.event.id).unwrap().status,
+            EventStatus::Resolved {
+                resolution: Resolution::Acted,
+                ..
+            }
+        ));
+        let result = state_after(
+            &submitted,
+            &[("phase", 4), ("result_durable", 1), ("resolved", 1)],
+        );
+        assert_transition(
+            &model,
+            &submitted,
+            &result,
+            "PersistResult",
+            "operator actuator durable result and resolution",
+        );
+
+        let second = claim("ready two", 2);
+        let ambiguous_intent = state_after(&initial, &[("phase", 1), ("intent_durable", 1)]);
+        let ambiguous_mutation = state_after(
+            &ambiguous_intent,
+            &[
+                ("phase", 2),
+                ("mutations", 1),
+                ("input_epoch", 1),
+                ("expected_epoch", 1),
+            ],
+        );
+        let response = operator_action_transaction(
+            &queue,
+            second.event.id,
+            &second.token,
+            &action_hash,
+            || Ok(()),
+            |preflight| {
+                preflight().unwrap();
+                assert!(matches!(
+                    queue.snapshot(second.event.id).unwrap().status,
+                    EventStatus::ActionInFlight { .. }
+                ));
+                assert_transition(
+                    &model,
+                    &initial,
+                    &ambiguous_intent,
+                    "PersistIntent",
+                    "ambiguous actuator durable preflight",
+                );
+                mutations.fetch_add(1, Ordering::SeqCst);
+                assert_transition(
+                    &model,
+                    &ambiguous_intent,
+                    &ambiguous_mutation,
+                    "MutateOnce",
+                    "ambiguous actuator terminal input",
+                );
+                "ERR submit verification timeout\nsecret-screen-row\n".to_string()
+            },
+        );
+        assert!(response.starts_with("ERR operator action in doubt"));
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            2,
+            "ambiguous action is not retried"
+        );
+        assert!(matches!(
+            queue.snapshot(second.event.id).unwrap().status,
+            EventStatus::InDoubt { ref reason, .. }
+                if !reason.contains("secret-screen-row")
+        ));
+        let ambiguous = state_after(&ambiguous_mutation, &[("phase", 3), ("in_doubt", 1)]);
+        assert_transition(
+            &model,
+            &ambiguous_mutation,
+            &ambiguous,
+            "CrashAfterMutation",
+            "ambiguous actuator outcome",
+        );
+
+        drop(queue);
+
+        // Crash after the shipping helper has durably written intent and called
+        // its executor, but before it can append a result. Takeover must expose
+        // InDoubt, and re-entering the same transaction must fail preflight
+        // before the mocked terminal input seam is reached again.
+        let crash_directory = directory.join("crash");
+        let crash_queue = DurableQueue::open(&crash_directory, 1, QueueConfig::default()).unwrap();
+        crash_queue.manage_sid("s-test").unwrap();
+        let crash_evidence = "ready crash";
+        let crash_fingerprint: [u8; 32] = Sha256::digest(crash_evidence.as_bytes()).into();
+        crash_queue
+            .enqueue(NewEvent::new(
+                "s-test",
+                EventGeneration::new(1, false, 3, crash_fingerprint),
+                AttentionCondition::Ready,
+                crash_evidence,
+            ))
+            .unwrap();
+        let crash_claim = crash_queue.claim().unwrap().unwrap();
+        let crash_mutations = std::sync::atomic::AtomicUsize::new(0);
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            operator_action_transaction(
+                &crash_queue,
+                crash_claim.event.id,
+                &crash_claim.token,
+                &action_hash,
+                || Ok(()),
+                |preflight| {
+                    preflight().unwrap();
+                    assert!(matches!(
+                        crash_queue.snapshot(crash_claim.event.id).unwrap().status,
+                        EventStatus::ActionInFlight { .. }
+                    ));
+                    crash_mutations.fetch_add(1, Ordering::SeqCst);
+                    panic!("simulated process loss after terminal input")
+                },
+            )
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(crash_mutations.load(Ordering::SeqCst), 1);
+        drop(crash_queue);
+
+        let recovered = DurableQueue::open(&crash_directory, 2, QueueConfig::default()).unwrap();
+        assert!(matches!(
+            recovered.snapshot(crash_claim.event.id).unwrap().status,
+            EventStatus::InDoubt { .. }
+        ));
+        let crash_intent = state_after(&initial, &[("phase", 1), ("intent_durable", 1)]);
+        let crash_mutated = state_after(
+            &crash_intent,
+            &[
+                ("phase", 2),
+                ("mutations", 1),
+                ("input_epoch", 1),
+                ("expected_epoch", 1),
+            ],
+        );
+        let crash_in_doubt = state_after(&crash_mutated, &[("phase", 3), ("in_doubt", 1)]);
+        assert_transition(
+            &model,
+            &crash_mutated,
+            &crash_in_doubt,
+            "CrashAfterMutation",
+            "crashed actuator takeover",
+        );
+
+        let retry = operator_action_transaction(
+            &recovered,
+            crash_claim.event.id,
+            &crash_claim.token,
+            &action_hash,
+            || Ok(()),
+            |preflight| match preflight() {
+                Ok(()) => {
+                    crash_mutations.fetch_add(1, Ordering::SeqCst);
+                    "OK 0 turn submitted=1 status=settled\n".to_string()
+                }
+                Err(error) => format!("ERR {error}\n"),
+            },
+        );
+        assert!(retry.starts_with("ERR "));
+        assert_eq!(
+            crash_mutations.load(Ordering::SeqCst),
+            1,
+            "takeover must not call terminal input again"
+        );
+        assert_transition(
+            &model,
+            &crash_in_doubt,
+            &crash_in_doubt,
+            "ReplayInDoubt",
+            "recovered actuator replay refusal",
+        );
+
+        // NEGATIVE CONTROL: this is exactly the Buggy=1 duplicate-input
+        // successor. Healthy model semantics must reject it.
+        let forged_replay = state_after(&crash_in_doubt, &[("mutations", 2), ("replayed", 1)]);
+        let (accepted, diagnostics) = verify::validate_transition_tiered(
+            &model,
+            &[("Buggy", 0)],
+            &crash_in_doubt,
+            &forged_replay,
+            Some("ReplayInDoubt"),
+            "operator actuator duplicate-input negative control",
+        );
+        assert!(
+            !accepted,
+            "duplicate-input negative control was accepted; binding is vacuous\n{diagnostics}"
+        );
+
+        drop(recovered);
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     /// The `dial <name>` relay verb is OWNER-only and takes exactly one connection
     /// name; both are rejected with a friendly `ERR` BEFORE any dial is attempted,
@@ -7644,6 +9719,97 @@ mod tests {
         }
     }
 
+    /// A wedged target must not make the operator's foreground `turn` exceed its
+    /// bound before the watcher deadline even starts.  The ordinary cross-input
+    /// path is intentionally backpressured; the operator path uses the immediate
+    /// sink result, stops before Enter, and leaves no rejected paste in the spill
+    /// drainer for surprise delivery after the call returns.
+    #[test]
+    #[cfg(unix)]
+    fn operator_turn_refuses_full_pty_promptly_without_late_input() {
+        use std::io::Read as _;
+
+        let store = crate::session_store::new_store();
+        let (handle, mut reader) = pipe_session(71);
+        store.write().unwrap().register(handle.clone());
+        aterm_pty::set_nonblocking(handle.master, true).expect("nonblocking test master");
+        handle.ctx.sink.note_master_nonblocking(true);
+
+        let mut filled = 0_usize;
+        loop {
+            match aterm_pty::write_some(handle.master, &[b'.'; 4096]) {
+                Ok(n) if n > 0 => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                other => panic!("unexpected pipe fill result: {other:?}"),
+            }
+        }
+        assert!(filled > 0, "pipe reached real backpressure");
+
+        let paste = |text: &str| {
+            operator_input(
+                &handle.term,
+                &handle.ctx,
+                Some(InputEvent::Paste(control_input::paste_text(text))),
+            ) == Delivery::Full
+        };
+        let press = |_: &str| panic!("BusyZero paste must stop before Enter");
+        let started = std::time::Instant::now();
+        let response = control_session::cmd_turn(
+            &handle.term,
+            &store,
+            handle.local_id,
+            "timeout=9000 -- REJECTED",
+            &subscribe::new_registry(),
+            &handle.ctx,
+            &control_session::TurnIo {
+                paste: &paste,
+                press: &press,
+            },
+        );
+        assert_eq!(response, "ERR paste delivery failed\n");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "foreground turn waited behind a full PTY: {:?}",
+            started.elapsed()
+        );
+
+        let mut old = vec![0_u8; filled];
+        reader.read_exact(&mut old).expect("drain original fill");
+        assert!(old.iter().all(|byte| *byte == b'.'));
+        assert!(
+            drain_pipe(&reader).is_empty(),
+            "the refused operator paste must not arrive after the turn returned"
+        );
+    }
+
+    #[test]
+    fn operator_input_diagnostics_retain_zero_vs_partial_and_stage() {
+        let paste_zero = OperatorInputFailure {
+            stage: OperatorInputStage::Paste,
+            delivery: Delivery::BusyZero,
+        }
+        .response();
+        assert_eq!(
+            operator_result_summary(&paste_zero),
+            "turn input=paste outcome=busy-zero"
+        );
+
+        let submit_partial = OperatorInputFailure {
+            stage: OperatorInputStage::Submit,
+            delivery: Delivery::PartialInDoubt { accepted: 1 },
+        }
+        .response();
+        assert_eq!(
+            operator_result_summary(&submit_partial),
+            "turn input=submit outcome=partial accepted=1"
+        );
+        assert_eq!(
+            operator_result_summary("ERR operator input submit partial accepted=1 leaked"),
+            "turn result unavailable",
+            "non-canonical fields must not enter the durable summary"
+        );
+    }
+
     /// THE follow-up's core claim: a cross-session input verb resolves the
     /// `@<selector>` TARGET the SAME way `send`/`feed` do and drives the source-blind
     /// seam against THAT session — bytes land in the TARGET's sink, never self's,
@@ -8440,10 +10606,19 @@ mod tests {
                 "update",
                 "help",
                 "verbs",
+                "operator",
+                "operator-propose-bin",
                 "sessions",
                 "whoami",
                 "grant",
                 "revoke",
+                // The session-connection verbs (design §6): connection-grain
+                // authority twins of grant/revoke, plus the aggregated graph
+                // and the raise act — all Owner-only, no op edge reaches them.
+                "connect",
+                "disconnect",
+                "flows",
+                "raise",
                 "dial",
                 "dial-list",
                 "dial-token",
@@ -8526,6 +10701,25 @@ mod tests {
         assert_eq!(escalated_op("invoke", "OpenPalette"), Some(OwnerOnly));
         assert_eq!(escalated_op("invoke", "SoftwareUpdate"), Some(OwnerOnly));
         assert_eq!(escalated_op("invoke", "ApplyUpdate"), Some(OwnerOnly));
+        // The connected-spawn presets MINT standing session-connection authority
+        // (design §5.3/§6) — their `invoke` twins carry the same OwnerOnly fence
+        // as the `spawn connected=` arm below.
+        assert_eq!(escalated_op("invoke", "NewControlledWindow"), Some(OwnerOnly));
+        assert_eq!(escalated_op("invoke", "NewControlledTab"), Some(OwnerOnly));
+        assert_eq!(escalated_op("invoke", "NewControllerWindow"), Some(OwnerOnly));
+        assert_eq!(escalated_op("invoke", "NewControllerTab"), Some(OwnerOnly));
+        // The context-menu picker/map rows (§2.3): the `invoke` twins of the
+        // `open connections` OwnerOnly arm below.
+        assert_eq!(escalated_op("invoke", "ConnectToSession"), Some(OwnerOnly));
+        assert_eq!(escalated_op("invoke", "ShowConnectionMap"), Some(OwnerOnly));
+        // The configure/disconnect ids (§2.3) rewrite/dissolve standing
+        // session-connection authority — the `connect`/`disconnect` verbs'
+        // OwnerOnly class, fenced identically at the invoke seam.
+        assert_eq!(
+            escalated_op("invoke", "ConfigureConnection"),
+            Some(OwnerOnly)
+        );
+        assert_eq!(escalated_op("invoke", "DisconnectSession"), Some(OwnerOnly));
         // A benign action / a benign `open` target does NOT escalate (base gate suffices).
         // Font zoom is runtime-only view state (no config persist).
         assert_eq!(escalated_op("invoke", "NewTab"), None);
@@ -8583,6 +10777,50 @@ mod tests {
         assert_eq!(escalated_op("open", "menu close"), Some(OwnerOnly));
         assert_eq!(escalated_op("open", "palette close"), Some(OwnerOnly));
         assert_eq!(escalated_op("open", "update close"), Some(OwnerOnly));
+
+        // SESSION CONNECTIONS (design §5.3/§6): a CONNECTED spawn mints standing
+        // cross-session authority, so `spawn connected=…` is OWNER-ONLY — no fine
+        // op expresses it — while a plain/`cwd=` spawn keeps its base WriteInput.
+        assert_eq!(
+            escalated_op("spawn", "connected=controller of=s-abc"),
+            Some(OwnerOnly)
+        );
+        assert_eq!(
+            escalated_op("spawn", "connected=controlled place=tab of=s-abc cwd=/tmp"),
+            Some(OwnerOnly)
+        );
+        assert_eq!(escalated_op("spawn", ""), None);
+        assert_eq!(escalated_op("spawn", "cwd=/tmp"), None);
+
+        // The fence must classify with the PARSER's tokenizer, not a whitespace
+        // split. Every spelling below is accepted by `parse_spawn_args` as a
+        // connected spawn, so every one of them must escalate; before this was
+        // wired to `split_quoted_tokens` the quoted forms walked straight past
+        // the gate and minted read-screen/signal/write-input on a real instance.
+        assert_eq!(
+            escalated_op("spawn", "\"connected=controller\" of=s-abc"),
+            Some(OwnerOnly),
+            "a quoted connected= must not walk past the Owner fence"
+        );
+        assert_eq!(
+            escalated_op("spawn", "of=s-abc \"connected=controlled\" place=tab"),
+            Some(OwnerOnly),
+            "position must not matter either"
+        );
+        // Unparseable input is fenced too: the fence is never weaker than the
+        // parser, and an unterminated quote reaches the parser as an error.
+        assert_eq!(escalated_op("spawn", "\"connected=controller"), Some(OwnerOnly));
+        // Every AGGREGATED-graph surface carries the `flows` Owner gate: the map
+        // (`open connections`), its text readout (`controls connections`), and its
+        // capture (`window connections`) — including the `close`-variant dismiss
+        // (the `open prefs close` rule). Benign targets keep their base class.
+        assert_eq!(escalated_op("open", "connections"), Some(OwnerOnly));
+        assert_eq!(escalated_op("controls", "connections"), Some(OwnerOnly));
+        assert_eq!(escalated_op("window", "connections"), Some(OwnerOnly));
+        assert_eq!(escalated_op("open", "connections close"), Some(OwnerOnly));
+        assert_eq!(escalated_op("controls", "front"), None);
+        assert_eq!(escalated_op("window", ""), None);
+        assert_eq!(escalated_op("window", "front shot.png"), None);
 
         // `meta` (base Read) escalates its WRITE sub-forms to WriteInput — a
         // read-only edge can read `meta` but never `meta set`/`meta unset` — and
@@ -8740,6 +10978,36 @@ mod tests {
             !dispatch_allows(edge_clip, "invoke", "OpenPalette", &ctx),
             "clipboard-write edge STILL DENIED invoke OpenPalette (owner-only)"
         );
+
+        // SESSION CONNECTIONS: the aggregated-graph surfaces and the connected
+        // spawn are OWNER-ONLY through the full dispatch decision — a write edge
+        // (and even a granted read edge, for the Read-class controls/window) is
+        // denied, while the same edge keeps the verb's benign targets.
+        let edge_read = edge_granted(Op::ReadScreen, &ctx);
+        for (verb, rest) in [
+            ("open", "connections"),
+            ("controls", "connections"),
+            ("window", "connections"),
+            ("spawn", "connected=controller of=s-abc"),
+        ] {
+            assert!(
+                !dispatch_allows(edge_write, verb, rest, &ctx),
+                "write edge DENIED {verb} {rest} (owner-only surface)"
+            );
+            assert!(
+                !dispatch_allows(edge_read, verb, rest, &ctx),
+                "read edge DENIED {verb} {rest} (owner-only surface)"
+            );
+            assert!(dispatch_allows(owner, verb, rest, &ctx), "Owner: {verb} {rest}");
+        }
+        assert!(
+            dispatch_allows(edge_read, "controls", "front", &ctx),
+            "read edge keeps benign controls targets"
+        );
+        assert!(
+            dispatch_allows(edge_write, "spawn", "cwd=/tmp", &ctx),
+            "write edge keeps the plain (non-minting) spawn"
+        );
     }
 
     /// PART B — the front-drive fence. A scoped input verb escalates to Owner while
@@ -8754,12 +11022,14 @@ mod tests {
         let owner = Scope::Owner;
 
         // Every overlay is a gateway with Owner-only bindings (About includes
-        // copy/open-URL), so all injected input verbs escalate identically.
+        // copy/open-URL; the connection map raises and DISCONNECTS, §5.3), so
+        // all injected input verbs escalate identically.
         for kind in [
             OverlayKind::Settings,
             OverlayKind::About,
             OverlayKind::Palette,
             OverlayKind::Update,
+            OverlayKind::ConnectionMap,
         ] {
             for verb in [
                 "key", "ctrl", "mouse", "paste", "focus", "send", "feed", "turn",
@@ -9093,6 +11363,136 @@ mod tests {
         let who = cmd_whoami(&ctx, owner);
         assert!(who.starts_with("OK s-"), "whoami: {who}");
         assert!(who.trim_end().ends_with("owner"), "whoami scope: {who}");
+    }
+
+    /// `revoke src=<sid>` (design §1.4#4/§6): the source sweep dissolves a WHOLE
+    /// connection — every row the source holds, across ops — and replies the
+    /// removed count; an unknown source is the fail-closed `ERR no such edge`
+    /// (never `OK 0`, which would read as a successful dissolution of nothing).
+    /// The sweep form keeps the token form's in-body Owner guard.
+    #[test]
+    fn revoke_src_form_sweeps_the_whole_connection_and_fails_closed_on_unknown() {
+        let ctx = test_ctx();
+        let owner = Scope::Owner;
+        let src = SessionId::new("s-sweepsrc1");
+
+        // Mint a full BOTH connection (three rows) through the ONE mint path
+        // (`grant_connection`, §1.4#2) — the graph the sweep must dissolve whole.
+        let minted = {
+            let mut edges = ctx.edges.lock().unwrap();
+            edges.grant_connection(
+                &src,
+                &ctx.self_id,
+                aterm_session::ConnectionKind::Both,
+                &ctx.nonce,
+            )
+        };
+        assert_eq!(minted.len(), 3, "Both mints all three human-fidelity ops");
+        for (_op, tok) in &minted {
+            let line = format!("AUTH {}", tok.to_hex());
+            assert!(
+                edge_scope_from_first_line(&line, &ctx).is_some(),
+                "live before the sweep"
+            );
+        }
+
+        // The sweep removes all three rows and reports the count; every minted
+        // token then fails closed at the handshake.
+        assert_eq!(cmd_revoke(&ctx, owner, "src=s-sweepsrc1"), "OK 3\n");
+        for (_op, tok) in &minted {
+            let line = format!("AUTH {}", tok.to_hex());
+            assert!(
+                edge_scope_from_first_line(&line, &ctx).is_none(),
+                "swept => fail closed"
+            );
+        }
+
+        // Unknown source / empty source / non-Owner scope all refuse.
+        assert_eq!(cmd_revoke(&ctx, owner, "src=s-nobody99"), "ERR no such edge\n");
+        assert_eq!(
+            cmd_revoke(&ctx, owner, "src="),
+            "ERR usage: revoke <edge-hex> | revoke src=<sid>\n"
+        );
+        assert_eq!(cmd_revoke(&ctx, edge(), "src=s-sweepsrc1"), "ERR denied\n");
+    }
+
+    /// The `session_edge` AUDIT seam (design §1.4#5, §7): each wire act — grant,
+    /// token revoke, source sweep — emits exactly one structured event on the
+    /// dedicated `session_edge` target carrying (action, origin, src, dst, op),
+    /// and NEVER a token hex (the bearer secret must not reach any log sink).
+    /// Captured records are filtered by this test's unique src sid, so parallel
+    /// tests minting their own edges cannot interfere.
+    #[test]
+    fn session_edge_audit_events_are_structured_and_hex_free() {
+        use std::sync::OnceLock;
+
+        struct Capture;
+        static CAPTURED: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
+        fn captured() -> &'static Mutex<Vec<(String, String)>> {
+            CAPTURED.get_or_init(|| Mutex::new(Vec::new()))
+        }
+        impl aterm_log::Log for Capture {
+            fn enabled(&self, _m: &aterm_log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &aterm_log::Record<'_>) {
+                captured()
+                    .lock()
+                    .unwrap()
+                    .push((record.target().to_string(), format!("{}", record.args())));
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: Capture = Capture;
+        // First installer wins process-wide (the logger OnceLock); either way the
+        // max level must admit the seam's Info tier.
+        let _ = aterm_log::set_logger(&LOGGER);
+        aterm_log::set_max_level(aterm_log::LevelFilter::Info);
+
+        let ctx = test_ctx();
+        let owner = Scope::Owner;
+        let src = "s-auditsrc7";
+
+        // grant -> revoke <hex> -> grant -> revoke src= : all four audited acts.
+        let reply1 = cmd_grant(&ctx, owner, &format!("{src} read-screen"));
+        let hex1 = reply1.strip_prefix("OK ").unwrap().trim_end();
+        assert_eq!(cmd_revoke(&ctx, owner, hex1), "OK\n");
+        let reply2 = cmd_grant(&ctx, owner, &format!("{src} write-input"));
+        let hex2 = reply2.strip_prefix("OK ").unwrap().trim_end();
+        assert_eq!(cmd_revoke(&ctx, owner, &format!("src={src}")), "OK 1\n");
+
+        let records: Vec<String> = captured()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(target, msg)| target == "session_edge" && msg.contains(src))
+            .map(|(_, msg)| msg.clone())
+            .collect();
+        let dst = ctx.self_id.as_str();
+        assert_eq!(records.len(), 4, "one event per act: {records:?}");
+        assert_eq!(
+            records[0],
+            format!("EDGE: action=grant origin=wire src={src} dst={dst} op=read-screen")
+        );
+        assert_eq!(
+            records[1],
+            format!("EDGE: action=revoke origin=wire src={src} dst={dst} op=read-screen")
+        );
+        assert_eq!(
+            records[2],
+            format!("EDGE: action=grant origin=wire src={src} dst={dst} op=write-input")
+        );
+        assert_eq!(
+            records[3],
+            format!("EDGE: action=revoke_src origin=wire src={src} dst={dst} op=*")
+        );
+        // The hex-free obligation: no captured line ANYWHERE carries a token.
+        for (_, msg) in captured().lock().unwrap().iter() {
+            assert!(
+                !msg.contains(hex1) && !msg.contains(hex2),
+                "a token hex leaked into a log line: {msg}"
+            );
+        }
     }
 
     /// `resize 65535 65535` asks for a ~4.3-billion-cell allocation; the parse
@@ -10420,6 +12820,97 @@ mod tests {
         );
     }
 
+    /// A push-only client can disappear while every watched terminal is quiet. The
+    /// server must discover that from the socket's read side, not from a future
+    /// write, or each crash permanently occupies one of the four reserved workers.
+    /// Run more sequential crash cycles than the pool size without producing a
+    /// single terminal byte; every loop must return and deregister on its own.
+    #[test]
+    fn quiet_subscription_crashes_reap_past_the_worker_pool_size() {
+        let store = session_store::new_store();
+        let h = registered_session(0, -1, b"");
+        store.write().unwrap().register(h.clone());
+        let active = active_for(&h);
+        let registry = subscribe::new_registry();
+
+        for cycle in 0..(CONTROL_SUBSCRIPTION_WORKERS + 2) {
+            let (client, server) = CtlStream::pair().expect("subscription socket pair");
+            let (store_t, active_t, registry_t) = (store.clone(), active.clone(), registry.clone());
+            let join = std::thread::spawn(move || {
+                let mut server = server;
+                run_subscribe_socket(
+                    "subscribe @. screen",
+                    &active_t,
+                    &store_t,
+                    &registry_t,
+                    Scope::Owner,
+                    &mut server,
+                );
+            });
+            let ack = read_until(&client, String::new(), |text| {
+                text.contains("OK subscribe 1\n")
+            });
+            assert!(
+                ack.contains("OK subscribe 1\n"),
+                "cycle {cycle} entered push mode: {ack:?}"
+            );
+
+            // Let the immediate catch-up finish and the server enter a genuinely
+            // quiet liveness wait. Dropping earlier could be detected by a pending
+            // catch-up write, which would not exercise the HUP-only failure mode.
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            assert!(
+                !join.is_finished(),
+                "cycle {cycle} keeps a fully-open quiet peer registered"
+            );
+
+            // No output or registry notify follows. Socket EOF is the only fact
+            // capable of releasing this worker.
+            drop(client);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !join.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(
+                join.is_finished(),
+                "quiet dead subscriber {cycle} was reaped within one liveness window"
+            );
+            join.join().expect("subscription loop exits cleanly");
+            assert_eq!(
+                registry.lock().unwrap().watched_sessions(),
+                0,
+                "cycle {cycle} released its registry entry"
+            );
+        }
+    }
+
+    /// The protocol requires a live subscriber to keep its write/send half open.
+    /// This lets the server distinguish a genuinely quiet reader from a dead or
+    /// half-closed one without emitting heartbeat traffic.
+    #[test]
+    fn subscription_probe_keeps_quiet_peer_and_rejects_write_half_close() {
+        let (client, server) = CtlStream::pair().expect("probe socket pair");
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+            .expect("bound liveness read");
+        assert!(
+            !subscription_peer_gone(&server),
+            "a fully-open quiet peer remains subscribed"
+        );
+
+        client
+            .shutdown(std::net::Shutdown::Write)
+            .expect("client closes its send half");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while !subscription_peer_gone(&server) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(
+            subscription_peer_gone(&server),
+            "client write-half close is a protocol-level disconnect"
+        );
+    }
+
     /// (b)-deny FAIL-CLOSED: a scoped `Edge` connection that subscribes to a SIBLING
     /// it has NO authorizing edge for gets `ERR denied\n` and never enters push mode
     /// (no partial subscription, no registry entry). Uses a buffer writer since the
@@ -11254,6 +13745,356 @@ mod tests {
         assert_eq!(
             cmd_family(&root_ctx, &store, Scope::Owner, "s-nope"),
             "ERR no such session\n"
+        );
+    }
+
+    // ---- session connections: the §6 wire verbs ---------------------------------
+
+    /// Register two sessions and return `(store, private conn store, src, dst)`
+    /// — the fixture every connection-verb test starts from. The PRIVATE record
+    /// store keeps these tests off the process-wide singleton.
+    fn connection_fixture() -> (
+        crate::session_store::Store,
+        crate::connections::ConnectionStore,
+        SessionHandle,
+        SessionHandle,
+    ) {
+        let store = session_store::new_store();
+        let a = registered_session(1, -1, b"");
+        let b = registered_session(2, -1, b"");
+        store.write().unwrap().register(a.clone());
+        store.write().unwrap().register(b.clone());
+        (store, crate::connections::new_connection_store(), a, b)
+    }
+
+    /// The token hex bound to `op=` on a `connect` reply line.
+    fn reply_token(reply: &str, op: &str) -> Option<EdgeToken> {
+        reply
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix(&format!("{op}=")))
+            .and_then(EdgeToken::from_hex)
+    }
+
+    /// `connect dst= src=` (default kind=both) mints the three human-fidelity
+    /// rows into the DESTINATION's table, replies every minted `op=<hex>`, and
+    /// the round trip is visible in the `edges` listing (token-free).
+    #[test]
+    fn connect_verb_round_trip_is_visible_in_edges() {
+        let (store, conn, a, b) = connection_fixture();
+        let out = cmd_connect_in(
+            &conn,
+            &store,
+            Scope::Owner,
+            &format!("dst={} src={}", b.sid.as_str(), a.sid.as_str()),
+        );
+        assert!(
+            out.starts_with("OK read-screen="),
+            "reply leads with the pull op: {out}"
+        );
+        for op in ["read-screen", "write-input", "signal"] {
+            assert!(
+                reply_token(&out, op).is_some(),
+                "{op}=<hex> must be delivered: {out}"
+            );
+        }
+        // The delivered write token is a REAL edge on the destination.
+        let tok = reply_token(&out, "write-input").unwrap();
+        assert!(
+            decide_edge(
+                &b.ctx.edges.lock().unwrap(),
+                &tok,
+                &b.sid,
+                Op::WriteInput,
+                &b.ctx.nonce
+            )
+            .is_permitted(),
+            "the delivered token authorizes"
+        );
+        // Visible in `edges` on the destination — triples only, no hex.
+        let edges = cmd_edges(&b.ctx);
+        assert!(edges.starts_with("OK 3\n"), "{edges}");
+        assert!(
+            edges.contains(&format!("{} {} read-screen", a.sid.as_str(), b.sid.as_str())),
+            "{edges}"
+        );
+        assert!(!edges.contains(&tok.to_hex()), "no token leak: {edges}");
+        // A scoped edge cannot connect (Owner-only, also gated by the table).
+        assert_eq!(
+            cmd_connect_in(&conn, &store, edge(), "dst=s-x src=s-y"),
+            "ERR denied\n"
+        );
+    }
+
+    /// DECLARATIVE set semantics on the wire (design §2.5/§9): a same-kind
+    /// re-connect replies the SAME live tokens (no churn); a pull→push re-kind
+    /// leaves exactly the push rows — the replaced pull row is gone, so no
+    /// observer ever reads both kinds at once via `edges`.
+    #[test]
+    fn connect_verb_is_declarative_across_kind_transitions() {
+        let (store, conn, a, b) = connection_fixture();
+        let line = |kind: &str| format!("dst={} src={} kind={kind}", b.sid.as_str(), a.sid.as_str());
+
+        let first = cmd_connect_in(&conn, &store, Scope::Owner, &line("pull"));
+        assert!(first.starts_with("OK read-screen="), "{first}");
+        assert!(!first.contains("write-input="), "pull mints no push: {first}");
+        // Idempotent re-connect: byte-identical reply — the original token stays.
+        let again = cmd_connect_in(&conn, &store, Scope::Owner, &line("pull"));
+        assert_eq!(first, again, "same-kind re-connect must not rotate tokens");
+
+        // Re-kind pull→push: ONE atomic transition; `edges` shows exactly push.
+        let pull_tok = reply_token(&first, "read-screen").unwrap();
+        let pushed = cmd_connect_in(&conn, &store, Scope::Owner, &line("push"));
+        assert!(!pushed.contains("read-screen="), "{pushed}");
+        assert!(
+            pushed.contains("write-input=") && pushed.contains("signal="),
+            "{pushed}"
+        );
+        let edges = cmd_edges(&b.ctx);
+        assert!(edges.starts_with("OK 2\n"), "exactly the push rows: {edges}");
+        assert!(
+            !edges.contains("read-screen"),
+            "pull must not survive the transition: {edges}"
+        );
+        assert_eq!(
+            decide_edge(
+                &b.ctx.edges.lock().unwrap(),
+                &pull_tok,
+                &b.sid,
+                Op::ReadScreen,
+                &b.ctx.nonce
+            ),
+            aterm_session::EdgeDecision::Deny,
+            "the replaced kind's token dies in the transition"
+        );
+    }
+
+    /// The `connect` argument fences: usage, self-loop, unknown/exited dst.
+    #[test]
+    fn connect_verb_arguments_fail_closed() {
+        let (store, conn, a, b) = connection_fixture();
+        for bad in [
+            "",
+            "dst=s-x",
+            "src=s-x",
+            "dst=s-x src=s-y kind=bogus",
+            "dst= src=s-y",
+            "dst=s-x src=s-y extra",
+        ] {
+            assert!(
+                cmd_connect_in(&conn, &store, Scope::Owner, bad).starts_with("ERR usage"),
+                "{bad:?} must be a usage error"
+            );
+        }
+        assert_eq!(
+            cmd_connect_in(
+                &conn,
+                &store,
+                Scope::Owner,
+                &format!("dst={0} src={0}", a.sid.as_str())
+            ),
+            "ERR self-loop\n"
+        );
+        assert_eq!(
+            cmd_connect_in(&conn, &store, Scope::Owner, "dst=s-nope src=s-any"),
+            "ERR no such session\n",
+            "dst must be registered"
+        );
+        // An Exited dst refuses the mint (its nonce already fails closed).
+        let mut dead = registered_session(9, -1, b"");
+        dead.state = SessionState::Exited;
+        let dead_sid = dead.sid.clone();
+        store.write().unwrap().register(dead);
+        assert_eq!(
+            cmd_connect_in(
+                &conn,
+                &store,
+                Scope::Owner,
+                &format!("dst={} src={}", dead_sid.as_str(), b.sid.as_str())
+            ),
+            "ERR exited\n"
+        );
+        // Nothing above left residue.
+        assert!(conn.records().is_empty());
+    }
+
+    /// `disconnect … kind=pull` removes ONLY the read-screen row of a recorded
+    /// connection; the bare form dissolves the remainder; an unknown pair fails
+    /// closed; unrecorded wire-grant rows dissolve through the op-filtered
+    /// sweep fallback.
+    #[test]
+    fn disconnect_verb_kind_filters_and_sweeps_unrecorded_grants() {
+        let (store, conn, a, b) = connection_fixture();
+        let pair = format!("dst={} src={}", b.sid.as_str(), a.sid.as_str());
+        assert!(
+            cmd_connect_in(&conn, &store, Scope::Owner, &pair).starts_with("OK"),
+            "fixture connect"
+        );
+
+        // kind=pull: exactly the read row goes; push stays live.
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, &format!("{pair} kind=pull")),
+            "OK 1\n"
+        );
+        let edges = cmd_edges(&b.ctx);
+        assert!(
+            edges.starts_with("OK 2\n") && !edges.contains("read-screen"),
+            "only read-screen removed: {edges}"
+        );
+
+        // The bare form dissolves the rest; a repeat fails closed.
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, &pair),
+            "OK 2\n"
+        );
+        assert_eq!(cmd_edges(&b.ctx), "OK 0\n");
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, &pair),
+            "ERR no such connection\n"
+        );
+
+        // Wire-granted rows with NO record: the op-filtered sweep fallback.
+        let c = SessionId::new("s-wire-src");
+        {
+            let mut tbl = b.ctx.edges.lock().unwrap();
+            let _ = tbl.grant(c.clone(), b.sid.clone(), Op::ReadScreen, b.ctx.nonce);
+            let _ = tbl.grant(c.clone(), b.sid.clone(), Op::WriteInput, b.ctx.nonce);
+        }
+        let wire_pair = format!("dst={} src={}", b.sid.as_str(), c.as_str());
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, &format!("{wire_pair} kind=push")),
+            "OK 1\n",
+            "push sweep takes only write-input"
+        );
+        let edges = cmd_edges(&b.ctx);
+        assert!(
+            edges.starts_with("OK 1\n") && edges.contains("read-screen"),
+            "{edges}"
+        );
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, &wire_pair),
+            "OK 1\n"
+        );
+        // A scoped edge cannot disconnect; unknown dst fails closed.
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, edge(), &pair),
+            "ERR denied\n"
+        );
+        assert_eq!(
+            cmd_disconnect_in(&conn, &store, Scope::Owner, "dst=s-nope src=s-x"),
+            "ERR no such session\n"
+        );
+    }
+
+    /// `flows` lists a minted triple across the whole instance (Owner-only), and
+    /// `flows --json` groups the pair's ops — no token ever appears.
+    #[test]
+    fn flows_verb_lists_the_aggregated_graph() {
+        let (store, conn, a, b) = connection_fixture();
+        assert_eq!(cmd_flows(&store, Scope::Owner, ""), "OK 0\n", "empty fabric");
+        let out = cmd_connect_in(
+            &conn,
+            &store,
+            Scope::Owner,
+            &format!("dst={} src={} kind=pull", b.sid.as_str(), a.sid.as_str()),
+        );
+        let tok = reply_token(&out, "read-screen").unwrap();
+
+        assert_eq!(
+            cmd_flows(&store, Scope::Owner, ""),
+            format!("OK 1\n{} {} read-screen\n", a.sid.as_str(), b.sid.as_str())
+        );
+        let json = cmd_flows(&store, Scope::Owner, "--json");
+        let body = json.strip_prefix("OK 1\n").expect("json_ok framing");
+        assert!(body.contains("\"flows\":[{"), "{body}");
+        assert!(
+            body.contains(&format!("\"src\":\"{}\"", a.sid.as_str()))
+                && body.contains(&format!("\"dst\":\"{}\"", b.sid.as_str()))
+                && body.contains("\"ops\":[\"read-screen\"]"),
+            "{body}"
+        );
+        assert!(!json.contains(&tok.to_hex()), "no token leak: {json}");
+
+        // Owner-only + strict flags.
+        assert_eq!(cmd_flows(&store, edge(), ""), "ERR denied\n");
+        assert!(cmd_flows(&store, Scope::Owner, "bogus").starts_with("ERR usage"));
+    }
+
+    /// `family` gains the §6 discovery rows for OWNER only: the source session
+    /// reads `pushes`, the destination `pushed-by`, a pull pair reads
+    /// `pulls`/`pulled-by`, a foreign (unregistered) src prints `unknown -` —
+    /// and an edge-scoped caller gets NONE of them (count intact).
+    #[test]
+    fn family_connection_rows_are_owner_only() {
+        let (store, conn, a, b) = connection_fixture();
+        assert!(
+            cmd_connect_in(
+                &conn,
+                &store,
+                Scope::Owner,
+                &format!("dst={} src={} kind=push", b.sid.as_str(), a.sid.as_str()),
+            )
+            .starts_with("OK"),
+            "fixture connect"
+        );
+        // A foreign wire-granted src pulling A: rows in A's table, src unknown.
+        let x = SessionId::new("s-foreign");
+        {
+            let mut tbl = a.ctx.edges.lock().unwrap();
+            let _ = tbl.grant(x.clone(), a.sid.clone(), Op::ReadScreen, a.ctx.nonce);
+        }
+
+        // Owner @ A: self+parent + `pushes B` + `pulled-by X` = 4 rows.
+        let fa = cmd_family(&a.ctx, &store, Scope::Owner, "");
+        assert!(fa.starts_with("OK 4\n"), "{fa}");
+        assert!(
+            fa.contains(&format!("pushes {} alive ", b.sid.as_str())),
+            "{fa}"
+        );
+        assert!(
+            fa.contains(&format!("pulled-by {} unknown -", x.as_str())),
+            "foreign src prints honestly: {fa}"
+        );
+        // Owner @ B: the inbound face of the same connection.
+        let fb = cmd_family(&b.ctx, &store, Scope::Owner, "");
+        assert!(
+            fb.contains(&format!("pushed-by {} alive ", a.sid.as_str())),
+            "{fb}"
+        );
+        assert!(!fb.contains("\npushes "), "B pushes nothing: {fb}");
+
+        // An edge-scoped caller gets NO connection rows — and the count agrees.
+        let fe = cmd_family(&a.ctx, &store, edge(), "");
+        assert!(fe.starts_with("OK 2\n"), "self+parent only: {fe}");
+        for kind in ["pushes ", "pushed-by ", "pulls ", "pulled-by "] {
+            assert!(!fe.contains(kind), "edge scope must not see {kind}: {fe}");
+        }
+    }
+
+    /// The pure half of `raise <sid>`: exactly one sid token resolves through
+    /// the registry to the local id the main-thread hop raises; unknown sids
+    /// and malformed argument lists fail closed (the proxy is never touched).
+    #[test]
+    fn raise_target_resolves_registered_sids() {
+        let store = session_store::new_store();
+        let h = registered_session(5, -1, b"");
+        store.write().unwrap().register(h.clone());
+        assert_eq!(raise_target(&store, h.sid.as_str()), Ok(5));
+        assert_eq!(
+            raise_target(&store, &format!("  {}  ", h.sid.as_str())),
+            Ok(5),
+            "whitespace-tolerant"
+        );
+        assert_eq!(
+            raise_target(&store, "s-nope"),
+            Err("ERR no such session\n".to_string())
+        );
+        assert_eq!(
+            raise_target(&store, ""),
+            Err("ERR usage: raise <sid>\n".to_string())
+        );
+        assert_eq!(
+            raise_target(&store, "s-a s-b"),
+            Err("ERR usage: raise <sid>\n".to_string())
         );
     }
 
@@ -12210,6 +15051,7 @@ mod tests {
             pasted.borrow_mut().push(text.to_string());
             // The app echoes the typed text (content advances, then goes quiet).
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |name: &str| {
             assert_eq!(name, "enter", "default submit key is enter");
@@ -12266,6 +15108,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12317,6 +15160,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12371,6 +15215,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12427,6 +15272,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12480,6 +15326,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12535,6 +15382,7 @@ mod tests {
         let paste = |text: &str| {
             pasted.borrow_mut().push(text.to_string());
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12580,7 +15428,7 @@ mod tests {
         // A held lease (as if another connection's turn were mid-flight) refuses
         // a new turn, naming the holder.
         *h.ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Turn(41));
-        let paste = |_: &str| {};
+        let paste = |_: &str| true;
         let press = |_: &str| true;
         let out = cmd_turn(
             term,
@@ -12604,6 +15452,7 @@ mod tests {
         let presses = Cell::new(0u32);
         let paste2 = |text: &str| {
             term.lock().unwrap().process(text.as_bytes());
+            true
         };
         let press2 = |_: &str| {
             presses.set(presses.get() + 1);
@@ -12697,7 +15546,7 @@ mod tests {
         assert!(cmd_lease(&h.ctx, "acquire holder=agent-a ttl=60000").starts_with("OK lease"));
 
         // A `turn` is HARD arbitration — it refuses to stomp a live cooperative hold.
-        let paste = |_: &str| {};
+        let paste = |_: &str| true;
         let press = |_: &str| true;
         let out = cmd_turn(
             term,
@@ -12786,7 +15635,7 @@ mod tests {
         store.write().unwrap().register(h.clone());
         let term = &h.term;
 
-        let paste = |_: &str| {};
+        let paste = |_: &str| true;
         let bad_press = |_: &str| false; // parse_key rejected the name
         let out = cmd_turn(
             term,

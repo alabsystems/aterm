@@ -14,6 +14,9 @@
 //!                                      line), run each against the fleet, and emit an
 //!                                      NDJSON result record per command.
 //!
+//!   aterm-fleet status|manage|...      thin clients of the opt-in operator
+//!                                      embedded in the caller's aterm instance.
+//!
 //! ## Why this shape, and where astream fits
 //!
 //! astream (the agent-native message bus) is at Phase 0: it ships the pure wire
@@ -29,39 +32,101 @@
 //! verbatim (a cross-instance `@<sid>` is relayed by aterm-ctl exactly as always).
 
 use std::io::{BufRead, BufReader, Write};
+use std::process::ExitCode;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 
-/// The whole fleet CLI as a callable: `argv[1..]` in, exits the process on
-/// completion (matching its binary-era behavior). Served in-process by the
+/// The whole fleet CLI as a callable: `argv[1..]` in, process exit code out.
+/// Served in-process by the
 /// ONE `aterm` binary (`aterm fleet …` / argv0 alias) and by the thin
 /// standalone bin.
-pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ! {
+pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let mode = argv.first().map(|a| a.to_string_lossy().into_owned());
     match mode.as_deref() {
-        Some("events") => federate(),
-        Some("exec") => dispatch(),
+        Some("events") => {
+            federate();
+            ExitCode::SUCCESS
+        }
+        Some("exec") => {
+            dispatch();
+            ExitCode::SUCCESS
+        }
+        Some(
+            command @ ("status" | "inspect" | "manage" | "unmanage" | "next" | "extend" | "ack"
+            | "reconcile" | "clear-fault" | "propose"),
+        ) => operator_command(command, &argv[1..]),
         Some("-h") | Some("--help") | None => usage(0),
         Some(other) => {
             eprintln!("aterm-fleet: unknown mode {other:?}");
-            usage(2);
+            usage(2)
         }
     }
-    std::process::exit(0);
 }
 
-fn usage(code: i32) -> ! {
-    eprint!(
-        "aterm-fleet — federate a fleet of aterm sessions into one fabric.\n\n\
+fn usage(code: u8) -> ExitCode {
+    let help = "aterm-fleet — federate a fleet of aterm sessions into one fabric.\n\n\
          USAGE:\n\
          \x20 aterm-fleet events     merge every live instance's `subscribe events` to stdout\n\
          \x20                        as NDJSON, addressed by astream Subject /fleet/<pid>/events/<sid>\n\
          \x20 aterm-fleet exec       read `@<sid> <verb> [args...]` command lines from stdin,\n\
-         \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\n\
-         The aterm-ctl binary is $ATERM_CTL, else a sibling of this binary, else PATH.\n"
-    );
-    std::process::exit(code);
+         \x20                        dispatch each to the fleet, emit an NDJSON result per line\n\
+         \x20 aterm-fleet status     show the embedded operator and managed allowlist\n\
+         \x20 aterm-fleet inspect <event>\n\
+         \x20 aterm-fleet manage <sid> | unmanage <sid>\n\
+         \x20 aterm-fleet next [timeout=<ms>]\n\
+         \x20 aterm-fleet extend <event> <claim-token> [ms=<n>]\n\
+         \x20 aterm-fleet ack <event> <claim-token> <no-action|pause|escalate>\n\
+         \x20 aterm-fleet reconcile <event> <claim-token> <acted|no-action|pause|escalate> confirm=human\n\
+         \x20 aterm-fleet clear-fault confirm=human\n\
+         \x20 aterm-fleet propose    read one guarded-turn JSON proposal from stdin\n\n\
+         Operator commands use the in-process control client. Legacy events/exec find\n\
+         aterm-ctl via $ATERM_CTL, then a sibling of this binary, then PATH.\n\n\
+         The embedded operator is EXPERIMENTAL (status reports it) and OFF by default.\n\
+         Launch an aterm instance with ATERM_OPERATOR=1 to opt in; it then starts with an\n\
+         empty allowlist, so `manage <sid>` is still required before anything is observed.\n\
+         Without the opt-in (or with $ATERM_NO_OPERATOR set) its verbs answer\n\
+         `ERR operator unavailable`. See docs/OPERATOR-EMBEDDED.md.\n";
+    if code == 0 {
+        print!("{help}");
+    } else {
+        eprint!("{help}");
+    }
+    ExitCode::from(code)
+}
+
+/// Forward a fleet-facing operator command to the normal aterm instance that
+/// hosts the caller. The embedded service is already resident; this invocation
+/// owns no queue, subscription, or mutation authority and returns after one
+/// reply. Call the library directly so `aterm fleet` remains genuinely
+/// one-binary and preserves `aterm-ctl`'s exact exit status (including 124).
+fn operator_command(command: &str, args: &[std::ffi::OsString]) -> ExitCode {
+    let ctl_args = match operator_ctl_args(command, args) {
+        Ok(ctl_args) => ctl_args,
+        Err(error) => {
+            eprintln!("aterm-fleet: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    aterm_ctl::main_entry(ctl_args)
+}
+
+fn operator_ctl_args(
+    command: &str,
+    args: &[std::ffi::OsString],
+) -> Result<Vec<std::ffi::OsString>, &'static str> {
+    let mut ctl_args = Vec::with_capacity(args.len() + 2);
+    if command == "propose" {
+        if !args.is_empty() {
+            return Err("propose reads one JSON proposal from stdin and takes no arguments");
+        }
+        ctl_args.push(std::ffi::OsString::from("operator-propose-bin"));
+    } else {
+        ctl_args.push(std::ffi::OsString::from("operator"));
+        ctl_args.push(std::ffi::OsString::from(command));
+        ctl_args.extend_from_slice(args);
+    }
+    Ok(ctl_args)
 }
 
 /// Resolve the `aterm-ctl` client: `$ATERM_CTL`, else a sibling of this binary
@@ -487,5 +552,19 @@ mod tests {
         let (sid, argv) = dispatch_argv("text");
         assert_eq!(sid, "-");
         assert_eq!(argv, vec!["text".to_string()]);
+    }
+
+    #[test]
+    fn operator_commands_build_exact_text_or_binary_control_frames() {
+        let clear =
+            operator_ctl_args("clear-fault", &[std::ffi::OsString::from("confirm=human")]).unwrap();
+        assert_eq!(
+            clear,
+            ["operator", "clear-fault", "confirm=human"].map(std::ffi::OsString::from)
+        );
+
+        let proposal = operator_ctl_args("propose", &[]).unwrap();
+        assert_eq!(proposal, [std::ffi::OsString::from("operator-propose-bin")]);
+        assert!(operator_ctl_args("propose", &[std::ffi::OsString::from("inline")]).is_err());
     }
 }

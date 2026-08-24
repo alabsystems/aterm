@@ -348,6 +348,10 @@ pub(crate) const EDIT_TAB_STATUS: &str = "tab_status";
 pub(crate) const EDIT_TAB_STATUS_QUIET_AFTER_MS: &str = "tab_status_quiet_after_ms";
 pub(crate) const EDIT_TAB_STATUS_DWELL_MS: &str = "tab_status_dwell_ms";
 pub(crate) const EDIT_TAB_STATUS_BADGE: &str = "tab_status_badge";
+/// The §4 connection mark's opt-out (Session Connections). Independent of the
+/// status classifier quartet above: it gates only the fourth tab mark, never
+/// the connections themselves.
+pub(crate) const EDIT_TAB_CONNECTION_BADGE: &str = "tab_connection_badge";
 pub(crate) const EDIT_SEARCH_HISTORY_LINES: &str = "search_history_lines";
 pub(crate) const EDIT_ALLOW_OSC52_QUERY: &str = "allow_osc52_query";
 /// macOS Secure Keyboard Entry (`Config::secure_keyboard_entry`, default OFF):
@@ -1143,6 +1147,9 @@ pub(crate) const VISUAL_PREVIEW_EXEMPT_KEYS: &[&str] = &[
     EDIT_TAB_STATUS_QUIET_AFTER_MS,
     EDIT_TAB_STATUS_DWELL_MS,
     EDIT_TAB_STATUS_BADGE,
+    // The connection mark shares the tab-chrome rationale above: it lives on
+    // the tab strip, not in any workbench grid cell.
+    EDIT_TAB_CONNECTION_BADGE,
     EDIT_STREAM_FADE,
     EDIT_STREAM_FADE_MS,
 ];
@@ -1498,6 +1505,7 @@ pub(crate) fn edit_kind(key: &str) -> EditKind {
         | EDIT_TITLE_SUMMARY_ALLOW_REMOTE
         | EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_BADGE
+        | EDIT_TAB_CONNECTION_BADGE
         | EDIT_SERIOUS_MODE
         | EDIT_LOAD_ADAPTIVE_MOTION
         | EDIT_CURSOR_TRAIL_RING
@@ -2397,7 +2405,8 @@ pub(crate) fn section_of(key: &str) -> Section {
         | EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_QUIET_AFTER_MS
         | EDIT_TAB_STATUS_DWELL_MS
-        | EDIT_TAB_STATUS_BADGE => Section::Window,
+        | EDIT_TAB_STATUS_BADGE
+        | EDIT_TAB_CONNECTION_BADGE => Section::Window,
         // Keyboard & clipboard behavior — how what you type and copy is handled.
         EDIT_COPY_ON_SELECT
         | EDIT_CONFIRM_MULTILINE_PASTE
@@ -2612,7 +2621,8 @@ pub(crate) fn group_of(key: &str) -> (&'static str, u8) {
         EDIT_TAB_STATUS
         | EDIT_TAB_STATUS_QUIET_AFTER_MS
         | EDIT_TAB_STATUS_DWELL_MS
-        | EDIT_TAB_STATUS_BADGE => ("Tab Status", 2),
+        | EDIT_TAB_STATUS_BADGE
+        | EDIT_TAB_CONNECTION_BADGE => ("Tab Status", 2),
         EDIT_WINDOW_PADDING | EDIT_WINDOW_PADDING_TOP => ("Window padding", 2),
         EDIT_SHOW_BUILD_BADGE | EDIT_ACTIVE_TAB_COLOR => ("Chrome", 3),
         EDIT_RESTORE_SESSION => ("Session", 4),
@@ -2652,7 +2662,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Opacity requires macOS GPU rendering; other renderers stay solid. Text over translucent backgrounds uses at least 4.5:1 contrast."
         }
         "Paste safety" => {
-            "Confirm unbracketed multiline paste. Bracketed paste bypasses it. macOS and Windows prompt; other platforms paste without prompting."
+            "Confirm unbracketed multiline paste. Bracketed paste bypasses it. macOS asks with a sheet, Windows with a dialog, Linux with an in-window banner."
         }
         "Motion" => {
             "Automatic follows system motion when available and reduces effects under load by default. Full allows motion; Reduced limits it. Load adaptation is in Manual."
@@ -3408,6 +3418,16 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
             "running",
             "failed",
             "session",
+        ],
+        EDIT_TAB_CONNECTION_BADGE => &[
+            "connection",
+            "session connection",
+            "badge",
+            "mark",
+            "outbound",
+            "inbound",
+            "peer",
+            "tab",
         ],
         EDIT_TAB_STATUS_QUIET_AFTER_MS => &[
             "tab status",
@@ -4407,6 +4427,13 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             key: EDIT_TAB_STATUS_BADGE,
             kind: EditKind::Bool,
             seed: Some(cfg.tab_status_badge_or_default().to_string()),
+            placeholder: String::new(),
+        },
+        EditField {
+            label: "Mark connected sessions on tabs",
+            key: EDIT_TAB_CONNECTION_BADGE,
+            kind: EditKind::Bool,
+            seed: Some(cfg.tab_connection_badge_or_default().to_string()),
             placeholder: String::new(),
         },
         EditField {

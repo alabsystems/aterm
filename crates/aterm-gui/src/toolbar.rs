@@ -208,7 +208,7 @@ pub(crate) fn format_tab_chrome(
     let selected = active.min(count - 1) as isize;
     let states = (0..count)
         .map(|index| {
-            let mut state = Vec::with_capacity(4);
+            let mut state = Vec::with_capacity(6);
             if index == selected as usize {
                 state.push("selected");
             }
@@ -221,6 +221,12 @@ pub(crate) fn format_tab_chrome(
                 }
                 if metadata.attention {
                     state.push("attention");
+                }
+                // `conn-out` / `conn-in`; a both-ways connection reports BOTH
+                // tokens, so the states list stays total per direction (§6:
+                // the mark is never visual-only).
+                if let Some(conn) = metadata.conn {
+                    state.extend_from_slice(conn.chrome_states());
                 }
             }
             state
@@ -262,6 +268,20 @@ fn tab_help(
     }
     if metadata.attention {
         parts.push("Needs attention".to_string());
+    }
+    // The §4 connection mark's non-visual twin, role-level like the mark
+    // itself (per-peer detail belongs to the tooltip/menu composition).
+    match metadata.conn {
+        Some(crate::tab_bar::TabConnRole::Outbound) => {
+            parts.push("Connects into a peer session".to_string());
+        }
+        Some(crate::tab_bar::TabConnRole::Inbound) => {
+            parts.push("A peer session connects in".to_string());
+        }
+        Some(crate::tab_bar::TabConnRole::Both) => {
+            parts.push("Connected both ways with peers".to_string());
+        }
+        None => {}
     }
     if index < 9 {
         parts.push(format!("⌘{}", index + 1));
@@ -356,7 +376,9 @@ mod shared_tests {
             dirty: true,
             busy: true,
             attention: true,
+            conn: Some(crate::tab_bar::TabConnRole::Both),
             closable: true,
+            drop_target: false,
         };
         let line = format_tab_chrome(
             &["Settings".to_string()],
@@ -368,7 +390,11 @@ mod shared_tests {
         assert!(line.contains("count=1 selected=0"));
         assert!(line.contains(r#"labels=["Settings"]"#));
         assert!(line.contains(r#"icons=[Some("settings")]"#));
-        assert!(line.contains(r#"["selected", "dirty", "busy", "attention"]"#));
+        // A both-ways connection reports BOTH directional tokens, keeping the
+        // states list total per direction.
+        assert!(line.contains(
+            r#"["selected", "dirty", "busy", "attention", "conn-out", "conn-in"]"#
+        ));
         assert!(line.contains("Settings · Cursor & Motion"));
 
         let help = tab_help(
@@ -379,7 +405,46 @@ mod shared_tests {
         );
         assert_eq!(
             help,
-            "Settings · Cursor & Motion · App: settings · Unsaved changes · Working · Needs attention · ⌘2"
+            "Settings · Cursor & Motion · App: settings · Unsaved changes · Working · Needs attention · Connected both ways with peers · ⌘2"
+        );
+    }
+
+    /// Each connection role is stated (never visual-only): its own chrome
+    /// token(s) and its own hover-help line, one per direction.
+    #[test]
+    fn connection_roles_state_their_direction_in_chrome_and_help() {
+        let conn_only = |conn| TabStripMetadata {
+            icon: None,
+            dirty: false,
+            busy: false,
+            attention: false,
+            conn,
+            closable: true,
+            drop_target: false,
+        };
+        let line = format_tab_chrome(
+            &["push-src".to_string(), "push-dst".to_string()],
+            &[
+                conn_only(Some(crate::tab_bar::TabConnRole::Outbound)),
+                conn_only(Some(crate::tab_bar::TabConnRole::Inbound)),
+            ],
+            &[None, None],
+            0,
+        )
+        .expect("two tabs report chrome");
+        assert!(line.contains(r#"["selected", "conn-out"], ["conn-in"]"#));
+        assert_eq!(
+            tab_help("push-src", None, conn_only(Some(crate::tab_bar::TabConnRole::Outbound)), 0),
+            "push-src · Connects into a peer session · ⌘1"
+        );
+        assert_eq!(
+            tab_help("push-dst", None, conn_only(Some(crate::tab_bar::TabConnRole::Inbound)), 1),
+            "push-dst · A peer session connects in · ⌘2"
+        );
+        assert_eq!(
+            tab_help("peer", None, conn_only(None), 0),
+            "peer · ⌘1",
+            "no connection adds nothing"
         );
     }
 
@@ -767,7 +832,9 @@ mod non_macos_tests {
             dirty,
             busy,
             attention,
+            conn: None,
             closable: true,
+            drop_target: false,
         }
     }
 
@@ -893,11 +960,11 @@ mod macos {
         tab_help,
     };
     use crate::menu::MenuAction;
-    use crate::session_chrome::{TabChromeExt, TabMenuEntry};
+    use crate::session_chrome::{ConnVerb, TabChromeExt, TabMenuEntry};
     use crate::tab_bar::{
-        TAB_ICON_DESIGN_SIZE, TAB_ICON_NATIVE_SIZE, TAB_STATUS_KINDS, TabIconKind,
+        TAB_ICON_DESIGN_SIZE, TAB_ICON_NATIVE_SIZE, TAB_STATUS_KINDS, TabConnRole, TabIconKind,
         TabIconPrimitive, TabStatusKind, TabStripMetadata, native_tab_content_layout,
-        tab_icon_primitives, tab_status_center,
+        tab_icon_primitives, tab_status_center, tab_status_mark_scale,
     };
     use crate::tab_model::TabId;
     use crate::{TabAction, Wake, WindowId};
@@ -971,6 +1038,19 @@ mod macos {
     /// edge to separate it from the chip before it. Shorter than the pill on purpose:
     /// it should divide two titles, not draw a box around each.
     const TAB_RULE_HEIGHT: f64 = 14.0;
+
+    /// The §3.1 "small movement threshold" in AppKit points — the native twin
+    /// of `conn_drag::CONN_DRAG_THRESHOLD_PX` (which is physical px; at 1×
+    /// they coincide, at Retina this is deliberately the finger-feel unit): a
+    /// connector press that travels less than this before `mouseUp:` opens the
+    /// Connections menu; crossing it posts `Wake::ConnDragBegin` and the press
+    /// becomes a connection drag.
+    const CONN_DRAG_START_PTS: f64 = 4.0;
+
+    /// Slop (points) around the status-canvas rect that still counts as the
+    /// §3.1 connector: the painted marks are small, and a press one point off
+    /// the ink is still aimed at the cell.
+    const CONN_HIT_SLOP_PTS: f64 = 2.0;
 
     /// Width cap (points) of the inline rename editor in the SOLO band. The solo
     /// cell spans the whole window, and a full-width field in the titlebar reads
@@ -1624,6 +1704,26 @@ mod macos {
         /// User-attention state: an orange diamond, independently visible from dirty
         /// and busy.
         attention: Cell<bool>,
+        /// Connection-mark role (design §4): the fourth shape in the status
+        /// canvas — ▲ outbound / ▽ inbound / hourglass both, in the muted busy
+        /// ink. `None` draws nothing.
+        conn: Cell<Option<TabConnRole>>,
+        /// App-pushed drag-to-connect DROP-TARGET highlight (design §3.2):
+        /// this chip hosts the session under a live connection drag's cursor.
+        /// Arrives through the same [`TabStripMetadata`] push as every other
+        /// chip fact (`set_metadata`); paints an accent ring in `drawRect:`.
+        drop_target: Cell<bool>,
+        /// Where the §3.1 connector gesture PRESSED, in this view's own
+        /// coordinates — `Some` exactly while a connector press is being
+        /// disambiguated (menu vs drag); [`Self::mouseUp`] takes it. The
+        /// connector check runs BEFORE select/rename/reorder in `mouseDown:`
+        /// and suppresses `SelectTab` for that press (the reorder-latch
+        /// precedent, one gesture at a time).
+        conn_press: Cell<Option<CGPoint>>,
+        /// Whether the connector press crossed [`CONN_DRAG_START_PTS`] and
+        /// became a connection drag (posted `Wake::ConnDragBegin`); the
+        /// release then posts the drop instead of opening the menu.
+        conn_dragging: Cell<bool>,
         /// Canonical close policy. The 24pt close target keeps its geometry, but a
         /// non-closable tab never reveals or dispatches the button.
         closable: Cell<bool>,
@@ -1692,6 +1792,15 @@ mod macos {
         /// menu is built fresh per pop, so a stale retained menu can never
         /// outlive its facts.
         menu_entries: RefCell<Vec<TabMenuEntry>>,
+        /// The CONNECTION rows of the menu snapshot the OPEN context menu was
+        /// built from, in encounter order — what a `tabMenuConnection:` click
+        /// decodes its item `tag` (an index into this Vec) against. Captured
+        /// by [`Self::show_context_menu`] at pop time, the `menu_tab`
+        /// discipline: a mid-track strip refresh may rewrite `menu_entries`,
+        /// but the popped menu keeps its visual snapshot, so the click must
+        /// decode against that SAME snapshot — an index into the live model
+        /// could name a different peer.
+        menu_conn: RefCell<Vec<(aterm_session::SessionId, ConnVerb)>>,
     }
 
     declare_class!(
@@ -1736,6 +1845,31 @@ mod macos {
                     // nothing to select away from, so no pill, no keyline, and no
                     // selected surface — just the title group over the seamless
                     // terminal-coloured titlebar, exactly like macOS Terminal.
+                    //
+                    // Except while it is the DROP TARGET of a live connection
+                    // drag (design §3.2): the lone tab is still a session, so
+                    // the band draws the accent keyline the chip highlight
+                    // uses — App-pushed via `set_metadata`, cleared with the
+                    // drag.
+                    if ivars.drop_target.get() {
+                        // SAFETY: standard AppKit drawing on the main thread
+                        // inside a draw cycle (as below).
+                        unsafe {
+                            let bounds = self.bounds();
+                            NSColor::controlAccentColor().set();
+                            let keyline = CGRect::new(
+                                CGPoint::new(
+                                    bounds.origin.x + 8.0,
+                                    ivars.center_y.get() - TAB_PILL_HEIGHT * 0.5,
+                                ),
+                                CGSize::new((bounds.size.width - 16.0).max(0.0), 2.0),
+                            );
+                            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                                keyline, 1.0, 1.0,
+                            )
+                            .fill();
+                        }
+                    }
                     self.paint_identity();
                     return;
                 }
@@ -1818,6 +1952,23 @@ mod macos {
                         );
                         NSBezierPath::bezierPathWithRect(rule).fill();
                     }
+                    // DROP-TARGET highlight (design §3.2, App-pushed through
+                    // `set_metadata`): the chip under a live connection drag
+                    // wears an accent ring + faint accent wash over whatever
+                    // state it painted above, so the target reads even when
+                    // the pointer is captured by another window. Purely
+                    // paint — the select/reorder geometry is untouched.
+                    if ivars.drop_target.get() {
+                        let wash = NSColor::controlAccentColor().colorWithAlphaComponent(0.18);
+                        wash.set();
+                        let path = NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                            pill, TAB_PILL_RADIUS, TAB_PILL_RADIUS,
+                        );
+                        path.fill();
+                        NSColor::controlAccentColor().set();
+                        path.setLineWidth(2.0);
+                        path.stroke();
+                    }
                 }
                 self.paint_identity();
             }
@@ -1838,6 +1989,33 @@ mod macos {
                     .contains(NSEventModifierFlags::NSEventModifierFlagControl);
                 if ctrl {
                     self.show_context_menu(event);
+                    return;
+                }
+                // THE §3.1 CONNECTOR — the status-canvas cell — checked BEFORE
+                // the double-click / select / reorder seeds (the design's
+                // ordering mandate): a press here ARMS the connect gesture and
+                // suppresses `SelectTab` for this press. `mouseUp:` within the
+                // movement threshold opens the Connections menu (the same
+                // context menu, aimed by the stable tab id); `mouseDragged:`
+                // past it becomes a connection drag. Only exists while a
+                // status canvas painted (`status_rect` mirrors the pixels), so
+                // the hit region can never outrun the ink.
+                // SAFETY: `locationInWindow` + `convertPoint_fromView` are
+                // side-effect-free getters on the main thread; `None` source
+                // view means window coordinates.
+                let ivars = self.ivars();
+                let p = unsafe {
+                    let win_pt = event.locationInWindow();
+                    self.convertPoint_fromView(win_pt, None)
+                };
+                if let Some([sx, sy, sw, sh]) = ivars.status_rect.get()
+                    && p.x >= sx - CONN_HIT_SLOP_PTS
+                    && p.x <= sx + sw + CONN_HIT_SLOP_PTS
+                    && p.y >= sy - CONN_HIT_SLOP_PTS
+                    && p.y <= sy + sh + CONN_HIT_SLOP_PTS
+                {
+                    ivars.conn_press.set(Some(p));
+                    ivars.conn_dragging.set(false);
                     return;
                 }
                 // A DOUBLE-click renames the tab's focused session in place. AppKit
@@ -1865,14 +2043,8 @@ mod macos {
                     });
                     return;
                 }
-                let ivars = self.ivars();
-                // SAFETY: `locationInWindow` + `convertPoint_fromView` are
-                // side-effect-free getters on the main thread; `None` source view means
-                // window coordinates.
-                let p = unsafe {
-                    let win_pt = event.locationInWindow();
-                    self.convertPoint_fromView(win_pt, None)
-                };
+                // `p` was computed above for the connector check; the press
+                // seed reuses it.
                 ivars.press_x.set(p.x);
                 ivars.dragged.set(false);
                 let _ = ivars.proxy.send_event(Wake::SelectTab {
@@ -1902,6 +2074,53 @@ mod macos {
             #[allow(non_snake_case)]
             fn mouseDragged(&self, event: &NSEvent) {
                 let ivars = self.ivars();
+                // A CONNECTOR press (design §3.1) owns this drag: past the
+                // point threshold it becomes a connection drag —
+                // `Wake::ConnDragBegin` once, then screen-space tracking
+                // (`Wake::ConnDragTo`) so the App-side machine resolves the
+                // drop target across windows. Checked BEFORE the reorder
+                // latch: the connector press never reorders.
+                if let Some(press) = ivars.conn_press.get() {
+                    // SAFETY: side-effect-free geometry getters, main thread.
+                    let p = unsafe {
+                        let win_pt = event.locationInWindow();
+                        self.convertPoint_fromView(win_pt, None)
+                    };
+                    if !ivars.conn_dragging.get() {
+                        let (dx, dy) = (p.x - press.x, p.y - press.y);
+                        if dx * dx + dy * dy
+                            <= CONN_DRAG_START_PTS * CONN_DRAG_START_PTS
+                        {
+                            return; // §3.1: still within the menu-open slop
+                        }
+                        ivars.conn_dragging.set(true);
+                        let _ = ivars.proxy.send_event(Wake::ConnDragBegin {
+                            window: ivars.window,
+                            // The STABLE id: the drag lives for seconds and
+                            // the positional index re-stamps under it.
+                            tab: ivars.tab_id.get(),
+                        });
+                    }
+                    match self.winit_screen_point(event) {
+                        Some((x, y)) => {
+                            let _ = ivars.proxy.send_event(Wake::ConnDragTo {
+                                window: ivars.window,
+                                x,
+                                y,
+                            });
+                        }
+                        None => {
+                            // No window/screen to convert against (teardown
+                            // mid-gesture): dissolve rather than track lies.
+                            ivars.conn_press.set(None);
+                            ivars.conn_dragging.set(false);
+                            let _ = ivars.proxy.send_event(Wake::ConnDragCancel {
+                                window: ivars.window,
+                            });
+                        }
+                    }
+                    return;
+                }
                 if ivars.dragged.get() {
                     return; // already fired this gesture
                 }
@@ -1931,6 +2150,41 @@ mod macos {
                     action: TabAction::Move { from, to },
                     reply: tx,
                 });
+            }
+
+            /// The CONNECTOR gesture's commit (design §3.1): a release still
+            /// within the movement threshold opens the Connections menu — the
+            /// same session context menu, the press-release half of the
+            /// disambiguation — while a release past it posts the drop
+            /// (`Wake::ConnDragDrop`) for the App-side §3.3 resolution.
+            /// Non-connector presses have no release half (select/reorder are
+            /// press-committed), so this is a no-op for them.
+            #[method(mouseUp:)]
+            #[allow(non_snake_case)]
+            fn mouseUp(&self, event: &NSEvent) {
+                let ivars = self.ivars();
+                let Some(_press) = ivars.conn_press.take() else {
+                    return;
+                };
+                if !ivars.conn_dragging.take() {
+                    // Release in place: the §3.1 menu-open.
+                    self.show_context_menu(event);
+                    return;
+                }
+                match self.winit_screen_point(event) {
+                    Some((x, y)) => {
+                        let _ = ivars.proxy.send_event(Wake::ConnDragDrop {
+                            window: ivars.window,
+                            x,
+                            y,
+                        });
+                    }
+                    None => {
+                        let _ = ivars.proxy.send_event(Wake::ConnDragCancel {
+                            window: ivars.window,
+                        });
+                    }
+                }
             }
 
             /// Pointer entered the tab — reveal the close ✕ (every tab hides it until
@@ -2040,24 +2294,74 @@ mod macos {
                     });
                 }
             }
+
+            /// `tabMenuConnection:` — the action wired to every per-peer
+            /// CONNECTION row of this tab's context menu. The item's `tag` is
+            /// an INDEX into the pop-time row snapshot (`menu_conn`, stamped
+            /// by [`Self::show_context_menu`] — the `menu_tab` discipline),
+            /// never a `MenuAction` tag: the act needs a peer argument no
+            /// fieldless tag can carry. An out-of-range tag is inert
+            /// (defensive — only `show_context_menu` builds these items).
+            #[method(tabMenuConnection:)]
+            fn tab_menu_connection(&self, sender: Option<&NSMenuItem>) {
+                let Some(item) = sender else { return };
+                // SAFETY: `item` is the live NSMenuItem AppKit passed as the
+                // action sender; `tag` is a plain getter with no side effects.
+                let tag = unsafe { item.tag() };
+                let ivars = self.ivars();
+                let Ok(i) = usize::try_from(tag) else { return };
+                let row = ivars.menu_conn.borrow().get(i).cloned();
+                let Some((peer_sid, verb)) = row else { return };
+                // `None` cannot happen from a real click (see `tabMenuAction:`).
+                let Some(tab) = ivars.menu_tab.get() else { return };
+                let _ = ivars.proxy.send_event(Wake::TabMenuConnection {
+                    window: ivars.window,
+                    tab,
+                    peer_sid,
+                    verb,
+                });
+            }
         }
     );
 
     impl TabView {
-        /// Paint the shared code-native icon IR and independent dirty/busy/attention
-        /// status shapes. AppKit's view
+        /// The drag event's cursor in WINIT screen space (physical px,
+        /// top-left origin of the MAIN display) — the space the App-side
+        /// window-frame registry's `inner_position` entries live in, so the
+        /// native connector drag and the in-grid one resolve targets through
+        /// identical arithmetic. The flip law is winit's own
+        /// (`y_top = main_height − y_appkit`, main-display height from the
+        /// same CoreGraphics call winit uses — the `platform.rs`
+        /// `window_work_area_pts` precedent), then scaled by THIS window's
+        /// backing factor exactly as winit scales its position reports.
+        /// (Mixed-DPI desktops share winit's own cross-scale imprecision —
+        /// recorded §3.2 note.) `None` when the view has no window (teardown).
+        fn winit_screen_point(&self, event: &NSEvent) -> Option<(f64, f64)> {
+            #[link(name = "CoreGraphics", kind = "framework")]
+            unsafe extern "C" {
+                fn CGMainDisplayID() -> u32;
+                fn CGDisplayBounds(display: u32) -> NSRect;
+            }
+            // SAFETY: geometry getters on the live event/window on the main
+            // thread; the CoreGraphics pair is a flat display-bounds getter.
+            unsafe {
+                let window = self.window()?;
+                let win_pt = event.locationInWindow();
+                let screen_pt: CGPoint = msg_send![&*window, convertPointToScreen: win_pt];
+                let scale: f64 = msg_send![&*window, backingScaleFactor];
+                let main_h = CGDisplayBounds(CGMainDisplayID()).size.height;
+                Some((screen_pt.x * scale, (main_h - screen_pt.y) * scale))
+            }
+        }
+
+        /// Paint the shared code-native icon IR and independent dirty/busy/
+        /// attention/connection status shapes. AppKit's view
         /// coordinate system points upward, so the top-left 16×16 design box is flipped
         /// once here; primitive ordering and dimensions otherwise match the in-grid
         /// RawRgba8 raster exactly.
         fn paint_identity(&self) {
             let ivars = self.ivars();
-            let metadata = TabStripMetadata {
-                icon: ivars.icon.get(),
-                dirty: ivars.dirty.get(),
-                busy: ivars.busy.get(),
-                attention: ivars.attention.get(),
-                closable: ivars.closable.get(),
-            };
+            let metadata = self.metadata();
             // Geometry is resolved once by `relayout` (which also placed the labels and
             // the ✕) and cached, so the draw cycle never re-derives it — and the painted
             // ornaments are guaranteed to agree with the laid-out text.
@@ -2127,18 +2431,36 @@ mod macos {
                                 ))
                                 .fill();
                             }
+                            TabIconPrimitive::Triangle { points } => {
+                                // No app icon uses a filled triangle today (the
+                                // primitive exists for the connection mark, drawn
+                                // below from cached status geometry), but the IR
+                                // walk stays total so a future icon just works.
+                                let path = NSBezierPath::bezierPath();
+                                path.moveToPoint(point(points[0]));
+                                path.lineToPoint(point(points[1]));
+                                path.lineToPoint(point(points[2]));
+                                path.closePath();
+                                path.fill();
+                            }
                         }
                     }
                 }
                 if let Some(status) = layout_status {
                     let count = metadata.status_count();
                     let mut ordinal = 0usize;
-                    let scale = status[2] / f64::from(TAB_ICON_DESIGN_SIZE);
+                    // The same shared shrink the in-grid rasterizer applies for
+                    // the four-mark packing, folded into the point scale so
+                    // every dimension below tracks it.
+                    let scale = status[2] / f64::from(TAB_ICON_DESIGN_SIZE)
+                        * f64::from(tab_status_mark_scale(count));
                     for kind in TAB_STATUS_KINDS {
                         if !metadata.has_status_kind(kind) {
                             continue;
                         }
-                        let x = status[0] + f64::from(tab_status_center(ordinal, count)) * scale;
+                        let x = status[0]
+                            + f64::from(tab_status_center(ordinal, count))
+                                * (status[2] / f64::from(TAB_ICON_DESIGN_SIZE));
                         let y = status[1] + status[3] * 0.5;
                         ordinal += 1;
                         match kind {
@@ -2171,6 +2493,50 @@ mod macos {
                                 diamond.lineToPoint(CGPoint::new(x - radius, y));
                                 diamond.closePath();
                                 diamond.fill();
+                            }
+                            // The connection mark (§4), in busy's muted ink and
+                            // the exact geometry `tab_bar::status_primitives`
+                            // rasterizes in-grid (AppKit's y points up, so the
+                            // up-triangle apex is y + height here).
+                            TabStatusKind::Connection => {
+                                if let Some(role) = metadata.conn {
+                                    ink.set();
+                                    let (hw, hh) = (2.5 * scale, 2.4 * scale);
+                                    match role {
+                                        TabConnRole::Outbound => {
+                                            let arrow = NSBezierPath::bezierPath();
+                                            arrow.moveToPoint(CGPoint::new(x, y + hh));
+                                            arrow.lineToPoint(CGPoint::new(x + hw, y - hh));
+                                            arrow.lineToPoint(CGPoint::new(x - hw, y - hh));
+                                            arrow.closePath();
+                                            arrow.fill();
+                                        }
+                                        TabConnRole::Inbound => {
+                                            let width = 1.15 * scale;
+                                            // Half-stroke inset: the outer ink
+                                            // silhouette matches outbound's fill.
+                                            let (cw, ch) = (hw - width * 0.5, hh - width * 0.5);
+                                            let arrow = NSBezierPath::bezierPath();
+                                            arrow.setLineWidth(width);
+                                            arrow.setLineCapStyle(NSLineCapStyle::Round);
+                                            arrow.moveToPoint(CGPoint::new(x - cw, y + ch));
+                                            arrow.lineToPoint(CGPoint::new(x + cw, y + ch));
+                                            arrow.lineToPoint(CGPoint::new(x, y - ch));
+                                            arrow.closePath();
+                                            arrow.stroke();
+                                        }
+                                        TabConnRole::Both => {
+                                            let hw = 2.2 * scale;
+                                            let hourglass = NSBezierPath::bezierPath();
+                                            hourglass.moveToPoint(CGPoint::new(x - hw, y + hh));
+                                            hourglass.lineToPoint(CGPoint::new(x + hw, y + hh));
+                                            hourglass.lineToPoint(CGPoint::new(x - hw, y - hh));
+                                            hourglass.lineToPoint(CGPoint::new(x + hw, y - hh));
+                                            hourglass.closePath();
+                                            hourglass.fill();
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -2216,6 +2582,10 @@ mod macos {
                 dirty: Cell::new(metadata.dirty),
                 busy: Cell::new(metadata.busy),
                 attention: Cell::new(metadata.attention),
+                conn: Cell::new(metadata.conn),
+                drop_target: Cell::new(metadata.drop_target),
+                conn_press: Cell::new(None),
+                conn_dragging: Cell::new(false),
                 closable: Cell::new(metadata.closable),
                 hovered: Cell::new(false),
                 press_x: Cell::new(0.0),
@@ -2234,6 +2604,7 @@ mod macos {
                 title: RefCell::new(title.to_string()),
                 tooltip: RefCell::new(tooltip.map(str::to_string)),
                 menu_entries: RefCell::new(Vec::new()),
+                menu_conn: RefCell::new(Vec::new()),
             };
             let this = mtm.alloc().set_ivars(ivars);
             // SAFETY: `initWithFrame:` is the documented non-raising NSView initializer.
@@ -2667,6 +3038,20 @@ mod macos {
             // the eventual `tabMenuAction:` click must dispatch against the tab
             // this menu was popped ON, not whatever later drifted into the slot.
             self.ivars().menu_tab.set(Some(self.ivars().tab_id.get()));
+            // Same pop-time capture for the CONNECTION rows: each row's item
+            // tag indexes THIS snapshot (in encounter order, matching the
+            // running counter in the build loop below), so a click after a
+            // mid-track model rewrite still names the peer the human saw.
+            *self.ivars().menu_conn.borrow_mut() = entries
+                .iter()
+                .filter_map(|e| match e {
+                    TabMenuEntry::ConnectionAction { peer_sid, verb, .. } => {
+                        Some((peer_sid.clone(), *verb))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut conn_index: isize = 0;
             let menu = NSMenu::new(mtm);
             // SAFETY: plain main-thread NSMenu/NSMenuItem construction + setters on
             // fresh instances (the `initWithTitle:action:keyEquivalent:` initializer
@@ -2711,6 +3096,24 @@ mod macos {
                             item.setTarget(Some(target));
                             menu.addItem(&item);
                         }
+                        TabMenuEntry::ConnectionAction { label, enabled, .. } => {
+                            // Tag = index into the pop-time `menu_conn`
+                            // snapshot filled above; the running counter walks
+                            // the SAME filtered order, so the two agree by
+                            // construction.
+                            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                                mtm.alloc(),
+                                &NSString::from_str(label),
+                                Some(objc2::sel!(tabMenuConnection:)),
+                                &NSString::from_str(""),
+                            );
+                            item.setTag(conn_index);
+                            conn_index += 1;
+                            item.setEnabled(*enabled);
+                            let target: &AnyObject = self;
+                            item.setTarget(Some(target));
+                            menu.addItem(&item);
+                        }
                     }
                 }
                 // Pops synchronously at the event's location and runs the nested
@@ -2737,13 +3140,22 @@ mod macos {
             let old_dirty = ivars.dirty.replace(metadata.dirty);
             let old_busy = ivars.busy.replace(metadata.busy);
             let old_attention = ivars.attention.replace(metadata.attention);
+            let old_conn = ivars.conn.replace(metadata.conn);
             let old_closable = ivars.closable.replace(metadata.closable);
-            if old_icon == metadata.icon
-                && old_dirty == metadata.dirty
-                && old_busy == metadata.busy
-                && old_attention == metadata.attention
-                && old_closable == metadata.closable
-            {
+            let old_drop = ivars.drop_target.replace(metadata.drop_target);
+            let ornaments_changed = old_icon != metadata.icon
+                || old_dirty != metadata.dirty
+                || old_busy != metadata.busy
+                || old_attention != metadata.attention
+                || old_conn != metadata.conn
+                || old_closable != metadata.closable;
+            if !ornaments_changed {
+                // The drag drop-target highlight (§3.2) moves NO geometry —
+                // it is an accent wash over the existing pill — so a
+                // flag-only flip is a plain repaint, never a relayout.
+                if old_drop != metadata.drop_target {
+                    self.mark_dirty();
+                }
                 return;
             }
             // Ornament slots (and, in the solo band, the whole centred group) move when
@@ -2792,13 +3204,7 @@ mod macos {
         /// diff path so VoiceOver can never lag the selected pixels.
         fn sync_semantics(&self) {
             let ivars = self.ivars();
-            let metadata = TabStripMetadata {
-                icon: ivars.icon.get(),
-                dirty: ivars.dirty.get(),
-                busy: ivars.busy.get(),
-                attention: ivars.attention.get(),
-                closable: ivars.closable.get(),
-            };
+            let metadata = self.metadata();
             let title = ivars.title.borrow();
             let tooltip = ivars.tooltip.borrow();
             let help = tab_help(&title, tooltip.as_deref(), metadata, ivars.index.get());
@@ -2880,7 +3286,9 @@ mod macos {
                 dirty: ivars.dirty.get(),
                 busy: ivars.busy.get(),
                 attention: ivars.attention.get(),
+                conn: ivars.conn.get(),
                 closable: ivars.closable.get(),
+                drop_target: ivars.drop_target.get(),
             }
         }
 
@@ -3277,7 +3685,9 @@ mod macos {
                 dirty: false,
                 busy: false,
                 attention: false,
+                conn: None,
                 closable: true,
+                drop_target: false,
             })
         };
         // A missing id entry (defensive — the caller always pairs `ids` with

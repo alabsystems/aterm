@@ -498,17 +498,37 @@ fn pending_state_lines(layout: &crate::store::Layout, tool: &str) -> Vec<String>
     // NOT RUNNING (no file, stale heartbeat, dead pid, or a terminal snapshot):
     // only not-running states may render, whatever the snapshot claims. A recorded
     // failure outranks the generic line — every failure names its next act.
-    if let Some(status) = crate::status::read(layout)
-        && let Some(row) = status.programs.get(name)
-        && row.state.starts_with("error")
-    {
-        out.push(format!(
-            "atpkg: the last install attempt FAILED: {} — fix: aterm pkg update \
-             retries it; Settings ▸ Packages shows details.",
-            crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
-        ));
-        let _ = crate::progress::append_bump(layout, &tn);
-        return out;
+    if let Some(status) = crate::status::read(layout) {
+        if let Some(row) = status.programs.get(name)
+            && row.state.starts_with("error")
+        {
+            out.push(format!(
+                "atpkg: the last install attempt FAILED: {} — fix: aterm pkg update \
+                 retries it; Settings ▸ Packages shows details.",
+                crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
+            ));
+            let _ = crate::progress::append_bump(layout, &tn);
+            return out;
+        }
+        // A BLOCKED toolset outranks the generic promise: "open aterm, it
+        // provisions" is a lie when the recorded `*toolset*` row says the
+        // registry publishes no build for this machine (or the disk cannot
+        // hold one) — the reconcile pass writes that row precisely so this
+        // stub, which may outlive the pass by months, can tell the truth.
+        if let Some(row) = status.programs.get("*toolset*")
+            && let Some(why) = row.state.strip_prefix("blocked: ")
+        {
+            out.push(format!(
+                "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
+                 shows details.",
+                crate::progress::sanitize_for_tty(why, PENDING_ERROR_CAP)
+            ));
+            // Still worth a bump: for the disk-blocked case the user may just
+            // have freed space, and the GUI's bump watch turns this wish into
+            // an immediate pass; an unserved-triple pass re-skips quietly.
+            let _ = crate::progress::append_bump(layout, &tn);
+            return out;
+        }
     }
     out.push(
         "atpkg: nothing is installing right now — fix: open aterm (it provisions the \
@@ -2932,11 +2952,77 @@ fn install_default_set_inner(
     for p in removed_programs(layout) {
         wanted.remove(&p);
     }
+    // SERVE THIS TRIPLE OR SAY NOTHING. `wanted` so far is what the signed
+    // index NAMES — which, on a machine whose triple the registry publishes no
+    // artifacts for (an Intel Mac before x86_64 lands; Linux/Windows today),
+    // is a list of programs that can never arrive here. Unfiltered, it turned
+    // every 6-hour tick into theater: "installing N program(s)" announced, N
+    // failures counted, a failure pill raised — forever — and N pending stubs
+    // laid on PATH whose promise ("open aterm, it provisions") could never
+    // come true. The seed prescan (`seed_serviceable`) already applies this
+    // rule with the same probe; the network lane now applies it BEFORE the
+    // stub reconcile and the announcement, so unserved programs neither
+    // announce, nor count as failures, nor leave stubs. The probe proves
+    // missing-ness from a verified manifest and DEFERS on any fetch failure
+    // (`group_missing_triple`), so an offline tick drops nothing — the real
+    // stage still fails loudly there. One `*toolset*` status row records the
+    // truth for `__pending`'s not-running fallback to surface.
+    let triple = current_triple();
+    let mut unserved: Vec<String> = Vec::new();
+    for group in crate::plan_groups(&index, ch) {
+        let missing: Vec<String> = group
+            .members
+            .iter()
+            .filter(|m| wanted.contains(m.as_str()) && !installed.contains_key(m.as_str()))
+            .cloned()
+            .collect();
+        if missing.is_empty()
+            || group
+                .members
+                .iter()
+                .any(|m| crate::linkmode::is_linked(layout, m))
+        {
+            continue;
+        }
+        let probe: &[String] = match &group.group {
+            Some(_) => &group.members,
+            None => &missing,
+        };
+        if crate::flow::group_missing_triple(fetcher, &index, cfg.channel(), triple, probe)
+            .is_some()
+        {
+            unserved.extend(missing);
+        }
+    }
+    if !unserved.is_empty() {
+        unserved.sort();
+        for p in &unserved {
+            wanted.remove(p.as_str());
+        }
+        println!(
+            "atpkg: {} program(s) have no build for this machine ({triple}): {} — skipped, \
+             not failed; they install automatically once builds publish",
+            unserved.len(),
+            unserved.join(", ")
+        );
+        record_status(
+            layout,
+            "*toolset*",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: String::from("blocked: no build for this architecture"),
+                tree_root: String::new(),
+            },
+            format!("unserved for {triple}: {}", unserved.join(", ")),
+        );
+    }
     // Pending-stub reconcile at the index resolve (R6): the SIGNED set replaces the
     // compiled roster the adoption-time stubs were laid from — newly listed names
     // gain stubs (PATH coverage before their bytes move), de-listed/removed/
     // installed names lose theirs, and every kept stub is rewritten so its embedded
-    // atpkg path survives app relocation/self-update.
+    // atpkg path survives app relocation/self-update. `wanted` is already
+    // triple-filtered above, so a stub is only ever laid for a program whose
+    // bytes CAN move on this machine.
     crate::stub::reconcile(layout, &wanted, &installed);
     // ANNOUNCE BEFORE ACTING — the seed lane's law, now kept on the wire lane
     // too (the block comment at the caller had argued for it while nothing
@@ -6621,6 +6707,13 @@ mod tests {
     /// Write one program's release-signed `pkg-<prog>-<build>.toml` (+ `.sig`) beside its
     /// real archive, with the archive's genuine sha256 + tree_root baked in.
     fn write_pkg(dir: &Path, prog: &str, build: u64) {
+        write_pkg_for_triple(dir, prog, build, current_triple());
+    }
+
+    /// [`write_pkg`] with an explicit artifact `target` — a manifest whose one
+    /// artifact serves a FOREIGN triple is how the registry looks from every
+    /// machine the publisher does not build for.
+    fn write_pkg_for_triple(dir: &Path, prog: &str, build: u64, triple: &str) {
         let archive = make_archive(dir, prog, build);
         let sha = crate::tree::file_sha256(&archive).unwrap();
         let probe = dir.join(format!("probe-{prog}"));
@@ -6632,8 +6725,7 @@ mod tests {
              exposes = [\"{prog}\"]\n\
              [[artifact]]\ntarget = \"{triple}\"\nkind = \"binary\"\n\
              asset = \"{prog}-{build}.tar.zst\"\nsha256 = \"{sha}\"\ntree_root = \"{root}\"\n\
-             size = 100\n[artifact.cost]\ndisk_installed = 1048576\n",
-            triple = current_triple()
+             size = 100\n[artifact.cost]\ndisk_installed = 1048576\n"
         );
         let name = dir.join(format!("pkg-{prog}-{build}.toml"));
         std::fs::write(&name, body.as_bytes()).unwrap();
@@ -6728,6 +6820,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&co);
+    }
+
+    /// AUDIT-2 ITEM 2: a program the registry publishes NO artifact for on
+    /// this triple neither announces, nor counts as a failure, nor leaves a
+    /// pending stub on PATH — and the `*toolset*` status row records why, so
+    /// a pre-existing stub's `__pending` tells the truth instead of promising
+    /// a launch will provision it. Served members in the same pass still
+    /// install normally.
+    #[test]
+    fn unserved_triple_members_skip_quietly_with_a_recorded_reason() {
+        let dir = scratch("unserved");
+        write_registry(&dir, "stable");
+        // ay's one artifact serves a machine this test is not running on.
+        write_pkg_for_triple(&dir, "ay", 18, "riscv64gc-unknown-linux-gnu");
+        let layout = temp_layout("unserved");
+        let cfg = crate::config::PackagesConfig::default();
+        let fetcher = crate::DirFetcher::new(dir.clone());
+        let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        assert_eq!(out.failures, 0, "unserved is a correct state, not a failure");
+        let active = crate::active_builds(&layout);
+        assert!(!active.contains_key("ay"), "no artifact, no install");
+        assert_eq!(
+            active.get("ny").copied(),
+            Some(7),
+            "served members still install in the same pass"
+        );
+        assert!(
+            !crate::stub::pending_stub_exists(&layout, "ay"),
+            "no stub for a program whose bytes can never move here"
+        );
+        let status = crate::status::read(&layout).expect("status recorded");
+        let row = status.programs.get("*toolset*").expect("toolset row");
+        assert_eq!(row.state, "blocked: no build for this architecture");
+        let lines = pending_state_lines(&layout, "ay");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("no build for this architecture")),
+            "__pending surfaces the recorded reason, not the launch promise: {lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // Channel THREADING: the bootstrap resolves the CONFIG channel, not a hardcoded

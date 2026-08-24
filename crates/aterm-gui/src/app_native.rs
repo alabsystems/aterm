@@ -6764,6 +6764,8 @@ impl App {
                             attention: presentation.indicators.attention,
                             status_attention: false,
                         },
+                        // No session, no edge table, no connection role.
+                        conn: None,
                         closable: presentation.closable,
                         tooltip: presentation.tooltip,
                     }

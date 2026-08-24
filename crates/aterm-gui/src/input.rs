@@ -64,7 +64,9 @@ use std::sync::Mutex;
 use aterm_core::selection::SelectionSide;
 use aterm_core::terminal::Terminal;
 use aterm_session::Op;
-use aterm_session::sink::SinkWriter;
+#[cfg(test)]
+use aterm_session::sink::ImmediateWrite;
+use aterm_session::sink::{InputEpoch, SinkWriter};
 use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey, encode_key_with_event};
 use aterm_types::mouse::MouseButton;
 
@@ -338,8 +340,27 @@ pub enum InputOutcome {
 pub enum Delivery {
     /// Every intended byte reached the PTY (or there were none to write).
     Full,
+    /// Every intended byte reached the PTY through an epoch-conditional write.
+    /// Carry this token into the next guarded step; reading the epoch afterward
+    /// would be racy because it could accidentally adopt a foreign attempt.
+    FullAt { epoch: InputEpoch },
     /// A short or failed PTY write — the bytes did not (fully) land.
     Failed,
+    /// The immediate actuator path accepted zero bytes and queued nothing.
+    BusyZero,
+    /// A foreign input attempt invalidated the guarded epoch; zero bytes from
+    /// this event were accepted and nothing was queued.
+    ConflictZero,
+    /// The immediate actuator path handed this prefix to the kernel and queued
+    /// no tail.  The mutation is in-doubt and must not be retried.
+    PartialInDoubt { accepted: usize },
+}
+
+impl Delivery {
+    #[must_use]
+    pub const fn is_full(self) -> bool {
+        matches!(self, Self::Full | Self::FullAt { .. })
+    }
 }
 
 /// Classify a sink write result against the intended frame length. A partial
@@ -568,14 +589,30 @@ pub enum EgressMode {
     /// foreground feels backpressure on THIS thread instead of growing the spill
     /// without bound. MUST NOT be used on the UI thread.
     Backpressured,
+    /// A guarded actuator call: either write one bounded frame to the kernel
+    /// immediately or fail without spilling it for later delivery.  This mode is
+    /// non-parking and preserves the generation checked immediately before the
+    /// action; [`Delivery::Failed`] means the caller must stop and treat the
+    /// action as refused/in-doubt, never retry it blindly.
+    #[cfg(test)]
+    TryImmediate,
 }
 
 /// Deliver `bytes` to `sink` per `mode`. Transport only: the bytes are identical
-/// either way (see [`EgressMode`]); only the parking discipline differs.
-fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8]) -> std::io::Result<usize> {
+/// either way (see [`EgressMode`]); only the parking discipline differs.  The
+/// immediate mode retains the zero-vs-partial distinction needed by the durable
+/// actuator; ordinary modes preserve their existing `Full`/`Failed` contract.
+fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8]) -> Delivery {
     match mode {
-        EgressMode::Interactive => sink.write_frame_nonparking(bytes),
-        EgressMode::Backpressured => sink.write_frame(bytes),
+        EgressMode::Interactive => delivered(sink.write_frame_nonparking(bytes), bytes.len()),
+        EgressMode::Backpressured => delivered(sink.write_frame(bytes), bytes.len()),
+        #[cfg(test)]
+        EgressMode::TryImmediate => match sink.try_write_frame_immediate(bytes) {
+            ImmediateWrite::Full => Delivery::Full,
+            ImmediateWrite::BusyZero => Delivery::BusyZero,
+            ImmediateWrite::ConflictZero => Delivery::ConflictZero,
+            ImmediateWrite::PartialInDoubt { accepted } => Delivery::PartialInDoubt { accepted },
+        },
     }
 }
 
@@ -585,7 +622,8 @@ fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8]) -> std::io::Result<us
 /// text` / `format_paste` / the focus-report egress, reading the relevant mode
 /// ONCE per event under a single `term_lock`, ending at the `mode`-selected
 /// [`emit`] (`Interactive` = non-parking on the UI thread; `Backpressured` =
-/// blocking + `SPILL_CAP` on an expendable thread). Sole BYTE-PRODUCING reader:
+/// blocking + `SPILL_CAP` on an expendable thread; `TryImmediate` = guarded,
+/// non-spilling actuator egress). Sole BYTE-PRODUCING reader:
 /// the predictive-echo gate reads the narrow
 /// `Terminal::kitty_suppresses_predictive_echo()` projection too, but only to
 /// decide whether a local guess may PAINT — a display-only read that can never
@@ -629,7 +667,7 @@ pub fn seam_egress(
             let d = if bytes.is_empty() {
                 Delivery::Full // faithful no-op (e.g. legacy release): nothing to deliver
             } else {
-                delivered(emit(sink, mode, &bytes), bytes.len())
+                emit(sink, mode, &bytes)
             };
             Egress::Reported(d)
         }
@@ -641,7 +679,7 @@ pub fn seam_egress(
                     crate::keymap::encode_committed_text(text, mode)
                 };
                 if !out.is_empty() {
-                    d = delivered(emit(sink, mode, &out), out.len());
+                    d = emit(sink, mode, &out);
                 }
             }
             Egress::Reported(d)
@@ -653,7 +691,7 @@ pub fn seam_egress(
             let d = if bytes.is_empty() {
                 Delivery::Full
             } else {
-                delivered(emit(sink, mode, bytes), bytes.len())
+                emit(sink, mode, bytes)
             };
             Egress::Reported(d)
         }
@@ -685,7 +723,7 @@ pub fn seam_egress(
             match report {
                 Some(bytes) => {
                     let d = match bytes {
-                        Some(b) => delivered(emit(sink, mode, &b), b.len()),
+                        Some(b) => emit(sink, mode, &b),
                         None => Delivery::Full,
                     };
                     Egress::Reported(d)
@@ -716,7 +754,7 @@ pub fn seam_egress(
             match report {
                 Some(bytes) => {
                     let d = match bytes {
-                        Some(b) => delivered(emit(sink, mode, &b), b.len()),
+                        Some(b) => emit(sink, mode, &b),
                         None => Delivery::Full,
                     };
                     Egress::Reported(d)
@@ -852,8 +890,9 @@ pub fn seam_egress(
                     // the platform's setting, never from `_audit`).
                     let mut d = Delivery::Full;
                     for _ in 0..repeat {
-                        if delivered(emit(sink, mode, &b), b.len()) == Delivery::Failed {
-                            d = Delivery::Failed; // any short/failed write fails the lot
+                        let attempt = emit(sink, mode, &b);
+                        if !attempt.is_full() {
+                            d = attempt; // any short/failed write fails the lot
                         }
                     }
                     Egress::Reported(d)
@@ -879,7 +918,7 @@ pub fn seam_egress(
             let d = if out.is_empty() {
                 Delivery::Full
             } else {
-                delivered(emit(sink, mode, &out), out.len())
+                emit(sink, mode, &out)
             };
             Egress::Reported(d)
         }
@@ -889,7 +928,7 @@ pub fn seam_egress(
             let mut d = Delivery::Full;
             if term_lock(term).focus_reporting_enabled() {
                 let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
-                d = delivered(emit(sink, mode, seq), seq.len());
+                d = emit(sink, mode, seq);
             }
             Egress::Reported(d)
         }

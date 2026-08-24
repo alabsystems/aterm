@@ -117,6 +117,33 @@ pub(crate) struct TabMenu {
     pub keyboard: bool,
 }
 
+impl TabMenu {
+    /// `controls tab-menu` (design §2.1 [v5]): the OPEN card's rows and cursor.
+    /// Item text is VERBATIM the `chrome` verb's per-tab mirror
+    /// ([`crate::session_chrome::menu_entry_mirror`]) so the two introspection
+    /// surfaces can never describe one menu differently — the same discipline
+    /// the palette's `controls menu` lines follow.
+    pub(crate) fn controls_lines(&self) -> Vec<String> {
+        let mut out = Vec::with_capacity(self.entries.len() + 1);
+        out.push(format!(
+            "tab-menu tab={} index={} rows={} selected={}",
+            self.tab,
+            self.index,
+            self.entries.len(),
+            self.highlight
+                .map_or_else(|| "none".to_string(), |i| i.to_string()),
+        ));
+        for (i, entry) in self.entries.iter().enumerate() {
+            out.push(format!(
+                "tab-menu item index={i} selected={} text={:?}",
+                Some(i) == self.highlight,
+                crate::session_chrome::menu_entry_mirror(entry),
+            ));
+        }
+        out
+    }
+}
+
 /// Where the card actually landed, in FRAME cell coordinates (the same axis the
 /// tab-strip splice works in: row 0 is the strip's first row). Recorded by the
 /// painter and read by the hit-test, so the two can never disagree about where
@@ -195,6 +222,7 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
         TabMenuEntry::Header(t) => t.as_str(),
         TabMenuEntry::Separator => "",
         TabMenuEntry::Action { label, .. } => label,
+        TabMenuEntry::ConnectionAction { label, .. } => label,
     }
 }
 
@@ -204,7 +232,11 @@ fn entry_text(entry: &TabMenuEntry) -> &str {
 /// selectable, exactly like a greyed `NSMenuItem`.
 #[must_use]
 pub(crate) fn is_selectable(entry: &TabMenuEntry) -> bool {
-    matches!(entry, TabMenuEntry::Action { enabled: true, .. })
+    matches!(
+        entry,
+        TabMenuEntry::Action { enabled: true, .. }
+            | TabMenuEntry::ConnectionAction { enabled: true, .. }
+    )
 }
 
 /// Content width the card wants: the widest entry, floored at [`MIN_CONTENT`]
@@ -533,9 +565,14 @@ pub(crate) fn paint(
         let bg = if selected { c.sel_bg } else { c.card_bg };
         let (fg, bold) = match entry {
             TabMenuEntry::Header(_) => (c.band.label, false),
-            TabMenuEntry::Action { enabled: false, .. } => (c.disabled, false),
-            TabMenuEntry::Action { .. } if selected => (c.sel_fg, true),
-            TabMenuEntry::Action { .. } => (c.band.value, false),
+            TabMenuEntry::Action { enabled: false, .. }
+            | TabMenuEntry::ConnectionAction { enabled: false, .. } => (c.disabled, false),
+            TabMenuEntry::Action { .. } | TabMenuEntry::ConnectionAction { .. } if selected => {
+                (c.sel_fg, true)
+            }
+            TabMenuEntry::Action { .. } | TabMenuEntry::ConnectionAction { .. } => {
+                (c.band.value, false)
+            }
             TabMenuEntry::Separator => unreachable!("handled above"),
         };
         let mut row = vec![chrome_band::cell(' ', fg, bg, false, false); w];
@@ -621,9 +658,17 @@ pub(crate) fn fingerprint(menu: Option<&TabMenu>, rect: Option<MenuRect>) -> u64
         match e {
             TabMenuEntry::Header(t) => (0u8, t.as_str()).hash(&mut h),
             TabMenuEntry::Separator => 1u8.hash(&mut h),
-            TabMenuEntry::Action {
-                label, enabled, ..
-            } => (2u8, *label, *enabled).hash(&mut h),
+            TabMenuEntry::Action { label, enabled, .. } => {
+                (2u8, label.as_str(), *enabled).hash(&mut h);
+            }
+            // A connection row's identity is its PEER as well as its label —
+            // two peers' `Disconnect` rows read alike and must not collapse.
+            TabMenuEntry::ConnectionAction {
+                label,
+                peer_sid,
+                verb,
+                enabled,
+            } => (3u8, label.as_str(), peer_sid.as_str(), *verb as u8, *enabled).hash(&mut h),
         }
     }
     rect.hash(&mut h);
@@ -643,22 +688,22 @@ mod tests {
             TabMenuEntry::Header("spawned \u{00B7} 4m".into()),
             TabMenuEntry::Separator,
             TabMenuEntry::Action {
-                label: "Rename Session\u{2026}",
+                label: "Rename Session\u{2026}".into(),
                 action: MenuAction::RenameSession,
                 enabled: true,
             },
             TabMenuEntry::Action {
-                label: "Copy Session ID",
+                label: "Copy Session ID".into(),
                 action: MenuAction::CopySessionId,
                 enabled: true,
             },
             TabMenuEntry::Action {
-                label: "Copy CWD",
+                label: "Copy CWD".into(),
                 action: MenuAction::CopyCwd,
                 enabled: false,
             },
             TabMenuEntry::Action {
-                label: "Close Tab",
+                label: "Close Tab".into(),
                 action: MenuAction::CloseTab,
                 enabled: true,
             },
@@ -720,7 +765,7 @@ mod tests {
         match &m[hit] {
             TabMenuEntry::Action { action, label, .. } => {
                 assert_eq!(*action, MenuAction::CopySessionId);
-                assert_eq!(*label, "Copy Session ID");
+                assert_eq!(label, "Copy Session ID");
             }
             other => panic!("expected an action, got {other:?}"),
         }

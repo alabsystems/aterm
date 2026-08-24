@@ -1340,12 +1340,87 @@ impl TabIconKind {
     }
 }
 
+/// Which side(s) of a live session connection (design §4) a tab's sessions sit
+/// on: `Outbound` = some session here holds authority INTO a peer, `Inbound` =
+/// a peer holds authority over a session here, `Both` = both at once.
+///
+/// Deliberately NOT a [`TabIndicators`] field: the indicator bits have exactly
+/// two recomputing owners (the status classifier and the native leaves), and
+/// several seams ASSIGN whole `TabIndicators` values over a presentation —
+/// a third owner's bit stored there would be erased by every such write (the
+/// latching bug that struct's doc comment exists to prevent). The role is
+/// instead stamped per TAB by `App::stamp_tab_connection_roles` inside the one
+/// strip-refresh funnel, so it can never fight the indicator owners.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum TabConnRole {
+    Outbound,
+    Inbound,
+    Both,
+}
+
+impl TabConnRole {
+    /// The role the two per-session predicate flags spell; `None` = no mark.
+    #[must_use]
+    pub(crate) const fn from_flags(outbound: bool, inbound: bool) -> Option<Self> {
+        match (outbound, inbound) {
+            (true, true) => Some(Self::Both),
+            (true, false) => Some(Self::Outbound),
+            (false, true) => Some(Self::Inbound),
+            (false, false) => None,
+        }
+    }
+
+    /// This role's directional flags, `(outbound, inbound)` — the inverse of
+    /// [`Self::from_flags`], so folds can union in flag space.
+    #[must_use]
+    pub(crate) const fn flags(self) -> (bool, bool) {
+        match self {
+            Self::Outbound => (true, false),
+            Self::Inbound => (false, true),
+            Self::Both => (true, true),
+        }
+    }
+
+    /// OR-fold two optional roles (the [`aggregate_presentations`] discipline:
+    /// one pane's role never hides another's — outbound + inbound = both).
+    #[must_use]
+    pub(crate) const fn union(a: Option<Self>, b: Option<Self>) -> Option<Self> {
+        let (ao, ai) = match a {
+            Some(role) => role.flags(),
+            None => (false, false),
+        };
+        let (bo, bi) = match b {
+            Some(role) => role.flags(),
+            None => (false, false),
+        };
+        Self::from_flags(ao || bo, ai || bi)
+    }
+
+    /// Stable state tokens for the `chrome` introspection line (`format_tab_
+    /// chrome`). `Both` reports BOTH directional tokens rather than a third
+    /// spelling, so a script greps `conn-out`/`conn-in` and never misses a
+    /// direction (§6: marks are never visual-only).
+    #[must_use]
+    pub(crate) const fn chrome_states(self) -> &'static [&'static str] {
+        match self {
+            Self::Outbound => &["conn-out"],
+            Self::Inbound => &["conn-in"],
+            Self::Both => &["conn-out", "conn-in"],
+        }
+    }
+}
+
 /// Chrome metadata computed from tab content rather than from a PTY mirror.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub(crate) struct TabPresentation {
     pub(crate) title: String,
     pub(crate) icon: Option<TabIconKind>,
     pub(crate) indicators: TabIndicators,
+    /// The tab's connection-mark role (design §4), stamped from the live edge
+    /// tables by the strip-refresh funnel — see [`TabConnRole`] for why this is
+    /// not an indicator bit. `None` = no live connection touches this tab's
+    /// sessions (or the `tab_connection_badge` opt-out quieted the mark).
+    pub(crate) conn: Option<TabConnRole>,
     pub(crate) closable: bool,
     pub(crate) tooltip: Option<String>,
 }
@@ -1357,6 +1432,7 @@ impl TabPresentation {
             title: title.into(),
             icon: None,
             indicators: TabIndicators::default(),
+            conn: None,
             closable: true,
             tooltip: None,
         }
@@ -1375,6 +1451,7 @@ pub(crate) fn aggregate_presentations(
     let mut focused_presentation = None;
     let mut fallback = None;
     let mut indicators = TabIndicators::default();
+    let mut conn = None;
     let mut closable = true;
     let mut count = 0usize;
     for (view, presentation) in presentations {
@@ -1386,6 +1463,9 @@ pub(crate) fn aggregate_presentations(
         // erase one another.
         indicators.attention |= presentation.indicators.attention;
         indicators.status_attention |= presentation.indicators.status_attention;
+        // Directional union: a background pane's outbound role and the focused
+        // pane's inbound role read as `Both`, never as whichever pane won.
+        conn = TabConnRole::union(conn, presentation.conn);
         closable &= presentation.closable;
         if fallback.is_none() {
             fallback = Some(presentation.clone());
@@ -1396,6 +1476,7 @@ pub(crate) fn aggregate_presentations(
     }
     let mut result = focused_presentation.or(fallback)?;
     result.indicators = indicators;
+    result.conn = conn;
     result.closable = closable;
     if count > 1 {
         result.tooltip = Some(match result.tooltip {
@@ -2040,6 +2121,7 @@ mod tests {
                             attention: false,
                             status_attention: false,
                         },
+                        conn: Some(TabConnRole::Inbound),
                         closable: true,
                         tooltip: Some("primary".to_string()),
                     },
@@ -2058,6 +2140,8 @@ mod tests {
                             // hide, this leaf's out-of-band mark.
                             status_attention: true,
                         },
+                        // Unions with the focused pane's Inbound to Both below.
+                        conn: Some(TabConnRole::Outbound),
                         closable: false,
                         tooltip: None,
                     },
@@ -2075,6 +2159,7 @@ mod tests {
                 status_attention: true,
             }
         );
+        assert_eq!(aggregate.conn, Some(TabConnRole::Both));
         assert!(!aggregate.closable);
     }
 

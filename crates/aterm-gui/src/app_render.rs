@@ -137,15 +137,23 @@ fn confirm_cursor_move_candidate(
         }
         None => false,
     };
-    let glow_generation_changed = window
+    // ONE ownership verdict per frame: the glow engine (owner of the row
+    // probe) triages the generation change, and that verdict is projected
+    // verbatim onto the classic trail and the cursor companion. Only an
+    // unowned RELOCATION (a program-owned cursor move or a terminal/screen
+    // identity change) grounds the companion — output-only spinner/stream
+    // batches at an untouched caret keep its earned momentum, matching
+    // `retire_unowned_cursor_motion`'s own contract.
+    let ownership = window
         .cursor_glow
-        .observe_content_generation(generation, candidate_confirmed);
-    let trail_generation_changed = window
+        .observe_content_generation(generation, cur, candidate_confirmed);
+    window
         .cursor_trail
-        .observe_content_generation(generation, candidate_confirmed);
-    let unowned_generation =
-        !candidate_confirmed && (glow_generation_changed || trail_generation_changed);
-    if unowned_generation {
+        .observe_content_generation(generation, ownership);
+    if matches!(
+        ownership,
+        aterm_effects::cursor_trail::GenerationOwnership::UnownedRelocation
+    ) {
         window.cursor_cat.retire_unowned_cursor_motion();
     }
 }
@@ -158,8 +166,40 @@ fn cursor_fx_generation_torn(
     observed != committed
 }
 
-/// Retire every cursor-coordinate owner when LOCK B commits a different
-/// terminal generation than LOCK A classified. `free_scratch` is deliberately
+/// Whether a torn LOCK A/LOCK B frame must HARD-RESET the cursor-effect
+/// engines, not merely suppress this frame's overlay projection
+/// (`suppress_torn_cursor_projection`, which always runs on a torn frame).
+///
+/// A reset is owed only when the mid-frame batch actually invalidated the
+/// coordinate space the engines ticked in: the terminal or screen identity
+/// changed, or the cursor LOCK B commits differs (position or visibility)
+/// from the one LOCK A classified. A busy TUI streaming output lands batches
+/// between the locks several times a second WITHOUT moving the cursor —
+/// resetting both engines there killed all resident light plus the effect
+/// frame train (an idle engine requests no frames), which is how the v0.49.0
+/// alt-screen trail/kitty blackout survived even healthy admission. The
+/// non-diverged torn frame keeps the engines live: its overlay is suppressed
+/// for exactly one frame and the next tick re-emits from resident state.
+#[inline]
+fn torn_cursor_fx_must_reset(
+    observed: aterm_effects::cursor_trail::ContentGeneration,
+    committed: aterm_effects::cursor_trail::ContentGeneration,
+    observed_cursor: (u16, u16),
+    committed_cursor: (u16, u16),
+    observed_visible: bool,
+    committed_visible: bool,
+) -> bool {
+    observed.terminal_id != committed.terminal_id
+        || observed.alternate_screen != committed.alternate_screen
+        || observed_cursor != committed_cursor
+        || observed_visible != committed_visible
+}
+
+/// Retire every cursor-coordinate owner when a torn LOCK A/LOCK B frame
+/// actually DIVERGED the cursor's coordinate space (`torn_cursor_fx_must_reset`
+/// — identity change, or a mid-frame cursor move/visibility flip). A merely
+/// torn generation with a coherent cursor only suppresses that one frame's
+/// projection and keeps the engines live. `free_scratch` is deliberately
 /// conservative: the cursor kitty, resident pet, and Robi share that untagged
 /// sprite plane, so keeping any of it would risk one frame at the old cursor.
 fn retire_torn_cursor_fx(window: &mut WindowState) {
@@ -209,7 +249,7 @@ mod cursor_fx_generation_fence_tests {
     use super::{
         confirm_cursor_move_candidate, cursor_fx_generation_torn,
         rebind_cursor_override_after_torn, retire_torn_cursor_fx, suppress_torn_cursor_projection,
-        suppress_torn_robi_tip,
+        suppress_torn_robi_tip, torn_cursor_fx_must_reset,
     };
     use crate::{App, Backend, WindowId};
     use aterm_core::render::{
@@ -406,8 +446,69 @@ mod cursor_fx_generation_fence_tests {
         assert!(!ok, "a resident companion may not survive generation drift");
     }
 
+    /// TORN-FRAME PIN (v0.49.0): a PTY chunk landing between LOCK A and
+    /// LOCK B is a standing, several-times-per-second event under a streaming
+    /// TUI. Such a frame suppresses its own overlay projection (bounded, one
+    /// frame — `suppress_torn_cursor_projection` runs on every torn frame),
+    /// but it must HARD-RESET the engines only when the mid-frame batch
+    /// actually diverged the cursor's coordinate space; the old unconditional
+    /// reset destroyed resident light and stopped the effect frame train on
+    /// every busy alt-screen frame.
     #[test]
-    fn unowned_program_generation_even_at_same_cursor_grounds_an_earned_flying_cursor_cat() {
+    fn torn_frame_resets_engines_only_on_cursor_divergence() {
+        let observed = ContentGeneration {
+            process_sequence: 41,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let committed = ContentGeneration {
+            process_sequence: 42,
+            ..observed
+        };
+        assert!(
+            !torn_cursor_fx_must_reset(observed, committed, (3, 9), (3, 9), true, true),
+            "an output-only mid-frame batch keeps the engines and their resident light"
+        );
+        assert!(
+            torn_cursor_fx_must_reset(observed, committed, (3, 9), (4, 0), true, true),
+            "a mid-frame cursor move owns a hard reset"
+        );
+        assert!(
+            torn_cursor_fx_must_reset(observed, committed, (3, 9), (3, 9), true, false),
+            "a mid-frame visibility flip owns a hard reset"
+        );
+        assert!(
+            torn_cursor_fx_must_reset(
+                observed,
+                ContentGeneration {
+                    alternate_screen: false,
+                    ..committed
+                },
+                (3, 9),
+                (3, 9),
+                true,
+                true,
+            ),
+            "a mid-frame screen swap owns a hard reset"
+        );
+        assert!(
+            torn_cursor_fx_must_reset(
+                observed,
+                ContentGeneration {
+                    terminal_id: 8,
+                    ..committed
+                },
+                (3, 9),
+                (3, 9),
+                true,
+                true,
+            ),
+            "a mid-frame terminal identity change owns a hard reset"
+        );
+    }
+
+    #[test]
+    fn unowned_generation_grounds_the_cursor_cat_only_on_relocation() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         let now = Instant::now();
@@ -454,6 +555,12 @@ mod cursor_fx_generation_fence_tests {
         }
         assert!(ws.cursor_cat.is_active(), "fixture earns a real flying episode");
 
+        // An unowned OUTPUT-ONLY batch at the same cursor (a spinner /
+        // streaming chunk — Claude Code emits several per second) is not a
+        // relocation: the companion keeps its earned episode. This is the
+        // paint-side half of the v0.49.0 regression — the old fence grounded
+        // the cat on every such batch, so it could never stay visible on a
+        // busy alternate-screen TUI.
         confirm_cursor_move_candidate(
             ws,
             Some((2, 2)),
@@ -464,8 +571,31 @@ mod cursor_fx_generation_fence_tests {
             },
         );
         assert!(
+            ws.cursor_cat.is_active(),
+            "an unowned output-only batch at an unmoved cursor keeps the earned flight"
+        );
+
+        // A program-owned RELOCATION (the cursor lands somewhere no candidate
+        // owns) still grounds it — `retire_unowned_cursor_motion`'s contract.
+        ws.cursor_glow.tick(
+            Some((2, 2)),
+            now + Duration::from_secs(4),
+            &glow_cfg,
+            geom,
+            &mut ws.glow_scratch,
+        );
+        confirm_cursor_move_candidate(
+            ws,
+            Some((9, 40)),
+            now + Duration::from_secs(5),
+            ContentGeneration {
+                process_sequence: 22,
+                ..generation
+            },
+        );
+        assert!(
             !ws.cursor_cat.is_active(),
-            "an unowned same-cursor rewrite cannot carry the old flying episode"
+            "an unowned cursor relocation cannot carry the old flying episode"
         );
     }
 }
@@ -4121,6 +4251,35 @@ mod native_damage_tests {
 /// (`app_introspect`), which mirrors this LOCK A derivation exactly.
 pub(crate) const BLINK_RECENT_MAX: Duration = Duration::from_secs(1);
 
+/// Resolve one captured frame's row-probe [`aterm_effects::cursor_glow::ProbeTrust`]
+/// — the repair for the alt-screen `no-row-probe` retire class. The old seam
+/// was a boolean (`probe_ok = !alt || blink_recent`) that WITHHELD the probe
+/// from every plain alt-screen app, protecting the kill/poof detector from
+/// phantom poofs (Ctrl-U/Ctrl-W page-scroll in vim/less, and region scrolls
+/// slide content through the cursor row). But withholding it also starved the
+/// typed-echo CONFIRM proof: on `less` /-search typing, `vi` insert mode, and
+/// a per-key-echo TUI whose concurrent streamer writes at another row via
+/// cursor save/restore (ESC 7/ESC 8), `row_cur_meta` was never available and
+/// EVERY honest keystroke's admission retired `reason=no-row-probe` — zero
+/// confirms, zero spawns, zero ink — while a repaint-BLINKING alt TUI (Claude
+/// Code's DEC-2026 bracket) confirmed fine. The probe now always flows and
+/// carries its trust class instead: `ContentOnly` feeds only the exact
+/// content proofs (typed/delete confirm, unowned-steady anchor), and every
+/// kill/poof branch refuses it inside the engine, so the phantom-poof fence
+/// holds exactly as before. All four capture seams (single-pane LOCK A, the
+/// composed live/headless seam, the split-pane compose pass, and the headless
+/// `app_introspect` capture) resolve trust through this one function.
+pub(crate) fn row_probe_trust(
+    is_alt: bool,
+    blink_recent: bool,
+) -> aterm_effects::cursor_glow::ProbeTrust {
+    if !is_alt || blink_recent {
+        aterm_effects::cursor_glow::ProbeTrust::Full
+    } else {
+        aterm_effects::cursor_glow::ProbeTrust::ContentOnly
+    }
+}
+
 /// Resolve the companion's local terminal palette from every grid cell its
 /// prospective sprite intersects. The explicit cap keeps this cold emission
 /// path allocation-free and O(1), even under degenerate cell metrics.
@@ -5528,6 +5687,11 @@ pub(crate) fn prepend_strip_rows(
     if strip == 0 {
         return;
     }
+    // D-2: the splice shifts every per-row channel down by `strip`, so terminal
+    // row `r` becomes frame row `r + strip`. The revision lane is stamped in
+    // ENGINE row space and is not shifted here — disown it rather than let a
+    // consumer read row `r`'s revision against row `r + strip`'s content.
+    dst.invalidate_row_revisions();
     dst.cells.splice(
         0..0,
         strip_rows.iter().map(|src| match pool.pop() {
@@ -7256,6 +7420,11 @@ pub(crate) fn fill_divider_grid_cells(
     theme: Theme,
 ) {
     let seam = divider_cell(theme);
+    // D-2: a composed frame's row `r` is a band of SOME pane (or a divider
+    // seam), not the row the last engine fill stamped into this reused scratch.
+    // Disown the revision lane before the rebuild so the dirty diff compares
+    // composed content exactly, as it did before the lane existed.
+    dst.invalidate_row_revisions();
     dst.rows = rows;
     dst.cols = cols;
     dst.cells.resize_with(rows, Vec::new);
@@ -10165,13 +10334,18 @@ pub(crate) struct CursorFxInputs {
     pub live_cursor_rgb: [u8; 3],
     /// Live default background (DECSCNM-folded) — the rainbow's dark-theme input.
     pub default_bg: u32,
-    /// ERASE-POOF row probe `(row, caret)` for this frame — the chars ride in
+    /// Row probe `(row, caret, trust)` for this frame — the chars ride in
     /// the window's `poof_row_buf`, captured under the SAME term lock as the
     /// cursor sample (row/caret in the same coordinate space as `cur`).
     /// `None` when the viewport is scrolled back, history shifted this frame,
     /// or the caller doesn't probe (headless without a capture) — the engine
-    /// then keeps its previous probe and the poof detector idles.
-    pub row_probe: Option<(u16, u16)>,
+    /// then keeps its previous probe and the poof detector idles. The trust
+    /// class ([`row_probe_trust`]) says which detector families may read it:
+    /// a plain alt-screen frame (no repaint blink) ships `ContentOnly`, so
+    /// the typed-echo confirm proof stays fed (the `no-row-probe` repair)
+    /// while the kill/poof detector keeps refusing exactly what it always
+    /// refused there.
+    pub row_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)>,
     /// Terminal parser generation coherent with `cur` and `row_probe`.
     pub content_generation: aterm_effects::cursor_trail::ContentGeneration,
     /// The live default FOREGROUND (`0x00RRGGBB`), the twin of `default_bg`.
@@ -11628,9 +11802,14 @@ impl App {
         // PRESENTED truth against this frame's row. A `None` probe (scrolled
         // back / history shifted / an unwired caller) leaves the previous
         // probe in place — the detector idles rather than forgetting.
-        if let Some((prow, pcaret)) = row_probe {
-            ws.cursor_glow
-                .observe_row(prow, pcaret, &ws.poof_row_buf, frame_started);
+        if let Some((prow, pcaret, probe_trust)) = row_probe {
+            ws.cursor_glow.observe_row_with_trust(
+                prow,
+                pcaret,
+                &ws.poof_row_buf,
+                frame_started,
+                probe_trust,
+            );
             // STAR-LANDING NEIGHBORS, same probe generation: the flanking
             // rows captured beside `poof_row_buf` under the caller's term
             // lock. A grid-edge neighbor was not captured — `None` tells the
@@ -12332,11 +12511,13 @@ impl App {
             let blink_recent = window
                 .last_blink_at
                 .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_RECENT_MAX);
-            let probe_ok = !alt || blink_recent;
+            // Plain-alt frames ship a ContentOnly probe instead of none — the
+            // `no-row-probe` repair; see [`row_probe_trust`].
+            let probe_trust = row_probe_trust(alt, blink_recent);
             // Scroll/invalidating content movement is applied before the probe
             // decision, so no pre-scroll row identity can be sampled back into
             // an engine that was just translated or reset.
-            if probe_ok && display_offset == 0 && !scroll_change.changed() {
+            if display_offset == 0 && !scroll_change.changed() {
                 Some((
                     cursor
                         .0
@@ -12344,6 +12525,7 @@ impl App {
                     cursor
                         .1
                         .saturating_add(u16::try_from(col).unwrap_or(u16::MAX)),
+                    probe_trust,
                 ))
             } else {
                 None
@@ -12428,15 +12610,19 @@ impl App {
         window
             .cursor_glow
             .set_reduced_motion(!policy.animate(crate::motion::MotionEffect::CursorGlow));
-        if let Some((probe_row, probe_caret)) = row_probe {
+        if let Some((probe_row, probe_caret, probe_trust)) = row_probe {
             if col > 0 {
                 let len = window.poof_row_buf.len();
                 window.poof_row_buf.resize(len.saturating_add(col), ' ');
                 window.poof_row_buf.rotate_right(col);
             }
-            window
-                .cursor_glow
-                .observe_row(probe_row, probe_caret, &window.poof_row_buf, now);
+            window.cursor_glow.observe_row_with_trust(
+                probe_row,
+                probe_caret,
+                &window.poof_row_buf,
+                now,
+                probe_trust,
+            );
         }
         confirm_cursor_move_candidate(window, effect_cursor, now, content_generation);
         window.cursor_glow.tick(
@@ -12665,8 +12851,9 @@ impl App {
             return false;
         };
         let Some(host) = window
-            .level_up_card
+            .conn_wire_card
             .as_ref()
+            .or(window.level_up_card.as_ref())
             .or(window.notice_card.as_ref())
             .or(window.badge_card.as_ref())
         else {
@@ -13035,6 +13222,20 @@ impl App {
 
         if let Some(window) = self.windows.get_mut(&id) {
             fill_divider_grid(&mut window.input_scratch, rows, cols, self.theme);
+            // Bump IMMEDIATELY after the cells rewrite, not only at this
+            // frame's normal exit: the `abandoned` bail below returns before
+            // that exit's bump, and the divider fill both rewrites `cells`
+            // wholesale AND zeroes `display_offset`/`base_y`/
+            // `absolute_row_revision` while leaving the engine continuity
+            // stamps intact — a shape that passes every clause of the
+            // damage-scoped refill check. Un-bumped, a heterogeneous
+            // transition abandoned mid-resolve and reverted to single-pane
+            // let the scoped arm retain the divider lattice as engine content
+            // (adversarial review of the DMG-1 wiring, 2026-08-24). The
+            // normal path's exit bump remains; a double bump is just
+            // "changed" twice and gates identically.
+            window.input_scratch.snapshot_seq =
+                window.input_scratch.snapshot_seq.wrapping_add(1);
             window.input_scratch.default_bg = aterm_core::render::COLOR_UNSET;
             window.input_scratch.cursor_color = aterm_core::render::COLOR_UNSET;
             // A heterogeneous (mixed terminal/native) composite is never
@@ -13968,6 +14169,7 @@ impl App {
         // shares the notice slot and yields to a live pill (see
         // `splice_pkg_progress` / the pkg_progress_card parity contract).
         self.splice_pkg_progress(id);
+        self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
         }
@@ -14030,6 +14232,7 @@ impl App {
         // shares the notice slot and yields to a live pill (see
         // `splice_pkg_progress` / the pkg_progress_card parity contract).
         self.splice_pkg_progress(id);
+        self.splice_conn_wire(id);
         if !self.compose_native_route_card(id) {
             return;
         }
@@ -14111,6 +14314,11 @@ impl App {
         // `last_frame_render_ms` on an actual present (early-out frames return before
         // `record_present`, so they never count). One `Instant::now()` per redraw.
         let frame_started = Instant::now();
+        // CONNECTION MAP liveness (§5.2): lease/watcher annotations are read AT
+        // PAINT TIME — they have no wake funnel (§5.1), so the open map's terms
+        // are stamped here, ahead of the repaint key that folds them in. A
+        // no-op (cheap `is_none` check) for every other frame.
+        self.connection_map_prepaint(id);
         // GPU-loss fallback changes the shared backend before every per-window
         // CPU surface is guaranteed to exist. Rebuild any missing/mismatched
         // target here, inside the same bounded failed-present funnel: a transient
@@ -14621,18 +14829,19 @@ impl App {
             let blink_recent = ws
                 .last_blink_at
                 .is_some_and(|t| frame_started.saturating_duration_since(t) <= BLINK_RECENT_MAX);
-            // NEVER in a PLAIN alt-screen app (vim/less — no repaint blink):
-            // Ctrl-U/Ctrl-W are page-scroll / window commands there, and
-            // region scrolls slide content through the cursor row with no
-            // scrollback trace — a fresh kill hint would pair with that slide
-            // into a phantom poof (adversarial review). A repaint-BLINKING
-            // alt-screen TUI (Claude Code — live frame evidence) keeps the
-            // probe: its kill keys are real kills.
-            let probe_ok = !is_alt || blink_recent;
+            // PLAIN alt-screen apps (vim/less — no repaint blink) used to
+            // lose the probe here outright, protecting the kill/poof detector
+            // from phantom poofs — and starving the typed-echo confirm proof,
+            // which then retired `no-row-probe` on every honest keystroke
+            // (less /-search, vi insert, the ESC 7/ESC 8 streamer TUI). The
+            // probe now always flows and carries its trust class instead; the
+            // engine's kill/poof branches refuse ContentOnly probes, so the
+            // phantom-poof fence holds unchanged (see [`row_probe_trust`]).
+            let probe_trust = row_probe_trust(is_alt, blink_recent);
             // Advance/drop cursor-effect geometry before sampling the new row.
             // The terminal snapshot remains monotonic even when retained
             // scrollback is capped at zero or full.
-            let row_probe = if probe_ok && display_offset == 0 && !scroll_change.changed() {
+            let row_probe = if display_offset == 0 && !scroll_change.changed() {
                 let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
                 // STAR-LANDING NEIGHBORS: capture the rows flanking the
                 // cursor row under the SAME lock, so the displaced rainbow kitty
@@ -14648,7 +14857,7 @@ impl App {
                 if (cpos.row as usize) + 1 < rows {
                     term.row_cols_into(cpos.row as usize + 1, &mut ws.poof_row_below_buf);
                 }
-                Some((cpos.row, cpos.col))
+                Some((cpos.row, cpos.col, probe_trust))
             } else {
                 None
             };
@@ -14727,8 +14936,13 @@ impl App {
             // (same lock, same epoch — no torn read); scans/sampling below run
             // unlocked off this snapshot.
             if deco_rescan || rain_refresh {
-                term.cell_frame_into(&mut ws.input_scratch, rows, cols);
-                term.take_damage();
+                // The same historical extract+take pair as LOCK B, so it takes
+                // the same DMG-1 scoped arm (and re-establishes the continuity
+                // chain a plain pair would break for the NEXT frame — the
+                // scoped fn restamps `extract_gen`, `cell_frame_into` +
+                // `take_damage` does not).
+                let refill = term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
+                metrics::note_frame_refill(refill);
             }
             // The composition must occupy exactly the columns the committed text
             // will (the write path honors EA-Ambiguous width), so the overlay
@@ -16137,6 +16351,11 @@ impl App {
             // Provisioning progress card (WP3 plumbing): 0 when hidden — the key
             // stays byte-identical to the no-card path (FL-1).
             let pkg_progress_fp = self.pkg_progress.fingerprint(frame_started);
+            // Drag-to-connect wire on THIS window — `0` when no drag renders
+            // here (idle invariant), a cursor-tracking hash while one does.
+            // (`conn_drag` is a disjoint App field from the borrowed `ws`.)
+            let conn_wire_fp =
+                crate::app_conn_drag::conn_wire_fp_for(self.conn_drag.as_ref(), id, ws.win_px);
             let key = RepaintKey {
                 damage_epoch: epoch,
                 grid_top,
@@ -16180,6 +16399,7 @@ impl App {
                 notice_fp,
                 level_up_fp,
                 pkg_progress_fp,
+                conn_wire_fp,
                 // An OS appearance flip must reach the glass: the Settings preview's
                 // auto titlebar mock splits on it and no other term moves (main.rs).
                 system_dark: repaint_system_dark(self.os_appearance),
@@ -16246,24 +16466,57 @@ impl App {
                 // `rows` here and this `cell_frame_into` refills in place. It stamps
                 // `snapshot_seq` with the grid's CURRENT damage epoch (render_cells.rs).
                 let mut term = term_lock(&front_terminal.term);
-                term.cell_frame_into(&mut ws.input_scratch, rows, cols);
+                // DMG-1 REACHES THE SHIPPING FRONTEND: the damage-scoped
+                // extraction (built + differentially-oracled in aterm-core,
+                // measured 2.35×/2.65× on the frame tick, stranded with zero
+                // production callers until here) replaces the historical
+                // `cell_frame_into` + `take_damage` pair byte-for-byte: its
+                // Full arm IS that pair, and the Scoped arm retains only rows
+                // the engine can prove untouched (identity, extract_gen,
+                // snapshot_seq==engine_fill_seq, dims, offset, row order —
+                // every clause conservative, any break = Full). The host-side
+                // scratch mutators below (stream fade, IME preedit, strip
+                // splice) all follow the ghost-paint bump discipline, so a
+                // mutated frame costs the NEXT frame its scoped arm and
+                // nothing else. `metrics` counts the reach.
+                let refill = term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
+                metrics::note_frame_refill(refill);
                 let committed_generation =
                     aterm_effects::cursor_trail::ContentGeneration {
                         process_sequence: term.pipeline_timestamps().process_sequence,
                         terminal_id: term.render_identity(),
                         alternate_screen: term.is_alternate_screen(),
                     };
+                // The cursor LOCK B commits, read under the SAME hold as the
+                // generation so the torn triage below compares one coherent
+                // observation against LOCK A's.
+                let committed_cursor = term.cursor();
+                let committed_cursor_visible = term.cursor_visible();
                 // The presented pair is re-sampled here; the foreground half is
                 // not read on this path (the effect config was already folded
                 // above from the same observation), so it is discarded by name.
                 (presented_default_bg_u32, _, presented_cursor_color_u32) =
                     terminal_frame_colors(&term);
-                term.take_damage();
                 drop(term);
                 cursor_fx_torn =
                     cursor_fx_generation_torn(content_generation, committed_generation);
                 if cursor_fx_torn {
-                    retire_torn_cursor_fx(ws);
+                    // Suppression (below, at the projection splice) is owed on
+                    // every torn frame; the ENGINE reset only when the
+                    // mid-frame batch moved the cursor or changed identity —
+                    // an output-only batch keeps the resident light and the
+                    // effect frame train alive, and the next coherent frame
+                    // re-emits it (see `torn_cursor_fx_must_reset`).
+                    if torn_cursor_fx_must_reset(
+                        content_generation,
+                        committed_generation,
+                        (cpos.row, cpos.col),
+                        (committed_cursor.row, committed_cursor.col),
+                        cursor_visible,
+                        committed_cursor_visible,
+                    ) {
+                        retire_torn_cursor_fx(ws);
+                    }
                     reset_cursor_override_after_torn = true;
                 }
                 // Freshness vs. decoration consistency: this is a NON-rescan frame, so
@@ -16749,6 +17002,10 @@ impl App {
         // shares the notice slot and yields to a live pill (see
         // `splice_pkg_progress` / the pkg_progress_card parity contract).
         self.splice_pkg_progress(id);
+        // DRAG-TO-CONNECT wire (design §3.2) — paint-only, its own slot,
+        // priority over the level-up/notice cards while a connection drag from
+        // THIS window is in flight. A no-op (card = None) otherwise.
+        self.splice_conn_wire(id);
         self.splice_config_notice(id);
         // The multi-line-paste confirmation is a SECURITY question: it paints
         // over the config notice when both bands are up (same mechanics).
@@ -17056,6 +17313,10 @@ impl App {
                 .iter()
                 .map(|tab| tab_bar::TabStripMetadata::from_presentation(&tab.presentation)),
         );
+        // The App-pushed drag-to-connect drop-target highlight (design §3.2):
+        // stamped on the SAME buffer the strip fingerprint hashes, so a target
+        // change repaints the strip through the ordinary fingerprint epoch.
+        self.stamp_conn_drop_target(id, metadata);
     }
 
     /// Ensure a windowed CPU-backend window owns a CPU presentation target. The
@@ -17503,6 +17764,7 @@ impl App {
                 .route_card
                 .as_ref()
                 .or(ws.settings_card.as_ref())
+                .or(ws.conn_wire_card.as_ref())
                 .or(ws.level_up_card.as_ref())
                 .or(ws.notice_card.as_ref())
                 .or(ws.badge_card.as_ref())
@@ -17622,6 +17884,7 @@ impl App {
                 || overlay.is_some()
                 || ws.route_card.is_some()
                 || ws.settings_card.is_some()
+                || ws.conn_wire_card.is_some()
                 || ws.level_up_card.is_some()
                 || ws.notice_card.is_some()
                 || ws.badge_card.is_some();
@@ -17725,6 +17988,7 @@ impl App {
                         .route_card
                         .as_ref()
                         .or(ws.settings_card.as_ref())
+                        .or(ws.conn_wire_card.as_ref())
                         .or(ws.level_up_card.as_ref())
                         .or(ws.notice_card.as_ref())
                         .or(ws.badge_card.as_ref())
@@ -19043,10 +19307,10 @@ impl App {
         // so the overlay needs this pane's `ambiguous_width_double` — the
         // capture path reads it from the live lock it already holds.
         let mut focus_ambiguous_cjk = false;
-        // The focused pane's ERASE-POOF probe `(row, caret)` in WINDOW coords
+        // The focused pane's row probe `(row, caret, trust)` in WINDOW coords
         // (`None` ⇒ scrolled back / history shifted — the engine keeps its
         // previous probe). Chars ride `ws.poof_row_buf`, window-column aligned.
-        let mut focus_probe: Option<(u16, u16)> = None;
+        let mut focus_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)> = None;
         // PHOSPHOR rain, compose path (split-pane audit): the FOCUSED pane
         // rains — the aurora/comet law ("effects follow focus, clipped to the
         // pane") applied to the ambient effect. These locals snapshot the
@@ -19182,13 +19446,15 @@ impl App {
                     let blink_recent = ws
                         .last_blink_at
                         .is_some_and(|t| now.saturating_duration_since(t) <= BLINK_RECENT_MAX);
-                    let pane_probe_ok = !pane_alt || blink_recent;
+                    // Plain-alt panes ship a ContentOnly probe instead of
+                    // none — the `no-row-probe` repair; see [`row_probe_trust`].
+                    let pane_probe_trust = row_probe_trust(pane_alt, blink_recent);
                     // The monotonic terminal clock is compared before a row
                     // probe can be captured. This remains true at a full/zero
                     // retained-history cap and on the alternate grid.
-                    focus_probe = if pane_probe_ok && d_off == 0 && !scroll_change.changed() {
+                    focus_probe = if d_off == 0 && !scroll_change.changed() {
                         let _fill = term.row_cols_into(cp.row as usize, &mut ws.poof_row_buf);
-                        Some((cp.row + r.row_off, cp.col + r.col_off))
+                        Some((cp.row + r.row_off, cp.col + r.col_off, pane_probe_trust))
                     } else {
                         None
                     };
@@ -19502,7 +19768,7 @@ impl App {
             // ERASE-POOF probe feed, immediately before the tick — the compose
             // path's mirror of `tick_cursor_fx`'s feed (same engine, same
             // window-coord contract).
-            if let Some((prow, pcaret)) = focus_probe {
+            if let Some((prow, pcaret, probe_trust)) = focus_probe {
                 // Shift onto window columns with a leading blank pad, so the
                 // diff's vanished-span columns emit at the pane's true x
                 // (capacity settles after one frame; no steady-state alloc).
@@ -19516,7 +19782,7 @@ impl App {
                     ws.poof_row_buf.rotate_right(off);
                 }
                 ws.cursor_glow
-                    .observe_row(prow, pcaret, &ws.poof_row_buf, now);
+                    .observe_row_with_trust(prow, pcaret, &ws.poof_row_buf, now, probe_trust);
                 // STAR-LANDING NEIGHBORS: deliberately NOT wired on the
                 // compose path (the pane loop would need two more locked
                 // captures + the same column shift). Unprobed neighbors mean
@@ -19870,6 +20136,8 @@ impl App {
         // Provisioning progress card — same term as the single-pane key: the card
         // is WINDOW chrome over the finished composite; 0 when hidden (FL-1).
         let pkg_progress_fp = self.pkg_progress.fingerprint(now);
+        // Drag-to-connect wire on THIS window (same term as the single-pane key).
+        let conn_wire_fp = self.conn_wire_fingerprint(wid);
         let key = RepaintKey {
             damage_epoch,
             grid_top,
@@ -19922,6 +20190,7 @@ impl App {
             notice_fp,
             level_up_fp,
             pkg_progress_fp,
+            conn_wire_fp,
             // Same appearance term as the single-pane key (see `RepaintKey`).
             system_dark: repaint_system_dark(self.os_appearance),
         };

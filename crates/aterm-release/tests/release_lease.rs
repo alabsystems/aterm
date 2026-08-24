@@ -5,6 +5,9 @@
 //! protocol/ref semantics against a local bare remote; the injected fixture
 //! covers the one transport ambiguity real local Git cannot reproduce.
 
+#[path = "../src/apple.rs"]
+#[allow(dead_code)]
+mod apple;
 #[path = "../src/buildplan.rs"]
 #[allow(dead_code)]
 mod buildplan;
@@ -17,6 +20,9 @@ mod seedpack;
 #[path = "../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
+#[path = "../src/cli.rs"]
+#[allow(dead_code)]
+mod cli;
 #[path = "../src/dmg.rs"]
 #[allow(dead_code)]
 mod dmg;
@@ -35,6 +41,11 @@ mod manifest_out;
 #[path = "../src/mirror.rs"]
 #[allow(dead_code)]
 mod mirror;
+// Mounted for publish.rs, whose roster reconstruction publishes the pair through the
+// provisioning module's writer lock and redo transaction.
+#[path = "../src/provision.rs"]
+#[allow(dead_code)]
+mod provision;
 #[path = "../src/publish.rs"]
 #[allow(dead_code)]
 mod publish;

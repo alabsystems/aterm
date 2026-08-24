@@ -95,6 +95,9 @@ aterm-core = { workspace = true, features = ["bidi", "serde"] }
 # The selection/block control verbs + the shared response-framing primitives,
 # hosted here through `control_host::GuiHost`'s `SessionHost` impl.
 aterm-control = { workspace = true }
+# Durable event claims/WAL for the operator observer embedded in every normal
+# GUI/headless process. This crate remains host-agnostic and has no GUI edge.
+aterm-agent = { workspace = true }
 # L0.5 semantic predicates: the `await match <re>` verb compiles its regex here,
 # so the engine core stays regex-free (RFC R2 purity).
 aterm-observe = { workspace = true }

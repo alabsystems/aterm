@@ -31,6 +31,8 @@
 //! platform. The impure work (leaf-lock reads, epoch caching) lives in
 //! `App::composed_session_chrome` (`app_tabs.rs`).
 
+use aterm_session::SessionId;
+
 use crate::menu::MenuAction;
 
 /// How many timeline events the tooltip / menu shows — the "recent" TAIL,
@@ -87,6 +89,55 @@ pub(crate) struct SessionChromeInput {
     /// The recent timeline tail, NEWEST-FIRST, already capped to
     /// [`TIMELINE_TAIL`] by the caller (the composer re-caps defensively).
     pub timeline: Vec<TimelineNote>,
+    /// This session's live SESSION CONNECTIONS (design §2.3/§4), one fact per
+    /// peer, gathered by the caller from the in-process edge tables (the
+    /// authority record — never lineage, never the token store) and already
+    /// sorted for a stable listing. Empty = no CONNECTIONS rows beyond the
+    /// always-present spawn presets / picker entries.
+    pub connections: Vec<ConnectionFact>,
+}
+
+/// Which way the AUTHORITY of a connection points, seen from the session whose
+/// chrome is being composed ("S"). A row lives in its DESTINATION's table, so:
+/// `Outbound` = S holds ops over the peer, `Inbound` = the peer holds ops over
+/// S, `Peer` = both directions exist (the §2.3 `⇆` pair).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnDirection {
+    Outbound,
+    Inbound,
+    Peer,
+}
+
+/// The push/pull face of a connection's op set — the family-row rung (§6):
+/// `write-input` present ⇒ Push (it can type), else Pull (read-only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnFlow {
+    Push,
+    Pull,
+}
+
+/// One connected peer as the chrome shows it — plain data (the caller resolves
+/// titles/directions under its own locks; the composer renders). `live` is
+/// BEST-EFFORT: today's lease/watcher state names control connections, not
+/// peer sessions, so per-peer traffic cannot be attributed honestly — callers
+/// pass `false` (absent = not live) until a per-connection activity seam
+/// exists; the rendering already supports the flag.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConnectionFact {
+    /// The peer's registry sid — what the [`TabMenuEntry::ConnectionAction`]
+    /// rows target.
+    pub peer_sid: SessionId,
+    /// The peer's display title (user meta title ▸ registry title), or
+    /// `unknown` for a foreign src no local session owns.
+    pub peer_title: String,
+    pub direction: ConnDirection,
+    /// The [`ConnFlow`] of the S-relative half: the S→peer half for
+    /// `Outbound`/`Peer`, the peer→S half for `Inbound`. (`Peer` renders the
+    /// bare `⇆` line, direction-symmetric, so its flow is not shown.)
+    pub kind: ConnFlow,
+    /// Whether the connection is actively driving right now. Best-effort —
+    /// see the struct doc; `false` means "not known live", never "idle".
+    pub live: bool,
 }
 
 /// One timeline event as the chrome shows it: the kind token plus its age at
@@ -105,21 +156,53 @@ pub(crate) struct TimelineNote {
 /// macOS strip renders as `NSMenuItem`s and the `chrome` verb serialises via
 /// [`tab_menu_chrome_line`]. Mirrors [`crate::menu::MENU_MODEL`]'s
 /// philosophy: the description IS the menu; native code only renders it.
+/// Deliberately FLAT — no submenu variant (design R15): per-peer sub-actions
+/// are flat rows under a per-peer [`TabMenuEntry::Header`], which keeps the
+/// serialization's flat `items=[…]` contract and the NSMenu render loop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum TabMenuEntry {
-    /// A disabled, informational row (identity / timeline lines).
+    /// A disabled, informational row (identity / timeline / connection lines).
     Header(String),
     /// A native separator.
     Separator,
     /// A live command row: `action`'s tag is what the `NSMenuItem` carries, so
     /// the click dispatches through the SAME tag→[`MenuAction`] decode the menu
     /// bar uses (never a parallel path). `enabled: false` renders greyed
-    /// (e.g. `Copy CWD` with no reported cwd).
+    /// (e.g. `Copy CWD` with no reported cwd). `label` is owned so live rows
+    /// can name peers (design §2.2 [v5]); the fixed rows pay one small clone
+    /// per compose, which is already epoch-gated.
     Action {
-        label: &'static str,
+        label: String,
         action: MenuAction,
         enabled: bool,
     },
+    /// A per-peer connection row (design §2.2 [v5]): Show / Configure… /
+    /// Disconnect against `peer_sid`. NOT tag→[`MenuAction`] dispatched — the
+    /// action needs a peer ARGUMENT, so the native item's tag is an index into
+    /// the pop-time snapshot (the `menu_tab` precedent) and the click posts
+    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }`.
+    ConnectionAction {
+        label: String,
+        peer_sid: SessionId,
+        verb: ConnVerb,
+        enabled: bool,
+    },
+}
+
+/// The closed verb vocabulary of a [`TabMenuEntry::ConnectionAction`] row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConnVerb {
+    /// Raise the window hosting the peer and select its tab (the `raise` wire
+    /// verb's UI twin).
+    Show,
+    /// Open the connection editor for this pair — the §2.5 sheet: the shared
+    /// confirm/configure card (`conn_card`), pre-filled from the live pair
+    /// state; Confirm applies through the declarative `connect` set-semantics
+    /// seam.
+    Configure,
+    /// Dissolve the connection with this peer (both directions), pair-precise
+    /// through [`crate::connections::disconnect_kind_in`], origin `ui`.
+    Disconnect,
 }
 
 /// The per-tab chrome EXTENSION the app pushes to the native strip alongside
@@ -151,6 +234,13 @@ pub(crate) struct CachedChrome {
     /// visible label by title-format settings, so it must be an independent
     /// cache epoch rather than relying on `high_id` or `label`.
     pub activity_revision: u64,
+    /// The connection store's revision at compose time (design §2.4 [v5]): a
+    /// connection mint/revoke/sweep moves NONE of the other epochs, so without
+    /// this the menu would list a revoked connection (and the tooltip its
+    /// line) for up to [`CACHE_MAX_AGE_MS`] while the §4 marks already
+    /// cleared. Bumped by every authority act — see
+    /// `crate::connections::ConnectionTable::bump_revision`.
+    pub connections_revision: u64,
     /// [`crate::turn_ledger::now_ms`] at compose time — bounds staleness of
     /// the coarse relative ages.
     pub composed_ms: u64,
@@ -310,6 +400,36 @@ fn display_description(prose: &str) -> String {
     }
 }
 
+/// ONE connection's display line, shared VERBATIM by the tooltip and the
+/// menu's per-peer header (design §2.3/§4 — one composer, two surfaces):
+/// `⇥ pushes into "build" · live` / `⇤ pulled by "operator"` /
+/// `⇆ peer "claude (b)"`. The glyph encodes the AUTHORITY direction (⇥ this
+/// session holds ops over the peer, ⇤ the peer holds ops over it, ⇆ both);
+/// the verb encodes the [`ConnFlow`] rung (write-input ⇒ push). Titles are
+/// program-influenced text, so they take the same sanitize+cap path as every
+/// other prose line.
+fn connection_line(fact: &ConnectionFact) -> String {
+    let title = display_description(&crate::session_timeline::sanitize_presentation_line(
+        &fact.peer_title,
+        crate::session_timeline::META_DESCRIPTION_MAX,
+    ));
+    let head = match (fact.direction, fact.kind) {
+        (ConnDirection::Outbound, ConnFlow::Push) => "\u{21e5} pushes into",
+        (ConnDirection::Outbound, ConnFlow::Pull) => "\u{21e5} pulls from",
+        (ConnDirection::Inbound, ConnFlow::Push) => "\u{21e4} pushed by",
+        (ConnDirection::Inbound, ConnFlow::Pull) => "\u{21e4} pulled by",
+        (ConnDirection::Peer, _) => "\u{21c6} peer",
+    };
+    let live = if fact.live { " \u{00b7} live" } else { "" };
+    format!("{head} \"{title}\"{live}")
+}
+
+/// The per-connection lines in the input's (caller-sorted) order — appended to
+/// the tooltip's identity block and rendered as the menu's per-peer headers.
+fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
+    input.connections.iter().map(connection_line).collect()
+}
+
 /// The shared identity/timeline HEADER LINES (title, durable description,
 /// generated activity, cwd, state, then the newest-first timeline tail) — the
 /// one list both surfaces render. Authored and generated prose are labeled so
@@ -359,18 +479,21 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
 
 /// Compose the hover TOOLTIP for one terminal tab, or `None` when the session
 /// carries NOTHING beyond its bare label (no authored description, generated
-/// activity, icon, cwd, state, or timeline) — the tab then keeps today's
-/// no-tooltip behavior instead of a tooltip that merely repeats the chip text.
-/// Shape: the identity lines, then a blank line, then the newest-first timeline
-/// tail (each `<kind> · <age>`).
+/// activity, icon, cwd, state, connection, or timeline) — the tab then keeps
+/// today's no-tooltip behavior instead of a tooltip that merely repeats the
+/// chip text. Shape: the identity lines, the per-connection lines (design §4:
+/// the mark is never visual-only), then a blank line, then the newest-first
+/// timeline tail (each `<kind> · <age>`).
 #[must_use]
 pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
     let (identity, timeline) = header_lines(input);
-    if identity.len() <= 1 && timeline.is_empty() {
+    let connections = connection_lines(input);
+    if identity.len() <= 1 && connections.is_empty() && timeline.is_empty() {
         // Only the title line — nothing the chip doesn't already say.
         return None;
     }
     let mut lines = identity;
+    lines.extend(connections);
     if !timeline.is_empty() {
         lines.push(String::new());
         lines.extend(timeline);
@@ -380,10 +503,14 @@ pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
 
 /// Compose the right-click CONTEXT-MENU model for one terminal tab: the same
 /// identity lines as the tooltip as disabled headers, a separator, the
-/// newest-first timeline tail (disabled), a separator, then the actions. The
-/// menu ALWAYS exists (unlike the tooltip): a bare unnamed session still owns
+/// newest-first timeline tail (disabled), a separator, the CONNECTIONS section
+/// (design §2.3), a separator, then the actions. The menu ALWAYS exists
+/// (unlike the tooltip): a bare unnamed session still owns
 /// `Copy Session ID` / `Copy CWD` / `Close Tab`, with the unavailable copies
-/// greyed rather than hidden (a stable menu shape is learnable).
+/// greyed rather than hidden (a stable menu shape is learnable) — and the
+/// CONNECTIONS section is likewise always present (the spawn presets / picker
+/// entries are its floor), FLAT per design R15: per-peer `Header` rows carry
+/// the direction line, the peer's `ConnectionAction` rows follow flat.
 #[must_use]
 pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> {
     let (identity, timeline) = header_lines(input);
@@ -393,30 +520,81 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
         entries.extend(timeline.into_iter().map(TabMenuEntry::Header));
     }
     entries.push(TabMenuEntry::Separator);
+    entries.push(TabMenuEntry::Header("CONNECTIONS".to_string()));
+    for fact in &input.connections {
+        entries.push(TabMenuEntry::Header(connection_line(fact)));
+        for (label, verb) in [
+            ("Show", ConnVerb::Show),
+            ("Configure…", ConnVerb::Configure),
+            ("Disconnect", ConnVerb::Disconnect),
+        ] {
+            entries.push(TabMenuEntry::ConnectionAction {
+                label: label.to_string(),
+                peer_sid: fact.peer_sid.clone(),
+                verb,
+                enabled: true,
+            });
+        }
+    }
+    // The §2.3 spawn presets + picker/map entries — plain MenuAction rows (the
+    // same actions the File menu / palette dispatch), gated on `has_session`
+    // where the act needs THIS session as its origin.
+    let action = |label: &str, action: MenuAction, enabled: bool| TabMenuEntry::Action {
+        label: label.to_string(),
+        action,
+        enabled,
+    };
+    entries.push(action(
+        "New Controlled Session in New Window",
+        MenuAction::NewControlledWindow,
+        input.has_session,
+    ));
+    entries.push(action(
+        "New Controlled Session as Tab",
+        MenuAction::NewControlledTab,
+        input.has_session,
+    ));
+    entries.push(action(
+        "New Controller Session in New Window",
+        MenuAction::NewControllerWindow,
+        input.has_session,
+    ));
+    entries.push(action(
+        "New Controller Session as Tab",
+        MenuAction::NewControllerTab,
+        input.has_session,
+    ));
+    entries.push(action(
+        "Connect to Session…",
+        MenuAction::ConnectToSession,
+        input.has_session,
+    ));
+    entries.push(action(
+        "Show Connection Map",
+        MenuAction::ShowConnectionMap,
+        true,
+    ));
+    entries.push(TabMenuEntry::Separator);
     // FIRST because it is the identity action the headers above are about; the
     // clipboard pair and the close follow. Gated on `has_session` like the id
     // copy: the pin is SESSION metadata, so a tab with no session has nothing
     // to rename (and the write path would no-op silently).
-    entries.push(TabMenuEntry::Action {
-        label: "Rename Session…",
-        action: MenuAction::RenameSession,
-        enabled: input.has_session && input.can_rename,
-    });
-    entries.push(TabMenuEntry::Action {
-        label: "Copy Session ID",
-        action: MenuAction::CopySessionId,
-        enabled: input.has_session,
-    });
-    entries.push(TabMenuEntry::Action {
-        label: "Copy CWD",
-        action: MenuAction::CopyCwd,
-        enabled: input.cwd.as_deref().is_some_and(|c| !c.is_empty()),
-    });
-    entries.push(TabMenuEntry::Action {
-        label: "Close Tab",
-        action: MenuAction::CloseTab,
-        enabled: true,
-    });
+    entries.push(action(
+        "Rename Session…",
+        MenuAction::RenameSession,
+        input.has_session && input.can_rename,
+    ));
+    entries.push(action(
+        "Copy Session ID",
+        MenuAction::CopySessionId,
+        input.has_session,
+    ));
+    entries.push(action(
+        "Copy CWD",
+        MenuAction::CopyCwd,
+        input.cwd.as_deref().is_some_and(|c| !c.is_empty()),
+    ));
+    entries.push(action("Close Tab", MenuAction::CloseTab, true));
     entries
 }
 
@@ -425,24 +603,41 @@ pub(crate) fn compose_tab_menu(input: &SessionChromeInput) -> Vec<TabMenuEntry> 
 /// a right-click on that chip pops. Separators print as `---`; a DISABLED
 /// action is suffixed ` (disabled)` so a driving AI sees the same
 /// greyed-vs-live distinction a human does. Headers print verbatim (their
-/// disabled-ness is structural: they carry no action).
+/// disabled-ness is structural: they carry no action). A connection row stays
+/// FLAT and carries its peer argument as `<label> @<sid>` — the control
+/// layer's `@<sid>` addressing spelling, so a driving AI can read the target
+/// straight off the mirror.
 #[must_use]
 pub(crate) fn tab_menu_chrome_line(index: usize, entries: &[TabMenuEntry]) -> String {
-    let items: Vec<String> = entries
-        .iter()
-        .map(|e| match e {
-            TabMenuEntry::Header(t) => t.clone(),
-            TabMenuEntry::Separator => "---".to_string(),
-            TabMenuEntry::Action { label, enabled, .. } => {
-                if *enabled {
-                    (*label).to_string()
-                } else {
-                    format!("{label} (disabled)")
-                }
-            }
-        })
-        .collect();
+    let items: Vec<String> = entries.iter().map(menu_entry_mirror).collect();
     format!("tab-menu tab={index} items={items:?}")
+}
+
+/// ONE entry's mirror token — the per-item serialization [`tab_menu_chrome_line`]
+/// lists and the in-grid overlay's `controls tab-menu` rows reuse VERBATIM, so
+/// the two introspection readings of one composed model can never spell an item
+/// differently. Headers verbatim, separators `---`, disabled rows suffixed
+/// ` (disabled)`, connection rows flat with their `@<sid>` peer argument.
+#[must_use]
+pub(crate) fn menu_entry_mirror(entry: &TabMenuEntry) -> String {
+    let disabled_suffix = |enabled: bool| if enabled { "" } else { " (disabled)" };
+    match entry {
+        TabMenuEntry::Header(t) => t.clone(),
+        TabMenuEntry::Separator => "---".to_string(),
+        TabMenuEntry::Action { label, enabled, .. } => {
+            format!("{label}{}", disabled_suffix(*enabled))
+        }
+        TabMenuEntry::ConnectionAction {
+            label,
+            peer_sid,
+            enabled,
+            ..
+        } => format!(
+            "{label} @{}{}",
+            peer_sid.as_str(),
+            disabled_suffix(*enabled)
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -454,6 +649,7 @@ mod tests {
             high_id: 0,
             label: "session".to_string(),
             activity_revision: 0,
+            connections_revision: 0,
             composed_ms,
             ext: TabChromeExt::default(),
         }
@@ -517,6 +713,23 @@ mod tests {
                     age_ms: 7_200_000,
                 },
             ],
+            connections: Vec::new(),
+        }
+    }
+
+    fn fact(
+        sid: &str,
+        title: &str,
+        direction: ConnDirection,
+        kind: ConnFlow,
+        live: bool,
+    ) -> ConnectionFact {
+        ConnectionFact {
+            peer_sid: SessionId::new(sid),
+            peer_title: title.to_string(),
+            direction,
+            kind,
+            live,
         }
     }
 
@@ -595,7 +808,8 @@ mod tests {
         assert!(compose_tab_menu(&input).iter().all(|entry| match entry {
             TabMenuEntry::Header(label) =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
-            TabMenuEntry::Action { label, .. } =>
+            TabMenuEntry::Action { label, .. }
+            | TabMenuEntry::ConnectionAction { label, .. } =>
                 !crate::session_timeline::metadata_has_forbidden_formatting(label),
             TabMenuEntry::Separator => true,
         }));
@@ -758,22 +972,39 @@ mod tests {
     }
 
     /// The menu model carries the pinned structure: identity headers, sep,
-    /// timeline headers, sep, then the four actions in order — with the
-    /// SAME header text the tooltip shows (one composer, two surfaces).
+    /// timeline headers, sep, the CONNECTIONS section, sep, then the actions
+    /// in order — with the SAME header text the tooltip shows (one composer,
+    /// two surfaces; the `CONNECTIONS` section marker is the one menu-only
+    /// header, being structure rather than a fact).
     #[test]
     fn menu_matches_tooltip_headers_and_orders_actions() {
-        let input = full_input();
+        let mut input = full_input();
+        input.connections = vec![fact(
+            "s-peer",
+            "build",
+            ConnDirection::Outbound,
+            ConnFlow::Push,
+            false,
+        )];
         let menu = compose_tab_menu(&input);
         let tip = compose_tooltip(&input).unwrap();
         let tip_lines: Vec<&str> = tip.lines().filter(|l| !l.is_empty()).collect();
         let menu_headers: Vec<&str> = menu
             .iter()
             .filter_map(|e| match e {
-                TabMenuEntry::Header(h) => Some(h.as_str()),
+                TabMenuEntry::Header(h) if h != "CONNECTIONS" => Some(h.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(menu_headers, tip_lines, "menu headers ARE the tooltip");
+        // The tooltip orders identity → connections → timeline; the menu holds
+        // the connection line in its own section AFTER the timeline. Same
+        // facts, sorted per surface.
+        let mut tip_sorted = tip_lines.clone();
+        tip_sorted.sort_unstable();
+        let mut menu_sorted = menu_headers.clone();
+        menu_sorted.sort_unstable();
+        assert_eq!(menu_sorted, tip_sorted, "menu headers ARE the tooltip");
+        assert!(tip_lines.contains(&"\u{21e5} pushes into \"build\""));
         let actions: Vec<(&str, MenuAction, bool)> = menu
             .iter()
             .filter_map(|e| match e {
@@ -781,13 +1012,35 @@ mod tests {
                     label,
                     action,
                     enabled,
-                } => Some((*label, *action, *enabled)),
+                } => Some((label.as_str(), *action, *enabled)),
                 _ => None,
             })
             .collect();
         assert_eq!(
             actions,
             vec![
+                (
+                    "New Controlled Session in New Window",
+                    MenuAction::NewControlledWindow,
+                    true
+                ),
+                (
+                    "New Controlled Session as Tab",
+                    MenuAction::NewControlledTab,
+                    true
+                ),
+                (
+                    "New Controller Session in New Window",
+                    MenuAction::NewControllerWindow,
+                    true
+                ),
+                (
+                    "New Controller Session as Tab",
+                    MenuAction::NewControllerTab,
+                    true
+                ),
+                ("Connect to Session…", MenuAction::ConnectToSession, true),
+                ("Show Connection Map", MenuAction::ShowConnectionMap, true),
                 ("Rename Session…", MenuAction::RenameSession, true),
                 ("Copy Session ID", MenuAction::CopySessionId, true),
                 ("Copy CWD", MenuAction::CopyCwd, true),
@@ -798,14 +1051,127 @@ mod tests {
             menu.iter()
                 .filter(|e| matches!(e, TabMenuEntry::Separator))
                 .count(),
-            2,
-            "identity | timeline | actions"
+            3,
+            "identity | timeline | connections | actions"
         );
     }
 
-    /// A bare session still gets a menu (label header + actions), with the
-    /// unavailable copies GREYED, not hidden — and only ONE separator (no
-    /// empty timeline group).
+    /// The CONNECTIONS section per state (design §2.3): no connections keeps
+    /// the section with only the preset/picker floor; a one-way connection
+    /// gets its header + the three flat per-peer rows; a peer pair renders the
+    /// `⇆` line; a live connection carries the `· live` qualifier. The menu
+    /// stays FLAT throughout (design R15 — no submenu variant exists to
+    /// regress into).
+    #[test]
+    fn connections_section_renders_each_state_flat() {
+        let conn_rows = |input: &SessionChromeInput| -> Vec<(String, String, ConnVerb, bool)> {
+            compose_tab_menu(input)
+                .iter()
+                .filter_map(|e| match e {
+                    TabMenuEntry::ConnectionAction {
+                        label,
+                        peer_sid,
+                        verb,
+                        enabled,
+                    } => Some((
+                        label.clone(),
+                        peer_sid.as_str().to_string(),
+                        *verb,
+                        *enabled,
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        // NONE: the marker + floor rows exist, no per-peer rows.
+        let none = full_input();
+        let menu = compose_tab_menu(&none);
+        assert!(
+            menu.iter()
+                .any(|e| matches!(e, TabMenuEntry::Header(h) if h == "CONNECTIONS")),
+            "the section marker is always present"
+        );
+        assert!(conn_rows(&none).is_empty());
+
+        // ONE-WAY: header line + Show/Configure…/Disconnect for that peer.
+        let mut one_way = full_input();
+        one_way.connections = vec![fact(
+            "s-b",
+            "operator",
+            ConnDirection::Inbound,
+            ConnFlow::Pull,
+            false,
+        )];
+        let menu = compose_tab_menu(&one_way);
+        assert!(
+            menu.iter()
+                .any(|e| matches!(e, TabMenuEntry::Header(h) if h == "\u{21e4} pulled by \"operator\"")),
+        );
+        assert_eq!(
+            conn_rows(&one_way),
+            vec![
+                ("Show".to_string(), "s-b".to_string(), ConnVerb::Show, true),
+                (
+                    "Configure…".to_string(),
+                    "s-b".to_string(),
+                    ConnVerb::Configure,
+                    true
+                ),
+                (
+                    "Disconnect".to_string(),
+                    "s-b".to_string(),
+                    ConnVerb::Disconnect,
+                    true
+                ),
+            ]
+        );
+
+        // PEER + LIVE: the ⇆ line, and the live qualifier on a live push.
+        let mut peers = full_input();
+        peers.connections = vec![
+            fact("s-b", "claude (b)", ConnDirection::Peer, ConnFlow::Push, false),
+            fact("s-c", "build", ConnDirection::Outbound, ConnFlow::Push, true),
+        ];
+        let headers: Vec<String> = compose_tab_menu(&peers)
+            .iter()
+            .filter_map(|e| match e {
+                TabMenuEntry::Header(h) => Some(h.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(headers.contains(&"\u{21c6} peer \"claude (b)\"".to_string()));
+        assert!(headers.contains(&"\u{21e5} pushes into \"build\" \u{00b7} live".to_string()));
+        // Two peers ⇒ two flat row groups, in the caller's order.
+        let rows = conn_rows(&peers);
+        assert_eq!(rows.len(), 6);
+        assert!(rows[..3].iter().all(|(_, sid, ..)| sid == "s-b"));
+        assert!(rows[3..].iter().all(|(_, sid, ..)| sid == "s-c"));
+
+        // The tooltip carries the SAME connection lines (§4: never
+        // visual-only), and a hostile peer title cannot forge a line.
+        let tip = compose_tooltip(&peers).unwrap();
+        assert!(tip.contains("\u{21c6} peer \"claude (b)\""));
+        assert!(tip.contains("\u{21e5} pushes into \"build\" \u{00b7} live"));
+        let mut hostile = full_input();
+        hostile.connections = vec![fact(
+            "s-evil",
+            "a\u{202e}b\nCONNECTIONS",
+            ConnDirection::Outbound,
+            ConnFlow::Pull,
+            false,
+        )];
+        let tip = compose_tooltip(&hostile).unwrap();
+        assert!(
+            tip.lines().any(|l| l == "\u{21e5} pulls from \"abCONNECTIONS\""),
+            "controls/bidi stripped, no forged extra line: {tip:?}"
+        );
+    }
+
+    /// A bare session still gets a menu (label header + sections + actions),
+    /// with the unavailable copies GREYED, not hidden — and only TWO
+    /// separators (no empty timeline group; the connections section is always
+    /// present because its preset/picker floor is).
     #[test]
     fn bare_session_menu_greys_unavailable_copies() {
         let input = SessionChromeInput {
@@ -819,8 +1185,33 @@ mod tests {
             menu.iter()
                 .filter(|e| matches!(e, TabMenuEntry::Separator))
                 .count(),
-            1
+            2
         );
+        // No session ⇒ every act that needs THIS session as its subject greys:
+        // the spawn presets and the picker (their origin is this session).
+        for a in [
+            MenuAction::NewControlledWindow,
+            MenuAction::NewControlledTab,
+            MenuAction::NewControllerWindow,
+            MenuAction::NewControllerTab,
+            MenuAction::ConnectToSession,
+        ] {
+            assert!(
+                menu.iter().any(|e| matches!(
+                    e,
+                    TabMenuEntry::Action { action, enabled: false, .. } if *action == a
+                )),
+                "{a:?} greys without a session"
+            );
+        }
+        assert!(menu.iter().any(|e| matches!(
+            e,
+            TabMenuEntry::Action {
+                action: MenuAction::ShowConnectionMap,
+                enabled: true,
+                ..
+            }
+        )));
         assert!(menu.iter().any(|e| matches!(
             e,
             TabMenuEntry::Action {
@@ -856,19 +1247,35 @@ mod tests {
     }
 
     /// The `chrome` verb's mirror line serialises EXACTLY the composed model:
-    /// headers verbatim, separators as `---`, disabled actions annotated — so
-    /// the introspected listing IS the on-screen menu.
+    /// headers verbatim, separators as `---`, disabled actions annotated, and
+    /// connection rows flat with their `@<sid>` peer argument — so the
+    /// introspected listing IS the on-screen menu.
     #[test]
     fn chrome_line_mirrors_composed_model() {
-        let input = SessionChromeInput {
+        let mut input = SessionChromeInput {
             label: "zsh".to_string(),
             cwd: Some("/tmp".to_string()),
+            has_session: true,
+            can_rename: true,
             ..SessionChromeInput::default()
         };
+        input.connections = vec![fact(
+            "s-b",
+            "build",
+            ConnDirection::Outbound,
+            ConnFlow::Push,
+            false,
+        )];
         let line = tab_menu_chrome_line(2, &compose_tab_menu(&input));
         assert_eq!(
             line,
-            r#"tab-menu tab=2 items=["zsh", "cwd: /tmp", "---", "Rename Session… (disabled)", "Copy Session ID (disabled)", "Copy CWD", "Close Tab"]"#
+            "tab-menu tab=2 items=[\"zsh\", \"cwd: /tmp\", \"---\", \"CONNECTIONS\", \
+             \"\u{21e5} pushes into \\\"build\\\"\", \"Show @s-b\", \"Configure… @s-b\", \
+             \"Disconnect @s-b\", \"New Controlled Session in New Window\", \
+             \"New Controlled Session as Tab\", \"New Controller Session in New Window\", \
+             \"New Controller Session as Tab\", \"Connect to Session…\", \
+             \"Show Connection Map\", \"---\", \"Rename Session…\", \"Copy Session ID\", \
+             \"Copy CWD\", \"Close Tab\"]"
         );
     }
 }

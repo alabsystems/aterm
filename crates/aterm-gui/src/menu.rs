@@ -199,6 +199,19 @@ pub enum MenuAction {
     /// Open Session in New Window — show the active session in a SECOND window
     /// (same live grid in two windows; `App::open_active_session_in_new_window`).
     ViewSessionInNewWindow,
+    /// New Controlled Session in New Window (session connections, design §2.3):
+    /// spawn a session the FOCUSED session holds a `both` connection over, in a
+    /// fresh window; lineage `parent = focused` (`App::spawn_connected_session`).
+    NewControlledWindow,
+    /// New Controlled Session as Tab — the same mint, placed beside the focused
+    /// session in its window.
+    NewControlledTab,
+    /// New Controller Session in New Window — the INVERSE preset: the newborn
+    /// holds `both` over the focused session (a supervisor), its shell receives
+    /// `ATERM_OBSERVE_SESSION_ID=<focused sid>`; a lineage root.
+    NewControllerWindow,
+    /// New Controller Session as Tab — the controller preset placed as a tab.
+    NewControllerTab,
     /// Close Tab — close the active tab (`App::close_active_tab`).
     CloseTab,
     // Edit menu
@@ -274,6 +287,25 @@ pub enum MenuAction {
     /// Copy the right-clicked tab's shell-reported cwd (RAW, never
     /// `~`-abbreviated — a pasted path must be real) to the clipboard.
     CopyCwd,
+    /// Connect to Session… (session connections, design §2.3): open the
+    /// connection PICKER for the subject session (`session.connect_to`) —
+    /// its selection opens the shared confirm/configure card for
+    /// subject ⇄ chosen. Context-menu + palette; the tab-menu path carries
+    /// the clicked tab as the subject, the palette/invoke path the front one.
+    ConnectToSession,
+    /// Show Connection Map (design §5): raise the instance's aggregated
+    /// connection map. The map surface is a later slice — dispatch routes to
+    /// the palette until it lands.
+    ShowConnectionMap,
+    /// Configure Connection… (`session.configure_connection`, design §2.3):
+    /// the §2.5 sheet directly when the subject has exactly ONE connected
+    /// peer, the picker when several, a refusal when none. Not a bar item;
+    /// palette + `invoke` reachable like the picker/map ids.
+    ConfigureConnection,
+    /// Disconnect Session… (`session.disconnect`, design §2.3): dissolve the
+    /// subject's connection — directly with one peer, via the picker when
+    /// ambiguous, NEVER by guessing. Not a bar item.
+    DisconnectSession,
     // Window menu
     /// Edit the FOCUSED PANE's session pin in place on the tab strip — the
     /// keyboard/menu twin of double-clicking a tab. Named "Rename SESSION", not
@@ -350,6 +382,14 @@ impl MenuAction {
             MenuAction::FavouriteKitty => 46,
             MenuAction::Packages => 47,
             MenuAction::RenameSession => 48,
+            MenuAction::NewControlledWindow => 49,
+            MenuAction::NewControlledTab => 50,
+            MenuAction::NewControllerWindow => 51,
+            MenuAction::NewControllerTab => 52,
+            MenuAction::ConnectToSession => 53,
+            MenuAction::ShowConnectionMap => 54,
+            MenuAction::ConfigureConnection => 55,
+            MenuAction::DisconnectSession => 56,
         }
     }
 
@@ -403,6 +443,14 @@ impl MenuAction {
             46 => MenuAction::FavouriteKitty,
             47 => MenuAction::Packages,
             48 => MenuAction::RenameSession,
+            49 => MenuAction::NewControlledWindow,
+            50 => MenuAction::NewControlledTab,
+            51 => MenuAction::NewControllerWindow,
+            52 => MenuAction::NewControllerTab,
+            53 => MenuAction::ConnectToSession,
+            54 => MenuAction::ShowConnectionMap,
+            55 => MenuAction::ConfigureConnection,
+            56 => MenuAction::DisconnectSession,
             _ => return None,
         })
     }
@@ -437,6 +485,21 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             // The pin is SESSION metadata; a native whole tab owns no session,
             // so the item greys rather than opening an editor over nothing.
             | MenuAction::RenameSession
+            // The connected-spawn presets take the FOCUSED session as their
+            // origin (the S of the §2.3 spawn rows) — a native whole tab has
+            // no session to connect, so they grey out there.
+            | MenuAction::NewControlledWindow
+            | MenuAction::NewControlledTab
+            | MenuAction::NewControllerWindow
+            | MenuAction::NewControllerTab
+            // The picker connects THIS session to a chosen peer — same
+            // origin-needs-a-session rule as the presets, which also covers
+            // the configure/disconnect ids (they act FROM the subject
+            // session). (The map is instance-wide and deliberately not
+            // listed.)
+            | MenuAction::ConnectToSession
+            | MenuAction::ConfigureConnection
+            | MenuAction::DisconnectSession
     )
 }
 
@@ -535,6 +598,24 @@ impl MenuAction {
             MenuAction::OpenPalette | MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => {
                 OwnerOnly
             }
+            // The connected-spawn presets MINT standing session-connection
+            // authority over the focused session (design §5.3/§6) — the
+            // `invoke` twin of the `spawn connected=` OwnerOnly escalation
+            // fence: no fine op expresses "may create authority between
+            // sessions", so only the god token may fire them.
+            MenuAction::NewControlledWindow
+            | MenuAction::NewControlledTab
+            | MenuAction::NewControllerWindow
+            | MenuAction::NewControllerTab => OwnerOnly,
+            // The connection PICKER can mint the same standing authority the
+            // presets do, the MAP is the instance-wide aggregated view (§5.3),
+            // and configure/disconnect REWRITE/DISSOLVE standing authority —
+            // all `invoke` twins of the `open connections` / `connect` /
+            // `disconnect` OwnerOnly class.
+            MenuAction::ConnectToSession
+            | MenuAction::ShowConnectionMap
+            | MenuAction::ConfigureConnection
+            | MenuAction::DisconnectSession => OwnerOnly,
             // Benign runtime/view/window/tab state. Font zoom is runtime-only
             // (`set_font_px` pins `font_px`; it does NOT persist to `aterm.toml`), so it
             // stays `WriteInput`. `Quit` is a denial of service, not a capability escalation, so it
@@ -604,6 +685,10 @@ impl MenuAction {
             "MoveTabToNewWindow" => Some(MenuAction::MoveTabToNewWindow),
             "MoveTabToNextWindow" => Some(MenuAction::MoveTabToNextWindow),
             "ViewSessionInNewWindow" => Some(MenuAction::ViewSessionInNewWindow),
+            "NewControlledWindow" => Some(MenuAction::NewControlledWindow),
+            "NewControlledTab" => Some(MenuAction::NewControlledTab),
+            "NewControllerWindow" => Some(MenuAction::NewControllerWindow),
+            "NewControllerTab" => Some(MenuAction::NewControllerTab),
             "CloseTab" => Some(MenuAction::CloseTab),
             "Copy" => Some(MenuAction::Copy),
             "Paste" => Some(MenuAction::Paste),
@@ -631,6 +716,10 @@ impl MenuAction {
             "Help" => Some(MenuAction::Help),
             "CopySessionId" => Some(MenuAction::CopySessionId),
             "CopyCwd" => Some(MenuAction::CopyCwd),
+            "ConnectToSession" => Some(MenuAction::ConnectToSession),
+            "ShowConnectionMap" => Some(MenuAction::ShowConnectionMap),
+            "ConfigureConnection" => Some(MenuAction::ConfigureConnection),
+            "DisconnectSession" => Some(MenuAction::DisconnectSession),
             _ => None,
         }
     }
@@ -737,6 +826,33 @@ const FILE_MENU: &[MenuEntry] = &[
         action: MenuAction::NewTab,
         key: "t",
         mods: MenuMods::Command,
+    },
+    Separator,
+    // The session-connection spawn presets (design §2.3): four flat rows under
+    // the New group. No key equivalents — deliberate, authority-minting acts.
+    Item {
+        label: "New Controlled Session in New Window",
+        action: MenuAction::NewControlledWindow,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "New Controlled Session as Tab",
+        action: MenuAction::NewControlledTab,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "New Controller Session in New Window",
+        action: MenuAction::NewControllerWindow,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "New Controller Session as Tab",
+        action: MenuAction::NewControllerTab,
+        key: "",
+        mods: MenuMods::None,
     },
     Separator,
     Item {
@@ -1510,6 +1626,45 @@ mod macos {
             true,
         );
         add_separator(mtm, &file);
+        // The session-connection spawn presets (design §2.3), mirroring the
+        // portable FILE_MENU model: four flat rows, no key equivalents.
+        add_item(
+            mtm,
+            &file,
+            target,
+            "New Controlled Session in New Window",
+            MenuAction::NewControlledWindow,
+            "",
+            false,
+        );
+        add_item(
+            mtm,
+            &file,
+            target,
+            "New Controlled Session as Tab",
+            MenuAction::NewControlledTab,
+            "",
+            false,
+        );
+        add_item(
+            mtm,
+            &file,
+            target,
+            "New Controller Session in New Window",
+            MenuAction::NewControllerWindow,
+            "",
+            false,
+        );
+        add_item(
+            mtm,
+            &file,
+            target,
+            "New Controller Session as Tab",
+            MenuAction::NewControllerTab,
+            "",
+            false,
+        );
+        add_separator(mtm, &file);
         add_item(
             mtm,
             &file,
@@ -2156,6 +2311,10 @@ mod tests {
         MenuAction::MoveTabToNewWindow,
         MenuAction::MoveTabToNextWindow,
         MenuAction::ViewSessionInNewWindow,
+        MenuAction::NewControlledWindow,
+        MenuAction::NewControlledTab,
+        MenuAction::NewControllerWindow,
+        MenuAction::NewControllerTab,
         MenuAction::CloseTab,
         MenuAction::Copy,
         MenuAction::Paste,
@@ -2185,13 +2344,25 @@ mod tests {
         MenuAction::ApplyUpdate,
     ];
 
-    /// The actions that live ONLY in the tab-strip CONTEXT menu (session-metadata
-    /// stage 2, `session_chrome::compose_tab_menu`) — deliberately NOT in the menu
-    /// bar, hence not in [`ALL_ACTIONS`]/`MENU_MODEL`. (`CloseTab` also appears in
-    /// the context menu, but it is a BAR action first and lives in the list above.)
-    /// Kept as a named twin list so the round-trip/uniqueness proofs cover the
-    /// whole enum: `ALL_ACTIONS ∪ TAB_CONTEXT_ACTIONS`.
-    const TAB_CONTEXT_ACTIONS: &[MenuAction] = &[MenuAction::CopySessionId, MenuAction::CopyCwd];
+    /// The NON-BAR action vocabulary: the tab-strip CONTEXT menu's own rows
+    /// (session-metadata stage 2 copies + the session-connection picker/map
+    /// rows, `session_chrome::compose_tab_menu`) and the §2.3 connection ids
+    /// that exist only as palette/`invoke` commands
+    /// (`session.configure_connection` / `session.disconnect`) — deliberately
+    /// NOT in the menu bar, hence not in [`ALL_ACTIONS`]/`MENU_MODEL`; the
+    /// connection rows the PALETTE lists are appended beside the model there,
+    /// never through it. (`CloseTab` also appears in the context menu, but it
+    /// is a BAR action first and lives in the list above.) Kept as a named
+    /// twin list so the round-trip/uniqueness proofs cover the whole enum:
+    /// `ALL_ACTIONS ∪ TAB_CONTEXT_ACTIONS`.
+    const TAB_CONTEXT_ACTIONS: &[MenuAction] = &[
+        MenuAction::CopySessionId,
+        MenuAction::CopyCwd,
+        MenuAction::ConnectToSession,
+        MenuAction::ShowConnectionMap,
+        MenuAction::ConfigureConnection,
+        MenuAction::DisconnectSession,
+    ];
 
     /// Every action's tag round-trips through `from_tag`, and the tags are
     /// distinct ACROSS the bar and tab-context vocabularies (so the integer
@@ -2217,18 +2388,22 @@ mod tests {
 
     /// The tab-context actions are a deliberate NON-bar vocabulary: their invoke
     /// names round-trip (so `invoke CopySessionId` is fenceable + dispatchable),
-    /// they classify as the clipboard boundary, and they must NOT leak into
-    /// `MENU_MODEL` (the bar mirror stays exactly the bar).
+    /// each classifies at its honest boundary (the copies move text onto the
+    /// pasteboard; the connection picker/map are the `open connections`
+    /// OwnerOnly twins), and they must NOT leak into `MENU_MODEL` (the bar
+    /// mirror stays exactly the bar).
     #[test]
     fn tab_context_actions_round_trip_and_stay_out_of_the_bar() {
         for a in TAB_CONTEXT_ACTIONS.iter().copied() {
             let name = format!("{a:?}");
             assert_eq!(MenuAction::from_invoke_name(&name), Some(a));
-            assert_eq!(
-                a.invoke_authority(),
-                super::InvokeAuthority::ClipboardWrite,
-                "{a:?} moves text onto the pasteboard"
-            );
+            let expected = match a {
+                MenuAction::CopySessionId | MenuAction::CopyCwd => {
+                    super::InvokeAuthority::ClipboardWrite
+                }
+                _ => super::InvokeAuthority::OwnerOnly,
+            };
+            assert_eq!(a.invoke_authority(), expected, "{a:?} boundary");
             assert!(
                 !MENU_MODEL.iter().any(|s| s
                     .entries
@@ -2236,6 +2411,28 @@ mod tests {
                     .any(|e| matches!(e, MenuEntry::Item { action, .. } if *action == a))),
                 "{a:?} is context-menu-only, never a bar item"
             );
+        }
+    }
+
+    /// The connected-spawn presets MINT session-connection authority over the
+    /// focused session, so their `invoke` fence is OwnerOnly — the MenuAction
+    /// twin of the `spawn connected=` escalation arm (design §5.3/§6). They
+    /// are also terminal-only: the origin is the FOCUSED session, absent under
+    /// a native whole tab.
+    #[test]
+    fn connected_spawn_presets_are_owner_only_and_terminal_only() {
+        for a in [
+            MenuAction::NewControlledWindow,
+            MenuAction::NewControlledTab,
+            MenuAction::NewControllerWindow,
+            MenuAction::NewControllerTab,
+        ] {
+            assert_eq!(
+                a.invoke_authority(),
+                super::InvokeAuthority::OwnerOnly,
+                "{a:?} mints standing authority — only the god token may invoke it"
+            );
+            assert!(super::requires_terminal_tab(a), "{a:?} needs a focused session");
         }
     }
 
@@ -2379,10 +2576,15 @@ mod tests {
         );
         assert!(titles[1].starts_with("menu \"File\": "));
         assert!(titles[3].starts_with("menu \"View\": "));
-        // Separators are skipped; labels are comma-joined.
+        // Separators are skipped; labels are comma-joined. The connection spawn
+        // presets (design §2.3) sit between the New group and the Open items.
         assert!(
-            titles[1]
-                .contains("New Window, New Terminal Tab, Open Markdown…, Open File in Editor…"),
+            titles[1].contains(
+                "New Window, New Terminal Tab, \
+                 New Controlled Session in New Window, New Controlled Session as Tab, \
+                 New Controller Session in New Window, New Controller Session as Tab, \
+                 Open Markdown…, Open File in Editor…"
+            ),
             "File labels in order: {:?}",
             titles[1]
         );
@@ -2475,6 +2677,11 @@ mod tests {
                     | MenuAction::ToggleMatrixRain
                     // Same reason: the pin is SESSION metadata.
                     | MenuAction::RenameSession
+                    // The connected-spawn presets need a FOCUSED session origin.
+                    | MenuAction::NewControlledWindow
+                    | MenuAction::NewControlledTab
+                    | MenuAction::NewControllerWindow
+                    | MenuAction::NewControllerTab
             );
             assert_eq!(
                 super::requires_terminal_tab(action),

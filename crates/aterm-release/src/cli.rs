@@ -17,12 +17,12 @@ use std::process::Command;
 use crate::ledger::{self, Error};
 use crate::{publish, verify};
 
-pub const USAGE: &str = "aterm-release — the `cargo ship` release cutter
+pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
-  cargo ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
+  targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z] [--set-version X.Y.Z]
                  [--min-build N] [--gate] [--rehearse OWNER/REPO]
-                 [--arm64-only] [--strand-pre-roster-clients]
+                 [--arm64-only] [--no-paint-smoke] [--strand-pre-roster-clients]
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → draft-first publish → late tag → flip → verify.
         --dry-run          gates + provisional number + full local build into
@@ -48,6 +48,14 @@ USAGE
         --rehearse O/R     full real cut published to the scratch repo O/R
                            (provisional number, no ledger push, no tag)
         --arm64-only       ship a single-arch build (explicit opt-out)
+        --no-paint-smoke   EMERGENCY ONLY: skip the self-check's paint smoke
+                           (the ten-keystroke pixel proof that the just-built
+                           bundle actually paints its flagship effect — the
+                           check born from v0.48.0/v0.49.0 shipping the rainbow
+                           trail dark, docs/RELEASE-PROOF-DISCIPLINE.md).
+                           Refused on a notarized real cut unless
+                           ATERM_NO_PAINT_SMOKE_ACK=this-cut-may-ship-dark is
+                           also set
         --strand-pre-roster-clients
                            OPERATOR ASSERTION, only meaningful once the paper
                            master is armed: no client running a build older than
@@ -58,7 +66,7 @@ USAGE
                            an older release: they do not miss this update, they
                            never update again.
 
-  cargo ship provision --id <machine-id> [--check]
+  targo --unverified ship provision --id <machine-id> [--check]
                            ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh
                            FIRST — provision refuses without a Trust toolchain.
                            Then: make THIS machine a publisher. Seeds the newest
@@ -81,17 +89,17 @@ USAGE
                            mode to run when something is wrong and you do not
                            yet want to touch the machine.
 
-  cargo ship status        version · ledger tail · dangling claims · newest
+  targo --unverified ship status        version · ledger tail · dangling claims · newest
                            published build
-  cargo ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
+  targo --unverified ship recover vX.Y.Z <full-claim-sha> --old-publisher-stopped
         [--release-credentials <profile.toml>] [--no-draft-was-posted]
                            explicit killed-machine recovery: exact-CAS rotate
                            its fence only after operator stop proof; abandon
                            unpublished state or validate + finish a published
                            exact-identity cut
-  cargo ship verify [vX.Y.Z]
+  targo --unverified ship verify [vX.Y.Z]
                            re-run the post-publish check anytime
-  cargo ship yank <build> [--release-credentials <profile.toml>]
+  targo --unverified ship yank <build> [--release-credentials <profile.toml>]
         [--strand-pre-roster-clients]
                            publish + fully verify a min_build-ratcheted
                            successor FIRST; only then remove the inert bad
@@ -208,7 +216,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             }
             let id = id.ok_or(
                 "provision needs --id <machine-id> — the roster name this machine signs \
-                 under (e.g. cargo ship provision --id m2)",
+                 under (e.g. targo --unverified ship provision --id m2)",
             )?;
             Ok(Cmd::Provision { id, check })
         }
@@ -278,7 +286,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
         "yank" => {
             let build = it
                 .next()
-                .ok_or("yank needs the bad release's build number: cargo ship yank <build>")?;
+                .ok_or("yank needs the bad release's build number: targo --unverified ship yank <build>")?;
             let build: u64 = build
                 .parse()
                 .map_err(|_| format!("yank: {build:?} is not a build number (u64)"))?;
@@ -339,6 +347,9 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
             "--arm64-only" => opts.arm64_only = true,
+            // An EMERGENCY ESCAPE, not a setting — publish::paint_smoke_policy
+            // owns the refusal on notarized real cuts and the ack it demands.
+            publish::NO_PAINT_SMOKE_FLAG => opts.no_paint_smoke = true,
             // An ACKNOWLEDGEMENT, not a parameter — see publish::PreRosterClients
             // for why it is on the command line and not in the credentials profile.
             publish::PRE_ROSTER_STRANDING_FLAG => opts.strand_pre_roster_clients = true,
@@ -387,6 +398,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
             || opts.resume
             || opts.gate
             || opts.arm64_only
+            || opts.no_paint_smoke
             || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
             || opts.min_build.is_some()
@@ -403,6 +415,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
         && (opts.dry_run
             || opts.gate
             || opts.arm64_only
+            || opts.no_paint_smoke
             || opts.strand_pre_roster_clients
             || opts.set_version.is_some()
             || opts.min_build.is_some()
@@ -476,7 +489,7 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
     }
 }
 
-/// The workspace root, from git — the `cargo ship` alias may be invoked from
+/// The workspace root, from git — the `targo --unverified ship` alias may be invoked from
 /// any subdirectory of the checkout, and every pipeline path is repo-relative.
 fn repo_root() -> ledger::Result<std::path::PathBuf> {
     let out = Command::new("git")
@@ -485,7 +498,7 @@ fn repo_root() -> ledger::Result<std::path::PathBuf> {
         .map_err(|e| Error::new(format!("failed to run git rev-parse --show-toplevel: {e}")))?;
     if !out.status.success() {
         return Err(Error::new(
-            "not inside a git checkout — run `cargo ship` from the aterm workspace".to_string(),
+            "not inside a git checkout — run `targo --unverified ship` from the aterm workspace".to_string(),
         ));
     }
     let root = String::from_utf8_lossy(&out.stdout).trim().to_string();

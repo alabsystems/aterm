@@ -146,6 +146,8 @@ const HELP_HEAD: &str = concat!(
 pub enum Verb {
     /// `aterm ctl` — the introspection / control client.
     Ctl,
+    /// `aterm conn` — session connections (the pull/push wiring front door).
+    Conn,
     /// `aterm pkg` — the toolchain package manager.
     Pkg,
     /// `aterm fleet` — fleet federation (events + exec).
@@ -170,6 +172,7 @@ impl Verb {
     /// Every verb, in the order `--help` lists them.
     pub const ALL: &'static [Verb] = &[
         Verb::Ctl,
+        Verb::Conn,
         Verb::Pkg,
         Verb::Fleet,
         Verb::Drive,
@@ -185,6 +188,7 @@ impl Verb {
     pub const fn name(self) -> &'static str {
         match self {
             Verb::Ctl => "ctl",
+            Verb::Conn => "conn",
             Verb::Pkg => "pkg",
             Verb::Fleet => "fleet",
             Verb::Drive => "drive",
@@ -207,6 +211,9 @@ impl Verb {
     pub const fn argv0_alias(self) -> Option<&'static str> {
         match self {
             Verb::Ctl => Some("aterm-ctl"),
+            // `conn` never was a sibling binary — it is presentation over the
+            // ctl wire verbs, shipped only as a front-door word.
+            Verb::Conn => None,
             Verb::Pkg => Some("atpkg"),
             Verb::Fleet => Some("aterm-fleet"),
             Verb::Drive => Some("aterm-drive"),
@@ -238,6 +245,7 @@ impl Verb {
         match self {
             Verb::NewTab | Verb::NewWindow | Verb::SplitPane => true,
             Verb::Ctl
+            | Verb::Conn
             | Verb::Pkg
             | Verb::Fleet
             | Verb::Drive
@@ -251,6 +259,7 @@ impl Verb {
     pub const fn usage(self) -> &'static str {
         match self {
             Verb::Ctl => "aterm ctl <args>",
+            Verb::Conn => "aterm conn [<cmd>]",
             Verb::Pkg => "aterm pkg <args>",
             Verb::Fleet => "aterm fleet <args>",
             Verb::Drive => "aterm drive <args>",
@@ -274,6 +283,10 @@ impl Verb {
             Verb::Ctl => &[
                 "Introspect & drive any terminal: read the screen, send keys,",
                 "run a turn, subscribe to events, capture a real frame.",
+            ],
+            Verb::Conn => &[
+                "See & wire SESSION CONNECTIONS: which sessions pull or",
+                "push each other (ls | add | set | rm | spawn | show | map).",
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
             Verb::Fleet => &["Federate many sessions' events; dispatch commands back."],

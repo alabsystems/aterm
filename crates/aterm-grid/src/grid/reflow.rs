@@ -13,6 +13,7 @@ use self::reflow_map::{
     ExtrasCopyCtx, ExtrasSource, chunk_cells_to_rows, copy_cells_to_row, source_coords_for_row,
 };
 use super::row_u16;
+use super::scroll_convert::ScrolledRowExtras;
 use super::{CellCoord, CellExtras, Grid};
 use crate::Damage;
 use crate::LineSize;
@@ -170,6 +171,9 @@ impl Grid {
         // method pulls history back until the trailing-blank band returns to
         // this count, so the prompt stays anchored to its content instead of
         // stranding mid-window above a band of reflow-created blanks.
+        // (Rows-only resizes deliberately do NOT ride this fill: the grow
+        // reveal is a pure relabel that keeps absolute numbering, which the
+        // fill's history renumbering would break for the anchored reader.)
         let pre_trailing_blanks =
             (new_cols != old_cols && reflow).then(|| self.trailing_blank_rows_below_cursor());
 
@@ -262,7 +266,7 @@ impl Grid {
             self.migrate_complex_ring_to_extras();
         }
 
-        let revealed = self.adjust_row_count(new_rows, new_cols);
+        let (revealed, reveal_extras) = self.adjust_row_count(new_rows, new_cols);
         // Discard CellExtras entries for rows that were removed during
         // adjust_row_count. Without this, orphaned HashMap entries for
         // deleted rows leak memory until the next full grid clear. (#7409)
@@ -319,6 +323,13 @@ impl Grid {
                     .clamp_col_for_row(saved, self.storage.saved_cursor.cursor.col);
             }
         }
+        // Re-attach the revealed ring rows' extracted extras at their FINAL
+        // viewport rows — after the shift above, so they cannot ride it (see
+        // `adjust_row_count_rows_only`; discarding these is how emoji came
+        // back as U+FFFD and hyperlinks vanished across a shrink+grow).
+        for (row, bx) in reveal_extras {
+            self.inject_scrolled_extras(row, &bx);
+        }
         // Restore the rewrapped history as the front (oldest) of the scrollback,
         // after the visible grid is finalized so adjust_row_count cannot trim it
         // and the new dimensions are in place (#7906).
@@ -345,21 +356,23 @@ impl Grid {
         // rewraps nothing and leaves `absolute_row_counter` alone; it only
         // re-splits the same lines across the live/history boundary, and an
         // ALREADY-ARCHIVED line keeps its absolute number exactly — a shrink
-        // pushes the bottom `v - t` viewport rows on top of history
-        // (`adjust_row_count_rows_only`) and a grow reclassifies the `t - v`
-        // newest history lines as visible; everything deeper is untouched in
-        // both. `prev_offset > 0` means the row under the eye IS such a line,
-        // which is what makes this anchor exact rather than approximate. A WIDTH
-        // reflow renumbers rows wholesale (the wrapped-line count changes), so no
-        // exact anchor exists there and the clamped offset stays the best
-        // available answer — staying in history is far better than snapping a
-        // scrolled-back reader to the live bottom.
+        // trims blanks and demotes TOP viewport rows into history (with the
+        // bottom-push corner, see `adjust_row_count_rows_only`), and a grow
+        // appends blanks whose scrolled-back arm pulls nothing (the deficit
+        // fill is gated to `prev_offset == 0` precisely so the anchor below
+        // stays exact); everything deeper is untouched in both. `prev_offset >
+        // 0` means the row under the eye IS such a line, which is what makes
+        // this anchor exact rather than approximate. A WIDTH reflow renumbers
+        // rows wholesale (the wrapped-line count changes), so no exact anchor
+        // exists there and the clamped offset stays the best available answer —
+        // staying in history is far better than snapping a scrolled-back reader
+        // to the live bottom.
         //
         // The anchor arm can still CLAMP: on a rows shrink at the retention cap
-        // the demanded `d + (v - t)` may exceed the post-resize
-        // `scrollback_lines()`. That moves the reader off the anchored line but
-        // stays in bounds — the same degradation the offset arm has always had.
-        // `Damage::Full` below subsumes the primitive's targeted damage.
+        // the demanded history may exceed the post-resize `scrollback_lines()`.
+        // That moves the reader off the anchored line but stays in bounds — the
+        // same degradation the offset arm has always had. `Damage::Full` below
+        // subsumes the primitive's targeted damage.
         match prev_anchor {
             Some(anchor) if new_cols == old_cols => self.scroll_to_absolute_row(anchor),
             _ => self.storage.display_offset = prev_offset.min(self.storage.scrollback_lines()),
@@ -422,8 +435,14 @@ impl Grid {
     /// ring-held lines directly above the old viewport that the caller's
     /// `visible_rows` update re-labels as visible content at the TOP of the
     /// screen. The caller owes the cursor a downward shift by exactly this
-    /// count — the cursor's content moved that many rows down the viewport.
-    fn adjust_row_count(&mut self, target_rows: u16, new_cols: u16) -> usize {
+    /// count — the cursor's content moved that many rows down the viewport —
+    /// and owes the returned `(viewport row, extras)` pairs re-injection into
+    /// the live map AFTER that shift (see `adjust_row_count_rows_only`).
+    fn adjust_row_count(
+        &mut self,
+        target_rows: u16,
+        new_cols: u16,
+    ) -> (usize, Vec<(u16, Box<ScrolledRowExtras>)>) {
         let target = target_rows as usize;
         let old_visible = usize::from(self.storage.visible_rows);
 
@@ -566,7 +585,9 @@ impl Grid {
             }
             self.storage.total_lines += rows_to_add;
         }
-        revealed
+        // The width path's revealed rows carry no ring_extras hand-off: their
+        // extras (if any) already rode the take/restore scrollback round trip.
+        (revealed, Vec::new())
     }
 
     /// Rows-only [`adjust_row_count`](Self::adjust_row_count), for EVERY grid
@@ -597,8 +618,35 @@ impl Grid {
     /// into the lazy buffer, exactly like `scroll_up`'s at-capacity eviction,
     /// so retention past the ring is unchanged.
     ///
-    /// Returns the revealed-history count (see [`Self::adjust_row_count`]).
-    fn adjust_row_count_rows_only(&mut self, target: usize, new_cols: u16) -> usize {
+    /// Returns the revealed-history count plus the revealed rows' extracted
+    /// extras for caller-side re-injection (see [`Self::adjust_row_count`]).
+    ///
+    /// ANCHORING (audit-2 item 1). The original in-place shapes were mutually
+    /// inconsistent: shrink demoted the BOTTOM viewport rows as newest history
+    /// (#7662's bottom-push, in ring form) while grow revealed newest history
+    /// at the TOP — so every shrink+grow cycle ROTATED the screen (bottom rows
+    /// came back on top), walked the prompt down, detached the cursor from its
+    /// line, and corrupted scrollback reading order; the grow also DISCARDED
+    /// the revealed rows' `ring_extras` (emoji/hyperlink/RGB lost in transit,
+    /// a discard dating to 8a227e9b that this path made reachable for every
+    /// grid shape). The shapes now anchor like every other terminal:
+    ///
+    /// * SHRINK first TRIMS trailing blank rows below the cursor (they carry
+    ///   nothing — dropping them archives no fake history), then demotes TOP
+    ///   rows into the ring (pure relabel — the exact inverse of the grow
+    ///   reveal, so shrink+grow is identity), and only when the cursor sits
+    ///   too high for that (a full screen with the cursor near the top) falls
+    ///   back to the old bottom-push for the remainder — content-preserving,
+    ///   with the old ordering quirk confined to that corner.
+    /// * GROW keeps the reveal-at-top relabel (absolute numbering intact, so
+    ///   a scrolled-back reader's anchor stays exact) and hands the revealed
+    ///   rows' `ring_extras` back for re-injection instead of discarding
+    ///   them.
+    fn adjust_row_count_rows_only(
+        &mut self,
+        target: usize,
+        new_cols: u16,
+    ) -> (usize, Vec<(u16, Box<ScrolledRowExtras>)>) {
         let visible = self.storage.visible_rows as usize;
         debug_assert_eq!(
             self.storage.total_lines,
@@ -607,43 +655,105 @@ impl Grid {
         );
 
         if target < visible {
-            // SHRINK: the bottom (visible - target) viewport rows become the
-            // NEWEST history (#7662's bottom-push, in ring form) and the top
-            // `target` rows stay visible. Linearize, then rotate the viewport
-            // slice: [hist | V0..Vv-1] -> [hist | Vt..Vv-1 | V0..Vt-1].
+            let shrink = visible - target;
             if self.storage.ring_head != 0 {
                 self.storage.rows.rotate_left(self.storage.ring_head);
                 self.storage.ring_head = 0;
             }
-            let hist = self.storage.total_lines - visible;
 
-            // The demoted rows' live extras (keyed by their visible row, the
-            // #7783 external-row rule) move into ring_extras — the ring
-            // history's side table — in age order. Re-align the deque first:
-            // it may be legitimately empty while history exists (the
-            // post-clear steady state reuse keeps it empty), and appending
-            // must not shift those default entries.
-            while self.storage.ring_extras.len() < hist {
-                self.storage.ring_extras.push_back(None);
+            // 1) TRIM: trailing blank rows strictly below the cursor are not
+            // content — archiving them would manufacture blank history that a
+            // later grow reveals ABOVE real content. Drop them outright.
+            let trim = shrink.min(self.trailing_blank_rows_below_cursor());
+            if trim > 0 {
+                let keep = self.storage.total_lines - trim;
+                self.storage.rows.truncate(keep);
+                self.storage.total_lines = keep;
+                // Their extras keys land >= `target` after the demote shift
+                // below and are swept by the caller's `retain_rows_below`.
             }
-            for i in target..visible {
-                let extracted = Self::extract_row_extras(
-                    &self.storage.rows[hist + i],
-                    &self.storage.extras,
-                    row_u16(i),
-                    self.styles(),
-                );
-                self.storage.push_ring_extras(extracted);
-            }
-            self.storage.rows[hist..].rotate_left(target);
+            let remaining = shrink - trim;
 
-            // Enforce the retention cap: a full ring cannot absorb the
-            // demoted rows, so evict the oldest past it — the same
-            // observable effect as scroll_up's at-capacity eviction. Bounded
-            // by the height delta: `total_lines <= visible + max_scrollback`
-            // on entry, so `excess <= visible - target`. (The dropped rows'
-            // page memory is reclaimed on the next rebuild, like the tiered
-            // trim path.)
+            // 2) TOP-DEMOTE: the top `demote` viewport rows become the newest
+            // history — a pure relabel (they already sit directly above the
+            // surviving viewport in the linearized ring), the exact inverse
+            // of the grow-side pull. Capped at the cursor row so the cursor's
+            // line always stays visible.
+            let cursor_row = usize::from(self.storage.cursor.row).min(visible - 1);
+            let demote = remaining.min(cursor_row);
+            let hist = self.storage.total_lines - (visible - trim);
+            if demote > 0 {
+                // The demoted rows' live extras (keyed by their visible row,
+                // the #7783 external-row rule) move into ring_extras — the
+                // ring history's side table — in age order. Re-align the
+                // deque first: it may be legitimately empty while history
+                // exists (the post-clear steady-state reuse keeps it empty),
+                // and appending must not shift those default entries.
+                while self.storage.ring_extras.len() < hist {
+                    self.storage.ring_extras.push_back(None);
+                }
+                for i in 0..demote {
+                    let extracted = Self::extract_row_extras(
+                        &self.storage.rows[hist + i],
+                        &self.storage.extras,
+                        row_u16(i),
+                        self.styles(),
+                    );
+                    self.storage.push_ring_extras(extracted);
+                }
+                // Surviving-viewport extras and the cursor follow their rows
+                // up; a demote-displaced selection is invalidated rather than
+                // silently re-attached to shifted rows.
+                let old_bottom = row_u16(visible - trim - 1);
+                self.storage
+                    .extras
+                    .shift_region_up_by(0, old_bottom, row_u16(demote));
+                self.storage.cursor.row = self.storage.cursor.row.saturating_sub(row_u16(demote));
+                if self.storage.saved_cursor.valid {
+                    self.storage.saved_cursor.cursor.row = self
+                        .storage
+                        .saved_cursor
+                        .cursor
+                        .row
+                        .saturating_sub(row_u16(demote));
+                }
+                self.force_selection_invalidation();
+            }
+            let bottom_push = remaining - demote;
+
+            // 3) BOTTOM-PUSH CORNER: the cursor sits too near the top for the
+            // demand (a full non-blank screen, cursor high — a TUI shape).
+            // Preserve the content by pushing the bottom rows as newest
+            // history, the pre-rework mechanism: reading order above the
+            // viewport is imperfect here, but nothing is lost, and the demote
+            // above has already pinned the cursor's line on screen.
+            if bottom_push > 0 {
+                let hist_after_demote = hist + demote;
+                // Extras of the pushed rows, keyed by their CURRENT visible
+                // rows (post-demote-shift): the pushed rows are the bottom
+                // `bottom_push` of the surviving viewport.
+                let surviving = visible - trim - demote;
+                while self.storage.ring_extras.len() < hist_after_demote {
+                    self.storage.ring_extras.push_back(None);
+                }
+                for i in target..surviving {
+                    let extracted = Self::extract_row_extras(
+                        &self.storage.rows[hist_after_demote + i],
+                        &self.storage.extras,
+                        row_u16(i),
+                        self.styles(),
+                    );
+                    self.storage.push_ring_extras(extracted);
+                }
+                self.storage.rows[hist_after_demote..].rotate_left(target);
+            }
+
+            // 4) RETENTION CAP: a full ring cannot absorb the demoted rows, so
+            // evict the oldest past it — the same observable effect as
+            // scroll_up's at-capacity eviction. Bounded by the height delta:
+            // `total_lines <= visible + max_scrollback` on entry, so
+            // `excess <= visible - target`. (The dropped rows' page memory is
+            // reclaimed on the next rebuild, like the tiered trim path.)
             let excess =
                 (self.storage.total_lines - target).saturating_sub(self.storage.max_scrollback);
             if excess > 0 {
@@ -678,15 +788,31 @@ impl Grid {
             // GROW: reveal up to (target - visible) newest history lines by
             // pure reclassification — they already sit in the ring directly
             // above the viewport, so the caller's visible_rows update alone
-            // re-labels them (the tiered path reveals the same rows via its
-            // store round-trip). Their ring_extras entries leave the history
-            // side table with them; like the tiered path, re-labelled rows
-            // re-pair with live extras only where the cells still carry them.
+            // re-labels them, absolute numbering intact (which is what keeps
+            // a scrolled-back reader's anchor exact). Their `ring_extras`
+            // entries are handed BACK to the caller for re-injection at the
+            // rows' final viewport coordinates — this pop used to DISCARD
+            // them (audit-2 item 6: emoji revealed as U+FFFD, hyperlinks and
+            // RGB gone; a discard dating to 8a227e9b that the shape-unified
+            // routing made reachable for every grid). The hand-off exists
+            // because injection must land AFTER the caller shifts the old
+            // viewport's extras down by `revealed` — injected here, the
+            // entries would ride that shift to the wrong rows.
             let hist = self.storage.total_lines - visible;
             let revealed = (target - visible).min(hist);
             let keep = hist - revealed;
-            while self.storage.ring_extras.len() > keep {
-                self.storage.ring_extras.pop_back();
+            let mut reveal_extras: Vec<(u16, Box<ScrolledRowExtras>)> = Vec::new();
+            // Deque tail = newest ring row = the BOTTOM revealed viewport row
+            // (`revealed - 1`); the deque may hold fewer entries than history
+            // rows (older rows without extras), which the `keep` bound
+            // tolerates exactly as the old consume loop did.
+            for j in (0..revealed).rev() {
+                if self.storage.ring_extras.len() <= keep {
+                    break;
+                }
+                if let Some(bx) = self.storage.ring_extras.pop_back().flatten() {
+                    reveal_extras.push((row_u16(j), bx));
+                }
             }
             // Any remaining growth needs fresh blank rows at the bottom.
             if target > self.storage.total_lines {
@@ -704,10 +830,52 @@ impl Grid {
                 }
                 self.storage.total_lines += rows_to_add;
             }
-            return revealed;
+            return (revealed, reveal_extras);
         }
         // target == visible: nothing to reclassify.
-        0
+        (0, Vec::new())
+    }
+
+    /// The write-side inverse of [`Self::extract_row_extras`]: re-attach a
+    /// revealed ring row's extracted extras to its viewport row in the LIVE
+    /// map. Cells were never touched in transit (demote and reveal are pure
+    /// relabels), so only the side-table entries need reseating — the cell's
+    /// own `is_complex`/RGB-overflow markers still point here.
+    fn inject_scrolled_extras(&mut self, row_idx: u16, e: &ScrolledRowExtras) {
+        let extras = &mut self.storage.extras;
+        for span in &e.hyperlinks {
+            for col in span.start_col..span.end_col {
+                let cell = extras.get_or_create(CellCoord::new(row_idx, col));
+                cell.set_hyperlink(Some(span.url.clone()));
+                cell.set_hyperlink_id(span.id.clone());
+            }
+        }
+        for (col, s) in &e.complex_chars {
+            extras
+                .get_or_create(CellCoord::new(row_idx, *col))
+                .set_complex_char(Some(s.clone()));
+        }
+        for (col, marks) in &e.combining {
+            let cell = extras.get_or_create(CellCoord::new(row_idx, *col));
+            for c in marks {
+                cell.add_combining(*c);
+            }
+        }
+        for (col, rgb) in &e.rgb_fg {
+            extras
+                .get_or_create(CellCoord::new(row_idx, *col))
+                .set_fg_rgb(Some(*rgb));
+        }
+        for (col, rgb) in &e.rgb_bg {
+            extras
+                .get_or_create(CellCoord::new(row_idx, *col))
+                .set_bg_rgb(Some(*rgb));
+        }
+        for (col, packed) in &e.underline_colors {
+            extras
+                .get_or_create(CellCoord::new(row_idx, *col))
+                .set_underline_color_u32(Some(*packed));
+        }
     }
 
     /// Reflow lines when column count changes.

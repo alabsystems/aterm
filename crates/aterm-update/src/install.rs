@@ -229,6 +229,34 @@ fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> st
     error
 }
 
+/// This process's argv (past argv0), minus the leading run of `--window` mode
+/// pins, for forwarding to a re-exec image.
+///
+/// Every boot-time swap pins `--window` ahead of the forwarded args
+/// ([`boot_reexec_command`]) — and the args it forwards are this process's OWN
+/// argv, which already carries the pin from the previous swap. Forwarded
+/// verbatim, the command line grows by one `--window` per update cycle
+/// (observed in the field at six after a night of channel activity). Only the
+/// LEADING run can be pins — ours, or a user's semantically identical one — so
+/// stripping it makes the re-exec argv a fixed point, while everything from
+/// the first other token on is forwarded untouched: a `--window` inside an
+/// `-e`/`--command` payload is past that boundary by construction and can
+/// never be affected.
+pub fn reexec_forwarded_args(
+    args: impl Iterator<Item = std::ffi::OsString>,
+) -> Vec<std::ffi::OsString> {
+    let mut forwarded = Vec::new();
+    let mut leading = true;
+    for arg in args {
+        if leading && arg == "--window" {
+            continue;
+        }
+        leading = false;
+        forwarded.push(arg);
+    }
+    forwarded
+}
+
 /// The post-swap re-exec command: the NEW binary at the canonical path, the
 /// forwarded argv, the single-use re-exec nonce — and the caller's handoff
 /// authority variables restored onto the exec image ONLY. The GUI's prearm
@@ -252,8 +280,10 @@ fn boot_reexec_command(
         // router's scan stops at the first -e/--command/--, so an appended
         // flag would be invisible (or pollute the -e payload). An env-launched
         // headless instance still carries ATERM_HEADLESS here (boot-time
-        // apply runs before the entry consumes it).
-        .args(std::env::args_os().skip(1))
+        // apply runs before the entry consumes it). The forwarded args are
+        // stripped of the leading pins earlier swaps prepended, so exactly ONE
+        // `--window` survives however many updates this process has ridden.
+        .args(reexec_forwarded_args(std::env::args_os().skip(1)))
         .env("ATERM_UPDATE_REEXEC", reexec_value);
     for (key, value) in handoff_env {
         reexec.env(key, value);
@@ -2997,13 +3027,17 @@ fn revert_to_rollback(
     // (already cleared), and nothing staged, so it comes up clean on the old build.
     let mut reexec = Command::new(&b.exe);
     reexec
-        .args(std::env::args_os().skip(1))
+        .args(reexec_forwarded_args(std::env::args_os().skip(1)))
         // NO --window here: the restored ROLLBACK build may predate the
         // one-binary router entirely (its gui parser exits 2 on the unknown
         // flag — a dead relaunch is worse than a mode-imperfect one). A
         // pre-collapse rollback IS the window binary and needs no flag; a
         // one-binary rollback launched flag-less from a TTY degrades to a
-        // session but stays alive.
+        // session but stays alive. That is also why the LEADING `--window`
+        // pins are stripped from the forwarded args: this process's argv
+        // carries one per swap it has ridden, and forwarding any of them to a
+        // pre-collapse rollback is the exit-2 dead relaunch this comment
+        // exists to prevent.
         ;
     let err = exec_preserving_handoff_fds(&mut reexec, handoff_fds);
     crate::warn(&format!("re-exec of restored build failed: {err}"));
@@ -3343,6 +3377,45 @@ mod tests {
             )),
             "handoff authority restored onto the exec image"
         );
+    }
+
+    /// THE `--window` accumulation regression (2026-08-24): the re-exec
+    /// forwards this process's own argv, which already carries the mode pin
+    /// the PREVIOUS swap prepended — forwarded verbatim, a long-lived install
+    /// grows one `--window` per update it rides (observed at six). The strip
+    /// makes the forwarded argv a fixed point while never reaching past the
+    /// first non-pin token, so `-e`/`--command` payloads are untouchable.
+    #[test]
+    fn reexec_forwarded_args_is_a_fixed_point_and_never_reads_past_the_lead() {
+        let args = |list: &[&str]| -> Vec<std::ffi::OsString> {
+            list.iter().map(std::ffi::OsString::from).collect()
+        };
+        // The field case: six accumulated pins collapse to none forwarded
+        // (boot_reexec_command re-pins exactly one).
+        assert_eq!(
+            super::reexec_forwarded_args(args(&["--window"; 6]).into_iter()),
+            args(&[]),
+        );
+        // Fixed point: a once-stripped argv re-strips to itself.
+        let once = super::reexec_forwarded_args(
+            args(&["--window", "--font-px", "30", "--window"]).into_iter(),
+        );
+        assert_eq!(once, args(&["--font-px", "30", "--window"]));
+        assert_eq!(
+            super::reexec_forwarded_args(once.clone().into_iter()),
+            once,
+            "stripping must converge after one pass"
+        );
+        // A `--window` past the first other token is payload-adjacent and
+        // survives verbatim — including inside an -e command.
+        assert_eq!(
+            super::reexec_forwarded_args(
+                args(&["-e", "sh", "-c", "--window"]).into_iter()
+            ),
+            args(&["-e", "sh", "-c", "--window"]),
+        );
+        // Empty argv (Finder/launchd launch) stays empty.
+        assert_eq!(super::reexec_forwarded_args(args(&[]).into_iter()), args(&[]));
     }
 
     /// `rfc3339_delta_secs` inverts `format_rfc3339` across day/month/year and

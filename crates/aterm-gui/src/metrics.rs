@@ -133,6 +133,13 @@ static REDRAW_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static REDRAW_EARLY_OUTS: AtomicU64 = AtomicU64::new(0);
 static REDRAW_SYNC_HOLDS: AtomicU64 = AtomicU64::new(0);
 static REDRAW_RETRY_GATED: AtomicU64 = AtomicU64::new(0);
+// The damage-scoped frame-extraction reach (DMG-1): how many presented-path
+// refills rode the scoped arm vs fell back to the full O(rows×cols) walk. A
+// full-arm-dominated steady state means some per-frame scratch mutator broke
+// the continuity chain — the number that says whether the 2.35×/2.65× win is
+// actually reaching this machine's frames.
+static FRAME_REFILLS_SCOPED: AtomicU64 = AtomicU64::new(0);
+static FRAME_REFILLS_FULL: AtomicU64 = AtomicU64::new(0);
 static PRE_PRESENT_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static LAST_PRE_PRESENT_NS: AtomicU64 = AtomicU64::new(0);
 static PRE_PRESENT_TOTAL_NS: AtomicU64 = AtomicU64::new(0);
@@ -860,11 +867,17 @@ fn derive_startup_attach(
 //
 // `startup_attach_backend_finalize_ns` measures ONE `handle.join()`: the event
 // loop blocking on the backend-build worker spawned in `crate::main_entry`.
-// That single number is the LARGEST phase in the whole ledger (300.83 ms
-// median on macOS, 66.1% of rust_main → first_present) and, until these
-// stamps, the only phase with no drill-down — so every optimization proposed
-// inside it had to be argued from a guess, and three in a row were refused for
-// being unsizeable.
+// That single number was READ AS the largest phase in the whole ledger
+// (300.83 ms median on macOS, 66.1% of rust_main → first_present, recorded
+// 2026-07-30) and, until these stamps, the only phase with no drill-down — so
+// every optimization proposed inside it had to be argued from a guess, and
+// three in a row were refused for being unsizeable. These stamps settled it on
+// 2026-08-23: `backend_finalize` is 0.01 ms median (0.02 ms max, 40 fresh
+// processes) with `after_join_ns` exactly 0.00 in every sample — the SMALLEST
+// phase in the ledger, not the largest
+// (`docs/measured/arena/2026-08-23-start-backend-finalize-drilldown-dev-smoke.md`,
+// M5 Max DEV-SMOKE / NON-PUBLISHABLE). The 300.83 ms figure is superseded and
+// must not be used to size work.
 //
 // TWO SEPARATE QUESTIONS live in that number, and conflating them is what made
 // the guesses wrong:
@@ -1727,6 +1740,19 @@ pub fn note_redraw_early_out() {
     REDRAW_EARLY_OUTS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// The presented-path frame extraction completed: which arm refilled the
+/// snapshot (`Scoped` retains undamaged rows; `Full` is the fallback walk).
+pub fn note_frame_refill(refill: aterm_core::render::FrameRefill) {
+    match refill {
+        aterm_core::render::FrameRefill::Scoped { .. } => {
+            FRAME_REFILLS_SCOPED.fetch_add(1, Ordering::Relaxed);
+        }
+        aterm_core::render::FrameRefill::Full => {
+            FRAME_REFILLS_FULL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A synchronized-output hold intentionally retained the previous frame.
 pub fn note_redraw_sync_hold() {
     REDRAW_SYNC_HOLDS.fetch_add(1, Ordering::Relaxed);
@@ -1872,6 +1898,8 @@ pub fn reset() {
     REDRAW_EARLY_OUTS.store(0, Ordering::Relaxed);
     REDRAW_SYNC_HOLDS.store(0, Ordering::Relaxed);
     REDRAW_RETRY_GATED.store(0, Ordering::Relaxed);
+    FRAME_REFILLS_SCOPED.store(0, Ordering::Relaxed);
+    FRAME_REFILLS_FULL.store(0, Ordering::Relaxed);
     PRE_PRESENT_ATTEMPTS.store(0, Ordering::Relaxed);
     LAST_PRE_PRESENT_NS.store(0, Ordering::Relaxed);
     PRE_PRESENT_TOTAL_NS.store(0, Ordering::Relaxed);
@@ -1970,6 +1998,10 @@ pub struct Snapshot {
     pub redraw_early_outs: u64,
     pub redraw_sync_holds: u64,
     pub redraw_retry_gated: u64,
+    /// Presented-path refills that rode the damage-scoped arm (DMG-1) vs the
+    /// full O(rows×cols) fallback — see the statics' note.
+    pub frame_refills_scoped: u64,
+    pub frame_refills_full: u64,
     pub pre_present_attempts: u64,
     pub last_pre_present_ns: u64,
     pub pre_present_total_ns: u64,
@@ -2155,6 +2187,8 @@ pub fn snapshot() -> Snapshot {
         redraw_early_outs: REDRAW_EARLY_OUTS.load(Ordering::Relaxed),
         redraw_sync_holds: REDRAW_SYNC_HOLDS.load(Ordering::Relaxed),
         redraw_retry_gated: REDRAW_RETRY_GATED.load(Ordering::Relaxed),
+        frame_refills_scoped: FRAME_REFILLS_SCOPED.load(Ordering::Relaxed),
+        frame_refills_full: FRAME_REFILLS_FULL.load(Ordering::Relaxed),
         pre_present_attempts: PRE_PRESENT_ATTEMPTS.load(Ordering::Relaxed),
         last_pre_present_ns: LAST_PRE_PRESENT_NS.load(Ordering::Relaxed),
         pre_present_total_ns: PRE_PRESENT_TOTAL_NS.load(Ordering::Relaxed),

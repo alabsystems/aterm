@@ -1318,6 +1318,46 @@ pub struct RenderInput {
     /// damage-scoped path was dead code there. Metadata, EXCLUDED from
     /// `PartialEq`/`Eq`.
     pub engine_row_order: RowOrder,
+    /// D-2 PER-ROW CONTENT REVISION, one entry per row of this snapshot: the
+    /// engine's [`Grid::row_revisions`](crate::grid::Grid::row_revisions) value
+    /// for the row, captured under the SAME lock as the cells.
+    ///
+    /// This is the damage fact the engine already knows, carried across the
+    /// snapshot boundary so a consumer diffing two snapshots can answer "did row
+    /// `r` change?" with a `u64` compare instead of re-deriving it from every
+    /// cell of every row. `aterm_render::compute_dirty_rows` is that consumer.
+    ///
+    /// THE ONE GUARANTEE: for two snapshots of the SAME terminal whose row
+    /// identity is pinned (see [`row_rev_lane`](Self::row_rev_lane)), a row whose
+    /// content changed between them has DIFFERENT entries here. The converse is
+    /// NOT guaranteed — an unchanged row may be re-stamped — so a consumer may
+    /// over-repaint but can never skip a changed row.
+    ///
+    /// `0` is the NO-STAMP sentinel and means UNKNOWN, not "unchanged": a
+    /// consumer must answer that row by comparing content. Host-built rows (a
+    /// spliced tab strip, a composed pane band) carry it, so a host that
+    /// prepends rows without extending this lane fails closed by construction.
+    ///
+    /// Pure metadata: EXCLUDED from `PartialEq`/`Eq` like `snapshot_seq` — it
+    /// advances on every damaged frame, so counting it would defeat the very
+    /// dirty-gate it feeds.
+    pub row_rev: Vec<u64>,
+    /// Identity of the row-revision LANE [`row_rev`](Self::row_rev) belongs to,
+    /// or `0` when this snapshot's stamps must not be trusted at all.
+    ///
+    /// Set to the filling terminal's extraction identity by an ENGINE fill, and
+    /// left at (or reset to) `0` by every other producer — `empty()`, and any
+    /// host that composes or re-shapes a snapshot's rows. Two snapshots may only
+    /// have their stamps compared when both lanes are non-zero AND equal:
+    /// distinct terminals mint revisions from independent clocks, so a numeric
+    /// collision between two panes' stamps would otherwise read as "unchanged".
+    ///
+    /// A non-zero lane is NOT on its own sufficient. The consumer must also pin
+    /// row IDENTITY (`base_y`, `absolute_row_revision`, `engine_alt`, a zero
+    /// `display_offset`, `engine_row_order`) and freedom from post-fill host cell
+    /// writes (`snapshot_seq == engine_fill_seq`). Metadata, EXCLUDED from
+    /// `PartialEq`/`Eq`.
+    pub row_rev_lane: u64,
 }
 
 /// The column order a [`RenderInput`]'s rows are in, as left by the last ENGINE
@@ -1424,6 +1464,8 @@ impl Clone for RenderInput {
             engine_fill_seq: self.engine_fill_seq,
             engine_alt: self.engine_alt,
             engine_row_order: self.engine_row_order,
+            row_rev: self.row_rev.clone(),
+            row_rev_lane: self.row_rev_lane,
         }
     }
 
@@ -1498,6 +1540,8 @@ impl Clone for RenderInput {
         self.engine_fill_seq = source.engine_fill_seq;
         self.engine_alt = source.engine_alt;
         self.engine_row_order = source.engine_row_order;
+        self.row_rev.clone_from(&source.row_rev);
+        self.row_rev_lane = source.row_rev_lane;
     }
 }
 
@@ -1643,6 +1687,11 @@ impl PartialEq for RenderInput {
         // damage carrier) are extraction-continuity tokens, not rendered content:
         // comparing them would make every scoped refill compare unequal and defeat
         // the very dirty-gate they exist to feed — same law as `snapshot_seq`.
+        // `row_rev` / `row_rev_lane` (D-2 per-row revision) are excluded for the
+        // SAME reason and it is load-bearing: the stamps advance on every damaged
+        // frame, so folding them into content equality would make two snapshots of
+        // an unchanged screen compare unequal and turn every gate hit into a
+        // repaint — the exact opposite of what they exist to buy.
     }
 }
 
@@ -1721,7 +1770,31 @@ impl RenderInput {
             engine_fill_seq: 0,
             engine_alt: false,
             engine_row_order: RowOrder::Logical,
+            row_rev: Vec::new(),
+            row_rev_lane: 0,
         }
+    }
+
+    /// Disown the D-2 per-row revision lane: this snapshot's rows are no longer
+    /// the rows an engine fill stamped, so nothing may be concluded from their
+    /// revisions.
+    ///
+    /// The seam every HOST producer that RE-SHAPES rows must call — the split
+    /// compositor (which rebuilds the grid from several terminals' panes) and
+    /// the in-grid tab-strip splice (which shifts every row down by the strip).
+    /// Both reuse a scratch that a single-pane engine fill may have stamped, and
+    /// both leave row `r` meaning something entirely different; without this the
+    /// stale lane would answer for rows it never saw.
+    ///
+    /// Host mutators that write cells IN PLACE (stream fade, the IME preedit
+    /// overlay, prediction ghosts) do not need this — they keep row identity and
+    /// already self-report through `snapshot_seq != engine_fill_seq`, which the
+    /// consumer's gate requires — but calling it is always sound: the only cost
+    /// of a disowned lane is the exact whole-grid compare the lane exists to
+    /// avoid.
+    pub fn invalidate_row_revisions(&mut self) {
+        self.row_rev_lane = 0;
+        self.row_rev.clear();
     }
 
     /// Whether ANY selection is live on this frame — the scalar one or any pane

@@ -130,6 +130,40 @@ pub struct GridPresentationState {
     /// active text selection. Metadata may drain its copy mid-parser to
     /// preserve OSC ordering; selection is adjusted once per complete batch.
     pub pending_selection_row_update: Option<AbsoluteRowUpdate>,
+    /// D-2 PER-ROW CONTENT REVISION: `row_rev[r]` is the value of
+    /// [`row_rev_clock`](Self::row_rev_clock) at the most recent fold that saw
+    /// visible row `r` damaged. One `u64` per VISIBLE row (never per scrollback
+    /// row) — the damage tracker's own coordinate space.
+    ///
+    /// The contract consumers rely on, and the ONLY one:
+    ///
+    /// > for two folds F1 before F2, `row_rev[r]` differs between them IF row
+    /// > `r`'s content changed between F1 and F2.
+    ///
+    /// The converse does NOT hold and must never be assumed: an unchanged row
+    /// may still be re-stamped (a redundant write, a `Damage::Full` session,
+    /// a foreign consumer's take). Over-reporting costs a repaint;
+    /// under-reporting is a stale frame, so every doubt resolves toward a
+    /// fresh stamp.
+    ///
+    /// This is the row-identity-STABLE half of the damage fact only. Anything
+    /// that MOVES content between row indices without marking every moved row
+    /// (`mark_scroll_damage` marks only the exposed strip) is invisible here —
+    /// which is why consumers must additionally pin `base_y`,
+    /// `absolute_row_revision`, the alt bit and a zero `display_offset` before
+    /// comparing two snapshots' stamps. See
+    /// `aterm_render::compute_dirty_rows`.
+    pub row_rev: Vec<u64>,
+    /// Monotone clock the fold stamps [`row_rev`](Self::row_rev) with. Advanced
+    /// once per fold that observes NEW damage, so two folds with nothing between
+    /// them leave every row's revision untouched (an idle frame stays an exact
+    /// gate hit rather than degrading into a whole-screen repaint).
+    pub row_rev_clock: u64,
+    /// The tracker mark-clock ([`crate::damage::DamageTracker::mark_seq`]) as of
+    /// the last fold. The fold is a no-op while this is unchanged, which is what
+    /// makes back-to-back folds (the extract's and the following
+    /// `take_damage`'s) idempotent instead of double-stamping every damaged row.
+    pub row_rev_folded_seq: u64,
 }
 
 fn coalesce_row_splice(
@@ -154,6 +188,21 @@ fn coalesce_row_splice(
     }
 }
 
+/// Advance the D-2 row-revision clock, SKIPPING zero.
+///
+/// Zero is the "no stamp / do not trust" sentinel a snapshot carries for a row
+/// no engine fold has ever vouched for, so the clock must never mint it — a
+/// wrapped clock handing out 0 would turn a real revision into "unknown",
+/// which the consumer answers with the brute-force compare (safe), but a
+/// SECOND wrap could then hand 0 to two snapshots and make them compare equal.
+#[inline]
+const fn next_row_rev_clock(clock: u64) -> u64 {
+    match clock.wrapping_add(1) {
+        0 => 1,
+        next => next,
+    }
+}
+
 impl GridPresentationState {
     #[cfg(kani)]
     pub(crate) fn kani_stub() -> Self {
@@ -167,6 +216,59 @@ impl GridPresentationState {
             coordinates_invalidated: false,
             pending_absolute_row_update: None,
             pending_selection_row_update: None,
+            row_rev: Vec::new(),
+            row_rev_clock: 0,
+            row_rev_folded_seq: 0,
+        }
+    }
+
+    /// D-2: fold the CURRENT damage session into the per-row revisions.
+    ///
+    /// Idempotent while nothing new has been marked, so the two folds a frame
+    /// performs — the extract's and the following `take_damage`'s — stamp a
+    /// damaged row exactly ONCE between them. Both folds are required:
+    ///
+    /// * the EXTRACT's fold publishes this session's damage to the snapshot
+    ///   being filled, and
+    /// * the RESET's fold captures damage that a FOREIGN consumer is about to
+    ///   discard (`take_damage` clears the bits for everyone), which no later
+    ///   fold could recover.
+    ///
+    /// `Damage::Full` re-stamps unconditionally: it keeps no mark clock (see
+    /// [`Damage::mark_seq`]), so "nothing new since the last fold" is not a
+    /// question it can answer, and answering it wrongly is a stale frame. A
+    /// full-damage frame repaints everything anyway, so the cost of the
+    /// unconditional re-stamp lands only on frames that were never cheap.
+    pub(crate) fn fold_row_revisions(&mut self, visible_rows: u16) {
+        let rows = usize::from(visible_rows);
+        // A row-count change is a full re-resolve for every consumer (resize
+        // marks full damage), so rebuild the lane rather than carrying stamps
+        // across a geometry the old indices no longer describe.
+        if self.row_rev.len() != rows {
+            self.row_rev.clear();
+            self.row_rev.resize(rows, 0);
+            self.row_rev_folded_seq = 0;
+        }
+        match self.damage.mark_seq() {
+            // Partial: skip when no mark has been made since the last fold.
+            Some(seq) => {
+                if seq == self.row_rev_folded_seq {
+                    return;
+                }
+                self.row_rev_folded_seq = seq;
+                self.row_rev_clock = next_row_rev_clock(self.row_rev_clock);
+                let clock = self.row_rev_clock;
+                for row in self.damage.damaged_rows(visible_rows) {
+                    if let Some(slot) = self.row_rev.get_mut(usize::from(row)) {
+                        *slot = clock;
+                    }
+                }
+            }
+            // Full: no clock to consult, so re-stamp every row.
+            None => {
+                self.row_rev_clock = next_row_rev_clock(self.row_rev_clock);
+                self.row_rev.fill(self.row_rev_clock);
+            }
         }
     }
 
@@ -262,7 +364,20 @@ impl GridPresentationState {
 
     #[inline]
     pub(crate) fn clear_damage(&mut self, visible_rows: u16) {
+        // D-2: capture this session's damage BEFORE discarding it. `reset` is
+        // the one choke point every consumer funnels through, so a foreign
+        // consumer that takes the damage between two of OUR extracts cannot
+        // erase a row change from the revision lane.
+        self.fold_row_revisions(visible_rows);
+        let was_full = self.damage.is_full();
         self.damage.reset(visible_rows);
+        if was_full {
+            // `reset` from `Full` installs a FRESH tracker whose mark clock
+            // restarts at 0. Rewinding the fold's watermark in lockstep keeps
+            // "no mark since the last fold" honest; leaving it high would make
+            // the next real mark compare equal and skip the fold.
+            self.row_rev_folded_seq = 0;
+        }
     }
 
     pub(crate) fn mark_scroll_damage(&mut self, visible_rows: u16, n: usize) {

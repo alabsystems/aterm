@@ -180,6 +180,15 @@ pub fn model_registry() -> Vec<Model> {
         kernel_model(),
         snapshot_model(),
         read_image_seq_model(),
+        // Resident operator safety: durable event claims, guarded mutation WAL +
+        // attempted-input epoch, GAP/resnapshot cursors, single-leader epoch
+        // fencing, and the durable fleet-fault gate. Tier-1 binds these scalar
+        // projections to shipping reducers.
+        operator_event_delivery_model(),
+        operator_wal_actuator_model(),
+        operator_resync_cursor_model(),
+        operator_leadership_model(),
+        operator_fleet_fault_model(),
         // A7 (WS-G): the PTY-master fd-lifecycle ownership discipline — drift-free
         // twin of FdLifecycle.tla, anchored to aterm-session/src/sink.rs.
         fd_lifecycle_model(),
@@ -296,11 +305,12 @@ pub fn model_registry() -> Vec<Model> {
         cursor_move_candidate_model(),
         // The blackout's liveness twin: an environment adversary produces the
         // audited real-shell echo shapes (plain/E1..E5/cold/swallowed/
-        // deviating) and the settled decision must CONFIRM every handled
-        // shape — safety alone had proven a mute gate green. E2/E5 are
-        // registered standing gaps, stated as invariants and reprinted by the
-        // Tier-0 driver. Tier-1 binds the real confirm_content_candidate in
-        // aterm-effects/src/cursor_glow.rs.
+        // deviating, plus shape 10's unblinked-alt echo — the probe-starved
+        // less//vi//ESC 7-streamer class) and the settled decision must
+        // CONFIRM every handled shape — safety alone had proven a mute gate
+        // green. E2/E5 are registered standing gaps, stated as invariants and
+        // reprinted by the Tier-0 driver. Tier-1 binds the real
+        // confirm_content_candidate in aterm-effects/src/cursor_glow.rs.
         typed_echo_liveness_model(),
         cursor_viewport_lifecycle_model(),
         cursor_effect_scroll_model(),

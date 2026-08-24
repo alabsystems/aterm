@@ -85,6 +85,15 @@ pub const ENV_EDGE_WRITE: &str = "ATERM_EDGE_WRITE";
 /// A `Signal` `EdgeToken` (`<64hex>`), parent → child. Fallback env channel.
 pub const ENV_EDGE_SIGNAL: &str = "ATERM_EDGE_SIGNAL";
 
+/// The sid a CONTROLLER session was spawned to observe (session connections,
+/// `SESSION_CONNECTIONS.md` §2.3/§6): the "New Controller Session" presets and
+/// `spawn connected=controller of=<sid>` inject it so the supervisor's tooling
+/// knows which session it holds a connection over. IDENTITY ONLY — never a
+/// token (design §1.4#3): authority stays in the origin's `EdgeTable`, held by
+/// the spawning process's `ConnectionRecord` store. Deny-listed (below) so the
+/// hint never leaks past one hop — a grandchild is not the controller.
+pub const ENV_OBSERVE_SESSION_ID: &str = "ATERM_OBSERVE_SESSION_ID";
+
 // ---------------------------------------------------------------------------
 // L3 network-drive selectors (aterm-gui `net_listen`): the bind address + the
 // operator's TLS cert/key PATHS that opt a ROOT instance into a network control
@@ -129,6 +138,9 @@ pub const ENV_DENY_VARS: &[&str] = &[
     ENV_EDGE_READ,
     ENV_EDGE_WRITE,
     ENV_EDGE_SIGNAL,
+    // Controller-spawn observation hint (session connections): one hop only —
+    // a descendant that did not receive it fresh is not the controller.
+    ENV_OBSERVE_SESSION_ID,
 ];
 
 /// Returns `true` if `key` matches a deny-listed AI or containment env var.
@@ -211,6 +223,7 @@ mod tests {
             ENV_EDGE_READ,
             ENV_EDGE_WRITE,
             ENV_EDGE_SIGNAL,
+            ENV_OBSERVE_SESSION_ID,
         ] {
             assert!(is_ai_env_var(v), "{v} must be deny-listed for inheritance");
         }

@@ -499,6 +499,10 @@ pub(crate) fn cmd_window(
         AuxTarget::Prefs => "aterm-prefs",
         AuxTarget::About => "aterm-about",
         AuxTarget::Menu => "aterm-menu",
+        AuxTarget::TabMenu => "aterm-tab-menu",
+        AuxTarget::ConnCard => "aterm-conn-card",
+        AuxTarget::SessionPicker => "aterm-session-picker",
+        AuxTarget::Connections => "aterm-connections",
         AuxTarget::Update => "aterm-update",
     };
     let p = path_arg.trim();
@@ -1813,11 +1817,15 @@ pub(crate) fn cmd_controls(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             | AuxTarget::Prefs
             | AuxTarget::About
             | AuxTarget::Menu
+            | AuxTarget::TabMenu
+            | AuxTarget::ConnCard
+            | AuxTarget::SessionPicker
+            | AuxTarget::Connections
             | AuxTarget::Update),
         ) => t,
         _ => {
             return format!(
-                "ERR unsupported target {trimmed:?} (use: front | prefs | about | menu | update)\n"
+                "ERR unsupported target {trimmed:?} (use: front | prefs | about | menu | tab-menu | conn-card | session-picker | connections | update)\n"
             );
         }
     };
@@ -1901,7 +1909,7 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     let (target_tok, close) = match trimmed.split_once(char::is_whitespace) {
         Some((t, r)) if r.trim() == "close" => (t, true),
         Some(_) => {
-            return "ERR usage: open <prefs|about|menu|update> [close]\n".to_string();
+            return "ERR usage: open <prefs|about|menu|connections|update> [close]\n".to_string();
         }
         None => (trimmed, false),
     };
@@ -1914,10 +1922,17 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         return "ERR target perf was removed with the bottom HUD\n".to_string();
     }
     let target = match AuxTarget::parse(target_tok) {
-        Some(t @ (AuxTarget::Prefs | AuxTarget::About | AuxTarget::Menu | AuxTarget::Update)) => t,
+        Some(
+            t @ (AuxTarget::Prefs
+            | AuxTarget::About
+            | AuxTarget::Menu
+            | AuxTarget::TabMenu
+            | AuxTarget::Connections
+            | AuxTarget::Update),
+        ) => t,
         _ => {
             return format!(
-                "ERR unsupported target {target_tok:?} (use: prefs | about | menu | update)\n"
+                "ERR unsupported target {target_tok:?} (use: prefs | about | menu | tab-menu | connections | update)\n"
             );
         }
     };
@@ -2230,7 +2245,12 @@ pub(crate) fn cmd_session_status(proxy: &EventLoopProxy<Wake>, session: u64, res
 ///
 /// Returns `None` for an unterminated quote — a malformed request, answered with
 /// the verb's usage line rather than a half-path.
-fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
+/// The spawn/act argument tokenizer. `pub(crate)` because the socket-policy fence
+/// in `control.rs` MUST classify with the very tokenizer that later parses the
+/// command: a fence that splits differently than the parser is a fence with a
+/// spelling that walks past it (`spawn "connected=controller" of=…` parsed as a
+/// connected spawn while `split_whitespace` saw a token starting with `"`).
+pub(crate) fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     let mut current = String::new();
     let mut started = false;
@@ -2260,6 +2280,88 @@ fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
     Some(out)
 }
 
+/// The `spawn` verb's usage line — one string for every malformed form, naming
+/// the whole grammar (plain + connected) so a caller who got one token wrong
+/// sees the complete contract.
+const SPAWN_USAGE: &str = "ERR usage: spawn [connected=controlled|controller place=window|tab of=<sid>] [cwd=<path>] [split=<v|h>]\n";
+
+/// One parsed `spawn` request: the plain tab/split spawn, or the CONNECTED form
+/// (design §6) with every argument present and validated.
+#[derive(Debug, PartialEq, Eq)]
+enum SpawnForm {
+    Plain {
+        cwd: Option<String>,
+        split: Option<crate::pane::SplitDir>,
+    },
+    Connected {
+        kind: crate::connections::ConnectedSpawnKind,
+        place: crate::connections::ConnectedSpawnPlace,
+        origin: aterm_session::SessionId,
+        cwd: Option<String>,
+    },
+}
+
+/// PURE parse of the `spawn` argument line (unit-tested off the event loop),
+/// over [`split_quoted_tokens`] so a quoted `cwd=` keeps its spaces in both
+/// forms. `of=` is MANDATORY when `connected=` is present — the App dispatch
+/// discards selectors, and an authority-minting argument gets no guessed
+/// default (design §6); `place=` is equally explicit (the grammar brackets
+/// neither). A `place=`/`of=` without `connected=` is a usage error, as is any
+/// unknown token or value.
+///
+/// `split=` and `connected=` are mutually exclusive: `place=` already says
+/// where a connected newborn lands, and a pane split is not one of its two
+/// answers — so the pair is refused rather than silently resolved.
+fn parse_spawn_args(rest: &str) -> Result<SpawnForm, ()> {
+    use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+    let (mut cwd, mut split, mut kind, mut place, mut origin) = (None, None, None, None, None);
+    let Some(tokens) = split_quoted_tokens(rest) else {
+        return Err(());
+    };
+    for tok in tokens {
+        if let Some(v) = tok.strip_prefix("cwd=") {
+            cwd = Some(v.to_string());
+        } else if let Some(v) = tok.strip_prefix("split=") {
+            split = Some(match v {
+                "v" | "vertical" => crate::pane::SplitDir::Vertical,
+                "h" | "horizontal" => crate::pane::SplitDir::Horizontal,
+                _ => return Err(()),
+            });
+        } else if let Some(v) = tok.strip_prefix("connected=") {
+            kind = Some(match v {
+                "controlled" => ConnectedSpawnKind::Controlled,
+                "controller" => ConnectedSpawnKind::Controller,
+                _ => return Err(()),
+            });
+        } else if let Some(v) = tok.strip_prefix("place=") {
+            place = Some(match v {
+                "window" => ConnectedSpawnPlace::Window,
+                "tab" => ConnectedSpawnPlace::Tab,
+                _ => return Err(()),
+            });
+        } else if let Some(v) = tok.strip_prefix("of=") {
+            if v.is_empty() {
+                return Err(());
+            }
+            origin = Some(aterm_session::SessionId::new(v));
+        } else {
+            return Err(());
+        }
+    }
+    match (kind, place, origin) {
+        (None, None, None) => Ok(SpawnForm::Plain { cwd, split }),
+        (Some(kind), Some(place), Some(origin)) if split.is_none() => Ok(SpawnForm::Connected {
+            kind,
+            place,
+            origin,
+            cwd,
+        }),
+        // A partial connected form (connected= without of=/place=, or a stray
+        // place=/of=), or a connected form carrying split=, never guesses.
+        _ => Err(()),
+    }
+}
+
 /// `spawn [cwd=<path>] [split=<v|h>]` -> mint ONE new session in the frontmost
 /// window and reply `OK <sid>` — birth as a socket primitive. The sid is live in
 /// the registry before the reply is sent, so `@<sid> …` works immediately: an
@@ -2281,31 +2383,36 @@ fn split_quoted_tokens(rest: &str) -> Option<Vec<String>> {
 ///
 /// The newborn runs the default shell; give it a command with
 /// `@<sid> turn '<cmd>'`. Main-thread hop like `open`/`controls`.
+///
+/// `spawn connected=controlled|controller place=window|tab of=<sid> [cwd=…]`
+/// (design §6) additionally mints the `both` SESSION CONNECTION binding the
+/// newborn to `of=` — Owner-only (the `escalated_op` fence runs before this
+/// dispatch). The handler resolves `of=` on the main thread and refuses
+/// `place=window` under headless with the NEW `ERR headless` reply (§1.4#7);
+/// `place=tab` works headless. cwd default for the connected form is the
+/// ORIGIN session's cwd.
 pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    const USAGE: &str = "ERR usage: spawn [cwd=<path>] [split=<v|h>]\n";
-    let mut cwd: Option<String> = None;
-    let mut split: Option<crate::pane::SplitDir> = None;
-    let Some(tokens) = split_quoted_tokens(rest) else {
-        return USAGE.to_string();
+    let sent = match parse_spawn_args(rest) {
+        Ok(SpawnForm::Plain { cwd, split }) => call_main(proxy, |tx| Wake::SpawnSession {
+            cwd,
+            split,
+            reply: tx,
+        }),
+        Ok(SpawnForm::Connected {
+            kind,
+            place,
+            origin,
+            cwd,
+        }) => call_main(proxy, |tx| Wake::SpawnConnectedSession {
+            kind,
+            place,
+            origin,
+            cwd,
+            reply: tx,
+        }),
+        Err(()) => return SPAWN_USAGE.to_string(),
     };
-    for tok in tokens {
-        if let Some(v) = tok.strip_prefix("cwd=") {
-            cwd = Some(v.to_string());
-        } else if let Some(v) = tok.strip_prefix("split=") {
-            split = match v {
-                "v" | "vertical" => Some(crate::pane::SplitDir::Vertical),
-                "h" | "horizontal" => Some(crate::pane::SplitDir::Horizontal),
-                _ => return USAGE.to_string(),
-            };
-        } else {
-            return USAGE.to_string();
-        }
-    }
-    match call_main(proxy, |tx| Wake::SpawnSession {
-        cwd,
-        split,
-        reply: tx,
-    }) {
+    match sent {
         Ok(Ok(sid)) => format!("OK {sid}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -2378,7 +2485,8 @@ pub(crate) fn cmd_panes(proxy: &EventLoopProxy<Wake>, session: Option<u64>) -> S
 
 #[cfg(test)]
 mod spawn_parse_tests {
-    use super::split_quoted_tokens;
+    use super::{SpawnForm, parse_spawn_args, split_quoted_tokens};
+    use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
 
     /// The BACKWARD-COMPATIBILITY leg: every `spawn` request that worked before
     /// quoting existed must tokenize byte-identically, or a quiet regression
@@ -2435,6 +2543,105 @@ mod spawn_parse_tests {
     #[test]
     fn an_unterminated_quote_is_rejected() {
         assert_eq!(split_quoted_tokens(r#"cwd="C:\Program Files"#), None);
+    }
+
+    #[test]
+    fn plain_spawn_parses_with_and_without_cwd() {
+        assert_eq!(
+            parse_spawn_args(""),
+            Ok(SpawnForm::Plain {
+                cwd: None,
+                split: None
+            })
+        );
+        assert_eq!(
+            parse_spawn_args("cwd=/tmp/x"),
+            Ok(SpawnForm::Plain {
+                cwd: Some("/tmp/x".to_string()),
+                split: None
+            })
+        );
+        assert_eq!(
+            parse_spawn_args("cwd=/tmp/x split=v"),
+            Ok(SpawnForm::Plain {
+                cwd: Some("/tmp/x".to_string()),
+                split: Some(crate::pane::SplitDir::Vertical)
+            })
+        );
+        // The quoted `cwd=` reaches the plain form through the same tokenizer.
+        assert_eq!(
+            parse_spawn_args(r#"cwd="C:\Program Files\Git""#),
+            Ok(SpawnForm::Plain {
+                cwd: Some(r"C:\Program Files\Git".to_string()),
+                split: None
+            })
+        );
+        assert_eq!(parse_spawn_args("bogus"), Err(()));
+        assert_eq!(parse_spawn_args("split=diagonal"), Err(()));
+        // An unterminated quote is malformed for the verb, not "to end of line".
+        assert_eq!(parse_spawn_args(r#"cwd="C:\Program Files"#), Err(()));
+    }
+
+    #[test]
+    fn connected_spawn_requires_the_full_explicit_form() {
+        // The complete form parses, cwd optional.
+        let full = parse_spawn_args("connected=controlled place=tab of=s-abc cwd=/w");
+        assert_eq!(
+            full,
+            Ok(SpawnForm::Connected {
+                kind: ConnectedSpawnKind::Controlled,
+                place: ConnectedSpawnPlace::Tab,
+                origin: aterm_session::SessionId::new("s-abc"),
+                cwd: Some("/w".to_string()),
+            })
+        );
+        assert!(matches!(
+            parse_spawn_args("connected=controller place=window of=s-abc"),
+            Ok(SpawnForm::Connected {
+                kind: ConnectedSpawnKind::Controller,
+                place: ConnectedSpawnPlace::Window,
+                ..
+            })
+        ));
+        // `of=` is MANDATORY when connected= is present (an authority-minting
+        // argument gets no guessed default — design §6) — and so is place=.
+        assert_eq!(parse_spawn_args("connected=controlled place=tab"), Err(()));
+        assert_eq!(parse_spawn_args("connected=controlled of=s-abc"), Err(()));
+        assert_eq!(parse_spawn_args("connected=controlled"), Err(()));
+        // A stray place=/of= without connected= never means a plain spawn.
+        assert_eq!(parse_spawn_args("place=tab"), Err(()));
+        assert_eq!(parse_spawn_args("of=s-abc"), Err(()));
+        // Unknown values fail closed.
+        assert_eq!(
+            parse_spawn_args("connected=owner place=tab of=s-abc"),
+            Err(())
+        );
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=pane of=s-abc"),
+            Err(())
+        );
+        assert_eq!(parse_spawn_args("connected=controlled place=tab of="), Err(()));
+    }
+
+    /// The usage string the wire replies for every malformed form names the
+    /// WHOLE grammar (a caller sees the complete contract).
+    #[test]
+    fn spawn_usage_names_the_connected_grammar() {
+        assert!(super::SPAWN_USAGE.contains("connected=controlled|controller"));
+        assert!(super::SPAWN_USAGE.contains("place=window|tab"));
+        assert!(super::SPAWN_USAGE.contains("of=<sid>"));
+        assert!(super::SPAWN_USAGE.contains("split=<v|h>"));
+    }
+
+    /// `place=` already says where a connected newborn lands; a pane split is
+    /// not one of its two answers, so the pair is refused rather than one of
+    /// the two silently winning.
+    #[test]
+    fn connected_and_split_are_mutually_exclusive() {
+        assert_eq!(
+            parse_spawn_args("connected=controlled place=tab of=s-abc split=v"),
+            Err(())
+        );
     }
 }
 

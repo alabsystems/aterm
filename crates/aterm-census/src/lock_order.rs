@@ -298,6 +298,19 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         def_file: "crates/aterm-gui/src/control_query.rs",
     },
     GuardHelper {
+        // The SESSION-CONNECTIONS record store (design §1.3): the per-instance
+        // `(dst, src) -> ConnectionRecord` map behind one mutex. `records()` is
+        // method-shaped but is NOT one of the standard acquisition names, so
+        // its call sites carry no token and every caller's hold would be
+        // invisible — registration places those held-acquire edges instead.
+        // `self.records.lock()` inside `impl ConnectionTable`, so the identity
+        // takes the enclosing impl type exactly as the census's self-receiver
+        // rule spells it.
+        symbol: "records",
+        identity: "records",
+        def_file: "crates/aterm-gui/src/connections.rs",
+    },
+    GuardHelper {
         // The isearch prefix-narrowing stacks (SA-1): a grown query verifies
         // only the previous frame's lines, and the per-terminal frame stacks
         // live in one static behind this helper. Structurally the twin of
@@ -309,6 +322,21 @@ const GUARD_HELPERS: &[GuardHelper] = &[
         symbol: "narrow_sessions_lock",
         identity: "NARROW_SESSIONS",
         def_file: "crates/aterm-gui/src/control_query.rs",
+    },
+    GuardHelper {
+        // Operator claims/management hold the one host authority gate across
+        // their durable queue transition. Callers receive that guard through
+        // this helper, so the hold must remain visible to the lock graph.
+        symbol: "accepting_guard",
+        identity: "fleet_fault",
+        def_file: "crates/aterm-gui/src/operator_host.rs",
+    },
+    GuardHelper {
+        // Cleanup/reconciliation uses the same host authority gate through a
+        // distinct policy helper; it is the same lock identity, not a waiver.
+        symbol: "mutation_guard",
+        identity: "fleet_fault",
+        def_file: "crates/aterm-gui/src/operator_host.rs",
     },
 ];
 
@@ -3057,6 +3085,16 @@ mod tests {
                 .to_string(),
         ));
         files.push((
+            // The embedded operator's two guard-returning policy helpers both
+            // expose the same host authority mutex to their callers.
+            "crates/aterm-gui/src/operator_host.rs".to_string(),
+            "fn accepting_guard(&self) -> MutexGuard<'_, HostActuationGate> {\n    \
+             self.shared.fleet_fault.lock().unwrap()\n}\n\
+             fn mutation_guard(&self) -> MutexGuard<'_, HostActuationGate> {\n    \
+             self.shared.fleet_fault.lock().unwrap()\n}\n"
+                .to_string(),
+        ));
+        files.push((
             // The workspace's ONE process-environment mutation lock
             // (`aterm_log::env`). `scoped`/`scoped_unset` hold its guard across a
             // caller-supplied body, which is precisely the invisible hold this
@@ -3064,6 +3102,16 @@ mod tests {
             "crates/aterm-log/src/lib.rs".to_string(),
             "fn env_lock() -> MutexGuard<'static, ()> {\n    \
              ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())\n}\n"
+                .to_string(),
+        ));
+        files.push((
+            // The session-connections record store: a `&self` method whose
+            // name is outside the standard vocabulary, so the registry — not
+            // the token scan — is what makes its callers' holds visible.
+            "crates/aterm-gui/src/connections.rs".to_string(),
+            "impl ConnectionTable {\n    \
+             pub(crate) fn records(&self) -> MutexGuard<'_, Records> {\n        \
+             self.records.lock().unwrap_or_else(|p| p.into_inner())\n    }\n}\n"
                 .to_string(),
         ));
         // The registered vocabulary interior (VOCABULARY_INTERIORS):
@@ -4639,17 +4687,18 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 47 crates (46 until the K-2
+        // aterm-gui process surface, currently 49 crates (46 until the K-2
         // winit→engine key map moved out of aterm-types into its own
-        // `aterm-winit-keymap` crate; the SAME code, one more manifest). The
-        // exact member list is pinned by scan_set's
+        // `aterm-winit-keymap` crate, then +2 when the embedded operator put
+        // `aterm-agent` — and through it `aterm-ctl` — on the GUI's own
+        // dependency edge). The exact member list is pinned by scan_set's
         // derived_closure_matches_the_pinned_canary; this asserts the census
         // actually WALKS the derived set and reports its provenance +
         // exclusions in the transcript.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log
-                .contains("across 47 workspace crate(s) + 5 vendored crate(s)"),
+                .contains("across 49 workspace crate(s) + 5 vendored crate(s)"),
             "the census must report the full derived closure + the scanned vendored \
              crates:\n{}",
             out.log

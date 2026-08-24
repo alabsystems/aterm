@@ -158,6 +158,9 @@ use std::process::ExitCode;
 use aterm_types::control_socket::{self, SocketDirective};
 use aterm_uds::CtlStream;
 
+mod conn;
+pub use conn::conn_main_entry;
+
 /// Usage synopsis — the one-line invocation shape, shared by `--help` and the
 /// "no verb given" usage error so they never drift apart.
 const SYNOPSIS: &str = "aterm-ctl [--sock PATH | --pid PID] [--timeout SECS] <verb> [args...]";
@@ -609,6 +612,12 @@ fn front_door_fish(verbs: &str, flags: &[(&str, &str)], ctl_verbs: &str) -> Stri
     s.push_str(ctl_verbs);
     s.push_str("'\n");
     push_fish_ctl_flags(&mut s, "complete -c aterm -n '__fish_seen_subcommand_from ctl' ");
+    // The ONE binary also fronts `aterm conn` (the session-connections CLI,
+    // SESSION_CONNECTIONS.md §6.1), implemented in this crate — so its subverbs
+    // complete here, gated behind a seen `conn`, exactly as `ctl`'s do.
+    s.push_str("complete -c aterm -n '__fish_seen_subcommand_from conn' -a '");
+    s.push_str(conn::CONN_SUBVERBS);
+    s.push_str("'\n");
     for (flag, desc) in flags {
         s.push_str("complete -c aterm -n __fish_use_subcommand -l ");
         s.push_str(flag.trim_start_matches('-'));
@@ -1254,6 +1263,11 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
             let stdout = stdout_handle();
             let mut out = stdout.lock();
             out.write_all(help.as_bytes())?;
+            // End the guard explicitly before any later branch-local helper can
+            // acquire stdout. The branches are mutually exclusive at runtime;
+            // the explicit drop also makes that fact visible to the lexical
+            // lock-order census.
+            drop(out);
             return Ok(ExitCode::SUCCESS);
         } else if arg == "-V" || arg == "--version" {
             print_stdout_line(&format!("aterm-ctl {}", aterm_types::version::APP_VERSION))?;
@@ -1355,6 +1369,17 @@ fn real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
     let (selector, rest) = split_selector(&request_parts);
     let verb_tok = rest.first().map(String::as_str);
     let verb_args = rest.get(1..).unwrap_or(&[]);
+    if verb_tok == Some("operator-propose-bin") {
+        if selector.is_some() || !verb_args.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "operator-propose-bin reads one JSON proposal from stdin and takes no selector or inline arguments",
+            ));
+        }
+        let payload = read_stdin_payload()?;
+        validate_operator_proposal_size(payload.len())?;
+        return feed_bin_exchange(&path, "operator-propose-bin", &payload, deadline);
+    }
     if verb_tok == Some("feed-bin") {
         // The payload is stdin, not an inline argument; an inline token (e.g. a
         // bare length) has no client path and would only desync the frame.
@@ -1566,6 +1591,17 @@ fn read_stdin_payload() -> io::Result<Vec<u8>> {
         return Err(oversized_feed_bin_error());
     }
     Ok(buf)
+}
+
+fn validate_operator_proposal_size(size: usize) -> io::Result<()> {
+    if size > aterm_types::control_verbs::MAX_OPERATOR_PROPOSAL_BYTES {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "operator proposal exceeds the 65536-byte limit",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether a server status line reports a TIMEOUT outcome: a bare `OK timeout`
@@ -2359,6 +2395,15 @@ fn subscribe_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_proposal_limit_matches_the_server_protocol_bound() {
+        let limit = aterm_types::control_verbs::MAX_OPERATOR_PROPOSAL_BYTES;
+        assert!(validate_operator_proposal_size(limit).is_ok());
+        let error = validate_operator_proposal_size(limit + 1).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("65536-byte limit"));
+    }
 
     /// CLIENT-1: `cast`/`temporal` are BYTE-framed (`OK <nbytes>` + body) — gated by
     /// verb so their bodies stream to stdout instead of being DISCARDED (the old

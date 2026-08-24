@@ -127,6 +127,54 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
             A::LocalUi,
             C::Terminal,
         ),
+        // Session-connection spawn presets (design §2.3): peer/place ride as
+        // reducer parameters never id names (`command_registry.rs` rule — one
+        // fieldless id per parameterless act). `A::Owner` because each MINTS
+        // standing session-connection authority over the focused session (the
+        // OwnerOnly `invoke` fence twin); terminal content because the origin
+        // is the FOCUSED session.
+        M::NewControlledWindow => spec(
+            "session.connect_controlled_window",
+            S::Process,
+            A::Owner,
+            C::Terminal,
+        ),
+        M::NewControlledTab => spec(
+            "session.connect_controlled_tab",
+            S::Window,
+            A::Owner,
+            C::Terminal,
+        ),
+        M::NewControllerWindow => spec(
+            "session.connect_controller_window",
+            S::Process,
+            A::Owner,
+            C::Terminal,
+        ),
+        M::NewControllerTab => spec(
+            "session.connect_controller_tab",
+            S::Window,
+            A::Owner,
+            C::Terminal,
+        ),
+        // The connection PICKER (§2.5; parameterless — the chosen peer is a
+        // reducer parameter) and the instance-wide MAP (§5). Owner for the
+        // same mint-standing-authority / aggregated-disclosure reasons as the
+        // presets and the `flows` verb.
+        M::ConnectToSession => spec("session.connect_to", S::Window, A::Owner, C::Terminal),
+        M::ShowConnectionMap => spec("view.connections", S::App, A::Owner, C::Any),
+        // Configure/disconnect an EXISTING connection (§2.3): the peer is a
+        // reducer parameter (the picker/sheet resolve it), never an id name.
+        // Owner because both rewrite/dissolve standing session-connection
+        // authority; terminal content because the subject is the focused (or
+        // clicked-tab) session.
+        M::ConfigureConnection => spec(
+            "session.configure_connection",
+            S::Window,
+            A::Owner,
+            C::Terminal,
+        ),
+        M::DisconnectSession => spec("session.disconnect", S::Window, A::Owner, C::Terminal),
         // Compatibility spelling: the shipping action still closes the focused
         // pane/view. New UI uses `tab.close_tree` for whole-tree close.
         M::CloseTab => spec("view.close_focused", S::View, A::LocalUi, C::Any),
@@ -380,6 +428,51 @@ mod tests {
             menu_command(menu::MenuAction::SplitVertical).content,
             ContentRequirement::Any
         );
+        // The session-connection presets: one fieldless id per parameterless
+        // act (peer/place are parameters, never id names — the §2.3 [v5]
+        // command-id rule), Owner authority (they mint standing
+        // session-connection authority), terminal content (the origin is the
+        // focused session).
+        for (action, id) in [
+            (
+                menu::MenuAction::NewControlledWindow,
+                "session.connect_controlled_window",
+            ),
+            (
+                menu::MenuAction::NewControlledTab,
+                "session.connect_controlled_tab",
+            ),
+            (
+                menu::MenuAction::NewControllerWindow,
+                "session.connect_controller_window",
+            ),
+            (
+                menu::MenuAction::NewControllerTab,
+                "session.connect_controller_tab",
+            ),
+        ] {
+            let spec = menu_command(action);
+            assert_eq!(spec.id.as_str(), id);
+            assert_eq!(spec.authority, ActionAuthority::Owner, "{id} mints authority");
+            assert_eq!(spec.content, ContentRequirement::Terminal);
+        }
+        // The picker/map ids (§2.3 [v5]): stable fieldless identities, Owner
+        // authority (the picker mints, the map aggregates).
+        let connect_to = menu_command(menu::MenuAction::ConnectToSession);
+        assert_eq!(connect_to.id.as_str(), "session.connect_to");
+        assert_eq!(connect_to.authority, ActionAuthority::Owner);
+        let map = menu_command(menu::MenuAction::ShowConnectionMap);
+        assert_eq!(map.id.as_str(), "view.connections");
+        assert_eq!(map.authority, ActionAuthority::Owner);
+        // The configure/disconnect ids (§2.3): the peer stays a parameter —
+        // one stable fieldless id each — and both are Owner (they rewrite or
+        // dissolve standing session-connection authority).
+        let configure = menu_command(menu::MenuAction::ConfigureConnection);
+        assert_eq!(configure.id.as_str(), "session.configure_connection");
+        assert_eq!(configure.authority, ActionAuthority::Owner);
+        let disconnect = menu_command(menu::MenuAction::DisconnectSession);
+        assert_eq!(disconnect.id.as_str(), "session.disconnect");
+        assert_eq!(disconnect.authority, ActionAuthority::Owner);
     }
 
     #[test]

@@ -580,6 +580,8 @@ impl App {
                         attention: presentation.indicators.attention,
                         status_attention: false,
                     },
+                    // No session, no edge table, no connection role either.
+                    conn: None,
                     closable: presentation.closable,
                     tooltip: presentation.tooltip,
                 })
@@ -1188,6 +1190,59 @@ impl App {
             .collect()
     }
 
+    /// Stamp each tab's §4 connection role onto its presentation from the live
+    /// edge tables ([`crate::connections::roles_by_local`] — the §4.1 predicate
+    /// over the registry, tables only, no liveness qualifier). Runs inside
+    /// [`Self::refresh_window_tabs`] — the one funnel every structural change,
+    /// prompt relabel, and connect/disconnect repaint flows through — so both
+    /// strip renderers read the mark out of the same canonical presentation
+    /// snapshot as every other indicator, and a stale mark cannot outlive the
+    /// next strip push. `tab_connection_badge = false` stamps `None`: the MARK
+    /// is quieted, the connections themselves (and their non-visual `chrome`/
+    /// `edges` surfaces) are untouched.
+    fn stamp_tab_connection_roles(&mut self, wid: WindowId) {
+        let roles = if self.config.tab_connection_badge_or_default() {
+            crate::connections::roles_by_local(&self.store)
+        } else {
+            std::collections::HashMap::new()
+        };
+        let Some(ws) = self.windows.get(&wid) else {
+            return;
+        };
+        // OR-fold panes per tab (the `aggregate_presentations` discipline): a
+        // background pane's direction never hides behind the focused pane's —
+        // outbound + inbound across a split reads as Both.
+        let per_tab: Vec<Option<crate::tab_model::TabConnRole>> = ws
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| {
+                let (mut outbound, mut inbound) = (false, false);
+                tab.root.any_leaf(&mut |view| {
+                    if let Some(session) = self
+                        .view_store
+                        .get(*view)
+                        .copied()
+                        .and_then(crate::tab_model::View::terminal_session)
+                        && let Some(role) = roles.get(&session)
+                    {
+                        outbound |= role.outbound;
+                        inbound |= role.inbound;
+                    }
+                    false
+                });
+                crate::tab_model::TabConnRole::from_flags(outbound, inbound)
+            })
+            .collect();
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            for (index, conn) in per_tab.into_iter().enumerate() {
+                if let Some(tab) = ws.tab_set.tab_at_mut(index) {
+                    tab.presentation.conn = conn;
+                }
+            }
+        }
+    }
+
     /// Canonical, non-title chrome metadata paired by index with [`Self::tab_titles`].
     /// The presentation is the stable tab model's own value, never inferred from a
     /// title, PTY, URI, or native reducer state at paint time.
@@ -1195,13 +1250,17 @@ impl App {
         &self,
         wid: WindowId,
     ) -> Vec<crate::tab_bar::TabStripMetadata> {
-        self.windows.get(&wid).map_or_else(Vec::new, |ws| {
+        let mut metadata = self.windows.get(&wid).map_or_else(Vec::new, |ws| {
             ws.tab_set
                 .tabs()
                 .iter()
                 .map(|tab| crate::tab_bar::TabStripMetadata::from_presentation(&tab.presentation))
                 .collect()
-        })
+        });
+        // The App-pushed drag-to-connect drop-target highlight (design §3.2)
+        // rides the same snapshot to both strips.
+        self.stamp_conn_drop_target(wid, &mut metadata);
+        metadata
     }
 
     /// The per-tab chrome EXTENSIONS (hover tooltip + right-click context-menu
@@ -1396,6 +1455,11 @@ impl App {
         else {
             return chrome::TabChromeExt::default();
         };
+        // Read the connections epoch BEFORE any fact is gathered: a mutation
+        // racing this compose then leaves the cached entry already stale, so
+        // the next refresh recomposes — never the inverse (fresh epoch over
+        // stale facts, which would serve a revoked menu for 30 s, §2.4).
+        let connections_revision = self.connections.revision();
         // Tab Subject & Status owns the live activity line when it has anything
         // honest to say; the older generated summary remains the fallback so
         // nothing regresses while the two subsystems coexist (RFC §11).
@@ -1416,6 +1480,7 @@ impl App {
             && c.high_id == high_id
             && c.label == label
             && c.activity_revision == activity_revision
+            && c.connections_revision == connections_revision
         {
             return c.ext.clone();
         }
@@ -1450,13 +1515,18 @@ impl App {
                 return stale;
             }
         };
-        let (state, has_session) = {
+        let (state, has_session, sid) = {
             let g = self.store.read().unwrap_or_else(|p| p.into_inner());
             match g.by_local(session) {
-                Some(h) => (Some(h.state.as_str().to_string()), true),
-                None => (None, false),
+                Some(h) => (Some(h.state.as_str().to_string()), true, Some(h.sid.clone())),
+                None => (None, false, None),
             }
         };
+        // Connection facts AFTER the store guard above is dropped (the gather
+        // re-reads the registry itself — the clone-then-release discipline).
+        let connections = sid
+            .as_ref()
+            .map_or_else(Vec::new, |sid| self.connection_facts(sid));
         let timeline: Vec<chrome::TimelineNote> = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             // Walk the retained deque BACKWARDS and stop after the tail we keep:
@@ -1486,6 +1556,7 @@ impl App {
             state,
             has_session,
             timeline,
+            connections,
         };
         let ext = chrome::TabChromeExt {
             tooltip: chrome::compose_tooltip(&input),
@@ -1497,11 +1568,106 @@ impl App {
                 high_id,
                 label: label.to_string(),
                 activity_revision,
+                connections_revision,
                 composed_ms: now,
                 ext: ext.clone(),
             },
         );
         ext
+    }
+
+    /// Gather one session's §2.3 connection FACTS from the live edge tables —
+    /// the tables and ONLY the tables (the §4.1 mark rule: they are the
+    /// authority record, so a wire `grant` with no [`ConnectionRecord`] still
+    /// lists honestly). Per peer, both halves are folded: rows with `src = S`
+    /// in other sessions' tables are S's OUTBOUND authority, rows in S's own
+    /// table are INBOUND; both present ⇒ the `⇆` peer pair. The flow rung is
+    /// the family-row convention (write-input ⇒ push). Peer titles resolve
+    /// user meta title ▸ registry title (the fleet-glance rung); a foreign
+    /// src no local session owns titles `unknown`. Sorted by peer sid for a
+    /// stable menu. `live` is best-effort `false` throughout: lease/watcher
+    /// identity names control connections, not peer sessions, so per-peer
+    /// liveness cannot be attributed honestly today (absent = not live).
+    ///
+    /// Runs only on a chrome-cache MISS (epoch-gated by the connections
+    /// revision), so the table walk is authority-act rate, never per frame.
+    /// `pub(crate)`: the session picker gathers its peer rows through this
+    /// same fold, so the picker and the menu can never list peers differently.
+    pub(crate) fn connection_facts(
+        &self,
+        sid: &aterm_session::SessionId,
+    ) -> Vec<crate::session_chrome::ConnectionFact> {
+        use crate::session_chrome::{ConnDirection, ConnFlow, ConnectionFact};
+        #[derive(Default)]
+        struct Halves {
+            out_any: bool,
+            out_write: bool,
+            in_any: bool,
+            in_write: bool,
+        }
+        // Keyed by the sid STRING (SessionId is not Ord); BTreeMap gives the
+        // stable listing order.
+        let mut peers: std::collections::BTreeMap<String, (aterm_session::SessionId, Halves)> =
+            std::collections::BTreeMap::new();
+        for edge in crate::connections::all_edges(&self.store) {
+            if edge.src == edge.dst {
+                continue; // self-loops spell no connection (§1.5)
+            }
+            let (peer, outbound) = if edge.src == *sid {
+                (edge.dst, true)
+            } else if edge.dst == *sid {
+                (edge.src, false)
+            } else {
+                continue;
+            };
+            let write = matches!(edge.op, aterm_session::Op::WriteInput);
+            let entry = &mut peers
+                .entry(peer.as_str().to_string())
+                .or_insert_with(|| (peer, Halves::default()))
+                .1;
+            if outbound {
+                entry.out_any = true;
+                entry.out_write |= write;
+            } else {
+                entry.in_any = true;
+                entry.in_write |= write;
+            }
+        }
+        if peers.is_empty() {
+            return Vec::new();
+        }
+        let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+        peers
+            .into_values()
+            .map(|(peer, halves)| {
+                let peer_title = g.by_sid(&peer).map_or_else(
+                    || "unknown".to_string(),
+                    |h| {
+                        h.ctx
+                            .meta
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get("title")
+                            .map(str::to_string)
+                            .unwrap_or_else(|| h.title.clone())
+                    },
+                );
+                let (direction, push) = match (halves.out_any, halves.in_any) {
+                    (true, true) => (ConnDirection::Peer, halves.out_write),
+                    (true, false) => (ConnDirection::Outbound, halves.out_write),
+                    // (false, false) is unreachable: an entry exists only
+                    // because at least one half was folded.
+                    _ => (ConnDirection::Inbound, halves.in_write),
+                };
+                ConnectionFact {
+                    peer_sid: peer,
+                    peer_title,
+                    direction,
+                    kind: if push { ConnFlow::Push } else { ConnFlow::Pull },
+                    live: false,
+                }
+            })
+            .collect()
     }
 
     /// Full hover/accessibility context paired by index with [`Self::tab_titles`].
@@ -2079,6 +2245,203 @@ impl App {
         }
     }
 
+    /// Resolve + validate a CONNECTED spawn's origin and place BEFORE anything
+    /// is created (design §6 `spawn connected=` / the §2.3 presets) — the
+    /// headless-testable half of [`Self::spawn_connected_session`] (the spawn
+    /// itself needs the event loop). Returns the origin's local id and, for
+    /// `place=tab`, the window hosting it (the newborn lands beside the
+    /// origin). `place=window` under headless is the NEW `ERR headless` reply
+    /// (design §1.4#7): the `Wake::CreateWindow` arm silently ignores, but a
+    /// reply-bearing, authority-minting spawn must refuse honestly — and
+    /// BEFORE any create. `place=tab` stays headless-legal (tabs are logical).
+    pub(crate) fn connected_spawn_precheck(
+        &self,
+        place: crate::connections::ConnectedSpawnPlace,
+        origin: &aterm_session::SessionId,
+    ) -> Result<(u64, Option<WindowId>), String> {
+        let origin_local = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            match g.by_sid(origin) {
+                None => return Err("no such session".to_string()),
+                // A dead origin can neither drive nor be driven; its table's
+                // nonce already fails closed — refuse honestly (the `connect`
+                // verb's rule).
+                Some(h) if matches!(h.state, session_store::SessionState::Exited) => {
+                    return Err("exited".to_string());
+                }
+                Some(h) => h.local_id,
+            }
+        };
+        match place {
+            crate::connections::ConnectedSpawnPlace::Window => {
+                if self.headless {
+                    return Err("headless".to_string());
+                }
+                Ok((origin_local, None))
+            }
+            crate::connections::ConnectedSpawnPlace::Tab => {
+                let host = self
+                    .windows
+                    .keys()
+                    .find(|wid| self.terminal_view_location(**wid, origin_local).is_some())
+                    .copied();
+                match host {
+                    Some(host) => Ok((origin_local, Some(host))),
+                    None => Err("no window hosts the origin session".to_string()),
+                }
+            }
+        }
+    }
+
+    /// The session's shell-reported cwd by registry LOCAL id (raw, the
+    /// [`Self::tab_session_cwd`] rung without the tab resolution) — the
+    /// connected spawn's origin-cwd default (design §6: `cwd=` overrides it).
+    fn session_cwd_by_local(&self, local: u64) -> Option<String> {
+        let s = self.pool.get(local)?;
+        let term = term_lock(&s.term);
+        term.current_working_directory()
+            .filter(|c| !c.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Mint a CONNECTED spawn's `both` session connection through the ONE mint
+    /// path ([`crate::connections::connect_in`], design §1.4#2): controlled ⇒
+    /// the origin drives the newborn (`src=origin, dst=newborn`); controller ⇒
+    /// the newborn drives the origin. Split from the spawn so the mint half is
+    /// unit-testable against registered stub sessions (no PTY, no event loop).
+    pub(crate) fn mint_connected(
+        &self,
+        kind: crate::connections::ConnectedSpawnKind,
+        origin: &aterm_session::SessionId,
+        newborn: &aterm_session::SessionId,
+        surface: &str,
+    ) -> Result<(), String> {
+        let (src, dst) = match kind {
+            crate::connections::ConnectedSpawnKind::Controlled => (origin, newborn),
+            crate::connections::ConnectedSpawnKind::Controller => (newborn, origin),
+        };
+        let dst_ctx = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            match g.by_sid(dst) {
+                Some(h) => h.ctx.clone(),
+                None => return Err("no such session".to_string()),
+            }
+        };
+        if crate::connections::connect_in(
+            &self.connections,
+            src,
+            dst,
+            &dst_ctx.edges,
+            &dst_ctx.nonce,
+            aterm_session::ConnectionKind::Both,
+            surface,
+        ) {
+            Ok(())
+        } else {
+            // `connect_in` refuses only a self-loop — unreachable here (the
+            // newborn's sid is freshly generated), kept fail-closed.
+            Err("self-loop".to_string())
+        }
+    }
+
+    /// The CONNECTED-SPAWN presets end-to-end (design §2.3 / §6 `spawn
+    /// connected=`), shared by the menu dispatch (`surface="ui"`) and the wire
+    /// handler (`Wake::SpawnConnectedSession`, `surface="wire"`): precheck,
+    /// spawn the newborn at `place` (lineage parent = origin for CONTROLLED;
+    /// `ATERM_OBSERVE_SESSION_ID` env for CONTROLLER), then mint the ONE
+    /// `both` connection and refresh the §4 marks. Returns the newborn's sid
+    /// (the wire `OK <sid>` body). The newborn is found by REGISTRY DIFF (the
+    /// [`Self::spawn_tab_session`] idiom) so a concurrently exiting session
+    /// can never be misattributed.
+    pub(crate) fn spawn_connected_session(
+        &mut self,
+        el: &ActiveEventLoop,
+        kind: crate::connections::ConnectedSpawnKind,
+        place: crate::connections::ConnectedSpawnPlace,
+        origin: &aterm_session::SessionId,
+        cwd: Option<String>,
+        surface: &str,
+    ) -> Result<String, String> {
+        use crate::connections::{ConnectedSpawnKind as Kind, ConnectedSpawnPlace as Place};
+        let (origin_local, host) = self.connected_spawn_precheck(place, origin)?;
+        // Default the newborn's cwd to the ORIGIN's (design §6): the `of=`
+        // target need not be the front pane the plain-spawn default would read.
+        let cwd = cwd.or_else(|| self.session_cwd_by_local(origin_local));
+        let lineage_parent = matches!(kind, Kind::Controlled).then(|| origin.clone());
+        let observe = matches!(kind, Kind::Controller).then(|| origin.clone());
+        let before: std::collections::HashSet<aterm_session::SessionId> = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            g.snapshot().iter().map(|h| h.sid.clone()).collect()
+        };
+        match place {
+            Place::Window => {
+                if self
+                    .create_window_internal_connected(
+                        el,
+                        cwd.as_deref(),
+                        None,
+                        lineage_parent,
+                        observe.as_ref(),
+                    )
+                    .is_none()
+                {
+                    return Err("could not open a new window".to_string());
+                }
+            }
+            Place::Tab => {
+                // Precheck resolved the hosting window for every Tab place.
+                let host = host.expect("tab precheck resolves a host window");
+                self.open_tab_in_cwd_observing(host, cwd.as_deref(), observe.as_ref());
+            }
+        }
+        let newborn = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            g.snapshot().into_iter().find(|h| !before.contains(&h.sid))
+        };
+        let Some(newborn) = newborn else {
+            return Err("session did not spawn".to_string());
+        };
+        self.mint_connected(kind, origin, &newborn.sid, surface)?;
+        // First-use notice (design §1.4#8): once per config lifetime, on the
+        // first UI-ORIGINATED connect only — wire callers read the reply.
+        if surface == "ui"
+            && crate::connections::first_use_notice_should_show(crate::app_config::config_path())
+        {
+            self.notice = Some(crate::notice::TransientNotice::session_connection(
+                crate::connections::first_use_notice_text(kind),
+                std::time::Instant::now(),
+            ));
+        }
+        // The tables changed ON the main thread — no wake round-trip needed:
+        // run the `Wake::ConnectionsChanged` body directly.
+        self.refresh_connection_surfaces();
+        Ok(newborn.sid.as_str().to_string())
+    }
+
+    /// Re-stamp every window's §4 tab marks through the one strip funnel and
+    /// repaint — the `Wake::ConnectionsChanged` body, also run directly by
+    /// main-thread minters (the connected-spawn presets) whose authority act
+    /// never crossed the control thread. Authority-act rate, all windows (a
+    /// connection's endpoints may sit in different windows).
+    pub(crate) fn refresh_connection_surfaces(&mut self) {
+        let wids: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            let _ = self.refresh_window_tabs(wid);
+        }
+        // The §5 map is a connection surface too: any OPEN map re-snapshots
+        // the graph now (selection surviving by identity) rather than serving
+        // revoked arrows until its next open.
+        self.connection_map_refresh_all();
+        // So is the ❯ status item (§5.1 — its menu renders the connections
+        // count). The per-window loop above reaches it through the
+        // `refresh_window_tabs` title funnel, but the bar item OUTLIVES
+        // windows — a wire mint after the last window closed would otherwise
+        // serve the stale count. Fingerprint-gated, so the double visit on the
+        // windowed path costs one string compare.
+        self.refresh_operator_status_item();
+        self.request_redraw_all_windows();
+    }
+
     /// REGISTRY snapshot → [`crate::status_item::SessionRow`]s (effective
     /// title + typed `role`/`attention`, one leaf-lock take per row) →
     /// `classify`, then join the window rows (id order, composed chrome
@@ -2140,6 +2503,12 @@ impl App {
         // Start is only offered when the agent CLI is actually launchable —
         // otherwise the menu would type a command the shell cannot find.
         glance.start_available = operator_cli_on_path();
+        // Not a title fact: the connections count (design §5.1) comes from the
+        // live edge fold — the store read guard above is already released, so
+        // the brief per-table locks inside honor the no-store-lock-across-a-
+        // table-lock discipline. Same cost class as the marks' roles fold,
+        // which already rides this refresh rate.
+        glance.connections = crate::connections::connection_count(&self.store);
         glance
     }
 
@@ -2299,6 +2668,15 @@ impl App {
                 }
                 self.refresh_operator_status_item();
             }
+            crate::status_item::OperatorAction::ShowConnectionMap => {
+                // §5.1 host+raise: the map opens on the frontmost window and
+                // raises/focuses it (`open_connection_map` does both). With no
+                // window resolvable this logs and moves on — the palette-enter
+                // precedent, exactly the `MenuAction::ShowConnectionMap` arm.
+                if let Err(e) = self.open_connection_map() {
+                    aterm_log::info!("connection map: {e}");
+                }
+            }
         }
     }
 
@@ -2322,6 +2700,41 @@ impl App {
             w.focus_window();
         }
         true
+    }
+
+    /// `raise <sid>` (the `Wake::RaiseSession` body): the
+    /// [`Self::dispatch_operator_action`] Show shape for an ARBITRARY session —
+    /// find the window hosting it, select its tab, focus the window. `Err` when
+    /// no window shows the session (headless, or a view the strips dropped) so
+    /// the wire verb reports honestly instead of silently succeeding. ONE body
+    /// with the menu path ([`Self::focus_session_window`]) — a raise from the
+    /// wire and a raise from a menu row cannot drift, de-miniaturize belt
+    /// included.
+    ///
+    /// SPEC (design §9: the window-routing obligations): this real seam IS the
+    /// `WindowRouting.RaiseSession` action — a pure focus re-point of
+    /// `frontmost` onto an already-allocated id (the host window's), minting
+    /// and destroying nothing and never exiting. The `#[refines]` keeps
+    /// `window_routing` fully bound now that the act exists; Tier-1 drives this
+    /// seam in `window_routing_conformance` (headless, the OS-focus half is a
+    /// windowed concern, so the projected step may be the model-admitted
+    /// `frontmost' = frontmost` stutter). PROJECTION
+    /// (`aterm_gui::App::project_window_routing`): the
+    /// `window_routing_conformance::project` tuple.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "window_routing",
+            action = "RaiseSession",
+            project = "aterm_gui::App::project_window_routing"
+        )
+    )]
+    pub(crate) fn raise_session_by_id(&mut self, session: u64) -> Result<(), String> {
+        if self.focus_session_window(session) {
+            Ok(())
+        } else {
+            Err("no such session".to_string())
+        }
     }
 
     /// MRU bookkeeping for a menu-driven raise, skipped when the id already
@@ -2386,6 +2799,19 @@ impl App {
     /// `None` keeps the default: inherit the focused pane's cwd so a Cmd-T tab opens
     /// where the user is.
     pub(crate) fn open_tab_in_cwd(&mut self, owner: WindowId, cwd_override: Option<&str>) {
+        self.open_tab_in_cwd_observing(owner, cwd_override, None);
+    }
+
+    /// [`open_tab_in_cwd`] with the per-spawn CONTROLLER observation hint
+    /// threaded through (session connections §2.3: a controller-as-tab preset
+    /// injects `ATERM_OBSERVE_SESSION_ID=<origin>` into the newborn's shell).
+    /// Every non-connected caller goes through the `None` wrapper above.
+    pub(crate) fn open_tab_in_cwd_observing(
+        &mut self,
+        owner: WindowId,
+        cwd_override: Option<&str>,
+        observe: Option<&aterm_session::SessionId>,
+    ) {
         if !self.windows.contains_key(&owner) {
             return;
         }
@@ -2411,6 +2837,7 @@ impl App {
             &self.session_factory,
             &proxy,
             cwd.as_deref(),
+            observe,
             None, // fresh shell (not a seamless-update adoption)
         ) {
             Ok(session) => {
@@ -2694,6 +3121,10 @@ impl App {
         // terminal tab (see `composed_session_chrome`), and the strip receives
         // titles/metadata/chrome as ONE consistent snapshot.
         let ext = self.tab_chrome_ext(wid, &titles);
+        // The §4 connection mark rides the same consistent snapshot: stamped
+        // from the live edge tables here, so `metadata` below carries it to
+        // both strips (and into the in-grid fingerprint) at once.
+        self.stamp_tab_connection_roles(wid);
         let metadata = self.tab_strip_metadata(wid);
         let tooltips = self.tab_tooltips(wid);
         let active = self
@@ -3229,13 +3660,8 @@ impl App {
             .ok_or_else(|| "focused view ownership could not detach".to_string())?;
         if let crate::tab_model::View::Terminal(terminal) = removed_link
             && self.detach_session_view(terminal.session)
-            && let Some(stable) = self
-                .store
-                .write()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .deregister_local(terminal.session)
         {
-            crate::proxy::unpublish_session(&stable);
+            self.retire_session_registration(terminal.session);
         }
         self.retain_closed_view(recovery);
         self.refresh_aggregate_tab_presentation(wid, tab_id);
@@ -3812,6 +4238,26 @@ impl App {
                     ws.pending_close = true;
                 }
             }
+            // The CONNECTOR — the tab's status-mark cell (design §3.1 [v5]).
+            // This column ALONE is arm-on-press / commit-on-release (every
+            // other strip click stays press-committed as before): the press
+            // arms the drag-to-connect gesture, a release within the movement
+            // threshold opens the session Connections context menu WITHOUT
+            // selecting the tab (`App::conn_drag_release`), and movement past
+            // the threshold becomes a connection drag (`App::conn_drag_motion`
+            // — the native renderer runs the same disambiguation and likewise
+            // suppresses SelectTab). Not a chip press for the double-click
+            // streak, and it is a click away from an open rename.
+            tab_bar::TabHit::Connector(i) => {
+                self.clear_strip_press(wid);
+                self.settle_rename_edit(wid);
+                if !self.conn_drag_arm(wid, i) {
+                    // No live session under the chip (a native tab): nothing
+                    // to drag — the menu still opens, press-committed as the
+                    // pre-drag behavior did, and WITHOUT selecting (§3.1).
+                    let _ = self.open_connector_menu(wid, i, col);
+                }
+            }
         }
         if let Some(ws) = self.windows.get(&wid)
             && let Some(w) = &ws.os_window
@@ -3881,17 +4327,52 @@ impl App {
     /// caller that gets `false` must let the gesture fall through to whatever it
     /// would have done before.
     ///
-    /// Both real callers (the strip's right press, Shift+F10 / the Menu key)
-    /// are `#[cfg(windows)]` — macOS pops a real `NSMenu` off the native strip
-    /// instead, and the card is not offered on Linux (see the `Chrome` arm in
-    /// `app_mouse`) — so off Windows this is reachable only from tests.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// The RIGHT-PRESS and keyboard callers (the strip's right press,
+    /// Shift+F10 / the Menu key) are `#[cfg(windows)]` — macOS pops a real
+    /// `NSMenu` off the native strip instead, and the card is not offered on
+    /// Linux (see the `Chrome` arm in `app_mouse`). The CONNECTOR caller
+    /// ([`Self::open_connector_menu`], design §3.1 [v5]) is cross-platform:
+    /// the status-mark cell is a new hit target, not a changed gesture, and it
+    /// opens the same card everywhere the in-grid strip is drawn.
     pub(crate) fn open_tab_context_menu(
         &mut self,
         wid: WindowId,
         index: usize,
         anchor_col: u16,
         keyboard: bool,
+    ) -> bool {
+        self.open_tab_context_menu_inner(wid, index, anchor_col, keyboard, true)
+    }
+
+    /// The CONNECTOR's opening (design §3.1 [v5]): the same card, anchored at
+    /// `anchor_col`, but WITHOUT the select-first rule above.
+    ///
+    /// The right-press selects because a context menu's subject must be the
+    /// tab the user is looking at. The connector is the opposite gesture: it is
+    /// a per-tab affordance whose menu already names its own tab, and the very
+    /// next thing the hand may do is drag FROM it onto another session — so
+    /// switching the front tab out from under that gesture would both steal the
+    /// grid and contradict §3.1 ("the connector press never selects the tab").
+    /// The native strip suppresses `SelectTab` on the connector press for the
+    /// same reason; this is the in-grid half of one rule.
+    pub(crate) fn open_connector_menu(
+        &mut self,
+        wid: WindowId,
+        index: usize,
+        anchor_col: u16,
+    ) -> bool {
+        self.open_tab_context_menu_inner(wid, index, anchor_col, false, false)
+    }
+
+    /// The shared body. `select` is the ONE difference between the two
+    /// openings, kept as a parameter rather than a second copy of the pop.
+    fn open_tab_context_menu_inner(
+        &mut self,
+        wid: WindowId,
+        index: usize,
+        anchor_col: u16,
+        keyboard: bool,
+        select: bool,
     ) -> bool {
         // No strip, no menu. The card hangs BELOW the band, so with
         // `tab_strip_rows = 0` it would float at the top of the terminal grid
@@ -3920,7 +4401,9 @@ impl App {
         // field you then right-click is kept, not dropped).
         self.clear_strip_press(wid);
         self.settle_rename_edit(wid);
-        if self.windows.get(&wid).and_then(|ws| ws.tab_set.active_index()) != Some(index) {
+        if select
+            && self.windows.get(&wid).and_then(|ws| ws.tab_set.active_index()) != Some(index)
+        {
             self.switch_tab_in(wid, index);
         }
         // Seeded to the first enabled action only for a KEYBOARD open: a card
@@ -3971,12 +4454,17 @@ impl App {
         else {
             return false;
         };
-        // The chip's own start column, read off the SAME laid-out segments the
-        // strip painted, so the card lines up with the tab it belongs to. A
-        // window whose segments have not been laid out yet (no frame drawn)
-        // falls back to column 0 — flush left, still under the band.
-        let anchor = self
-            .windows
+        let anchor = self.tab_chip_anchor_col(wid, index);
+        self.open_tab_context_menu(wid, index, anchor, true)
+    }
+
+    /// C5 — the chip's own start column, read off the SAME laid-out segments
+    /// the strip painted, so a card opened without a pointer still lines up
+    /// with the tab it belongs to. A window whose segments have not been laid
+    /// out yet (no frame drawn) falls back to column 0 — flush left, still
+    /// under the band.
+    fn tab_chip_anchor_col(&self, wid: WindowId, index: usize) -> u16 {
+        self.windows
             .get(&wid)
             .and_then(|ws| {
                 ws.tab_segments
@@ -3984,8 +4472,16 @@ impl App {
                     .find(|seg| seg.kind == tab_bar::TabHit::Select(index))
                     .map(|seg| seg.start_col)
             })
-            .unwrap_or(0);
-        self.open_tab_context_menu(wid, index, anchor, true)
+            .unwrap_or(0)
+    }
+
+    /// C5 — open the CONNECTOR's menu for chip `index` with no pointer column
+    /// of its own (the connection-drag release-in-place path): anchored at the
+    /// chip, not keyboard-seeded (the gesture that opened it was a press), and
+    /// not selecting (§3.1 — it is the same connector press).
+    pub(crate) fn open_tab_context_menu_at_chip(&mut self, wid: WindowId, index: usize) -> bool {
+        let anchor = self.tab_chip_anchor_col(wid, index);
+        self.open_connector_menu(wid, index, anchor)
     }
 
     /// C5 — dismiss any open tab context menu on `wid`. Returns whether one was
@@ -4156,14 +4652,8 @@ impl App {
         align_terminal_projection_to_active(ws, &self.view_store);
         self.remove_tab_views(&stable_tab);
         for sid in closing {
-            if self.detach_session_view(sid)
-                && let Some(stable) = self
-                    .store
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .deregister_local(sid)
-            {
-                crate::proxy::unpublish_session(&stable);
+            if self.detach_session_view(sid) {
+                self.retire_session_registration(sid);
             }
         }
         if let Some(tab) = recovery {
@@ -4435,15 +4925,41 @@ impl App {
     /// view remains: `pool.detach` returns `true` iff the view count hit 0. A later
     /// `@<selector>` to a genuinely-closed id fail-closes (unknown -> Deny).
     pub(crate) fn teardown_session(&mut self, id: u64) {
-        let dropped = self.detach_session_view(id);
-        if dropped
-            && let Some(stable) = self
-                .store
-                .write()
-                .unwrap_or_else(|p| p.into_inner())
-                .deregister_local(id)
-        {
+        if self.detach_session_view(id) {
+            self.retire_session_registration(id);
+        }
+    }
+
+    /// Retire everything keyed by a DROPPED session's stable sid — the shared tail
+    /// of every mid-run close path, called only after `detach_session_view`
+    /// returned `true` (the view count actually hit 0): deregister from the
+    /// process-wide registry (P1.1), retire the sibling-discovery graph entry,
+    /// then run the close-time CONNECTION sweep (design §1.4#4) — drop the closed
+    /// session's connection records and revoke every edge row it was the SOURCE
+    /// of in the surviving sessions' tables. The sweep is a security OBLIGATION,
+    /// not bookkeeping: a row's nonce is the DESTINATION's, so source death does
+    /// not fail closed by nonce, and token hexes are non-enumerable — this sweep
+    /// is those rows' only dissolution path. The deregister is a bound statement
+    /// (not an `if let` scrutinee) so the store write guard is DROPPED before the
+    /// sweep re-reads the registry for the survivors' tables.
+    pub(crate) fn retire_session_registration(&mut self, id: u64) {
+        let stable = self
+            .store
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .deregister_local(id);
+        if let Some(stable) = stable {
             crate::proxy::unpublish_session(&stable);
+            // Through the App's own store handle (the process singleton in a
+            // real run) so the §2.4 freshness bump lands where the chrome
+            // cache reads it — private-store tests included.
+            crate::connections::sweep_session_closed_in(&self.connections, &stable, &self.store);
+            // The sweep dissolves edges with NO wake funnel of its own: the
+            // marks and menus recompose through the close path's later strip
+            // refresh (revision-gated), but an OPEN §5 map re-snapshots only
+            // when told — retarget it now or it serves the dead session's
+            // chip and arrows until the next unrelated authority act.
+            self.connection_map_refresh_all();
         }
     }
 }
@@ -6163,6 +6679,193 @@ mod session_chrome_app_tests {
         );
     }
 
+    /// One session's registry endpoint identity, as the fixture returns it.
+    type Endpoint = (aterm_session::SessionId, std::sync::Arc<crate::SessionCtx>);
+
+    /// Two registered stub sessions in one window plus their `(sid, ctx)`
+    /// pairs — the session-connections fixture.
+    fn connected_pair_app() -> (App, Endpoint, Endpoint) {
+        let mut app = App::headless_for_test();
+        app.push_stub_tab(WindowId(0), crate::stub_session(app.next_session_id));
+        let (a, b) = {
+            let g = app.store.read().unwrap();
+            let a = g.by_local(0).expect("session 0 registered");
+            let b = g.by_local(1).expect("session 1 registered");
+            ((a.sid.clone(), a.ctx.clone()), (b.sid.clone(), b.ctx.clone()))
+        };
+        (app, a, b)
+    }
+
+    /// The ❯ status item's glance (design §5.1): the connections count is
+    /// filled from the live edge fold — a mint moves it AND the fingerprint
+    /// (so the fingerprint-gated menu actually rebuilds), a dissolve returns
+    /// it, and the several op rows one `Both` mints stay ONE counted
+    /// connection (the map's one-arrow-per-direction rule).
+    #[test]
+    fn operator_fleet_glance_counts_connections_and_moves_the_fingerprint() {
+        let (app, (a_sid, a_ctx), (b_sid, b_ctx)) = connected_pair_app();
+        let before = app.operator_fleet_glance();
+        assert_eq!(before.connections, 0);
+        assert!(crate::connections::connect_in(
+            &app.connections,
+            &a_sid,
+            &b_sid,
+            &b_ctx.edges,
+            &b_ctx.nonce,
+            aterm_session::ConnectionKind::Both,
+            "test"
+        ));
+        let minted = app.operator_fleet_glance();
+        assert_eq!(minted.connections, 1, "one directed pair, however many ops");
+        assert_ne!(
+            before.fingerprint(),
+            minted.fingerprint(),
+            "the count is a rendered fact — it must move the fingerprint"
+        );
+        // The reverse direction is a SECOND connection…
+        assert!(crate::connections::connect_in(
+            &app.connections,
+            &b_sid,
+            &a_sid,
+            &a_ctx.edges,
+            &a_ctx.nonce,
+            aterm_session::ConnectionKind::Pull,
+            "test"
+        ));
+        assert_eq!(app.operator_fleet_glance().connections, 2);
+        // …and dissolving one leaves the other honestly counted.
+        assert!(crate::connections::disconnect_in(
+            &app.connections,
+            &a_sid,
+            &b_sid,
+            &b_ctx.edges,
+            "test"
+        ));
+        assert_eq!(app.operator_fleet_glance().connections, 1);
+    }
+
+    /// §2.4 [v5] + the §9 obligation ("the menu model updates without cache
+    /// expiry after a wire grant"): a connection mint/dissolve moves NO other
+    /// cache epoch — no timeline record, no label drift, no activity — so the
+    /// connections revision must invalidate the cached ext by itself, on BOTH
+    /// endpoints' chrome, immediately rather than at the 30 s backstop.
+    #[test]
+    fn connection_acts_invalidate_the_chrome_cache_without_expiry() {
+        let (mut app, (a_sid, _a_ctx), (b_sid, b_ctx)) = connected_pair_app();
+        let titles = app.tab_titles(WindowId(0));
+        let before = app.tab_chrome_ext(WindowId(0), &titles);
+        assert!(
+            !before[0]
+                .menu
+                .iter()
+                .any(|e| matches!(e, TabMenuEntry::ConnectionAction { .. })),
+            "no per-peer rows before any connection exists"
+        );
+        // Mint A → B through the App's OWN store (what the menu paths and —
+        // via the shared singleton — the wire `connect` verb do).
+        assert!(crate::connections::connect_in(
+            &app.connections,
+            &a_sid,
+            &b_sid,
+            &b_ctx.edges,
+            &b_ctx.nonce,
+            aterm_session::ConnectionKind::Both,
+            "test"
+        ));
+        let fresh = app.tab_chrome_ext(WindowId(0), &titles);
+        let tip_a = fresh[0].tooltip.as_deref().unwrap_or_default();
+        assert!(
+            tip_a.contains("\u{21e5} pushes into"),
+            "A recomposed with its outbound line, no expiry needed: {tip_a:?}"
+        );
+        assert!(
+            fresh[0].menu.iter().any(|e| matches!(
+                e,
+                TabMenuEntry::ConnectionAction {
+                    verb: crate::session_chrome::ConnVerb::Disconnect,
+                    peer_sid,
+                    ..
+                } if *peer_sid == b_sid
+            )),
+            "A's menu grew the peer's Disconnect row"
+        );
+        let tip_b = fresh[1].tooltip.as_deref().unwrap_or_default();
+        assert!(
+            tip_b.contains("\u{21e4} pushed by"),
+            "B recomposed with the inbound inverse: {tip_b:?}"
+        );
+        // Dissolve — again with no other epoch movement — and both clear.
+        assert!(crate::connections::disconnect_in(
+            &app.connections,
+            &a_sid,
+            &b_sid,
+            &b_ctx.edges,
+            "test"
+        ));
+        let cleared = app.tab_chrome_ext(WindowId(0), &titles);
+        for (i, ext) in cleared.iter().enumerate() {
+            assert!(
+                !ext.menu
+                    .iter()
+                    .any(|e| matches!(e, TabMenuEntry::ConnectionAction { .. })),
+                "tab {i} still lists a dissolved connection"
+            );
+        }
+    }
+
+    /// The context-menu Disconnect dispatch (`Wake::TabMenuConnection`)
+    /// dissolves BOTH directions of the clicked pair — records and rows —
+    /// and Show raises the PEER's tab; both resolve the clicked tab by its
+    /// pop-time STABLE id.
+    #[test]
+    fn tab_menu_connection_dispatch_disconnects_and_shows_the_peer() {
+        let (mut app, (a_sid, a_ctx), (b_sid, b_ctx)) = connected_pair_app();
+        let wid = WindowId(0);
+        // A ⇆ B: two records, rows in both tables.
+        for (src, dst, ctx) in [(&a_sid, &b_sid, &b_ctx), (&b_sid, &a_sid, &a_ctx)] {
+            assert!(crate::connections::connect_in(
+                &app.connections,
+                src,
+                dst,
+                &ctx.edges,
+                &ctx.nonce,
+                aterm_session::ConnectionKind::Both,
+                "test"
+            ));
+        }
+        // Show, clicked on A's tab (tab 0), targets the PEER: the window
+        // switches to B's tab.
+        let tab_a = app.windows[&wid].tab_set.tabs()[0].id;
+        app.dispatch_tab_menu_connection(
+            wid,
+            tab_a,
+            &b_sid,
+            crate::session_chrome::ConnVerb::Show,
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.active_index(),
+            Some(1),
+            "Show raises the peer's tab"
+        );
+        // Disconnect on A's tab against peer B: BOTH directions dissolve.
+        app.dispatch_tab_menu_connection(
+            wid,
+            tab_a,
+            &b_sid,
+            crate::session_chrome::ConnVerb::Disconnect,
+        );
+        assert!(app.connections.records().is_empty(), "both records gone");
+        assert!(a_ctx.edges.lock().unwrap().is_empty(), "B → A rows gone");
+        assert!(b_ctx.edges.lock().unwrap().is_empty(), "A → B rows gone");
+        // A stale (closed-tab) id drops the action instead of guessing.
+        app.dispatch_tab_menu_connection(
+            wid,
+            crate::tab_model::TabId::from_stored(u64::MAX),
+            &b_sid,
+            crate::session_chrome::ConnVerb::Disconnect,
+        );
+    }
+
     /// REGRESSION (stale-index context menu, close half): when the CLICKED tab
     /// closes while its menu is open, the pop-time id resolves to `None` and
     /// the dispatcher drops the action — it must never fall back to the frozen
@@ -6688,4 +7391,126 @@ fn operator_cli_on_path() -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
     })
+}
+
+#[cfg(test)]
+mod connected_spawn_tests {
+    use super::*;
+    use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
+    use aterm_session::{Op, SessionId};
+
+    /// Register a second stub session in `app`'s registry (the mint half of a
+    /// connected spawn only needs the store) and park it in the pool so its
+    /// ctx Arcs stay shared with the registered handle.
+    fn register_stub(app: &mut App, id: u64) -> SessionId {
+        let s = crate::stub_session(id);
+        let sid = s.ctx.self_id.clone();
+        App::register_session(&app.store, &s, None);
+        app.pool.insert(s);
+        sid
+    }
+
+    fn session0_sid(app: &App) -> SessionId {
+        app.store
+            .read()
+            .unwrap()
+            .by_local(0)
+            .expect("harness registers session 0")
+            .sid
+            .clone()
+    }
+
+    /// The §6 precheck contract: `place=window` under headless is the NEW
+    /// `ERR headless` refusal (checked BEFORE any create — the wire wrapper
+    /// formats this exact `Err` body as `ERR headless`); `place=tab` stays
+    /// headless-legal and resolves the window hosting the origin; an unknown
+    /// or Exited `of=` fails closed.
+    #[test]
+    fn precheck_refuses_headless_window_and_dead_origins_but_allows_tabs() {
+        let app = App::headless_for_test();
+        let sid0 = session0_sid(&app);
+        assert_eq!(
+            app.connected_spawn_precheck(ConnectedSpawnPlace::Window, &sid0),
+            Err("headless".to_string()),
+            "place=window under headless refuses BEFORE any create (design §1.4#7)"
+        );
+        assert_eq!(
+            app.connected_spawn_precheck(ConnectedSpawnPlace::Tab, &sid0),
+            Ok((0, Some(WindowId(0)))),
+            "place=tab is headless-legal and lands beside the origin"
+        );
+        assert_eq!(
+            app.connected_spawn_precheck(ConnectedSpawnPlace::Tab, &SessionId::new("s-nope")),
+            Err("no such session".to_string())
+        );
+        app.store
+            .write()
+            .unwrap()
+            .set_state(0, session_store::SessionState::Exited);
+        assert_eq!(
+            app.connected_spawn_precheck(ConnectedSpawnPlace::Tab, &sid0),
+            Err("exited".to_string()),
+            "a dead origin can neither drive nor be driven"
+        );
+    }
+
+    /// The mint half of a CONTROLLED spawn: the origin gains a `both`
+    /// connection over the newborn — three rows in the NEWBORN's table, all
+    /// `src=origin`, exactly the set the `edges` verb (and the §4 roles fold)
+    /// reads. A CONTROLLER spawn inverts: the rows land in the ORIGIN's table
+    /// with the newborn as src.
+    #[test]
+    fn mint_connected_writes_a_both_connection_in_the_right_direction() {
+        let mut app = App::headless_for_test();
+        let origin = session0_sid(&app);
+        let newborn = register_stub(&mut app, 41);
+
+        assert_eq!(
+            app.mint_connected(ConnectedSpawnKind::Controlled, &origin, &newborn, "test"),
+            Ok(())
+        );
+        let rows = {
+            // Clone-then-release (the registry discipline): no store lock held
+            // across the table lock, even in a test.
+            let ctx = {
+                let g = app.store.read().unwrap();
+                g.by_sid(&newborn).unwrap().ctx.clone()
+            };
+            let edges = ctx.edges.lock().unwrap();
+            edges.edges()
+        };
+        assert_eq!(rows.len(), 3, "both = pull + push = 3 ops: {rows:?}");
+        for row in &rows {
+            assert_eq!(row.src, origin, "the origin drives the newborn");
+            assert_eq!(row.dst, newborn);
+        }
+        let ops: Vec<Op> = rows.iter().map(|e| e.op).collect();
+        for op in [Op::ReadScreen, Op::WriteInput, Op::Signal] {
+            assert!(ops.contains(&op), "missing {op:?} in {ops:?}");
+        }
+        // The §4 roles fold sees it (the marks read exactly these tables).
+        let roles = crate::connections::roles_by_local(&app.store);
+        assert!(roles[&0].outbound && !roles[&0].inbound);
+        assert!(roles[&41].inbound && !roles[&41].outbound);
+
+        // CONTROLLER inverts src/dst: rows in the ORIGIN's table.
+        let supervisor = register_stub(&mut app, 42);
+        assert_eq!(
+            app.mint_connected(ConnectedSpawnKind::Controller, &origin, &supervisor, "test"),
+            Ok(())
+        );
+        let origin_rows = {
+            let ctx = {
+                let g = app.store.read().unwrap();
+                g.by_sid(&origin).unwrap().ctx.clone()
+            };
+            let edges = ctx.edges.lock().unwrap();
+            edges.edges()
+        };
+        assert_eq!(origin_rows.len(), 3);
+        for row in &origin_rows {
+            assert_eq!(row.src, supervisor, "the newborn supervises the origin");
+            assert_eq!(row.dst, origin);
+        }
+    }
 }

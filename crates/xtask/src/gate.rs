@@ -1828,8 +1828,8 @@ impl LaneVerdict {
     }
 }
 
-/// Run the two repo guard scripts (`tools/grep_guard.sh`, `tools/license_check.sh`),
-/// FAILING CLOSED when one is missing.
+/// Run the repo guard scripts (`tools/grep_guard.sh`, `tools/license_check.sh`,
+/// `tools/paint_guard.sh`), FAILING CLOSED when one is missing.
 ///
 /// Both take the repo root as their argument, and both are executed directly so
 /// their `#!/usr/bin/env bash` shebang is honored — they use bash-only process
@@ -1849,6 +1849,15 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
     for (label, rel) in [
         ("grep_guard", "tools/grep_guard.sh"),
         ("license_check", "tools/license_check.sh"),
+        // The paint-conformance tooth (2026-08-24 blackout audit,
+        // docs/RELEASE-PROOF-DISCIPLINE.md): when the paint-relevant trees
+        // (effects/render/gui + the gate's own machinery) differ from the last
+        // take it proved green, it re-runs the shape matrix against the
+        // RELEASE binary — headless launch, control-socket keystrokes, pixels
+        // asserted. Unchanged trees cost one content hash, so the ordinary
+        // push keeps the hook's affordability rule; the script itself owns the
+        // macOS-only honesty and the loud ATERM_SKIP_PAINT_GUARD escape.
+        ("paint_guard", "tools/paint_guard.sh"),
     ] {
         let script = root.join(rel);
         let lane = if script.exists() {
@@ -2176,7 +2185,10 @@ fn gate_lint_args(args: &[String]) -> bool {
 /// than let that hinge on which binaries happen to be installed, the hook
 /// declares the exclusion with `--no-fmt` and this function prints it.
 fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
-    eprintln!("=== gate lint (tippy -D warnings + trustfmt + guards[grep_guard,license_check]) ===");
+    eprintln!(
+        "=== gate lint (tippy -D warnings + trustfmt + \
+         guards[grep_guard,license_check,paint_guard]) ==="
+    );
     let mut findings: Vec<&str> = Vec::new();
     let mut blocked_not_run: Vec<&str> = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();

@@ -9,14 +9,31 @@
 //! phase is a single `handle.join()` on the backend-build worker. Everything the
 //! worker does — wgpu instance/adapter/device acquisition, the parallel font
 //! thread, and every render pipeline — therefore collapses into ONE opaque
-//! number, measured at 300.83 ms median on macOS. Three separate optimizations
-//! were proposed inside that number and all three were refused for being
-//! unsizeable.
+//! number. That number was recorded at 300.83 ms median on macOS on 2026-07-30
+//! and read as the largest phase of startup; three separate optimizations were
+//! proposed inside it and all three were refused for being unsizeable.
+//!
+//! **THE 300 ms PHASE IS NOT THERE, AND THIS PROBE IS WHAT PROVED IT.** With
+//! the drill-down wired, `backend_finalize` measures **0.01 ms median, 0.02 ms
+//! max over 40 fresh processes**, and the worker had already finished before
+//! the join was reached in EVERY sample — the build's 35.76 ms of real work is
+//! entirely hidden under window creation
+//! (`docs/measured/arena/2026-08-23-start-backend-finalize-drilldown-dev-smoke.md`;
+//! Apple M5 Max, **DEV-SMOKE / NON-PUBLISHABLE**, single-arm). The 300.83 ms
+//! figure comes from the 2026-07-30 font-seal A/B in the same lane and the same
+//! class, and is superseded: do not size work against it again.
 //!
 //! This module is the ns-resolution split of that construction, recorded WHERE
 //! the work happens (this crate) and read back by the frontend, which cannot see
 //! in here. It publishes nothing itself: `aterm-gui` folds these legs into its
 //! `metrics` ledger beside the phases they explain.
+//!
+//! The module keeps earning its place regardless of how small the phase turned
+//! out to be. A phase nobody can see is a phase people invent numbers for —
+//! this one collected three — and the legs below are the standing instrument
+//! that would catch it growing teeth for real: a slower adapter, a fatter
+//! pipeline set, or a launch path fast enough that the join starts waiting
+//! again. This probe reports the cost; it does not assert the cost is large.
 //!
 //! ## Rules, matching the startup ledger's own conventions
 //!

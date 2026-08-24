@@ -2609,10 +2609,38 @@ mod tests {
     /// history to be orphaned from, so it returns early rather than reddening
     /// somebody else's push. That is not a hole — the claim only exists because
     /// a human wrote it, and writing it is the moment this becomes checkable.
+    ///
+    /// AND A BOX THAT CLAIMS ONLY ITS OWN CURRENT IDENTITIES IS SIMPLY NEW.
+    /// Orphaning means a box asserted a HISTORICAL name — a rename — and that
+    /// assertion then failed to reach any row. A machine whose only claims are
+    /// its fingerprint and the hostname it answers to right now has asserted no
+    /// history, so zero rows is the honest state of a machine that has not run
+    /// yet, not a broken claim. Reddening there would push the next author
+    /// toward inventing an alias to silence it — which is exactly how two
+    /// physical machines got merged under one box name here (see the
+    /// `WHAT ACTUALLY HAPPENED HERE` note in perf-boxes.tsv).
     #[test]
     fn this_box_is_not_orphaned_from_its_own_committed_history() {
         let me = machine_id();
         if !me.claimed {
+            return;
+        }
+        let aliases_text = committed_aliases();
+        let current: std::collections::BTreeSet<&str> = me
+            .identities
+            .iter()
+            .map(std::string::String::as_str)
+            .collect();
+        let claims_a_historical_name = aliases_text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let mut f = l.split('\t');
+                Some((f.next()?.trim(), f.next()?.trim()))
+            })
+            .any(|(b, ident)| b == me.key && !current.contains(ident));
+        if !claims_a_historical_name {
             return;
         }
         let ledger = committed_ledger();

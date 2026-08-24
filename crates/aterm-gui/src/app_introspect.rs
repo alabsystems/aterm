@@ -1222,6 +1222,27 @@ pub(crate) enum AuxTarget {
     /// The native Settings `/updates` route. `controls update` projects the exact compiled
     /// native semantic frame when that route is open.
     Update,
+    /// The IN-GRID session context menu overlay (`WindowState::tab_menu`, design
+    /// §2.1 [v5]) — the second renderer of the composed tab-menu model. `controls
+    /// tab-menu` serialises the OPEN card's rows + cursor (item text verbatim the
+    /// `chrome` verb's per-tab mirror); closed reports `tab-menu open=false`.
+    TabMenu,
+    /// The connection confirm/configure card (`WindowState::conn_card`, design
+    /// §3.3 + §2.5). `controls conn-card` reads the OPEN card's pair +
+    /// direction/kind selection; closed reports `conn-card open=false`. Like
+    /// the tab menu it cannot be `open`ed from the wire — it needs a pair
+    /// argument only the UI gestures (menu/picker/drag) carry.
+    ConnCard,
+    /// The session picker (`WindowState::session_picker`, design §2.3/§2.5).
+    /// `controls session-picker` reads the OPEN picker's intent + filtered
+    /// rows; closed reports `session-picker open=false`.
+    SessionPicker,
+    /// The connection map (`WindowState::connection_map`, design §5). `open
+    /// connections` raises it on the frontmost window (host+raise, §5.1);
+    /// `controls connections` reads the OPEN map's groups/arrows/annotations;
+    /// closed reports `connections open=false`. Every wire read of it is
+    /// Owner-gated (§5.3 — the `flows` twin).
+    Connections,
 }
 
 impl AuxTarget {
@@ -1235,6 +1256,10 @@ impl AuxTarget {
             "prefs" | "preferences" | "settings" => Some(AuxTarget::Prefs),
             "about" => Some(AuxTarget::About),
             "menu" | "palette" => Some(AuxTarget::Menu),
+            "tab-menu" => Some(AuxTarget::TabMenu),
+            "conn-card" => Some(AuxTarget::ConnCard),
+            "session-picker" => Some(AuxTarget::SessionPicker),
+            "connections" => Some(AuxTarget::Connections),
             "update" | "software-update" => Some(AuxTarget::Update),
             _ => None,
         }
@@ -1247,6 +1272,10 @@ impl AuxTarget {
             AuxTarget::Prefs => "prefs",
             AuxTarget::About => "about",
             AuxTarget::Menu => "menu",
+            AuxTarget::TabMenu => "tab-menu",
+            AuxTarget::ConnCard => "conn-card",
+            AuxTarget::SessionPicker => "session-picker",
+            AuxTarget::Connections => "connections",
             AuxTarget::Update => "update",
         }
     }
@@ -2640,8 +2669,11 @@ impl App {
             let blink_recent = ws.last_blink_at.is_some_and(|t| {
                 now.saturating_duration_since(t) <= crate::app_render::BLINK_RECENT_MAX
             });
-            let probe_ok = !is_alt || blink_recent;
-            let row_probe = if probe_ok && display_offset == 0 && !scroll_change.changed() {
+            // Plain-alt frames ship a ContentOnly probe instead of none —
+            // the `no-row-probe` repair (less /-search, vi insert, the
+            // ESC 7/ESC 8 streamer TUI); see `app_render::row_probe_trust`.
+            let probe_trust = crate::app_render::row_probe_trust(is_alt, blink_recent);
+            let row_probe = if display_offset == 0 && !scroll_change.changed() {
                 let _fill = term.row_cols_into(cpos.row as usize, &mut ws.poof_row_buf);
                 // STAR-LANDING NEIGHBORS — the windowed LOCK A capture's
                 // twin, so a headless capture licenses (or forbids) the
@@ -2652,7 +2684,7 @@ impl App {
                 if (cpos.row as usize) + 1 < rows {
                     term.row_cols_into(cpos.row as usize + 1, &mut ws.poof_row_below_buf);
                 }
-                Some((cpos.row, cpos.col))
+                Some((cpos.row, cpos.col, probe_trust))
             } else {
                 None
             };
@@ -2993,6 +3025,7 @@ impl App {
             .route_card
             .as_ref()
             .or(ws.settings_card.as_ref())
+            .or(ws.conn_wire_card.as_ref())
             .or(ws.level_up_card.as_ref())
             .or(ws.notice_card.as_ref())
             .or(ws.badge_card.as_ref())
@@ -3015,6 +3048,7 @@ impl App {
                 .route_card
                 .as_ref()
                 .or(ws.settings_card.as_ref())
+                .or(ws.conn_wire_card.as_ref())
                 .or(ws.level_up_card.as_ref())
                 .or(ws.notice_card.as_ref())
                 .or(ws.badge_card.as_ref())
@@ -3239,6 +3273,7 @@ impl App {
         let crate::WindowState {
             route_card,
             settings_card,
+            conn_wire_card,
             level_up_card,
             notice_card,
             badge_card,
@@ -3248,6 +3283,7 @@ impl App {
         let tray_arg = route_card
             .as_ref()
             .or(settings_card.as_ref())
+            .or(conn_wire_card.as_ref())
             .or(level_up_card.as_ref())
             .or(notice_card.as_ref())
             .or(badge_card.as_ref())
@@ -5099,6 +5135,32 @@ impl App {
                 "update",
                 crate::native_settings::SettingsRoute::SoftwareUpdate,
             ))),
+            // The OPEN in-grid tab menu's live rows (cursor included). No
+            // closed-state snapshot fallback here: the composed per-tab model is
+            // already served closed by the `chrome` verb's `tab-menu` lines —
+            // this target reads the INTERACTIVE surface, which either exists or
+            // honestly does not.
+            AuxTarget::TabMenu => match self.front().and_then(|ws| ws.tab_menu.as_ref()) {
+                Some(menu) => menu.controls_lines(),
+                None => vec!["tab-menu open=false".to_string()],
+            },
+            // The two connection surfaces read their INTERACTIVE state only
+            // (the tab-menu rule: the surface exists or honestly does not).
+            AuxTarget::ConnCard => match self.front().and_then(|ws| ws.conn_card()) {
+                Some(card) => card.controls_lines(),
+                None => vec!["conn-card open=false".to_string()],
+            },
+            AuxTarget::SessionPicker => match self.front().and_then(|ws| ws.session_picker()) {
+                Some(picker) => picker.controls_lines(),
+                None => vec!["session-picker open=false".to_string()],
+            },
+            // The aggregated fabric (§5.3 Owner-gated at the dispatch): the
+            // OPEN map's live rows only — the closed aggregation is already
+            // served by the `flows` verb, so no snapshot fallback here.
+            AuxTarget::Connections => match self.front().and_then(|ws| ws.connection_map()) {
+                Some(map) => map.controls_lines(),
+                None => vec!["connections open=false".to_string()],
+            },
             AuxTarget::Front => match self.front().and_then(|ws| ws.overlay()) {
                 Some(o) => vec![o.status_line()],
                 None => vec!["overlay open=false".to_string()],
@@ -6195,6 +6257,7 @@ mod chrome_output_tests {
             title: "Settings".to_string(),
             icon: Some(crate::tab_model::TabIconKind::Settings),
             indicators: crate::tab_model::TabIndicators::default(),
+            conn: None,
             closable: true,
             tooltip: Some("Settings · Cursor & Motion".to_string()),
         };
@@ -7267,6 +7330,36 @@ mod terminal_split_capture_tests {
             app.window_selection_text(wid).as_deref(),
             Some("RIGHT"),
             "the focused pane wins whenever it has a selection at all"
+        );
+
+        // …INCLUDING when its selection resolves to NOTHING. Ownership is decided by
+        // `has_selection()`, never by whether the text is non-empty:
+        // `selection_to_string_capped` returns `None` for an all-whitespace span (every
+        // row is trailing-trimmed), so gating on the TEXT would fall through to the
+        // sibling and hand back a pane the user never touched. That is a silent
+        // wrong-copy, and with `copy_on_select` defaulting on it would fire on every
+        // drag across a blank region — sweeping past a short prompt line is enough.
+        {
+            let mut terminal = term_lock(&right_term);
+            let selection = terminal.text_selection_mut();
+            // A row the seed never wrote: resolves to "" and therefore to `None`.
+            selection.start_selection(3, 0, SelectionSide::Left, SelectionType::Simple);
+            selection.update_selection(3, 6, SelectionSide::Right);
+            selection.complete_selection();
+            assert!(
+                terminal.selection_to_string().is_none(),
+                "precondition: this selection is real but resolves to no text"
+            );
+            assert!(
+                terminal.text_selection().has_selection(),
+                "precondition: …and the pane genuinely holds it"
+            );
+        }
+        assert_eq!(
+            app.window_selection_text(wid),
+            None,
+            "a focused pane holding a whitespace-only selection copies NOTHING — it \
+             must never fall through to a sibling's text"
         );
     }
 

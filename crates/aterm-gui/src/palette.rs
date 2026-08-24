@@ -40,6 +40,19 @@ const MAX_CMD_ROWS: usize = 14;
 /// on top (2), and the key-hint footer on the bottom (1).
 const CHROME_ROWS: usize = 3;
 
+/// The session-connection command rows (design §2.3) — palette-only ids with
+/// NO menu-bar item (the bar mirror stays exactly the bar; `MENU_MODEL`
+/// completeness proofs pin them OUT of the model). Listed here so the palette
+/// and the `invoke` verb (which resolves names through
+/// [`PaletteState::action_by_name`]) reach them; the picker/sheet resolve the
+/// peer parameter after dispatch.
+const CONNECTION_ROWS: &[(&str, MenuAction)] = &[
+    ("Connect to Session…", MenuAction::ConnectToSession),
+    ("Configure Connection…", MenuAction::ConfigureConnection),
+    ("Disconnect Session…", MenuAction::DisconnectSession),
+    ("Show Connection Map", MenuAction::ShowConnectionMap),
+];
+
 /// Maximum logical width of the floating command card. Wide windows should leave enough
 /// of the owning app visible to read as a modal layer, not stretch a short command label
 /// across an entire desktop-sized surface.
@@ -227,8 +240,12 @@ pub(crate) struct PaletteLive {
 
 impl PaletteState {
     /// Build the palette from [`MENU_MODEL`], every command enabled and unchecked (the pure,
-    /// `App`-free default the unit tests use). `App::palette_enter` calls [`Self::resolve`]
-    /// right after to fold in live enabled/checked state.
+    /// `App`-free default the unit tests use), then the session-connection
+    /// command rows ([`CONNECTION_ROWS`]) — ids that live in NO menu bar
+    /// (design §2.3: "all palette/`invoke`-reachable"), appended BESIDE the
+    /// model so the bar mirror stays exactly the bar. `App::palette_enter`
+    /// calls [`Self::resolve`] right after to fold in live enabled/checked
+    /// state.
     pub(crate) fn new() -> Self {
         let mut rows = Vec::new();
         for section in MENU_MODEL {
@@ -252,6 +269,18 @@ impl PaletteState {
                     });
                 }
             }
+        }
+        for (label, action) in CONNECTION_ROWS {
+            rows.push(PaletteRow {
+                section: Cow::Borrowed("Connections"),
+                label: Cow::Borrowed(label),
+                action: PaletteTarget::Menu(*action),
+                key: "",
+                mods: MenuMods::None,
+                shortcut: Cow::Borrowed(""),
+                enabled: true,
+                checked: None,
+            });
         }
         Self {
             rows,
@@ -490,6 +519,21 @@ impl PaletteState {
                 | MenuAction::SplitHorizontal
                 | MenuAction::ViewSessionInNewWindow => {
                     row.enabled = !live.native_tab_active;
+                }
+                // The connected-spawn presets take the FOCUSED session as
+                // their origin (design §2.3) — no front terminal, no origin,
+                // so the rows honestly disable (and the invoke path refuses)
+                // instead of silently no-op'ing. The picker/configure/
+                // disconnect ids act FROM the focused session too; the map is
+                // instance-wide and stays enabled.
+                MenuAction::NewControlledWindow
+                | MenuAction::NewControlledTab
+                | MenuAction::NewControllerWindow
+                | MenuAction::NewControllerTab
+                | MenuAction::ConnectToSession
+                | MenuAction::ConfigureConnection
+                | MenuAction::DisconnectSession => {
+                    row.enabled = live.terminal_front;
                 }
                 _ => {}
             }
@@ -1173,7 +1217,9 @@ pub(crate) fn palette_row_hit(
 /// The haystack is an ITERATOR, not a `&str`, so [`PaletteState::filtered`] can lowercase
 /// `"label  section"` lazily instead of `format!`-ing and lowercasing a fresh `String` for
 /// every row on every call. The body only ever consumed `haystack.chars()` anyway.
-fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = char>) -> bool {
+/// `pub(crate)`: the session picker ([`crate::session_picker`]) filters with the SAME
+/// match, so the two type-to-filter surfaces can never rank/miss differently.
+pub(crate) fn fuzzy_subsequence(needle: &str, haystack: impl Iterator<Item = char>) -> bool {
     let mut hay = haystack;
     'outer: for nc in needle.chars() {
         for hc in hay.by_ref() {
@@ -1467,13 +1513,62 @@ mod tests {
         assert!(s.rows.iter().any(|r| r.action == MenuAction::About));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Copy));
         assert!(s.rows.iter().any(|r| r.action == MenuAction::Help));
-        // Same count as the model's Item entries.
+        // Same count as the model's Item entries PLUS the palette-only
+        // session-connection rows (design §2.3 — ids with no bar item).
         let model_items = MENU_MODEL
             .iter()
             .flat_map(|sec| sec.entries.iter())
             .filter(|e| matches!(e, MenuEntry::Item { .. }))
             .count();
-        assert_eq!(s.rows.len(), model_items);
+        assert_eq!(s.rows.len(), model_items + CONNECTION_ROWS.len());
+    }
+
+    /// The §2.3 connection ids have palette rows (design: "all palette/
+    /// `invoke`-reachable") in their own section, resolvable BY NAME for the
+    /// `invoke` verb; the session-subject ones gate on a front terminal while
+    /// the instance-wide map stays enabled.
+    #[test]
+    fn connection_ids_have_palette_rows_and_gate_on_a_front_terminal() {
+        let mut s = PaletteState::new();
+        for (label, action) in CONNECTION_ROWS {
+            let row = s
+                .rows
+                .iter()
+                .find(|r| r.action == *action)
+                .unwrap_or_else(|| panic!("{action:?} has a palette row"));
+            assert_eq!(row.section, "Connections");
+            assert_eq!(row.label, *label);
+            // Resolvable by its invoke name (the `invoke` verb's path).
+            assert_eq!(s.action_by_name(&format!("{action:?}")), Ok(*action));
+        }
+        // No front terminal: the session-subject ids disable (and invoke
+        // refuses with the disabled reason); the map row stays live.
+        let live = PaletteLive {
+            terminal_front: false,
+            ..PaletteLive::default()
+        };
+        s.resolve(&live);
+        for action in [
+            MenuAction::ConnectToSession,
+            MenuAction::ConfigureConnection,
+            MenuAction::DisconnectSession,
+        ] {
+            let row = s.rows.iter().find(|r| r.action == action).unwrap();
+            assert!(!row.enabled, "{action:?} needs a front session");
+            assert!(
+                s.action_by_name(&format!("{action:?}"))
+                    .is_err_and(|e| e.contains("disabled")),
+                "{action:?} refuses with the disabled reason"
+            );
+        }
+        assert!(
+            s.rows
+                .iter()
+                .find(|r| r.action == MenuAction::ShowConnectionMap)
+                .unwrap()
+                .enabled,
+            "the map is instance-wide"
+        );
     }
 
     /// AUDIT I9 — the accelerator projection, both platforms in one table.

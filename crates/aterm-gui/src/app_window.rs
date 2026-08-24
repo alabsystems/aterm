@@ -505,6 +505,14 @@ impl App {
         cols: u16,
         cwd_override: Option<&str>,
         adopt: Option<crate::spawn::Adopted>,
+        // Session-connection birth facts (design §2.3 spawn presets), `(None,
+        // None)` for every ordinary open: `lineage_parent` records the origin
+        // as the first session's registry parent (a CONTROLLED window is a
+        // child of its origin; a controller window stays a lineage root — the
+        // shipping `None`), and `observe` injects the CONTROLLER hint env
+        // (`ATERM_OBSERVE_SESSION_ID`) into the newborn's shell.
+        lineage_parent: Option<aterm_session::SessionId>,
+        observe: Option<&aterm_session::SessionId>,
     ) -> Option<WindowId> {
         // Mint the window id FIRST so the spawned session's `Wake`s are stamped with
         // the window that will own them (Output/Exit/Bell route back to THIS window).
@@ -529,6 +537,7 @@ impl App {
             &self.session_factory,
             &proxy,
             cwd.as_deref(),
+            observe,
             adopt, // SEAMLESS: `Some` re-adopts this window's handed-off first-leaf shell
         ) {
             Ok(s) => s,
@@ -541,7 +550,7 @@ impl App {
             }
         };
         self.next_session_id += 1;
-        self.install_window_state(wid, session, rows, cols);
+        self.install_window_state_with_parent(wid, session, rows, cols, lineage_parent);
         Some(wid)
     }
 
@@ -550,12 +559,32 @@ impl App {
     /// (real PTY) and the pure windows/pool/frontmost bookkeeping are separable:
     /// the unit test drives THIS with a stub `Session`, exercising the real
     /// frontmost/windows/pool state transitions with no PTY.
+    // Test-only sugar now that the shipping caller (`create_window_logical`)
+    // threads the lineage parent explicitly; the state-transition tests drive
+    // the same body through this `None` wrapper.
+    #[cfg(test)]
     pub(crate) fn install_window_state(
         &mut self,
         wid: WindowId,
         session: Session,
         rows: u16,
         cols: u16,
+    ) {
+        self.install_window_state_with_parent(wid, session, rows, cols, None);
+    }
+
+    /// `install_window_state` with an explicit registry LINEAGE PARENT for the
+    /// window's first session — the session-connections CONTROLLED-window preset
+    /// records `parent = origin` (design §2.3); every ordinary window stays a
+    /// fresh lineage root (`None`, the wrapper above / every shipping caller
+    /// but the connected spawn).
+    pub(crate) fn install_window_state_with_parent(
+        &mut self,
+        wid: WindowId,
+        session: Session,
+        rows: u16,
+        cols: u16,
+        lineage_parent: Option<aterm_session::SessionId>,
     ) {
         let sid = session.id;
         // Clone the mirror Arcs BEFORE moving the session into the pool (the pool
@@ -567,10 +596,11 @@ impl App {
             session.ctx.sink.clone(),
         );
         // P1.1: register in the process-wide registry. A new window's first tab has
-        // no parent (it is a fresh root, like session 0). Test-only inert sessions
+        // no parent (it is a fresh root, like session 0) unless a connected spawn
+        // named its origin. Test-only inert sessions
         // (`master == -1`) are not registered, avoiding phantom control targets.
         if session.master >= 0 {
-            Self::register_session(&self.store, &session, None);
+            Self::register_session(&self.store, &session, lineage_parent);
         }
         let layout = pane::PaneTree::new(sid);
         let tab = crate::register_terminal_tab(&mut self.tab_ids, &mut self.view_store, &layout)
@@ -658,8 +688,46 @@ impl App {
         cwd_override: Option<&str>,
         adopt: Option<crate::spawn::Adopted>,
     ) -> Option<WindowId> {
+        self.create_window_internal_connected(el, cwd_override, adopt, None, None)
+    }
+
+    /// [`create_window_internal`] with the session-connection birth facts
+    /// threaded through (the §2.3 window presets): `lineage_parent` for a
+    /// CONTROLLED window, `observe` for a CONTROLLER window's env hint. Every
+    /// ordinary open goes through the `(None, None)` wrapper above.
+    ///
+    /// SPEC (design §9: the window-routing obligations): this real seam IS the
+    /// `WindowRouting.ConnectedCreateWindow` action — the `spawn connected=
+    /// place=window` mint: the same monotonic-id/`win_count`/`frontmost`
+    /// bookkeeping as `CreateWindow` (via `create_window_logical`), with the
+    /// hosted-origin precondition already enforced by
+    /// [`App::connected_spawn_precheck`] (a live origin ⇒ `win_count > 0`;
+    /// headless `place=window` is refused before any create). The `#[refines]`
+    /// keeps `window_routing` fully bound now that the act exists; Tier-1
+    /// validates the mint transition against this arm in
+    /// `window_routing_conformance` (through the shared logical minting seam —
+    /// this fn itself needs an `ActiveEventLoop`). PROJECTION
+    /// (`aterm_gui::App::project_window_routing`): the
+    /// `window_routing_conformance::project` tuple.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "window_routing",
+            action = "ConnectedCreateWindow",
+            project = "aterm_gui::App::project_window_routing"
+        )
+    )]
+    pub(crate) fn create_window_internal_connected(
+        &mut self,
+        el: &ActiveEventLoop,
+        cwd_override: Option<&str>,
+        adopt: Option<crate::spawn::Adopted>,
+        lineage_parent: Option<aterm_session::SessionId>,
+        observe: Option<&aterm_session::SessionId>,
+    ) -> Option<WindowId> {
         let (rows, cols) = self.front().map_or((80, 24), |ws| (ws.rows, ws.cols));
-        let wid = self.create_window_logical(rows, cols, cwd_override, adopt)?;
+        let wid =
+            self.create_window_logical(rows, cols, cwd_override, adopt, lineage_parent, observe)?;
         if !self.headless && !self.attach_os_window(el, wid) {
             // GPU surface failed: roll back the just-created window + its fresh
             // session rather than leave a present-less black window.
@@ -2085,14 +2153,8 @@ impl App {
         // fail-closes a later @<selector>. EACH pane is detached (not once per tab)
         // so a split-tab window releases every pane's PTY.
         for id in ids {
-            if self.detach_session_view(id)
-                && let Some(sid) = self
-                    .store
-                    .write()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .deregister_local(id)
-            {
-                crate::proxy::unpublish_session(&sid);
+            if self.detach_session_view(id) {
+                self.retire_session_registration(id);
             }
         }
         for view in view_ids {

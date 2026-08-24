@@ -2514,11 +2514,25 @@ impl App {
                     ));
                 }
             }
+            let operator_quiesce = match self.operator_control.as_ref() {
+                Some(control) => Some(control.try_begin_update_quiesce().map_err(|error| {
+                    crate::UpdateHandoffStartError::failed(format!(
+                        "resident operator could not quiesce for replacement: {error}"
+                    ))
+                })?),
+                None => None,
+            };
             self.shutdown_title_summaries();
-            match {
+            let spawn = || {
                 let mut cmd = std::process::Command::new(exe);
-                cmd.args(std::env::args_os().skip(1))
-                    .env("ATERM_UPDATED_FROM", build.to_string());
+                // Forward argv minus the leading `--window` pins earlier boot
+                // swaps prepended — every successor lane strips them so no
+                // relaunch path can re-grow the argv (aterm-update's
+                // reexec_forwarded_args doc has the accumulation story).
+                cmd.args(aterm_update::reexec_forwarded_args(
+                    std::env::args_os().skip(1),
+                ))
+                .env("ATERM_UPDATED_FROM", build.to_string());
                 bind_expected_update_artifact(&mut cmd, apply_attempt.as_ref());
                 // Same headless re-injection as the unix exec path above (and for
                 // the same reason: argv passes through verbatim, so the env
@@ -2527,16 +2541,34 @@ impl App {
                 if self.headless {
                     cmd.env("ATERM_HEADLESS", "1");
                 }
-                cmd.spawn()
-            } {
-                Ok(_) => std::process::exit(0),
-                Err(err) => {
+                match cmd.spawn() {
+                    Ok(_) => std::process::exit(0),
+                    Err(error) => Err(error),
+                }
+            };
+            let spawn_result = match operator_quiesce.as_ref() {
+                Some(quiesce) => quiesce.with_commit_permit(spawn),
+                None => Ok(spawn()),
+            };
+            match spawn_result {
+                Ok(Ok(())) => {
+                    return Err(crate::UpdateHandoffStartError::failed(
+                        "replacement returned after a successful Windows spawn",
+                    ));
+                }
+                Ok(Err(err)) => {
                     // A failed spawn leaves this process live. Restore a fresh exact
                     // authority/worker after the pre-replacement shutdown.
                     self.reconfigure_title_summaries();
                     aterm_log::warn!("update apply: re-spawn failed: {err}");
                     return Err(crate::UpdateHandoffStartError::failed(format!(
                         "replacement process could not start: {err}"
+                    )));
+                }
+                Err(error) => {
+                    self.reconfigure_title_summaries();
+                    return Err(crate::UpdateHandoffStartError::failed(format!(
+                        "resident operator revoked replacement: {error}"
                     )));
                 }
             }
@@ -2633,7 +2665,12 @@ impl App {
                 debug_assert!(live.is_empty());
                 let mut command = std::process::Command::new(exe);
                 command
-                    .args(std::env::args_os().skip(1))
+                    // Leading `--window` pins from earlier boot swaps are
+                    // stripped (see the Windows spawn above) — the successor's
+                    // own boot swap re-pins exactly one when it needs it.
+                    .args(aterm_update::reexec_forwarded_args(
+                        std::env::args_os().skip(1),
+                    ))
                     .env("ATERM_UPDATED_FROM", build.to_string());
                 // Same rule as the seamless lane below: an ACTIVATION binds no
                 // expected artifact. The successor swaps nothing; binding the
@@ -2648,8 +2685,8 @@ impl App {
                 );
                 // Headless survives the re-exec. The ENV channel, not the flag,
                 // is right here even though `--headless` is the canonical
-                // user-facing spelling: the successor inherits our argv verbatim
-                // (`args_os().skip(1)`), and argv may carry an `-e`/`--command`
+                // user-facing spelling: the successor inherits our argv (minus
+                // the leading pins), and argv may carry an `-e`/`--command`
                 // boundary that swallows every token after it — an appended flag
                 // would become part of the child's command line, and a prepended
                 // one would reorder a payload we must pass through unchanged.
@@ -2659,8 +2696,27 @@ impl App {
                 if self.headless {
                     command.env("ATERM_HEADLESS", "1");
                 }
+                let operator_quiesce = match self.operator_control.as_ref() {
+                    Some(control) => Some(control.try_begin_update_quiesce().map_err(|error| {
+                        crate::UpdateHandoffStartError::failed(format!(
+                            "resident operator could not quiesce for replacement: {error}"
+                        ))
+                    })?),
+                    None => None,
+                };
                 self.shutdown_title_summaries();
-                let error = command.exec();
+                let error = match operator_quiesce.as_ref() {
+                    Some(quiesce) => match quiesce.with_commit_permit(|| command.exec()) {
+                        Ok(error) => error,
+                        Err(error) => {
+                            self.reconfigure_title_summaries();
+                            return Err(crate::UpdateHandoffStartError::failed(format!(
+                                "resident operator revoked replacement: {error}"
+                            )));
+                        }
+                    },
+                    None => command.exec(),
+                };
                 // `exec` returns only on failure. Recreate the worker/authority so
                 // Smart Titles continue in the still-running old process.
                 self.reconfigure_title_summaries();
@@ -2881,8 +2937,11 @@ impl App {
         let mut capture_cells = 0_u64;
         // Latched once the aggregate cell budget has refused a carried-history
         // checkpoint: every later session goes straight to visible-only rather than
-        // paying an admission probe that the budget has already proven cannot pass.
-        let mut history_over_budget = false;
+        // paying a probe that this pool has already proven cannot pass. TWO causes
+        // arm it — the budget refusing the carry, and the produced blob refusing the
+        // wire's shape — which is why it is named for its EFFECT and not for either
+        // one of them.
+        let mut history_latched_off = false;
         // MANDATORY FIRST, OPTIONAL SECOND. Price the visible+alt grids of the WHOLE
         // POOL before charging any of it, in both budgets. Without this the budgets
         // are spent greedily in pool order and a later session finds nothing left
@@ -2914,19 +2973,19 @@ impl App {
         }
         for session in self.pool.iter() {
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
+                capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
                 break;
             }
             let terminal = match session.term.try_lock() {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    capture_failed = Some("a terminal engine was busy during handoff capture");
+                    capture_failed = Some("a terminal engine was busy during handoff capture".to_string());
                     break;
                 }
             };
             if !terminal.parser_is_ground() {
-                capture_failed = Some("a terminal parser was mid-sequence during handoff capture");
+                capture_failed = Some("a terminal parser was mid-sequence during handoff capture".to_string());
                 break;
             }
             // SCROLLBACK IS BEST-EFFORT AND MUST NEVER COST THE HANDOFF.
@@ -2969,7 +3028,7 @@ impl App {
                 MAX_HANDOFF_CAPTURE_BUDGET_BYTES,
             );
             let mut history = if remaining >= HANDOFF_HISTORY_COMFORT
-                && !history_over_budget
+                && !history_latched_off
                 && history_fits_cells
                 && history_fits_bytes
             {
@@ -3022,7 +3081,7 @@ impl App {
                      visible screen and queued output still survive the update."
                 );
                 history = 0;
-                history_over_budget = true;
+                history_latched_off = true;
                 per_grid = crate::seamless::admit_checkpoint_dimensions(
                     &mut capture_cells,
                     rows,
@@ -3039,7 +3098,7 @@ impl App {
             // 256 MiB allocation that was never involved.
             if per_grid.is_none() {
                 capture_failed =
-                    Some("visible-screen capture exceeded the aggregate grid-cell budget");
+                    Some("visible-screen capture exceeded the aggregate grid-cell budget".to_string());
                 break;
             }
             capture_budget = per_grid
@@ -3054,22 +3113,86 @@ impl App {
             // "memory": nothing here allocates these bytes, they are the decode
             // ceiling the successor would be granted.
             if capture_budget > MAX_HANDOFF_CAPTURE_BUDGET_BYTES {
-                capture_failed =
-                    Some("visible-screen capture exceeded the aggregate decode-authority budget");
+                capture_failed = Some(
+                    "visible-screen capture exceeded the aggregate decode-authority budget"
+                        .to_string(),
+                );
                 break;
             }
-            let Some(checkpoint) = terminal.checkpoint_carry(history as usize) else {
-                capture_failed = Some("a terminal parser left Ground during handoff capture");
+            let Some(mut checkpoint) = terminal.checkpoint_carry(history as usize) else {
+                capture_failed =
+                    Some("a terminal parser left Ground during handoff capture".to_string());
                 break;
             };
+            // DEGRADE ON SHAPE — the sibling of the budget arm above, and the arm
+            // whose absence stranded a machine on an update it had already
+            // downloaded and verified.
+            //
+            // The budget ladder prices TIME and SPACE. It cannot see the third way
+            // a carry can be wrong: the produced blob not matching the shape the
+            // wire allows. That is what `checkpoint_shape_refusal` asks, and until
+            // now nobody asked it here — the checkpoint went straight into
+            // `screens` and the first shape check ran in `screen_digest`, past the
+            // point where the carry could still be lowered, with nothing left to do
+            // but refuse the whole update. It refused every ~10 minutes for four
+            // days.
+            //
+            // Lowering the carry is the cure for this whole CLASS, not one bug: the
+            // inactive grid's blob is the only one whose record count the wire
+            // cannot describe, and at `history == 0` it is exactly `rows` records by
+            // construction, whatever the producer believed about the slot.
+            //
+            // Re-probing is exact rather than approximate, for the same reason the
+            // budget arm gives: nothing here has been published yet. The aggregates
+            // are function locals, `screen_digest`'s own aggregate is fresh per
+            // call, and this session's cells were already admitted at the HIGHER
+            // carry — so a re-carry at 0 leaves the pool charged for history it no
+            // longer holds. That over-charge is deliberate: it is conservative, it
+            // only ever makes a LATER session degrade sooner, and refunding a
+            // transactional admission would be the kind of partial-authority
+            // bookkeeping `admit_checkpoint_dimensions` exists to avoid.
+            if let Some(refusal) = crate::seamless::checkpoint_shape_refusal(session.id, &checkpoint)
+            {
+                if history == 0 {
+                    // Nothing left to lower. A visible-only capture that still will
+                    // not take the wire's shape is a genuine blocker, and now it
+                    // says which check refused instead of dying anonymously.
+                    capture_failed = Some(format!(
+                        "a visible checkpoint could not be shaped for the wire even without                          carried scrollback ({refusal})"
+                    ));
+                    break;
+                }
+                aterm_log::warn!(
+                    "update apply: carrying no scrollback for the rest of this handoff — the                      carried shape was refused ({refusal}). Processes, the visible screen and                      queued output still survive the update."
+                );
+                // Only the LATCH carries this decision forward. Unlike the budget
+                // arm — which lowers `history` before the carry that reads it —
+                // this one runs after, and re-carries explicitly below; assigning
+                // `history` here would be writing to a value nothing reads again.
+                history_latched_off = true;
+                let Some(visible_only) = terminal.checkpoint_carry(0) else {
+                    capture_failed =
+                        Some("a terminal parser left Ground during handoff capture".to_string());
+                    break;
+                };
+                if let Some(refusal) =
+                    crate::seamless::checkpoint_shape_refusal(session.id, &visible_only)
+                {
+                    capture_failed = Some(format!(
+                        "a visible checkpoint could not be shaped for the wire even without                          carried scrollback ({refusal})"
+                    ));
+                    break;
+                }
+                checkpoint = visible_only;
+            }
             screens.push((session.id, checkpoint));
             if std::time::Instant::now() >= deadline {
-                capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
+                capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
                 break;
             }
         }
         if capture_failed.is_none() && std::time::Instant::now() >= deadline {
-            capture_failed = Some("bounded visible-screen capture exceeded 20 ms");
+            capture_failed = Some("bounded visible-screen capture exceeded 20 ms".to_string());
         }
         if let Some(reason) = capture_failed {
             self.rollback_overlap(None, &live);
@@ -3112,7 +3235,10 @@ impl App {
         self.next_update_handoff_id = next_attempt_id;
         let mut command = std::process::Command::new(exe);
         command
-            .args(std::env::args_os().skip(1))
+            // Leading `--window` pins stripped, as on the cold/Windows lanes.
+            .args(aterm_update::reexec_forwarded_args(
+                std::env::args_os().skip(1),
+            ))
             .env("ATERM_UPDATED_FROM", build.to_string());
         // An ACTIVATION binds no expected artifact: the successor has nothing to swap
         // (its `apply_staged_if_ready` finds no newer stage and returns NoUpdate) and
@@ -3186,11 +3312,18 @@ impl App {
                 "handoff layout could not be committed canonically",
             ));
         };
-        let Some(screen_digest) = crate::seamless::screen_digest(&screens) else {
-            self.rollback_overlap(None, &live);
-            return Err(crate::UpdateHandoffStartError::failed(
-                "visible checkpoint set could not be committed canonically",
-            ));
+        // The refusal REASON rides the message: this arm used to surface a dozen
+        // distinct causes as one opaque sentence, so a stuck update was invisible
+        // until someone read the source. It reaches the user through
+        // `aterm ctl update status`'s `apply_failure=`.
+        let screen_digest = match crate::seamless::screen_digest(&screens) {
+            Ok(digest) => digest,
+            Err(refusal) => {
+                self.rollback_overlap(None, &live);
+                return Err(crate::UpdateHandoffStartError::failed(format!(
+                    "visible checkpoint set could not be committed canonically: {refusal}"
+                )));
+            }
         };
         if std::time::Instant::now() >= deadline {
             self.rollback_overlap(None, &live);
@@ -3525,6 +3658,17 @@ impl App {
                 detail: _detail,
                 input_drain_spins: _input_drain_spins,
             } = completion;
+            // Quiesce the resident operator only for the final admission seam.
+            // A rejection drops this reversible token; a successful Commit
+            // `_exit`s while its gate is still held by `with_commit_permit`.
+            let (operator_quiesce, mut operator_quiesce_error) =
+                match self.operator_control.as_ref() {
+                    Some(control) => match control.try_begin_update_quiesce() {
+                        Ok(quiesce) => (Some(quiesce), None),
+                        Err(error) => (None, Some(error)),
+                    },
+                    None => (None, None),
+                };
             let Some((facts, native_safety, proof, arbiter)) = self.collect_handoff_commit_facts(
                 nonce.as_deref(),
                 input_dispatch_fenced,
@@ -3538,7 +3682,8 @@ impl App {
                 }
                 return;
             };
-            let commit_admitted = handoff_commit_admitted(facts);
+            let commit_admitted =
+                handoff_commit_admitted(facts) && operator_quiesce_error.is_none();
             let mut commit_lost_arbiter = false;
             let mut commit_write_failed = false;
             if commit_admitted && let (Some(commit_fd), Some(proof)) = (commit_fd.as_ref(), proof) {
@@ -3551,19 +3696,33 @@ impl App {
                     // atomic <=PIPE_BUF write and `_exit(0)` in the same typed
                     // operation. EPIPE explicitly transfers Committing back to
                     // Rejecting so one reaper can restore the parent.
-                    let Err(_) = crate::seamless::commit_and_exit(commit_fd, proof);
-                    commit_write_failed = true;
+                    let commit_result = match operator_quiesce.as_ref() {
+                        Some(quiesce) => quiesce.with_commit_permit(|| {
+                            crate::seamless::commit_and_exit(commit_fd, proof)
+                        }),
+                        None => Ok(crate::seamless::commit_and_exit(commit_fd, proof)),
+                    };
+                    match commit_result {
+                        Ok(Err(_)) => commit_write_failed = true,
+                        Err(error) => operator_quiesce_error = Some(error),
+                        Ok(Ok(never)) => match never {},
+                    }
                     let _ = arbiter.commit_failed_to_rejecting();
                 } else {
                     commit_lost_arbiter = true;
                 }
             }
 
-            let rejection = handoff_rejection_reason(
-                facts,
-                &native_safety,
-                commit_lost_arbiter,
-                commit_write_failed,
+            let rejection = operator_quiesce_error.map_or_else(
+                || {
+                    handoff_rejection_reason(
+                        facts,
+                        &native_safety,
+                        commit_lost_arbiter,
+                        commit_write_failed,
+                    )
+                },
+                |error| format!("resident operator could not quiesce for Commit: {error}"),
             );
             let activity_shaped = handoff_rejection_activity_shaped(facts);
             if activity_shaped && let Some(pending) = self.pending_update_handoff.as_mut() {

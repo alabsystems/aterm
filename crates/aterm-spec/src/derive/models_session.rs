@@ -1393,6 +1393,16 @@ pub fn recording_model() -> Model {
 /// routing invariants (Buggy=0) and CATCHES the missed exit (Buggy=1 ->
 /// counterexample on `ExitIffEmpty`).
 ///
+/// SESSION CONNECTIONS (design §9: the window-routing obligations EXTENDED, not
+/// a new standalone model): two connection-era acts join the machine.
+/// `ConnectedCreateWindow` — the `spawn connected= place=window` mint (§2.3/§6)
+/// — is CreateWindow with the hosted-origin precondition stated explicitly
+/// (`win_count > 0`); `RaiseSession` — the `raise <sid>` / map-Enter focus
+/// routing (§5/§6) — re-points `frontmost` nondeterministically over the
+/// already-allocated ids (the CloseWindow re-point abstraction) and touches
+/// nothing else. Both preserve all three invariants over the SAME
+/// `MaxWin`/`MaxId`-bounded space: they add transitions, never state.
+///
 /// Invariants:
 ///   ExitIffEmpty       — `exited = 1  <=>  win_count = 0` (close-last exits, and
 ///                        the app never exits while a window remains).
@@ -1619,6 +1629,69 @@ pub fn window_routing_model() -> Model {
                         ),
                     },
                 ],
+            },
+            // `spawn connected= place=window` (session connections §2.3/§6): the
+            // connected-spawn WINDOW MINT. A CreateWindow-class act — the newborn
+            // window takes the next monotonic id and becomes frontmost — whose
+            // extra precondition is a LIVE, HOSTED origin session (`of=<origin>`).
+            // Scalar-projected, a hosted origin means at least one live window
+            // (`win_count > 0`; headless `place=window` is refused BEFORE any
+            // create, design §1.4#7). The clause is invariant-implied (`exited=0`
+            // forces `win_count > 0` under ExitIffEmpty) but stating it keeps the
+            // origin precondition in the spec, not smuggled from an invariant.
+            // Same MaxWin/MaxId bounds and updates as CreateWindow, so the
+            // reachable space stays exactly as bounded.
+            Action {
+                name: "ConnectedCreateWindow",
+                guard: Some(and_(
+                    and_(
+                        and_(
+                            le(var("win_count"), sub(cst("MaxWin"), int(1))),
+                            le(var("next_id"), sub(cst("MaxId"), int(1))),
+                        ),
+                        eq(var("exited"), int(0)),
+                    ),
+                    gt(var("win_count"), int(0)),
+                )),
+                updates: vec![
+                    Update {
+                        var: "win_count",
+                        expr: add(var("win_count"), int(1)),
+                    },
+                    Update {
+                        var: "frontmost",
+                        expr: var("next_id"),
+                    },
+                    Update {
+                        var: "next_id",
+                        expr: add(var("next_id"), int(1)),
+                    },
+                ],
+            },
+            // `raise <sid>` / map Enter / menu Show (session connections §5/§6):
+            // a FOCUS-ROUTING act — re-point `frontmost` to the window hosting
+            // the raised session; no window is created or destroyed and the app
+            // never exits. WHICH window hosts the session is not a function of
+            // the scalar projection (it doesn't track which ids are live), so
+            // the faithful abstraction is CloseWindow's nondeterministic
+            // re-point: `frontmost' \in 1..(next_id - 1)` — any already-
+            // allocated id, the real app's host-window choice (and the headless
+            // no-OS-focus stutter, `frontmost' = frontmost`) each one admissible
+            // value. `ty` checks the whole fan-out, so EVERY admissible raise
+            // preserves FrontmostLive and FrontmostAllocated. A live window
+            // implies a CreateWindow has run or init holds (`next_id >= 2`), so
+            // the range is non-empty. Only `frontmost` moves (win_count/next_id/
+            // exited UNCHANGED): the act adds edges, never states.
+            Action {
+                name: "RaiseSession",
+                guard: Some(and_(
+                    gt(var("win_count"), int(0)),
+                    eq(var("exited"), int(0)),
+                )),
+                updates: vec![Update {
+                    var: "frontmost",
+                    expr: in_range(int(1), sub(var("next_id"), int(1))),
+                }],
             },
         ],
         invariants: vec![

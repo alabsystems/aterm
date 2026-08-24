@@ -131,6 +131,43 @@ pub struct ContentGeneration {
     pub alternate_screen: bool,
 }
 
+/// Verdict of one per-frame [`ContentGeneration`] observation. Computed ONCE
+/// per frame by `CursorGlow::observe_content_generation` — the glow engine
+/// holds the row probe, so it is the one authority — and projected verbatim
+/// onto the classic trail twin and the host's cursor-companion fence, so all
+/// three consumers act on a single decision and cannot diverge.
+///
+/// The proportionality law this encodes (the v0.49.0 regression's fix): an
+/// unowned parser batch retires only what it actually invalidates. A busy
+/// alternate-screen TUI (Claude Code: spinner + token streaming, several
+/// batches per second) emits a standing stream of unowned generations while
+/// the caret and its row stay untouched — wiping ALL resident light on every
+/// one of them destroyed the ribbon, comet, and companion faster than any
+/// admitted spawn could be composited, while quiet one-batch-per-keystroke
+/// main-screen shells never fired the fence at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GenerationOwnership {
+    /// The generation did not change (or this observation set the baseline).
+    Steady,
+    /// The change was exactly the candidate confirmed this same frame: old
+    /// visual geometry retires, and the admitted spawn forges fresh light.
+    Owned,
+    /// An unowned batch left the coordinate space intact (same terminal, same
+    /// screen), the cursor anchor unmoved, and the probed anchor row
+    /// content-identical under the implicit-blank lens: resident light
+    /// survives — the hint/candidate cohort still revokes fail-closed, so
+    /// cold output can never BUY light, it merely stops destroying it.
+    UnownedSteady,
+    /// An unowned batch rewrote content beneath an unmoved cursor — or could
+    /// not be attested (no coherent probe pair this frame): every resident
+    /// visual retires, exactly the original fence.
+    UnownedRewrite,
+    /// An unowned batch moved the cursor or changed terminal/screen identity:
+    /// resident light retires and the cursor companion's earned flight is
+    /// disowned with it.
+    UnownedRelocation,
+}
+
 /// The exact cell material a committed text event is expected to leave at the
 /// pre-input caret: one lead scalar followed by `\0` continuation cells for a
 /// wide grapheme.  The host builds this from the same grapheme/ambiguous-width
@@ -526,37 +563,62 @@ impl CursorTrail {
 
     /// Fence resident comet cells against an in-place terminal rewrite.
     ///
-    /// `exact_candidate_confirmed` is true only for the exact authored edit
-    /// confirmed in this same frame. Any other parser-generation change can
-    /// replace text beneath a still-live cell without moving the cursor, so
-    /// retire the visual trail while preserving the honest cursor anchor. A
+    /// `ownership` is the verdict `CursorGlow::observe_content_generation`
+    /// reached for this SAME frame — the glow engine holds the row probe, so
+    /// it is the one authority and this twin applies the same decision (the
+    /// two engines and the cursor companion must agree; both host seams
+    /// project it). [`GenerationOwnership::Owned`] retires only the visual
+    /// sparks — the confirmed candidate forges the fresh ones this tick.
+    /// [`GenerationOwnership::UnownedSteady`] keeps the resident comet (the
+    /// batch provably left the anchor row and the cursor alone) while the
+    /// hint/candidate cohort still revokes fail-closed. Every other unowned
+    /// verdict retires the comet wholesale, exactly the original fence. A
     /// scroll signal still translates geometry when no parser generation
     /// changed; a parser batch that also scrolls is conservatively retired.
-    /// The first observation is a silent baseline.
+    /// The first observation is a silent baseline; an authority verdict that
+    /// disagrees with this engine's own change detection fails closed.
     pub fn observe_content_generation(
         &mut self,
         generation: ContentGeneration,
-        exact_candidate_confirmed: bool,
-    ) -> bool {
+        ownership: GenerationOwnership,
+    ) {
         let changed = self
             .last_content_generation
             .is_some_and(|previous| previous != generation);
         self.last_content_generation = Some(generation);
         if !changed {
-            return false;
+            return;
         }
-        // Even an exact candidate owns only the cells it will forge now; it
-        // cannot certify older sparks elsewhere in the same parser batch.
-        self.sparks.clear();
-        if exact_candidate_confirmed {
-            return true;
+        match ownership {
+            GenerationOwnership::Owned => {
+                // Even an exact candidate owns only the cells it will forge
+                // now; it cannot certify older sparks elsewhere in the same
+                // parser batch.
+                self.sparks.clear();
+            }
+            GenerationOwnership::UnownedSteady => {
+                // The batch is proven steady at the anchor: the resident
+                // comet survives it. The classifier cohort still fails
+                // closed — retention never arms anything.
+                self.type_hint = None;
+                self.nav_hint = None;
+                self.move_hint = None;
+                self.move_candidate = None;
+                self.candidate_superseded = false;
+            }
+            // `Steady` while THIS engine observed a change is a
+            // desynchronized authority — fail closed like a rewrite.
+            GenerationOwnership::Steady
+            | GenerationOwnership::UnownedRewrite
+            | GenerationOwnership::UnownedRelocation => {
+                self.sparks.clear();
+                self.type_hint = None;
+                self.nav_hint = None;
+                self.move_hint = None;
+                self.move_candidate = None;
+                self.candidate_superseded = false;
+            }
         }
-        self.type_hint = None;
-        self.nav_hint = None;
-        self.move_hint = None;
-        self.move_candidate = None;
-        self.candidate_superseded = false;
-        true
     }
 
     /// Arm the navigation veto — see `CursorGlow::note_navigation`.

@@ -96,7 +96,7 @@ fn main() {
 /// argument pull stays a fixed number of `next()` calls: `collect()` on an arbitrary-length
 /// iterator is an unbounded allocation Trust cannot bound (`count-not-derivable`).
 /// (`std::env::args` itself is a hardened compat_observable boundary either way; see the
-/// artifact notes in `create_secret_file`.) The widest verb is `setup`, which takes six
+/// artifact notes in [`atpkg_keys::fsio`].) The widest verb is `setup`, which takes six
 /// flags — twelve tokens — so this leaves room and [`vet_args`] refuses anything past it
 /// rather than silently dropping it.
 #[cfg(unix)]
@@ -738,12 +738,22 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
 /// All this layer adds is the line that tells the operator a fresh roster was started,
 /// because the library half is used by code paths that report through a structured
 /// summary instead.
+///
+/// The exact byte SNAPSHOT comes back with the roster, because guarded publication needs
+/// it twice over: as the compare-and-swap premise checked immediately before the write,
+/// and as the predecessor a crash-recovery replay is entitled to overwrite.
 #[cfg(unix)]
 fn load_roster(
     path: &str,
     master_pubkey: &str,
     now: u64,
-) -> Result<aterm_update_core::roster::Roster, String> {
+) -> Result<
+    (
+        aterm_update_core::roster::Roster,
+        Option<atpkg_keys::provision::RosterSnapshot>,
+    ),
+    String,
+> {
     // `MayCreateFresh` is this wrapper's callers' contract (`setup`, the first
     // mint on a box with no roster); `join`'s stricter `MustExist` is applied inside
     // `provision::plan`, not here.
@@ -761,7 +771,7 @@ fn load_roster(
             " — starting a new one at roster_seq 0",
         ]));
     }
-    Ok(roster)
+    Ok((roster, snapshot))
 }
 
 /// A stable, printable name for a rejection (see
@@ -773,12 +783,14 @@ fn reject_name(r: &aterm_update_core::roster::RosterReject) -> String {
 }
 
 /// Emit the roster and its detached master signature. The bytes are signed BEFORE either
-/// file is written, and [`atpkg_keys::provision::publish_roster`] fails AS A PAIR: on an
-/// error return the on-disk pair is a consistent one (the previous document with its
-/// previous signature), never a new document beside a stale signature — its own error
-/// text names the one crash-window residual and the copy-back recovery.
+/// file is written, and [`atpkg_keys::provision::publish_roster_locked`] commits a
+/// durable redo directory before either canonical file moves — so the crash window
+/// between the two renames, which no error path can close, is completed forward by the
+/// next run that takes the roster lock.
 #[cfg(unix)]
 fn publish_roster(
+    lock: &atpkg_keys::provision::RosterLock,
+    snapshot: Option<&atpkg_keys::provision::RosterSnapshot>,
     path: &str,
     roster: &aterm_update_core::roster::Roster,
     seed: &atpkg_keys::master::MasterSeed,
@@ -793,7 +805,7 @@ fn publish_roster(
     let bytes = text.into_bytes();
     // The master's whole residency window closes here: sign, and drop it.
     let sig = seed.sign(&bytes)?;
-    atpkg_keys::provision::publish_roster(path, &bytes, &sig)?;
+    atpkg_keys::provision::publish_roster_locked(lock, path, snapshot, &bytes, &sig)?;
     print_line(&concat(&["wrote ", path, " and ", path, ".sig"]));
     Ok(())
 }
@@ -841,9 +853,13 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
     )?;
     let seed = phrase.seed();
     announce_master(&seed)?;
-    let roster = load_roster(roster_path, &seed.pubkey_b64()?, now)?;
+    // ONE lock across read, edit and publish — the same one `setup`/`join` take, so a
+    // revoke and a join cannot each read sequence N and each publish an N+1 that
+    // de-authorizes the other's machine. The kernel releases it if this process dies.
+    let roster_lock = atpkg_keys::provision::lock_roster(roster_path)?;
+    let (roster, snapshot) = load_roster(roster_path, &seed.pubkey_b64()?, now)?;
     let roster = atpkg_keys::roster_ops::revoke(roster, id, now)?;
-    publish_roster(roster_path, &roster, &seed)?;
+    publish_roster(&roster_lock, snapshot.as_ref(), roster_path, &roster, &seed)?;
     show_roster(&roster);
     eprint_line(&concat(&[
         "atpkg-keys: '",
