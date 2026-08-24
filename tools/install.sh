@@ -2,10 +2,14 @@
 # Copyright 2026 Andrew Yates
 # SPDX-License-Identifier: Apache-2.0
 #
-# install.sh — batteries-included aterm install: the released aterm.app AND the
-# `aterm` command (ONE name on PATH; it fronts every verb — aterm help / ctl /
-# pkg / fleet / drive), in one command. Flags only EXCLUDE — except --token,
-# the one opt-in (see the `token` half below).
+# install.sh — the aterm install: the released aterm.app AND the `aterm`
+# command (ONE name on PATH; it fronts every verb — aterm help / ctl / pkg /
+# fleet / drive), in one command. The DEFAULT is the LEAN container: a ~27 MB
+# download, aterm opens immediately, and the ALab toolchain installs itself on
+# first launch with live progress. Flags only EXCLUDE — except --token and
+# --batteries, the two opt-ins (--batteries selects the batteries-included DMG
+# pair: first launch installs the whole toolset with no network, the
+# offline / air-gapped lane).
 #
 # The DEFAULT download source is the PUBLIC release repo (alabsystems/aterm),
 # fetched anonymously — no GitHub credential required. An authenticated `gh`
@@ -32,10 +36,12 @@
 #              archive history: they are skipped, never elected, exactly as the
 #              in-app updater skips them. An explicit --version pin bypasses
 #              selection and may still name an archived release
-#           2. require exactly one manifest and canonical DMG asset, carrying
-#              each exact API asset ID and byte size into its download
-#           3. bind tag == manifest version == DMG filename, then verify the
-#              DMG's SHA-256 against that manifest
+#           2. require exactly one manifest and canonical container asset —
+#              the lean aterm-<v>-mac.zip by default, the batteries DMG pair
+#              on --batteries (elect_container) — carrying each exact API
+#              asset ID and byte size into its download
+#           3. bind tag == manifest version == container filename, then verify
+#              the container's SHA-256 against that manifest
 #           4. verify the bundle's code signature; on the official public repo
 #              the Developer-ID team is pinned IN THIS SCRIPT (A66A9P66Z7 —
 #              see OFFICIAL_TEAM_ID) and a manifest that omits or contradicts
@@ -113,14 +119,21 @@
 # whatever app is installed, and the cargo fallback always builds the checkout.
 #
 # Usage:
-#   tools/install.sh                                  # everything (the default)
+#   tools/install.sh                                  # the recommended install: ~27 MB
+#                                                     # download. aterm opens immediately;
+#                                                     # the ALab toolchain installs itself
+#                                                     # on first launch with live progress
+#   tools/install.sh --batteries                      # the batteries-included DMG pair —
+#                                                     # offline / air-gapped: first launch
+#                                                     # installs the toolset, no network
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
 #   tools/install.sh --token                          # DO provision the update token
 #                                                     # (default: skipped — see `token`)
 #   tools/install.sh --no-token                       # hard off for the token half
-#   tools/install.sh --no-toolchain                   # app only — skip the ~4.2 GB ALab
-#                                                     # toolset (`aterm pkg seed` later)
+#   tools/install.sh --no-toolchain                   # lean zip, packages disabled — no
+#                                                     # toolset half at all (`aterm pkg
+#                                                     # install --default-set` later)
 #   tools/install.sh --no-path                        # don't touch the shell profile
 #   tools/install.sh --token --no-app --no-cli --no-toolchain --no-path
 #                                                     # ONLY provision the token — for a
@@ -158,7 +171,7 @@ usage() {
 		# Print the header comment: from line 5 to the first non-comment line, drop it.
 		sed -n '5,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 	else
-		echo "usage: install.sh [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_UPDATE_TOKEN, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
+		echo "usage: install.sh [--batteries] [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_UPDATE_TOKEN, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
 	fi
 }
 
@@ -856,6 +869,129 @@ random_suffix() {
 	printf '%s' "$s"
 }
 
+# --- container election: which macOS release asset an install downloads -------
+# The DEFAULT is the LEAN container (`aterm-<v>-mac.zip`, ~27 MB) on EVERY CPU:
+# aterm opens immediately, and the ALab toolchain installs itself on first
+# launch — per program, resumable, with live progress
+# (docs/DESIGN-streaming-batteries-2026-08-23.md §7). The batteries-included
+# DMG pair stays a first-class objective for offline / air-gapped installs and
+# is elected by the explicit --batteries flag: the canonical `aterm-<v>.dmg`
+# seals the arm64 toolchain, the additive `aterm-<v>-x86_64.dmg` the Intel one.
+# A release that names no zip in its manifest predates the lean container, so
+# the default falls back to the DMG election that release was cut for — every
+# older --version pin keeps installing exactly as before.
+#
+# Pure decision logic, extracted from install_app so the whole election matrix
+# is pinned by tools/test-install-channel.sh without a network or one Mac of
+# each CPU. Inputs are positional; outputs are globals:
+#   CONTAINER_KIND      dmg | zip
+#   ASSET_NAME/ASSET_SHA  the elected asset and its manifest digest
+#   LEAN_REASON         "" | default | no-toolchain (which lean lane, if any)
+#   TOOLCHAIN_DEFERRED  1 = the toolset half must NOT run synchronously here:
+#                       first launch provisions it, and the GUI's own seed
+#                       pass records adoption there — the audited consent
+#                       seam (atpkg cmd_seed). This script never writes
+#                       consent headlessly.
+# Status 2 = the manifest cannot honestly serve the requested lane (malformed
+# identity fields, or --batteries on a CPU whose seed this release never
+# shipped). Every refusal names its next act; the caller aborts.
+#
+# Every identity bind below is deliberate: the canonical-name bind stops a
+# manifest naming some other asset in the release, and the 64-hex bind stops
+# an empty or malformed field from turning the later digest comparison into a
+# no-op. A pair travels together or not at all — a name without a digest is a
+# malformed release this cutter never produces, and proceeding on half a pair
+# would be the one download whose digest check quietly degraded. The binds run
+# whenever the fields are PRESENT, not merely when their lane is elected: a
+# malformed manifest is a loud abort on every CPU, matching the doctrine that
+# only ABSENCE is silent (the fields parse under required=0 with the identity
+# fields, so duplicates and malformed values already aborted upstream).
+elect_container() { # <batteries01> <toolchain01> <apple_silicon01> <version> <dmg> <dmg_sha> <zip> <zip_sha> <dmg_x86> <dmg_x86_sha>
+	local batteries="$1" toolchain="$2" silicon="$3" version="$4"
+	local dmg_name="$5" dmg_sha="$6" zip_name="$7" zip_sha="$8"
+	local x86_name="$9" x86_sha="${10}"
+	CONTAINER_KIND=dmg
+	ASSET_NAME="$dmg_name"
+	ASSET_SHA="$dmg_sha"
+	LEAN_REASON=""
+	TOOLCHAIN_DEFERRED=0
+
+	if [[ -n "$x86_name" || -n "$x86_sha" ]]; then
+		if [[ -z "$x86_name" || -z "$x86_sha" ]]; then
+			echo "install.sh: manifest carries half an Intel DMG pair (dmg_x86_64/dmg_x86_64_sha256) — refusing" >&2
+			return 2
+		fi
+		if [[ "$x86_name" != "aterm-$version-x86_64.dmg" ]]; then
+			echo "install.sh: manifest dmg_x86_64 $x86_name is not canonical aterm-$version-x86_64.dmg" >&2
+			return 2
+		fi
+		if [[ ! "$x86_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+			echo "install.sh: manifest dmg_x86_64_sha256 is not exactly 64 hexadecimal digits" >&2
+			return 2
+		fi
+	fi
+	if [[ -n "$zip_name" || -n "$zip_sha" ]]; then
+		if [[ -z "$zip_name" || -z "$zip_sha" ]]; then
+			echo "install.sh: manifest carries half a lean zip pair (zip/zip_sha256) — refusing" >&2
+			return 2
+		fi
+		if [[ "$zip_name" != "aterm-$version-mac.zip" ]]; then
+			echo "install.sh: manifest zip $zip_name is not canonical aterm-$version-mac.zip" >&2
+			return 2
+		fi
+		if [[ ! "$zip_sha" =~ ^[0-9a-fA-F]{64}$ ]]; then
+			echo "install.sh: manifest zip_sha256 is not exactly 64 hexadecimal digits" >&2
+			return 2
+		fi
+	fi
+
+	if [[ "$batteries" -eq 1 ]]; then
+		# The explicit offline / air-gapped ask: the sealed toolchain, or a
+		# loud refusal — never a silent downgrade to a container that needs
+		# the network this lane exists to avoid. (--batteries + --no-toolchain
+		# was refused at the argument gate, so toolchain=1 here.)
+		if [[ "$silicon" -eq 1 ]]; then
+			return 0 # the canonical DMG, elected above
+		fi
+		if [[ -z "$x86_name" ]]; then
+			echo "install.sh: --batteries on an Intel Mac, but this release names no Intel batteries DMG" >&2
+			echo "  (the aterm-<version>-x86_64.dmg pair ships since 2026-08). Next act: rerun without" >&2
+			echo "  --batteries — the lean install; the toolchain installs itself on first launch —" >&2
+			echo "  or pin a release that ships the pair: --version <X.Y.Z>." >&2
+			return 2
+		fi
+		ASSET_NAME="$x86_name"
+		ASSET_SHA="$x86_sha"
+		return 0
+	fi
+
+	# The DEFAULT lane: the lean zip on EVERY CPU when the release ships one.
+	if [[ -n "$zip_name" ]]; then
+		CONTAINER_KIND=zip
+		ASSET_NAME="$zip_name"
+		ASSET_SHA="$zip_sha"
+		if [[ "$toolchain" -eq 0 ]]; then
+			# --no-toolchain keeps its meaning: lean zip, packages disabled —
+			# this run defers nothing, because the user excluded the toolset.
+			LEAN_REASON=no-toolchain
+		else
+			LEAN_REASON=default
+			TOOLCHAIN_DEFERRED=1
+		fi
+		return 0
+	fi
+
+	# No zip in the manifest: a pre-lean-container release (reachable via an
+	# explicit --version pin). Take the DMG election that release was built
+	# around — Intel its own DMG when the pair exists, arm64 the canonical
+	# one; the universal app installs either way, exactly as before the flip.
+	if [[ "$silicon" -eq 0 && "$toolchain" -eq 1 && -n "$x86_name" ]]; then
+		ASSET_NAME="$x86_name"
+		ASSET_SHA="$x86_sha"
+	fi
+	return 0
+}
+
 # Internal test seam: source this file to exercise the pure functions without
 # parsing CLI arguments or touching the host. Never part of the public surface.
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
@@ -1221,6 +1357,12 @@ TOKEN_EXPLICIT=0
 # opt-out exists for CI, which wants the app without the 4.2 GB expansion.
 DO_TOOLCHAIN="${ATERM_NO_TOOLCHAIN:+0}"
 DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
+# The container election (2026-08-23 funnel flip — DESIGN-streaming-batteries
+# §7): default = the LEAN zip on every CPU (aterm opens immediately; the
+# toolchain installs itself on first launch with live progress). --batteries
+# is the second opt-in flag (after --token): the sealed DMG pair, for
+# offline / air-gapped installs where first launch must need no network.
+DO_BATTERIES=0
 # PATH wiring for the user's OWN shell. `shell.d` is generated correctly but is
 # auto-sourced only by an aterm session, so every other terminal (iTerm, VS
 # Code, ssh) saw none of the toolset. Opt out with ATERM_NO_PATH=1.
@@ -1267,6 +1409,10 @@ while [[ $# -gt 0 ]]; do
 		DO_TOOLCHAIN=0
 		shift
 		;;
+	--batteries)
+		DO_BATTERIES=1
+		shift
+		;;
 	--no-path)
 		DO_PATH=0
 		shift
@@ -1291,6 +1437,13 @@ if [[ "$DO_UNINSTALL" -eq 1 ]]; then
 fi
 if [[ "$DRY_RUN" -eq 1 ]]; then
 	echo "install.sh: --dry-run is only meaningful with --uninstall" >&2
+	exit 2
+fi
+# The two flags answer the same question in opposite directions, so honoring
+# one would silently discard the other — refuse at the argument gate, before
+# any network or host mutation, like every other input contradiction.
+if [[ "$DO_BATTERIES" -eq 1 && "$DO_TOOLCHAIN" -eq 0 ]]; then
+	echo "install.sh: --batteries downloads the sealed toolchain and --no-toolchain excludes it — pick one" >&2
 	exit 2
 fi
 # The token half's arbitration, decided ONCE and consulted by the excludes
@@ -1350,6 +1503,12 @@ DEST=""
 # every other OS/arch keeps the loud skip, with the source build as remedy.
 LINUX_RELEASE=0
 [[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] && LINUX_RELEASE=1
+# --batteries names a macOS container; no sealed DMG exists off macOS. Loud
+# note, not an abort — the failsafe policy: the rest still installs, and the
+# toolset half below fetches from the network index exactly as before.
+if [[ "$DO_BATTERIES" -eq 1 && "$(uname -s)" != Darwin ]]; then
+	echo "install.sh: NOTE: --batteries selects the macOS batteries-included DMG — no sealed container exists for $(uname -s); the ALab toolset installs from the network index instead" >&2
+fi
 LINUX_TAR=""
 LINUX_TAR_RECORDS=""
 if [[ "$DO_APP" -eq 1 ]]; then
@@ -1619,125 +1778,55 @@ install_app() {
 	# semantics; see required_team_for.
 	TEAM_WANT="$(required_team_for "$REPO_SLUG" "${ATERM_TEAM_ID:-}" "$TEAM_MANIFEST")" || exit 1
 
-	# --- pick the container: per-arch DMG, or the LEAN zip --------------------
-	# The DMG carries the batteries-included toolchain seal (signed tarballs +
-	# manifests — docs/GOLDEN-INSTALL-PATH.md) so a first launch provisions the
-	# whole ALab toolset with no network. Since the per-arch DMG pair (2026-08)
-	# a release can carry TWO batteries-included DMGs: the canonical
-	# `aterm-<v>.dmg` (arm64 seed) and the additive `aterm-<v>-x86_64.dmg`
-	# (Intel seed), named by the manifest's optional dmg_x86_64/dmg_x86_64_sha256
-	# pair. The zip is the SAME signed, notarized bundle with the seal stripped
-	# (~1/40 the bytes) — it already exists, is already published every cut, and
-	# is what self-updates download.
-	#
-	# Election order, because the toolset is the product
-	# (docs/GOLDEN-INSTALL-PATH.md §1.3):
-	#   APPLE SILICON + toolchain — the canonical DMG. Default, unchanged.
-	#   INTEL + toolchain, manifest names an Intel DMG — that DMG: batteries
-	#   included on Intel, for the first time, with this architecture's own
-	#   binaries in the seed (since atpkg index 14 every ALab program publishes
-	#   x86_64-apple-darwin). Keyed on the MANIFEST fields, never on the release
-	#   listing: an older release without the pair takes the next arm.
-	#   INTEL + toolchain, no Intel DMG in this release — the lean zip, and the
-	#   published x86_64 programs arrive over the network
-	#   (`aterm pkg install --default-set`). This was the only Intel lane before
-	#   the pair existed, and stays the fallback so every older release keeps
-	#   installing.
-	#   --no-toolchain — the lean zip on any CPU: the flag already excludes the
-	#   toolset, so a sealed payload would ride down only to be deleted unopened.
-	# ZIP_NAME/ZIP_SHA were parsed WITH the identity fields above: absence is
-	# the only silent case (empty under required=0), while a duplicated key or
-	# a malformed value took the same loud abort as every other manifest field.
-	# (An earlier `|| ZIP_NAME=""` right here masked exactly that malformation
-	# as absence — the one download whose parser surprises fell back instead of
-	# stopping, contrary to the stated doctrine.)
-	CONTAINER_KIND=dmg
-	ASSET_NAME="$DMG_NAME"
-	ASSET_SHA="$SHA_WANT"
+	# --- pick the container: the LEAN zip by default, DMG pair on --batteries --
 	# HARDWARE, not the reporting process. `uname -m` answers for the running
 	# process: `#!/usr/bin/env bash` takes whatever bash is first on PATH, so an
 	# Intel-Homebrew /usr/local/bin/bash — or `arch -x86_64 bash`, or any
 	# Rosetta-translated shell — reports x86_64 on an M-series Mac. Deciding
-	# batteries from that would hand a real Apple Silicon machine the container
-	# with no toolchain in it, which is the exact opposite of the intent, and the
-	# user would never know why. `hw.optional.arm64` answers for the CPU.
+	# the container from that would hand a --batteries Apple Silicon machine
+	# the Intel seed, and the user would never know why. `hw.optional.arm64`
+	# answers for the CPU.
 	IS_APPLE_SILICON=0
 	[[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == 1 ]] && IS_APPLE_SILICON=1
-	LEAN_REASON=""
-	# The EXPLICIT flag outranks the architecture: a user who said
-	# --no-toolchain must be told "toolset skipped (--no-toolchain)", never a
-	# sentence about which DMGs this release carries — with the arms the other
-	# way around, an Intel Mac passing the flag got the pair/predates-the-pair
-	# explanation for a decision they had already made themselves.
-	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
-		LEAN_REASON=no-toolchain
-	elif [[ "$IS_APPLE_SILICON" == 0 ]]; then
-		LEAN_REASON=intel
-	fi
-	# INTEL + toolchain + the release names an Intel DMG: batteries included via
-	# the per-arch pair. The pair travels together or not at all — a name
-	# without a digest is a malformed release this cutter never produces, and
-	# proceeding on half a pair would be the one download whose digest check
-	# quietly degraded. Fail loud, not lean.
-	if [[ "$LEAN_REASON" == intel && "$DO_TOOLCHAIN" -eq 1 && ( -n "$DMG_X86_NAME" || -n "$DMG_X86_SHA" ) ]]; then
-		if [[ -z "$DMG_X86_NAME" || -z "$DMG_X86_SHA" ]]; then
-			echo "install.sh: manifest carries half an Intel DMG pair (dmg_x86_64/dmg_x86_64_sha256) — refusing" >&2
-			exit 1
-		fi
-		# The SAME identity binds the canonical DMG and zip lanes enforce: the
-		# canonical-name bind stops a manifest naming some other asset in the
-		# release, and the 64-hex bind stops an empty or malformed field from
-		# turning the later digest comparison into a no-op.
-		if [[ "$DMG_X86_NAME" != "aterm-$VERSION-x86_64.dmg" ]]; then
-			echo "install.sh: manifest dmg_x86_64 $DMG_X86_NAME is not canonical aterm-$VERSION-x86_64.dmg" >&2
-			exit 1
-		fi
-		if [[ ! "$DMG_X86_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
-			echo "install.sh: manifest dmg_x86_64_sha256 is not exactly 64 hexadecimal digits" >&2
-			exit 1
-		fi
-		CONTAINER_KIND=dmg
-		ASSET_NAME="$DMG_X86_NAME"
-		ASSET_SHA="$DMG_X86_SHA"
-		LEAN_REASON=""
-		echo "install.sh: Intel Mac — using the Intel batteries-included DMG ($ASSET_NAME)."
-		echo "install.sh:   Same signed, notarized universal app; the sealed toolchain carries"
-		echo "install.sh:   x86_64 builds of every ALab program, so first launch needs no network."
-	fi
-	if [[ -n "$ZIP_NAME" && -n "$ZIP_SHA" && -n "$LEAN_REASON" ]]; then
-		# The SAME identity binds the DMG lane enforces, applied to the zip. Skipping
-		# them here would have made the lean container the one download whose name
-		# and digest shape nobody checked — a filename from the manifest joined
-		# straight onto a temp path, and a digest compared without ever proving it
-		# is a digest. The canonical-name bind is what stops a manifest naming some
-		# other asset in the release; the 64-hex bind is what stops an empty or
-		# malformed field from turning the later comparison into a no-op.
-		if [[ "$ZIP_NAME" != "aterm-$VERSION-mac.zip" ]]; then
-			echo "install.sh: manifest zip $ZIP_NAME is not canonical aterm-$VERSION-mac.zip" >&2
-			exit 1
-		fi
-		if [[ ! "$ZIP_SHA" =~ ^[0-9a-fA-F]{64}$ ]]; then
-			echo "install.sh: manifest zip_sha256 is not exactly 64 hexadecimal digits" >&2
-			exit 1
-		fi
-		CONTAINER_KIND=zip
-		ASSET_NAME="$ZIP_NAME"
-		ASSET_SHA="$ZIP_SHA"
-		if [[ "$LEAN_REASON" == intel ]]; then
-			echo "install.sh: Intel Mac — using the lean container ($ASSET_NAME)."
-			echo "install.sh:   Identical signed app. This release predates the Intel"
-			echo "install.sh:   batteries-included DMG (aterm-<version>-x86_64.dmg), so the sealed"
-			echo "install.sh:   toolchain — packed per-architecture — is omitted rather than shipping"
-			echo "install.sh:   a gigabyte of arm64 binaries this CPU cannot run. The ALab toolset"
-			echo "install.sh:   installs over the network instead: \`aterm pkg install --default-set\`"
-			echo "install.sh:   (every program publishes x86_64-apple-darwin since atpkg index 14)."
+	# The decision itself lives in elect_container (with the election-order
+	# rationale and every manifest-identity bind), extracted so
+	# tools/test-install-channel.sh pins the whole matrix without a network or
+	# one Mac of each CPU. It sets CONTAINER_KIND/ASSET_NAME/ASSET_SHA/
+	# LEAN_REASON/TOOLCHAIN_DEFERRED; a refusal already named its next act.
+	elect_container "$DO_BATTERIES" "$DO_TOOLCHAIN" "$IS_APPLE_SILICON" "$VERSION" \
+		"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" "$DMG_X86_NAME" "$DMG_X86_SHA" || exit 1
+	# Narrate the election before any bytes move. Each arm says what was
+	# decided and why, in the voice of the decision's own cause: the default
+	# says what first launch will do, the flags echo the flag, the fallbacks
+	# name the release property that forced them.
+	case "$CONTAINER_KIND:$LEAN_REASON" in
+	zip:default)
+		echo "install.sh: using the lean container ($ASSET_NAME) — the recommended install."
+		;;
+	zip:no-toolchain)
+		echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME)."
+		echo "install.sh:   Identical signed app, without the ~1 GB sealed toolchain payload it"
+		echo "install.sh:   would only delete unopened. Install the ALab toolset any time later"
+		echo "install.sh:   with \`aterm pkg seed\` or \`aterm pkg install --default-set\`."
+		;;
+	dmg:*)
+		if [[ "$DO_BATTERIES" -eq 1 ]]; then
+			if [[ "$IS_APPLE_SILICON" == 1 ]]; then
+				echo "install.sh: --batteries — using the batteries-included DMG ($ASSET_NAME)."
+			else
+				echo "install.sh: --batteries — using the Intel batteries-included DMG ($ASSET_NAME)."
+				echo "install.sh:   Same signed, notarized universal app; the sealed toolchain carries"
+				echo "install.sh:   x86_64 builds of every ALab program."
+			fi
+			echo "install.sh:   First launch installs the whole ALab toolset with no network —"
+			echo "install.sh:   the offline / air-gapped lane."
 		else
-			echo "install.sh: --no-toolchain — using the lean container ($ASSET_NAME)."
-			echo "install.sh:   Identical signed app, without the ~1 GB sealed toolchain payload it"
-			echo "install.sh:   would only delete unopened. Install the ALab toolset any time later"
-			echo "install.sh:   with \`aterm pkg seed\` or \`aterm pkg install --default-set\`."
+			echo "install.sh: this release predates the lean container (no zip in its manifest) —"
+			echo "install.sh:   using the batteries-included DMG ($ASSET_NAME), exactly as its own"
+			echo "install.sh:   installer did."
 		fi
-	fi
+		;;
+	esac
 
 	# Official releases DO publish an Ed25519 aterm-appcast.toml.sig, but this
 	# bootstrap lane cannot verify it (macOS's stock LibreSSL has no Ed25519) —
@@ -1818,13 +1907,16 @@ install_app() {
 		fi
 	else
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
-		if [[ "$LEAN_REASON" == intel ]]; then
-			# This branch is only reached when the release names NO Intel DMG
-			# (the pair election above wins otherwise) — i.e. a pre-pair
-			# release. Say that, not the pre-index-14 claim that the toolset
-			# itself is Apple-silicon-only, which stopped being true when the
-			# registry went dual-arch.
-			echo "  then: aterm.app -> $DEST. This release predates the Intel batteries DMG; the ALab programs install from the network (published dual-arch since index 14)."
+		if [[ "$LEAN_REASON" == default ]]; then
+			# The recommended plan, in the owner's words: the small download is
+			# the whole wait — the toolset arrives per program, visibly, AFTER
+			# the window is already open. And the road not taken is named, so
+			# an air-gapped operator learns about --batteries here, not after
+			# a first launch that cannot reach the index.
+			echo "  then: aterm.app -> $DEST. aterm opens immediately; the ALab toolchain installs"
+			echo "  itself on first launch with live progress — programs download individually,"
+			echo "  resumably, and only this machine's builds. Offline / air-gapped install"
+			echo "  instead: rerun with --batteries."
 		else
 			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain); \`aterm pkg seed\` or \`aterm pkg install --default-set\` installs it later."
 		fi
@@ -2714,8 +2806,14 @@ wire_shell_path() {
 	esac
 	# No hook means no toolset was laid down (--no-toolchain, a machine the
 	# index publishes nothing for, or a declined set). Nothing to point at, so
-	# say nothing.
-	[[ -f "$hook" ]] || return 0
+	# say nothing — UNLESS the toolset is deferred to first launch: that lane
+	# lays the hook down minutes from now, and this script never runs again,
+	# so the guarded block goes in ahead of it. Safe because the line written
+	# below guards on the hook's existence itself — a no-op until first launch
+	# creates it, active from then on.
+	if [[ ! -f "$hook" ]]; then
+		[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] || return 0
+	fi
 
 	marker="# >>> aterm ALab toolset (managed by install.sh) >>>"
 	if [[ -f "$rc" ]] && grep -qF "$marker" "$rc" 2>/dev/null; then
@@ -2767,10 +2865,14 @@ wire_shell_path() {
 		return 0
 	fi
 	PATH_BLOCK_WROTE=1
+	# Tell the truth about WHEN the line does something: sourcing a hook that
+	# does not exist yet (the deferred lane) would be advice that fails.
+	local activate="open a new shell, or: . '$hook'"
+	[[ -f "$hook" ]] || activate="the guarded line activates once first launch installs the toolset"
 	if [[ -n "$path_line" ]]; then
-		echo "install.sh: put the ALab toolset and $BIN_DIR on PATH in $rc — open a new shell, or: . '$hook'"
+		echo "install.sh: put the ALab toolset and $BIN_DIR on PATH in $rc — $activate"
 	else
-		echo "install.sh: put the ALab toolset on PATH in $rc — open a new shell, or: . '$hook'"
+		echo "install.sh: put the ALab toolset on PATH in $rc — $activate"
 	fi
 	echo "  skip this next time with ATERM_NO_PATH=1"
 }
@@ -2816,7 +2918,22 @@ fi
 # sitting right in front of it. `install_toolchain` proves an `aterm` exists
 # and skips with a reason when it does not, which is the check that matters.
 if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
-	install_toolchain
+	if [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]]; then
+		# The lean default (docs/DESIGN-streaming-batteries-2026-08-23.md §7):
+		# first launch provisions the toolset per program with live progress,
+		# and the GUI's own seed pass records adoption there — the audited
+		# consent seam (atpkg cmd_seed). Running `pkg seed` headlessly here
+		# would block this install on the full download AND move the consent
+		# write out of that seam, so the deferral IS the design, not a skip.
+		# TOOLCHAIN_DEFERRED is set only by a fresh lean-DEFAULT app install;
+		# every repair lane (--no-app, an already-current app, --batteries,
+		# Linux) still runs install_toolchain synchronously right here.
+		echo "install.sh: toolset: installs on first launch — open aterm and the ALab toolchain"
+		echo "install.sh:   downloads itself with live progress, program by program. Terminal-first"
+		echo "install.sh:   instead: aterm pkg install --default-set"
+	else
+		install_toolchain
+	fi
 fi
 if [[ "$DO_PATH" -eq 1 ]]; then
 	wire_shell_path
