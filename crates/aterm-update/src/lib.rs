@@ -398,18 +398,27 @@ pub fn apply_staged_if_ready_preserving_fds_exact(
 
 /// Overlap-handoff PRE-PARK verification: authenticate the staged candidate
 /// (codesign policy + sealed build/commit rebinding, bound to the authorized
-/// artifact identity) while the calling process's PTY readers are all still
-/// live. The handoff child re-runs the complete gate at swap time — this call
-/// only moves the FIRST verdict out of the activity-sensitive parked window so
-/// a doomed candidate never parks a reader. See
-/// `install::preverify_staged_handoff_candidate` for the exact obligations.
+/// artifact identity) AND prove the bundle it would replace can become the
+/// swap's rollback source — both while the calling process's PTY readers are
+/// all still live. The handoff child re-runs the complete gate at swap time —
+/// this call only moves the FIRST verdict out of the activity-sensitive parked
+/// window so a doomed candidate never parks a reader. See
+/// `install::preverify_staged_handoff_candidate` for the exact obligations, and
+/// `install::preverify_installed_rollback_source` for why the second half is
+/// not optional.
 #[cfg(target_os = "macos")]
 pub fn preverify_staged_for_handoff(
     current_build: u64,
+    current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
 ) -> Result<(), String> {
-    install::preverify_staged_handoff_candidate(current_build, expected_build, expected_commit)
+    install::preverify_staged_handoff_candidate(
+        current_build,
+        current_commit,
+        expected_build,
+        expected_commit,
+    )
 }
 
 /// Non-macOS: there is no `.app` bundle, so there is nothing to pre-verify and
@@ -418,6 +427,7 @@ pub fn preverify_staged_for_handoff(
 #[cfg(not(target_os = "macos"))]
 pub fn preverify_staged_for_handoff(
     _current_build: u64,
+    _current_commit: Option<&str>,
     _expected_build: Option<u64>,
     _expected_commit: Option<&str>,
 ) -> Result<(), String> {

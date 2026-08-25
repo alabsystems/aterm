@@ -4993,6 +4993,7 @@ impl App {
                 } else {
                     aterm_update::preverify_staged_for_handoff(
                         current_build,
+                        Some(crate::build_info::GIT_COMMIT),
                         Some(build),
                         Some(&commit),
                     )

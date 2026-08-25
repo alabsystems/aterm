@@ -438,17 +438,17 @@ pub(crate) fn default_roles(theme: Theme) -> NativeRoles {
 /// the full token set from these seeds through the same OKLCH mix + contrast
 /// conditioning every terminal theme goes through, so the forced pages get the
 /// identical surface/ink discipline instead of a second hand-held ramp.
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 pub(crate) const FORCED_LIGHT_CHROME_BG: u32 = 0x00FA_FAFA;
 /// Dark text for the forced-light chrome (the libadwaita 80 %-black composite).
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 pub(crate) const FORCED_LIGHT_CHROME_FG: u32 = 0x002E_3436;
 /// The authored FORCED-chrome seed palette for config `window_theme = dark`
 /// (libadwaita dark: `window_bg_color #242424`, near-white text).
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 pub(crate) const FORCED_DARK_CHROME_BG: u32 = 0x0024_2424;
 /// Near-white text for the forced-dark chrome.
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 pub(crate) const FORCED_DARK_CHROME_FG: u32 = 0x00ED_EDED;
 
 /// The floor the carried terminal cursor — the accent SEED — is held to against
@@ -464,7 +464,7 @@ pub(crate) const FORCED_DARK_CHROME_FG: u32 = 0x00ED_EDED;
 /// usable lightness signal at all, and the hue it hands to [`roles`] is whatever
 /// rounding left in a near-neutral. Holding the seed to the same 3.0 the shipped
 /// ink must reach keeps the identity that gets carried a real colour.
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 const FORCED_CHROME_ACCENT_FLOOR: f32 = ACCENT_INK_FLOOR;
 
 /// The [`Theme`] the chrome painters draw from when config
@@ -475,7 +475,7 @@ const FORCED_CHROME_ACCENT_FLOOR: f32 = ACCENT_INK_FLOOR;
 /// the terminal theme — "same accent" per the libadwaita reference — with the
 /// cursor lightness-nudged ([`ensure_contrast`], hue-preserving) so it stays
 /// visible on the forced surface.
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 pub(crate) fn forced_chrome_theme(terminal: Theme, dark: bool) -> Theme {
     let (bg, fg) = if dark {
         (FORCED_DARK_CHROME_BG, FORCED_DARK_CHROME_FG)
@@ -495,8 +495,34 @@ pub(crate) fn forced_chrome_theme(terminal: Theme, dark: bool) -> Theme {
     }
 }
 
+/// The pixel-band chrome palette for a `window_theme` policy over a `terminal`
+/// theme — the pure core `App::chrome_palette_theme` runs on Linux AND Windows
+/// (the `STRIP_IS_CHROME_BAND` platforms), extracted so the resolution is
+/// testable on any host (the integration arm is `cfg`-gated per platform, but
+/// the LOGIC is one function). `Auto` follows the system (returns the terminal
+/// theme unchanged — the caption/CSD painter tracks the OS); a forced value
+/// whose darkness already matches keeps the terminal theme (no needless
+/// re-authoring); a forced value AGAINST the terminal darkness authors the
+/// forced-variant chrome so the band + native pages flip as one with the OS
+/// caption (owner decision 2026-08-25: Windows matches Linux).
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
+pub(crate) fn resolve_chrome_palette(
+    window_theme: crate::app_config::WindowTheme,
+    terminal: Theme,
+) -> Theme {
+    let force_dark = match window_theme {
+        crate::app_config::WindowTheme::Auto => return terminal,
+        crate::app_config::WindowTheme::Light => false,
+        crate::app_config::WindowTheme::Dark => true,
+    };
+    if crate::tab_bar::theme_is_dark(terminal.bg) == force_dark {
+        return terminal;
+    }
+    forced_chrome_theme(terminal, force_dark)
+}
+
 /// Inverse of [`packed_rgb`] (0x00RR_GGBB).
-#[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
+#[cfg(any(test, target_os = "linux", windows))] // pixel-band forced-palette seam (chrome_palette_theme, Linux+Windows) + tests; dead on macOS lib
 fn pack_rgb(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
@@ -892,6 +918,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The pixel-band palette resolver both Linux and Windows run (owner
+    /// decision 2026-08-25: Windows matches Linux). `Auto` follows the system
+    /// (terminal theme untouched); a forced value AGAINST the terminal
+    /// darkness authors the forced-variant chrome so the band + native pages
+    /// flip as ONE with the OS caption — killing the "light titlebar bolted
+    /// onto a dark chrome body" half-flip Windows used to show. A forced value
+    /// whose darkness already matches keeps the terminal theme (no re-author).
+    /// Runs on every host: the integration arm is cfg-gated per platform, but
+    /// this is the logic itself.
+    #[test]
+    fn resolve_chrome_palette_forces_the_whole_band_or_follows_the_system() {
+        use crate::app_config::WindowTheme;
+        let dark_term = Theme {
+            bg: 0x0000_0000,
+            fg: 0x00ff_ffff,
+            cursor: 0x0000_ff00,
+            selection: 0x0033_3333,
+        };
+        let light_term = Theme {
+            bg: 0x00ff_ffff,
+            fg: 0x0000_0000,
+            cursor: 0x0000_00ff,
+            selection: 0x00cc_cccc,
+        };
+
+        // `Theme` has no PartialEq; compare the four fields.
+        let same = |a: Theme, b: Theme| {
+            a.fg == b.fg && a.bg == b.bg && a.cursor == b.cursor && a.selection == b.selection
+        };
+
+        // Auto follows the system on both bands: terminal theme, untouched.
+        assert!(same(resolve_chrome_palette(WindowTheme::Auto, dark_term), dark_term));
+        assert!(same(resolve_chrome_palette(WindowTheme::Auto, light_term), light_term));
+
+        // Forced LIGHT over a DARK terminal authors a LIGHT chrome — the band
+        // no longer keeps the dark terminal palette under a light caption.
+        let forced = resolve_chrome_palette(WindowTheme::Light, dark_term);
+        assert!(!same(forced, dark_term), "forced light must re-author, not pass the dark band through");
+        assert!(
+            !crate::tab_bar::theme_is_dark(forced.bg),
+            "forced light must yield a LIGHT chrome bg (matches the light caption)"
+        );
+        // It is exactly the authored forced-light palette.
+        assert!(same(forced, forced_chrome_theme(dark_term, false)));
+
+        // Forced DARK over a LIGHT terminal authors a DARK chrome, symmetrically.
+        let forced_dark = resolve_chrome_palette(WindowTheme::Dark, light_term);
+        assert!(crate::tab_bar::theme_is_dark(forced_dark.bg));
+        assert!(same(forced_dark, forced_chrome_theme(light_term, true)));
+
+        // A forced value whose darkness ALREADY matches keeps the terminal
+        // theme — no needless re-authoring (a dark terminal + forced dark).
+        assert!(same(resolve_chrome_palette(WindowTheme::Dark, dark_term), dark_term));
+        assert!(same(resolve_chrome_palette(WindowTheme::Light, light_term), light_term));
     }
 
     /// The FORCED chrome palettes (`window_theme = light|dark` against the

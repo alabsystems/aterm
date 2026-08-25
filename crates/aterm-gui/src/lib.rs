@@ -10572,7 +10572,11 @@ struct App {
     /// [`WindowTheme::Auto`]): Auto follows the OS effective appearance, Light/Dark
     /// force an `NSAppearance`. Applied to the NSWindow in
     /// [`platform::AppRt::window_set_appearance`] at window attach. GLOBAL
-    /// (window-uniform); macOS-only effect (inert elsewhere).
+    /// (window-uniform). Drives real chrome on EVERY platform: the macOS
+    /// NSAppearance, and — via `chrome_palette_theme` — the whole pixel-band
+    /// chrome (tab band + native pages) and its caption on Linux AND Windows
+    /// (the latter since the 2026-08-25 match-Linux decision); only `Auto`
+    /// follows the system.
     window_theme: app_config::WindowTheme,
     /// GPU-present colour-space TAG (config `window_colorspace`, default
     /// [`app_config::WindowColorspace::Srgb`]): how ColorSync interprets the
@@ -19750,6 +19754,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         ready_raw_fd,
         incoming_exec_fds.parent_pid(),
     );
+    // Recorded BEFORE the match consumes them: which half was refused is the
+    // entire diagnosis when a candidate exits here, and the parent can never see
+    // it (all it observes is the readiness pipe closing).
+    let (ready_admitted, commit_admitted) = (ready.is_some(), commit.is_some());
     let (handoff_ready, mut handoff_commit, overlap_degraded) = match (ready, commit) {
         (Some(ready), Some(commit)) => (Some(ready), Some(commit), false),
         _ => (None, None, overlap_channels_present),
@@ -19758,6 +19766,21 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         .is_some()
         .then(crate::spawn::DeferredReaderGate::closed);
     if overlap_degraded && !seamless_adopt.is_empty() {
+        // SAY WHY, DURABLY. This is the exit the parked parent reads as
+        // `ChildDied`, and a LaunchServices-launched successor has no stderr, so
+        // without this line the whole failure is a verdict with no evidence
+        // anywhere on the machine — which is exactly how it reached the field.
+        aterm_log::error!(
+            "overlap handoff: this candidate holds {} adopted session(s) but the overlap \
+             authority is incomplete (readiness channel {}, Commit channel {}); closing every \
+             adopted master and exiting before any window so the outgoing process keeps every \
+             session. This binary is build {} commit {}.",
+            seamless_adopt.len(),
+            if ready_admitted { "admitted" } else { "REFUSED" },
+            if commit_admitted { "admitted" } else { "REFUSED" },
+            build_info::BUILD_NUMBER,
+            build_info::GIT_COMMIT
+        );
         // Recognizable overlap plus malformed/partial authority must never
         // fall through to eager adopted readers. Close every child duplicate
         // and exit this candidate before any session/thread spawn; the parked
@@ -19844,6 +19867,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     #[cfg(unix)]
     if let Some(commit) = handoff_commit.take() {
         let Some(watched) = commit.start_watch() else {
+            // Same sink discipline as the degraded exit above: this is another
+            // silent `ChildDied` from the parent's side unless it is written down.
+            aterm_log::error!(
+                "overlap handoff: the parent-liveness watcher for the Commit channel could not \
+                 start; closing every adopted master and exiting before any window so the \
+                 outgoing process keeps every session"
+            );
             for adopted in &seamless_adopt {
                 if adopted.master >= 3 {
                     aterm_pty::close_fd(adopted.master);

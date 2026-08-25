@@ -2319,6 +2319,20 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
         return own;
     };
     let Some(own) = own else {
+        // BOTH SINKS, and this is the reason the whole class of refusal below was
+        // invisible for a release: a successor started through LaunchServices is
+        // launchd's child with no terminal on either standard stream, so an
+        // `eprintln!` here reaches nobody. The outgoing process meanwhile sees only
+        // the readiness pipe close — `ChildDied`, the outcome that means the new
+        // bytes crashed — and reports THAT. Five identical field failures produced
+        // zero explanation because these three lines were stderr-only. The log file
+        // is the durable sink; stderr stays for a developer running the binary from
+        // a shell.
+        aterm_log::error!(
+            "seamless handoff refused: this build reports commit `{}`, which is not a usable \
+             identity",
+            crate::build_info::GIT_COMMIT
+        );
         eprintln!(
             "aterm-gui: seamless handoff refused: this build reports commit \
              `{}`, which is not a usable identity",
@@ -2333,10 +2347,28 @@ pub(crate) fn take_target_identity() -> Option<HandoffTarget> {
         .zip(normalize_commit(commit))
         .map(|(build, commit)| HandoffTarget { build, commit })
     else {
+        aterm_log::error!("seamless handoff refused: malformed target identity `{raw}`");
         eprintln!("aterm-gui: seamless handoff refused: malformed target identity `{raw}`");
         return None;
     };
     if expected != own {
+        // THE FIELD FAILURE, stated in full. This fires when the successor could
+        // not swap into the build the outgoing process authorized — a boot apply
+        // that answered `Deferred` (most often: the installed bundle cannot be the
+        // swap's rollback source) leaves this image running the OLD build, and an
+        // old build must refuse the target rather than adopt sessions under a
+        // proof it cannot honour. Naming the boot apply here is what turns the
+        // parent's bare `ChildDied` into a diagnosis.
+        aterm_log::error!(
+            "seamless handoff refused: the outgoing process authorized build {} commit {}, but \
+             this binary is build {} commit {} — this successor did not become the authorized \
+             build (see the `update apply (boot)` line above for why the swap did not happen). \
+             Closing the readiness channel; the outgoing process keeps every session.",
+            expected.build,
+            expected.commit,
+            own.build,
+            own.commit
+        );
         eprintln!(
             "aterm-gui: seamless handoff refused: the outgoing process authorized \
              build {} commit {}, but this binary is build {} commit {}",
@@ -3967,6 +3999,59 @@ mod tests {
         );
         aterm_pty::close_fd(m);
         aterm_pty::close_fd(s);
+    }
+
+    /// THE FIELD FAILURE, pinned end to end (2026-08-25). A successor whose boot
+    /// apply could not swap stays the OLD build, so `take_target_identity`
+    /// returns `None` — and THIS is what the parked parent actually observes:
+    /// `take_ready_fd` has already taken ownership of the readiness write end by
+    /// the time it refuses, so refusing DROPS it, the pipe's last write end
+    /// closes, and the parent's `wait_handoff_ready` reads EOF and books
+    /// `ChildDied` — the outcome that means "the new bytes crashed" — against a
+    /// build that never even started.
+    ///
+    /// The close is CORRECT and stays (a refused candidate must not sit on a
+    /// live channel it will never write). What was wrong is that it was the only
+    /// evidence produced anywhere: the refusal itself was `eprintln!`-only, and a
+    /// LaunchServices-launched successor has no stderr. This test pins the
+    /// mechanism so the next reader of a `ChildDied` verdict knows to look for a
+    /// wrong-build successor, not a crash.
+    #[test]
+    #[cfg(unix)]
+    fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
+        let mut fds = [0i32; 2];
+        // SAFETY: plain pipe(2) into a valid 2-slot out-array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+        let (rd, wr) = (fds[0], fds[1]);
+        // Serialized by ENV_LOCK.
+        aterm_log::env::set("ATERM_HANDOFF_READY_FD", wr.to_string());
+        // `target: None` is exactly what a wrong-build successor hands in: the
+        // parent authorized build X, this image is build Y, so the identity was
+        // refused a few instructions earlier.
+        assert!(
+            take_ready_fd(
+                Some("n".to_string()),
+                Some([7; 32]),
+                Some([8; 32]),
+                None,
+                &[],
+            )
+            .is_none(),
+            "a successor that is not the authorized build refuses the readiness channel"
+        );
+        // The parent's side: no write end survives anywhere, so the read end is
+        // at EOF immediately — a 0-byte read, which `wait_handoff_ready` types as
+        // `ChildDied`.
+        let mut byte = [0u8; 1];
+        // SAFETY: bounded read into a stack local on an fd this test owns.
+        let read = unsafe { libc::read(rd, byte.as_mut_ptr().cast(), 1) };
+        assert_eq!(
+            read, 0,
+            "the refusal dropped the only write end, so the parked parent reads EOF (ChildDied)"
+        );
+        aterm_pty::close_fd(rd);
     }
 
     /// The happy path: a real pipe write-end is adopted, its CLOEXEC is

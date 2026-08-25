@@ -1380,24 +1380,108 @@ fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
 /// `expected_build`/`expected_commit` bind the check to the exact artifact the
 /// updater reducer authorized, mirroring `ready_matches_expected`: a stage that
 /// changed identity since authorization fails now instead of after parking.
+///
+/// `current_commit` is the RUNNING image's provenance, and it is here for the
+/// second half of the gate — see [`preverify_installed_rollback_source`]. A
+/// staged apply is a SWAP, and a swap has two preconditions, not one: the
+/// incoming bundle must be authentic, AND the outgoing bundle must be able to
+/// become the rollback source the swap installs at the fixed path. Only the
+/// first was hoisted here originally, and the second is the one that fails on a
+/// hand-installed bundle — silently, inside the successor, five seconds after
+/// the terminal parked.
 pub fn preverify_staged_handoff_candidate(
     current_build: u64,
+    current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
 ) -> Result<(), String> {
     let Some(staging) = Staging::resolve() else {
         return Err("no private staging root is available".to_string());
     };
-    preverify_staged_handoff_candidate_at(&staging, current_build, expected_build, expected_commit)
+    preverify_staged_handoff_candidate_at(
+        &staging,
+        bundle::resolve().as_ref().map(|b| b.app_root.as_path()),
+        current_build,
+        current_commit,
+        expected_build,
+        expected_commit,
+    )
+}
+
+/// THE OTHER HALF OF A SWAP'S PRECONDITION: can the bundle we are running from
+/// become the rollback source the swap is about to install at the fixed path?
+///
+/// `apply_staged_if_ready` asks exactly this at step 7, immediately before it
+/// arms the crash-loop sentinel — "a corrupt/replaced install must never become
+/// crash-recovery authority" — and refuses with `Deferred` when the answer is
+/// no. That refusal is CORRECT and stays. What was wrong is WHERE the question
+/// was first asked: inside the SUCCESSOR's boot, after the outgoing process had
+/// already parked every reader, duplicated every PTY master, written a manifest
+/// and asked LaunchServices for a whole new application job.
+///
+/// A successor that cannot swap stays the OLD build, so it fails
+/// `seamless::take_target_identity` ("the outgoing process authorized build X,
+/// but this binary is build Y"), drops the readiness pipe it was handed, and
+/// exits. The parked parent reads EOF and books the one outcome that means the
+/// new bytes crashed — `ChildDied` — against a build that was never even
+/// executed. Observed in the field: five consecutive identical failures,
+/// `failing_applies=5 persistent=true`, five frozen terminals, and not one line
+/// anywhere naming the cause.
+///
+/// So the question moves here, where it is asked while every reader is still
+/// live and the answer costs the user nothing but a log line. This is strictly
+/// ADDITIVE, exactly like the staged half above: it can only ever refuse an
+/// attempt the swap was going to refuse anyway, and the swap re-runs it under
+/// `apply_lock` regardless.
+fn preverify_installed_rollback_source(
+    installed: Option<&Path>,
+    current_build: u64,
+    current_commit: Option<&str>,
+) -> Result<(), String> {
+    let Some(installed) = installed else {
+        // `bundle::resolve` is what the apply itself calls, and `None` there is
+        // `ApplyOutcome::NotApplicable` — the updater is inert for this process
+        // (no `.app` layout, a translocated or DMG launch, or a bundle carrying
+        // the `ATermDevBuild` mark). A handoff whose successor's swap will be a
+        // no-op can only ever end as a wrong-build refusal, so say so now.
+        return Err(
+            "this process does not run from an installed bundle the updater may replace, so a \
+             staged build cannot become its successor"
+                .to_string(),
+        );
+    };
+    match verified_bundle_identity(installed) {
+        Ok((build, commit)) => {
+            if identity_matches_running(build, &commit, current_build, current_commit) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the installed bundle at {} is sealed {build}/{commit}, which is not the \
+                     running {current_build}/{}: the swap would have no verified rollback \
+                     source, so no staged build can replace it",
+                    installed.display(),
+                    current_commit.unwrap_or("?")
+                ))
+            }
+        }
+        Err(error) => Err(format!(
+            "the installed bundle at {} cannot be the rollback source the swap installs: \
+             {error}",
+            installed.display()
+        )),
+    }
 }
 
 /// Injectable core of [`preverify_staged_handoff_candidate`]; the split exists
 /// so the refusal ladder is provable against a temp staging root without a
 /// signed fixture bundle (a missing/unsigned candidate must refuse BEFORE any
-/// caller could park a reader on its behalf).
+/// caller could park a reader on its behalf). `installed` is the resolved
+/// bundle root the swap would replace, injected for the same reason.
 fn preverify_staged_handoff_candidate_at(
     staging: &Staging,
+    installed: Option<&Path>,
     current_build: u64,
+    current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
 ) -> Result<(), String> {
@@ -1440,7 +1524,10 @@ fn preverify_staged_handoff_candidate_at(
     {
         return Err("staged bundle commit does not match the authorized artifact".to_string());
     }
-    Ok(())
+    // LAST, deliberately. Every check above is about the INCOMING bytes and is
+    // the more common refusal, so it keeps naming itself first; this one is
+    // about the machine's install and, when it fires, it fires forever.
+    preverify_installed_rollback_source(installed, current_build, current_commit)
 }
 
 /// Upper bound on the changelog text a `ready.toml` may carry.
@@ -3313,6 +3400,74 @@ use aterm_types::rfc3339::format_rfc3339;
 #[cfg(test)]
 mod tests {
 
+    /// THE ChildDied FIELD FAILURE (2026-08-25), pinned at the seam that now
+    /// answers it. Five consecutive in-session updates on one desk ended
+    /// `handoff proof ended ChildDied` with `failing_applies=5 persistent=true`,
+    /// and nothing on the machine named a cause. The chain was:
+    /// `/Applications/aterm.app` had been replaced in place by a hand-built,
+    /// ad-hoc-signed bundle → the successor's boot apply refused to swap
+    /// ("current installed rollback source is not verified") → the successor
+    /// stayed the OLD build → it refused the authorized target identity and
+    /// dropped the readiness pipe → the parent read EOF and booked the crash
+    /// outcome. Five frozen terminals for a verdict that was decidable before
+    /// the first reader parked.
+    ///
+    /// `None` is `bundle::resolve()` finding nothing the updater may replace,
+    /// which is `ApplyOutcome::NotApplicable` at swap time: a successor whose
+    /// swap is a no-op can only ever refuse the target, so this must refuse now.
+    #[test]
+    fn a_process_with_no_replaceable_bundle_refuses_before_anything_parks() {
+        let error = super::preverify_installed_rollback_source(None, 100, Some("abcdef0"))
+            .expect_err("no replaceable bundle cannot host a swap");
+        assert!(
+            error.contains("does not run from an installed bundle"),
+            "the refusal names the missing bundle rather than blaming the candidate: {error}"
+        );
+    }
+
+    /// A bundle path that is not a verifiable bundle refuses, and the refusal
+    /// NAMES THE PATH — the one fact an operator needs to act on, and the one
+    /// the `ChildDied` verdict could never carry.
+    #[test]
+    fn an_unverifiable_installed_bundle_refuses_and_names_itself() {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-rollback-source-{}-{}",
+            std::process::id(),
+            super::unix_now_secs()
+        ));
+        let error = super::preverify_installed_rollback_source(Some(&root), 100, Some("abcdef0"))
+            .expect_err("a path that is not a bundle cannot be a rollback source");
+        assert!(
+            error.contains(&root.display().to_string()),
+            "the refusal names the bundle it examined: {error}"
+        );
+        assert!(
+            error.contains("rollback source"),
+            "the refusal names WHAT the bundle failed to be: {error}"
+        );
+    }
+
+    /// The identity half of the same gate, pinned pure. The owner's desk failed
+    /// this one too — the bundle on disk was sealed 1787634715 while the process
+    /// running out of it was 1787614521, because the `.app` had been replaced
+    /// underneath a live instance. A rollback source that is not the running
+    /// image is not a rollback source.
+    #[test]
+    fn only_the_running_image_can_be_the_rollback_source() {
+        assert!(
+            super::identity_matches_running(1787614521, "abcdef0123", 1787614521, Some("abcdef0")),
+            "the sealed identity of the image we are executing is the rollback source"
+        );
+        assert!(
+            !super::identity_matches_running(1787634715, "abcdef0123", 1787614521, Some("abcdef0")),
+            "a bundle swapped under a live instance is a different build, not our rollback source"
+        );
+        assert!(
+            !super::identity_matches_running(1787614521, "abcdef0123", 1787614521, Some("9999999")),
+            "same build number, different provenance, is still not our image"
+        );
+    }
+
     /// THE ChildDied regression (2026-07-22): the post-swap re-exec image must
     /// carry BOTH the single-use re-exec nonce and the caller's restored
     /// handoff authority pairs — the successor's prearm cannot validate the
@@ -3630,7 +3785,7 @@ staged_at = "2026-08-17T00:00:00Z"
         let (s, root) = temp_staging();
 
         // Nothing staged: refuse immediately.
-        let absent = preverify_staged_handoff_candidate_at(&s, 10, None, None);
+        let absent = preverify_staged_handoff_candidate_at(&s, None, 10, None, None, None);
         assert!(
             absent.clone().unwrap_err().contains("no verified update"),
             "{absent:?}"
@@ -3638,14 +3793,14 @@ staged_at = "2026-08-17T00:00:00Z"
 
         // Staged but not strictly newer than the running build.
         write_ready(&s, 20);
-        let stale = preverify_staged_handoff_candidate_at(&s, 20, None, None);
+        let stale = preverify_staged_handoff_candidate_at(&s, None, 20, None, None, None);
         assert!(
             stale.clone().unwrap_err().contains("strictly newer"),
             "{stale:?}"
         );
 
         // Staged build is not the artifact the updater reducer authorized.
-        let wrong = preverify_staged_handoff_candidate_at(&s, 10, Some(21), None);
+        let wrong = preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(21), None);
         assert!(
             wrong
                 .clone()
@@ -3656,7 +3811,8 @@ staged_at = "2026-08-17T00:00:00Z"
 
         // Right identity on the marker, but no verifiable bundle exists at the
         // staged path: the sealed-identity gate must fail closed.
-        let unverifiable = preverify_staged_handoff_candidate_at(&s, 10, Some(20), None);
+        let unverifiable =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None);
         assert!(unverifiable.is_err(), "{unverifiable:?}");
 
         let _ = std::fs::remove_dir_all(root);

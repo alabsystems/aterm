@@ -22366,11 +22366,15 @@ impl App {
     /// otherwise config `window_theme = light` grows a dark toast on a
     /// forced-light Settings page.
     ///
-    /// The live OSC-11 tint is applied only where chrome IS the terminal (every
-    /// platform but Linux, and Linux `window_theme = auto` or a config side the
-    /// terminal theme already occupies). Once the operator has forced the chrome
-    /// AGAINST the terminal palette, following the program's `\e]11;` background
-    /// is following the surface these cards deliberately no longer sit on.
+    /// The live OSC-11 tint is applied only where chrome IS the terminal — i.e.
+    /// wherever `chrome_palette_theme` returned the terminal theme unchanged
+    /// (`window_theme = auto`, or a forced value the terminal already matches,
+    /// on any pixel-band platform including Windows since the 2026-08-25
+    /// match-Linux decision; macOS, no band). Once the operator has forced the
+    /// chrome AGAINST the terminal palette, following the program's `\e]11;`
+    /// background is following the surface these cards deliberately no longer
+    /// sit on — the runtime `(chrome.bg, chrome.fg) != (theme.bg, theme.fg)`
+    /// guard below is what enforces this, so no platform `cfg` is needed.
     fn chrome_card_theme(&self, wid: WindowId) -> aterm_render::Theme {
         let chrome = self.chrome_palette_theme();
         if (chrome.bg, chrome.fg) != (self.theme.bg, self.theme.fg) {

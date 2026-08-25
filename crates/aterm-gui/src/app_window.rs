@@ -478,19 +478,23 @@ impl App {
     /// background in the `#979797`..`#ADADAD` band, which is precisely what made
     /// `window_theme = light` a silent no-op for those themes.
     pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
-        #[cfg(target_os = "linux")]
+        // The PIXEL-BAND platforms (Linux + Windows, `STRIP_IS_CHROME_BAND`)
+        // resolve a FORCED `window_theme` into an authored chrome palette so
+        // the WHOLE chrome — tab band and native settings pages — flips to that
+        // variant, not just the OS caption. Before this, only Linux did
+        // (961f7bba); Windows flipped the DWM caption to the stock variant but
+        // kept painting the band + pages the TERMINAL theme, so
+        // `window_theme = "light"` over a dark terminal drew a light titlebar
+        // bolted onto a dark chrome body — the same config, opposite meanings
+        // per platform (owner decision 2026-08-25: match Linux). `Auto` still
+        // passes through on every platform (system-following chrome). macOS
+        // paints its tabs in the native toolbar — no band — so it never
+        // consumes this and keeps the pass-through.
+        #[cfg(any(target_os = "linux", windows))]
         {
-            let force_dark = match self.window_theme {
-                crate::app_config::WindowTheme::Auto => return self.theme,
-                crate::app_config::WindowTheme::Light => false,
-                crate::app_config::WindowTheme::Dark => true,
-            };
-            if crate::tab_bar::theme_is_dark(self.theme.bg) == force_dark {
-                return self.theme;
-            }
-            crate::native_appearance::forced_chrome_theme(self.theme, force_dark)
+            crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         self.theme
     }
 

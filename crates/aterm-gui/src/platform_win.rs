@@ -972,10 +972,15 @@ fn resolve_chrome_theme(policy: WindowTheme, bg: u32, high_contrast: bool) -> Wi
 // window reads as ONE surface (Windows Terminal's caption follows the profile
 // background the same way). Four deliberate gates keep this from doing damage:
 //
-//  * only the `Auto` policy tints — an explicit `window_theme = "light"/"dark"`
-//    is the user asking for the STOCK OS caption in that variant, and painting
-//    the terminal colour over it would overrule exactly the override the policy
-//    doc promises is hard;
+//  * only the `Auto` policy tints the caption with the terminal COLOUR — an
+//    explicit `window_theme = "light"/"dark"` gets the STOCK OS caption in
+//    that variant (immersive light/dark), NOT a terminal-coloured one. That is
+//    not a half-flip any more: since 2026-08-25 a forced value also drives the
+//    tab band and native pages to the forced VARIANT (App::chrome_palette_theme
+//    -> resolve_chrome_palette, matching Linux), so forced light = a light
+//    caption over a light-authored band, coherent as one chrome. Tinting the
+//    caption the terminal colour on a forced value would instead paint the
+//    terminal palette over the variant the user explicitly asked for;
 //  * High Contrast suppresses it — the HC palette owns the caption (the same
 //    accessibility deferral `resolve_chrome_theme` performs for immersive-dark);
 //  * an active backdrop material suppresses it — a solid caption colour paints

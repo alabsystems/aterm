@@ -1445,6 +1445,7 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
         } else {
             aterm_update::preverify_staged_for_handoff(
                 job.current_build,
+                Some(crate::build_info::GIT_COMMIT),
                 Some(job.target_build),
                 Some(&job.target_commit),
             )
@@ -2250,6 +2251,23 @@ fn run_handoff_decision(
         deadline,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
+        // `ChildDied` IS proof EOF and nothing more, and a successor that REFUSES
+        // this handoff closes the readiness channel exactly as one that crashed
+        // does — the verdict cannot tell them apart, and for five field failures
+        // it did not have to, because the refusing successor said nothing at all.
+        // It says so now (`seamless::take_target_identity`, and the degraded-
+        // authority exit in `main_entry`), so point the next reader at it rather
+        // than leaving `ChildDied` looking like an accusation against the bytes.
+        // Log-only: the completion detail stays short because it paints a pill.
+        if proof_outcome == crate::UpdateHandoffOutcome::ChildDied {
+            aterm_log::warn!(
+                "update apply: the successor closed the readiness channel without proving \
+                 adoption. A REFUSAL looks identical here — read this log just above for the \
+                 successor's own `seamless handoff refused:` / `overlap handoff:` line, which \
+                 names the reason (most often: it never became the authorized build because \
+                 its boot apply could not swap)."
+            );
+        }
         let rejected = worker_reject_and_reap_handoff_child(
             job,
             proxy,
