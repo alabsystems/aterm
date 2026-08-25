@@ -236,10 +236,92 @@ impl Grid {
         let lo_abs = self.visible_to_absolute(top);
         let hi_abs = self.visible_to_absolute(bottom);
         debug_assert!(lo_abs <= hi_abs);
+        self.damage_selection_absolute_rows(lo_abs, hi_abs);
+    }
+
+    /// SELECTION CUSTODY Phase 4: record that ABSOLUTE rows `lo_abs..=hi_abs` had
+    /// their content moved or rewritten.
+    ///
+    /// The primitive under [`Grid::damage_selection_visible_rows`], for the one
+    /// caller that already holds absolute rows and must NOT re-derive them from
+    /// visible ones: ordinary output, whose start row can have scrolled away by the
+    /// time the run ends (see [`Grid::damage_selection_output`]).
+    pub(crate) fn damage_selection_absolute_rows(&mut self, lo_abs: u64, hi_abs: u64) {
+        let (lo_abs, hi_abs) = if lo_abs <= hi_abs {
+            (lo_abs, hi_abs)
+        } else {
+            (hi_abs, lo_abs)
+        };
         self.storage.selection_damage = self
             .storage
             .selection_damage
             .union(crate::SelectionDamage::Band { lo_abs, hi_abs });
+    }
+
+    /// The ABSOLUTE row the cursor is on, i.e. where the next printed character
+    /// lands. Frame-invariant, so it survives any scroll that happens after it is
+    /// read — which is what lets ordinary output bracket a whole run with two reads.
+    #[must_use]
+    #[inline]
+    fn cursor_absolute_row(&self) -> u64 {
+        self.visible_to_absolute(self.storage.cursor.row)
+    }
+
+    /// SELECTION CUSTODY: snapshot where output is about to land, for
+    /// [`Grid::damage_selection_output`] to close over the print.
+    #[must_use]
+    pub fn output_damage_origin(&self) -> crate::OutputOrigin {
+        let cursor_row = self.storage.cursor.row;
+        // `Row::len()` is the last non-empty cell + 1, an O(1) field read.
+        let occupied = self.row(cursor_row).map_or(0, crate::Row::len);
+        crate::OutputOrigin {
+            abs_row: self.visible_to_absolute(cursor_row),
+            overwrites: self.storage.cursor.col < occupied,
+        }
+    }
+
+    /// SELECTION CUSTODY: record ORDINARY PRINTED OUTPUT that ran from `origin` to
+    /// the cursor's current position.
+    ///
+    /// The other half of the inverse hole. EL closed the `\r` + `\e[K` progress bar;
+    /// this closes the bare `\rProgress: 90%` overwrite, which replaces the cells
+    /// under a live highlight with no erase op anywhere, leaving a copy that returns
+    /// text the user never selected.
+    ///
+    /// Design §10 rejected PER-GLYPH tracking as too costly on the hottest loop, and
+    /// that judgement stands — this is not it. Three properties keep it cheap and
+    /// keep it from over-clearing:
+    ///
+    /// 1. Recorded per PRINT CALL, not per glyph: the bulk ASCII/Unicode blast paths
+    ///    pay it once for a whole run, and the absolute frame's invariance lets one
+    ///    band cover a run that wrapped and scrolled mid-flight.
+    /// 2. An APPEND past the row's existing content on a single row replaces nothing
+    ///    and records nothing. That is not only a saving, it is REQUIRED: a
+    ///    top-anchored history splice (Codex's `insert_history`) fills the blank row
+    ///    it just created, and the piecewise remap deliberately keeps a selection
+    ///    across that — recording it would silently destroy the survival
+    ///    `EligibleSelectionUsesPiecewiseRemap` proves.
+    /// 3. While an overwriting program stays on one row — a progress bar, a spinner —
+    ///    it is one `Option<u64>` compare and an early return, because
+    ///    `SelectionDamage::union` is monotone in coverage and re-recording an
+    ///    already-covered row cannot change the accumulator.
+    ///
+    /// Rows are recorded, columns are not, so an overwrite in a DIFFERENT column of a
+    /// selected row still clears it — the same row granularity every other member of
+    /// the lattice has, and it fails safe. The residual: a run that WRAPS is recorded
+    /// whole (rule 2 is asked of the first row only), which over-clears the wrapped
+    /// tail rather than under-naming it.
+    pub fn damage_selection_output(&mut self, origin: crate::OutputOrigin) {
+        let to_abs = self.cursor_absolute_row();
+        let single_row = origin.abs_row == to_abs;
+        if single_row && !origin.overwrites {
+            return;
+        }
+        if single_row && self.storage.last_output_damage_abs == Some(to_abs) {
+            return;
+        }
+        self.storage.last_output_damage_abs = Some(to_abs);
+        self.damage_selection_absolute_rows(origin.abs_row, to_abs);
     }
 
     // -------------------------------------------------------------------------

@@ -139,8 +139,13 @@ impl PackagesConfig {
     }
 
     /// Whether the first-run `seed` pass INSTALLS the bundled registry rather
-    /// than announcing it. Default TRUE (§9.1 — local bytes under the app's
-    /// own signature; installing the app is the consent).
+    /// than announcing it. Default TRUE (§9.1). On a SEALED install the bytes
+    /// are local, under the app's own signature — installing the app is the
+    /// consent. On a LEAN install (no seal: an Intel Mac, the zip container,
+    /// Linux) the same lane resolves the signed NETWORK index and the "seed"
+    /// is a multi-GB download; this key is the one switch that prevents it,
+    /// so every user-facing description of it must say both halves (the old
+    /// rationale here claimed local bytes unconditionally — audit-2 item 7).
     #[must_use]
     pub fn seed_install(&self) -> bool {
         self.seed_install.unwrap_or(true)

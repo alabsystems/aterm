@@ -229,33 +229,10 @@ fn exec_preserving_handoff_fds(command: &mut Command, handoff_fds: &[i32]) -> st
     error
 }
 
-/// This process's argv (past argv0), minus the leading run of `--window` mode
-/// pins, for forwarding to a re-exec image.
-///
-/// Every boot-time swap pins `--window` ahead of the forwarded args
-/// ([`boot_reexec_command`]) — and the args it forwards are this process's OWN
-/// argv, which already carries the pin from the previous swap. Forwarded
-/// verbatim, the command line grows by one `--window` per update cycle
-/// (observed in the field at six after a night of channel activity). Only the
-/// LEADING run can be pins — ours, or a user's semantically identical one — so
-/// stripping it makes the re-exec argv a fixed point, while everything from
-/// the first other token on is forwarded untouched: a `--window` inside an
-/// `-e`/`--command` payload is past that boundary by construction and can
-/// never be affected.
-pub fn reexec_forwarded_args(
-    args: impl Iterator<Item = std::ffi::OsString>,
-) -> Vec<std::ffi::OsString> {
-    let mut forwarded = Vec::new();
-    let mut leading = true;
-    for arg in args {
-        if leading && arg == "--window" {
-            continue;
-        }
-        leading = false;
-        forwarded.push(arg);
-    }
-    forwarded
-}
+// The relaunch argv filter lives in `crate::relaunch` — every platform
+// relaunches aterm, so it cannot live inside this macOS-only module.
+use crate::relaunch::reexec_forwarded_args;
+
 
 /// The post-swap re-exec command: the NEW binary at the canonical path, the
 /// forwarded argv, the single-use re-exec nonce — and the caller's handoff

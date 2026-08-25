@@ -7367,7 +7367,12 @@ impl App {
         );
         self.backend
             .set_background_opacity(self.render_knobs.background_opacity);
-        if !self.backend.is_gpu() {
+        // `backend_kind_undecided` keeps a headless launch's UNREDEEMED GPU intent
+        // out of these two "this run cannot do it" verdicts: the backend really is
+        // the CPU renderer at this instant, but `ensure_pixel_backend` may still
+        // install the device, and a deferral is not allowed to invent a diagnostic
+        // the same launch would not have printed before.
+        if !self.backend.is_gpu() && !self.backend_kind_undecided() {
             if self.render_knobs.background_opacity < 1.0 {
                 warn_background_opacity_unimplemented_once();
             }
@@ -7584,7 +7589,7 @@ impl App {
                 // so a translucent value there stays honestly solid — the warn-once.
                 if self.backend.is_gpu() {
                     self.apply_window_vibrancy();
-                } else if v < 1.0 {
+                } else if v < 1.0 && !self.backend_kind_undecided() {
                     warn_background_opacity_unimplemented_once();
                 }
             }
@@ -7609,7 +7614,7 @@ impl App {
                         g.set_backdrop_margins(m != BackgroundMaterial::None);
                     }
                     self.apply_window_vibrancy();
-                } else if m != BackgroundMaterial::None {
+                } else if m != BackgroundMaterial::None && !self.backend_kind_undecided() {
                     warn_background_material_unimplemented_once();
                 }
             }

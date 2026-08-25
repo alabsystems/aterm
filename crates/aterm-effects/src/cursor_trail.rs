@@ -581,6 +581,7 @@ impl CursorTrail {
         &mut self,
         generation: ContentGeneration,
         ownership: GenerationOwnership,
+        witness: Option<&crate::cursor_glow::BatchWakeWitness<'_>>,
     ) {
         let changed = self
             .last_content_generation
@@ -589,12 +590,20 @@ impl CursorTrail {
         if !changed {
             return;
         }
+        // The proportionate fence, mirroring the glow twin: a spark survives
+        // a judged batch iff the shared probe witness attests its cell was
+        // not rewritten. No witness = the old wholesale wipe, unchanged.
+        let retain_attested = |sparks: &mut Vec<Spark>| match witness {
+            Some(witness) => sparks.retain(|spark| witness.steady(spark.row, spark.col)),
+            None => sparks.clear(),
+        };
         match ownership {
             GenerationOwnership::Owned => {
                 // Even an exact candidate owns only the cells it will forge
                 // now; it cannot certify older sparks elsewhere in the same
-                // parser batch.
-                self.sparks.clear();
+                // parser batch — but the witness can, per column, and a comet
+                // must outlive the keystroke that follows it.
+                retain_attested(&mut self.sparks);
             }
             GenerationOwnership::UnownedSteady => {
                 // The batch is proven steady at the anchor: the resident
@@ -606,11 +615,20 @@ impl CursorTrail {
                 self.move_candidate = None;
                 self.candidate_superseded = false;
             }
+            GenerationOwnership::UnownedRewrite => {
+                // An identity-and-anchor-held rewrite (a streaming TUI
+                // repainting around a parked cursor): attested cells keep
+                // their light; the classifier cohort still fails closed.
+                retain_attested(&mut self.sparks);
+                self.type_hint = None;
+                self.nav_hint = None;
+                self.move_hint = None;
+                self.move_candidate = None;
+                self.candidate_superseded = false;
+            }
             // `Steady` while THIS engine observed a change is a
-            // desynchronized authority — fail closed like a rewrite.
-            GenerationOwnership::Steady
-            | GenerationOwnership::UnownedRewrite
-            | GenerationOwnership::UnownedRelocation => {
+            // desynchronized authority — fail closed like a relocation.
+            GenerationOwnership::Steady | GenerationOwnership::UnownedRelocation => {
                 self.sparks.clear();
                 self.type_hint = None;
                 self.nav_hint = None;

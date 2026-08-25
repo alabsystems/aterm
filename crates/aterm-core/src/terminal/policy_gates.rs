@@ -679,16 +679,43 @@ mod tests {
     /// win (51.2 -> 11.3 ns per gate), and it rides `cargo test`.
     ///
     /// TWO-SIDED. An UNCOVERED sequence — an XTWINOPS `Ps` past the compiled
-    /// range — must still be evaluated live, so the counter is proven to be
-    /// reading the real path rather than a path the burst never entered. Without
-    /// that half, a counter that had been accidentally disconnected would report
-    /// zero and this test would celebrate.
+    /// range, and an OSC 133 subcommand outside the compiled letter table — must
+    /// still be evaluated live, so the counter is proven to be reading the real
+    /// path rather than a path the burst never entered. Without that half, a
+    /// counter that had been accidentally disconnected would report zero and
+    /// this test would celebrate.
+    ///
+    /// PER-KIND, NOT IN AGGREGATE. Five gate KINDS are compiled here
+    /// (`response_sink`, `osc52_query`, `osc52_set`, the XTWINOPS table, the
+    /// shell table) and each is read at its OWN dispatch site, so "delete the
+    /// optimization and watch this go red" is only honest if it is checked ONE
+    /// KIND AT A TIME. It was not, when this test landed: sending the SHELL gate
+    /// alone back to a per-dispatch `shell_verdict` left this test GREEN,
+    /// because `Terminal::new` leaves `require_shell_integration_nonce` FALSE
+    /// and `shell_nonce_gate_ok` returns before it consults the gate at all —
+    /// the burst's `OSC 133;A` never reached AMB-3. Hence the nonce arming
+    /// below, which is load-bearing and not scene-setting.
     ///
     /// WHAT IT CANNOT CATCH: `evaluate` itself getting slower. Counts guard the
     /// structure of a win, never its constant factor.
     #[test]
     fn an_installed_policy_costs_no_per_dispatch_evaluation_at_the_compiled_gates() {
+        const NONCE: [u8; 32] = [0x5A; 32];
+        let id: String = NONCE.iter().fold(String::from("id="), |mut acc, b| {
+            use std::fmt::Write as _;
+            let _ = write!(acc, "{b:02x}");
+            acc
+        });
+        let nonced_mark = format!("\x1b]133;A;{id}\x07").into_bytes();
+
         let mut term = Terminal::new(24, 80);
+        // ARM THE SHELL GATE. `shell_nonce_gate_ok` short-circuits on
+        // `!require_shell_integration_nonce` — the default posture — and the
+        // gate below it is then never read, so a burst against a bare terminal
+        // measures NOTHING for AMB-3. The nonce is authorized too, so the mark
+        // is a mark that really is processed rather than one dropped on the way.
+        term.authorize_shell_integration(NONCE);
+        term.set_require_shell_integration_nonce(true);
         term.apply_policy_engine(PolicyEngine::new(profiles::standard()));
         // The INSTALL itself compiles the whole table, which is the one place
         // the evaluation is supposed to happen. Discard that.
@@ -713,10 +740,19 @@ mod tests {
             term.process(b"\x1b]52;c;aGk=\x07");
             let _ = term.take_response();
             // A shell-integration mark (AMB-3) and an in-range CSI t (AMB-4).
-            term.process(b"\x1b]133;A\x07");
+            // NONCED: the gate sits UNDER the nonce-required check, so a bare
+            // `OSC 133;A` against a default terminal never reaches it and this
+            // line would cover nothing (see the per-kind note above).
+            term.process(&nonced_mark);
             term.process(b"\x1b[18t");
             let _ = term.take_response();
         }
+        assert_eq!(
+            term.shell_integration_dropped_count(),
+            0,
+            "the burst's nonced mark was dropped — it is not reaching the \
+             shell-integration gate, so AMB-3 is uncovered again"
+        );
         assert_eq!(
             crate::terminal::policy_bridge::take_engine_decisions(),
             0,
@@ -736,6 +772,23 @@ mod tests {
             "an out-of-range XTWINOPS Ps did not reach the bridge — the counter \
              is not reading the live-evaluation path, so the zero above proves \
              nothing"
+        );
+
+        // THE OTHER SIDE FOR THE SHELL KIND, which the XTWINOPS probe above
+        // cannot stand in for: they are different tables read at different
+        // dispatch sites, and this one sits under a mode bit that is off by
+        // default. A LOWERCASE subcommand is outside `shell_slot`'s compiled
+        // letters and is documented to fall back to a live evaluation, so a
+        // zero here means the burst's mark never reached AMB-3 either and its
+        // half of the count above proves nothing.
+        term.process(format!("\x1b]133;z;{id}\x07").as_bytes());
+        let _ = term.take_response();
+        assert!(
+            crate::terminal::policy_bridge::take_engine_decisions() > 0,
+            "an uncompiled OSC 133 subcommand did not reach the bridge — the \
+             shell-integration gate is not being consulted at all (the \
+             nonce-required mode bit is the usual reason), so the zero above is \
+             vacuous for AMB-3"
         );
     }
 

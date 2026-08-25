@@ -117,6 +117,8 @@ mod github;
 mod health;
 #[cfg(target_os = "macos")]
 mod install;
+// Not macOS-only: every platform relaunches aterm (see the module's own doc).
+mod relaunch;
 #[cfg(target_os = "macos")]
 mod manifest;
 #[cfg(target_os = "macos")]
@@ -178,7 +180,7 @@ pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
 /// leading `--window` mode pins so no relaunch path can re-grow the argv the
 /// boot swap deliberately pins exactly once. See the function's own doc for
 /// the accumulation this closes.
-pub use install::reexec_forwarded_args;
+pub use relaunch::reexec_forwarded_args;
 
 /// The Apple Developer **Team ID** for the OPTIONAL Tier APPLE anchor, baked in at
 /// compile time from `ATERM_EXPECTED_TEAM_ID`. Empty (the default) does **not** disable

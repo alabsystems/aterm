@@ -733,8 +733,9 @@ impl EffectsPipeline {
                 let ownership = self
                     .glow
                     .observe_content_generation(generation, cur, false);
+                let witness = self.glow.batch_wake_witness();
                 self.trail
-                    .observe_content_generation(generation, ownership);
+                    .observe_content_generation(generation, ownership, witness.as_ref());
                 return;
             };
             let Some(render_row) = input.cells.get(usize::from(row)) else {
@@ -743,8 +744,9 @@ impl EffectsPipeline {
                 let ownership = self
                     .glow
                     .observe_content_generation(generation, cur, false);
+                let witness = self.glow.batch_wake_witness();
                 self.trail
-                    .observe_content_generation(generation, ownership);
+                    .observe_content_generation(generation, ownership, witness.as_ref());
                 return;
             };
             self.candidate_row_scratch.clear();
@@ -778,8 +780,9 @@ impl EffectsPipeline {
         let ownership = self
             .glow
             .observe_content_generation(generation, cur, candidate_confirmed);
+        let witness = self.glow.batch_wake_witness();
         self.trail
-            .observe_content_generation(generation, ownership);
+            .observe_content_generation(generation, ownership, witness.as_ref());
     }
 
     /// Visual bell → the rain engine's 2 s constant-luminance amber ALERT

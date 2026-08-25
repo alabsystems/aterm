@@ -612,7 +612,18 @@ pub fn top_anchored_scroll_history_model() -> Model {
                 } else {
                     0
                 };
-                selection_region_row = if top == 0 && full_width == 1 && history_enabled == 1 {
+                // The remap is what a splice does to rows ABOVE its boundary — i.e.
+                // to a selection the scrolled region actually covers. A selection
+                // BELOW the region does not move, archival regime or not, so
+                // `selection_disjoint` governs here too. Without the second
+                // conjunct this said that every archival scroll shifts the
+                // selection by one, which is false of `adjust_for_row_splice` for a
+                // selection under the boundary — and unwitnessable: the only real
+                // grid transition the old invariant admitted for
+                // `ChooseArchivalDisjoint` was one whose region DID cover the
+                // selection, i.e. the overlapping shape wearing the disjoint label.
+                selection_region_row = if top == 0 && full_width == 1 && history_enabled == 1
+                    && selection_disjoint == 0 {
                     if Buggy == 1 { selection_region_row } else { selection_region_row - 1 }
                 } else {
                     selection_region_row
@@ -643,7 +654,8 @@ pub fn top_anchored_scroll_history_model() -> Model {
             // survives iff it was piecewise-remapped (the archival regime) OR it was
             // disjoint from the damage.
             invariant EligibleSelectionUsesPiecewiseRemap:
-                if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1 {
+                if phase == 2 && top == 0 && full_width == 1 && history_enabled == 1
+                    && selection_disjoint == 0 {
                     selection_alive == 1 && selection_region_row == 1 &&
                     selection_footer_row == 4
                 } else if phase == 2 && selection_disjoint == 1 {
@@ -1102,6 +1114,15 @@ pub fn focus_modifier_cache_model() -> Model {
 /// the viewport back to the tail-follower. That is the second half of the user's
 /// complaint.
 ///
+/// Output and the SELECTION are a different matter, and the distinction is the
+/// whole point of Phase 4: output that REPLACED the selected rows may destroy the
+/// highlight (leaving it painted over new text is what makes a copy return
+/// something the user never selected), and ED 3 / `clear_scrollback` / RIS take
+/// the viewport back outright because the space the offset named is gone. Both are
+/// their own event kinds below rather than exceptions swept under one invariant —
+/// the earlier `OutputNeverTakesCustodyOrSelection` asserted the opposite of what
+/// the engine does and would have licensed deleting the damage test.
+///
 /// The custody invariants are stated over the OBSERVABLE state — `offset`,
 /// `owner`, `selection` — against a shadow of the pre-action values
 /// (`prev_offset`, `prev_owner`, `prev_selection`) that every action writes from
@@ -1113,9 +1134,15 @@ pub fn focus_modifier_cache_model() -> Model {
 /// `Buggy=1` reproduces the regression FAMILY. Two members are the literal
 /// shipping defect — an inert press and an auto-repeat tick each snap the viewport
 /// and clear the selection, which is what made ⌘-C copy nothing (the ⌘ keydown
-/// destroyed the selection before the `c` arrived). The other two are the
+/// destroyed the selection before the `c` arrived). The others are the
 /// neighbouring regressions the same invariants must catch: a release that
-/// disturbs, and output that snaps the reader back to live instead of repinning.
+/// disturbs, output that snaps the reader back to live instead of repinning,
+/// output that takes custody while clearing the rows it damaged, and a typing
+/// press that deselects without snapping. Every invariant here except the two
+/// state-consistency guards (`TailOwnerAtBottom`, `StateBounds`) is falsified by
+/// one of them, and `derived_ring_ty.rs` checks that invariant by invariant — an
+/// invariant no mutant can falsify is a ghost, which is how this model's first
+/// draft passed while stating nothing.
 ///
 /// Scope: this is the PRESS-PATH half of custody (design Phase 1) plus the output
 /// repin it must not fight. The alt-screen round-trip, scrollback eviction and
@@ -1142,7 +1169,9 @@ pub fn press_custody_model() -> Model {
             var prev_offset = 0;
             var prev_selection = 0;
             // What kind of event just fired: 0 a user gesture, 1 a typing press,
-            // 2 an auto-repeat tick, 3 a bare modifier, 4 a release, 5 output.
+            // 2 an auto-repeat tick, 3 a bare modifier, 4 a release, 5 output that
+            // missed the selected rows, 6 output that REPLACED them, 7 output that
+            // invalidated the coordinate space (ED 3 / clear_scrollback / RIS).
             var last_event = 0;
 
             action UserScroll when (offset <= MaxOffset - 1) {
@@ -1188,12 +1217,53 @@ pub fn press_custody_model() -> Model {
                 offset = 0;
                 last_event = 5;
             }
-            // The ONE handover. Unchanged by this design.
-            action TypingPress {
+            // Output that REPLACED the selected rows (Phase 4's overlapping
+            // `SelectionDamage`). It is a separate event kind because the shipped
+            // engine really does destroy a selection here — a highlight left over
+            // replaced text makes ⌘-C return something the user never selected —
+            // and a model that forbade it would contradict the code it stands for.
+            // What it still may not do is take the reading position: the repin
+            // rides the new lines exactly as for undamaged output.
+            action OutputDamagesTheSelectedRows
+                when (owner == 1 && selection == 1 && offset <= MaxOffset - 1)
+            {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset + 1 };
+                owner = if Buggy == 1 { 0 } else { 1 };
+                selection = 0;
+                last_event = 6;
+            }
+            // ED 3 / `clear_scrollback` / RIS: `repin_display_offset` clamps to 0
+            // because the coordinate space the offset named is gone. This IS output
+            // handing the viewport back to the tail-follower, so it is spelled as
+            // its own event kind rather than left to contradict the custody
+            // invariant. The model does not police the LABEL — as with
+            // `selection_custody_model`'s `WholesaleInvalidate`, an implementation
+            // that called everything wholesale would satisfy it; what the pair of
+            // kinds buys is that the ordinary path is checked and the exception is
+            // enumerated where a reader can see it.
+            action OutputInvalidatesTheCoordinateSpace {
                 prev_owner = owner;
                 prev_offset = offset;
                 prev_selection = selection;
                 offset = 0;
+                owner = 0;
+                // `Buggy = 1` keeps the highlight across the invalidation — a
+                // selection naming rows that no longer exist, which is the
+                // fail-OPEN direction this design exists to rule out.
+                selection = if Buggy == 1 { selection } else { 0 };
+                last_event = 7;
+            }
+            // The ONE handover. Unchanged by this design — but `Buggy = 1` still
+            // gives it a member (typing that deselects without snapping), because
+            // an invariant no mutant can falsify states nothing.
+            action TypingPress {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { offset } else { 0 };
                 owner = 0;
                 selection = 0;
                 last_event = 1;
@@ -1233,38 +1303,74 @@ pub fn press_custody_model() -> Model {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 5
+                    last_event <= 7
                 };
             invariant RepeatPressIsInert:
                 if last_event == 2 {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 5
+                    last_event <= 7
                 };
             invariant ReleaseIsInert:
                 if last_event == 4 {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 5
+                    last_event <= 7
                 };
-            invariant OutputNeverTakesCustodyOrSelection:
+            // Output never takes the reading position — the half of the old
+            // `OutputNeverTakesCustodyOrSelection` that is TRUE of the shipped
+            // system. It covers BOTH output kinds: damaging the selected rows is
+            // not a licence to snap. `prev_offset <= offset` rather than equality,
+            // because the repin RAISES the offset by the lines that arrived; what
+            // it may never do is move the view back toward live.
+            invariant OutputNeverTakesCustody:
                 if last_event == 5 {
-                    selection == prev_selection && owner == prev_owner
+                    owner == prev_owner && prev_offset <= offset
                 } else {
-                    last_event <= 5
+                    if last_event == 6 {
+                        owner == prev_owner && prev_offset <= offset
+                    } else {
+                        last_event <= 7
+                    }
+                };
+            // …and the selection half, narrowed to the case where it holds. The
+            // old form asserted this of ALL output and was false of the system
+            // that shipped: Phase 4 clears a selection whose rows the output
+            // replaced (event 6), and `post_process`'s fail-closed arm clears one
+            // it cannot place. WHICH damage may clear is `selection_custody_model`'s
+            // `OverlapDamageClears`; here the claim is only that output which did
+            // not touch the selected rows leaves the highlight alone.
+            invariant OutputSparesAnUndamagedSelection:
+                if last_event == 5 {
+                    selection == prev_selection
+                } else {
+                    last_event <= 7
                 };
             invariant TypingLandsAtLive:
                 if last_event == 1 {
                     offset == 0 && owner == 0 && selection == 0
                 } else {
-                    last_event <= 5
+                    last_event <= 7
+                };
+            // The ONE handover, and the discipline it owes. ED 3 / `clear_scrollback`
+            // / RIS destroy the coordinate space the anchors are stated in, so
+            // handing the viewport back is correct — but a selection may not
+            // OUTLIVE the space that gives its rows meaning. Every other invariant
+            // reaches event 7 only through an `else { last_event <= 7 }` arm, which
+            // is trivially true; without this one the model admits the action and
+            // then says nothing whatever about it.
+            invariant InvalidationCannotLeaveADanglingSelection:
+                if last_event == 7 {
+                    offset == 0 && owner == 0 && selection == 0
+                } else {
+                    last_event <= 7
                 };
             invariant StateBounds:
                 owner <= 1 && offset <= MaxOffset && selection <= 1 &&
                 prev_owner <= 1 && prev_offset <= MaxOffset && prev_selection <= 1 &&
-                last_event <= 5;
+                last_event <= 7;
         }
     }
 }
@@ -1286,10 +1392,20 @@ pub fn press_custody_model() -> Model {
 /// so the interval is stable under ordinary output.
 ///
 /// Damage bands are LITERAL per action rather than chosen, because the `ty_model!`
-/// grammar has no nondeterministic range arm. Two bands and two selections give all
-/// four overlap/disjoint pairings: `RegionDamageLow` covers rows 0..1,
-/// `RegionDamageHigh` covers row 3; `SelectLow` takes rows 0..1 and `SelectHigh`
-/// rows 2..3.
+/// grammar has no nondeterministic range arm. Two bands and three selections give
+/// all four overlap/disjoint pairings plus the single-row shape eviction needs:
+/// `RegionDamageLow` covers rows 0..1, `RegionDamageHigh` covers row 3; `SelectLow`
+/// takes rows 0..1, `SelectHigh` rows 2..3, and `SelectOldest` row 0 alone.
+///
+/// Every invariant is stated over the OBSERVABLE change — the post-state against a
+/// shadow of the pre-state (`prev_alive`, `prev_sel_lo`, `prev_sel_hi`) that every
+/// action writes before mutating — never over a value the action itself just wrote.
+/// That is not a style preference: as first written this model guarded `InertPress`
+/// and `UniformScroll` on `alive == 1` and had them write nothing but `last_event`,
+/// so `alive == 1` followed from the GUARD and the two invariants whose comments
+/// claim to state the user's complaints could not fail whatever the engine did.
+/// They are ghosts unless a mutant can falsify them, which is why every action that
+/// may not destroy a selection now carries a `Buggy = 1` branch that destroys one.
 ///
 /// SCOPE, stated rather than implied: this models the ENGINE's destroyers — the
 /// ones reachable from `Terminal::post_process` and its callers. The GUI has its
@@ -1303,8 +1419,21 @@ pub fn press_custody_model() -> Model {
 /// the coordinate space itself is gone, so no band can describe the damage and
 /// `All` is the honest answer.
 ///
-/// `Buggy = 1` is the literal shipping defect: ANY region damage clears, whether or
-/// not it overlapped.
+/// `Buggy = 1` is the regression FAMILY, one member per destroyer, each falsifying
+/// a NAMED invariant (`derived_ring_ty.rs` asserts that mapping member by member,
+/// so a future ghost fails the suite rather than passing it):
+///
+/// * `RegionDamageLow` clears whatever it hit — the literal shipping sentinel,
+///   caught by `DisjointDamagePreserves`.
+/// * `RegionDamageHigh` never clears — the inverse hole Phase 4 closed, where a
+///   highlight survives over replaced text and the copy returns something the user
+///   never selected. Caught by `OverlapDamageClears`.
+/// * `InertPress` and `UniformScroll` each destroy the selection — the two user
+///   complaints at the engine layer, caught by their own invariants.
+/// * `Evict` reports the loss without acting on it: it raises the floor and records
+///   `truncated`, but neither clamps the head nor drops a selection both of whose
+///   endpoints are gone. Caught by `PartialEvictionTruncates`, `NoDanglingAnchors`
+///   and `TruncationImpliesAClampedHead`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn selection_custody_model() -> Model {
@@ -1324,6 +1453,14 @@ pub fn selection_custody_model() -> Model {
             var floor = 0;
             // A head clamped to the floor by partial eviction.
             var truncated = 0;
+            // Shadow of the PRE-action selection, written by every action from the
+            // pre-state. Assignments are TLA+ simultaneous, so these read the state
+            // as it was BEFORE the step even where they are spelled first. This is
+            // what lets an invariant say "this event changed nothing" about an
+            // action that writes nothing.
+            var prev_alive = 0;
+            var prev_sel_lo = 0;
+            var prev_sel_hi = 0;
             // What just happened. ORDERED, so membership tests are prefixes — the
             // grammar renders `&&` unparenthesised and `||` parenthesised, so
             // mixing them is unsafe and every test below is a nested `if`.
@@ -1337,13 +1474,34 @@ pub fn selection_custody_model() -> Model {
             // eviction — a dangling anchor no code path can produce, which would
             // make `NoDanglingAnchors` false for a reason the terminal never has.
             action SelectLow when (floor == 0) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 alive = 1;
                 sel_lo = 0;
                 sel_hi = 1;
                 truncated = 0;
                 last_event = 1;
             }
+            // A one-row selection on the oldest retained row. It exists so the
+            // BOTH-ENDPOINTS-GONE arm of eviction is reachable at all: with only
+            // `SelectLow` and `SelectHigh` every live selection has `sel_hi > 0`,
+            // so `Evict`'s clear branch was dead and the law "a selection whose
+            // whole interval fell off the back is gone" went unmodelled.
+            action SelectOldest when (floor == 0) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
+                alive = 1;
+                sel_lo = 0;
+                sel_hi = 0;
+                truncated = 0;
+                last_event = 1;
+            }
             action SelectHigh {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 alive = 1;
                 sel_lo = 2;
                 sel_hi = 3;
@@ -1352,29 +1510,48 @@ pub fn selection_custody_model() -> Model {
             }
             // A deliberate deselect — always allowed, it IS the user's intent.
             action UserClear {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 alive = 0;
                 truncated = 0;
                 last_event = 1;
             }
             // The ONE handover: typing means take me to the prompt, and deselect.
             action TypingPress {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 alive = 0;
                 truncated = 0;
                 last_event = 2;
             }
-            // A bare modifier. Guarded on `alive` so the invariant below is about a
-            // selection that existed to be destroyed.
+            // A bare modifier. The guard keeps the state space to selections that
+            // existed to be destroyed; the INVARIANT does not lean on it — it
+            // compares against `prev_alive`, so removing the guard later cannot
+            // silently turn the property back into a tautology.
             action InertPress when (alive == 1) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
+                alive = if Buggy == 1 { 0 } else { alive };
                 last_event = 3;
             }
             // Ordinary output while the user reads: the anchors ride the content, so
             // in the absolute space the interval does not move at all.
             action UniformScroll when (alive == 1) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
+                alive = if Buggy == 1 { 0 } else { alive };
                 last_event = 5;
             }
             // Rows 0..1 replaced. Overlap reduces to `sel_lo <= 1`, because
             // `band_lo == 0 <= sel_hi` holds for every reachable selection.
             action RegionDamageLow when (alive == 1) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 band_lo = 0;
                 band_hi = 1;
                 alive = if Buggy == 1 {
@@ -1385,12 +1562,17 @@ pub fn selection_custody_model() -> Model {
                 last_event = 4;
             }
             // Row 3 replaced. Overlap reduces to `sel_hi > 2`, because
-            // `sel_lo <= 3 == band_hi` holds for every reachable selection.
+            // `sel_lo <= 3 == band_hi` holds for every reachable selection. Its
+            // mutant is the INVERSE of `RegionDamageLow`'s — damage that hit and
+            // did not clear — so the two halves of the lattice each have a member.
             action RegionDamageHigh when (alive == 1) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 band_lo = 3;
                 band_hi = 3;
                 alive = if Buggy == 1 {
-                    0
+                    1
                 } else {
                     if sel_hi > 2 { 0 } else { 1 }
                 };
@@ -1400,37 +1582,81 @@ pub fn selection_custody_model() -> Model {
             // records the loss; only both endpoints gone destroys the selection.
             // Every right-hand side reads the PRE-eviction state — assignments are
             // simultaneous — which is what lets `truncated` and `sel_lo` agree.
+            // `truncated = 0` on the survivor branch is the pre-value restated, not
+            // a reset: `Evict` is the only writer of `1` and its `floor == 0` guard
+            // lets it fire at most once per trace.
             action Evict when (alive == 1 && floor == 0) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 floor = 1;
-                alive = if sel_hi > 0 { 1 } else { 0 };
-                sel_lo = if sel_lo > 0 { sel_lo } else { 1 };
-                truncated = if sel_lo > 0 { truncated } else { 1 };
+                alive = if Buggy == 1 {
+                    1
+                } else {
+                    if sel_hi > 0 { 1 } else { 0 }
+                };
+                sel_lo = if Buggy == 1 {
+                    sel_lo
+                } else {
+                    if sel_lo > 0 { sel_lo } else { 1 }
+                };
+                truncated = if Buggy == 1 {
+                    1
+                } else {
+                    if sel_hi > 0 {
+                        if sel_lo > 0 { 0 } else { 1 }
+                    } else {
+                        0
+                    }
+                };
                 last_event = 6;
             }
             // ED 3 / clear_scrollback / RIS / Kitty unscroll: the coordinate space
             // itself is gone.
             action WholesaleInvalidate when (alive == 1) {
+                prev_alive = alive;
+                prev_sel_lo = sel_lo;
+                prev_sel_hi = sel_hi;
                 alive = 0;
                 truncated = 0;
                 last_event = 7;
             }
 
             // A bare modifier expresses no intent and may not destroy anything.
-            // This is complaint (1), as a model property.
+            // This is complaint (1), as a model property — stated as "the event
+            // CHANGED nothing", which is falsifiable, rather than "a selection
+            // exists", which the guard would have granted for free.
             invariant InertPressPreservesTheSelection:
-                if last_event == 3 { alive == 1 } else { alive <= 1 };
+                if last_event == 3 {
+                    alive == prev_alive && sel_lo == prev_sel_lo &&
+                    sel_hi == prev_sel_hi
+                } else {
+                    alive <= 1
+                };
             // Ordinary output cannot take a highlight. This is complaint (2).
             invariant UniformScrollPreservesTheSelection:
-                if last_event == 5 { alive == 1 } else { alive <= 1 };
+                if last_event == 5 {
+                    alive == prev_alive && sel_lo == prev_sel_lo &&
+                    sel_hi == prev_sel_hi
+                } else {
+                    alive <= 1
+                };
             // Damage that missed the selected rows leaves them alone — the half the
             // sentinel could not express, and the reason a status bar destroyed a
-            // scrollback highlight.
+            // scrollback highlight. Disjointness is decided on the PRE-state
+            // anchors and the conclusion is read off the POST-state.
             invariant DisjointDamagePreserves:
                 if last_event == 4 {
-                    if sel_lo > band_hi {
-                        alive == 1
+                    if prev_sel_lo > band_hi {
+                        alive == prev_alive && sel_lo == prev_sel_lo &&
+                        sel_hi == prev_sel_hi
                     } else {
-                        if band_lo > sel_hi { alive == 1 } else { alive <= 1 }
+                        if band_lo > prev_sel_hi {
+                            alive == prev_alive && sel_lo == prev_sel_lo &&
+                            sel_hi == prev_sel_hi
+                        } else {
+                            alive <= 1
+                        }
                     }
                 } else {
                     alive <= 1
@@ -1440,30 +1666,46 @@ pub fn selection_custody_model() -> Model {
             // the user never selected.
             invariant OverlapDamageClears:
                 if last_event == 4 {
-                    if sel_lo > band_hi {
+                    if prev_sel_lo > band_hi {
                         alive <= 1
                     } else {
-                        if band_lo > sel_hi { alive <= 1 } else { alive == 0 }
+                        if band_lo > prev_sel_hi { alive <= 1 } else { alive == 0 }
                     }
                 } else {
                     alive <= 1
                 };
-            // Losing the oldest line of a selection is not losing the selection.
+            // Losing the oldest line of a selection is not losing the selection —
+            // the head clamps to the new floor and the loss is RECORDED. Losing
+            // every line of it is: both endpoints gone means there is nothing left
+            // to name. Which arm applies is decided by the PRE-eviction interval.
             invariant PartialEvictionTruncates:
                 if last_event == 6 {
-                    if sel_hi > 0 { alive == 1 } else { alive == 0 }
+                    if prev_sel_hi > 0 {
+                        if prev_sel_lo > 0 {
+                            alive == 1 && sel_lo == prev_sel_lo && truncated == 0
+                        } else {
+                            alive == 1 && sel_lo == floor && truncated == 1
+                        }
+                    } else {
+                        alive == 0
+                    }
                 } else {
                     alive <= 1
                 };
             // Whatever else happens, a live selection never names an evicted row.
             invariant NoDanglingAnchors:
                 if alive == 1 { floor <= sel_lo } else { alive == 0 };
-            // A truncation is only ever recorded against a live, clamped head.
+            // A truncation is only ever recorded against a clamped head.
             invariant TruncationImpliesAClampedHead:
                 if truncated == 1 { floor <= sel_lo } else { truncated == 0 };
+            // A model-bounds guard, not a design claim: it states the space is the
+            // one the interpreter was asked to walk. It is the ONE invariant here
+            // with no `Buggy = 1` member, and `derived_ring_ty.rs` names it as such.
             invariant StateIsBounded:
                 alive <= 1 && truncated <= 1 && floor <= 1 && sel_lo <= 3 &&
-                sel_hi <= 3 && band_lo <= 3 && band_hi <= 3 && last_event <= 7;
+                sel_hi <= 3 && band_lo <= 3 && band_hi <= 3 &&
+                prev_alive <= 1 && prev_sel_lo <= 3 && prev_sel_hi <= 3 &&
+                last_event <= 7;
         }
     }
 }

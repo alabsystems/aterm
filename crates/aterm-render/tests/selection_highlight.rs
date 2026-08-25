@@ -348,3 +348,94 @@ fn scrolled_viewport_maps_selection_rows() {
         "scrolled: highlight on row 1"
     );
 }
+
+/// SELECTION CUSTODY Phase 2 — the PER-PANE selection colour resolution, on the CPU
+/// face, which needs no GPU adapter.
+///
+/// `per_pane_selection_colours_gpu_match_cpu` (aterm-gpu) is the differential that
+/// pins the two faces together, and it opens with `let Some(..) = backends(..) else
+/// { return; }`: on a machine with no usable wgpu adapter it reports PASS having
+/// asserted nothing, and the design's own named "highest-risk spot" — a per-entry
+/// resolution duplicated across `aterm-render` and `aterm-gpu` — is then verified
+/// nowhere in that run. This is the half that always runs. It is deliberately the
+/// SAME fixture, so a reader can see that the CPU expectations here are exactly the
+/// ones the differential holds the GPU to.
+#[test]
+fn per_pane_selection_colours_resolve_per_entry_on_the_cpu() {
+    use aterm_core::render::{COLOR_UNSET, PaneSelection};
+
+    let theme = Theme::default();
+    let Some(mut rend) = renderer() else {
+        eprintln!("SKIP: no system monospace font");
+        return;
+    };
+    let (cw, ch) = rend.cell_size();
+
+    let (rows, cols) = (2usize, 17usize);
+    let mut term = Terminal::new(rows as u16, cols as u16);
+    // Two panes of 8 columns with a 1-cell divider at column 8.
+    term.process(b"\x1b[?25lleft one|right on\r\nleft two|right tw");
+    let mut input = term.cell_frame(rows, cols);
+
+    let pane = |lo: u16, hi: u16, clip: SelectionClip, bg: u32, fg: u32, inactive: bool| {
+        let mut selection = aterm_core::selection::TextSelection::new();
+        selection.start_selection(0, lo, SelectionSide::Left, SelectionType::Simple);
+        selection.update_selection(1, hi, SelectionSide::Right);
+        selection.complete_selection();
+        PaneSelection {
+            selection,
+            clip,
+            bg,
+            fg,
+            inactive,
+        }
+    };
+    input.selections = vec![
+        // Focused pane: a live OSC 17 band with an explicit OSC 19 ink.
+        pane(
+            0,
+            7,
+            SelectionClip::new(0, 2, 0, 8),
+            0x0021_4365,
+            0x00fe_dcba,
+            false,
+        ),
+        // Unfocused pane: no live colour at all, so it takes the theme policy —
+        // and, being unfocused, its INACTIVE derivation.
+        pane(
+            9,
+            16,
+            SelectionClip::new(0, 2, 9, 17),
+            COLOR_UNSET,
+            COLOR_UNSET,
+            true,
+        ),
+    ];
+
+    let frame = rend.render_input(&input);
+    let live = 0x0021_4365;
+    let dim = aterm_render::derive_inactive_selection_bg(theme.selection, theme.bg);
+    assert_ne!(live, dim, "the fixture's two bands must differ");
+
+    // THE PROPERTY: each entry resolves its OWN colour. A regression that hoists one
+    // scalar back out of the loop makes these two equal.
+    assert!(
+        count_eq(&cell_pixels(&frame, cw, ch, 0, 7), live) > 0,
+        "the focused pane's band is its own live OSC 17 colour"
+    );
+    assert!(
+        count_eq(&cell_pixels(&frame, cw, ch, 0, 16), dim) > 0,
+        "the unfocused pane's band is the derived inactive colour"
+    );
+    let divider = cell_pixels(&frame, cw, ch, 0, 8);
+    assert_eq!(
+        (count_eq(&divider, live), count_eq(&divider, dim)),
+        (0, 0),
+        "the divider between them takes neither band"
+    );
+
+    // …and dropping the list hands the frame back to the scalar authority, which
+    // here paints nothing — proof the list is what produced those bands.
+    let plain = term.cell_frame(rows, cols);
+    assert_ne!(frame.pixels, rend.render_input(&plain).pixels);
+}

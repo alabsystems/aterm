@@ -3509,16 +3509,37 @@ mod tests {
         // the replacement (the double-close/fd-reuse regression).
         let source = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
         assert!(source >= 0, "open replacement");
-        if source != aliased {
-            assert_eq!(unsafe { libc::dup2(source, aliased) }, aliased, "reuse fd");
+        // REUSE, without stomping a neighbour. The prearm closed `aliased`, so
+        // the NUMBER is free — and this suite runs threaded, where a sibling
+        // test can open a file and be handed that very number microseconds
+        // later. `dup2` onto it would then silently replace a descriptor
+        // another test is using, which is a worse bug than the flake it caused
+        // here. So: take the number only while it is still free, and prove the
+        // fd we end up asserting on is OURS (it points at /dev/null) before
+        // trusting it. When the race is lost the reuse arm is skipped — the
+        // invariants above still ran, and a stomped sibling is not a price
+        // worth paying for one more assertion.
+        let mut reused = source == aliased;
+        if !reused && unsafe { libc::fcntl(aliased, libc::F_GETFD) } == -1 {
+            reused = unsafe { libc::dup2(source, aliased) } == aliased;
+        }
+        if reused && source != aliased {
             aterm_pty::close_fd(source);
         }
+        let ours = reused
+            && std::fs::read_link(format!("/proc/self/fd/{aliased}"))
+                .map(|target| target == std::path::Path::new("/dev/null"))
+                .unwrap_or(false);
         assert!(take_incoming().adopted.is_empty());
-        assert!(
-            unsafe { libc::fcntl(aliased, libc::F_GETFD) } >= 0,
-            "stale handoff must not close a reused descriptor"
-        );
-        aterm_pty::close_fd(aliased);
+        if ours {
+            assert!(
+                unsafe { libc::fcntl(aliased, libc::F_GETFD) } >= 0,
+                "stale handoff must not close a reused descriptor"
+            );
+            aterm_pty::close_fd(aliased);
+        } else if !reused {
+            aterm_pty::close_fd(source);
+        }
         aterm_pty::close_fd(peer);
     }
 

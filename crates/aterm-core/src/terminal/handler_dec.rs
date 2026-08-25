@@ -324,6 +324,57 @@ impl TerminalHandler<'_> {
         }
     }
 
+    /// SELECTION CUSTODY Phase 3 — record the MAIN grid's absolute row counter at
+    /// the instant this batch parks it (smcup), for the SCR-1 epilogue's re-pin.
+    ///
+    /// The epilogue used to re-pin the parked grid with `lines_added = 0`, on the
+    /// stated invariant that "a grid that has been swapped out stopped receiving
+    /// output". It stopped receiving it only AFTER the swap: a read that delivers
+    /// `"a\r\nb\r\nc\r\n\x1b[?1049h"` — job output followed by an app's smcup, and
+    /// batch boundaries are just `read()` boundaries — pushed three lines into the
+    /// MAIN grid's scrollback first. Dropping that advance left the restored reading
+    /// position three rows off the line the user was reading, while the selection
+    /// (whose `content_scroll_delta` IS drained on the exit batch) moved with the
+    /// content, so highlight and viewport disagreed.
+    ///
+    /// Called before the swap, while `self.grid` is still the main grid.
+    fn park_main_row_counter(&mut self) {
+        self.transient.alt_park_main_row_counter = Some(self.grid.absolute_row_counter());
+    }
+
+    /// SELECTION CUSTODY Phase 3 — take the parked reading position OFF a grid that
+    /// has just been swapped back in mid-batch, and hand it to the SCR-1 epilogue.
+    ///
+    /// A parked main grid carries the user's `display_offset` (that is how the
+    /// reading position survives a pager), and an rmcup makes it active again with
+    /// the rest of the batch still to process. Every write and erase after that
+    /// point goes through `row_index`, which SUBTRACTS `display_offset` — so
+    /// `\x1b[?1049l\r\x1b[KHELLO\n` in one read erased and wrote 40 rows back in the
+    /// user's history instead of on the live screen, recorded its damage band
+    /// against the LIVE rows it never touched, and tripped `row_index_base`'s
+    /// `debug_assert_eq!(display_offset, 0)` on the first region scroll.
+    ///
+    /// This is the batch prologue's rule applied at the second place a grid can
+    /// become active: processing runs at offset 0, and the epilogue re-pins.
+    fn flatten_restored_display_offset(&mut self) {
+        // Every exit path funnels here, so this is also the one place that learns the
+        // alt screen was left — `post_process` needs it for a batch that exits and
+        // re-enters, where its start/end comparison sees no change at all.
+        self.transient.alt_screen_left_in_batch = true;
+        let restored = self.grid.display_offset();
+        if restored > 0 {
+            self.grid.scroll_to_bottom();
+            self.transient.alt_restore_pin = Some((restored, self.grid.absolute_row_counter()));
+        }
+        // The rest of the batch writes against THIS grid now, so it owes the same
+        // precondition the batch prologue forces on the one it found active.
+        debug_assert_eq!(
+            self.grid.display_offset(),
+            0,
+            "a grid swapped in mid-batch must process at offset 0"
+        );
+    }
+
     /// Enter alternate screen for mode 47/1047 — buffer swap only, no cursor
     /// save, no clear.
     fn enter_alternate_screen_raw(&mut self) {
@@ -366,6 +417,7 @@ impl TerminalHandler<'_> {
         // (top_marg/bot_marg/lft_marg/rt_marg) — they persist across buffer
         // switches rather than belonging to either buffer.
         Self::copy_margins(self.grid, &mut new_grid);
+        self.park_main_row_counter();
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
@@ -426,6 +478,7 @@ impl TerminalHandler<'_> {
             let alt = std::mem::replace(self.grid, main_grid);
             *self.alt_grid = Some(alt);
         }
+        self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops);
         self.modes.alternate_screen = false;
         // SELECTION CUSTODY: bump the host-coordinate epoch on the INCOMING grid, but
@@ -537,6 +590,7 @@ impl TerminalHandler<'_> {
         // Margins are shared TScreen state in xterm — they persist onto the
         // alternate screen.
         Self::copy_margins(self.grid, &mut new_grid);
+        self.park_main_row_counter();
         let old_grid = std::mem::replace(self.grid, new_grid);
         *self.alt_grid = Some(old_grid);
         self.modes.alternate_screen = true;
@@ -605,6 +659,7 @@ impl TerminalHandler<'_> {
             Self::copy_margins(self.grid, &mut main_grid);
             *self.grid = main_grid;
         }
+        self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops);
         // Restore from the shared DECSC slot WITHOUT consuming it: xterm
         // CursorRestore leaves sc->saved set, so a later bare DECRC restores

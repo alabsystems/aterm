@@ -4003,6 +4003,13 @@ mod tests {
         };
 
         assert!(first.expires_at_ms <= 1);
+        // The queue's authority clock counts MONOTONIC milliseconds from its
+        // own origin, so "expired" here means "at least 2 ms of real time have
+        // passed since the queue was built". A machine fast enough to reach
+        // this line inside one millisecond reclaims nothing and waits out the
+        // recv below for a notice that was never owed — a race, not a defect.
+        // Cross the boundary explicitly rather than betting on being slow.
+        std::thread::sleep(Duration::from_millis(5));
         sink.maintenance();
         let first_notice = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(first_notice.session, u64::MAX);

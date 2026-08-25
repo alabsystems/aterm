@@ -201,6 +201,14 @@ pub fn model_registry() -> Vec<Model> {
         recording_model(),
         coalesce_model(),
         window_routing_model(),
+        // SELECTION CUSTODY: who owns the reading position and the highlight. Both
+        // are report-only for coverage (no `#[refines]` handler yet — obligation 3's
+        // `ratio == 1.0` is scoped to actively-bound machines), but registration is
+        // what puts them under `ty check --strict-vacuity` and makes them resolvable
+        // as anchor targets. They were left out when they landed, which meant the
+        // one repo-wide gate that would catch a dead action never saw them.
+        press_custody_model(),
+        selection_custody_model(),
         // Introspection / recursive-stacking control plane (audit findings M1/M2/S1).
         dispatch_complete_model(),
         relay_teardown_model(),

@@ -528,6 +528,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          event_wakes={} timer_wakes={} wait_cancelled_wakes={} poll_wakes={} \
          wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
+         stale_arm_heals={} \
          max_frame_gap_ms={:.2} \
          rust_main_to_first_present_ms={:.2} \
          rust_main_to_first_visible_ms={:.2} \
@@ -609,6 +610,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.deadline_in_ns),
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
+        m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
         ms(m.rust_main_to_first_visible_ns),
@@ -781,7 +783,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"event_wakes\":{},\"timer_wakes\":{},\"wait_cancelled_wakes\":{},\
          \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
-         \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\"max_frame_gap_ms\":{:.2},\
+         \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\"stale_arm_heals\":{},\
+         \"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
          \"rust_main_to_first_visible_ms\":{:.2},\
          \"startup_phase_schema\":{},\"startup_phase_valid\":{},\
@@ -862,6 +865,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.deadline_in_ns),
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
+        m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
         ms(m.rust_main_to_first_visible_ns),
@@ -3417,6 +3421,8 @@ mod tests {
             "last_present_drop_reason=",
             "wake_owner=",
             "deadline_owner=",
+            "past_deadline_arms=",
+            "stale_arm_heals=",
             "rust_main_to_first_present_ms=",
             "startup_phase_schema=",
             "startup_phase_valid=",
@@ -3490,6 +3496,7 @@ mod tests {
             "deadline_in_ms",
             "deadline_late_ms",
             "past_deadline_arms",
+            "stale_arm_heals",
             "rust_main_to_first_present_ms",
             "startup_phase_schema",
             "startup_phase_valid",

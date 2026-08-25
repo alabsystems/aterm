@@ -96,7 +96,10 @@ pub use pin::{Generation, Pin, PinnedRange};
 // Batch 2A: cursor, scroll region, and grid state types.
 pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
-pub use state::{AbsoluteRowUpdate, GridCursorState, GridPresentationState, SelectionDamage};
+pub use state::{
+    AbsoluteRowUpdate, BandSet, GridCursorState, GridPresentationState, MAX_SELECTION_DAMAGE_BANDS,
+    OutputOrigin, SelectionDamage,
+};
 
 // Terminal style types shared with checkpoint system.
 pub mod terminal_style;

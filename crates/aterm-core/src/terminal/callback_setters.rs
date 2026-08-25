@@ -27,6 +27,10 @@ impl Terminal {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         // Captured BEFORE the resize: afterwards both grids carry the new width.
         let cols_changed = self.grid.cols() != cols;
+        // Likewise the height: `finalize_resize` needs the SHRINK amount, and the
+        // grid publishes only the rows-GROW shift (`take_last_resize_row_shift`).
+        // Both grids are always resized to the same `rows`, so one capture serves.
+        let rows_before = self.grid.rows();
         if self.modes.alternate_screen {
             // Alt screen active: don't reflow current grid (app-managed content).
             // Saved primary grid should reflow normally.
@@ -42,7 +46,7 @@ impl Terminal {
                 alt.resize_no_reflow(rows, cols);
             }
         }
-        self.finalize_resize(cols_changed);
+        self.finalize_resize(cols_changed, rows_before);
     }
 
     /// Resize, but move the width-change off-screen scrollback rewrap OFF the
@@ -63,6 +67,7 @@ impl Terminal {
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
         // Captured BEFORE the resize, as in `resize`.
         let cols_changed = self.grid.cols() != cols;
+        let rows_before = self.grid.rows();
         let pending = if self.modes.alternate_screen {
             // Alt active: current (alt) grid is app-managed; the SAVED PRIMARY
             // holds the scrollback that reflows.
@@ -78,7 +83,7 @@ impl Terminal {
             }
             pending
         };
-        self.finalize_resize(cols_changed);
+        self.finalize_resize(cols_changed, rows_before);
         pending
     }
 
@@ -175,7 +180,11 @@ impl Terminal {
     /// Shared post-resize side effects for [`resize`](Self::resize) and the
     /// offloaded path: selection invalidation, the DEC-2048 in-band size report,
     /// and the debug structural-invariant self-check.
-    fn finalize_resize(&mut self, cols_changed: bool) {
+    ///
+    /// `cols_changed` and `rows_before` are both captured by the caller BEFORE the
+    /// resize: by the time this runs the grids carry the new geometry and the old
+    /// one is unrecoverable.
+    fn finalize_resize(&mut self, cols_changed: bool, rows_before: u16) {
         // SELECTION CUSTODY Phase 3: only a WIDTH change invalidates coordinates.
         //
         // This used to clear unconditionally, on the reasoning that "reflow
@@ -220,29 +229,61 @@ impl Terminal {
             // that is only sound with the `-revealed` delta above: with the old delta
             // of 0 the clear was the single thing masking the mis-anchor, and clamping
             // instead would leave a live highlight anchored `revealed` rows off its
-            // content after any window-height drag or font zoom. A rows-only SHRINK
-            // needs no delta of its own — `revealed == 0` there — and is protected by
-            // the above-live-bottom clear, which this change kept verbatim.
+            // content after any window-height drag or font zoom.
+            //
+            // A rows-only SHRINK needs its own transform, and it is NOT a uniform
+            // delta. `take_last_resize_row_shift()` is only ever SET on a grow
+            // (`reflow.rs`), so a shrink used to run `adjust_for_scroll(0, ..)` —
+            // anchors unchanged — on the premise that "no content moves under the
+            // eye". False: `adjust_row_count_rows_only` performs the #7662
+            // bottom-push, so the bottom `demoted` viewport rows become the NEWEST
+            // history while the top rows stay put. Live-top anchors really are
+            // unchanged, but every SCROLLBACK anchor gains `demoted` lines above it,
+            // and a delta of 0 left it that many rows off its content — silently, and
+            // in the wrong-copy direction. `adjust_for_rows_shrink` is that piecewise
+            // map; see its doc for the three regimes.
             let revealed = i32::from(self.grid.take_last_resize_row_shift());
             let max_rows = i32::from(self.grid.rows());
+            let demoted = i32::from(rows_before.saturating_sub(self.grid.rows()));
             let floor = i32::try_from(self.grid.scrollback_lines()).unwrap_or(i32::MAX);
-            self.text_selection
-                .adjust_for_scroll(-revealed, max_rows, floor);
+            if demoted > 0 {
+                // `revealed` carries the shrink's ACTUAL relabel distance, which is
+                // the demote count and not the height delta: TRIM drops trailing
+                // blank rows without moving anything, so a shrink that only trims
+                // moves the selection by zero. Using `demoted` here would push every
+                // anchor off its content by the trimmed count.
+                self.text_selection
+                    .adjust_for_rows_shrink(max_rows, revealed, floor);
+            } else {
+                self.text_selection
+                    .adjust_for_scroll(-revealed, max_rows, floor);
+            }
             // The parked selection gets the identical treatment against the OTHER
             // grid — `resize` resized both, and each recorded its own shift. Its
             // floor must come from that grid: while alt is up the ACTIVE grid's
             // `scrollback_lines()` is 0, which would evict every scrollback anchor
             // the main screen is holding. `max_rows` is shared, both grids having
-            // been resized to the same `rows`.
+            // been resized to the same `rows` — which is also why `demoted` is
+            // shared: the same height delta ran over both.
             if let Some(parked_grid) = self.alt_grid.as_mut() {
                 let parked_revealed = i32::from(parked_grid.take_last_resize_row_shift());
                 let parked_floor =
                     i32::try_from(parked_grid.scrollback_lines()).unwrap_or(i32::MAX);
-                self.parked_text_selection.adjust_for_scroll(
-                    -parked_revealed,
-                    max_rows,
-                    parked_floor,
-                );
+                if demoted > 0 {
+                    // The parked grid ran the same shapes and recorded its OWN
+                    // demote count — read it, never the active grid's.
+                    self.parked_text_selection.adjust_for_rows_shrink(
+                        max_rows,
+                        parked_revealed,
+                        parked_floor,
+                    );
+                } else {
+                    self.parked_text_selection.adjust_for_scroll(
+                        -parked_revealed,
+                        max_rows,
+                        parked_floor,
+                    );
+                }
             }
         }
         // DEC mode 2048: emit an in-band size report on every resize so a

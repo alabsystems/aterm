@@ -2477,7 +2477,7 @@ impl SettingsApp {
                     PendingAction::Config(patch) => config_application_projection(
                         view,
                         patch,
-                        SettingsAvailability::for_state(view, crate::metrics::backend_gpu()),
+                        SettingsAvailability::for_state(view, crate::backend_gpu_or_undecided()),
                     ),
                     _ => ConfigApplicationProjection {
                         has_live_edit: true,
@@ -6426,7 +6426,7 @@ fn page(
             SettingsRoute::SoftwareUpdate => update_page(
                 state,
                 update,
-                SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
+                SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
                 width,
                 cx.viewport.width,
                 cx.viewport.height,
@@ -9477,7 +9477,7 @@ fn manual_override_disclosure(
         state,
         None,
         &authored.key,
-        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
+        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
         state.presented_motion.get(),
     );
     parts.extend(effect.notes.into_iter().map(|note| note.semantic));
@@ -10880,6 +10880,13 @@ impl PackageAdmission {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SettingsAvailability {
+    /// CAN this run use a GPU — never "is a device live at this instant". Every
+    /// caller must source it from [`crate::backend_gpu_or_undecided`] rather
+    /// than [`crate::metrics::backend_gpu`]: a headless launch holding an
+    /// unredeemed GPU intent is running the CPU renderer right now and would
+    /// otherwise be told, in words, that its GPU-backed keys are unavailable —
+    /// a denial the identical launch never made before the deferral existed,
+    /// and one the first `image` would immediately contradict.
     backend_gpu: bool,
     macos: bool,
     windows: bool,
@@ -12543,7 +12550,7 @@ fn setting_row(
         state,
         None,
         field.key,
-        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
+        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
         state.presented_motion.get(),
     );
     let value = if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
@@ -15694,7 +15701,7 @@ fn packages_switch_row(
         state,
         None,
         key,
-        SettingsAvailability::for_state(state, crate::metrics::backend_gpu()),
+        SettingsAvailability::for_state(state, crate::backend_gpu_or_undecided()),
         state.presented_motion.get(),
     );
     let value = SettingsState::display_value(field)
@@ -16749,25 +16756,35 @@ mod tests {
 
     #[test]
     fn all_58_visual_fields_preview_candidate_semantics_fingerprint_pixels_and_isolation() {
-        const CASES: [(&str, &str); 58] = [
+        // The `window_theme` candidate must land on the side OPPOSITE the one
+        // this fixture's Auto resolves to, or the sample titlebar cannot move.
+        // Ask the painter's own resolver which side that is — a hand-kept
+        // per-platform table restates a rule it does not own, and goes quietly
+        // pixel-blind the day the rule changes (Linux Auto follows the host
+        // TERMINAL theme, the other platforms the OS appearance, and both of
+        // those answers moved during the 2026-08 window-chrome work).
+        let auto_window_sample_light = renderer_preview_spec(
+            &authored_visual_state(prefs::EDIT_WINDOW_THEME, None),
+            720,
+            crate::native_app::ViewMotionCx::default(),
+            13.0,
+            aterm_render::Theme::default(),
+        )
+        .expect("base preview for window_theme")
+        .window_sample_is_light(aterm_render::Theme::default());
+        let window_theme_candidate = if auto_window_sample_light {
+            "dark"
+        } else {
+            "light"
+        };
+        let cases: [(&str, &str); 58] = [
             (prefs::EDIT_THEME, "Nord"),
             (prefs::EDIT_FOREGROUND, "#00FF66"),
             (prefs::EDIT_BACKGROUND, "#101820"),
             (prefs::EDIT_CURSOR_COLOR, "#FF00FF"),
             (prefs::EDIT_SELECTION_COLOR, "#335577"),
             (prefs::EDIT_SELECTION_FOREGROUND, "#00FF66"),
-            // The candidate must land OPPOSITE the side Auto resolves to, or
-            // the sample titlebar cannot move: on Linux Auto follows the dark
-            // host terminal theme (`window_sample_light`), elsewhere it follows
-            // the host OS appearance, Light in this fixture.
-            (
-                prefs::EDIT_WINDOW_THEME,
-                if cfg!(target_os = "linux") {
-                    "light"
-                } else {
-                    "dark"
-                },
-            ),
+            (prefs::EDIT_WINDOW_THEME, window_theme_candidate),
             // 10, not 4.5: the default palette is deliberately lifted so every
             // ANSI token already reaches ~4.5:1 on the dark bg (see
             // `aterm_types::color_palette`) — a 4.5 floor is pixel-neutral by
@@ -16831,7 +16848,7 @@ mod tests {
             (prefs::EDIT_SHOW_BUILD_BADGE, "true"),
         ];
         assert_eq!(
-            CASES.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>(),
+            cases.iter().map(|(key, _)| *key).collect::<BTreeSet<_>>(),
             prefs::VISUAL_PREVIEW_KEYS.iter().copied().collect(),
         );
 
@@ -16849,7 +16866,7 @@ mod tests {
         // suite run). The fixture warms the cascade inline instead.
         crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
 
-        for (key, candidate_value) in CASES {
+        for (key, candidate_value) in cases {
             let base_state = authored_visual_state(key, None);
             let candidate_state = authored_visual_state(key, Some(candidate_value));
             let raw_before = candidate_state.raw_values.clone();
@@ -31484,6 +31501,89 @@ enabled = true
         assert_eq!(
             !unavailable(prefs::EDIT_TRAIL_SOUNDS),
             crate::trail_audio::output_available()
+        );
+    }
+
+    /// PARITY, at the one surface that states availability in WORDS. A headless
+    /// launch keeps its GPU as an intent and runs the CPU renderer until
+    /// something demands a pixel, so the LIVE-renderer read
+    /// (`metrics::backend_gpu`) is false through the whole life of an instance
+    /// that never captures. Sourcing these rows from it told the user that HDR
+    /// glow, cursor bloom, the P3 colour space and backdrop materials are
+    /// unavailable — about a device the same launch was always entitled to
+    /// build and would build on its first `image`, and which the warn-onces and
+    /// the config host already report as present. Settings owes the CAPABILITY
+    /// read ([`crate::backend_gpu_or_undecided`]): an unredeemed intent is "not
+    /// decided", never "no GPU".
+    ///
+    /// The third row is the one that keeps this from becoming a blanket "always
+    /// GPU": a run that has SETTLED on the CPU renderer — `--cpu`, a windowed
+    /// CPU launch, a redemption that failed — still says so.
+    #[test]
+    fn a_deferred_gpu_intent_projects_the_same_availability_as_a_live_device() {
+        let state = SettingsViewState::new(&Config::default());
+        let effect = |availability| {
+            projected_effect(
+                "cursor_trail = true\ncursor_trail_style = \"fire\"\n",
+                &[(prefs::EDIT_HDR_GLOW, "true")],
+                prefs::EDIT_HDR_GLOW,
+                availability,
+                crate::native_app::ViewMotionCx::default(),
+            )
+        };
+        let live_device =
+            SettingsAvailability::for_state(&state, crate::backend_gpu_capability(true, false));
+        let settled_cpu =
+            SettingsAvailability::for_state(&state, crate::backend_gpu_capability(false, false));
+        assert!(
+            effect_note_contains(&effect(settled_cpu), "GPU renderer only"),
+            "a run that has settled on the CPU renderer still discloses the denial"
+        );
+        assert!(
+            !effect_note_contains(&effect(live_device), "GPU renderer only"),
+            "a GPU run never carries the denial"
+        );
+
+        // THE ROUTING, through a real call site rather than a restatement of it:
+        // `manual_override_disclosure` is one of the five `for_state` callers and
+        // returns the sentence a user reads. An instance holding an unredeemed
+        // intent must produce the live-device sentence.
+        let authored = ManualOverride {
+            key: prefs::EDIT_HDR_GLOW.to_string(),
+            label: "HDR glow".to_string(),
+            preview: "true".to_string(),
+            known: true,
+            reset_safe: true,
+        };
+        let (deferred_availability, deferred_disclosure) = {
+            let _intent = crate::DeferredGpuIntentGuard::arm();
+            (
+                SettingsAvailability::for_state(&state, crate::backend_gpu_or_undecided()),
+                manual_override_disclosure(&state, &authored, 0, 1),
+            )
+        };
+        assert!(
+            !crate::metrics::backend_gpu(),
+            "the unit suite installs no device; the settled reading below assumes it"
+        );
+        let settled_disclosure = manual_override_disclosure(&state, &authored, 0, 1);
+
+        assert_eq!(
+            deferred_availability, live_device,
+            "a deferred instance must project a live device's availability"
+        );
+        assert_ne!(
+            settled_cpu, live_device,
+            "the fixture must actually distinguish the two readings"
+        );
+        assert!(
+            settled_disclosure.contains("requires the GPU renderer"),
+            "a settled CPU run still discloses the denial: {settled_disclosure}"
+        );
+        assert!(
+            !deferred_disclosure.contains("requires the GPU renderer"),
+            "an unredeemed intent must not deny a device this launch may still build: \
+             {deferred_disclosure}"
         );
     }
 

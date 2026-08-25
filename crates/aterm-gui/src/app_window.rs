@@ -468,8 +468,15 @@ impl App {
     ///    accent carried from the terminal theme.
     ///
     /// The CSD variant, the strip and the native pages all resolve from the one
-    /// `window_theme` field ([`crate::tab_bar::theme_is_dark`] classifying the
-    /// SAME bg this returns), so the three move together by construction.
+    /// `window_theme` field, classifying the SAME bg with the SAME predicate
+    /// ([`crate::tab_bar::theme_is_dark`] — which the role pipeline also
+    /// resolves its dark/light side with), so the three move together by
+    /// construction. When the predicate was only nominally shared — the strip's
+    /// Rec.601 luma here against a WCAG relative-luminance split inside
+    /// `native_appearance::roles` — the "already that side" branch below handed
+    /// back a theme whose roles then built the OPPOSITE side for every
+    /// background in the `#979797`..`#ADADAD` band, which is precisely what made
+    /// `window_theme = light` a silent no-op for those themes.
     pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
         #[cfg(target_os = "linux")]
         {
@@ -3772,6 +3779,53 @@ mod tests {
             app.chrome_theme_for_apprt(),
             crate::app_config::WindowTheme::Light
         );
+    }
+
+    /// Forcing a side is never a NO-OP — not even for the band of backgrounds
+    /// where the chrome's two dark/light answers used to differ.
+    ///
+    /// `chrome_palette_theme` passes the terminal theme straight through when the
+    /// configured side is the side that theme is already on. That test and the
+    /// role pipeline's own dark/light split were two different predicates: the
+    /// strip's Rec.601 luma here, a WCAG relative-luminance split there. Across
+    /// neutral `#979797`..`#ADADAD` they disagree, so `window_theme = light` on
+    /// such a theme took the passthrough — "you are already light" — and handed
+    /// back a background `native_appearance::roles` then built the DARK side
+    /// from. Config honoured on paper, nothing moved on screen. Both sites now
+    /// read the one predicate, so whatever comes back here, the pages build the
+    /// side the operator asked for.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn forcing_a_side_moves_the_pages_across_the_former_classifier_band() {
+        let mut app = App::headless_for_test();
+        for gray in [0x97_u32, 0xA0, 0xA6, 0xAD] {
+            let bg = (gray << 16) | (gray << 8) | gray;
+            app.theme.bg = bg;
+            for (window_theme, want_dark) in [
+                (crate::app_config::WindowTheme::Light, false),
+                (crate::app_config::WindowTheme::Dark, true),
+            ] {
+                app.window_theme = window_theme;
+                let chrome = app.chrome_palette_theme();
+                let side = [
+                    ((chrome.bg >> 16) & 0xff) as u8,
+                    ((chrome.bg >> 8) & 0xff) as u8,
+                    (chrome.bg & 0xff) as u8,
+                ];
+                assert_eq!(
+                    crate::native_appearance::surface_is_dark(side),
+                    want_dark,
+                    "#{gray:02X} under {window_theme:?}: the ROLE pipeline must build \
+                     the forced side, whether the theme passed through or the \
+                     authored palette replaced it"
+                );
+                assert_eq!(
+                    crate::tab_bar::theme_is_dark(chrome.bg),
+                    want_dark,
+                    "#{gray:02X} under {window_theme:?}: and the strip must agree"
+                );
+            }
+        }
     }
 
     #[test]

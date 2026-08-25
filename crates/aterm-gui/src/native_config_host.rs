@@ -201,7 +201,12 @@ impl App {
             return;
         }
 
-        let backend_gpu = self.backend.is_gpu();
+        // A headless launch's UNREDEEMED GPU intent counts as GPU here: the
+        // capability warnings answer "can this run do it", and `ensure_pixel_backend`
+        // may still install the device on the first pixel demand. Reading the live
+        // CPU backend alone would report a denial the same launch would not have
+        // reported before the deferral existed.
+        let backend_gpu = self.backend.is_gpu() || self.backend_kind_undecided();
         if let Some(lane) = self.native_config_host.as_mut() {
             lane.request(
                 document,

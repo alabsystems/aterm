@@ -1585,6 +1585,25 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     }
 }
 
+/// SELECTION CUSTODY (R1) — whether a delivery is the FIRST landing of a
+/// physical press or a replayed AUTO-REPEAT tick of a hold already in progress.
+///
+/// `InputEvent::Key` carries `KeyEventType::Repeat` and needs nothing else, but
+/// the two other byte-producing press payloads have no event type to stamp: a
+/// `[key_sequences]` chord forwards `InputEvent::KeySequence(bytes)` and the
+/// `option_as_meta = false` / IME-commit fallback forwards `InputEvent::Text`.
+/// [`App::repeat_literal`] replays the stored event VERBATIM, so the repeat is a
+/// fact about the CALL, not about the value — and threading it through the call
+/// is the only spelling that covers all three payloads without inventing an
+/// event type on variants that have no notion of one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PressPhase {
+    /// The press as the user's finger first landed it (and every non-hold event).
+    Initial,
+    /// An auto-repeat tick of a hold whose press already took custody.
+    Repeat,
+}
+
 /// SELECTION CUSTODY (R1) — the ONE implementation of "what a disturbing press
 /// does to the terminal's reading position", shared by the seam's consolidated
 /// press scope and [`App::input_to_hidden_session`] so the two can never drift
@@ -1732,7 +1751,7 @@ impl App {
     /// `InputEvent` are byte-identical (the indistinguishability invariant, proven
     /// by `input::tests::bytes_human_eq_controller`).
     pub(crate) fn input(&mut self, wid: WindowId, ev: InputEvent, src: Source) -> InputOutcome {
-        self.input_to_session(wid, ev, src, None)
+        self.input_to_session(wid, ev, src, None, crate::app_input::PressPhase::Initial)
     }
 
     /// Whether tone-of-typing inference may run AT ALL: the `tone_melody`
@@ -2113,7 +2132,12 @@ impl App {
     /// any window. Terminal-side semantics (snap live viewport, clear terminal
     /// selection, preserve paste FIFO ordering) still apply, but no visible
     /// window animator/predictor/cursor state may be touched by hidden input.
-    fn input_to_hidden_session(&self, target_session: u64, ev: InputEvent) -> InputOutcome {
+    fn input_to_hidden_session(
+        &self,
+        target_session: u64,
+        ev: InputEvent,
+        phase: PressPhase,
+    ) -> InputOutcome {
         debug_assert!(matches!(
             ev,
             InputEvent::Key { .. } | InputEvent::Text(_) | InputEvent::KeySequence(_)
@@ -2126,19 +2150,22 @@ impl App {
         // same helper. A hidden session is reached only by a held key whose
         // press already established session ownership, so in practice every
         // event arriving here is a Repeat — which is precisely what must no
-        // longer disturb the reading position. The `display_offset() != 0`
-        // guard inside the helper also closes this path's missing-guard bug.
+        // longer disturb the reading position, and `phase` says so even for the
+        // `KeySequence`/`Text` payloads that carry no event type to read it off.
+        // The `display_offset() != 0` guard inside the helper also closes this
+        // path's missing-guard bug.
         let PressClass { inert_modifier, .. } = classify_press(&ev);
         let is_release = matches!(
             &ev,
             InputEvent::Key { event_type, .. }
                 if matches!(event_type, aterm_types::keyboard::KeyEventType::Release)
         );
-        let is_repeat = matches!(
-            &ev,
-            InputEvent::Key { event_type, .. }
-                if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
-        );
+        let is_repeat = phase == PressPhase::Repeat
+            || matches!(
+                &ev,
+                InputEvent::Key { event_type, .. }
+                    if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
+            );
         let press_disturbs = !is_release && !is_repeat && !inert_modifier;
         if press_disturbs {
             let mut terminal = term_lock(&term);
@@ -2160,6 +2187,7 @@ impl App {
         ev: InputEvent,
         src: Source,
         target_session: Option<u64>,
+        phase: PressPhase,
     ) -> InputOutcome {
         // Every real input advances the automatic-update quiet clock, but a
         // PENDING overlap BUFFERS THROUGH byte-producing input rather than
@@ -2392,7 +2420,7 @@ impl App {
                     })
                 });
             let Some(presented) = presented else {
-                return self.input_to_hidden_session(target, ev);
+                return self.input_to_hidden_session(target, ev, phase);
             };
             presented
         } else {
@@ -2510,11 +2538,16 @@ impl App {
                 // Everything else — the encode, the predictor, the cosmetic feeds,
                 // the release-relevance publication — is untouched: this gates
                 // SIDE EFFECTS only and never a byte.
-                let is_repeat = matches!(
-                    &ev,
-                    InputEvent::Key { event_type, .. }
-                        if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
-                );
+                //
+                // A `Key` states its own repeat; `KeySequence`/`Text` cannot, so
+                // [`PressPhase`] carries the fact from `repeat_literal`, which
+                // replays the stored payload verbatim.
+                let is_repeat = phase == PressPhase::Repeat
+                    || matches!(
+                        &ev,
+                        InputEvent::Key { event_type, .. }
+                            if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
+                    );
                 let press_disturbs = !is_release && !is_repeat && !inert_modifier;
                 // The exact pre-write proofs are produced only on a press-like
                 // event. Keep them available across the PTY dispatch below so
@@ -2522,7 +2555,15 @@ impl App {
                 // take the fail-closed tuple and can never arm or revoke one.
                 let (candidate_was_pending, typed_move_proof, delete_move_proof) =
                     if let Some(input_now) = input_now {
-                    self.reset_blink(wid);
+                    // Same §3 row 1 contract as `on_key`'s reset above: a bare
+                    // modifier press is inert and leaves the blink phase alone.
+                    // Gated on `inert_modifier` ONLY — never on `press_disturbs`
+                    // — because an auto-repeat tick is a key the user is still
+                    // holding down, and the cursor must stay solid for the whole
+                    // hold.
+                    if !inert_modifier {
+                        self.reset_blink(wid);
+                    }
                     // Predictive local echo (mosh-style): register the classified
                     // `predict_candidate` glyph so it can paint before the shell
                     // echoes it. Resolved BEFORE the term lock below (pure, no term
@@ -4414,7 +4455,13 @@ impl App {
         clear_physical_release_trace();
         #[cfg(test)]
         let trace_event = event.clone();
-        let outcome = self.input_to_session(wid, event, Source::Human, Some(session));
+        let outcome = self.input_to_session(
+            wid,
+            event,
+            Source::Human,
+            Some(session),
+            crate::app_input::PressPhase::Initial,
+        );
         #[cfg(test)]
         record_physical_release_trace(PhysicalReleaseTrace::Literal {
             arrival_window: wid,
@@ -4465,7 +4512,18 @@ impl App {
         }
         #[cfg(test)]
         let trace_event = event.clone();
-        let outcome = self.input_to_session(window, event, Source::Human, Some(session));
+        // SELECTION CUSTODY (R1): the payload is replayed BYTE-IDENTICAL, so the
+        // repeat cannot be read off the event — `KeySequence`/`Text` carry no
+        // event type. Say it here instead, or a held `[key_sequences]` chord (or
+        // a non-US-layout key arriving as committed text) re-snaps the viewport
+        // and re-clears the selection on every tick of the hold.
+        let outcome = self.input_to_session(
+            window,
+            event,
+            Source::Human,
+            Some(session),
+            PressPhase::Repeat,
+        );
         #[cfg(test)]
         record_physical_release_trace(PhysicalReleaseTrace::Literal {
             arrival_window: repeat_window,
@@ -4616,6 +4674,7 @@ impl App {
                     InputEvent::ScrollView(intent),
                     Source::Human,
                     Some(session),
+                    PressPhase::Repeat,
                 );
                 true
             }
@@ -4814,6 +4873,7 @@ impl App {
             },
             Source::Human,
             Some(session),
+            PressPhase::Repeat,
         );
         #[cfg(test)]
         {
@@ -5340,8 +5400,16 @@ impl App {
         // Resolved once here off the key identity; the seam re-derives the same
         // answer from the engine key for the presses that reach it.
         let inert = keymap::press_is_inert(&ev);
-        // Typing makes the cursor solid and restarts the blink period.
-        self.reset_blink(wid);
+        // Typing makes the cursor solid and restarts the blink period — but a
+        // BARE MODIFIER is inert (design §3 row 1: "no snap, no clear, no blink
+        // reset, no glide cancel"), so resting a finger on ⇧ to shift-click no
+        // longer restarts the phase. Deliberately NOT gated on auto-repeat: a
+        // held key is still a key you are holding, and the cursor must not start
+        // blinking mid-hold. (Repeats return above this line anyway; the seam's
+        // own reset carries them.)
+        if !inert {
+            self.reset_blink(wid);
+        }
         // MULTI-LINE-PASTE CONFIRMATION BANNER (Linux — `paste_banner` is `None` on
         // the native-alert platforms): while the banner is up over THIS window it is
         // MODAL and owns the keyboard, exactly as the macOS sheet's key window and
@@ -12566,6 +12634,367 @@ mod press_path_lock_elision_tests {
         unsafe {
             libc::close(pipe[0]);
             libc::close(pipe[1]);
+        }
+    }
+
+    /// SELECTION CUSTODY (R1) for the two byte-producing press payloads that
+    /// carry NO event type: a `[key_sequences]`-bound chord forwards
+    /// `InputEvent::KeySequence(bytes)`, and the `option_as_meta = false` /
+    /// IME-commit fallback forwards `InputEvent::Text` — the ordinary shape of a
+    /// key on a non-US layout.
+    ///
+    /// `repeat_literal` replays that stored payload VERBATIM, so the seam could
+    /// not read the repeat off the event: `is_repeat` was `false` on every tick
+    /// and the press-path snap+clear re-ran at the auto-repeat rate. These users
+    /// were still getting the ~30 Hz snap-and-clear Phase 1 exists to prevent,
+    /// with no difference they could infer from the US-layout holder beside them.
+    /// [`PressPhase`] carries the fact through the call instead.
+    #[test]
+    fn a_held_literal_payload_repeats_without_re_taking_the_reading_position() {
+        for (code, payload) in [
+            (KeyCode::KeyP, InputEvent::KeySequence(b"\x1b[99~".to_vec())),
+            (KeyCode::KeyE, InputEvent::Text("é".to_string())),
+        ] {
+            let mut app = App::headless_for_test();
+            let wid = WindowId(0);
+            let physical = PhysicalKey::Code(code);
+            let term = scrolled_back_with_a_selection(&mut app, wid);
+
+            // The PRESS still takes custody — unchanged, and the control for
+            // everything below: it proves this payload really does reach the
+            // press path, so a green repeat assertion cannot be green by absence.
+            app.forward_literal_press(wid, physical, payload.clone());
+            {
+                let t = term_lock(&term);
+                assert_eq!(
+                    t.grid().display_offset(),
+                    0,
+                    "the first landing of {payload:?} must still snap to live"
+                );
+                assert!(
+                    !t.text_selection().has_selection(),
+                    "the first landing of {payload:?} must still deselect"
+                );
+            }
+
+            // Mid-hold the user wheels back into history and drags a new
+            // selection — the exact case Phase 1 exists to protect.
+            let _ = scrolled_back_with_a_selection(&mut app, wid);
+            let offset = term_lock(&term).grid().display_offset();
+
+            // …and the key is STILL down: more auto-repeat ticks arrive.
+            for tick in 0..3 {
+                app.route_physical_repeat(wid, physical);
+                let t = term_lock(&term);
+                assert_eq!(
+                    t.grid().display_offset(),
+                    offset,
+                    "repeat {tick} of {payload:?} snapped the viewport back to live"
+                );
+                assert!(
+                    t.text_selection().has_selection(),
+                    "repeat {tick} of {payload:?} cleared the mid-hold selection"
+                );
+            }
+        }
+    }
+
+    /// SELECTION CUSTODY — design §3 row 1 spells an inert modifier press as
+    /// "No snap, no clear, NO BLINK RESET, no glide cancel". Three of the four
+    /// shipped: the blink reset ran unconditionally, one line after `inert` was
+    /// computed. Scrolled back with the cursor mid-blink-off, reaching for ⇧ to
+    /// shift-click-extend snapped the cursor solid and restarted the period — a
+    /// visible change from a press the design declares inert.
+    ///
+    /// The gate is on INERTNESS ONLY, never on auto-repeat: a held key is still
+    /// a key you are holding, so the last two steps pin that a repeat tick — and
+    /// an ordinary press — still keep the cursor solid.
+    #[test]
+    fn a_bare_modifier_leaves_the_blink_alone_while_typing_and_repeats_reset_it() {
+        use winit::keyboard::NamedKey as WNamed;
+        // Park the cursor mid-blink-OFF with a live blink deadline, as a settled
+        // idle window between two blinks really sits.
+        fn park_blink_off(app: &mut App, wid: WindowId, deadline: std::time::Instant) {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.blink_phase = false;
+            ws.next_blink = Some(deadline);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+
+        // The `on_key` half: winit's real bare-modifier events. `AltGraph`/`Fn`
+        // are the ones the ENGINE has no key for, so they never reach the seam —
+        // they hold `on_key`'s own gate on their own, exactly as they do for the
+        // glide cancel in `unmapped_modifier_keys_are_inert_too`.
+        for (named, code) in [
+            (WNamed::Shift, KeyCode::ShiftLeft),
+            (WNamed::Super, KeyCode::SuperLeft),
+            (WNamed::Control, KeyCode::ControlLeft),
+            (WNamed::Alt, KeyCode::AltLeft),
+            (WNamed::CapsLock, KeyCode::CapsLock),
+            (WNamed::AltGraph, KeyCode::AltRight),
+            (WNamed::Fn, KeyCode::Fn),
+        ] {
+            park_blink_off(&mut app, wid, deadline);
+            app.on_key(wid, modifier_event(named, code, ElementState::Pressed));
+            let ws = &app.windows[&wid];
+            assert!(
+                !ws.blink_phase,
+                "bare {named:?} must not snap the cursor solid"
+            );
+            assert_eq!(
+                ws.next_blink,
+                Some(deadline),
+                "bare {named:?} must not restart the blink period"
+            );
+        }
+
+        // The SEAM half: the same press arriving as an engine event (a controller
+        // verb, or a held modifier routed to its press-time session).
+        park_blink_off(&mut app, wid, deadline);
+        let _ = app.input(
+            wid,
+            InputEvent::Key {
+                key: Key::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            Source::Human,
+        );
+        let ws = &app.windows[&wid];
+        assert!(!ws.blink_phase, "the seam must honour the same contract");
+        assert_eq!(ws.next_blink, Some(deadline), "…period included");
+
+        // CONTROL 1: an auto-repeat tick of a held ordinary key. It takes no
+        // custody (that is the fix above), but the cursor must stay solid for the
+        // whole hold — the blink must never be gated on `press_disturbs`.
+        park_blink_off(&mut app, wid, deadline);
+        let _ = app.input(
+            wid,
+            InputEvent::Key {
+                key: Key::Character('a'),
+                mods: Modifiers::empty(),
+                base_layout: None,
+                event_type: KeyEventType::Repeat,
+            },
+            Source::Human,
+        );
+        assert!(
+            app.windows[&wid].blink_phase,
+            "a repeat tick must keep the cursor solid mid-hold"
+        );
+
+        // CONTROL 2: ordinary typing, unchanged.
+        park_blink_off(&mut app, wid, deadline);
+        app.on_key(wid, character_event('a', ElementState::Pressed));
+        assert!(
+            app.windows[&wid].blink_phase,
+            "typing still makes the cursor solid"
+        );
+        assert_ne!(
+            app.windows[&wid].next_blink,
+            Some(deadline),
+            "…and still restarts the blink period"
+        );
+    }
+
+    /// SELECTION CUSTODY §3 row 4 — the HIDDEN-session press gate, which had no
+    /// test at all.
+    ///
+    /// `input_to_hidden_session` is reached only by a held key whose press already
+    /// established session ownership, i.e. by AUTO-REPEAT ticks aimed at a session no
+    /// window fronts any more. Before the shared helper it snapped and cleared on
+    /// every one of those ticks, and it had no `display_offset() != 0` guard, so a key
+    /// held over a window whose tab had since changed reset a BACKGROUND session's
+    /// reading position ~30 times a second. Nothing in the gui suite constructed that
+    /// state, so deleting `press_disturbs` from this path was invisible.
+    #[test]
+    fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
+        use crate::stub_session;
+        use aterm_types::keyboard::{Key as EngineKey, KeyEventType, Modifiers};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let hidden_session = 0u64;
+        let term = scrolled_back_with_a_selection(&mut app, wid);
+        let offset = term_lock(&term).grid().display_offset();
+
+        // Push a second tab so session 0 is no longer fronted by any window —
+        // exactly the state `input_to_hidden_session` exists for.
+        let sid = app.next_session_id;
+        app.push_stub_tab(wid, stub_session(sid));
+        assert_ne!(
+            app.front_terminal(wid).map(|t| t.session),
+            Some(hidden_session),
+            "precondition: session 0 is hidden"
+        );
+
+        let held = |event_type| InputEvent::Key {
+            key: EngineKey::Character('j'),
+            mods: Modifiers::empty(),
+            base_layout: None,
+            event_type,
+        };
+
+        // The auto-repeat ticks of the hold: the SAME press continuing. They must
+        // not take custody a second time.
+        for _ in 0..4 {
+            app.input_to_hidden_session(hidden_session, held(KeyEventType::Repeat), crate::app_input::PressPhase::Repeat);
+        }
+        {
+            let t = term_lock(&term);
+            assert_eq!(
+                t.grid().display_offset(),
+                offset,
+                "an auto-repeat tick must not snap a hidden session's viewport"
+            );
+            assert!(
+                t.text_selection().has_selection(),
+                "an auto-repeat tick must not clear a hidden session's selection"
+            );
+        }
+
+        // A bare modifier is inert on this path too.
+        app.input_to_hidden_session(
+            hidden_session,
+            InputEvent::Key {
+                key: EngineKey::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
+                mods: Modifiers::SHIFT,
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+            crate::app_input::PressPhase::Initial,
+        );
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            offset,
+            "a bare modifier expresses no intent, hidden or not"
+        );
+
+        // …and the CONTROL: a genuine press still takes custody, so the gate is a
+        // scoped exclusion and not a blanket "hidden input never disturbs".
+        app.input_to_hidden_session(hidden_session, held(KeyEventType::Press), crate::app_input::PressPhase::Initial);
+        let t = term_lock(&term);
+        assert_eq!(
+            t.grid().display_offset(),
+            0,
+            "a real press into a hidden session still snaps it to live"
+        );
+        assert!(!t.text_selection().has_selection(), "…and still deselects");
+    }
+
+    /// The `display_offset() != 0` guard the hidden path never had, pinned on the
+    /// shared helper that now owns it. The guard is what makes the returned
+    /// `scrolled` flag mean "the reading position ACTUALLY moved" — the change-gated
+    /// repaint the seam runs off it — so a helper that snapped unconditionally would
+    /// report a viewport move on every keystroke of a live terminal.
+    #[test]
+    fn press_custody_reports_only_the_disturbances_it_actually_caused() {
+        use aterm_core::selection::{SelectionSide, SelectionType};
+        use aterm_core::terminal::Terminal;
+
+        let mut live = Terminal::new(24, 40);
+        live.process("line\r\n".repeat(64).as_bytes());
+        assert_eq!(live.grid().display_offset(), 0, "precondition: at the tail");
+        assert_eq!(
+            super::apply_press_custody(&mut live, true),
+            (false, false),
+            "nothing to snap and nothing to clear: a disturbing press changed nothing"
+        );
+
+        let mut scrolled = Terminal::new(24, 40);
+        scrolled.process("line\r\n".repeat(64).as_bytes());
+        scrolled.scroll_to_top();
+        assert_ne!(scrolled.grid().display_offset(), 0);
+        {
+            let sel = scrolled.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 3, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        assert_eq!(
+            super::apply_press_custody(&mut scrolled, false),
+            (false, false),
+            "a NON-disturbing press must short-circuit before either read"
+        );
+        assert_ne!(
+            scrolled.grid().display_offset(),
+            0,
+            "…and must leave the viewport where the user put it"
+        );
+        assert!(scrolled.text_selection().has_selection());
+
+        assert_eq!(
+            super::apply_press_custody(&mut scrolled, true),
+            (true, true),
+            "a disturbing press over a scrolled-back selection reports BOTH effects"
+        );
+        assert_eq!(scrolled.grid().display_offset(), 0);
+        assert!(!scrolled.text_selection().has_selection());
+    }
+
+    /// SELECTION CUSTODY §3 rows 29 / §4c — ⌘↓ is "the deliberate return to live,
+    /// WITH your selection intact", driven through the shipping `App::on_key`.
+    ///
+    /// `cmd_arrows_are_the_deliberate_return_to_live` asserts only on the pure
+    /// `scrollback_chord` classifier, so routing the chord through the press path
+    /// instead of `input_scroll_view` would silently start clearing the selection the
+    /// chord exists to preserve, with the suite still green.
+    #[test]
+    fn cmd_down_returns_to_live_through_on_key_without_clearing_the_selection() {
+        use winit::keyboard::NamedKey as WNamed;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = scrolled_back_with_a_selection(&mut app, wid);
+        let offset_before = term_lock(&term).grid().display_offset();
+        let text_before = term_lock(&term).selection_to_string();
+        assert!(
+            text_before.is_some(),
+            "precondition: a resolvable selection"
+        );
+
+        app.on_modifiers_changed(wid, ModifiersState::SUPER);
+        app.on_key(
+            wid,
+            modifier_event(WNamed::ArrowDown, KeyCode::ArrowDown, ElementState::Pressed),
+        );
+
+        let t = term_lock(&term);
+        if super::HARDCODED_SUPER_CHORDS {
+            assert_eq!(
+                t.grid().display_offset(),
+                0,
+                "⌘↓ returns the viewport to live"
+            );
+            assert_eq!(
+                t.selection_to_string(),
+                text_before,
+                "…and the selection it was introduced to preserve survives it, \
+                 naming the same text"
+            );
+        } else {
+            // On Linux ⌘(Super) belongs to the DESKTOP: the chord is not
+            // claimed, so it falls through to the encoder and lands in the PTY
+            // like any other key — which is precisely why the viewport returns
+            // to live and the selection clears here. The seam this test guards
+            // (a claimed chord that scrolls WITHOUT disturbing the selection)
+            // exists only where the suite is compiled in; off it, ordinary
+            // keystroke semantics are the correct and total answer.
+            let _ = offset_before;
+            assert_eq!(
+                t.grid().display_offset(),
+                0,
+                "an unclaimed chord reaches the PTY, and input returns the viewport to live"
+            );
+            assert_eq!(
+                t.selection_to_string(),
+                None,
+                "…clearing the selection exactly as typing any key does"
+            );
         }
     }
 }

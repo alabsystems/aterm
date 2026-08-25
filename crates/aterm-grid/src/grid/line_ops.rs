@@ -51,6 +51,15 @@ impl Grid {
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
             // Fill BCE RGB in vacated cells at cursor position after shift (#7685).
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            // SELECTION CUSTODY — ICH is a CONTENT-REPLACEMENT op in exactly the
+            // class EL is: it shifts the row's tail right under whatever highlight is
+            // painted there, so a copy afterwards returns text shifted by `count`
+            // columns — text the user never selected. It recorded nothing until now,
+            // which is the silent-failure direction the design calls the worst
+            // outcome. One row of damage, the cursor's, like EL. NOT
+            // `damage_selection_scroll_region`: that also invalidates host coordinate
+            // caches, and ICH moves cells within a row without moving any ROW.
+            self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
@@ -85,6 +94,10 @@ impl Grid {
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
             // Fill BCE RGB in vacated cells at end of line after shift (#7685).
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
+            // SELECTION CUSTODY — DCH shifts the row's tail LEFT under a live
+            // highlight; see `insert_chars` for why this is EL's class and why the
+            // band is one row with no host-coordinate invalidation.
+            self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
@@ -127,6 +140,9 @@ impl Grid {
                 .extras
                 .shift_cols_right(cursor_row, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            // SELECTION CUSTODY — the margined ICH replaces content exactly as the
+            // unmargined one does; see `insert_chars`.
+            self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
@@ -168,6 +184,9 @@ impl Grid {
                 .extras
                 .shift_cols_left(cursor_row, cursor_col, count, right_bound);
             self.fill_bce_rgb_range(cursor_row, right_bound - count, right_bound);
+            // SELECTION CUSTODY — the margined DCH replaces content exactly as the
+            // unmargined one does; see `insert_chars`.
+            self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }
@@ -202,6 +221,11 @@ impl Grid {
                 .extras
                 .clear_range(cursor_row, cursor_col, cursor_col + count);
             self.fill_bce_rgb_range(cursor_row, cursor_col, cursor_col + count);
+            // SELECTION CUSTODY — ECH blanks cells in place, which is what EL does,
+            // and a program repainting a field with `\e[40X` instead of `\e[K`
+            // differed from one that used EL only in which op got a mark. It gets the
+            // same one-row band; see `insert_chars`.
+            self.damage_selection_visible_rows(cursor_row, cursor_row);
             self.storage.mark_content_row(cursor_row);
         }
     }

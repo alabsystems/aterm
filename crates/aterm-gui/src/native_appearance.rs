@@ -203,6 +203,76 @@ struct Oklch {
     h: f32,
 }
 
+/// Is this chrome background the DARK side?  THE ONE dark/light classifier for
+/// chrome — [`crate::tab_bar::bg_is_light`], the same predicate the tab strip's
+/// tones and the CSD variant resolve with.
+///
+/// It is shared, not merely equivalent, because the strip and this role pipeline
+/// answer ONE question: which side is this window's chrome on. This pipeline used
+/// to answer it with a WCAG relative-luminance split (`< 0.42`) of its own, and
+/// the two thresholds disagree across a real band — neutral `#979797`..`#ADADAD`
+/// and their chromatic equivalents, where gamma-encoded Rec.601 luma has already
+/// crossed 150 while linear luminance has not. That disagreement is exactly how
+/// config `window_theme = light` stayed a NO-OP for those themes:
+/// [`crate::App::chrome_palette_theme`] classified the terminal theme as "already
+/// light", passed it through unforced, and this pipeline then built the DARK side
+/// from the very same background.
+pub(crate) fn surface_is_dark(bg: [u8; 3]) -> bool {
+    !crate::tab_bar::bg_is_light(bg)
+}
+
+/// The accent tint an interactive fill carries WHEN THE ACCENT ITSELF IS THE INK
+/// on top of it: a selected navigation row paints its label and icon in
+/// `accent` on `elevated` washed this far toward `accent`, and pressing that same
+/// selected row deepens the wash to [`ACCENT_WASH_PRESSED`].  Owned here rather
+/// than in the painter so [`accent_over_its_own_wash`] and the pixels
+/// `native_ui` produces cannot drift apart.
+pub(crate) const ACCENT_WASH_SELECTED: f32 = 0.13;
+/// The deepest accent wash that still carries ACCENT ink (the pressed state of a
+/// selected navigation row).  Deeper washes than this exist, but the ink on them
+/// is text_primary/secondary, floored against `surface` already.
+pub(crate) const ACCENT_WASH_PRESSED: f32 = 0.16;
+/// The floor the accent holds AS INK, against the wash it is inked on.  A rule or
+/// a fill can be quieter than its surroundings; a LABEL cannot.
+const ACCENT_INK_FLOOR: f32 = 3.0;
+
+/// Straight sRGB channel lerp — the mix the native painter builds control fills
+/// with ([`crate::native_ui::mix_rgb`] delegates here), as distinct from the
+/// perceptual [`mix_oklab`] the role ramps use.  The accent floor below has to
+/// measure the EXACT bytes the painter will put on screen.
+pub(crate) fn mix_srgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
+    let amount = amount.clamp(0.0, 1.0);
+    std::array::from_fn(|index| {
+        (f32::from(a[index]) + (f32::from(b[index]) - f32::from(a[index])) * amount).round() as u8
+    })
+}
+
+/// Hold the accent to [`ACCENT_INK_FLOOR`] against its OWN wash.
+///
+/// The selected rail row is the one place the accent is body-sized ink, and its
+/// backdrop is built FROM the accent — so flooring the accent against `surface`
+/// (which the wash is not) left the SELECTED row the least legible row in the
+/// rail: 2.69:1 on the forced-light chrome against 9.63:1 for its unselected
+/// siblings, which reads as "disabled", the exact opposite of selected.
+///
+/// The target moves with the answer, so this is a fixpoint: each pass re-mixes
+/// the wash from the current accent and nudges lightness only as far as that wash
+/// demands ([`ensure_contrast`] is hue- and chroma-preserving). The wash travels
+/// only [`ACCENT_WASH_PRESSED`] of the way toward the accent, so the residual
+/// contracts by roughly that factor per pass and the loop settles in two or three;
+/// the bound is a guarantee of termination, not a budget.
+fn accent_over_its_own_wash(accent: [u8; 3], elevated: [u8; 3]) -> [u8; 3] {
+    let mut accent = accent;
+    for _ in 0..8 {
+        let wash = mix_srgb(elevated, accent, ACCENT_WASH_PRESSED);
+        if contrast_ratio(accent, wash) >= ACCENT_INK_FLOOR {
+            break;
+        }
+        accent = ensure_contrast(accent, wash, ACCENT_INK_FLOOR);
+    }
+    accent
+}
+
 /// Build the native palette.  Neutral roles preserve the theme's perceptual hue;
 /// chromatic roles keep the theme accent hue but cap its chroma for large controls.
 pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeRoles {
@@ -210,7 +280,7 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
     let bg = packed_rgb(theme.bg);
     let fg = packed_rgb(theme.fg);
     let selection = packed_rgb(theme.selection);
-    let dark = relative_luminance(bg) < 0.42;
+    let dark = surface_is_dark(bg);
 
     let surface = neutral_surface(bg, fg, if dark { 0.075 } else { 0.055 });
     let elevated = neutral_surface(surface, fg, if dark { 0.075 } else { 0.065 });
@@ -238,7 +308,10 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
     } else {
         accent_seed.l.clamp(0.42, 0.58)
     };
-    let accent = ensure_contrast(oklch_to_rgb(accent_seed), surface, 3.0);
+    // Floored twice, against both backdrops the accent actually meets: the page
+    // surface it rules and fills on, and the selected-row wash it INKS on.
+    let accent = ensure_contrast(oklch_to_rgb(accent_seed), surface, ACCENT_INK_FLOOR);
+    let accent = accent_over_its_own_wash(accent, elevated);
 
     let black = [8, 10, 13];
     let white = [250, 251, 253];
@@ -320,14 +393,21 @@ pub(crate) const FORCED_DARK_CHROME_BG: u32 = 0x0024_2424;
 #[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
 pub(crate) const FORCED_DARK_CHROME_FG: u32 = 0x00ED_EDED;
 
-/// The floor the carried terminal accent is held to against the forced chrome
-/// surface. Deliberately below the 3.0 ink floor: the accent paints RULES and
-/// FILLS (the strip's active underline, selected washes), never body text, and
-/// [`roles`]/`strip_colors` re-floor every ink they derive from it — but a dark
-/// theme's near-white cursor carried verbatim onto the #FAFAFA surface would be
-/// an invisible underline, which is what this catches.
+/// The floor the carried terminal cursor — the accent SEED — is held to against
+/// the forced chrome surface.
+///
+/// This is a floor on the INPUT, not on the shipped accent. The accent is body
+/// ink: a selected navigation row paints its label and icon in it, so the floor
+/// that decides legibility is [`ACCENT_INK_FLOOR`], applied by [`roles`] against
+/// both the surface and the row's own wash ([`accent_over_its_own_wash`]) — and
+/// [`roles`] re-derives lightness and chroma from clamps of its own, so nothing
+/// here can substitute for that. What this catches is a degenerate SEED: a dark
+/// theme's near-white cursor carried verbatim onto `#FAFAFA` arrives with no
+/// usable lightness signal at all, and the hue it hands to [`roles`] is whatever
+/// rounding left in a near-neutral. Holding the seed to the same 3.0 the shipped
+/// ink must reach keeps the identity that gets carried a real colour.
 #[cfg(any(test, target_os = "linux"))] // Linux forced-palette seam (chrome_palette_theme) + tests; dead on mac/win lib
-const FORCED_CHROME_ACCENT_FLOOR: f32 = 2.2;
+const FORCED_CHROME_ACCENT_FLOOR: f32 = ACCENT_INK_FLOOR;
 
 /// The [`Theme`] the chrome painters draw from when config
 /// `window_theme = light|dark` forces the side AGAINST the terminal theme's own
@@ -635,18 +715,124 @@ mod tests {
         },
     ];
 
+    /// Every bundled scheme, as its own chrome — the donor set the forced test
+    /// below carries onto the authored surfaces.
+    fn bundled_themes() -> Vec<(&'static str, Theme)> {
+        aterm_types::scheme::builtin_names()
+            .into_iter()
+            .map(|name| {
+                let parts = aterm_types::scheme::builtin(name)
+                    .expect("a listed builtin exists")
+                    .to_theme_parts();
+                (
+                    name,
+                    Theme {
+                        fg: parts.fg,
+                        bg: parts.bg,
+                        cursor: parts.cursor,
+                        selection: parts.selection,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// THE contract, asserted on the pairs that actually meet on screen.
+    ///
+    /// The accent one is the pair this used to get wrong: `accent`-vs-`surface`
+    /// is the pair for a RULE, but a SELECTED navigation row paints its label and
+    /// icon in `accent` on a wash built FROM `accent` over `elevated`, and that
+    /// pair measured 2.69:1 on the forced-light chrome while the row's own
+    /// unselected siblings sat at 9.63:1 — the selected row was the least legible
+    /// row in the rail, which reads as "disabled".
+    fn assert_role_contract(what: &str, r: NativeRoles) {
+        assert!(
+            contrast_ratio(r.text_primary, r.surface) >= 4.5,
+            "{what}: primary text"
+        );
+        assert!(
+            contrast_ratio(r.text_secondary, r.surface) >= 4.5,
+            "{what}: secondary text"
+        );
+        assert!(
+            contrast_ratio(r.text_tertiary, r.surface) >= 3.0,
+            "{what}: tertiary text"
+        );
+        assert!(
+            contrast_ratio(r.accent, r.surface) >= ACCENT_INK_FLOOR,
+            "{what}: accent as a rule on the page"
+        );
+        for (state, mix) in [
+            ("selected", ACCENT_WASH_SELECTED),
+            ("pressed", ACCENT_WASH_PRESSED),
+        ] {
+            let wash = mix_srgb(r.elevated, r.accent, mix);
+            let ratio = contrast_ratio(r.accent, wash);
+            assert!(
+                ratio >= ACCENT_INK_FLOOR,
+                "{what}: accent ink on the {state} row's own wash is {ratio:.2}:1"
+            );
+        }
+        assert!(
+            contrast_ratio(r.on_accent, r.accent) >= 4.5,
+            "{what}: ink on an accent fill"
+        );
+        assert!(contrast_ratio(r.danger, r.surface) >= 4.5, "{what}: danger");
+        assert!(
+            contrast_ratio(r.success, r.surface) >= 4.5,
+            "{what}: success"
+        );
+        assert_ne!(r.surface, r.elevated, "{what}: elevation is visible");
+    }
+
     #[test]
     fn roles_meet_their_contrast_contract_on_diverse_themes() {
         for theme in THEMES {
-            let r = default_roles(theme);
-            assert!(contrast_ratio(r.text_primary, r.surface) >= 4.5);
-            assert!(contrast_ratio(r.text_secondary, r.surface) >= 4.5);
-            assert!(contrast_ratio(r.text_tertiary, r.surface) >= 3.0);
-            assert!(contrast_ratio(r.accent, r.surface) >= 3.0);
-            assert!(contrast_ratio(r.on_accent, r.accent) >= 4.5);
-            assert!(contrast_ratio(r.danger, r.surface) >= 4.5);
-            assert!(contrast_ratio(r.success, r.surface) >= 4.5);
-            assert_ne!(r.surface, r.elevated);
+            assert_role_contract(&format!("{theme:?}"), default_roles(theme));
+        }
+        for (name, theme) in bundled_themes() {
+            assert_role_contract(name, default_roles(theme));
+        }
+    }
+
+    /// ONE dark/light predicate decides which side the chrome is on. The strip's
+    /// band tones, the CSD variant and this role pipeline all read
+    /// [`crate::tab_bar::bg_is_light`]; the WCAG relative-luminance split this
+    /// module used to keep for itself disagreed with it across a REAL band of
+    /// backgrounds, and that disagreement is the whole mechanism behind
+    /// `window_theme = light` doing nothing for those themes (the passthrough in
+    /// `chrome_palette_theme` saw "already light" and handed back a theme this
+    /// pipeline then built the DARK side from).
+    #[test]
+    fn the_role_pipeline_and_the_strip_classify_every_background_the_same_way() {
+        // The band is real, not hypothetical: the retired split still calls
+        // these DARK, while the shipping predicate — and therefore the strip,
+        // the header and the pages — call them LIGHT.
+        for gray in 0x97..=0xAD_u8 {
+            let bg = [gray; 3];
+            assert!(
+                relative_luminance(bg) < 0.42,
+                "#{gray:02X}{gray:02X}{gray:02X} is inside the retired split's dark side"
+            );
+            assert!(
+                !surface_is_dark(bg),
+                "#{gray:02X}{gray:02X}{gray:02X} is on the strip's light side"
+            );
+        }
+        // …and no background anywhere can split the two sites apart.
+        for r in (0..=255).step_by(15) {
+            for g in (0..=255).step_by(15) {
+                for b in (0..=255).step_by(15) {
+                    let bg = [r as u8, g as u8, b as u8];
+                    let packed =
+                        (u32::from(bg[0]) << 16) | (u32::from(bg[1]) << 8) | u32::from(bg[2]);
+                    assert_eq!(
+                        surface_is_dark(bg),
+                        crate::tab_bar::theme_is_dark(packed),
+                        "{bg:?}: the role pipeline and the strip must be ONE predicate"
+                    );
+                }
+            }
         }
     }
 
@@ -656,30 +842,31 @@ mod tests {
     /// EVERY carried accent, since the terminal theme donates cursor/selection.
     #[test]
     fn forced_chrome_themes_meet_the_roles_contract_for_any_carried_accent() {
-        for terminal in THEMES {
+        let donors = THEMES
+            .into_iter()
+            .map(|theme| ("hand-written", theme))
+            .chain(bundled_themes());
+        for (name, terminal) in donors {
             for dark in [false, true] {
                 let forced = forced_chrome_theme(terminal, dark);
-                // The authored side really is that side, under both classifiers
-                // (the roles split here and the strip's `bg_is_light`).
-                assert_eq!(relative_luminance(packed_rgb(forced.bg)) < 0.42, dark);
+                // The authored side really is that side, under THE chrome
+                // classifier — the one the roles pipeline, the strip and the CSD
+                // variant share.
+                assert_eq!(surface_is_dark(packed_rgb(forced.bg)), dark);
                 assert!(
                     contrast_ratio(packed_rgb(forced.fg), packed_rgb(forced.bg)) >= 7.0,
                     "authored chrome text is comfortably readable on its own surface"
                 );
-                // The carried accent stays visible on the forced surface.
+                // The carried accent SEED arrives as a real colour on the forced
+                // surface (the shipped accent is floored again by `roles`).
                 assert!(
                     contrast_ratio(packed_rgb(forced.cursor), packed_rgb(forced.bg))
                         >= FORCED_CHROME_ACCENT_FLOOR - 0.01
                 );
-                let r = default_roles(forced);
-                assert!(contrast_ratio(r.text_primary, r.surface) >= 4.5);
-                assert!(contrast_ratio(r.text_secondary, r.surface) >= 4.5);
-                assert!(contrast_ratio(r.text_tertiary, r.surface) >= 3.0);
-                assert!(contrast_ratio(r.accent, r.surface) >= 3.0);
-                assert!(contrast_ratio(r.on_accent, r.accent) >= 4.5);
-                assert!(contrast_ratio(r.danger, r.surface) >= 4.5);
-                assert!(contrast_ratio(r.success, r.surface) >= 4.5);
-                assert_ne!(r.surface, r.elevated);
+                assert_role_contract(
+                    &format!("{name} carried onto the forced dark={dark} chrome"),
+                    default_roles(forced),
+                );
             }
         }
         // A terminal theme already on the forced side round-trips its accent

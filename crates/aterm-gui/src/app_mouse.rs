@@ -3830,9 +3830,15 @@ impl App {
     /// Edit ▸ Select All: select the entire visible screen as whole lines (a
     /// `Lines` selection from the top row to the bottom row, full width), then
     /// repaint so the highlight shows. Mirrors a triple-click line selection
-    /// dragged top-to-bottom; the snap-to-bottom first makes 0..rows stable
-    /// selection coordinates (matching `search_recompute`). Copy (Cmd-C) then
-    /// works on the whole screen exactly as on a mouse selection.
+    /// dragged top-to-bottom. Copy (Cmd-C) then works on the whole VISIBLE
+    /// screen exactly as on a mouse selection.
+    ///
+    /// SELECTION CUSTODY Phase 2 deleted the snap-to-bottom this used to do
+    /// first, so the rows it writes are NOT `0..rows`: they are
+    /// `-off..=rows-1-off` for the live `display_offset` (negative rows are
+    /// scrollback), which collapses to `0..rows` only when the viewport is
+    /// already at live. Any second caller must derive its arithmetic the same
+    /// way — see the body for why.
     pub(crate) fn select_all(&mut self) {
         // A window-level command (menu Select All): targets the frontmost window.
         let Some(ws) = self.front() else { return };
@@ -6444,5 +6450,248 @@ mod tests {
             );
             app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
         }
+    }
+
+    /// SELECTION CUSTODY §3 row 24, on the REAL handler: a word/line drag must
+    /// re-derive its ORIGIN from the LIVE selection on every move, not from the
+    /// `GestureOrigin.row` captured at press time.
+    ///
+    /// The design calls this "Not optional under this design" because Phase 4 stopped
+    /// output from clearing selections: `post_process` compensates the ENGINE anchors
+    /// through `adjust_for_scroll`, nothing compensates `GestureOrigin.row`, so a drag
+    /// that outlives one line of output re-anchors on a row the origin unit no longer
+    /// occupies — a live wrong-copy path. Nothing called `drag_selection` from a test
+    /// before this one, so reverting the re-derivation left the suite green.
+    ///
+    /// Content-level oracle deliberately: the assertion is on the TEXT the drag
+    /// resolves to, which is what a ⌘-C would put on the clipboard.
+    #[test]
+    fn a_line_drag_re_anchors_on_its_origin_line_after_output_scrolls_the_grid() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(&numbered_screen("L"));
+
+        // Triple-click row 5 → the "L05" line; the gesture origin is captured at 5.
+        app.select_line_click(wid, 5, 0);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("L05"),
+            "precondition: the triple-click selected the L05 line"
+        );
+
+        // Three lines of ordinary output scroll the grid. Phase 4 records no damage
+        // for plain writes, so the selection SURVIVES and its anchors ride up to
+        // row 2 — while `GestureOrigin.row` is still the stale 5.
+        term_lock(&term).process(b"\r\nX\r\nY\r\nZ");
+        assert_eq!(
+            app.windows[&wid].gesture.map(|g| g.row),
+            Some(5),
+            "precondition: the captured gesture row is NOT compensated — that is the trap"
+        );
+        assert!(
+            term_lock(&term).text_selection().has_selection(),
+            "precondition: ordinary output must not clear the selection (Phase 4)"
+        );
+
+        // Drag down to viewport row 8 (now "L11").
+        app.drag_selection(wid, 8, 0);
+
+        let text = term_lock(&term)
+            .selection_to_string()
+            .expect("the drag resolves to text");
+        assert_eq!(
+            text.lines().next(),
+            Some("L05"),
+            "the drag must stay anchored on its ORIGIN line; anchoring on the stale \
+             gesture row would start the copy at L08 — text the user never selected"
+        );
+        assert_eq!(
+            text.lines().last(),
+            Some("L11"),
+            "…and reach the hovered line"
+        );
+    }
+
+    /// The word (double-click) arm of the same rule — it re-derives the origin
+    /// through the identical `origin_row` lookup, and a word drag is the shape the
+    /// design's scenario names.
+    #[test]
+    fn a_word_drag_re_anchors_on_its_origin_word_after_output_scrolls_the_grid() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(&numbered_screen("w"));
+
+        app.select_word_click(wid, 5, 0);
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("w05"),
+            "precondition: the double-click selected the w05 word"
+        );
+
+        term_lock(&term).process(b"\r\nX\r\nY\r\nZ");
+        app.drag_selection(wid, 8, 0);
+
+        let text = term_lock(&term)
+            .selection_to_string()
+            .expect("the drag resolves to text");
+        assert!(
+            text.starts_with("w05"),
+            "the word drag must keep its ORIGIN word fully selected after the scroll; \
+             got {text:?}"
+        );
+    }
+
+    /// The fallback half of the same code: with NO live selection to read, the drag
+    /// falls back to the captured `GestureOrigin.row`. Pins that the re-derivation is
+    /// a correction, not a replacement — a first move after the engine cleared the
+    /// selection must still produce one.
+    #[test]
+    fn a_drag_with_no_live_selection_falls_back_to_the_captured_gesture_row() {
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(&numbered_screen("L"));
+
+        app.select_line_click(wid, 5, 0);
+        // The engine drops the selection out from under the drag (an overlapping
+        // damage band would do exactly this).
+        term_lock(&term).text_selection_mut().clear();
+
+        app.drag_selection(wid, 8, 0);
+        let text = term_lock(&term)
+            .selection_to_string()
+            .expect("the fallback still builds a selection");
+        assert_eq!(
+            text.lines().next(),
+            Some("L05"),
+            "with nothing live to read, the captured gesture row is the origin"
+        );
+    }
+
+    /// 24 rows of `<tag>NN`, cursor left on the last row so one more newline scrolls
+    /// the whole screen — the fixture the drag-origin tests share.
+    fn numbered_screen(tag: &str) -> Vec<u8> {
+        let mut seed = Vec::new();
+        for r in 0..24u16 {
+            if r > 0 {
+                seed.extend_from_slice(b"\r\n");
+            }
+            seed.extend_from_slice(format!("{tag}{r:02}").as_bytes());
+        }
+        seed
+    }
+
+    /// SELECTION CUSTODY §3 rows 21/22 — BLUR must SETTLE the in-flight selection,
+    /// not merely drop the window-local gesture flags.
+    ///
+    /// `on_focus_loss_clears_stuck_pointer_gesture` asserts `!ws.selecting` and
+    /// `ws.gesture.is_none()`, both of which were already true BEFORE this fix — the
+    /// bug was that they were dropped WITHOUT finishing the selection, leaving a
+    /// painted `InProgress` highlight that `extend_selection` refuses and that
+    /// copy-on-select never fired for. `Terminal::text_selection().state()` is the
+    /// only observable the fix changes, and nothing looked at it.
+    #[test]
+    fn blur_settles_the_in_flight_selection_into_a_completed_one() {
+        use aterm_core::selection::SelectionState;
+
+        use crate::{App, WindowId, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(b"hello world");
+
+        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+        app.begin_selection(wid, SelectionType::Simple);
+        app.drag_selection(wid, 0, 5);
+        assert_eq!(
+            term_lock(&term).text_selection().state(),
+            SelectionState::InProgress,
+            "precondition: the sweep leaves the engine mid-gesture"
+        );
+
+        // Focus is stolen mid-sweep; the release never comes back.
+        app.on_focus(wid, false);
+
+        assert_eq!(
+            term_lock(&term).text_selection().state(),
+            SelectionState::Complete,
+            "blur must COMPLETE the selection, not strand it InProgress"
+        );
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("hello"),
+            "…and the settled selection still names the swept text"
+        );
+        // A completed selection is one the user can act on: extending it works,
+        // which is exactly what an InProgress zombie refuses.
+        assert!(
+            app.extend_selection_to(wid, 0, 10),
+            "the settled selection is extendable — the InProgress zombie was not"
+        );
+    }
+
+    /// The second call site of the same fix: a TAB SWITCH settles the drag on the
+    /// tab being left. Same observable, different entry point — `sync_window`.
+    #[test]
+    fn a_tab_switch_settles_the_in_flight_selection_on_the_tab_it_leaves() {
+        use aterm_core::selection::SelectionState;
+
+        use crate::{App, WindowId, stub_session, term_lock};
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&term).process(b"hello world");
+
+        app.windows.get_mut(&wid).expect("window").last_mouse_cell = (0, 0);
+        app.begin_selection(wid, SelectionType::Simple);
+        app.drag_selection(wid, 0, 5);
+        assert_eq!(
+            term_lock(&term).text_selection().state(),
+            SelectionState::InProgress
+        );
+
+        // The user opens/switches to another tab with the button still down.
+        let sid = app.next_session_id;
+        app.push_stub_tab(wid, stub_session(sid));
+
+        assert_eq!(
+            term_lock(&term).text_selection().state(),
+            SelectionState::Complete,
+            "the tab switch must settle the drag on the tab it leaves"
+        );
+        assert_eq!(
+            term_lock(&term).selection_to_string().as_deref(),
+            Some("hello")
+        );
     }
 }

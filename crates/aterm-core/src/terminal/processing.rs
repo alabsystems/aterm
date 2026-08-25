@@ -232,16 +232,29 @@ impl Terminal {
         // PERMANENTLY. Exit restored the main grid wholesale — including its
         // display_offset of 0.
         //
-        // So repin the grid that was actually pinned. `lines_added` is 0 for it by
-        // construction: a grid that has been swapped out stopped receiving output,
-        // so no lines entered ITS scrollback during this batch. `repin_display_offset`
-        // clamps to that grid's own `scrollback_lines()`, so `DisplayOffsetValid`
-        // still holds for whichever grid we touch.
+        // So repin the grid that was actually pinned. `repin_display_offset` clamps
+        // to that grid's own `scrollback_lines()`, so `DisplayOffsetValid` still
+        // holds for whichever grid we touch.
+        //
+        // Its `lines_added` is the advance of the SAME grid's counter, measured to
+        // the moment it was parked — NOT 0. The comment that used to justify 0 said
+        // "a grid that has been swapped out stopped receiving output"; it stopped
+        // receiving it only AFTER the swap, and output before the smcup in the same
+        // read is routine (`"a\r\nb\r\nc\r\n\x1b[?1049h"`). See
+        // `park_main_row_counter`.
+        let parked_main_counter = self.transient.alt_park_main_row_counter.take();
         if pinned_offset > 0 {
             let entered_alt = !was_alt && self.modes.alternate_screen;
             if entered_alt {
+                // `lines_before` and the parked counter are BOTH the main grid's, so
+                // their difference is a statement about one coordinate space. The
+                // fallback keeps the old behaviour if no park was recorded (it always
+                // is: every enter path records one before its swap).
+                let lines_added = parked_main_counter
+                    .unwrap_or(lines_before)
+                    .saturating_sub(lines_before);
                 if let Some(main_grid) = self.alt_grid.as_mut() {
-                    main_grid.repin_display_offset(pinned_offset, 0);
+                    main_grid.repin_display_offset(pinned_offset, lines_added);
                 }
             } else {
                 let lines_added = self
@@ -249,6 +262,30 @@ impl Terminal {
                     .absolute_row_counter()
                     .saturating_sub(lines_before);
                 self.grid.repin_display_offset(pinned_offset, lines_added);
+            }
+        }
+
+        // The OTHER pin this batch can hold: one an rmcup took off a grid it swapped
+        // back in mid-batch (`flatten_restored_display_offset`). That grid processed
+        // the rest of the batch at offset 0, as everything downstream of `row_index`
+        // requires, so the reading position is restored HERE — advanced by whatever
+        // entered its scrollback after the swap, exactly like the prologue's pin.
+        //
+        // The two are mutually exclusive in practice (a batch that starts scrolled
+        // back on main parks that grid at the forced 0, so its rmcup restores 0 and
+        // records nothing), but if both ever fired this one is the later, more
+        // specific reading and must win.
+        if let Some((restored_offset, counter_at_swap)) = self.transient.alt_restore_pin.take() {
+            // The restored grid is the one the batch ENDED on, unless the batch went
+            // on to re-enter alt — then it is parked again and lives in `alt_grid`.
+            let restored_grid = if self.modes.alternate_screen {
+                self.alt_grid.as_mut()
+            } else {
+                Some(&mut self.grid)
+            };
+            if let Some(grid) = restored_grid {
+                let lines_added = grid.absolute_row_counter().saturating_sub(counter_at_swap);
+                grid.repin_display_offset(restored_offset, lines_added);
             }
         }
 
@@ -335,11 +372,22 @@ impl Terminal {
         // own selection dies at exit rather than becoming a second durable selection
         // with its own lifetime. See the field doc for why that asymmetry is what
         // keeps the clear-site list finite.
+        //
+        // Both arms compare the batch's START screen with its END screen, so a batch
+        // that EXITS and RE-ENTERS (`\x1b[?1049l\x1b[?47h` — one destroys the alt
+        // buffer, the other allocates a fresh blank one) runs NEITHER, and the dead
+        // alt screen's anchors would stay live over a buffer that never held the
+        // selected text. `alt_screen_left_in_batch` is the exit paths' report that
+        // this happened; the 47-family re-entry records no damage of its own, so
+        // nothing else would clear it.
         let left_alt = was_alt && !self.modes.alternate_screen;
+        let exited_mid_batch = std::mem::take(&mut self.transient.alt_screen_left_in_batch);
         if left_alt {
             self.text_selection = std::mem::take(&mut self.parked_text_selection);
         } else if !was_alt && self.modes.alternate_screen {
             self.parked_text_selection = std::mem::take(&mut self.text_selection);
+        } else if exited_mid_batch && self.modes.alternate_screen {
+            self.text_selection.clear();
         }
 
         // Adjust selection coordinates after content scroll (#4056). A
@@ -466,20 +514,23 @@ impl Terminal {
         // `absolute_row_counter - rows`, the same base `Grid::visible_to_absolute`
         // uses when recording, so a band recorded mid-batch and an anchor tested
         // post-transform are directly comparable.
-        match self.grid.take_selection_damage() {
-            aterm_grid::SelectionDamage::None => {}
-            aterm_grid::SelectionDamage::All => self.text_selection.clear(),
-            aterm_grid::SelectionDamage::Band { lo_abs, hi_abs } => {
-                let live_top_abs = self
-                    .grid
-                    .absolute_row_counter()
-                    .saturating_sub(u64::from(self.grid.rows()));
-                if self
-                    .text_selection
-                    .intersects_absolute_band(live_top_abs, lo_abs, hi_abs)
-                {
-                    self.text_selection.clear();
-                }
+        //
+        // Asked through `clears_selection` rather than by matching the variants:
+        // damage can name SEVERAL disjoint bands (a TUI repainting its title row and
+        // its composer box in one batch), and a caller that matched `Band` by hand
+        // could only ever see their hull — clearing a selection in the gap that
+        // nothing rewrote.
+        let damage = self.grid.take_selection_damage();
+        if damage != aterm_grid::SelectionDamage::None {
+            let live_top_abs = self
+                .grid
+                .absolute_row_counter()
+                .saturating_sub(u64::from(self.grid.rows()));
+            let selection = &self.text_selection;
+            if damage.clears_selection(|lo_abs, hi_abs| {
+                selection.intersects_absolute_band(live_top_abs, lo_abs, hi_abs)
+            }) {
+                self.text_selection.clear();
             }
         }
 
@@ -694,6 +745,54 @@ mod tests {
     use super::{Terminal, splice_accounts_for_batch_row_advance};
     use crate::terminal::TerminalBuilder;
     use std::time::Duration;
+
+    /// The RIS clear in the `pending_parser_reset` block, ISOLATED.
+    ///
+    /// `scroll_pin_across_alt_screen::ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight`
+    /// pins the user-visible property and cannot isolate this line, and no black-box
+    /// test can: RIS's own `erase_scrollback` records `SelectionDamage::All` on the
+    /// main grid, that band is not drained while the alt grid is active, and the exit
+    /// batch drains it in `post_process` immediately AFTER the restore — so a parked
+    /// selection that survived the reset is destroyed on arrival anyway. Deleting
+    /// this clear leaves the property test green for that reason alone.
+    ///
+    /// What the line is actually for is the FIELD invariant documented on
+    /// `parked_text_selection` — "empty whenever `alternate_screen` is false", and
+    /// more sharply, never outliving the reset that erased the grid it names. That is
+    /// observable from inside the crate, one batch earlier than any restore, and it
+    /// is where this belongs: a future grid whose restore path does not happen to
+    /// carry an `All` moves the whole load onto this line.
+    #[test]
+    fn ris_empties_the_parked_selection_slot_in_the_batch_that_resets() {
+        use crate::selection::{SelectionSide, SelectionType};
+
+        let mut term = Terminal::new(6, 24);
+        for i in 0..40 {
+            term.process(format!("line-{i}\r\n").as_bytes());
+        }
+        {
+            let sel = term.text_selection_mut();
+            sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
+            sel.update_selection(0, 4, SelectionSide::Right);
+            sel.complete_selection();
+        }
+        term.process(b"\x1b[?1049h");
+        assert!(
+            term.parked_text_selection.has_selection(),
+            "precondition: entering alt parked the main selection in the slot"
+        );
+
+        // RIS and re-enter alt in ONE batch. `was_alt` and `modes.alternate_screen`
+        // are both true at `post_process`, so neither the park nor the restore runs:
+        // nothing but the reset itself can retire the slot.
+        term.process(b"\x1bc\x1b[?1049h");
+
+        assert!(
+            !term.parked_text_selection.has_selection(),
+            "the reset must retire the parked selection in its own batch; leaving it \
+             for a later restore hands a pre-RIS highlight back over an erased grid"
+        );
+    }
 
     /// Negative control for the cross-field contract behind piecewise selection
     /// recovery: the retained splice is sufficient only when it explains the

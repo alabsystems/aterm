@@ -120,16 +120,17 @@ fn real_scroll_transition_in_region(
     // runs after the geometric transform above. Without this the binding would model
     // a `post_process` that no longer exists, and would accept a stale highlight over
     // rewritten rows.
-    match grid.take_selection_damage() {
-        aterm_grid::SelectionDamage::None => {}
-        aterm_grid::SelectionDamage::All => selection.clear(),
-        aterm_grid::SelectionDamage::Band { lo_abs, hi_abs } => {
-            let live_top_abs = grid
-                .absolute_row_counter()
-                .saturating_sub(u64::from(grid.rows()));
-            if selection.intersects_absolute_band(live_top_abs, lo_abs, hi_abs) {
-                selection.clear();
-            }
+    let damage = grid.take_selection_damage();
+    if damage != aterm_grid::SelectionDamage::None {
+        let live_top_abs = grid
+            .absolute_row_counter()
+            .saturating_sub(u64::from(grid.rows()));
+        // Through `clears_selection`, exactly as `post_process` asks it — a match on
+        // `Band` alone cannot see the gap between two disjoint bands.
+        if damage.clears_selection(|lo_abs, hi_abs| {
+            selection.intersects_absolute_band(live_top_abs, lo_abs, hi_abs)
+        }) {
+            selection.clear();
         }
     }
     // ...and the EVICTION step that follows it there. A top-anchored archival scroll
@@ -234,5 +235,72 @@ fn real_grid_top_anchored_scroll_regimes_conform_to_derived_model() {
     assert!(
         !validate_scroll(&model, &prev, &over_cleared).0,
         "negative control: clearing a disjoint selection must be rejected"
+    );
+
+    // …and the OTHER THREE disjoint regimes, each against a real `Grid`. Only the
+    // interior one had a Tier-1 witness; the rest were asserted in the Tier-0
+    // interpreter loop alone, where the model computes `selection_alive` from its own
+    // literal rather than from anything the grid did. The two that most needed a real
+    // witness are here:
+    //
+    //   MARGINED  — its band is column-APPROXIMATE. `damage_selection_scroll_region`
+    //               records whole rows, so a horizontally margined rectangle names
+    //               more cells than it touched, and "disjoint ⇒ survives" is a claim
+    //               about which ROWS that approximation covers.
+    //   EPHEMERAL — a zero-scrollback grid, where `truncate_to_floor`'s `min_row == 0`
+    //               guard changes the answer.
+    //
+    // Each uses a region at rows 0..=1 of a 10-row grid, so the fixture selection at
+    // rows 2..4 is genuinely outside it — the same disjointness the interior case
+    // gets from a region below the selection, approached from above.
+    for (choice, full_width, history_enabled, expected_history) in [
+        ("ChooseArchivalDisjoint", true, true, 1),
+        ("ChooseMarginedDisjoint", false, true, 0),
+        ("ChooseEphemeralDisjoint", true, false, 0),
+    ] {
+        let (prev, next) =
+            real_scroll_transition_in_region(choice, 0, 1, full_width, history_enabled, 10);
+        assert_eq!(
+            next["selection_alive"], 1,
+            "{choice}: a real scroll must spare a selection outside its rows"
+        );
+        assert_eq!(
+            next["selection_region_row"], 2,
+            "{choice}: …and must not remap it — nothing moved under it"
+        );
+        assert_eq!(next["history_len"], expected_history, "{choice}");
+        assert_eq!(next["footer"], 1, "{choice}");
+        let (accepted, diagnostic) = validate_scroll(&model, &prev, &next);
+        assert!(
+            accepted,
+            "model rejected the real {choice} transition\nprev={prev:?}\nnext={next:?}\n{diagnostic}"
+        );
+
+        // Per-regime negative control: an over-clear in THIS regime is rejected too.
+        let (prev, mut over_cleared) =
+            real_scroll_transition_in_region(choice, 0, 1, full_width, history_enabled, 10);
+        over_cleared.insert("selection_alive", 0);
+        assert!(
+            !validate_scroll(&model, &prev, &over_cleared).0,
+            "{choice}: clearing a disjoint selection must be rejected"
+        );
+    }
+
+    // The archival regime's disjointness is NOT decorative, and this is what pins it:
+    // the same archival scroll whose region DOES cover the selection remaps it by one
+    // row, so labelling that transition `ChooseArchivalDisjoint` must be rejected.
+    // Before the model honoured `selection_disjoint` in its archival arm, this was
+    // the ONLY shape it accepted under that label — the overlapping transition
+    // wearing the disjoint name, which is why the regime had no honest witness.
+    let (prev, next) =
+        real_scroll_transition_in_region("ChooseArchivalDisjoint", 0, 2, true, true, 5);
+    assert_eq!(
+        next["selection_region_row"], 1,
+        "precondition: a region that covers the selection really does remap it"
+    );
+    assert!(
+        !validate_scroll(&model, &prev, &next).0,
+        "an archival scroll THROUGH the selection is the Overlapping regime; the \
+         model must not accept it as Disjoint"
     );
 }

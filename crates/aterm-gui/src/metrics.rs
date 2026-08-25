@@ -40,7 +40,7 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static FRAMES_PRESENTED: AtomicU64 = AtomicU64::new(0);
 static LAST_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
@@ -164,6 +164,28 @@ static LAST_DEADLINE_OWNER: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_DUE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_LATE_NS: AtomicU64 = AtomicU64::new(0);
 static PAST_DEADLINE_ARMS: AtomicU64 = AtomicU64::new(0);
+
+// STALE-ARM HEAL (busy-rearm audit, item 3): the SAME owner arming a deadline
+// more than [`STALE_ARM_HEAL_FLOOR`] in the past on CONSECUTIVE turns is a
+// scheduler bug — an honest deadline can be a little late (the turn that
+// computed it did real work first), but a deadline that stays far in the past
+// across turns is a self-rearming `WaitUntil(past)` spin. [`record_deadline`]
+// clamps the second and later arms of such a streak to `now + floor` and counts
+// them here, so the loop survives the whole class VISIBLY (the wake_heals
+// precedent: heal, count, log once per episode) instead of burning a core at
+// the event loop's floor. `STALE_ARM_STREAK_OWNER` holds the previous turn's
+// over-floor-late owner (`DeadlineOwner::None` = no streak); the episode flag
+// makes the log once-per-episode, re-arming when a healthy arm ends the streak.
+static STALE_ARM_HEALS: AtomicU64 = AtomicU64::new(0);
+static STALE_ARM_STREAK_OWNER: AtomicU64 = AtomicU64::new(0);
+static STALE_ARM_EPISODE: AtomicBool = AtomicBool::new(false);
+
+/// Detection threshold AND clamp distance for the stale-arm heal. At the
+/// observation-gate scale (the status classifier's 250 ms `min_interval`) on
+/// purpose: a healed spin degrades to <= 4 Hz, and no legitimate late arm —
+/// a busy turn runs tens of milliseconds, not hundreds — ever trips it.
+const STALE_ARM_HEAL_FLOOR_NS: u64 = 250_000_000;
+const STALE_ARM_HEAL_FLOOR: Duration = Duration::from_nanos(STALE_ARM_HEAL_FLOOR_NS);
 
 // Inter-frame GAP: wall time between two CONSECUTIVE presents (present→present),
 // the direct hitch/stutter signal ARENA-SCROLL wants — `max_frame_render_ms`
@@ -1792,21 +1814,66 @@ pub fn update_present_drop_disposition(reason: PresentDropReason, parked: bool) 
 }
 
 /// Publish the event loop's selected deadline. `None` means pure `Wait`.
-pub fn record_deadline(owner: DeadlineOwner, deadline: Option<Instant>, now: Instant) {
+///
+/// Returns the deadline the caller should actually arm: normally the input,
+/// unchanged — clamped to `now + STALE_ARM_HEAL_FLOOR` only when the SAME
+/// owner arms a deadline more than the floor in the past on consecutive turns
+/// (see the `STALE_ARM_HEALS` statics' note). A single late arm passes through
+/// untouched: a busy turn legitimately computes a deadline that is already
+/// behind it, and healing that would delay real work. The recorded
+/// `deadline_late_ms`/`past_deadline_arms` always describe the REQUESTED
+/// deadline, so the diagnostics stay honest about what the producer asked for
+/// even on healed turns.
+pub fn record_deadline(
+    owner: DeadlineOwner,
+    deadline: Option<Instant>,
+    now: Instant,
+) -> Option<Instant> {
     let clock_now = now_ns();
-    let (owner, due, late) = deadline.map_or((DeadlineOwner::None, 0, 0), |deadline| {
-        if deadline >= now {
+    let mut armed = deadline;
+    let (owner, due, late) = match deadline {
+        None => {
+            // A pure-Wait turn breaks any streak: consecutiveness is the bug's
+            // signature, and it just ended.
+            STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
+            STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
+            (DeadlineOwner::None, 0, 0)
+        }
+        Some(deadline) if deadline >= now => {
             let ahead = u64::try_from(deadline.duration_since(now).as_nanos()).unwrap_or(u64::MAX);
+            STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
+            STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
             (owner, clock_now.saturating_add(ahead), 0)
-        } else {
+        }
+        Some(deadline) => {
             let late = u64::try_from(now.duration_since(deadline).as_nanos()).unwrap_or(u64::MAX);
             PAST_DEADLINE_ARMS.fetch_add(1, Ordering::Relaxed);
+            if late > STALE_ARM_HEAL_FLOOR_NS && owner as u64 != DeadlineOwner::None as u64 {
+                let streak = STALE_ARM_STREAK_OWNER.swap(owner as u64, Ordering::Relaxed);
+                if streak == owner as u64 {
+                    STALE_ARM_HEALS.fetch_add(1, Ordering::Relaxed);
+                    armed = Some(now + STALE_ARM_HEAL_FLOOR);
+                    if !STALE_ARM_EPISODE.swap(true, Ordering::Relaxed) {
+                        aterm_log::warn!(
+                            "healed a stale deadline arm: owner={} late {} ms on consecutive \
+                             turns — clamped to now+{} ms (scheduler bug; see stale_arm_heals)",
+                            owner.as_str(),
+                            late / 1_000_000,
+                            STALE_ARM_HEAL_FLOOR_NS / 1_000_000
+                        );
+                    }
+                }
+            } else if late <= STALE_ARM_HEAL_FLOOR_NS {
+                STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
+                STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
+            }
             (owner, clock_now.saturating_sub(late), late)
         }
-    });
+    };
     LAST_DEADLINE_OWNER.store(owner as u64, Ordering::Relaxed);
     LAST_DEADLINE_DUE_NS.store(due, Ordering::Relaxed);
     LAST_DEADLINE_LATE_NS.store(late, Ordering::Relaxed);
+    armed
 }
 
 /// Record why winit began this event-loop iteration and attribute a timer wake
@@ -1912,6 +1979,11 @@ pub fn reset() {
     WAIT_CANCELLED_WAKES.store(0, Ordering::Relaxed);
     POLL_WAKES.store(0, Ordering::Relaxed);
     PAST_DEADLINE_ARMS.store(0, Ordering::Relaxed);
+    // The heal counter clears like `wake_heals`; the streak/episode latches are
+    // live detection state, reset so a fresh window re-logs a still-live spin.
+    STALE_ARM_HEALS.store(0, Ordering::Relaxed);
+    STALE_ARM_STREAK_OWNER.store(0, Ordering::Relaxed);
+    STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
     // Frame-gap window: clear the max AND the previous-present stamp so the idle
     // gap straddling the reset is never counted (the next present starts fresh).
     MAX_FRAME_GAP_NS.store(0, Ordering::Relaxed);
@@ -2020,6 +2092,11 @@ pub struct Snapshot {
     pub deadline_in_ns: u64,
     pub last_deadline_late_ns: u64,
     pub past_deadline_arms: u64,
+    /// Consecutive same-owner past-deadline arms that [`record_deadline`]
+    /// clamped to `now + STALE_ARM_HEAL_FLOOR`. ANY non-zero value means a
+    /// scheduler armed a self-rearming `WaitUntil(past)` spin and the fold
+    /// healed it — worth investigating even though the loop survived.
+    pub stale_arm_heals: u64,
     /// Worst present→present gap since reset (0 = fewer than two presents in the
     /// window). The hitch/stutter signal for scrub sweeps — see the static's
     /// note on the reset→drive→read discipline. ARENA-SCROLL's frame-gap number.
@@ -2213,6 +2290,7 @@ pub fn snapshot() -> Snapshot {
         },
         last_deadline_late_ns: LAST_DEADLINE_LATE_NS.load(Ordering::Relaxed),
         past_deadline_arms: PAST_DEADLINE_ARMS.load(Ordering::Relaxed),
+        stale_arm_heals: STALE_ARM_HEALS.load(Ordering::Relaxed),
         max_frame_gap_ns: MAX_FRAME_GAP_NS.load(Ordering::Relaxed),
         first_present_ns: startup.gui_entry_ns,
         rust_main_to_first_present_ns: startup.rust_main_ns,
@@ -2872,5 +2950,62 @@ mod histogram_tests {
             DeadlineOwner::KittyTenure
         );
         assert_eq!(DeadlineOwner::KittyTenure.as_str(), "kitty_tenure");
+    }
+
+    /// HEAL-AT-THE-FOLD (busy-rearm audit, item 3). One late arm is legal — a
+    /// busy turn computes its deadline after real work — but the SAME owner
+    /// arming more than the floor in the past on CONSECUTIVE turns is a
+    /// self-rearming `WaitUntil(past)` spin, and the fold must clamp it to
+    /// `now + floor` and count the heal so the loop survives the whole class
+    /// visibly.
+    #[test]
+    fn consecutive_same_owner_stale_arms_heal_to_the_floor() {
+        let now = Instant::now();
+        let future = now + Duration::from_millis(5);
+        let stale = now - Duration::from_secs(2);
+        let owner = DeadlineOwner::Blink;
+
+        // A healthy arm first, so this test never inherits streak state.
+        assert_eq!(record_deadline(owner, Some(future), now), Some(future));
+        let heals_before = STALE_ARM_HEALS.load(Ordering::Relaxed);
+
+        // First offence passes through unhealed: it may be honest lateness.
+        assert_eq!(record_deadline(owner, Some(stale), now), Some(stale));
+        assert_eq!(STALE_ARM_HEALS.load(Ordering::Relaxed), heals_before);
+
+        // The second consecutive same-owner offence is the bug's signature:
+        // clamped to the floor, and counted.
+        assert_eq!(
+            record_deadline(owner, Some(stale), now),
+            Some(now + STALE_ARM_HEAL_FLOOR),
+            "the armed deadline is healed to now + floor"
+        );
+        assert_eq!(STALE_ARM_HEALS.load(Ordering::Relaxed), heals_before + 1);
+
+        // A DIFFERENT owner does not inherit the streak.
+        assert_eq!(
+            record_deadline(DeadlineOwner::TitleSummary, Some(stale), now),
+            Some(stale)
+        );
+
+        // A healthy arm ends the episode; the next late arm is a fresh first
+        // offence and passes through again.
+        assert_eq!(record_deadline(owner, Some(future), now), Some(future));
+        assert_eq!(record_deadline(owner, Some(stale), now), Some(stale));
+
+        // Lateness at or under the floor never trips the healer: that is the
+        // ordinary busy-turn case, on any number of consecutive turns.
+        let barely = now - Duration::from_millis(100);
+        assert_eq!(record_deadline(owner, Some(barely), now), Some(barely));
+        assert_eq!(record_deadline(owner, Some(barely), now), Some(barely));
+        assert_eq!(STALE_ARM_HEALS.load(Ordering::Relaxed), heals_before + 1);
+
+        // A pure-Wait turn also breaks a streak.
+        assert_eq!(record_deadline(owner, Some(stale), now), Some(stale));
+        assert_eq!(record_deadline(owner, None, now), None);
+        assert_eq!(record_deadline(owner, Some(stale), now), Some(stale));
+
+        // Leave no streak behind for other tests.
+        assert_eq!(record_deadline(owner, Some(future), now), Some(future));
     }
 }

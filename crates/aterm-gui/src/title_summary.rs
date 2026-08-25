@@ -1742,17 +1742,34 @@ impl App {
     }
 
     pub(crate) fn next_title_summary_retry(&self) -> Option<Instant> {
+        let now = Instant::now();
         let scheduled = self.title_summaries.next_retry();
         let missing = smart_titles_enabled(&self.config)
             && self
                 .pool
                 .iter()
                 .any(|session| !self.title_summaries.tracks_session(session.id));
-        if missing {
-            Some(scheduled.map_or_else(Instant::now, |deadline| deadline.min(Instant::now())))
+        let deadline = if missing {
+            Some(scheduled.map_or(now, |deadline| deadline.min(now)))
         } else {
             scheduled
-        }
+        };
+        // FLOOR AN ALREADY-DUE DEADLINE (busy-rearm audit, item 4). Due-but-
+        // unserviced is legal coordinator state — the one-observation-per-turn
+        // admission bound, a contended `try_lock`, an untracked session
+        // awaiting discovery — but feeding the past instant (or a bare
+        // `Instant::now()`, past by the time `about_to_wait` folds it) into
+        // `WaitUntil` makes the wake fire immediately, get re-armed, and spin
+        // the loop at turn rate until the queue drains. The work happens on
+        // the next turn either way; re-time the WAKE to the retry ladder's
+        // base so the loop parks between turns instead.
+        deadline.map(|at| {
+            if at <= now {
+                now + Coordinator::OBSERVE_RETRY_BASE
+            } else {
+                at
+            }
+        })
     }
 
     pub(crate) fn retire_title_summary(&mut self, session: u64) {
@@ -5074,5 +5091,54 @@ p702\nf4\nn127.0.0.1:11434->127.0.0.1:53111\nTST=ESTABLISHED\n";
             retired["retry_pending"] == 1,
             retry_pending_after(ObservationRetryTransition::Retired)
         );
+    }
+
+    /// THE FOLD-SEAM FLOOR (busy-rearm audit, item 4). Due-but-unserviced is
+    /// legal coordinator state — the one-observation-per-turn admission bound,
+    /// a contended `try_lock`, an untracked session awaiting discovery — but
+    /// `about_to_wait` arms whatever this seam reports as a `WaitUntil`, and a
+    /// past instant (or a bare `Instant::now()`, past by fold time) fires
+    /// immediately, re-arms, and spins the loop at turn rate until the queue
+    /// drains. The seam must floor an already-due deadline to the retry
+    /// ladder's base; the paced work happens on the next turn either way.
+    #[test]
+    fn an_already_due_title_deadline_reaches_the_event_loop_floored() {
+        let mut app = crate::App::headless_for_test();
+        app.config.descriptive_titles = Some(true);
+        app.config.title_summary_provider = Some(TitleSummaryProvider::Builtin);
+
+        // An untracked session owes discovery: the old code reported a bare
+        // `Instant::now()` for it, every turn, until discovery completed.
+        assert!(!app.title_summary_tracks_session(0));
+        let deadline = app
+            .next_title_summary_retry()
+            .expect("a missing session owes discovery");
+        let after = Instant::now();
+        assert!(
+            deadline > after,
+            "the arm must still be in the future when the fold reads it"
+        );
+        assert!(
+            deadline <= after + Coordinator::OBSERVE_RETRY_BASE,
+            "but only by the retry ladder's base, so discovery stays prompt"
+        );
+
+        // Same law for a TRACKED session whose retry stamp already elapsed
+        // (the drain case): the stamp stays honest inside the coordinator,
+        // and only the WAKE reported to the loop is re-timed.
+        app.retry_title_observations();
+        assert!(app.title_summary_tracks_session(0));
+        app.title_summaries
+            .retries
+            .insert(0, Instant::now() - Duration::from_secs(1));
+        let deadline = app
+            .next_title_summary_retry()
+            .expect("an elapsed retry stays scheduled");
+        let after = Instant::now();
+        assert!(
+            deadline > after,
+            "an elapsed retry is floored, never fed back verbatim"
+        );
+        assert!(deadline <= after + Coordinator::OBSERVE_RETRY_BASE);
     }
 }

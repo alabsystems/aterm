@@ -551,6 +551,26 @@ pub(crate) fn wheel_route(
     WheelRoute::Viewport
 }
 
+/// The four FACTS [`wheel_route`] decides on, read from one engine under the
+/// caller's lock. Only reads — the policy is still entirely in `wheel_route`.
+///
+/// Split out of [`seam_egress`] so the derivation is reachable from a test on
+/// EVERY platform. The seam's own wheel tests need a pipe fd for `SinkWriter` and
+/// are therefore `#[cfg(unix)]`, which left the SELECTION CUSTODY Phase-2 Option
+/// override — the item the design calls load-bearing, "without this, Phase 4 is
+/// unreachable under any mouse-owning TUI" — unpinned on Windows, the platform
+/// where Alt is most likely to collide with something else. `alt_local`'s
+/// main-screen scoping lives here because it is a FACT about the engine (the alt
+/// screen carries no scrollback), not a policy choice.
+pub(crate) fn wheel_route_for(t: &Terminal, mods: u8) -> WheelRoute {
+    wheel_route(
+        mods & aterm_types::mouse::SHIFT_MASK != 0,
+        mods & aterm_types::mouse::ALT_MASK != 0 && !t.is_alternate_screen(),
+        t.mouse_tracking_enabled(),
+        t.is_alternate_screen() && t.modes().alternate_scroll,
+    )
+}
+
 /// The pure arithmetic of [`wheel_platform_lines`], split out so the multiply can be
 /// tested without a live `SystemParametersInfoW` (whose answer belongs to whoever's
 /// machine runs the suite, and so can never be asserted).
@@ -809,12 +829,7 @@ pub fn seam_egress(
                 // HERE, under this lock; the Alt override's main-screen scoping
                 // (no scrollback on the alt screen — see the contract) is one of
                 // those facts, not policy.
-                let route = wheel_route(
-                    *mods & aterm_types::mouse::SHIFT_MASK != 0,
-                    *mods & aterm_types::mouse::ALT_MASK != 0 && !t.is_alternate_screen(),
-                    t.mouse_tracking_enabled(),
-                    t.is_alternate_screen() && t.modes().alternate_scroll,
-                );
+                let route = wheel_route_for(&t, *mods);
                 if route == WheelRoute::Report {
                     let (rx, ry) = report_coords(&t, *col, *row, *px_off);
                     match t.encode_mouse_wheel(*dir, rx, ry, *mods) {
@@ -1275,6 +1290,64 @@ mod tests {
             libc::close(fds[0]);
         }
         e
+    }
+
+    /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE, on EVERY platform.
+    ///
+    /// The two `Egress`-level tests below say the same thing through the real seam,
+    /// but they need a pipe fd and are `#[cfg(unix)]`. This one goes through
+    /// [`wheel_route_for`] — the engine reads plus the policy table, no sink — so
+    /// the override the design calls load-bearing ("without this, Phase 4 is
+    /// unreachable under any mouse-owning TUI") is pinned on Windows too, where Alt
+    /// is most likely to collide with something else.
+    #[test]
+    fn the_option_wheel_override_routes_locally_on_every_platform() {
+        use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
+
+        let route = |term: &Mutex<Terminal>, mods: u8| {
+            let t = term.lock().expect("terminal");
+            super::wheel_route_for(&t, mods)
+        };
+
+        // MAIN screen, app grabbing the mouse (SGR tracking).
+        let tracking = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
+        assert_eq!(
+            route(&tracking, 0),
+            WheelRoute::Report,
+            "control: a tracking app still owns the plain wheel"
+        );
+        assert_eq!(
+            route(&tracking, ALT_MASK),
+            WheelRoute::Viewport,
+            "Option+wheel must reach the local scrollback under tracking"
+        );
+        assert_eq!(
+            route(&tracking, SHIFT_MASK),
+            WheelRoute::Viewport,
+            "…and the older Shift bypass is untouched"
+        );
+
+        // ALT screen: the override is scoped OUT. There is no scrollback to reach
+        // there, and stealing the wheel would cost the DEC-1007 arrows that
+        // less/man/git-log scroll by.
+        let alt_tracking = term_with(&[b"\x1b[?1049h", b"\x1b[?1000h", b"\x1b[?1006h"]);
+        assert_eq!(
+            route(&alt_tracking, ALT_MASK),
+            WheelRoute::Report,
+            "a mouse-owning alt-screen app keeps the wheel even with Option held"
+        );
+        let alt_scroll = term_with(&[b"\x1b[?1007h", b"\x1b[?1049h"]);
+        assert_eq!(
+            route(&alt_scroll, ALT_MASK),
+            WheelRoute::AltScroll,
+            "alternate scroll still converts the wheel to an arrow"
+        );
+
+        // No tracking, no alt screen: the wheel was always local, with or without
+        // Option — so the override adds a path, it does not redirect one.
+        let plain = term_with(&[]);
+        assert_eq!(route(&plain, 0), WheelRoute::Viewport);
+        assert_eq!(route(&plain, ALT_MASK), WheelRoute::Viewport);
     }
 
     /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE.

@@ -2910,6 +2910,16 @@ fn per_pane_selection_colours_gpu_match_cpu() {
     let theme = Theme::default();
     let px = 18.0;
     let Some((mut cpu, mut gpu)) = backends(px, theme) else {
+        // Skip LOUDLY, in the house idiom (cf. `tier0_or_skip` in aterm-spec): a
+        // differential with no GPU adapter asserts nothing, and reporting "ok" for
+        // it reads as coverage the run does not have.
+        eprintln!(
+            "GPU DIFFERENTIAL SKIPPED (this test is NOT a pass for it): no wgpu \
+             adapter on this machine. The CPU half of the same fixture still \
+             runs as aterm-render's \
+             `per_pane_selection_colours_resolve_per_entry_on_the_cpu`; what is \
+             unverified in THIS run is only that the GPU face agrees with it."
+        );
         return;
     };
     cpu.debug_block_on_lazy_fallbacks();

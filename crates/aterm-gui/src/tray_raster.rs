@@ -387,7 +387,13 @@ use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFa
 /// (OS/2 `sCapHeight`, measured-'H' fallback) and a per-char em-advance memo
 /// for [`measure_text`].
 struct ChromeFace {
-    font: fontdue::Font,
+    /// Shared with the TERMINAL renderer's parse of the same bytes: the chrome
+    /// draws Settings/About/tabs in the user's terminal face
+    /// (`Renderer::chrome_primary_face`) and falls back to the same bundled
+    /// DejaVu the default renderer parses, so every chrome face here was a
+    /// byte-identical second copy of a face the process already held
+    /// (~6.9 MB of live heap each). See `aterm_render::shared_parsed_face`.
+    font: std::sync::Arc<fontdue::Font>,
     /// Cap height as a fraction of the em (drives [`row_baseline`]).
     cap_ratio: f32,
     /// Memoized advance-per-em by char (advances scale linearly with px).
@@ -400,14 +406,7 @@ const ADVANCE_REF_PX: f32 = 64.0;
 
 impl ChromeFace {
     fn from_bytes(bytes: &[u8], index: u32) -> Option<Self> {
-        let font = fontdue::Font::from_bytes(
-            bytes,
-            fontdue::FontSettings {
-                collection_index: index,
-                ..fontdue::FontSettings::default()
-            },
-        )
-        .ok()?;
+        let (_, font) = aterm_render::shared_parsed_face(bytes, index).ok()?;
         let cap_ratio = aterm_render::chrome_metrics::cap_height_ratio(bytes, index, &font);
         Some(Self {
             font,

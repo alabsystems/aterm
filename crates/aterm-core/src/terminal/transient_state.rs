@@ -124,6 +124,26 @@ pub(super) struct TransientState {
     /// the current `advance_fast` call completes (#7153). The parser cannot be
     /// reset from inside its own dispatch loop.
     pub(super) pending_parser_reset: bool,
+    /// SELECTION CUSTODY Phase 3 — the MAIN grid's `absolute_row_counter` at the
+    /// instant this batch parked it (smcup). The SCR-1 epilogue re-pins that grid
+    /// and needs the lines it took BEFORE the swap: output can precede an smcup in
+    /// the same read, and those lines really did enter the main grid's scrollback.
+    /// Last park wins — a batch that enters twice re-parks from the later state.
+    pub(super) alt_park_main_row_counter: Option<u64>,
+    /// SELECTION CUSTODY Phase 3 — a reading position flattened off a grid that was
+    /// swapped back IN mid-batch (rmcup): `(the display_offset it was parked with,
+    /// that grid's absolute_row_counter at the swap)`.
+    ///
+    /// The rest of the batch is written through `row_index`, which subtracts
+    /// `display_offset`, so an incoming grid MUST be at 0 for the same reason the
+    /// batch prologue forces the active one to 0. The epilogue re-pins from this,
+    /// advancing by whatever entered that grid's scrollback after the swap.
+    pub(super) alt_restore_pin: Option<(usize, u64)>,
+    /// SELECTION CUSTODY Phase 3 — did this batch LEAVE the alt screen at any point?
+    /// `post_process` keys park/restore on the batch's start and end screen only, so
+    /// an exit followed by a re-entry runs neither arm; this is how it learns that
+    /// the alt buffer the current selection names has been destroyed in between.
+    pub(super) alt_screen_left_in_batch: bool,
     /// XTSAVE (CSI ? Ps s) saved DEC private mode values.
     ///
     /// Maps mode number to its saved boolean state. Restored by XTRESTORE
@@ -196,6 +216,9 @@ impl TransientState {
             last_combining_was_zwj: false,
             has_transient_extras: false,
             pending_parser_reset: false,
+            alt_park_main_row_counter: None,
+            alt_restore_pin: None,
+            alt_screen_left_in_batch: false,
             xtsave_modes: XtsaveModesMap::default(),
             last_osc_bel_terminated: false,
             kitty_images: HashMap::new(),
@@ -233,6 +256,9 @@ impl TransientState {
         self.last_combining_was_zwj = false;
         self.has_transient_extras = false;
         self.pending_parser_reset = false;
+        self.alt_park_main_row_counter = None;
+        self.alt_restore_pin = None;
+        self.alt_screen_left_in_batch = false;
         self.xtsave_modes.clear();
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;

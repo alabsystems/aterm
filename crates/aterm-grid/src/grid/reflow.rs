@@ -717,9 +717,35 @@ impl Grid {
                         .row
                         .saturating_sub(row_u16(demote));
                 }
-                self.force_selection_invalidation();
             }
             let bottom_push = remaining - demote;
+            // SELECTION CUSTODY — which of the two shapes above just ran decides
+            // whether a selection can FOLLOW its content or must be destroyed.
+            //
+            // A pure TOP-DEMOTE is a relabel: every row, live and already-archived,
+            // moves by exactly `demote`, so the selection is remappable and
+            // `TextSelection::adjust_for_rows_shrink` does it. Destroying it here
+            // would throw away a highlight whose text is still on screen, one row up
+            // — the ordinary window-height drag, and the failure this design exists
+            // to prevent. Hosts caching grid COORDINATES must still re-translate,
+            // which is what `invalidate_host_coordinates` says without also claiming
+            // the content is gone.
+            //
+            // The BOTTOM-PUSH corner is different in kind: it rotates the bottom
+            // rows below the existing history, so the map is non-monotonic and a
+            // span crossing the cut has no correct image. There, invalidation IS the
+            // honest answer.
+            //
+            // `last_resize_row_shift` carries `demote` rather than `visible - target`
+            // because TRIM discards blank rows without moving anything: a shrink that
+            // only drops trailing blanks moves the selection by ZERO, and a delta of
+            // `shrink` would push every anchor off its content.
+            self.storage.last_resize_row_shift = row_u16(demote);
+            if bottom_push > 0 {
+                self.force_selection_invalidation();
+            } else if demote > 0 {
+                self.invalidate_host_coordinates();
+            }
 
             // 3) BOTTOM-PUSH CORNER: the cursor sits too near the top for the
             // demand (a full non-blank screen, cursor high — a TUI shape).

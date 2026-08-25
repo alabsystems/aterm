@@ -2977,12 +2977,23 @@ fn paint_compiled_node(
             let selected = control.state.selected;
             let navigation = control.style == StyleRef::Navigation;
             let quiet = control.style == StyleRef::Quiet;
+            // The two accent-tinted states a SELECTED navigation row can be in
+            // paint the accent as their own ink, so their mix amounts are the
+            // ones `native_appearance` floors that accent against.
             let fill = if primary {
                 mix_rgb(roles.elevated, roles.accent, 0.20)
             } else if control.state.pressed {
-                mix_rgb(roles.elevated, roles.accent, 0.16)
+                mix_rgb(
+                    roles.elevated,
+                    roles.accent,
+                    crate::native_appearance::ACCENT_WASH_PRESSED,
+                )
             } else if selected {
-                mix_rgb(roles.elevated, roles.accent, 0.13)
+                mix_rgb(
+                    roles.elevated,
+                    roles.accent,
+                    crate::native_appearance::ACCENT_WASH_SELECTED,
+                )
             } else if control.state.hovered {
                 mix_rgb(roles.elevated, roles.text_primary, 0.09)
             } else if navigation {
@@ -4650,7 +4661,11 @@ fn paint_control_surface(
         radius: 8.0,
         fill: rgba(
             if state.pressed {
-                mix_rgb(roles.elevated, roles.accent, 0.16)
+                mix_rgb(
+                    roles.elevated,
+                    roles.accent,
+                    crate::native_appearance::ACCENT_WASH_PRESSED,
+                )
             } else if state.hovered {
                 mix_rgb(roles.elevated, roles.text_primary, 0.09)
             } else {
@@ -4709,10 +4724,7 @@ fn native_type_px(step: crate::type_scale::TypeStep) -> crate::type_scale::StepP
 }
 
 fn mix_rgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
-    let amount = amount.clamp(0.0, 1.0);
-    std::array::from_fn(|index| {
-        (f32::from(a[index]) + (f32::from(b[index]) - f32::from(a[index])) * amount).round() as u8
-    })
+    crate::native_appearance::mix_srgb(a, b, amount)
 }
 
 fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {

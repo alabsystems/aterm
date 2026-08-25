@@ -307,6 +307,13 @@ pub(crate) struct StatusFsm {
     prior: Option<(bool, u64)>,
     /// When display content last actually moved.
     last_movement: Option<Instant>,
+    /// The freshest PTY-output stamp any observation carried
+    /// ([`ActivitySample::last_output`]), folded MAX so a sample without one
+    /// (the exit path's blank sample) never rolls the clock back. Tracked
+    /// because [`StatusFsm::classify`] sustains `Running` on EITHER clock —
+    /// grid movement OR raw output — so the wake that retires the phase must
+    /// be armed off the same pair (see [`StatusFsm::owed_wake`]).
+    last_output: Option<Instant>,
     /// A candidate that has not yet satisfied dwell.
     pending: Option<(Candidate, Instant)>,
 }
@@ -318,6 +325,7 @@ impl StatusFsm {
             published: Status::seed(now),
             prior: None,
             last_movement: None,
+            last_output: None,
             pending: None,
         }
     }
@@ -329,15 +337,38 @@ impl StatusFsm {
     /// The instant at which this session could publish a transition that NO new
     /// output would cause. Three exist: a candidate still serving its dwell,
     /// `Running` aging into `Quiet`, and the LIVE typing `Idle` settling into
-    /// plain `Idle` — all keyed off the same movement clock. Everything else is
-    /// edge-driven — a settled `Idle` pane cannot become anything until bytes
-    /// arrive — so it returns `None` and costs the event loop nothing.
+    /// plain `Idle`. Everything else is edge-driven — a settled `Idle` pane
+    /// cannot become anything until bytes arrive — so it returns `None` and
+    /// costs the event loop nothing.
+    ///
+    /// THE CLOCK MUST TELL THE TRUTH (event-loop busy-rearm audit, item 1):
+    /// each arm is the earliest instant at which [`StatusFsm::classify`] could
+    /// actually CHANGE its verdict with no new evidence. `Running` is
+    /// sustained by `moved_recently || output_recently`, so its retirement is
+    /// keyed off the FRESHER of the two clocks. Arming off `last_movement`
+    /// alone was a ~200 kHz spin: a client that repaints without moving the
+    /// grid (sync-bracketed identical frames, heartbeats — a Claude Code TUI
+    /// does this indefinitely) lets `last_movement` go stale past
+    /// `quiet_after` while output keeps `Running` alive, so every armed
+    /// instant was already in the past, the wake fired immediately, the
+    /// observation gate refused or observed no change, and the loop re-armed.
     fn owed_wake(&self) -> Option<Instant> {
         if let Some((_, first_seen)) = &self.pending {
             return Some(*first_seen + self.policy.dwell);
         }
-        let aging = self.published.phase == Phase::Running || self.published.typing_live();
-        aging
+        if self.published.phase == Phase::Running {
+            return match (self.last_movement, self.last_output) {
+                (Some(movement), Some(output)) => {
+                    Some(movement.max(output) + self.policy.quiet_after)
+                }
+                (Some(at), None) | (None, Some(at)) => Some(at + self.policy.quiet_after),
+                (None, None) => None,
+            };
+        }
+        // LIVE typing settles on the movement clock alone: `typed_recently`
+        // requires movement, and ambient output cannot extend a keystroke echo.
+        self.published
+            .typing_live()
             .then(|| self.last_movement.map(|at| at + self.policy.quiet_after))
             .flatten()
     }
@@ -372,6 +403,13 @@ impl StatusFsm {
             _ => {}
         }
         self.prior = Some(identity);
+        // Fold the raw-output clock alongside the movement clock: `owed_wake`
+        // arms `Running`'s retirement off whichever is fresher, because
+        // `classify` keeps the phase alive on either. MAX, never overwrite —
+        // a sample with no stamp must not roll the clock back.
+        if let Some(at) = sample.last_output {
+            self.last_output = Some(self.last_output.map_or(at, |prior| prior.max(at)));
+        }
     }
 
     fn moved_recently(&self, now: Instant) -> bool {
@@ -896,7 +934,18 @@ impl StatusObserver {
     pub(crate) fn next_wake(&self) -> Option<Instant> {
         self.sessions
             .values()
-            .filter_map(|slot| slot.fsm.owed_wake())
+            .filter_map(|slot| {
+                // STRUCTURAL CLAMP (busy-rearm audit, item 2): an armed wake
+                // at which observation is forbidden is a contradiction —
+                // `due()` refuses this slot until `next_due`, so a deadline
+                // before its own observation gate can only fire, be refused,
+                // and re-arm. Clamping per slot converts ANY future bug of
+                // that class from an event-loop-rate spin to the observation
+                // rate (<= 4 Hz at the default interval), and retires the
+                // bounded dwell-edge spin (owed = first_seen + dwell in the
+                // past while the gate still had up to `min_interval` to run).
+                slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
+            })
             .min()
     }
 
@@ -2448,5 +2497,91 @@ mod tests {
             Some("Ready"),
             "an abandoned prompt decays to the prompt-state description"
         );
+    }
+
+    /// THE CLAUDE-CODE SHAPE (busy-rearm audit, item 1). A TUI that emits
+    /// output WITHOUT grid movement indefinitely — sync-bracketed identical
+    /// repaints, heartbeats — keeps `Running` alive through `output_recently`
+    /// while `last_movement` goes stale past `quiet_after`. Arming the retire
+    /// wake off the movement clock alone therefore produced a PAST instant on
+    /// every turn: the wake fired ~immediately, the observation gate refused
+    /// or observed no change, and the loop re-armed (~200 kHz sustained, 78%
+    /// CPU, input p99 335 ms — live evidence). The owed wake must be the
+    /// earliest instant `classify` could actually CHANGE the verdict: the
+    /// FRESHER of the two clocks plus `quiet_after`.
+    #[test]
+    fn output_without_movement_arms_the_retire_wake_off_the_freshest_clock() {
+        let t0 = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(0));
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        ev.activity.last_output = Some(t0);
+        observer.observe(1, &ev, t0);
+        // One real grid movement, then the grid goes still while output flows.
+        let t1 = t0 + DWELL;
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t1);
+        observer.observe(1, &ev, t1);
+        assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
+
+        // Far past `quiet_after` on the MOVEMENT clock, Running is still
+        // honestly sustained by raw output. The movement clock's instant
+        // (t1 + QUIET) is long past; the owed wake must ride the output clock.
+        let t2 = t1 + QUIET * 2;
+        ev.activity.last_output = Some(t2);
+        observer.observe(1, &ev, t2);
+        assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
+        let owed = observer.next_wake().expect("Running owes its retirement");
+        assert_eq!(
+            owed,
+            t2 + QUIET,
+            "the wake is the earliest instant classify could change its verdict"
+        );
+        assert!(owed > t2, "an owed wake is never already in the past");
+
+        // The user-visible contract is unchanged: at that wake the phase
+        // retires with no new bytes at all — output sustains the busy state,
+        // true silence ages it out.
+        observer.observe(1, &ev, owed);
+        observer.observe(1, &ev, owed + DWELL);
+        assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Quiet));
+    }
+
+    /// The structural invariant (busy-rearm audit, item 2): an armed wake at
+    /// which observation is FORBIDDEN is a contradiction — `due()` refuses the
+    /// slot until `next_due`, so a deadline before it can only fire, be
+    /// refused, and re-arm (the dwell-edge spin: up to `min_interval` of
+    /// hot turns per status transition). `next_wake` must clamp every slot's
+    /// owed instant to its own observation gate, converting any future bug of
+    /// this class to at most the observation rate.
+    #[test]
+    fn an_armed_wake_never_precedes_its_own_observation_gate() {
+        let t0 = Instant::now();
+        let interval = Duration::from_millis(250);
+        let mut observer = StatusObserver::new(policy(), interval);
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(false);
+        observer.observe(1, &ev, t0);
+
+        // Re-observe near the dwell edge: the pending candidate's raw owed
+        // instant (t0 + dwell) now precedes the refreshed observation gate.
+        let t1 = t0 + DWELL - Duration::from_millis(50);
+        observer.observe(1, &ev, t1);
+        let gate = observer.sessions.get(&1).expect("slot").next_due;
+        assert_eq!(gate, t1 + interval);
+        assert!(
+            t0 + DWELL < gate,
+            "the raw owed wake precedes the gate — the shape under test"
+        );
+        let owed = observer.next_wake().expect("a pending candidate owes a wake");
+        assert_eq!(owed, gate, "the armed wake is clamped to the gate");
+        assert!(
+            observer.due(1, owed),
+            "an armed wake at which observation is forbidden is a contradiction"
+        );
+
+        // The clamped wake still publishes: dwell was served well before it.
+        assert!(observer.observe(1, &ev, owed), "the transition lands");
+        assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Idle));
     }
 }

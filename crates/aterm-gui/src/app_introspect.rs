@@ -1816,7 +1816,10 @@ impl App {
             return;
         }
         let raw_focused = self.windows.get(&wid).is_some_and(|ws| ws.focused);
-        let motion = self.motion_policy(self.motion_focus(wid, raw_focused));
+        // `cursor_fx_focus`, not bare `motion_focus`: the present seams fold
+        // the TYPED WAKE into the focus input, and a capture must resolve the
+        // same policy the glass painted (gauntlet F3 parity).
+        let motion = self.motion_policy(self.cursor_fx_focus(wid, raw_focused, now));
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let glow_cfg = self.glow_config();
@@ -2009,9 +2012,11 @@ impl App {
         // reduced/unfocused window captures the same static app-owned decorations.
         // Folded into the effects engine's own `reduced_motion` seam below (it
         // cannot depend on `crate::motion`). Includes the same `motion_focus`
-        // recording pin used by application-present, preserving phase parity.
+        // recording pin used by application-present, preserving phase parity —
+        // and the same TYPED-WAKE fold (`cursor_fx_focus`), so a capture of a
+        // typed-into unfocused window shows the decorations the glass painted.
         let motion = self.motion_policy(
-            self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused)),
+            self.cursor_fx_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused), now),
         );
         let cfg = if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
             let mut c = cfg;
@@ -2860,6 +2865,11 @@ impl App {
         let Some(route) = self.active_visible_content_route(front) else {
             return;
         };
+        // A snapshot is a PIXEL demand: redeem a headless launch's deferred GPU
+        // intent before anything reads the renderer, so the artifact this writes
+        // is the one a boot-built device would have written. No-op everywhere
+        // else (windowed, and headless once redeemed or declined).
+        self.ensure_pixel_backend();
         let strip_rows = self.tab_strip_rows as usize;
         let has_os_window = self
             .windows
@@ -3206,6 +3216,10 @@ impl App {
             let _ = reply.send(Err("image request cancelled before render".to_string()));
             return;
         }
+        // PIXEL demand — see `render_image`. Redeemed here too rather than only at
+        // the caller: this is the entry the direct (test) callers use, and a second
+        // call from `render_image` is a no-op.
+        self.ensure_pixel_backend();
         if presented.is_none() {
             let prepared = match self.active_visible_content_route(front) {
                 Some(crate::VisibleContentRoute::Heterogeneous) => {
@@ -3795,6 +3809,12 @@ impl App {
             let _ = reply.send(Err("image request cancelled before render".to_string()));
             return;
         }
+        // THE headless pixel demand. Redeem the deferred GPU intent before any
+        // capture geometry or renderer state is read, so this capture is served by
+        // the same backend a boot-built one would have been — the parity the
+        // deferral is only allowed to exist under. No-op windowed, and after the
+        // first capture of a headless run.
+        self.ensure_pixel_backend();
         // Cross-session (`@<sid> image`): render the window whose ACTIVE tab
         // displays the target session — the frame that session's viewer actually
         // sees (splits, decorations, tab strip included). Self keeps the frontmost

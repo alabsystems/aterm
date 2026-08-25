@@ -83,6 +83,14 @@ impl ActionSink for TerminalHandler<'_> {
             }
         }
 
+        // SELECTION CUSTODY — ordinary output damages the rows it OVERWRITES; see
+        // `TerminalHandler::write_char`, which brackets the per-character paths this
+        // one bypasses (including both fallbacks above). Bracketing the BULK call
+        // rather than each glyph is what keeps this off the per-glyph cost design §10
+        // rejected: one pair of reads for a whole run, however long. The absolute
+        // frame is invariant, so a run that wraps and scrolls mid-flight is still
+        // named exactly by its first and last cursor row.
+        let origin = self.grid.output_damage_origin();
         // Check if style needs CellExtras overflow (RGB, hyperlinks, etc.).
         // Both flags cached at mutation time — no per-bulk-call overhead.
         if self.style.has_style_extras() || self.transient.has_transient_extras {
@@ -90,6 +98,7 @@ impl ActionSink for TerminalHandler<'_> {
         } else {
             self.write_ascii_bulk_fast(data);
         }
+        self.grid.damage_selection_output(origin);
     }
 
     /// FAST PATH: Print a run of decoded non-ASCII characters.
@@ -107,7 +116,12 @@ impl ActionSink for TerminalHandler<'_> {
             return;
         }
 
+        // SELECTION CUSTODY — as in `print_ascii_bulk`: one bracket for the whole
+        // run. `write_unicode_bulk`'s own per-character fallbacks route through
+        // `write_char`, which brackets itself; the extra record is idempotent.
+        let origin = self.grid.output_damage_origin();
         self.write_unicode_bulk(chars);
+        self.grid.damage_selection_output(origin);
     }
 
     /// Execute C0 and C1 control characters.

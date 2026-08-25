@@ -164,6 +164,21 @@ impl TerminalHandler<'_> {
         )
     )]
     pub(super) fn write_char(&mut self, c: char) {
+        // SELECTION CUSTODY — the OTHER half of the inverse hole (design §10). EL
+        // closed the `\r` + `\e[K` progress bar; a bare `\rProgress: 90%` replaces
+        // the cells under a live highlight with no erase op anywhere, and left a copy
+        // returning text the user never selected. `Grid::damage_selection_output`
+        // explains why this is not the per-glyph tracking §10 rejected, and why an
+        // APPEND — which replaces nothing — records nothing.
+        let origin = self.grid.output_damage_origin();
+        self.write_char_body(c);
+        self.grid.damage_selection_output(origin);
+    }
+
+    /// `write_char` without the output-damage bracket — see [`Self::write_char`],
+    /// which is the only caller. Split so every early return below is inside the
+    /// bracket rather than around it.
+    fn write_char_body(&mut self, c: char) {
         // Translate character through the active character set
         let translated = self.charset.translate(c);
 

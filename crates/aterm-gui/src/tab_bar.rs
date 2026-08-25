@@ -666,10 +666,21 @@ fn tab_content_layout(seg: &TabSegment, metadata: TabStripMetadata) -> TabConten
     // gets a trailing cell plus a separator only when one title cell survives. If the
     // tab is too narrow, inspection/accessibility still expose every state; paint never
     // overwrites the close affordance.
+    //
+    // The canvas anchors on the cell the CLOSE affordance owns or would have
+    // owned (design §3.1 [v5]: a non-closable chip's freed trailing cell IS
+    // the status canvas) — never on the label's own trailing pad, which is a
+    // centring device and would drag the mark one cell inward.
+    // A closable chip keeps its mark one cell inside the ✕; a non-closable one
+    // takes the very cell the ✕ would have owned (`end_col - 2`, the layout's
+    // own close column), never the label's trailing pad.
+    let status_anchor = match seg.close_col {
+        Some(close) => close.saturating_sub(2),
+        None => seg.end_col.saturating_sub(2),
+    };
     let status_col = if metadata.has_status() && title_end >= leading.saturating_add(3) {
-        let col = title_end - 1;
-        title_end = title_end.saturating_sub(2);
-        Some(col)
+        title_end = title_end.min(status_anchor.saturating_sub(2));
+        Some(status_anchor)
     } else {
         None
     };
@@ -2802,12 +2813,14 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// identical title end to end, NO cut can tell them apart — ten shells in one
 /// cwd under pressure rendered ten copies of `…d`, nine meaningless stubs
 /// (measured; the audit's capture). Text cannot distinguish them, so their
-/// POSITION does: each non-active twin is labelled with its 1-based strip
-/// ordinal — `2 · …oml` when the window affords a tail, bare `2` when it
-/// doesn't — the same number `switch_tab_<n>` answers to, so every twin is at
-/// least ADDRESSABLE. The ACTIVE twin is exempt: it is the tab being read, its
-/// pressure window is the reserved wide one, and it keeps as much of the real
-/// title as fits ([`ordinal_chip_label`]).
+/// POSITION does: each non-active twin is labelled with its 1-based STRIP
+/// POSITION — `2 · …oml` when the window affords a tail, bare `2` when it
+/// doesn't — which for the first nine tabs is also the number the
+/// `switch_tab_<n>` action takes, and past that is a position and nothing more
+/// ([`ordinal_chip_label`] documents exactly what the number does and does not
+/// promise). The ACTIVE twin is exempt: it is the tab being read, its pressure
+/// window is the reserved wide one, and it keeps as much of the real title as
+/// fits.
 ///
 /// ONE DIALECT PER STRIP, extended to the PRESSURE case: the cluster rule
 /// above already flips a shared-head FAMILY together, but a pressure strip
@@ -2825,6 +2838,13 @@ fn distinct_chip_labels(
     renaming: Option<usize>,
 ) -> Vec<Option<String>> {
     let mut labels: Vec<Option<String>> = vec![None; titles.len()];
+    // THE SAME SELECTION `layout_segments` LAID OUT. That function clamps
+    // `active` into range before it reserves the active chip's width
+    // (`active.min(tab_count - 1)`), so an out-of-range selection still widens
+    // the LAST chip; the twin exemption below has to answer the same question
+    // about the same tab, or the tab the layout treated as selected would be
+    // handed an ordinal while no chip on the strip keeps its title.
+    let active = active.min(titles.len().saturating_sub(1));
     // The strip is UNDER PRESSURE when any chip was compressed below the
     // legibility floor — `layout_segments` only ever emits such a segment on
     // its pressure branch (equal shares are floored at
@@ -2916,50 +2936,38 @@ fn distinct_chip_labels(
             .rfind(char::is_whitespace)
             .map_or(head.len(), |p| p + head[p..].chars().next().map_or(1, char::len_utf8));
         let remainder = &core[boundary..];
+        // The cluster members OTHER than this one, by title — what the survivor
+        // check measures this label's furniture against, and what the ordinal's
+        // tail is checked against too (same rule, same helper).
+        let siblings: Vec<&str> = members
+            .iter()
+            .filter(|&&m| m != i)
+            .map(|&m| titles[m].as_str())
+            .collect();
         // BYTE-IDENTICAL TWINS: no cut of this title can tell it from the
         // members it byte-equals, so a non-active twin is labelled by its
         // ordinal instead — the one thing about it that IS distinct. The
         // active twin falls through: it keeps as much real title as fits.
         let twins = members.iter().filter(|&&m| titles[m] == titles[i]).count();
-        if twins >= 2
-            && i != active
-            && let Some(label) = ordinal_chip_label(i, core, remainder, avail)
-        {
-            labels[i] = Some(label);
+        if twins >= 2 && i != active {
+            labels[i] = Some(ordinal_chip_label(
+                i,
+                &titles[i],
+                core,
+                remainder,
+                avail,
+                &siblings,
+            ));
             continue;
         }
-        let mut label = if !remainder.is_empty()
+        let label = if !remainder.is_empty()
             && strip_display_cells(remainder) <= avail.saturating_sub(1)
         {
             format!("…{remainder}")
         } else {
             truncate_title_tail(core, avail)
         };
-        // SURVIVOR CHECK (seen on glass). The cluster's shed uses the suffix
-        // shared by EVERY member, so one member in a different state (`· Typing
-        // a command` beside three `· Ready`s) collapses it to almost nothing —
-        // and the cut then keeps the very furniture the shed exists to remove,
-        // painting `…· Ready` on three chips that name nothing. When the label
-        // survives as pure furniture, re-cut against the suffix this title
-        // shares with the member it reads like.
-        let painted = label.trim_start_matches('…').trim_start().to_string();
-        if !painted.is_empty() {
-            let pair = members
-                .iter()
-                .filter(|&&m| m != i)
-                .map(|&m| common_suffix_bytes(&titles[i], &titles[m]))
-                .filter(|&n| n > 0 && n < titles[i].len())
-                .max()
-                .unwrap_or(0);
-            if pair > 0 && titles[i][titles[i].len() - pair..].trim_start().ends_with(&painted) {
-                let shed = &titles[i][..titles[i].len() - pair];
-                let recut = truncate_title_tail(shed, avail);
-                if !recut.trim_start_matches('…').trim().is_empty() {
-                    label = recut;
-                }
-            }
-        }
-        labels[i] = Some(label);
+        labels[i] = Some(furniture_survivor_recut(&titles[i], &siblings, avail, label));
     }
     // ONE DIALECT PER STRIP under pressure: a flipped cluster beside a
     // head-cut loner mixes `…oml` with `REA…` in windows too small for either
@@ -3042,18 +3050,108 @@ fn distinct_chip_labels(
     labels
 }
 
-/// The label a byte-identical twin paints: its 1-based strip ordinal — the
-/// number `switch_tab_<n>` already answers to — carrying a tail of the title
-/// when the window affords one (`2 · …oml`), bare (`2`) when it does not.
-/// `core`/`remainder` are the cluster's suffix-shed title and word-boundary
-/// tail, exactly what the family cut would have painted. `None` when even the
-/// digits do not fit `avail`: a clipped ordinal would LIE (a `10` painted as
-/// `1` addresses the wrong tab), so the caller falls back to the family cut.
-fn ordinal_chip_label(tab: usize, core: &str, remainder: &str, avail: usize) -> Option<String> {
+/// A cluster label that survived as pure FURNITURE, re-cut against the tab's
+/// own text — seen on glass, and the same rule wherever a cut of a clustered
+/// title is painted.
+///
+/// The cluster's shed uses the suffix shared by EVERY member, so one member in
+/// a different state (`· Typing a command` beside three `· Ready`s) collapses
+/// it to almost nothing — and the cut then keeps the very furniture the shed
+/// exists to remove, painting `…· Ready` on three chips that name nothing.
+/// When the painted text is nothing but the tail this title shares with the
+/// member it reads like, shed THAT suffix and cut again; a re-cut that would
+/// itself be empty is declined (the original label stands).
+///
+/// `siblings` are the cluster's other titles. A byte-identical twin shares its
+/// WHOLE title, which distinguishes nothing and would shed everything — such a
+/// sibling is skipped (`n < title.len()`), which is why the twins' answer is
+/// the ordinal rather than another cut.
+fn furniture_survivor_recut(
+    title: &str,
+    siblings: &[&str],
+    budget: usize,
+    label: String,
+) -> String {
+    let painted = label.trim_start_matches('…').trim_start().to_string();
+    if painted.is_empty() {
+        return label;
+    }
+    let pair = siblings
+        .iter()
+        .map(|other| common_suffix_bytes(title, other))
+        .filter(|&n| n > 0 && n < title.len())
+        .max()
+        .unwrap_or(0);
+    if pair > 0 && title[title.len() - pair..].trim_start().ends_with(&painted) {
+        let shed = &title[..title.len() - pair];
+        let recut = truncate_title_tail(shed, budget);
+        if !recut.trim_start_matches('…').trim().is_empty() {
+            return recut;
+        }
+    }
+    label
+}
+
+/// The label a byte-identical twin paints: its 1-based STRIP POSITION, carrying
+/// a tail of the title when the window affords one (`2 · …oml`), bare (`2`)
+/// when it does not. `core`/`remainder` are the cluster's suffix-shed title and
+/// word-boundary tail, exactly what the family cut would have painted;
+/// `siblings` are the cluster's other titles, so the tail answers to the same
+/// [`furniture_survivor_recut`] rule the family cut does — a tail that is
+/// nothing but the shared furniture names no tab, and painting it after the
+/// ordinal only spends the window twice.
+///
+/// WHAT THE NUMBER PROMISES, exactly. It is the tab's POSITION on the strip,
+/// left to right (1-based) — what the strip is ordered by and what the user
+/// counts. Whether it is also an ADDRESS depends on the platform, and on the two
+/// that paint these ordinals the honest answer is "only if you bound one":
+///
+/// * The ACTION exists everywhere: [`crate::keybinding::Action::parse`] accepts
+///   `switch_tab_1`..`switch_tab_9` and NOTHING above nine, on every platform
+///   (the parse is not `cfg`-gated). No default chord reaches it, though —
+///   `Keybindings::PLATFORM_DEFAULT_PAIRS` deliberately seeds no jump-to-tab
+///   anywhere (bare Alt+digit is readline's numeric argument, Ctrl+Alt+digit is
+///   AltGr), so the keystroke is the user's to write.
+/// * The HARDCODED chord is not a constant across platforms. `on_key` reaches
+///   `app_input::on_key_super_chord` — whose `1`..`9` arms call `switch_tab` —
+///   only through `app_input::HARDCODED_SUPER_CHORDS`, and that gate is FALSE
+///   on Linux (keyboard audit #4: the desktop owns Super). On the DESIGN lane,
+///   therefore, no built-in chord addresses a tab at all. On Windows the arms
+///   are compiled in, spelled Win+digit — the key the shell claims almost
+///   everywhere, which is why that platform seeds the Ctrl/Shift table instead.
+///   macOS has the real ⌘1..⌘9 and paints no band at all
+///   ([`STRIP_IS_CHROME_BAND`]), so these ordinals never appear there.
+///
+/// The number is therefore a POSITION first: honest about which chip it names on
+/// every platform, and an address as well wherever the user's keyboard has one.
+///
+/// THE ELISION MARK ALONE (`…`) when even the digits do not fit `avail`, and
+/// deliberately not a cut of the title: a clipped ordinal would LIE (a `10`
+/// painted as `1` names the wrong tab), and the family cut this used to fall
+/// back to is — for titles that are byte-identical — precisely the meaningless
+/// stub the ordinal exists to replace (ten chips painting `…d`, which claims a
+/// NAME each of them shares). A mark claims nothing: it says this chip has a
+/// title and no room to show it, which is the only true statement left, and the
+/// chip still carries its card, its position and its hover card. That window is
+/// a one-cell title (`avail == 1`) with ten or more tabs, or a two-cell one with
+/// a hundred — `every_strip_width_labels_a_twin_honestly` walks the widths the
+/// layout can produce and pins exactly which ones they are.
+fn ordinal_chip_label(
+    tab: usize,
+    title: &str,
+    core: &str,
+    remainder: &str,
+    avail: usize,
+    siblings: &[&str],
+) -> String {
     let digits = (tab + 1).to_string();
     let digit_cells = strip_display_cells(&digits);
     if digit_cells > avail {
-        return None;
+        return if avail == 0 {
+            String::new()
+        } else {
+            "…".to_string()
+        };
     }
     // ` · ` — the separator composed titles already use — costs 3 cells; a
     // tail below 2 cells (`…` + one char) says nothing worth the space.
@@ -3064,13 +3162,14 @@ fn ordinal_chip_label(tab: usize, core: &str, remainder: &str, avail: usize) -> 
         } else {
             truncate_title_tail(core, room)
         };
+        let tail = furniture_survivor_recut(title, siblings, room, tail);
         // A width-2 glyph can leave the tail cut with a bare `…` — worth
         // nothing; the bare ordinal reads better than `2 · …`.
         if !tail.is_empty() && tail != "…" {
-            return Some(format!("{digits} · {tail}"));
+            return format!("{digits} · {tail}");
         }
     }
-    Some(digits)
+    digits
 }
 
 /// Byte length of the longest common PREFIX of `a` and `b`, aligned to char
@@ -3273,6 +3372,26 @@ pub(crate) mod pixel_band {
         pub geometry: BandGeometry,
     }
 
+    impl BandInput<'_> {
+        /// ONE SELECTION, ONE READER. `active` arrives from the app as a raw
+        /// index and every consumer of the strip has to answer the SAME question
+        /// about the SAME tab: `layout_segments` clamps it into range before it
+        /// reserves the selected chip's wider window (`active.min(tab_count -
+        /// 1)`), and [`distinct_chip_labels`] clamps identically so the tab that
+        /// got that window is the tab exempted from the twins' ordinal. A band
+        /// that read the RAW index would disagree with both — an out-of-range
+        /// selection would leave the last chip drawn with the wide window, its
+        /// title kept whole by the cell pass, and yet painted inactive, measured
+        /// in the wrong face, and re-cut by the pixel repair the selection is
+        /// supposed to be exempt from.
+        ///
+        /// So the clamp lives HERE, once, and every reader in the band (paint,
+        /// separators, the label resolve, the fit) reads it through this.
+        fn selected(&self) -> usize {
+            self.active.min(self.titles.len().saturating_sub(1))
+        }
+    }
+
     /// Rasterize the strip band and return one `Vec<(col, ImageRef)>` PER STRIP
     /// ROW (sorted by column — the renderer binary-searches). `None` = paint the
     /// strip entirely with cells (no UI face installed yet, degenerate geometry,
@@ -3315,6 +3434,9 @@ pub(crate) mod pixel_band {
         if img_w > usize::from(u16::MAX) || img_h > usize::from(u16::MAX) {
             return None;
         }
+        // The band's ONE reading of the selection ([`BandInput::selected`]) —
+        // resolved at the entry, before anything paints or measures.
+        let active = input.selected();
         let colors = strip_colors_with_active(input.theme, input.active_override);
         let scale = if geometry.scale.is_finite() && geometry.scale > 0.0 {
             geometry.scale
@@ -3392,28 +3514,34 @@ pub(crate) mod pixel_band {
 
         // EVERY BAND: the distinct pass resolves all chip labels in ONE look at
         // every title (the cell painter's rule) — a per-tab cut must never
-        // erase exactly the characters that tell neighbours apart.
-        let mut labels = if STRIP_DISTINCT_LABELS {
-            distinct_chip_labels(
-                input.segments,
-                input.titles,
-                Some(input.metadata),
-                input.active,
-                input.paint.rename.map(|edit| edit.tab),
-            )
-        } else {
-            Vec::new()
-        };
+        // erase exactly the characters that tell neighbours apart — and the
+        // PIXEL fit that follows it is resolved in that same one look
+        // ([`resolve_band_labels`]), because the fit is a second truncation and
+        // a second truncation resolved chip by chip undoes the first pass's
+        // work.
+        //
+        // Hoisted out of the loop with the labels because both are the same
+        // question — does the SELECTION earn semibold — and the fit has to
+        // measure with the face the pen will draw with.
+        let wants_semibold = design.as_ref().is_none_or(|design| design.active_semibold);
+        let mut labels = resolve_band_labels(input, active, cols, cw, label_px, wants_semibold);
         for seg in input.segments {
             let end = seg.end_col.min(cols as u16);
             if seg.start_col >= end {
                 continue;
             }
-            let is_active = matches!(seg.kind, TabHit::Select(i) if i == input.active);
+            let is_active = matches!(seg.kind, TabHit::Select(i) if i == active);
             let is_hovered = !is_active
                 && !seg.solo
                 && matches!(seg.kind, TabHit::Select(i) if input.paint.hovered == Some(i));
             match seg.kind {
+                // The status-mark cell upstream added ([`TabHit::Connector`]):
+                // the pixel band has no design for it yet, so those columns go
+                // to the cell painter — the same totality escape SOLO takes
+                // one arm down, and the reason `fallback` exists.
+                TabHit::Connector(_) => {
+                    fallback.push((seg.start_col, end));
+                }
                 TabHit::Select(i) if seg.solo => {
                     // SOLO is macOS policy ([`SOLO_TITLE_BAND`]) — structurally
                     // unreachable on Windows, kept total: the cell painter owns it.
@@ -3432,31 +3560,18 @@ pub(crate) mod pixel_band {
                         continue;
                     }
                     let item = input.metadata.get(i).copied();
-                    let layout = item.map_or_else(
-                        || TabContentLayout {
-                            icon_start: None,
-                            title_start: seg.start_col + 1,
-                            title_end: match seg.close_col {
-                                Some(cx) => cx.saturating_sub(1),
-                                None => end.saturating_sub(1),
-                            },
-                            status_col: None,
-                        },
-                        |item| tab_content_layout(seg, item),
-                    );
-                    let raw = input.titles.get(i).map(String::as_str).unwrap_or("");
+                    let layout = band_content_layout(seg, item, end);
                     let avail = layout.title_end.saturating_sub(layout.title_start);
-                    // SAME semantic truncation as the cell painter (display
-                    // cells), so what the band shows is what hover cards / the
-                    // caption agree the visible title is; then a PIXEL fit below,
-                    // because a wide-lettered title can out-measure its mono span.
-                    let label: String = labels
-                        .get_mut(i)
-                        .and_then(Option::take)
-                        .unwrap_or_else(|| truncate_title(raw, avail as usize))
-                        .chars()
-                        .map(strip_char)
-                        .collect();
+                    // Resolved for the WHOLE strip above, and FINAL: the cell
+                    // painter's semantic truncation (display cells — so what the
+                    // band shows is what hover cards / the caption agree the
+                    // visible title is), the PIXEL fit (a wide-lettered title
+                    // can out-measure its mono span), and the distinctness
+                    // repair that keeps the two from cancelling out. This loop
+                    // draws that string; it never re-cuts it (the ACTIVE chip's
+                    // glyph-level fit is the one exception, and the repair
+                    // exempts the active label anyway — [`fit_labels_distinctly`]).
+                    let label: String = labels.get_mut(i).and_then(Option::take).unwrap_or_default();
                     if !crate::tray_raster::strip_band_run_coverable(&label) {
                         fallback.push((seg.start_col, end));
                         continue;
@@ -3534,7 +3649,7 @@ pub(crate) mod pixel_band {
                     // structure themselves, the way a libadwaita bar's do — a
                     // rule flush against a rounded card reads as grime.
                     if design.is_none()
-                        && strip_separates(i, input.active, input.paint.hovered)
+                        && strip_separates(i, active, input.paint.hovered)
                         && let Some(seam) = colors.seam
                     {
                         let half = (band_h * 0.28).max(3.0);
@@ -3619,11 +3734,11 @@ pub(crate) mod pixel_band {
                         // for a title the cascade draws in full. Only a run that
                         // shaped whole is then fitted, at the glyph level (no
                         // re-raster per candidate).
-                        // …and only where the lane WANTS semibold: a design
+                        // …and only where the lane WANTS semibold
+                        // (`wants_semibold`, resolved once for the band because
+                        // the label pass measures with the same face): a design
                         // candidate that keeps the selection's weight flat must
                         // not have the variable instance re-bolden it.
-                        let wants_semibold =
-                            design.as_ref().is_none_or(|design| design.active_semibold);
                         let varied = if is_active && wants_semibold {
                             variable_pen.as_ref().and_then(|pen| {
                                 let run = pen.shape(&label, label_px)?;
@@ -3644,9 +3759,14 @@ pub(crate) mod pixel_band {
                         match varied {
                             Some(overlay) => overlays.push(overlay),
                             None => {
-                                let label = fit_label(label, span_px, |s| {
-                                    crate::tray_raster::ui_text_width_for(face, s, label_px)
-                                });
+                                // NO SECOND FIT HERE. The string is already cut
+                                // to THIS span by THIS face
+                                // ([`resolve_band_labels`], which measured with
+                                // the very `face` this arm draws with) — and a
+                                // fit applied per chip at paint time is exactly
+                                // what the resolve pass exists to replace: it
+                                // can only shorten, and a shortening the strip
+                                // never saw can hand two chips one string.
                                 let x = match &design {
                                     // Centred by the SAME measure the pen draws
                                     // with, so alignment and paint cannot drift.
@@ -4021,6 +4141,320 @@ pub(crate) mod pixel_band {
         }
     }
 
+    /// The content geometry of ONE band segment — [`tab_content_layout`] where
+    /// the strip handed us metadata, and the plain ` title ✕ ` fallback where it
+    /// did not. Stated ONCE and read by both the label pass and the paint loop,
+    /// so the string that is fitted and the span it is fitted to are measured
+    /// from the same columns.
+    fn band_content_layout(
+        seg: &TabSegment,
+        item: Option<TabStripMetadata>,
+        end: u16,
+    ) -> TabContentLayout {
+        item.map_or_else(
+            || TabContentLayout {
+                icon_start: None,
+                title_start: seg.start_col + 1,
+                title_end: match seg.close_col {
+                    Some(cx) => cx.saturating_sub(1),
+                    None => end.saturating_sub(1),
+                },
+                status_col: None,
+            },
+            |item| tab_content_layout(seg, item),
+        )
+    }
+
+    /// Every chip label the band paints, resolved TOGETHER — the cell pass's
+    /// rule ([`distinct_chip_labels`]) carried through the PIXEL fit.
+    ///
+    /// THE SECOND TRUNCATION. `distinct_chip_labels` proves its distinctness in
+    /// the CELL domain, against `title_end - title_start` columns of mono grid.
+    /// The band then draws in the UI face, and [`fit_label`] cuts the resolved
+    /// label AGAIN against the pixel span — and a second truncation resolved one
+    /// chip at a time undoes exactly what the first pass did: `…~/aterm` and
+    /// `…$HOME/trust` are distinct in cells and both fit to `…~…` in pixels, which
+    /// is the ten-identical-chips defect back on the one lane a Linux (and
+    /// Windows) user ever sees. So the fit runs here, over the whole strip, and
+    /// a collision it CREATES is re-cut by ordinal exactly as the cell pass
+    /// re-cuts a twin ([`fit_labels_distinctly`]).
+    ///
+    /// A run the band cannot cover keeps its cell-domain label untouched: the
+    /// paint loop sends that segment to the cell painter wholesale, so its
+    /// string is not the band's to fit — it is only a name the fitted labels
+    /// must not collide with, which the repair honours by treating every label
+    /// already resolved as taken.
+    ///
+    /// FINAL, TOO. What this returns is what the paint loop draws — it holds no
+    /// second fit of its own, because a fit applied per chip at paint time is
+    /// the very thing this pass replaces. (The one string the paint loop can
+    /// still shorten is the ACTIVE label, through the variable instance's
+    /// glyph-level [`VariablePen::fit`]; that chip is exempt from the repair
+    /// either way, so the distinctness this pass proves cannot turn on it.)
+    /// `active` is the band's ONE reading of the selection
+    /// ([`BandInput::selected`]), passed in rather than re-read so the
+    /// exemption, the measuring face and the painted chip cannot disagree.
+    fn resolve_band_labels(
+        input: &BandInput<'_>,
+        active: usize,
+        cols: usize,
+        cw: f32,
+        label_px: f32,
+        wants_semibold: bool,
+    ) -> Vec<Option<String>> {
+        let mut cell = if STRIP_DISTINCT_LABELS {
+            distinct_chip_labels(
+                input.segments,
+                input.titles,
+                Some(input.metadata),
+                active,
+                input.paint.rename.map(|edit| edit.tab),
+            )
+        } else {
+            Vec::new()
+        };
+        let mut resolved: Vec<Option<String>> = vec![None; input.titles.len()];
+        let mut entries: Vec<BandLabel> = Vec::new();
+        for seg in input.segments {
+            let end = seg.end_col.min(cols as u16);
+            let TabHit::Select(i) = seg.kind else {
+                continue;
+            };
+            // Every skip the paint loop makes, made here too: a segment it
+            // hands to the cell painter has no pixel label to fit.
+            if seg.start_col >= end
+                || seg.solo
+                || i >= input.titles.len()
+                || input.paint.rename.is_some_and(|edit| edit.tab == i)
+            {
+                continue;
+            }
+            let item = input.metadata.get(i).copied();
+            let layout = band_content_layout(seg, item, end);
+            let avail = layout.title_end.saturating_sub(layout.title_start);
+            let raw = input.titles[i].as_str();
+            let text: String = cell
+                .get_mut(i)
+                .and_then(Option::take)
+                .unwrap_or_else(|| truncate_title(raw, usize::from(avail)))
+                .chars()
+                .map(strip_char)
+                .collect();
+            if !crate::tray_raster::strip_band_run_coverable(&text) {
+                // The cell painter's segment: hand the paint loop the same
+                // string it checked coverage with, so it takes the same
+                // fallback branch it always took.
+                resolved[i] = Some(text);
+                continue;
+            }
+            entries.push(BandLabel {
+                tab: i,
+                span_px: f32::from(avail) * cw - 1.0,
+                text,
+            });
+        }
+        // The face each label will be DRAWN with, so fit and paint cannot
+        // disagree about what fits. The active label may additionally go
+        // through the variable instance's own glyph-level fit
+        // ([`VariablePen::fit`]) — same candidate order, marginally different
+        // advances — but the repair below never rewrites the ACTIVE label, so
+        // that lane's measure only ever decides which string the OTHER chips
+        // must stay clear of.
+        let measure = |tab: usize, s: &str| {
+            let face = if tab == active && wants_semibold {
+                TextFace::UiBold
+            } else {
+                TextFace::Ui
+            };
+            crate::tray_raster::ui_text_width_for(face, s, label_px)
+        };
+        let taken: Vec<&str> = resolved.iter().filter_map(Option::as_deref).collect();
+        for (tab, text) in fit_labels_distinctly(&entries, active, &taken, &measure) {
+            resolved[tab] = Some(text);
+        }
+        resolved
+    }
+
+    /// One chip's label on the way into the pixel fit: the cell pass's resolved
+    /// string and the span it has to survive.
+    struct BandLabel {
+        tab: usize,
+        span_px: f32,
+        text: String,
+    }
+
+    /// Fit every band label to its own span and keep the strip DISTINCT across
+    /// that fit — [`resolve_band_labels`]'s rule, pure, so both lanes' shapes
+    /// can be driven from a test without a font on the host.
+    ///
+    /// `entries` are in strip order; `reserved` are labels already resolved for
+    /// this strip (the cell painter's fallback segments) that a fitted label
+    /// must not collide with. The ACTIVE chip is exempt from the repair for the
+    /// cell pass's reason — it is the tab being READ, its window is the reserved
+    /// wide one, and it keeps as much of the real title as fits — so it claims
+    /// its fitted string first and every collision is repaired on the other
+    /// member.
+    fn fit_labels_distinctly(
+        entries: &[BandLabel],
+        active: usize,
+        reserved: &[&str],
+        measure: &dyn Fn(usize, &str) -> f32,
+    ) -> Vec<(usize, String)> {
+        let mut fitted: Vec<(usize, String)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.tab,
+                    fit_label(entry.text.clone(), entry.span_px, |s| {
+                        measure(entry.tab, s)
+                    }),
+                )
+            })
+            .collect();
+        let mut taken: Vec<String> = reserved.iter().map(|s| (*s).to_string()).collect();
+        taken.extend(
+            fitted
+                .iter()
+                .filter(|(tab, _)| *tab == active)
+                .map(|(_, text)| text.clone()),
+        );
+        // One chip's position, spelled as far as its own span affords — the
+        // repair's only replacement, and the impostor's way out below.
+        let ordinal = |n: usize| {
+            let tab = entries[n].tab;
+            pixel_ordinal_label(tab, &entries[n].text, entries[n].span_px, &|s| {
+                measure(tab, s)
+            })
+        };
+        for n in 0..fitted.len() {
+            let tab = fitted[n].0;
+            if tab == active {
+                continue;
+            }
+            // An EMPTY label claims nothing and can collide with nothing —
+            // there is no window left to say anything in, and the chip is its
+            // card and its position (`ordinal_chip_label` documents that floor).
+            if fitted[n].1.is_empty() {
+                continue;
+            }
+            // THE TWO WAYS THE FIT LOSES A NAME. It collapsed this label onto
+            // one already on the strip; or it cut the label down to nothing but
+            // ELISION MARKS, which name nothing at all — and a fit can do that
+            // to an ordinal the cell pass had already resolved (`10` at a span
+            // that seats one glyph), which would undo the twins' answer on the
+            // only lane that paints.
+            let lost = label_says_nothing(&fitted[n].1)
+                || taken.iter().any(|other| *other == fitted[n].1);
+            if !lost {
+                taken.push(fitted[n].1.clone());
+                continue;
+            }
+            // The twins' answer, in the pixel domain: this chip's strip
+            // position, with as much of its own label trailing as the span
+            // still affords.
+            let recut = ordinal(n);
+            if recut.is_empty() {
+                // Not even the number fits. Whatever the fit left says at
+                // least as much as a mark would — keep it rather than trade
+                // text for a blank chip.
+                continue;
+            }
+            let mut text = recut;
+            if taken.contains(&text) {
+                // The bare number, then — it can only be taken by a title that
+                // IS that number, and a chip's own position outranks another
+                // chip's digits-as-a-name. But OUTRANKS has to mean the other
+                // one gives it back: pushing a second `3` onto the strip is the
+                // very collision this pass exists to remove, so the number is
+                // claimed only when it is FREE, or when its one holder is a
+                // band label this pass may still rewrite — which then takes its
+                // OWN position (a different number, so this cannot cascade).
+                let digits = (tab + 1).to_string();
+                let holders = taken.iter().filter(|other| **other == digits).count();
+                // The single holder, when it is a band label resolved ahead of
+                // this one — the only kind this pass may rewrite. `None` (a
+                // cell-painter fallback, or the ACTIVE chip's own title) leaves
+                // the ordinal-with-tail standing instead: the truer of the two
+                // claims, and its tail is what a reader has left to tell them
+                // apart.
+                let impostor = if holders == 1 {
+                    (0..n).find(|&m| fitted[m].0 != active && fitted[m].1 == digits)
+                } else {
+                    None
+                };
+                if holders == 0 {
+                    text = digits;
+                } else if let Some(m) = impostor {
+                    let swap = ordinal(m);
+                    if !swap.is_empty() && !taken.contains(&swap) {
+                        if let Some(p) = taken.iter().position(|other| *other == digits) {
+                            taken.remove(p);
+                        }
+                        taken.push(swap.clone());
+                        fitted[m].1 = swap;
+                        text = digits;
+                    }
+                }
+            }
+            fitted[n].1 = text.clone();
+            taken.push(text);
+        }
+        fitted
+    }
+
+    /// Does this label NAME anything, or is it only the mark that says a title
+    /// was cut? STRUCTURAL, and deliberately not `label == "…"`: the cell pass
+    /// resolves tail cuts that carry a LEADING mark (`…~/aterm`, the whole
+    /// pressure dialect), [`fit_label`] re-cuts those against the pixel span,
+    /// and its ellipsis-drop only pops a TRAILING one — so `…and` at a span that
+    /// seats two glyphs comes back as `……`, which says exactly as little as `…`
+    /// and would sail past an equality guard into the paint.
+    fn label_says_nothing(label: &str) -> bool {
+        label
+            .trim_matches(|c: char| c == '…' || c.is_whitespace())
+            .is_empty()
+    }
+
+    /// [`ordinal_chip_label`] in the PIXEL domain: the chip's 1-based strip
+    /// position, carrying as much of `label` as the span still affords after
+    /// the number and its ` · ` separator. Same promise as the cell version —
+    /// see its doc for what the number does and does not address.
+    ///
+    /// EMPTY means the span cannot seat the number at all (a clipped `10` names
+    /// tab 1, and the clip is real: the label draws inside a `ClipPush` of its
+    /// own span). The caller keeps whatever the fit left rather than trading it
+    /// for a blank chip.
+    fn pixel_ordinal_label(
+        tab: usize,
+        label: &str,
+        span_px: f32,
+        measure: &dyn Fn(&str) -> f32,
+    ) -> String {
+        let digits = (tab + 1).to_string();
+        if measure(&digits) > span_px {
+            return String::new();
+        }
+        let head = format!("{digits} · ");
+        let room = span_px - measure(&head);
+        if room > 0.0 {
+            let tail = fit_label(label.to_string(), room, measure);
+            // A tail of nothing but elision marks after the number spends the
+            // window on nothing; the bare number reads better (the cell
+            // version's rule), and the test is STRUCTURAL because the fit can
+            // leave `……` as readily as `…` ([`label_says_nothing`]).
+            //
+            // The COMPOSED string is measured too, not just its two halves:
+            // the resolve pass's answer is final (the paint loop holds no fit
+            // of its own), so a kerned seam that pushed `3 · …oml` a hair past
+            // the span has to fall back here rather than be clipped there.
+            let composed = head + &tail;
+            if !label_says_nothing(&tail) && measure(&composed) <= span_px {
+                return composed;
+            }
+        }
+        digits
+    }
+
     /// Shrink `label` (already display-cell-truncated) until it MEASURES inside
     /// `span_px` under `measure` — the mono span usually over-fits proportional
     /// text, so this is a no-op almost always; an all-caps pathological title
@@ -4029,6 +4463,18 @@ pub(crate) mod pixel_band {
     /// never disagree. The variable-instance path applies the SAME candidate
     /// order to an already-shaped run instead ([`VariablePen::fit`]), so it
     /// never re-rasters per candidate.
+    ///
+    /// PER CHIP, and that is why the paint loop does not call it: shortening one
+    /// label in isolation can hand two chips the same string. Its only callers
+    /// are [`resolve_band_labels`]'s pass — which runs it over the whole strip
+    /// and repairs what it collapses ([`fit_labels_distinctly`]) — and the
+    /// ordinal that repair falls back to. The label the paint loop draws is what
+    /// that pass returned, unaltered.
+    ///
+    /// It can leave a string that says NOTHING: the drop below pops a TRAILING
+    /// elision mark only, so a cell-domain tail cut (`…and`) shrinks through
+    /// `…a…` to `……`. That is honest here — there is no room for a name — and
+    /// it is the repair's business to notice ([`label_says_nothing`]).
     fn fit_label(label: String, span_px: f32, measure: impl Fn(&str) -> f32) -> String {
         if measure(&label) <= span_px {
             return label;
@@ -4329,6 +4775,23 @@ pub(crate) mod pixel_band {
                         color: ink,
                     });
                 }
+                // Upstream's connector arrow. The band's primitive set has no
+                // polygon fill, so the triangle is drawn as its three edges at
+                // the icon's own stroke weight — at a 13px chip glyph the
+                // outline closes into the solid mark the cell painter draws.
+                TabIconPrimitive::Triangle { points } => {
+                    for pair in [(0usize, 1usize), (1, 2), (2, 0)] {
+                        let (a, b) = (points[pair.0], points[pair.1]);
+                        prims.push(DrawPrim::Line {
+                            x1: a[0].mul_add(k, ox),
+                            y1: a[1].mul_add(k, oy),
+                            x2: b[0].mul_add(k, ox),
+                            y2: b[1].mul_add(k, oy),
+                            width: (0.9 * k).max(1.0),
+                            color: ink,
+                        });
+                    }
+                }
                 TabIconPrimitive::Dot { center, radius } => {
                     prims.push(DrawPrim::Dot {
                         cx: center[0].mul_add(k, ox),
@@ -4372,7 +4835,9 @@ pub(crate) mod pixel_band {
                     dirty: false,
                     busy: false,
                     attention: false,
+                    conn: None,
                     closable: true,
+                    drop_target: false,
                 };
                 n
             ]
@@ -4905,6 +5370,735 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
+        /// The band's title window and span for one segment, the way
+        /// [`resolve_band_labels`] measures them — the metadata-less form, so
+        /// the numbers are the LAYOUT's and not a platform's card pad.
+        fn window(seg: &TabSegment) -> (u16, f32) {
+            let layout = band_content_layout(seg, None, seg.end_col);
+            let avail = layout.title_end.saturating_sub(layout.title_start);
+            (avail, f32::from(avail) * CELL_W as f32 - 1.0)
+        }
+
+        /// A UI face whose every char out-measures the mono cell by half — the
+        /// pathological all-caps title [`fit_label`] exists for, as a closed
+        /// form, so this law is pinned on a host with no system font at all
+        /// (CI) and on both lanes alike: the string the fit resolves is not a
+        /// function of `BAND_OWNS_SURFACES`, only of the span and the face.
+        fn wide_face(_tab: usize, s: &str) -> f32 {
+            s.chars().count() as f32 * (CELL_W as f32 * 1.5)
+        }
+
+        /// THE SECOND TRUNCATION — the defect this pass exists to close.
+        /// [`distinct_chip_labels`] proves its distinctness in the CELL domain;
+        /// the band then re-cuts every resolved label against its PIXEL span,
+        /// and a re-cut applied chip by chip erases exactly the characters the
+        /// first pass kept: four shells under one prompt come back from the
+        /// cell pass with four different cwds and leave the naive fit as four
+        /// copies of one string. On Linux and Windows that fit is the ONLY
+        /// truncation a user ever sees painted.
+        #[test]
+        fn the_pixel_fit_cannot_undo_the_cell_pass_distinctness() {
+            let titles: Vec<String> = ["alpha", "beta", "gamma", "delta"]
+                .iter()
+                .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
+                .collect();
+            let metadata = plain(titles.len());
+            let segments =
+                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let cell: Vec<String> =
+                distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .collect();
+            // FIXTURE GUARD: the cell pass did its half — four windows, four
+            // strings. Without this the pixel law below could pass because
+            // nothing was distinct to lose.
+            for (i, a) in cell.iter().enumerate() {
+                for (j, b) in cell.iter().enumerate() {
+                    assert!(i == j || a != b, "cell fixture: {cell:?}");
+                }
+            }
+            let entries: Vec<BandLabel> = segments
+                .iter()
+                .filter_map(|seg| match seg.kind {
+                    TabHit::Select(i) => Some(BandLabel {
+                        tab: i,
+                        span_px: window(seg).1,
+                        text: cell[i].clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            // FIXTURE GUARD: the per-chip fit — the shipped call — DOES
+            // collapse them at this span, so the repair below has something to
+            // repair.
+            let naive: Vec<String> = entries
+                .iter()
+                .map(|entry| {
+                    fit_label(entry.text.clone(), entry.span_px, |s| wide_face(entry.tab, s))
+                })
+                .collect();
+            assert!(
+                naive.iter().enumerate().any(|(a, x)| naive
+                    .iter()
+                    .enumerate()
+                    .any(|(b, y)| a != b && x == y)),
+                "fixture: the naive per-chip fit must collide, else this test \
+                 proves nothing: {naive:?}"
+            );
+            let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+            assert_eq!(fitted.len(), titles.len(), "every chip resolved");
+            for (n, (tab, text)) in fitted.iter().enumerate() {
+                assert!(!text.is_empty(), "a chip with a window says something");
+                for (m, (_, other)) in fitted.iter().enumerate() {
+                    assert!(
+                        n == m || text != other,
+                        "tabs must stay tellable apart THROUGH the pixel fit: \
+                         {fitted:?}"
+                    );
+                }
+                // A chip is either untouched by the repair or addressable by
+                // its strip position — never quietly re-cut into something
+                // that names a different tab.
+                if *tab != 0 {
+                    assert!(
+                        *text == naive[n] || text.starts_with(&(tab + 1).to_string()),
+                        "a chip the fit collapsed carries its position: {text:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                fitted[0].1, naive[0],
+                "the ACTIVE chip is never the one re-cut"
+            );
+            // Every fitted string still MEASURES inside its own span — the
+            // repair must not buy distinctness with a clipped label.
+            for (entry, (_, text)) in entries.iter().zip(&fitted) {
+                assert!(
+                    wide_face(entry.tab, text) <= entry.span_px || text == "…",
+                    "{text:?} overflows its {}px span",
+                    entry.span_px
+                );
+            }
+        }
+
+        /// The same law where the labels arrive ALREADY ordinal-ed (the cell
+        /// pass's answer to byte-identical twins): ten shells in one cwd, the
+        /// audit's strip, through the band's pass. Nothing may collapse, and no
+        /// chip may claim a number that is not its own position.
+        #[test]
+        fn ten_identical_tabs_stay_addressable_through_the_pixel_fit() {
+            let titles: Vec<String> = (0..10)
+                .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+                .collect();
+            let metadata = plain(titles.len());
+            for cols in [80u16, 130, 200] {
+                let segments =
+                    layout_segments_with_metadata(cols, titles.len(), &metadata, 0, false);
+                let cell: Vec<String> =
+                    distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
+                        .into_iter()
+                        .map(Option::unwrap)
+                        .collect();
+                let entries: Vec<BandLabel> = segments
+                    .iter()
+                    .filter_map(|seg| match seg.kind {
+                        TabHit::Select(i) => Some(BandLabel {
+                            tab: i,
+                            span_px: window(seg).1,
+                            text: cell[i].clone(),
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+                for (n, (tab, text)) in fitted.iter().enumerate() {
+                    for (m, (_, other)) in fitted.iter().enumerate() {
+                        assert!(
+                            n == m || text.is_empty() || text != other,
+                            "{cols} cols: two chips paint {text:?}"
+                        );
+                    }
+                    if *tab != 0 && !text.is_empty() {
+                        let digits = text
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>();
+                        // Either the chip carries its OWN position, or the span
+                        // seats no number at all and it carries the elision
+                        // mark — never another tab's number.
+                        assert!(
+                            digits == (tab + 1).to_string() || label_says_nothing(text),
+                            "{cols} cols: tab {tab} paints {text:?}"
+                        );
+                    }
+                    // THE PASS'S ANSWER IS FINAL. The paint loop draws these
+                    // strings and holds no fit of its own, so each one must
+                    // already measure inside the span it will be drawn in — the
+                    // fit's own floor (a bare mark on a span too small for one
+                    // glyph) is the single exception, and it clips exactly as
+                    // it always did.
+                    assert!(
+                        wide_face(*tab, text) <= entries[n].span_px || text == "…",
+                        "{cols} cols: {text:?} would need a SECOND fit at paint \
+                         time ({}px span)",
+                        entries[n].span_px
+                    );
+                }
+            }
+        }
+
+        /// A LABEL THAT SAYS NOTHING IS NOT ALWAYS THE STRING `…`. The cell
+        /// pass's pressure dialect resolves TAIL cuts, which carry a LEADING
+        /// mark (`…and`), and [`fit_label`] re-cuts those against the pixel span
+        /// while its ellipsis-drop pops a TRAILING mark only — so a two-glyph
+        /// window leaves `……`, which names nothing and yet walks straight past
+        /// an equality guard into the paint. The repair's test is structural
+        /// ([`label_says_nothing`]), so the chip gets its position instead.
+        #[test]
+        fn a_stub_of_nothing_but_marks_is_repaired_like_the_bare_mark() {
+            // FIXTURE: the exact string the shipped fit leaves — the defect
+            // itself, not a story about it.
+            let squeeze = wide_face(1, "……");
+            let stub = fit_label("…and".to_string(), squeeze, |s| wide_face(1, s));
+            assert_eq!(stub, "……", "the pixel fit really does leave TWO marks");
+            assert_ne!(stub, "…", "and it is NOT the literal the old guard tested");
+            let entries = vec![
+                BandLabel {
+                    tab: 0,
+                    span_px: 200.0,
+                    text: "…alpha".to_string(),
+                },
+                BandLabel {
+                    tab: 1,
+                    span_px: squeeze,
+                    text: "…and".to_string(),
+                },
+                BandLabel {
+                    tab: 2,
+                    span_px: 200.0,
+                    text: "…gamma".to_string(),
+                },
+            ];
+            let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+            assert_eq!(
+                fitted[1].1, "2",
+                "a chip whose fit says nothing takes its POSITION — it does not \
+                 paint the stub the guard was meant to catch: {fitted:?}"
+            );
+            // The law behind the fixture, over the whole strip: a label that
+            // says nothing is only ever the answer where the window cannot
+            // seat this chip's number at all.
+            for (n, (tab, text)) in fitted.iter().enumerate() {
+                assert!(
+                    !label_says_nothing(text)
+                        || wide_face(*tab, &(tab + 1).to_string()) > entries[n].span_px,
+                    "tab {tab} paints {text:?} in a window its number fits"
+                );
+            }
+        }
+
+        /// THE LAST RESORT IS CHECKED LIKE EVERY OTHER CANDIDATE. When a
+        /// repaired chip's window seats nothing but the number, the one label
+        /// that can already hold that number is a chip whose TITLE reads as it —
+        /// and pushing the digits anyway leaves the pair painting one string,
+        /// which is the collision this whole pass exists to remove. A chip's own
+        /// position outranks another chip's digits-as-a-name, so the impostor
+        /// gives the string back and takes its own position instead.
+        #[test]
+        fn the_bare_number_last_resort_never_doubles_a_label() {
+            let squeeze = wide_face(2, "……");
+            let entries = vec![
+                BandLabel {
+                    tab: 0,
+                    span_px: 200.0,
+                    text: "…zulu".to_string(),
+                },
+                // A tab whose title IS the number the chip below needs.
+                BandLabel {
+                    tab: 1,
+                    span_px: 200.0,
+                    text: "3".to_string(),
+                },
+                // …and a window that seats the number and nothing else.
+                BandLabel {
+                    tab: 2,
+                    span_px: squeeze,
+                    text: "…and".to_string(),
+                },
+            ];
+            let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+            for (n, (tab, text)) in fitted.iter().enumerate() {
+                for (m, (_, other)) in fitted.iter().enumerate() {
+                    assert!(
+                        n == m || text != other,
+                        "tab {tab} doubles another chip's label: {fitted:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                fitted[2].1, "3",
+                "the position claims its own number: {fitted:?}"
+            );
+            assert!(
+                fitted[1].1.starts_with('2'),
+                "the title that reads as a number carries its own position \
+                 instead: {fitted:?}"
+            );
+        }
+
+        /// A label the band leaves to the CELL painter (an uncoverable run) is
+        /// still a name on the strip: the fit may not hand another chip that
+        /// same string.
+        #[test]
+        fn a_fitted_label_never_collides_with_a_cell_painter_fallback() {
+            let entries = vec![
+                BandLabel {
+                    tab: 1,
+                    span_px: 200.0,
+                    text: "…~/aterm".to_string(),
+                },
+                BandLabel {
+                    tab: 2,
+                    span_px: 200.0,
+                    text: "…$HOME/trust".to_string(),
+                },
+            ];
+            let fitted = fit_labels_distinctly(&entries, 0, &["…~/aterm"], &wide_face);
+            assert_ne!(
+                fitted[0].1, "…~/aterm",
+                "the fallback segment already paints that string"
+            );
+            assert!(fitted[0].1.starts_with('2'), "{:?}", fitted[0].1);
+            assert_eq!(fitted[1].1, "…$HOME/trust", "an uncontested label is untouched");
+        }
+
+        /// WINDOWS SHIPS THIS PASS TOO — [`STRIP_DISTINCT_LABELS`] is true on
+        /// every band — and its lane is the one no host here can raster: no
+        /// design, labels left-aligned, the cell painter's surfaces under them,
+        /// and a title window one cell WIDER than the chip-card lane's because
+        /// [`STRIP_CHIP_CARDS`] spends no interior pad there. What is
+        /// host-independent is every string the pass resolves, so both lanes'
+        /// windows are driven from here against the same pathological face.
+        /// Neither may collapse two chips into one, and neither may hand a chip
+        /// a number that is not its own position.
+        #[test]
+        fn both_band_lanes_resolve_the_same_strip_distinctly() {
+            assert_eq!(
+                STRIP_DISTINCT_LABELS, STRIP_IS_CHROME_BAND,
+                "the pass runs wherever the band does — Windows included"
+            );
+            let titles: Vec<String> = ["alpha", "beta", "gamma", "delta"]
+                .iter()
+                .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
+                .collect();
+            let metadata = plain(titles.len());
+            let segments =
+                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let cell: Vec<String> =
+                distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .collect();
+            // (lane, its interior card pad) — the `cfg` this host is NOT, and
+            // the one it is. `tab_content_layout` reads that pad off the build,
+            // so the two windows are computed here instead.
+            let mut widths = Vec::new();
+            for (lane, pad) in [("windows", 0u16), ("chip-card", 1u16)] {
+                let entries: Vec<BandLabel> = segments
+                    .iter()
+                    .filter_map(|seg| match seg.kind {
+                        TabHit::Select(i) => {
+                            let pad = if seg.end_col.saturating_sub(seg.start_col)
+                                >= PREFERRED_MIN_TAB_COLS
+                            {
+                                pad
+                            } else {
+                                0
+                            };
+                            let start = seg.start_col + 1 + pad;
+                            let end = match seg.close_col {
+                                Some(close) => close.saturating_sub(1),
+                                None => seg.end_col.saturating_sub(1 + pad),
+                            };
+                            let avail = end.saturating_sub(start);
+                            Some(BandLabel {
+                                tab: i,
+                                span_px: f32::from(avail) * CELL_W as f32 - 1.0,
+                                text: cell[i].clone(),
+                            })
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                widths.push(entries[1].span_px);
+                let fitted = fit_labels_distinctly(&entries, 0, &[], &wide_face);
+                for (n, (tab, text)) in fitted.iter().enumerate() {
+                    assert!(!text.is_empty(), "{lane}: a chip with a window speaks");
+                    for (m, (_, other)) in fitted.iter().enumerate() {
+                        assert!(
+                            n == m || text != other,
+                            "{lane}: two chips paint {text:?} — {fitted:?}"
+                        );
+                    }
+                    let digits = text
+                        .chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>();
+                    assert!(
+                        digits.is_empty() || digits == (tab + 1).to_string(),
+                        "{lane}: tab {tab} paints another tab's number: {text:?}"
+                    );
+                }
+            }
+            assert!(
+                widths[0] > widths[1],
+                "fixture: the two lanes really are different windows ({widths:?}) \
+                 — the Windows band spends no card pad"
+            );
+        }
+
+        /// The band's label plumbing end to end (no fonts required — a host
+        /// without a UI face resolves the same strings and simply leaves every
+        /// run to the cell painter): every chip the band will paint gets a
+        /// resolved label, the inline RENAME segment gets none because the cell
+        /// well owns it, and no two chips come back with one string.
+        #[test]
+        fn the_band_resolves_one_label_per_painted_chip() {
+            let titles: Vec<String> = ["alpha", "beta", "gamma"]
+                .iter()
+                .map(|leaf| format!("user@m17-tower: ~/work/service-{leaf}"))
+                .collect();
+            let metadata = plain(titles.len());
+            let segments =
+                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let paint = StripPaint {
+                rename: Some(StripRenameField {
+                    tab: 2,
+                    text: "renaming",
+                    cursor: 0,
+                }),
+                ..StripPaint::default()
+            };
+            let input = band(&segments, &titles, &metadata, paint, geometry(80, 1));
+            let resolved =
+                resolve_band_labels(&input, input.selected(), 80, CELL_W as f32, 13.0, true);
+            assert_eq!(resolved.len(), titles.len());
+            assert!(
+                resolved[2].is_none(),
+                "the rename well is the cell painter's: {resolved:?}"
+            );
+            for (i, label) in resolved.iter().enumerate().take(2) {
+                let label = label.as_deref().expect("a painted chip has a label");
+                assert!(!label.is_empty(), "tab {i} says nothing");
+                for (j, other) in resolved.iter().enumerate().take(2) {
+                    assert!(
+                        i == j || Some(label) != other.as_deref(),
+                        "two chips resolved to {label:?}"
+                    );
+                }
+            }
+        }
+
+        /// ONE SELECTION, ONE READER ([`BandInput::selected`]) — driven through
+        /// the band's real label entry, with the RAW reading beside it so the
+        /// difference is the assertion.
+        ///
+        /// An out-of-range `active` is not hypothetical plumbing: `layout_
+        /// segments` clamps it and widens the LAST chip, and
+        /// [`distinct_chip_labels`] clamps identically so that chip is the one
+        /// exempted from the twins' ordinal. Read RAW, the pixel pass exempts no
+        /// chip at all — the tab the layout selected is re-cut by the repair
+        /// (and measured in the wrong face), while the chip that lost the
+        /// collision keeps the name. The strip stays distinct either way; what
+        /// moves is WHICH tab is treated as the one being read.
+        #[test]
+        fn an_out_of_range_selection_is_clamped_once_for_the_whole_band() {
+            if !with_ui_faces() {
+                return;
+            }
+            // Two titles that FIT in the cell domain (nothing for the cell pass
+            // to cut) and collapse onto one string in the pixel one — the
+            // second truncation, with no ordinals in play beforehand.
+            let titles: Vec<String> = ["alpha", "beta"]
+                .iter()
+                .map(|leaf| format!("{}{leaf}", "W".repeat(20)))
+                .collect();
+            let metadata = plain(titles.len());
+            // The same out-of-range index the layout was given: it clamps, and
+            // the LAST chip gets the selected chip's wider window.
+            let segments = layout_segments_with_metadata(80, titles.len(), &metadata, 99, false);
+            let input = BandInput {
+                active: 99,
+                ..band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry(80, 1),
+                )
+            };
+            assert_eq!(input.selected(), 1, "the layout's selection is the last chip");
+            // A label size well past the mono cell, so the fit bites on any
+            // host face rather than only on a wide one.
+            let big = 30.0;
+            let raw = resolve_band_labels(&input, input.active, 80, CELL_W as f32, big, true);
+            let clamped =
+                resolve_band_labels(&input, input.selected(), 80, CELL_W as f32, big, true);
+            // FIXTURE GUARD, per host: the fit must really collapse the pair,
+            // or the repair has nothing to move and this proves nothing.
+            let raw_last = raw[1].as_deref().unwrap_or_default();
+            if !raw_last.starts_with('2') {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            assert!(
+                clamped[1].as_deref().is_some_and(|l| l.starts_with('W')),
+                "the SELECTED chip keeps its title through the pixel fit — the \
+                 repair is not the selection's to take: {clamped:?}"
+            );
+            assert!(
+                clamped[0].as_deref().is_some_and(|l| l.starts_with('1')),
+                "and the chip that lost the collision carries its position: \
+                 {clamped:?}"
+            );
+            // AND THE WHOLE BAND READS IT THAT WAY, not just the label pass:
+            // the raster of an out-of-range selection is the raster of the
+            // clamped one, byte for byte — every reader (the card fill, the
+            // ink, the semibold face, the resident ✕, the separators) has to
+            // have asked the same question of the same tab to land here.
+            let selected = BandInput {
+                active: input.selected(),
+                ..band(
+                    &segments,
+                    &titles,
+                    &metadata,
+                    StripPaint::default(),
+                    geometry(80, 1),
+                )
+            };
+            let (raw_px, raw_w, raw_h) = image_of(&raster_band(&input, &[]).expect("band"));
+            let (px, w, h) = image_of(&raster_band(&selected, &[]).expect("band"));
+            assert_eq!((raw_w, raw_h), (w, h), "same strip, same canvas");
+            let differing = raw_px.iter().zip(&px).filter(|(a, b)| a != b).count();
+            assert_eq!(
+                differing, 0,
+                "the band paints a different strip for the same selection \
+                 ({differing} bytes differ)"
+            );
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// THE BAND'S OWN RASTER, on glass: four chips whose titles share a
+        /// prompt, drawn in the host's real UI face at a width where the fit
+        /// bites. Two chips painting one picture IS the defect, so the pictures
+        /// are compared pixel for pixel over each title span (which excludes
+        /// the leading rule and the close mark — anything that differs there is
+        /// the LABEL).
+        #[test]
+        fn the_painted_band_gives_no_two_chips_the_same_picture() {
+            if !with_ui_faces() {
+                return;
+            }
+            let titles: Vec<String> = ["A", "B", "C", "D"]
+                .iter()
+                .map(|leaf| format!("WMWM: ~/WWWWWWWWWW{leaf}"))
+                .collect();
+            let metadata = plain(titles.len());
+            let segments =
+                layout_segments_with_metadata(80, titles.len(), &metadata, 0, false);
+            let geometry = geometry(80, 1);
+            let label_px = band_label_px((BAND_TOP + CELL_H) as f32, 1.0);
+            let cell: Vec<String> =
+                distinct_chip_labels(&segments, &titles, Some(&metadata), 0, None)
+                    .into_iter()
+                    .map(Option::unwrap)
+                    .collect();
+            // FIXTURE GUARD, per host: this law needs a UI face whose caps
+            // out-measure the mono cell, or the fit never bites and the raster
+            // has nothing to prove. A narrower face (or none — the mono
+            // fallback) skips rather than passes vacuously.
+            let naive: Vec<String> = segments
+                .iter()
+                .filter_map(|seg| match seg.kind {
+                    TabHit::Select(i) => {
+                        let span = window(seg).1;
+                        Some(fit_label(cell[i].clone(), span, |s| {
+                            crate::tray_raster::ui_text_width_for(TextFace::Ui, s, label_px)
+                        }))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let bites = naive
+                .iter()
+                .enumerate()
+                .any(|(a, x)| naive.iter().enumerate().any(|(b, y)| a != b && x == y));
+            if !bites {
+                crate::tray_raster::clear_ui_fonts_for_test();
+                return;
+            }
+            let input = band(
+                &segments,
+                &titles,
+                &metadata,
+                StripPaint::default(),
+                geometry,
+            );
+            let rows = raster_band(&input, &[]).expect("band");
+            let (rgba, w, h) = image_of(&rows);
+            // One picture per INACTIVE chip (equal windows, so equal labels
+            // would be equal pixels), cropped to the title span.
+            let pictures: Vec<(usize, Vec<u8>)> = segments
+                .iter()
+                .filter_map(|seg| match seg.kind {
+                    TabHit::Select(i) if i != 0 => {
+                        let layout = band_content_layout(seg, Some(PLAIN_TAB), seg.end_col);
+                        let x0 = usize::from(layout.title_start) * CELL_W;
+                        let x1 = usize::from(layout.title_end) * CELL_W;
+                        let mut px = Vec::new();
+                        for y in 0..h {
+                            for x in x0..x1.min(w) {
+                                px.extend_from_slice(&rgba[(y * w + x) * 4..(y * w + x) * 4 + 4]);
+                            }
+                        }
+                        Some((i, px))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(pictures.len(), 3, "three inactive chips");
+            for (i, a) in &pictures {
+                assert!(
+                    a.chunks(4).any(|px| px != &a[..4]),
+                    "chip {i} painted a flat span — no label reached the glass"
+                );
+                for (j, b) in &pictures {
+                    assert!(
+                        i == j || a != b,
+                        "chips {i} and {j} paint the same picture — the pixel \
+                         fit collapsed two labels the cell pass told apart \
+                         ({cell:?} → {naive:?})"
+                    );
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// VISUAL CAPTURE of the PIXEL band — the two strips this pass exists
+        /// for (ten byte-identical shells, and a mixed working set) at the three
+        /// widths where the fit goes from roomy to brutal — dumped as PNGs so
+        /// the labels can be read as PIXELS rather than as asserted strings.
+        /// Not a gate: `#[ignore]`d (it needs a real UI face) and asserted only
+        /// for "it produced a band".
+        ///
+        /// ```sh
+        /// BAND_PNG_DIR=/tmp/band cargo test -p aterm-gui --lib \
+        ///     band_strip_visual_capture -- --ignored --nocapture
+        /// ```
+        #[test]
+        #[ignore = "visual capture: needs a system UI face; run with --ignored"]
+        fn band_strip_visual_capture() {
+            if !with_ui_faces() {
+                eprintln!("no UI face — visual capture skipped");
+                return;
+            }
+            let dir = std::env::var("BAND_PNG_DIR").map_or_else(
+                |_| std::env::temp_dir().join("band-strip"),
+                std::path::PathBuf::from,
+            );
+            std::fs::create_dir_all(&dir).expect("output dir");
+            // A REAL Linux band: the synthetic head above the grid, one strip
+            // row, and the seam the cards centre against.
+            let (cell_h, band_top, underline_y) = (21usize, 11usize, 17usize);
+            let strips: [(&str, Vec<String>); 2] = [
+                (
+                    "ten-identical",
+                    (0..10)
+                        .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+                        .collect(),
+                ),
+                (
+                    "mixed",
+                    [
+                        "user@m17-tower: ~/aterm · Typing a command",
+                        "user@m17-tower: ~/aterm · Ready",
+                        "user@m17-tower: $HOME/trust · Ready",
+                        "vim src/tab_bar.rs",
+                        "cargo test -p aterm-gui",
+                        "README.md",
+                    ]
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+                ),
+            ];
+            for (name, titles) in strips {
+                let metadata = plain(titles.len());
+                for cols in [80usize, 130, 200] {
+                    let segments = layout_segments_with_metadata(
+                        cols as u16,
+                        titles.len(),
+                        &metadata,
+                        0,
+                        false,
+                    );
+                    let geometry = BandGeometry {
+                        cols,
+                        cell_w: CELL_W,
+                        cell_h,
+                        strip_rows: 1,
+                        band_top_px: band_top,
+                        scale: 1.0,
+                        seam_top_px: Some(band_top + underline_y),
+                    };
+                    let input = band(
+                        &segments,
+                        &titles,
+                        &metadata,
+                        StripPaint::default(),
+                        geometry,
+                    );
+                    let rows = raster_band(&input, &[]).expect("band");
+                    let (rgba, w, h) = image_of(&rows);
+                    // Composite over the band tone (the Linux canvas is opaque
+                    // anyway; the Windows lane's transparent pixels are the
+                    // cell background, which IS this colour) and magnify, so a
+                    // 13 px label can be judged on screen.
+                    let ground = strip_colors_with_active(input.theme, None).band_bg;
+                    const ZOOM: usize = 3;
+                    let mut rgb = Vec::with_capacity(w * h * ZOOM * ZOOM * 3);
+                    for y in 0..h * ZOOM {
+                        for x in 0..w * ZOOM {
+                            let i = ((y / ZOOM) * w + x / ZOOM) * 4;
+                            let a = f32::from(rgba[i + 3]) / 255.0;
+                            for c in 0..3 {
+                                let over = f32::from(rgba[i + c]);
+                                let under = f32::from(ground[c]);
+                                rgb.push(a.mul_add(over, (1.0 - a) * under).round() as u8);
+                            }
+                        }
+                    }
+                    let path = dir.join(format!("{name}-{cols}c.png"));
+                    let file = std::fs::File::create(&path).expect("create png");
+                    let mut encoder = png::Encoder::new(
+                        std::io::BufWriter::new(file),
+                        (w * ZOOM) as u32,
+                        (h * ZOOM) as u32,
+                    );
+                    encoder.set_color(png::ColorType::Rgb);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    encoder
+                        .write_header()
+                        .expect("png header")
+                        .write_image_data(&rgb)
+                        .expect("png data");
+                    eprintln!("wrote {} ({}x{})", path.display(), w * ZOOM, h * ZOOM);
+                }
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
         #[test]
         fn multi_row_strip_gets_a_ref_list_per_row_over_one_taller_image() {
             if !with_ui_faces() {
@@ -5322,9 +6516,20 @@ mod tests {
         let metadata = [TabStripMetadata::from_presentation(&busy)];
         let segments = layout_segments_with_metadata(40, 1, &metadata, 0, false);
         let seg = segments[0];
-        assert!(seg.solo);
-        let connector = seg.connector_col.expect("solo band with marks");
-        assert_eq!(connector, seg.end_col - 2);
+        // A lone tab is a SOLO BAND only where the platform paints one
+        // ([`SOLO_TITLE_BAND`], macOS): elsewhere it is an ordinary chip, and
+        // the connector is the chip's own status cell. Both surfaces mint the
+        // mark at the same column here, so the test is total either way.
+        assert_eq!(seg.solo, SOLO_TITLE_BAND);
+        let connector = seg.connector_col.expect("a lone tab with marks");
+        // Solo band: the fixed trailing status cell. Ordinary chip: one cell
+        // inside its ✕ (or the cell the ✕ would have owned when it has none).
+        let expected = if seg.solo {
+            seg.end_col - 2
+        } else {
+            seg.close_col.map_or(seg.end_col - 2, |close| close - 2)
+        };
+        assert_eq!(connector, expected);
         assert_eq!(hit_test(&segments, connector), Some(TabHit::Connector(0)));
 
         let titles = ["one".to_string()];
@@ -6632,9 +7837,10 @@ mod tests {
         // Identical titles end to end have nothing to distinguish them — the
         // suffix shed must not truncate them to nothing (the whole title IS
         // the common suffix; it is kept instead), and no cut can tell the
-        // twins apart, so the non-active one is labelled by its ORDINAL: the
+        // twins apart, so the non-active one is labelled by its POSITION: the
         // active twin keeps as much title as fits, its sibling becomes
-        // addressable (`switch_tab_2`'s `2`) with the tail the window affords.
+        // nameable (`2`, which for the first nine is also `switch_tab_2`'s
+        // number — see `ordinal_chip_label`) with the tail the window affords.
         let twins = ["same shell".to_string(), "same shell".to_string()];
         let segments = layout_segments(30, twins.len(), 0, false);
         let labels = distinct_chip_labels(&segments, &twins, None, 0, None);
@@ -6700,7 +7906,7 @@ mod tests {
     /// active chip and NINE copies of `…d` beside it — nine tabs, no way to
     /// name any of them. Byte-identical titles have no distinguishing text for
     /// any cut to keep, so a non-active twin is labelled by its 1-based strip
-    /// ORDINAL (the number `switch_tab_<n>` answers to): bare digits in a
+    /// POSITION (`switch_tab_<n>`'s number for the first nine): bare digits in a
     /// two-cell window, `2 · …nd` where the window affords a tail. The ACTIVE
     /// twin keeps as much real title as its reserved pressure width fits.
     #[test]
@@ -6750,7 +7956,7 @@ mod tests {
 
         // The active tab is a POSITION, not tab 0: mid-strip selection keeps
         // the title there and hands every other twin its own ordinal — tab 0
-        // included (`switch_tab_1` reaches it, so `1` names it).
+        // included (`1` names it, and `switch_tab_1` reaches it).
         let segments = layout_segments(80, titles.len(), 4, false);
         let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 4, None)
             .into_iter()
@@ -6759,6 +7965,214 @@ mod tests {
         assert_eq!(resolved[4], "…command");
         assert_eq!(resolved[0], "1");
         assert_eq!(resolved[9], "10");
+    }
+
+    /// WHAT THE ORDINAL PROMISES, pinned against the things it claims — because
+    /// a label that lies about which tab it addresses is worse than a stub, and
+    /// the claim lives in a doc that no compiler checks.
+    ///
+    /// Three assertions, one per clause of [`ordinal_chip_label`]'s promise: the
+    /// ACTION range (`switch_tab_1`..`switch_tab_9`, on every platform, the
+    /// parse being un-`cfg`-gated); that NO built-in default binds it, so the
+    /// keystroke really is the user's to write; and that the hardcoded Cmd
+    /// suite's own 1..=9 chord is NOT a platform constant — it is gated on
+    /// `app_input::HARDCODED_SUPER_CHORDS`, which is off on Linux, the lane that
+    /// paints this band as a designed strip. Widen any of the three and this
+    /// test fails, which is the point: the doc has to be re-read first.
+    #[test]
+    fn only_the_first_nine_ordinals_name_an_action() {
+        use crate::keybinding::{Action, Keybindings};
+        for n in 1..=9u8 {
+            assert_eq!(
+                Action::parse(&format!("switch_tab_{n}")),
+                Some(Action::SwitchTab(n)),
+                "the first nine positions are addressable by action"
+            );
+        }
+        for n in [10u32, 11, 20, 99, 100] {
+            assert_eq!(
+                Action::parse(&format!("switch_tab_{n}")),
+                None,
+                "no action names tab {n}: its ordinal is a POSITION, and the \
+                 label's doc says exactly that"
+            );
+        }
+        for (chord, action) in Keybindings::PLATFORM_DEFAULT_PAIRS {
+            assert!(
+                !matches!(Action::parse(action), Some(Action::SwitchTab(_))),
+                "a default now binds {chord:?} to {action:?} — the ordinal's doc \
+                 says the jump-to-tab keystroke is the user's to write"
+            );
+        }
+        assert_eq!(
+            crate::app_input::HARDCODED_SUPER_CHORDS,
+            !cfg!(target_os = "linux"),
+            "the hardcoded 1..=9 chord is compiled OUT on Linux — the ordinal's \
+             doc names exactly the platforms where the number is also an address"
+        );
+    }
+
+    /// EVERY WIDTH THE LAYOUT CAN PRODUCE, walked: ten to twenty shells with
+    /// one identical title, across the whole column range the strip lays out —
+    /// equal shares, the pressure branch, and the one-cell floor. A non-active
+    /// twin's label may be its OWN position (bare, or with a tail), or the bare
+    /// elision mark where the window seats no number at all — and never a cut
+    /// of the shared title, which is the meaningless stub the ordinals replaced
+    /// (ten chips painting `…d`). The `…` windows are pinned too, because
+    /// "somewhere it paints nothing" is only an honest answer if it is exactly
+    /// the windows that can hold no number.
+    #[test]
+    fn every_strip_width_labels_a_twin_honestly() {
+        let mut marks = 0usize;
+        // Two-digit ordinals over the whole column range, and THREE-digit ones
+        // over the widths that can seat 120 chips at all — the window where the
+        // old fall-through painted `…d` on a hundred chips that share the name.
+        let sweep: [(usize, Vec<u16>); 5] = [
+            (10, (1..=240).collect()),
+            (11, (1..=240).collect()),
+            (17, (1..=240).collect()),
+            (20, (1..=240).collect()),
+            (120, (240..=1200).step_by(53).collect()),
+        ];
+        for (tabs, widths) in sweep {
+            let titles: Vec<String> = (0..tabs)
+                .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+                .collect();
+            for cols in widths {
+                for active in [0usize, tabs / 2] {
+                    let segments = layout_segments(cols, tabs, active, false);
+                    let labels = distinct_chip_labels(&segments, &titles, None, active, None);
+                    for seg in &segments {
+                        let TabHit::Select(i) = seg.kind else { continue };
+                        if i == active {
+                            continue;
+                        }
+                        let layout = tab_content_layout(seg, PLAIN_TAB);
+                        let avail =
+                            usize::from(layout.title_end.saturating_sub(layout.title_start));
+                        // Only a CUT title is the ordinals' business: a title
+                        // that fits is painted whole and is honest by
+                        // construction.
+                        if strip_display_cells(&titles[i]) <= avail {
+                            continue;
+                        }
+                        let label = labels[i].as_deref().unwrap_or("");
+                        let digits = (i + 1).to_string();
+                        let where_ = format!("{tabs} tabs, {cols} cols, tab {i}, avail {avail}");
+                        if label.is_empty() {
+                            assert_eq!(avail, 0, "{where_}: a window with room says something");
+                            continue;
+                        }
+                        if label == "…" {
+                            marks += 1;
+                            assert!(
+                                strip_display_cells(&digits) > avail,
+                                "{where_}: the mark is only for a window that \
+                                 seats no number — this one seats {digits}"
+                            );
+                            continue;
+                        }
+                        assert!(
+                            label == digits || label.starts_with(&format!("{digits} · ")),
+                            "{where_}: {label:?} is neither this tab's position \
+                             nor an honest mark"
+                        );
+                        assert!(
+                            strip_display_cells(label) <= avail,
+                            "{where_}: {label:?} overflows its window"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            marks > 0,
+            "the mark's window is reachable — if it ever stops being, this \
+             test is the place that says so"
+        );
+    }
+
+    /// THE ORDINAL'S TAIL ANSWERS TO THE SURVIVOR RULE TOO. The cluster sheds
+    /// the suffix EVERY member shares, so one member in a different state
+    /// (`· Typing a command` beside the `· Ready`s) collapses that shed to
+    /// nothing — and the tail then keeps the very furniture the shed exists to
+    /// remove. The family cut re-cuts against the suffix this title shares with
+    /// the member it reads like; the ordinal's tail is the same cut of the same
+    /// title, so it takes the same rule ([`furniture_survivor_recut`]) instead
+    /// of spending the window twice: once on a number, once on `· Ready`.
+    #[test]
+    fn an_ordinal_tail_is_never_the_shared_furniture() {
+        let titles = [
+            "~/work/aterm · Ready".to_string(),
+            "~/work/aterm · Ready".to_string(),
+            "~/work/trust · Ready".to_string(),
+            "~/work/other · Typing a command".to_string(),
+        ];
+        let segments = layout_segments(80, titles.len(), 0, false);
+        let resolved: Vec<String> = distinct_chip_labels(&segments, &titles, None, 0, None)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect();
+        let twin = &resolved[1];
+        assert!(
+            twin.starts_with("2 · "),
+            "the non-active twin is labelled by its position: {twin:?}"
+        );
+        assert!(
+            !twin.contains("Ready"),
+            "the tail is this tab's own text, not the state every chip on the \
+             strip shares: {twin:?}"
+        );
+        assert!(
+            twin.contains("aterm"),
+            "and what it spends the tail on is the cwd that names it: {twin:?}"
+        );
+        // FIXTURE GUARD: the cut the tail is MADE of — the cluster's shed
+        // collapsed to nothing by the one member in a different state, so the
+        // word-boundary cut at the tail's own budget lands squarely in the
+        // furniture. Without the survivor rule that is what the chip paints
+        // after its number, and the test would be proving nothing.
+        let seg = segments
+            .iter()
+            .find(|seg| matches!(seg.kind, TabHit::Select(1)))
+            .expect("the twin has a chip");
+        let layout = tab_content_layout(seg, PLAIN_TAB);
+        let avail = usize::from(layout.title_end.saturating_sub(layout.title_start));
+        let naive = truncate_title_tail(&titles[1], avail.saturating_sub(4));
+        assert!(
+            naive.contains("Ready") && !naive.contains("aterm"),
+            "fixture: the naive tail is pure furniture: {naive:?}"
+        );
+    }
+
+    /// ONE SELECTION, TWO READERS. `layout_segments` clamps `active` into range
+    /// before it reserves the active chip's width, so an out-of-range selection
+    /// still widens the LAST chip; the label pass has to answer the same
+    /// question about the same tab, or the chip the layout treats as selected
+    /// is handed an ordinal while no chip on the strip keeps its title.
+    #[test]
+    fn an_out_of_range_selection_resolves_like_the_clamped_one() {
+        let titles: Vec<String> = (0..4)
+            .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
+            .collect();
+        for cols in [40u16, 80, 130] {
+            let segments = layout_segments(cols, titles.len(), 99, false);
+            let clamped = layout_segments(cols, titles.len(), titles.len() - 1, false);
+            assert_eq!(segments, clamped, "fixture: the LAYOUT already clamps");
+            let out_of_range = distinct_chip_labels(&segments, &titles, None, 99, None);
+            let in_range =
+                distinct_chip_labels(&segments, &titles, None, titles.len() - 1, None);
+            assert_eq!(
+                out_of_range, in_range,
+                "{cols} cols: the labels follow the same clamp the layout did"
+            );
+            assert!(
+                out_of_range[titles.len() - 1]
+                    .as_deref()
+                    .is_some_and(|label| !label.starts_with('4')),
+                "the chip the layout widened keeps its TITLE: {out_of_range:?}"
+            );
+        }
     }
 
     /// ONE TRUNCATION DIALECT PER PRESSURE STRIP — the audit's inconsistency:

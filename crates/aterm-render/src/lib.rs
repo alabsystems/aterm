@@ -226,6 +226,105 @@ fn interned_parsed_font_lookup(bytes: &[u8]) -> Option<InternedFace> {
         .map(|(src, font)| (src.clone(), font.clone()))
 }
 
+/// One entry of [`SHARED_PARSED_FACES`]: the source bytes that were parsed, the
+/// collection index they were parsed at, and a WEAK handle to the parse.
+struct SharedFace {
+    bytes: std::sync::Arc<[u8]>,
+    index: u32,
+    font: std::sync::Weak<fontdue::Font>,
+}
+
+/// PRIMARY/CHROME face parses, shared by source bytes.
+///
+/// `fontdue::Font::from_bytes` materialises every glyph outline: MEASURED at
+/// 6.94 MB of live heap for the bundled DejaVu Sans Mono (2,044 geometry
+/// allocations). The same face was parsed THREE times in one idle process — the
+/// renderer's own build (`Renderer::from_bytes`), the seal-time rebuild
+/// (`rebuild_from_admitted`, via `fork_semantic_surface`), and the GUI chrome's
+/// fallback face (`tray_raster::default_chrome_fonts` over
+/// [`embedded_font`]) — so ~14 MB of an idle terminal's ~103 MB heap was three
+/// byte-identical copies of one font. Parsed faces are immutable and already
+/// `Arc`-shared for the styled and fallback tiers ([`StyledFace`],
+/// [`intern_parsed_font`]); this extends the same sharing to the primary tier.
+///
+/// WEAK, not strong, unlike [`PARSED_FONT_INTERN`]: the primary face is
+/// USER-CHOSEN and a settings font picker can walk dozens of families in one
+/// session. A strong store would retain every face the user ever previewed;
+/// weak handles bound the store to what is actually live, and each call prunes
+/// the entries whose last holder has dropped. The retained `bytes` are the
+/// lookup key AND the handle callers reuse, so a live entry costs nothing the
+/// caller was not already holding.
+///
+/// NO CONVERGENCE IS CLAIMED, exactly as [`intern_parsed_font`]: the parse runs
+/// outside the lock, so two threads racing on the same unparsed face can both
+/// pay for it and one result is dropped. Blocking a render thread behind
+/// another thread's font parse would be worse than the duplicate.
+static SHARED_PARSED_FACES: std::sync::Mutex<Vec<SharedFace>> = std::sync::Mutex::new(Vec::new());
+
+/// Hard cap on live cache entries. A terminal has one primary face plus the
+/// chrome's; the slack covers split panes mid-font-change. Never a correctness
+/// bound — an evicted entry only costs a re-parse, never a wrong face.
+const SHARED_PARSED_FACE_SLOTS: usize = 8;
+
+/// The parsed face for `bytes` at `index`, reusing a live parse of the IDENTICAL
+/// bytes when one exists. Returns the shared source-byte handle alongside it, so
+/// callers that retain the bytes (rustybuzz shaping, ttf-parser metric duty)
+/// share one copy of those too.
+///
+/// Keyed by BYTE EQUALITY, never a digest: handing back a different face for a
+/// hash collision would be a silent typography corruption, and the compare only
+/// runs on the rare face-load path (length pre-filters it).
+pub fn shared_parsed_face(
+    bytes: &[u8],
+    index: u32,
+) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>), String> {
+    {
+        let mut store = SHARED_PARSED_FACES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Prune first: a dead weak handle also releases its key bytes.
+        store.retain(|entry| entry.font.strong_count() > 0);
+        if let Some((src, font)) = store.iter().find_map(|entry| {
+            (entry.index == index && entry.bytes.len() == bytes.len() && &*entry.bytes == bytes)
+                .then(|| entry.font.upgrade().map(|font| (entry.bytes.clone(), font)))
+                .flatten()
+        }) {
+            return Ok((src, font));
+        }
+    }
+    // Parse OUTSIDE the lock (a broad face costs hundreds of ms); a racer's
+    // duplicate result is dropped by the re-check below.
+    let parsed = fontdue::Font::from_bytes(
+        bytes,
+        fontdue::FontSettings {
+            collection_index: index,
+            ..fontdue::FontSettings::default()
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    let font = std::sync::Arc::new(parsed);
+    let src: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    let mut store = SHARED_PARSED_FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((src, font)) = store.iter().find_map(|entry| {
+        (entry.index == index && entry.bytes.len() == bytes.len() && &*entry.bytes == bytes)
+            .then(|| entry.font.upgrade().map(|font| (entry.bytes.clone(), font)))
+            .flatten()
+    }) {
+        return Ok((src, font));
+    }
+    if store.len() >= SHARED_PARSED_FACE_SLOTS {
+        store.remove(0);
+    }
+    store.push(SharedFace {
+        bytes: src.clone(),
+        index,
+        font: std::sync::Arc::downgrade(&font),
+    });
+    Ok((src, font))
+}
+
 /// Colours as 0x00RR_GGBB: default foreground/background, the block cursor
 /// fill, and the selection-highlight background (painted under selected cells
 /// in place of the cell bg; the glyph keeps its own foreground).
@@ -1007,7 +1106,10 @@ pub struct ChromeBleed {
 /// has no glyph for a code point — so 日本語, math symbols, and the like render
 /// instead of going blank. Glyph dispatch is per-char and cached.
 pub struct Renderer {
-    font: fontdue::Font,
+    /// Shared, so a second `Renderer` over the SAME bytes — the seal-time
+    /// rebuild, a semantic fork — reuses one parse instead of paying another
+    /// whole-face outline materialisation (see [`shared_parsed_face`]).
+    font: std::sync::Arc<fontdue::Font>,
     /// Raw PRIMARY-face bytes, retained so a `rustybuzz::Face` can be built for
     /// run shaping (ligatures). `None` when no bytes were available (e.g. a font
     /// loaded only by path that failed to re-read) — ligatures then cleanly
@@ -5585,8 +5687,9 @@ mod font_enum_tests {
 impl Renderer {
     /// Build from explicit font bytes at a given pixel size.
     pub fn from_bytes(bytes: &[u8], px: f32, theme: Theme) -> Result<Self, String> {
-        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-            .map_err(|e| e.to_string())?;
+        // One parse per distinct face in the process: the seal-time rebuild and
+        // every semantic fork over these same bytes reuse it (`shared_parsed_face`).
+        let (primary_bytes, font) = shared_parsed_face(bytes, 0)?;
         // FONT-DISPLAY-FIT: a bundled PROPORTIONAL display face rasterizes a notch
         // smaller and takes its cell from the widest advance, not `M` (see
         // [`DisplayFaceFit`]). Every other face — including the monospaced bundled
@@ -5618,7 +5721,9 @@ impl Renderer {
             font,
             // Retain the primary bytes (as a shared Arc) so run shaping can build a
             // rustybuzz::Face — and so `row_glyph_plan` clones a handle, not the font.
-            rb_primary_bytes: Some(std::sync::Arc::from(bytes)),
+            // The handle comes from the face cache, so N renderers over one face
+            // share ONE byte copy as well as one parse.
+            rb_primary_bytes: Some(primary_bytes),
             // W9: resolved below by `refresh_variations` (needs the fields built).
             var_coords: None,
             vf_bold_coords: None,
@@ -6165,13 +6270,14 @@ impl Renderer {
     /// and the existing face is left untouched. The fallback / injected-bold / emoji
     /// faces are NOT reset — they cover what the new primary misses just as before.
     pub fn set_primary_font(&mut self, bytes: &[u8]) -> Result<(), String> {
-        let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
-            .map_err(|e| e.to_string())?;
+        // Shared parse (see `shared_parsed_face`): swapping BACK to a face another
+        // pane still holds costs a lookup, not a whole-face re-materialisation.
+        let (primary_bytes, font) = shared_parsed_face(bytes, 0)?;
         font.horizontal_line_metrics(self.px)
             .ok_or("font has no horizontal line metrics at the current px")?;
         let adv = font.metrics('M', self.px).advance_width;
         self.font = font;
-        self.rb_primary_bytes = Some(std::sync::Arc::from(bytes));
+        self.rb_primary_bytes = Some(primary_bytes);
         // W9: the old face's variation coords are meaningless on the new
         // bytes — reset BEFORE any metrics derivation below reads them, then
         // re-resolve for the new face at the end.
@@ -6823,14 +6929,13 @@ impl Renderer {
                     break;
                 }
                 if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
-                    && let Ok(font) = fontdue::Font::from_bytes(
-                        bytes.as_slice(),
-                        fontdue::FontSettings::default(),
-                    )
+                    // Shared parse: the GUI chrome draws bold labels from the same
+                    // `-Bold.ttf` sibling, so this face was materialised twice.
+                    && let Ok((bytes, font)) = shared_parsed_face(bytes.as_slice(), 0)
                 {
                     self.styled_faces[slot] = Some(StyledFace {
-                        font: std::sync::Arc::new(font),
-                        bytes: std::sync::Arc::from(bytes.into_boxed_slice()),
+                        font,
+                        bytes,
                         index: 0,
                         gid_cache: FxHashMap::default(),
                     });
@@ -10488,7 +10593,7 @@ impl Renderer {
                         }
                         FacePick::Styled { slot, .. } => self.styled_faces[*slot]
                             .as_ref()
-                            .map_or(&self.font, |sf| sf.font.as_ref()),
+                            .map_or(self.font.as_ref(), |sf| sf.font.as_ref()),
                         FacePick::Primary => &self.font,
                     };
                     let (m, b) = face.rasterize_indexed(gid, self.px);
@@ -20178,6 +20283,78 @@ impl Rasterizer for Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MEMORY: two renderers over the SAME primary bytes must share ONE parsed
+    /// face, not hold two whole-face outline materialisations.
+    ///
+    /// This is the shape the shipping process actually builds: the backend
+    /// worker's `Renderer::from_bytes`, then the seal-time `rebuild_from_admitted`
+    /// and every semantic fork over the identical bytes. Measured before
+    /// `shared_parsed_face`, each of those parses cost 6.94 MB of live heap for
+    /// the bundled DejaVu Sans Mono alone.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn identical_primary_bytes_share_one_parsed_face() {
+        let a = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
+            .expect("embedded font builds a renderer");
+        let b = Renderer::from_bytes(embedded_font(), 20.0, Theme::default())
+            .expect("embedded font builds a renderer at another px");
+        assert!(
+            std::sync::Arc::ptr_eq(&a.font, &b.font),
+            "identical primary bytes must reuse one parse (px is a rasterize \
+             argument, not a property of the parse)"
+        );
+        // The retained source bytes ride the same handle, so the raw blob is
+        // shared too (rustybuzz shaping and ttf-parser metric duty read it).
+        let (Some(ra), Some(rb)) = (a.rb_primary_bytes.as_ref(), b.rb_primary_bytes.as_ref())
+        else {
+            panic!("from_bytes retains the primary bytes");
+        };
+        assert!(std::sync::Arc::ptr_eq(ra, rb), "source bytes share one copy");
+    }
+
+    /// The cache is keyed by CONTENT, so a genuinely different face never
+    /// aliases another's parse — the failure mode that would render the wrong
+    /// glyphs. A digest key could collide; byte equality cannot.
+    #[cfg(feature = "embedded-font")]
+    #[test]
+    fn a_different_face_never_aliases_a_cached_parse() {
+        let (_, primary) = shared_parsed_face(embedded_font(), 0).expect("bundled face parses");
+        // Truncating the blob yields bytes fontdue must either reject or parse
+        // as its OWN face — never as the cached one.
+        let mut other = embedded_font().to_vec();
+        other.truncate(other.len() - 1);
+        if let Ok((_, parsed)) = shared_parsed_face(&other, 0) {
+            assert!(
+                !std::sync::Arc::ptr_eq(&primary, &parsed),
+                "different bytes must never share a parse"
+            );
+        }
+    }
+
+    /// The cache holds WEAK handles: once every renderer over a face is dropped,
+    /// the parse is released rather than retained for the process lifetime. This
+    /// is what makes a settings font picker — which can walk dozens of families —
+    /// bounded instead of a slow leak of ~7 MB per previewed face.
+    #[test]
+    fn a_dropped_face_is_released_not_retained() {
+        // A bundled DISPLAY face, deliberately not the primary: nothing else in
+        // this test binary builds a renderer or a chrome face from it, so this
+        // test owns the only strong reference and the assertion is about the
+        // cache's weakness, not about test scheduling.
+        let bytes = display_face_bytes("bubble").expect("bundled display face");
+        let weak = {
+            let (_, font) = shared_parsed_face(bytes, 0).expect("bundled face parses");
+            std::sync::Arc::downgrade(&font)
+        };
+        assert!(
+            weak.upgrade().is_none(),
+            "the cache must not keep a face alive after its last holder drops"
+        );
+        // And the entry does not wedge the cache: the next request re-parses.
+        let (_, again) = shared_parsed_face(bytes, 0).expect("re-parse after release");
+        assert!(again.horizontal_line_metrics(16.0).is_some());
+    }
 
     /// PERF/parity: the per-blit hoisted corrected-blend path ([`blend_text_pre`]
     /// over a precomputed [`TextBlendPre`]) returns BYTE-FOR-BYTE what the

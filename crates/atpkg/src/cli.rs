@@ -2791,28 +2791,40 @@ fn cmd_update_all() -> ExitCode {
             )
             .ok()
             .map(|index| !seed_serviceable(&layout, &*fetcher, &index, cfg).is_empty());
-            let (said, state) = if serves_us == Some(true) {
-                // The index DOES publish for this triple, so something else refused
-                // every member — a revocation, a floor, a filter. Saying "no build
-                // for your architecture" here sends the user to fix the wrong thing.
-                (
-                    format!(
-                        "nothing is installed and nothing was installable — the index \
-                         publishes builds for {} but every one was refused (revoked, \
-                         below the floor, or filtered out); see `aterm pkg doctor`",
-                        current_triple()
-                    ),
-                    "unavailable: every published build was refused",
-                )
-            } else {
-                (
+            let (said, state) = match serves_us {
+                Some(true) => {
+                    // The index DOES publish for this triple, so something else refused
+                    // every member — a revocation, a floor, a filter. Saying "no build
+                    // for your architecture" here sends the user to fix the wrong thing.
+                    (
+                        format!(
+                            "nothing is installed and nothing was installable — the index \
+                             publishes builds for {} but every one was refused (revoked, \
+                             below the floor, or filtered out); see `aterm pkg doctor`",
+                            current_triple()
+                        ),
+                        "unavailable: every published build was refused",
+                    )
+                }
+                Some(false) => (
                     format!(
                         "nothing is installed and nothing was installable — no published \
                          build was found for this machine's architecture ({})",
                         current_triple()
                     ),
                     "unavailable: no build for this architecture",
-                )
+                ),
+                // `None` = the index never RESOLVED — an offline machine, a rate
+                // limit, a proxy. Blaming the CPU here (as this arm used to) told
+                // a user with a network hiccup that their machine can never be
+                // served, the exact inversion of the truth (audit-2 item 6).
+                None => (
+                    "nothing is installed — the signed index could not be reached, so \
+                     nothing could be checked or fetched. When the connection is back, \
+                     re-run: aterm pkg install --default-set"
+                        .to_string(),
+                    "unavailable: index unreachable",
+                ),
             };
             eprintln!("atpkg: {said}");
             record_status(

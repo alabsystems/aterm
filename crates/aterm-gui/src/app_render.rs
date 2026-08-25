@@ -77,6 +77,16 @@ const SHED_FADE_IN_SECS: f32 = 0.25;
 /// ~9 frames at 60 Hz — generous for any legitimate multi-write update batch.
 const SYNC_HOLD_CAP: std::time::Duration = std::time::Duration::from_millis(150);
 
+/// How long one key/text egress holds the cursor-effect TYPED WAKE
+/// ([`App::cursor_fx_focus`]) for its window. Must outlive every cursor
+/// effect's visible decay so expiry never chops live light: the comet trail's
+/// lifetime clamps at 2 s (`cursor_trail_ms_or_default`), and the aurora /
+/// rainbow-momentum tails drain within a couple of seconds of the last key —
+/// 5 s covers all of them with margin while still returning an idle unfocused
+/// window to W11b's demoted-static state (FL-1's settle re-engages once the
+/// engines drain).
+pub(crate) const CURSOR_FX_TYPED_WAKE: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// One window's decision after comparing two non-destructive terminal scroll
 /// snapshots. `translated_rows` carries the exact cumulative distance (up to
 /// the engine's `u16` coordinate contract); a larger value retires wholesale.
@@ -147,9 +157,10 @@ fn confirm_cursor_move_candidate(
     let ownership = window
         .cursor_glow
         .observe_content_generation(generation, cur, candidate_confirmed);
+    let witness = window.cursor_glow.batch_wake_witness();
     window
         .cursor_trail
-        .observe_content_generation(generation, ownership);
+        .observe_content_generation(generation, ownership, witness.as_ref());
     if matches!(
         ownership,
         aterm_effects::cursor_trail::GenerationOwnership::UnownedRelocation
@@ -9882,6 +9893,138 @@ mod motion_policy_tests {
         assert_eq!(app.motion_policy(true), MotionPolicy::Reduced);
     }
 
+    /// The cursor-effect TYPED WAKE (`App::cursor_fx_focus`): a key/text
+    /// egress into a window pins the motion policy's FOCUS input for THAT
+    /// window while the wake is live, and only for it — the predicate whose
+    /// absence was the v0.48–v0.50 real-window trail/kitty blackout (typed
+    /// windows without OS key focus composed under W11b's amplitude-0
+    /// demotion while the admission ring read perfectly healthy). Like the
+    /// recording pin, the wake never touches the MODE inputs: OS
+    /// Reduce-Motion still demotes a woken window.
+    #[test]
+    fn typed_wake_pins_cursor_fx_focus() {
+        use std::time::{Duration, Instant};
+
+        use crate::WindowId;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        // Idle + unfocused: the W11b baseline demotion holds.
+        assert!(!app.cursor_fx_focus(wid, false, t0));
+        assert_eq!(
+            app.motion_policy(app.cursor_fx_focus(wid, false, t0)),
+            MotionPolicy::Reduced,
+            "an idle unfocused window stays demoted"
+        );
+        // One key egress stamps the wake (`last_key_at`, both input sources)…
+        app.windows.get_mut(&wid).expect("window").last_key_at = Some(t0);
+        assert!(
+            app.cursor_fx_focus(wid, false, t0 + Duration::from_millis(1)),
+            "a live typed wake pins the focus input"
+        );
+        assert_eq!(
+            app.motion_policy(app.cursor_fx_focus(wid, false, t0 + Duration::from_millis(1))),
+            MotionPolicy::Full,
+            "a typed-into unfocused window animates its earned trail"
+        );
+        // …for the typed window ONLY (a sibling stays demoted)…
+        assert!(
+            !app.cursor_fx_focus(WindowId(1), false, t0 + Duration::from_millis(1)),
+            "the wake is per-window, not app-global"
+        );
+        // …and it EXPIRES: past the hold the demotion re-engages, so an idle
+        // unfocused window still does no decorative work (FL-1's settle).
+        assert!(
+            !app.cursor_fx_focus(
+                wid,
+                false,
+                t0 + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1)
+            ),
+            "an expired wake demotes again"
+        );
+        // The wake never overrides the accessibility mode.
+        app.system_reduce_motion = true;
+        assert_eq!(
+            app.motion_policy(app.cursor_fx_focus(wid, false, t0 + Duration::from_millis(1))),
+            MotionPolicy::Reduced,
+            "OS Reduce-Motion still demotes a typed-into window"
+        );
+    }
+
+    /// Tier-1 for the blackout itself, at the real seam: `tick_cursor_fx` on
+    /// an UNFOCUSED window with a live typed wake emits real comet cells into
+    /// `trail_scratch` — the exact frame shape v0.48–v0.50 composed as zero
+    /// pixels — and an idle unfocused tick past the wake's expiry drains back
+    /// to the demoted-static state (no resident trail), keeping FL-1's
+    /// settled-window early-out honest.
+    #[test]
+    fn typed_wake_lets_an_unfocused_window_paint_its_trail() {
+        use std::time::{Duration, Instant};
+
+        use super::CursorFxInputs;
+        use crate::WindowId;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("comet".into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        app.windows.get_mut(&wid).expect("window").focused = false;
+
+        // Seed the engines on the unfocused window (no wake yet): demoted.
+        let mut seed = CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        let seeded = app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
+        assert!(
+            !seeded.win_focused,
+            "unfocused + idle: W11b demotes (negative control)"
+        );
+
+        // A keystroke arrives: the input path stamps `last_key_at` and heats
+        // the cadence (`App::input`'s egress arm — both sources), and the
+        // engines see a typed move. The next tick must paint the trail even
+        // though the window never held OS key focus.
+        let typed = t0 + Duration::from_millis(1);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.last_key_at = Some(typed);
+            ws.typing_cadence.on_keystroke(typed);
+            ws.cursor_glow.note_synthetic_move(typed);
+            ws.cursor_trail.note_synthetic_move(typed);
+        }
+        let mut live = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(2));
+        live.cur = Some((2, 5));
+        let live_tick = app.tick_cursor_fx(wid, live).expect("live cursor tick");
+        assert!(
+            live_tick.win_focused,
+            "the typed wake pins the tick's focus fold"
+        );
+        assert_eq!(live_tick.motion, MotionPolicy::Full);
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            !ws.trail_scratch.is_empty(),
+            "an unfocused window paints the trail its typing earned \
+             (the v0.48–v0.50 real-window blackout frame)"
+        );
+
+        // Past the wake's hold (which outlives every effect decay) the
+        // demotion re-engages and the engines drain to proven-zero.
+        let mut idle =
+            CursorFxInputs::sample_for_test(typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1));
+        idle.cur = Some((2, 5));
+        let idle_tick = app.tick_cursor_fx(wid, idle).expect("idle tick");
+        assert!(
+            !idle_tick.win_focused,
+            "an idle unfocused window demotes again (FL-1 settle intact)"
+        );
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.trail_scratch.is_empty(),
+            "the drained unfocused window holds no resident trail"
+        );
+    }
+
     /// The `motion_focus` RECORDING PIN: an in-flight `video` capture feeds
     /// `true` into the policy's FOCUS input for the RECORDED window only — a
     /// control-socket recording is a watcher, so the unfocused demotion (W11b)
@@ -11270,6 +11413,37 @@ impl App {
         focused || self.video_rec.as_ref().is_some_and(|v| v.window == id)
     }
 
+    /// The focus bit the CURSOR-EFFECT seams (aurora / comet / rainbow-kitty
+    /// companion) feed the motion policy for window `id`:
+    /// [`Self::motion_focus`] (OS focus OR the recording pin) OR'd with a LIVE
+    /// TYPED WAKE — a key/text egress into THIS window within
+    /// [`CURSOR_FX_TYPED_WAKE`] (`WindowState::last_key_at`, stamped on the
+    /// PTY-bound key path for BOTH input sources, physical and control-socket).
+    ///
+    /// W11b demotes an unfocused window because BACKGROUND motion is pure
+    /// decoration — but a window RECEIVING typed input is being driven, and
+    /// the trail those keystrokes earn is typing feedback, not idle ornament.
+    /// Without this wake the demotion hard-zeroed the typed trail whenever the
+    /// typed window did not hold OS key focus: control-socket typing never
+    /// grants key focus, and a handoff-adopted window may never observe a
+    /// `Focused(true)` — the v0.48–v0.50 real-window trail/kitty blackout,
+    /// which every `ctl video`-measured proof missed because the recording pin
+    /// above un-suppresses exactly this gate for the recorded window.
+    ///
+    /// The wake fires only on typing and expires: an idle unfocused window
+    /// still demotes (FL-1's settle is intact — the hold outlives every
+    /// effect's decay, so expiry never chops live light), and OS Reduce-Motion
+    /// / `motion = "reduced"` / load-shed still zero the amplitude exactly as
+    /// [`crate::motion::MotionPolicy::resolve`] proves — like the recording
+    /// pin, the wake touches the FOCUS input only, never the mode.
+    pub(crate) fn cursor_fx_focus(&self, id: WindowId, focused: bool, now: Instant) -> bool {
+        self.motion_focus(id, focused)
+            || self
+                .windows
+                .get(&id)
+                .is_some_and(|ws| ws.cursor_fx_typed_wake(now))
+    }
+
     /// Whether the raw overload latch is allowed to suppress decorative work
     /// under the current user policy. `perf_reduced` is diagnostic history;
     /// explicit `motion = "full"` and `load_adaptive_motion = false` both opt
@@ -11650,8 +11824,13 @@ impl App {
         // static). Each consumer takes its amplitude from this single value.
         // An in-flight `video` recording of THIS window pins the focus input
         // (`motion_focus`): the recording is a watcher, so the glass animates.
+        // A LIVE TYPED WAKE pins it too (`cursor_fx_focus`): typing into an
+        // unfocused window — control-socket driving, a handoff-adopted window
+        // that never saw `Focused(true)` — earns its trail as typing feedback,
+        // where W11b's demotion used to hard-zero it (the v0.48–v0.50
+        // real-window trail/kitty blackout).
         let raw_focused = self.windows.get(&id)?.focused;
-        let win_focused = self.motion_focus(id, raw_focused);
+        let win_focused = self.cursor_fx_focus(id, raw_focused, frame_started);
         let motion = self.motion_policy(win_focused);
         let cursor_body_allowed = self
             .serious_mode_policy()
@@ -12531,7 +12710,9 @@ impl App {
                 None
             }
         };
-        let focused = self.motion_focus(wid, raw_focused);
+        // Same TYPED-WAKE fold as the single-pane path (`cursor_fx_focus`):
+        // typing into an unfocused window keeps its earned trail/kitty light.
+        let focused = self.cursor_fx_focus(wid, raw_focused, now);
         let mode = self.config.motion_mode();
         let policy = crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, focused);
         let shed = if mode != crate::motion::MotionMode::Full
@@ -19209,7 +19390,9 @@ impl App {
         // path: Reduced (config / OS flag / unfocused window) ⇒ intensity 0 —
         // with the same `motion_focus` recording pin as the single-pane path.
         let raw_focused = self.windows.get(&wid)?.focused;
-        let focused = self.motion_focus(wid, raw_focused);
+        // Same TYPED-WAKE fold as the single-pane path (`cursor_fx_focus`):
+        // typing into an unfocused window keeps its earned trail/kitty light.
+        let focused = self.cursor_fx_focus(wid, raw_focused, now);
         let cursor_body_allowed = self
             .serious_mode_policy()
             .allows(crate::motion::SeriousEffect::CursorBody);
@@ -21643,6 +21826,36 @@ impl App {
         ws.input_scratch.cursor_visible = false;
     }
 
+    /// The palette a FLOATING CHROME CARD rasterizes from — the build badge, the
+    /// notice pill, the package-progress card. All three are CHROME: they float
+    /// above whatever route the window is showing, and
+    /// [`Self::compose_native_route_card`] folds them into a NATIVE route's tray,
+    /// where a terminal-themed card lands on a chrome-themed page. So they take
+    /// the chrome-resolved palette ([`Self::chrome_palette_theme`]) for exactly
+    /// the reason the modal panel at [`Self::append_native_modal_prims`] does:
+    /// otherwise config `window_theme = light` grows a dark toast on a
+    /// forced-light Settings page.
+    ///
+    /// The live OSC-11 tint is applied only where chrome IS the terminal (every
+    /// platform but Linux, and Linux `window_theme = auto` or a config side the
+    /// terminal theme already occupies). Once the operator has forced the chrome
+    /// AGAINST the terminal palette, following the program's `\e]11;` background
+    /// is following the surface these cards deliberately no longer sit on.
+    fn chrome_card_theme(&self, wid: WindowId) -> aterm_render::Theme {
+        let chrome = self.chrome_palette_theme();
+        if (chrome.bg, chrome.fg) != (self.theme.bg, self.theme.fg) {
+            return chrome;
+        }
+        let mut theme = self.theme;
+        if let Some(ws) = self.windows.get(&wid) {
+            let live = ws.input_scratch.default_bg;
+            if live != aterm_core::render::COLOR_UNSET {
+                theme.bg = live;
+            }
+        }
+        theme
+    }
+
     /// Rasterize the subtle top-right build/version badge into its OWN paint-only
     /// `badge_card` slot (which NEVER gates the mouse — unlike the modal `settings_card`).
     /// No-op ⇒ `badge_card = None` when the `show_build_badge` setting is off
@@ -21668,14 +21881,9 @@ impl App {
             }
             return;
         }
-        // Tint off the live OSC-11 background exactly as `splice_settings_panel` does.
-        let mut theme = self.theme;
-        if let Some(ws) = self.windows.get(&wid) {
-            let live = ws.input_scratch.default_bg;
-            if live != aterm_core::render::COLOR_UNSET {
-                theme.bg = live;
-            }
-        }
+        // Chrome-resolved, then tinted off the live OSC-11 background exactly as
+        // `splice_settings_panel` does wherever chrome still follows the terminal.
+        let theme = self.chrome_card_theme(wid);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as u32;
         let pad_top = self.win_pad_top(wid) as u32;
@@ -21697,6 +21905,13 @@ impl App {
             pad.hash(&mut h);
             pad_top.hash(&mut h);
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
+            // …and the PALETTE it paints from, exactly as `splice_pkg_progress`
+            // folds its own: a live OSC-11 background or a `window_theme` flip
+            // moves the pill's tones, and a resident raster keyed on geometry
+            // alone would sit out both.
+            theme.bg.hash(&mut h);
+            theme.fg.hash(&mut h);
+            theme.cursor.hash(&mut h);
             h.finish()
         };
         if ws
@@ -21781,15 +21996,11 @@ impl App {
             }
             return;
         }
-        // Tint off the live OSC-11 background, like the badge/settings splices.
-        let mut theme = self.theme;
-        let cursor = crate::settings::u32_rgb(self.theme.cursor);
-        if let Some(ws) = self.windows.get(&wid) {
-            let live = ws.input_scratch.default_bg;
-            if live != aterm_core::render::COLOR_UNSET {
-                theme.bg = live;
-            }
-        }
+        // Chrome-resolved and OSC-11 tinted, like the badge/settings splices —
+        // including the accent the pill's own rule wears, which the forced
+        // palette carries from the terminal theme.
+        let theme = self.chrome_card_theme(wid);
+        let cursor = crate::settings::u32_rgb(theme.cursor);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as u32;
         let pad_top = self.win_pad_top(wid) as u32;
@@ -21815,6 +22026,10 @@ impl App {
             pad.hash(&mut h);
             pad_top.hash(&mut h);
             head.hash(&mut h); // the dy anchor moves with the chrome headroom
+            // …and the palette, for the reason `splice_build_badge` states.
+            theme.bg.hash(&mut h);
+            theme.fg.hash(&mut h);
+            theme.cursor.hash(&mut h);
             h.finish()
         };
         // Post-merge reconciliation: the keys-era notice_tray takes the
@@ -21982,14 +22197,8 @@ impl App {
             }
             return;
         }
-        // Tint off the live OSC-11 background, like every card splice.
-        let mut theme = self.theme;
-        if let Some(ws) = self.windows.get(&wid) {
-            let live = ws.input_scratch.default_bg;
-            if live != aterm_core::render::COLOR_UNSET {
-                theme.bg = live;
-            }
-        }
+        // Chrome-resolved and OSC-11 tinted, like every card splice.
+        let theme = self.chrome_card_theme(wid);
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid) as u32;
         let pad_top = self.win_pad_top(wid) as u32;
@@ -24168,6 +24377,95 @@ mod config_notice_overlay_tests {
         assert!(
             title.to_ascii_lowercase().contains("config"),
             "native framebuffer includes the diagnostic cell band: {title:?}"
+        );
+    }
+
+    /// A floating chrome card is CHROME. It follows the live OSC-11 background
+    /// only while chrome IS the terminal; once `window_theme` forces the chrome
+    /// AGAINST the terminal palette, the badge/notice/progress cards take the
+    /// page's palette like the modal panel already does — otherwise a
+    /// forced-light Settings page grows a dark toast, and a program's `\e]11;`
+    /// background repaints a card that no longer sits on it.
+    #[test]
+    fn a_floating_chrome_card_takes_the_page_palette_over_the_terminal_background() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.prepare_terminal_capture_grid(wid).unwrap();
+        let recoloured = 0x0012_0034;
+        app.windows.get_mut(&wid).unwrap().input_scratch.default_bg = recoloured;
+        assert_eq!(
+            app.chrome_card_theme(wid).bg,
+            recoloured,
+            "chrome that IS the terminal still follows the program's background"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            app.window_theme = crate::app_config::WindowTheme::Light;
+            let forced = app.chrome_card_theme(wid);
+            assert_eq!(
+                (forced.bg, forced.fg),
+                (
+                    crate::native_appearance::FORCED_LIGHT_CHROME_BG,
+                    crate::native_appearance::FORCED_LIGHT_CHROME_FG
+                ),
+                "a forced-light page's cards are painted on the forced-light palette"
+            );
+            assert_eq!(
+                forced.selection, app.theme.selection,
+                "the accent identity is still the terminal theme's"
+            );
+        }
+    }
+
+    /// …and the raster proves it: the notice pill composited over a FORCED-LIGHT
+    /// native route is light, where the same pill over the same (dark) terminal
+    /// theme is dark. The staleness key has to carry the palette too, or the
+    /// second splice would hand back the first one's cached bytes.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_notice_pill_over_a_forced_light_page_is_a_light_pill() {
+        fn pill_luma(app: &mut App, wid: WindowId) -> f32 {
+            app.splice_notice(wid);
+            let card = app.windows[&wid]
+                .notice_card
+                .as_ref()
+                .expect("the notice splice painted a pill");
+            // The pill's own body, sampled at the card's centre (the shadow
+            // margin and the rounded corners live at the edges).
+            let (x, y) = (card.pw / 2, card.ph / 2);
+            let i = ((y * card.pw + x) * 4) as usize;
+            let px = &card.rgba[i..i + 4];
+            0.2126f32.mul_add(
+                f32::from(px[0]),
+                0.7152f32.mul_add(f32::from(px[1]), 0.0722 * f32::from(px[2])),
+            )
+        }
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
+        assert!(app.prepare_native_input_scratch(wid));
+        app.notice = Some(crate::notice::TransientNotice::update_status(
+            "checking for updates",
+            Instant::now() - std::time::Duration::from_millis(400),
+        ));
+
+        assert!(
+            crate::tab_bar::theme_is_dark(app.theme.bg),
+            "precondition: the default terminal theme is dark"
+        );
+        app.window_theme = crate::app_config::WindowTheme::Auto;
+        let terminal_toned = pill_luma(&mut app, wid);
+        app.window_theme = crate::app_config::WindowTheme::Light;
+        let forced_light = pill_luma(&mut app, wid);
+
+        assert!(
+            terminal_toned < 96.0,
+            "chrome that extends the terminal keeps a dark pill: {terminal_toned:.1}"
+        );
+        assert!(
+            forced_light > 160.0,
+            "a forced-light page carries a light pill: {forced_light:.1}"
         );
     }
 }

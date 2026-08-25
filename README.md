@@ -468,13 +468,15 @@ aterm trustc --help
 aterm pkg list
 ```
 
-The app is universal, and so is most of the toolchain: the public package index
-carries Apple-silicon macOS, Intel macOS, and x86_64 Linux builds under the same
-build numbers. On an Intel Mac `aterm pkg` installs the solvers and tools — `ay`,
-`clean`, `nn`, `ny`, `ty`, `trust-mc` — from the network; the `trust` compiler
-and the rest of its coherence group have no Intel-Mac build yet and are skipped
-there until one publishes. The Linux `trust` bundle is a genesis-lineage build
-(stock stage0 Rust), not Trust-from-Trust.
+The app is universal — Apple-silicon macOS, Intel macOS, and x86_64 Linux — and
+the toolchain index publishes per-architecture builds under the same build
+numbers where they exist. On an Intel Mac `aterm pkg` installs the solvers and
+tools — `ay`, `clean`, `nn`, `ny`, `ty`, `trust-mc` — from the network; the
+`trust` compiler and the rest of its coherence group have no Intel-Mac build yet
+and are skipped there until one publishes. Linux toolchain builds are not
+published yet: the terminal itself works fully, `aterm pkg` says so honestly
+("no build for this architecture"), and the toolset installs automatically once
+Linux artifact rows publish.
 
 `aterm <tool>` resolves against the managed store — never `$PATH` — so aterm's
 own verbs cannot be shadowed. Settings ▸ Packages ▸ Install ALab Toolset (or

@@ -601,6 +601,67 @@ impl TextSelection {
         self.clamp_head_to_min_row(min_row)
     }
 
+    /// Re-anchor endpoints across a rows-only SHRINK.
+    ///
+    /// A rows-only resize rewraps nothing, but a SHRINK still moves the coordinate
+    /// space: the rows the viewport gives up become the newest history. Since
+    /// `e6b1cefa` made the in-place rows-only shapes anchor at the CURSOR, that
+    /// movement is a PURE RELABEL — every row, live and already-archived alike,
+    /// moves by exactly `-removed_rows`:
+    ///
+    /// ```text
+    /// BEFORE (10 rows)          AFTER (6 rows)
+    ///   rel -1: line-54           rel -5: line-54
+    ///   rel  0: line-55           rel -4: line-55
+    ///   rel  7: line-62           rel  3: line-62
+    /// ```
+    ///
+    /// So it is exactly [`Self::adjust_for_scroll`] with `delta = removed_rows`,
+    /// and this is a named delegation rather than its own arithmetic.
+    ///
+    /// **This function used to be piecewise, and the history is worth keeping.**
+    /// The shrink previously performed a #7662 bottom-push,
+    /// `[hist | V0..Vv-1] -> [hist | Vt..Vv-1 | V0..Vt-1]`, demoting the BOTTOM
+    /// `removed_rows` viewport rows while the top `kept_rows` stayed put. That map
+    /// was NON-MONOTONIC — row `kept_rows - 1` did not move while row `kept_rows`
+    /// jumped below every scrollback row that preceded it — so a span straddling the
+    /// cut remapped to a REVERSED, WIDER range and the copy walk
+    /// (`for row in first_row..=last_row`) returned rows the user never selected.
+    /// It needed a regime guard that cleared such a span outright.
+    ///
+    /// Cursor anchoring removed the need for all of it: a monotonic map cannot
+    /// reverse a span, so there is nothing to guard. If the rows-only shapes ever
+    /// stop anchoring at the cursor, the straddle hazard comes back with them.
+    ///
+    /// Passing 0 (which is what `take_last_resize_row_shift()` returns on a shrink)
+    /// leaves every anchor `removed_rows` rows off its content: the highlight covers
+    /// different text and a copy returns lines the user never selected — the same
+    /// wrong-copy class the rows-GROW direction already had.
+    ///
+    /// Returns `false` (and clears) when an endpoint is above the pre-resize live
+    /// bottom — content that never existed; an endpoint evicted below the history
+    /// floor CLAMPS rather than destroying the half the user can still see.
+    pub fn adjust_for_rows_shrink(
+        &mut self,
+        kept_rows: i32,
+        removed_rows: i32,
+        floor: i32,
+    ) -> bool {
+        if self.state == SelectionState::None {
+            return true;
+        }
+        // Degenerate geometry from an FFI/host caller: fall back to the uniform
+        // range check rather than inventing a cut point (#7541's guard, shared).
+        if kept_rows <= 0 || removed_rows <= 0 {
+            return self.adjust_for_scroll(0, kept_rows, floor);
+        }
+        // `kept_rows` is the POST-shift live bottom, which is what the bound check
+        // inside `adjust_for_scroll` compares against: a legitimate pre-resize row
+        // in `0..kept_rows + removed_rows` lands in `-removed_rows..kept_rows`, and
+        // anything above the pre-resize bottom lands above `kept_rows` and clears.
+        self.adjust_for_scroll(removed_rows, kept_rows, floor)
+    }
+
     /// Translate both anchor rows into a presentation coordinate space.
     ///
     /// This is for composition-only offsets such as prepending window chrome or

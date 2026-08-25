@@ -274,8 +274,31 @@ fn path_search(exe: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
         .map(|dir| dir.join(exe))
-        .find(|cand| cand.is_file())
+        .find(|cand| cand.is_file() && !is_pending_stub(cand))
 }
+
+/// Is this candidate atpkg's PENDING-PROGRAM stub rather than the tool?
+///
+/// A program the registry lists but has not installed yet still gets a file in
+/// the store's `bin/`: a tiny script that prints "not installed yet" and exits
+/// nonzero, so an interactive shell explains itself instead of saying "command
+/// not found". Discovery must not mistake that placeholder for the tool — a
+/// harness that runs it reads the refusal as the tool's OUTPUT and fails hard
+/// (measured: the spec-xref gate hard-failed on this box the moment a pending
+/// `trust-ir` stub reached PATH, where before it had cleanly skipped). The stub
+/// names itself on its second line; anything unreadable is treated as a real
+/// binary, because a false "pending" would hide an installed tool.
+fn is_pending_stub(cand: &Path) -> bool {
+    let Ok(bytes) = std::fs::read(cand) else {
+        return false;
+    };
+    let head = &bytes[..bytes.len().min(256)];
+    head.windows(PENDING_STUB_MARKER.len())
+        .any(|w| w == PENDING_STUB_MARKER)
+}
+
+/// The self-identifying line atpkg writes into every pending-program stub.
+const PENDING_STUB_MARKER: &[u8] = b"atpkg pending-program stub";
 
 /// Locate the Trust `ty` model-checker for `label`, or PANIC with a build hint.
 /// Verification is ALWAYS required — no env var, no skip. A conformance test that
@@ -1585,6 +1608,36 @@ fn transition_trace_json(
 
 #[cfg(test)]
 mod tests {
+    use super::is_pending_stub;
+
+    /// A pending-program stub on PATH is NOT the tool: discovery must skip it,
+    /// or a harness runs the placeholder and reads its refusal as tool output
+    /// (the spec-xref gate hard-failed exactly that way once a pending
+    /// `trust-ir` stub reached PATH).
+    #[test]
+    fn a_pending_stub_is_not_the_tool() {
+        let dir = std::env::temp_dir().join(format!("aterm_stub_probe_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk probe dir");
+        let stub = dir.join("trust-ir-probe");
+        std::fs::write(
+            &stub,
+            "#!/bin/sh\n# atpkg pending-program stub v1\n# Replaced by the real shim when the program installs.\nexit 127\n",
+        )
+        .expect("write stub");
+        assert!(is_pending_stub(&stub), "the stub names itself");
+
+        let real = dir.join("trust-ir-real");
+        std::fs::write(&real, b"\x7fELF fake binary bytes").expect("write real");
+        assert!(!is_pending_stub(&real), "a real binary is not a stub");
+
+        let missing = dir.join("nope");
+        assert!(
+            !is_pending_stub(&missing),
+            "unreadable candidates stay eligible — a false pending would hide an installed tool"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     use super::*;
     use crate::derive::{config_catalog_snapshot_model, ring_model, transact_model};
     use crate::ty_model;

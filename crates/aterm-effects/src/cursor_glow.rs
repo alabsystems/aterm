@@ -2885,6 +2885,29 @@ impl RainbowState {
         self.wake_fold_carry = None;
     }
 
+    /// The proportionate twin of [`Self::clear_visual_geometry`]: retire the
+    /// families a generation fence must always retire (jumps, bursts — landing
+    /// transients with no per-cell attestation), but let the TYPING WAKE's
+    /// cell-anchored memory survive where `keep(row, col)` attests the cell's
+    /// content is unchanged. The nozzle (`wake_head`) survives only on the
+    /// attested row itself — it is sub-cell, so its evidence is the row's.
+    /// The fold carry survives by its own law ("a scalar cannot paint stale
+    /// rows"); an in-flight retract keeps draining whatever sparks survive.
+    fn retire_keeping_validated_wake(&mut self, keep: &dyn Fn(u16, u16) -> bool, attested_row: u16) {
+        self.jumps.clear();
+        self.bursts.clear();
+        for slot in &mut self.tail {
+            if slot.is_some_and(|(row, col)| !keep(row, col)) {
+                *slot = None;
+            }
+        }
+        self.ink_pops.retain(|pop| keep(pop.row, pop.col));
+        if self.wake_head.is_some_and(|(row, _)| row != attested_row) {
+            self.wake_head = None;
+            self.wake_at = None;
+        }
+    }
+
     fn clear_admission(&mut self) {
         self.type_press_ring = [None; CursorGlow::RAINBOW_TYPED_SWEEP_MAX];
         self.type_press_head = 0;
@@ -3285,6 +3308,30 @@ fn captured_probe_row<'a>(
 #[inline]
 fn padded_probe_cell(cells: &[char], col: usize) -> char {
     cells.get(col).copied().unwrap_or(' ')
+}
+
+/// A borrowed per-column attestation of one judged parser batch: which cells
+/// of the probed anchor row the batch provably did not rewrite. Handed to the
+/// classic trail's fence ([`crate::cursor_trail::CursorTrail::observe_content_generation`])
+/// so both engines apply one retention law from one probe capture.
+pub struct BatchWakeWitness<'probe> {
+    row: u16,
+    caret: u16,
+    prev: &'probe [char],
+    cur: &'probe [char],
+}
+
+impl BatchWakeWitness<'_> {
+    /// Whether the judged batch provably left `(row, col)` untouched: the
+    /// attested row, strictly before the captured caret (the presentation
+    /// zone), content byte-steady under the implicit-blank lens.
+    #[must_use]
+    pub fn steady(&self, row: u16, col: u16) -> bool {
+        row == self.row
+            && col < self.caret
+            && padded_probe_cell(self.prev, col as usize)
+                == padded_probe_cell(self.cur, col as usize)
+    }
 }
 
 /// CONTENT inequality of two captured rows under the implicit-blank lens —
@@ -5916,10 +5963,13 @@ impl CursorGlow {
         if exact_candidate_confirmed {
             // The exact proof may spawn fresh geometry below, but it does not
             // certify any already-resident spark/particle on another cell or
-            // row in the same parser batch. Retire old visuals only; preserve
-            // the one-shot candidate, its Backspace span, and its key-time
-            // audio dedup credit for the imminent admitted spawn.
-            self.clear_visual_geometry();
+            // row in the same parser batch. Retire what the probe cannot
+            // attest; the wake cells it proves untouched keep their light (a
+            // ribbon must outlive the keystroke that follows it — the
+            // alt-screen darkness dossier). The one-shot candidate, its
+            // Backspace span, and its key-time audio dedup credit are
+            // preserved for the imminent admitted spawn, exactly as before.
+            self.retire_geometry_keeping_validated_wake();
             return GenerationOwnership::Owned;
         }
         let identity_held = previous.terminal_id == generation.terminal_id
@@ -5936,11 +5986,36 @@ impl CursorGlow {
             self.revoke_unowned_hints();
             return GenerationOwnership::UnownedSteady;
         }
-        self.clear_denied_move_visuals();
         if identity_held && anchor_held {
+            // A rewrite that held identity and anchor: a streaming TUI
+            // repainting around a parked cursor. The correlation ledger
+            // retires (a denied delta can never pair with its old key), but
+            // wake cells the probe attests untouched keep their light — this
+            // is the batch cadence Claude-Code-style TUIs emit continuously,
+            // and the wholesale wipe here was the dominant pixel-killer.
+            self.retire_denied_move_keeping_validated_wake();
             GenerationOwnership::UnownedRewrite
         } else {
+            self.clear_denied_move_visuals();
             GenerationOwnership::UnownedRelocation
+        }
+    }
+
+    /// The per-column attestation of the batch this fence just judged, for the
+    /// classic trail twin: it holds no probe of its own, so the host threads
+    /// this witness into its fence to apply the same proportionate retention.
+    /// `None` whenever this frame cannot attest columns (no probe pair, or the
+    /// probe changed rows) — the twin then fails closed to its wholesale wipe.
+    #[must_use]
+    pub fn batch_wake_witness(&self) -> Option<BatchWakeWitness<'_>> {
+        match (self.row_prev_meta, self.row_cur_meta) {
+            (Some(prev), Some(cur)) if prev.row == cur.row => Some(BatchWakeWitness {
+                row: cur.row,
+                caret: cur.caret,
+                prev: &self.row_prev,
+                cur: &self.row_cur,
+            }),
+            _ => None,
         }
     }
 
@@ -7126,6 +7201,67 @@ impl CursorGlow {
         self.fire_halo_out.clear();
     }
 
+    /// The PROPORTIONATE generation fence: retire everything
+    /// [`Self::clear_visual_geometry`] retires EXCEPT wake cells the row probe
+    /// attests this batch did not rewrite.
+    ///
+    /// The wholesale wipe on every generation change is why the ribbon could
+    /// never outlive one keystroke in a streaming TUI — the very confirm that
+    /// admits a fresh spawn destroyed the light every previous confirm laid,
+    /// and between keystrokes any unowned repaint finished the job
+    /// (docs/design/CURSOR-TRAIL-ALT-SCREEN-GAP.md). The fence's actual law is
+    /// narrower than its old wipe: never leave light on a cell whose CONTENT
+    /// the batch rewrote. The probe pair attests exactly that, per column,
+    /// under the implicit-blank lens — so a wake spark survives iff it sits on
+    /// the attested row, STRICTLY BEFORE the captured caret (the presentation
+    /// zone where echoes may not rewrite silently), on a column whose probed
+    /// content is byte-steady. No attesting pair, or a probe that changed
+    /// rows: fail closed to the wholesale wipe, exactly as before.
+    ///
+    /// Only the cell-anchored WAKE families are eligible (sparks; the rainbow
+    /// tail memory, ink pops and nozzle). The projectile/transient families
+    /// (particles, glide, meteors, vapor, bolts, ring, crown, style fades)
+    /// stay on the wholesale rule: they are sub-second at-cursor flashes whose
+    /// retirement was never the darkness, and a row probe cannot attest their
+    /// sub-cell positions anyway.
+    fn retire_geometry_keeping_validated_wake(&mut self) {
+        let attested = match (self.row_prev_meta, self.row_cur_meta) {
+            (Some(prev), Some(cur)) if prev.row == cur.row => Some((cur.row, cur.caret)),
+            _ => None,
+        };
+        let Some((row, caret)) = attested else {
+            self.clear_visual_geometry();
+            return;
+        };
+        self.fading.clear();
+        self.ramp_in_at = None;
+        self.particles.clear();
+        self.glide.clear();
+        self.fire_meteors.clear();
+        self.vapor.clear();
+        self.last_smoke = None;
+        self.bolts.clear();
+        self.ring = None;
+        self.crown_until = None;
+        self.halo_out.clear();
+        self.patch_out.clear();
+        self.under_out.clear();
+        self.char_out.clear();
+        self.fire_halo_out.clear();
+        let prev_cells = std::mem::take(&mut self.row_prev);
+        let cur_cells = std::mem::take(&mut self.row_cur);
+        let steady = |cell_row: u16, cell_col: u16| {
+            cell_row == row
+                && cell_col < caret
+                && padded_probe_cell(&prev_cells, cell_col as usize)
+                    == padded_probe_cell(&cur_cells, cell_col as usize)
+        };
+        self.sparks.retain(|spark| steady(spark.row, spark.col));
+        self.rainbow.retire_keeping_validated_wake(&steady, row);
+        self.row_prev = prev_cells;
+        self.row_cur = cur_cells;
+    }
+
     /// Retire every visual trail family at a denied relocation while
     /// preserving independently earned, already-queued key-time audio. The
     /// echo-dedup ledger is one-shot correlation state: once the first observed
@@ -7134,6 +7270,24 @@ impl CursorGlow {
     fn clear_denied_move_visuals(&mut self) {
         let sound_cues = std::mem::take(&mut self.sound_cues);
         self.clear_transient_state();
+        self.sound_cues = sound_cues;
+    }
+
+    /// The proportionate twin of [`Self::clear_denied_move_visuals`] for an
+    /// unowned REWRITE that held identity and anchor: the one-shot correlation
+    /// state retires exactly as there (a denied first delta can never honestly
+    /// pair with its old key), but the resident wake keeps every cell the
+    /// probe attests untouched, and the probe double buffer itself survives —
+    /// it is this frame's honest capture and the NEXT batch's retention
+    /// evidence, which is what lets a wake live through a STREAM of unowned
+    /// repaints instead of only the first one.
+    fn retire_denied_move_keeping_validated_wake(&mut self) {
+        let sound_cues = std::mem::take(&mut self.sound_cues);
+        self.retire_geometry_keeping_validated_wake();
+        self.rainbow.clear_admission();
+        self.clear_keyed_clicks();
+        self.revoke_unowned_hints();
+        self.last_poof = None;
         self.sound_cues = sound_cues;
     }
 
@@ -25030,7 +25184,7 @@ mod tests {
             glow.observe_content_generation(generation(30), Some((2, 2)), false),
             GenerationOwnership::Steady
         );
-        trail.observe_content_generation(generation(30), GenerationOwnership::Steady);
+        trail.observe_content_generation(generation(30), GenerationOwnership::Steady, None);
 
         // One real keystroke: exact typed candidate, echo at generation 31.
         let baseline_cells = [' '; 12];
@@ -25051,7 +25205,7 @@ mod tests {
             glow.observe_content_generation(generation(31), Some(target), true),
             GenerationOwnership::Owned
         );
-        trail.observe_content_generation(generation(31), GenerationOwnership::Owned);
+        trail.observe_content_generation(generation(31), GenerationOwnership::Owned, None);
         glow.tick(Some(target), typed_at, &c, g, &mut glow_out);
         trail.tick(Some(target), typed_at, &trail_cfg, &mut trail_out);
         assert!(
@@ -25070,7 +25224,7 @@ mod tests {
             glow.observe_content_generation(generation(32), Some(target), false),
             GenerationOwnership::UnownedSteady
         );
-        trail.observe_content_generation(generation(32), GenerationOwnership::UnownedSteady);
+        trail.observe_content_generation(generation(32), GenerationOwnership::UnownedSteady, None);
         glow.tick(Some(target), stream_at, &c, g, &mut glow_out);
         trail.tick(Some(target), stream_at, &trail_cfg, &mut trail_out);
         assert!(
@@ -25082,19 +25236,58 @@ mod tests {
             "the classic comet survives the proven-steady batch too"
         );
 
-        // NEGATIVE CONTROL (cold-output protection): a batch that rewrites
-        // the probed anchor row retires the light exactly as before.
+        // PROPORTIONATE FENCE (the alt-screen darkness dossier): an unowned
+        // rewrite that changes a NON-wake column retires the classifier
+        // cohort but keeps the light whose cells the probe attests steady.
+        // This is the streaming-TUI batch cadence — it must not wipe a wake
+        // it never touched, or the ribbon can never outlive one repaint.
         let rewrite_at = stream_at + Duration::from_millis(20);
         let mut rewritten = echoed;
-        rewritten[3] = '#';
+        rewritten[5] = '#';
         glow.observe_row(2, 3, &rewritten, rewrite_at);
         assert_eq!(
             glow.observe_content_generation(generation(33), Some(target), false),
             GenerationOwnership::UnownedRewrite
         );
-        trail.observe_content_generation(generation(33), GenerationOwnership::UnownedRewrite);
+        let witness = glow.batch_wake_witness();
+        trail.observe_content_generation(
+            generation(33),
+            GenerationOwnership::UnownedRewrite,
+            witness.as_ref(),
+        );
         glow.tick(Some(target), rewrite_at, &c, g, &mut glow_out);
         trail.tick(Some(target), rewrite_at, &trail_cfg, &mut trail_out);
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "an unowned rewrite AWAY from the wake keeps the attested light"
+        );
+        assert!(
+            !trail_out.is_empty(),
+            "the classic comet keeps its attested cells too"
+        );
+
+        // NEGATIVE CONTROL (cold-output protection): a rewrite beneath the
+        // wake itself retires that light exactly as before — per cell, under
+        // the same lens the confirm proof reads.
+        let beneath_at = rewrite_at + Duration::from_millis(20);
+        let mut beneath = rewritten;
+        beneath[0] = '#';
+        beneath[1] = '#';
+        beneath[2] = '#';
+        beneath[3] = '#';
+        glow.observe_row(2, 3, &beneath, beneath_at);
+        assert_eq!(
+            glow.observe_content_generation(generation(34), Some(target), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        let witness = glow.batch_wake_witness();
+        trail.observe_content_generation(
+            generation(34),
+            GenerationOwnership::UnownedRewrite,
+            witness.as_ref(),
+        );
+        glow.tick(Some(target), beneath_at, &c, g, &mut glow_out);
+        trail.tick(Some(target), beneath_at, &trail_cfg, &mut trail_out);
         assert!(
             !frame_has_output(&glow_out, &glow),
             "a rewrite beneath the light still retires it"
@@ -25104,10 +25297,10 @@ mod tests {
         // ...and an unowned RELOCATION is the wholesale fence plus the
         // companion-grounding verdict the host acts on.
         assert_eq!(
-            glow.observe_content_generation(generation(34), Some((7, 60)), false),
+            glow.observe_content_generation(generation(35), Some((7, 60)), false),
             GenerationOwnership::UnownedRelocation
         );
-        trail.observe_content_generation(generation(34), GenerationOwnership::UnownedRelocation);
+        trail.observe_content_generation(generation(35), GenerationOwnership::UnownedRelocation, None);
 
         // Tier-1 bind: the model's proven-steady unowned batch keeps resident
         // light charged while still consuming any in-flight candidate, and a
@@ -25187,7 +25380,7 @@ mod tests {
             GenerationOwnership::Steady,
             "the first observation is a silent baseline"
         );
-        trail.observe_content_generation(generation(10), GenerationOwnership::Steady);
+        trail.observe_content_generation(generation(10), GenerationOwnership::Steady, None);
 
         // Charge genuinely resident light in generation 10.
         let charged_at = t0 + Duration::from_millis(1);
@@ -25226,7 +25419,7 @@ mod tests {
             glow.observe_content_generation(generation(11), Some((2, 3)), true),
             GenerationOwnership::Owned
         );
-        trail.observe_content_generation(generation(11), GenerationOwnership::Owned);
+        trail.observe_content_generation(generation(11), GenerationOwnership::Owned, None);
         assert!(
             !frame_has_output(&[], &glow) && !trail.is_active(),
             "exact evidence retires every pre-existing visual before fresh spawn"
@@ -25243,7 +25436,7 @@ mod tests {
             glow.observe_content_generation(generation(11), Some(target), false),
             GenerationOwnership::Steady
         );
-        trail.observe_content_generation(generation(11), GenerationOwnership::Steady);
+        trail.observe_content_generation(generation(11), GenerationOwnership::Steady, None);
         glow.tick(Some(target), settle, &c, g, &mut glow_out);
         trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
         assert!(frame_has_output(&glow_out, &glow));
@@ -25258,7 +25451,7 @@ mod tests {
             glow.observe_content_generation(generation(12), Some(target), false),
             GenerationOwnership::UnownedRewrite
         );
-        trail.observe_content_generation(generation(12), GenerationOwnership::UnownedRewrite);
+        trail.observe_content_generation(generation(12), GenerationOwnership::UnownedRewrite, None);
         glow.tick(Some(target), settle, &c, g, &mut glow_out);
         trail.tick(Some(target), settle, &trail_cfg, &mut trail_out);
         assert!(!frame_has_output(&glow_out, &glow));
@@ -25282,7 +25475,7 @@ mod tests {
             ),
             "a parser batch that also scrolls fails closed: {scrolled:?}"
         );
-        trail.observe_content_generation(generation(13), scrolled);
+        trail.observe_content_generation(generation(13), scrolled, None);
         glow.tick(Some((2, 4)), settle, &c, g, &mut glow_out);
         trail.tick(Some((2, 4)), settle, &trail_cfg, &mut trail_out);
         assert!(!frame_has_output(&glow_out, &glow) && trail_out.is_empty());

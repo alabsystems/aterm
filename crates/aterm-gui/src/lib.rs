@@ -2805,6 +2805,7 @@ enum Wake {
     /// same stale-menu reasons as `TabMenuAction`; `user_event` runs
     /// [`App::dispatch_tab_menu_connection`]. Posted by BOTH menu renderers
     /// (the macOS strip's `NSMenu` relay and the in-grid overlay card).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     TabMenuConnection {
         window: WindowId,
         tab: tab_model::TabId,
@@ -4423,6 +4424,264 @@ fn apply_font_config_to_backend(
     backend.set_config_symbol_font(config.symbol_font.as_deref());
     backend.set_config_emoji_font(config.emoji_font.as_deref());
     backend.set_font_variations(variations, dark_nudge);
+}
+
+/// THE HEADLESS GPU DEFERRAL, as a decision. `want_gpu` says whether this launch
+/// may use a GPU at all (`--cpu`/`$ATERM_CPU` > `$ATERM_GPU` > config `gpu` >
+/// default-on); this says whether the device is built at BOOT or kept as an
+/// intent for the first pixel demand ([`App::ensure_pixel_backend`]).
+///
+/// Deferred exactly when a headless launch may use a GPU, for two reasons that
+/// are both properties of having NO GLASS:
+///   * nothing presents. The only paths that can reach the device are the pixel
+///     verbs (`image`, `snapshot`, the offscreen present-real `video` loop), and
+///     a headless instance driven through the text surface never touches one —
+///     it would hold the device's ~190 MB RSS / ~127 MB PSS (measured here on an
+///     NVIDIA/Vulkan box with `smaps_rollup`) for a process lifetime, unused.
+///   * headless JOINS the build before it binds the control socket, so the
+///     device sits IN FRONT of the first request rather than beside it: ~118 ms
+///     of boot-to-ready that no text verb was waiting on.
+///
+/// Windowed is never deferred: its device backs the swapchain the first frame
+/// needs, and that build already overlaps the OS window-server round trip.
+const fn defer_gpu_build(want_gpu: bool, headless: bool) -> bool {
+    want_gpu && headless
+}
+
+/// PROCESS-GLOBAL twin of [`App::backend_kind_undecided`], for the capability
+/// readers that have no `&App` to ask. Native Settings projects availability from
+/// FREE view functions (`setting_row`, `page`, `manual_override_disclosure`, …)
+/// whose only inputs are the view state and the process globals, so without a
+/// mirror those rows can only read [`metrics::backend_gpu`] — "which renderer is
+/// live this instant" — and a deferred launch would be told its GPU-backed keys
+/// are unavailable purely because nothing has demanded a pixel yet. That is the
+/// same lie `backend_kind_undecided` already closes at the warn-once and
+/// config-host seams, arriving through the one surface that states it in words.
+static BACKEND_GPU_UNDECIDED: AtomicBool = AtomicBool::new(false);
+
+/// Publish this process's UNREDEEMED-intent state. Written wherever
+/// `App::deferred_gpu` is — the launch that arms it, the test constructor that
+/// does not, and [`App::set_deferred_gpu`] — so the field and its mirror cannot
+/// drift apart.
+fn set_backend_gpu_undecided(on: bool) {
+    BACKEND_GPU_UNDECIDED.store(on, Ordering::Relaxed);
+}
+
+/// "CAN this run use a GPU", as against [`metrics::backend_gpu`]'s "WHICH
+/// renderer is live this instant". Availability surfaces ask the first question
+/// and must never be answered with the second: an unredeemed intent is not a
+/// verdict of "no GPU", it is "not decided yet", and the launch that redeems it
+/// would have reported GPU all along.
+pub(crate) fn backend_gpu_or_undecided() -> bool {
+    backend_gpu_capability(
+        metrics::backend_gpu(),
+        BACKEND_GPU_UNDECIDED.load(Ordering::Relaxed),
+    )
+}
+
+/// The pure half of [`backend_gpu_or_undecided`], so a test can state the
+/// deferred and the eager reading side by side without touching a global the
+/// rest of the suite is concurrently reading.
+pub(crate) const fn backend_gpu_capability(live_gpu: bool, undecided: bool) -> bool {
+    live_gpu || undecided
+}
+
+// KNOWN BOUND, deliberately not papered over: this answers with the run's
+// INTENT while one is unredeemed, so a headless process that never asks for a
+// pixel — on a box where the GPU could not have been built at all — keeps
+// saying "available" for its whole life. Redemption is what decides, and every
+// pixel path redeems before it answers (a failure there flips the mirror false
+// and re-pins, so the words correct themselves the moment anything looks).
+// Making the surface say "undecided" instead would need a third state carried
+// through every availability row; claiming "unavailable" instead would be the
+// worse lie, because the common deferred run DOES get its GPU.
+
+/// Arm the unredeemed-intent mirror for the length of one test and restore the
+/// prior value on drop, panics included. The mirror is process-global (the
+/// readers it exists for have no `&App`), so a test that flips it is briefly
+/// visible to the rest of a threaded suite — the guard's whole job is to keep
+/// that window to the single call under test.
+#[cfg(test)]
+pub(crate) struct DeferredGpuIntentGuard(bool);
+
+#[cfg(test)]
+impl DeferredGpuIntentGuard {
+    pub(crate) fn arm() -> Self {
+        Self(BACKEND_GPU_UNDECIDED.swap(true, Ordering::Relaxed))
+    }
+}
+
+#[cfg(test)]
+impl Drop for DeferredGpuIntentGuard {
+    fn drop(&mut self) {
+        set_backend_gpu_undecided(self.0);
+    }
+}
+
+#[cfg(test)]
+mod headless_gpu_deferral_tests {
+    /// The deferral is armed by BOTH halves and neither alone: a windowed GPU
+    /// launch still builds at boot (its swapchain needs the device), and a
+    /// headless `--cpu` launch has no intent to defer in the first place — the
+    /// row that keeps `ensure_pixel_backend` from resurrecting a GPU the user
+    /// explicitly refused.
+    #[test]
+    fn only_a_headless_launch_that_may_use_a_gpu_defers_the_device() {
+        assert!(super::defer_gpu_build(true, true), "headless GPU launch");
+        assert!(!super::defer_gpu_build(true, false), "windowed GPU launch");
+        assert!(!super::defer_gpu_build(false, true), "headless --cpu");
+        assert!(!super::defer_gpu_build(false, false), "windowed --cpu");
+    }
+
+    /// A pixel demand on a launch with NO deferred intent must construct
+    /// nothing. Every windowed run and every `--cpu` headless run reaches
+    /// `ensure_pixel_backend` on its first `image`/`snapshot`, so this is the
+    /// guard that keeps the redemption from becoming a lazy GPU UPGRADE for
+    /// launches that already settled the question: a CPU run stays a CPU run no
+    /// matter how many captures it serves, and the repeat proves the no-op is
+    /// the absent intent rather than a once-only latch.
+    #[test]
+    fn a_pixel_demand_without_a_deferred_intent_builds_nothing() {
+        let mut app = super::App::headless_for_test();
+        assert!(!app.backend_kind_undecided(), "no intent at construction");
+        for _ in 0..3 {
+            app.ensure_pixel_backend();
+            assert!(!app.use_gpu, "no intent, so no device may appear");
+            assert!(!app.backend.is_gpu());
+            assert!(!app.backend_kind_undecided());
+        }
+    }
+
+    /// The CAPABILITY read must follow the intent, not the renderer that happens
+    /// to be live. Native Settings projects availability from free view functions
+    /// with no `&App` to ask, so `backend_kind_undecided` reaches them only
+    /// through the process-global mirror — and if the two drift, Settings tells
+    /// the user GPU-backed features are unavailable while the warn-onces and the
+    /// config host, reading the same run through the field, report them present.
+    ///
+    /// The intent is armed and spent WITHOUT an assertion in between: the mirror
+    /// is process-global, so a panic while it is armed would leak a deferral into
+    /// every test that projects availability afterwards.
+    #[test]
+    fn the_settings_capability_read_follows_the_intent_the_app_holds() {
+        // This test WRITES the process-global mirror, so it owns it for the
+        // duration and restores whatever it found — the guard exists for
+        // exactly this, and without it a sibling test's App construction used
+        // to race the reads below.
+        let _mirror = super::DeferredGpuIntentGuard::arm();
+        let mut app = super::App::headless_for_test();
+        super::set_backend_gpu_undecided(false);
+        let fresh = (
+            app.backend_kind_undecided(),
+            super::backend_gpu_or_undecided(),
+        );
+        app.set_deferred_gpu(true);
+        let armed = (
+            app.backend_kind_undecided(),
+            super::backend_gpu_or_undecided(),
+        );
+        app.set_deferred_gpu(false);
+        let spent = (
+            app.backend_kind_undecided(),
+            super::backend_gpu_or_undecided(),
+        );
+
+        assert_eq!(fresh, (false, false), "a test App carries no intent");
+        assert_eq!(
+            armed,
+            (true, true),
+            "an unredeemed intent reads as GPU-capable everywhere, not just where an &App is in hand"
+        );
+        assert_eq!(
+            spent,
+            (false, false),
+            "a spent intent is an honest CPU run again"
+        );
+    }
+
+    /// THE LOST DIAGNOSTIC. Boot pins the render config while the renderer kind
+    /// is still open, and that pin deliberately WITHHOLDS the two "this run
+    /// cannot do it" warn-onces (`background_opacity` / `background_material`
+    /// have no CPU consumer) because a device may still be coming. When the
+    /// redemption then fails, the assumption behind the suppression is refuted —
+    /// and without a second pin it outlives its reason: the run finishes on the
+    /// CPU backend with the warning permanently missing, withheld from the user
+    /// who set the key precisely on the path that proved them right.
+    ///
+    /// The failure is simulated AT THE SEAM rather than at the tail: an UNSEALED
+    /// font generation is exactly what `cpu_renderer_from_admitted` refuses, so
+    /// the redemption declines through `ensure_pixel_backend`'s first `Err` arm
+    /// having touched no device — the whole path, not just the helper it calls.
+    /// (Its GPU-build sibling declines through the same tail; a box with a
+    /// working adapter cannot be made to fail that one on demand.)
+    ///
+    /// The re-pin is proved by the knob it writes (the translucent value the
+    /// backend was not carrying), and the verdict by the guard the warn-onces sit
+    /// behind. The warning's own firing cannot be asserted positively — it is a
+    /// `std::sync::Once` per process and another test may legitimately have spent
+    /// it first — but its SUPPRESSION can be, and is, below.
+    #[test]
+    fn a_declined_redemption_restores_the_cpu_only_warnings_boot_withheld() {
+        let _lane = crate::config_notice::lane_test_guard();
+        let mut app = super::App::headless_for_test();
+        let _ = crate::config_notice::take_deferred();
+        // A launch that asked for translucent glass, on a boot that has not yet
+        // decided whether it has a GPU to composite it with.
+        app.render_knobs.background_opacity = 0.5;
+        app.set_deferred_gpu(true);
+        app.pin_backend_render_config_core();
+        let withheld = crate::config_notice::take_deferred();
+        let undecided = (
+            app.backend_kind_undecided(),
+            backend_background_opacity(&app),
+        );
+
+        // Every write the pin makes is idempotent, so "it ran a second time" is
+        // invisible unless something moved between the two runs. Move the knob
+        // WITHOUT pinning it: only a second pin can carry it to the renderer.
+        app.render_knobs.background_opacity = 0.25;
+        // A generation the redemption cannot fork => the first `Err` arm.
+        app.backend = super::BackendSlot::Ready(super::Backend::Cpu(
+            super::Renderer::from_system(super::FONT_PX, app.theme)
+                .expect("system font for an unsealed generation"),
+        ));
+        app.ensure_pixel_backend();
+        let settled = (
+            app.backend_kind_undecided(),
+            app.backend.is_gpu(),
+            backend_background_opacity(&app),
+        );
+        // Whatever the process-wide `Once` did with it, this test does not leave
+        // a notice behind for the banner-drain tests to find.
+        let _ = crate::config_notice::take_deferred();
+
+        assert_eq!(
+            undecided,
+            (true, 0.5),
+            "boot pins the knob onto the live CPU renderer either way"
+        );
+        assert!(
+            withheld.is_empty(),
+            "an unredeemed intent withholds the CPU-only warning: {withheld:?}"
+        );
+        assert_eq!(
+            settled,
+            (false, false, 0.25),
+            "a declined redemption re-pins against a backend that is now, finally, the answer"
+        );
+    }
+
+    /// The live background opacity the CPU renderer is actually carrying — the
+    /// observable that separates "the failure path re-pinned" from "the failure
+    /// path returned".
+    fn backend_background_opacity(app: &super::App) -> f32 {
+        match &app.backend {
+            super::BackendSlot::Ready(super::Backend::Cpu(renderer)) => {
+                renderer.background_opacity()
+            }
+            _ => panic!("the headless test App holds a ready CPU renderer"),
+        }
+    }
 }
 
 /// The App's [`Backend`] slot (#7 tail): on a WINDOWED cold launch the backend
@@ -7809,15 +8068,34 @@ impl WindowState {
                     || self.cursor_phaser.is_active()))
     }
 
+    /// The cursor-effect TYPED WAKE at this window's own seams: a key/text
+    /// egress into THIS window within
+    /// [`crate::app_render::CURSOR_FX_TYPED_WAKE`] (`last_key_at`, stamped for
+    /// BOTH input sources). The scheduler below and the motion-policy focus
+    /// fold ([`App::cursor_fx_focus`]) consume this SAME predicate, so the
+    /// policy that admits a typed trail on an unfocused window and the frame
+    /// train that animates it can never disagree — a wake that painted but
+    /// never scheduled would freeze the comet mid-decay between echoes.
+    pub(crate) fn cursor_fx_typed_wake(&self, now: Instant) -> bool {
+        self.last_key_at.is_some_and(|at| {
+            now.saturating_duration_since(at) <= crate::app_render::CURSOR_FX_TYPED_WAKE
+        })
+    }
+
     /// Whether the 60 fps terminal-effects lane needs another frame. This is the
     /// exact predicate consumed by `about_to_wait`, kept as a method so native-tab
     /// transitions can regression-test the real scheduling decision without an OS
     /// event-loop fixture. Stream fade is terminal paint too; unlike cursor effects
     /// it may run unfocused, but it still cannot schedule over native content.
+    /// The focus term folds the TYPED WAKE ([`Self::cursor_fx_typed_wake`]):
+    /// a typed-into unfocused window earns Full motion at the policy seam, so
+    /// its light must keep frame cadence until it drains — without this fold
+    /// the wake painted each keystroke's echo frame and then froze.
     fn terminal_effect_frame_active(&self, now: Instant, animate_cursor_cat: bool) -> bool {
         self.front_terminal().is_some()
             && ((!self.is_split() && (self.fade_shown || self.stream_fade.is_active(now)))
-                || (self.focused && self.cursor_fx_active(now, animate_cursor_cat)))
+                || ((self.focused || self.cursor_fx_typed_wake(now))
+                    && self.cursor_fx_active(now, animate_cursor_cat)))
     }
 
     /// Active phosphor-rain consumption period iff terminal pixels are the
@@ -9819,6 +10097,17 @@ struct App {
     /// [`Self::finalize_backend`] overwrites it with the build's actual outcome
     /// (a GPU-init failure falls back to CPU) before any rebuild can read it.
     use_gpu: bool,
+    /// HEADLESS DEFERRAL: an unredeemed GPU intent. `true` only on a headless
+    /// launch that may use a GPU (`want_gpu`) and has not yet been asked for a
+    /// pixel — the backend is the CPU renderer and the device does not exist.
+    /// [`Self::ensure_pixel_backend`] redeems it at the first pixel demand and
+    /// clears it; a redemption FAILURE clears it too, so a box whose device will
+    /// not initialize pays the attempt once and then reads as an honest CPU run
+    /// for the rest of the session rather than retrying on every capture.
+    ///
+    /// Always `false` windowed: that device backs a swapchain the first frame
+    /// needs, and its build already overlaps the OS window-server round trip.
+    deferred_gpu: bool,
     /// The configured renderer theme, re-applied when a font-zoom rebuilds the backend.
     theme: Theme,
     /// The live parsed [`Config`], retained so an OS light↔dark switch can re-resolve a
@@ -11960,6 +12249,13 @@ impl App {
         );
         let mut pool = SessionPool::default();
         pool.insert(session0);
+        // The test App is handed a built CPU backend, so it carries no intent.
+        // It deliberately does NOT clear the process-global mirror: this
+        // constructor runs in hundreds of tests, a threaded suite runs them
+        // beside each other, and a blind `false` here reaches INTO whichever
+        // test is currently exercising a deferral — measured as a ~11% flake
+        // on the availability test. The mirror is owned by whoever armed it,
+        // and `DeferredGpuIntentGuard` restores it on drop, panics included.
         let apprt = platform::platform_apprt();
         native_appearance::install_preferences(apprt.native_appearance_preferences());
         let mut native_config_service =
@@ -12033,6 +12329,8 @@ impl App {
             default_font_px: FONT_PX,
             font_px_explicit: false,
             use_gpu: false,
+            // No intent to redeem: the test App is handed a built CPU backend.
+            deferred_gpu: false,
             theme,
             config: startup_config,
             title_summaries: title_summary::Coordinator::new(None),
@@ -13455,6 +13753,160 @@ impl App {
     #[must_use]
     fn headless_boot_health_checkpoint(&self) -> bool {
         self.sock_plan.is_none() || self.sock_bound.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether this run's renderer KIND is still open. True only while a headless
+    /// GPU intent sits unredeemed: the live backend is the CPU renderer, but
+    /// [`Self::ensure_pixel_backend`] may still install the device, so the live
+    /// backend is not yet this run's verdict on GPU-only features.
+    ///
+    /// The "this run cannot do X" warn-onces and the config host's capability
+    /// report consult it, so arming the deferral never manufactures a diagnostic
+    /// (or a capability denial) that the same launch would not have produced
+    /// before — the honest answer at that instant is "not decided", not "no GPU".
+    pub(crate) const fn backend_kind_undecided(&self) -> bool {
+        self.deferred_gpu
+    }
+
+    /// The ONLY mutator of the intent after construction: it moves the field and
+    /// its process-global mirror ([`set_backend_gpu_undecided`]) together, so the
+    /// `&App` readers (the warn-onces, the config host) and the `&App`-less ones
+    /// (native Settings' availability rows) can never disagree about whether this
+    /// run's renderer kind is still open.
+    pub(crate) fn set_deferred_gpu(&mut self, on: bool) {
+        self.deferred_gpu = on;
+        set_backend_gpu_undecided(on);
+    }
+
+    /// HEADLESS DEFERRAL, redeemed: build the GPU device NOW, because something is
+    /// about to ask this process for PIXELS. Called at the top of every path that
+    /// can rasterize a headless frame — the `image` verb, the SIGUSR1/`snapshot`
+    /// artifact, the native/heterogeneous capture, and the offscreen present-real
+    /// `video` loop, which is GPU-ONLY by the recording-arm law and would refuse
+    /// outright against a CPU backend. Every other headless verb reads text and
+    /// never comes here, which is the whole saving.
+    ///
+    /// PARITY IS THE CONTRACT. The redeemed device must render the byte-identical
+    /// capture a device built at boot would have, so the face is not rediscovered
+    /// here: it is forked from the resident CPU backend's SEALED admitted
+    /// generation (`cpu_renderer_from_admitted`) and handed over whole
+    /// (`install_prepared_font`) — the same seam a font-zoom rebuild uses. Nothing
+    /// re-opens a configured font path on this thread, so the worker-only
+    /// admission boundary stays exactly where the boot build left it, and a font
+    /// file swapped since boot cannot enter through the capture verb.
+    ///
+    /// The geometry the CPU backend was carrying (pad, top pad, chrome headroom)
+    /// is lifted across explicitly — a fresh backend starts at zero, and dropping
+    /// the border would move every pixel in the frame.
+    ///
+    /// ONE attempt: the intent is spent whether the build succeeds or fails, so a
+    /// box with no usable device pays the probe once and then reads as an honest
+    /// CPU run instead of re-attempting on every capture. On failure the CPU
+    /// renderer keeps serving — the same fail-soft the boot build has always had.
+    pub(crate) fn ensure_pixel_backend(&mut self) {
+        if !self.deferred_gpu {
+            return;
+        }
+        self.set_deferred_gpu(false);
+        debug_assert!(
+            self.headless,
+            "the GPU deferral is headless-only; windowed builds its device at boot"
+        );
+        // Fork the boot generation BEFORE building the device: a face that cannot
+        // be rebuilt is a reason not to swap backends at all, and finding that out
+        // first costs nothing while finding it out second would strand a live
+        // device with no admitted face to install.
+        let prepared = match self
+            .backend
+            .cpu_renderer_from_admitted(self.font_px, self.theme)
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                eprintln!(
+                    "aterm-gui: deferred GPU build declined ({error}); \
+                     the CPU renderer keeps serving captures"
+                );
+                self.settle_on_cpu_renderer();
+                return;
+            }
+        };
+        let family = self.font_family.clone();
+        let mut gpu = match aterm_gpu::GpuRenderer::new_with_family(
+            family.as_deref(),
+            self.font_px,
+            self.theme,
+        ) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                // The same sentence the boot build prints, for the same reason:
+                // the run continues on the CPU renderer.
+                eprintln!("aterm-gui: GPU unavailable ({error}); using CPU renderer");
+                self.settle_on_cpu_renderer();
+                return;
+            }
+        };
+        let (name, adapter_backend) = gpu.adapter();
+        eprintln!("aterm-gui: GPU rendering on {name} ({adapter_backend})");
+        gpu.install_prepared_font(family, prepared, self.theme);
+        // Geometry is renderer state, and a fresh backend starts at zero.
+        let pad = self.backend.pad();
+        let pad_top = self.backend.pad_top();
+        let head = self.backend.head();
+        self.backend = BackendSlot::Ready(Backend::Gpu(GpuBackend::new(gpu)));
+        self.use_gpu = true;
+        metrics::set_backend_gpu(true);
+        self.backend.set_pad(pad);
+        self.backend.set_pad_top(pad_top);
+        self.backend.set_head(head);
+        // The device is new, so its GPU-side copies of the effect and render
+        // knobs are at defaults — the CPU face carried its own across the fork,
+        // the uniforms did not. Both seams are the ones the windowed deferred
+        // join uses, so a redeemed backend and a joined one are pinned alike.
+        self.pin_gpu_effect_config();
+        self.pin_backend_render_config_core();
+        // NO `reset_gpu_window_caches` and NO `sync_chrome_fonts` here, and both
+        // omissions are reasoned rather than saved effort. There is nothing
+        // GPU-side to invalidate: this is the first device this process has had,
+        // `introspect_gpu` has never met one, and a window can hold a `Gpu` or
+        // `Virtual` target only downstream of a redemption that has not happened
+        // yet (asserted below). And the chrome rasterizer already holds faces
+        // forked from this same admitted generation at boot — the face did not
+        // change here, only the renderer wrapping it, so re-forking would spend
+        // the ~295 ms `sync_chrome_fonts` costs to arrive at the same bytes.
+        debug_assert!(
+            self.windows.values().all(|ws| !matches!(
+                ws.present,
+                Some(PresentTarget::Gpu { .. } | PresentTarget::Virtual { .. })
+            )),
+            "a GPU-backed present target existed before the GPU did"
+        );
+    }
+
+    /// The redemption's FAIL-SOFT tail, shared by both `Err` arms of
+    /// [`Self::ensure_pixel_backend`]: the intent is spent, no device arrived, and
+    /// this run has just become an honest CPU run — so re-run the render pin that
+    /// boot ran while the question was still open.
+    ///
+    /// The pin is not repeated for the knobs' sake; every one of those writes is
+    /// the same value onto the same resident CPU backend. It is repeated for the
+    /// VERDICTS it carries. Boot pinned with `backend_kind_undecided()` true,
+    /// which deliberately withheld the two "this run cannot do it" warn-onces
+    /// (`background_opacity` and `background_material` have no CPU consumer) on
+    /// the assumption a device was still coming. That assumption has just been
+    /// refuted, and without a second pin the suppression outlives its reason: the
+    /// run ends on the CPU backend with the diagnostics silently missing —
+    /// withheld, in the end, on exactly the path that proved them true, from the
+    /// user who deliberately set those keys and can watch them do nothing.
+    fn settle_on_cpu_renderer(&mut self) {
+        debug_assert!(
+            !self.deferred_gpu,
+            "the intent is spent before the run settles on the CPU renderer"
+        );
+        debug_assert!(
+            !self.backend.is_gpu(),
+            "a declined redemption installs no device"
+        );
+        self.pin_backend_render_config_core();
     }
 
     /// OVERLAP HANDOFF (incoming side): if this boot carries a readiness fd and
@@ -15843,6 +16295,12 @@ impl ApplicationHandler<Wake> for App {
                         "a recording or recording export is already in progress",
                     );
                 } else if let Some(wid) = self.frontmost_window {
+                    // A recording is the loudest PIXEL demand there is, and the
+                    // recording-arm law below reads `self.backend.is_gpu()`: a
+                    // headless launch whose GPU intent is still unredeemed would
+                    // otherwise be told "GPU backend required" about a device it
+                    // was always entitled to build. Redeem FIRST, then decide.
+                    self.ensure_pixel_backend();
                     let opts = aterm_gpu::video_tap::CaptureOpts {
                         half_res: !full_res,
                         budget_bytes,
@@ -16747,7 +17205,13 @@ impl ApplicationHandler<Wake> for App {
                     // front-tab routing byte-for-byte; `Some` re-resolves the
                     // named session here, on the one thread that can, and takes
                     // the hidden path if it is no longer the active tab.
-                    outcome = self.input_to_session(wid, ev, src, session);
+                    outcome = self.input_to_session(
+                        wid,
+                        ev,
+                        src,
+                        session,
+                        crate::app_input::PressPhase::Initial,
+                    );
                 }
                 // Esc and close-button paths can defer a logical window close until
                 // after the input batch; finish that transaction here.
@@ -19395,6 +19859,33 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
             (false, Some(explicit)) => explicit,
             (false, None) => true,
         };
+    // HEADLESS DEFERRAL: `want_gpu` says WHETHER this launch may use a GPU; for a
+    // headless launch it does not say WHEN. A headless run has no glass — the only
+    // things that can ever reach the device are the PIXEL verbs (`image`,
+    // `snapshot`, the offscreen present-real `video` loop), and a headless instance
+    // driven purely through the text surface (`text`, `send`, `history`, `status`,
+    // `await`) never asks for a single pixel. Building the device for those runs
+    // costs, measured on this box with `smaps_rollup` on an isolated instance,
+    // 170 MB RSS / 93 MB PSS held for the process lifetime plus ~85 ms welded onto
+    // the boot path — headless JOINS the backend build before it binds the socket,
+    // so the device is in front of the first request rather than beside it.
+    //
+    // So headless builds the CPU renderer at boot and keeps the GPU as an INTENT,
+    // redeemed by `App::ensure_pixel_backend` at the first pixel demand. Parity is
+    // the whole point of the deferral: the redeemed backend hands the GPU renderer
+    // the resident CPU face's SEALED admitted generation (`rebuild_from_admitted` →
+    // `install_prepared_font`), the same generation a cold GPU build would have
+    // carried, so the capture it renders is byte-identical to today's — no path is
+    // re-read at redemption time, which also keeps the worker-only font admission
+    // boundary exactly where it was. WINDOWED is untouched: its device backs a
+    // swapchain that the first frame needs, and it is already overlapped with the
+    // OS window-server round trip rather than serialized in front of it.
+    let defer_gpu = defer_gpu_build(want_gpu, headless);
+    // Publish the intent to the `&App`-less capability readers (native Settings'
+    // availability rows) the moment it is decided, and for every launch — a
+    // windowed or `--cpu` run stores the honest `false`.
+    set_backend_gpu_undecided(defer_gpu);
+    let build_gpu = want_gpu && !defer_gpu;
     // H1 (Windows Mica/Acrylic): when the config asks for a client-area backdrop
     // (`background_material != none`), latch the DirectComposition VISUAL
     // swapchain BEFORE the backend build below creates the wgpu instance — the
@@ -19537,7 +20028,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // wait at its join, and every pipeline); the adapter report below is
         // deliberately inside this leg, and lands in the derived GPU tail.
         let gpu_build_started = Instant::now();
-        let (mut backend, use_gpu) = if want_gpu {
+        // `build_gpu`, not `want_gpu`: a headless launch defers the device to its
+        // first pixel demand, so this worker builds the CPU face it needs either
+        // way and `App::ensure_pixel_backend` redeems the intent later.
+        let (mut backend, use_gpu) = if build_gpu {
             match aterm_gpu::GpuRenderer::new_with_family(
                 family_for_build.as_deref(),
                 font_px,
@@ -20156,6 +20650,14 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // GPU cursor-comet BLOOM settings from config (GPU backend only; the
         // CPU/software path has no bloom). Set before the first present so the
         // per-window bloom target is built alongside the offscreen.
+        //
+        // DEAD while the deferral is armed — the worker published a CPU backend,
+        // and the redemption in `App::ensure_pixel_backend` pins these through
+        // `App::pin_gpu_effect_config`, the same one-seam method the windowed
+        // deferred join and the H1 fail-soft rebuild use (it reads the LIVE
+        // serious-mode policy and config, which is what a redemption after a
+        // config reload must do). This arm survives for the headless launch that
+        // reaches here with a GPU backend anyway.
         if let Backend::Gpu(g) = &mut backend {
             g.set_bloom(
                 !config.serious_mode_or_default() && config.cursor_trail_bloom_or_default(),
@@ -20531,6 +21033,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         default_font_px: font_px,
         font_px_explicit,
         use_gpu,
+        deferred_gpu: defer_gpu,
         theme,
         config: config.clone(),
         title_summaries: title_summary::Coordinator::new(Some(proxy.clone())),
@@ -30739,7 +31242,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            139,
+            141,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(

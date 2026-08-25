@@ -252,6 +252,11 @@ impl TerminalHandler<'_> {
                         // is_ascii guard above ensures cp is in 0x20..0x7F
                         #[allow(clippy::cast_possible_truncation)]
                         let ascii_byte = cp as u8;
+                        // SELECTION CUSTODY — REP's bulk arm is the one printing path
+                        // that reaches the grid without going through `write_char`,
+                        // so it needs its own output-damage bracket; the else-arm
+                        // below is covered by `write_char`'s.
+                        let origin = self.grid.output_damage_origin();
                         self.grid.write_cell_run(
                             ascii_byte,
                             count as usize,
@@ -259,6 +264,7 @@ impl TerminalHandler<'_> {
                             flags,
                             &mut last_byte,
                         );
+                        self.grid.damage_selection_output(origin);
                     } else {
                         for _ in 0..count {
                             // Re-translate through the CURRENT GL charset

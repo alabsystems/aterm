@@ -998,7 +998,17 @@ mod tests {
         }
         let _ = cached_results(&mut t, "needle");
         let refreshes = t.search_index_refreshes();
+        let epoch = t.grid().history_renumber_epoch();
         t.resize(6, 33);
+        // The WIRING guard, stated the same way the unscroll arm states it. The
+        // refresh assertion below is also satisfied by the reuse guard's
+        // `cached.cols == cols` fence, so on its own it holds with the width-reflow
+        // epoch bump (`scrollback_reflow.rs`) deleted — and then a LATER width
+        // change that happens to restore `cols` refreshes over renumbered keys.
+        assert!(
+            t.grid().history_renumber_epoch() > epoch,
+            "a width rewrap renumbers history and must advance the epoch"
+        );
         let got = cached_results(&mut t, "needle");
         assert_eq!(
             t.search_index_refreshes(),
@@ -1035,3 +1045,4 @@ mod tests {
         assert_eq!(got, legacy_results(&t, "needle"));
     }
 }
+

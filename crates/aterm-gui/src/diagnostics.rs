@@ -225,6 +225,54 @@ pub(crate) struct ConfigSemanticWarning {
     pub(crate) message: String,
 }
 
+/// The at-most-one semantic warning a single `[keybindings]` row earns, with
+/// the built-in shadow ALREADY RESOLVED by the caller
+/// ([`crate::keybinding::builtin_shadow_label`]).
+///
+/// The label is a PARAMETER rather than a lookup because the hardcoded
+/// Cmd/Super suite is compiled off on Linux, so a host-conditional test can
+/// only ever assert the Linux half — and the review's escape (`"cmd+c" =
+/// "none"` validating fully green) lived exactly in the half Linux cannot see.
+/// With the gate explicit, the macOS-shaped path is reachable from any host.
+///
+/// Order is load-bearing, and the unbind arm is deliberately NOT terminal:
+/// `"none"`/`"unbind"` is the documented spelling for masking a platform SEED,
+/// so it must never be flagged as an unknown action (the old behaviour told a
+/// user their working config was broken) — but an unbind cannot mask a
+/// HARDCODED built-in, so where one claims the chord the conflict caveat is
+/// exactly as true as for any other value and still rides.
+fn keybinding_row_warning(
+    chord: &str,
+    action: &str,
+    shadow: Option<&'static str>,
+) -> Option<ConfigSemanticWarning> {
+    if let Err(e) = crate::keybinding::Chord::parse(chord) {
+        return Some(ConfigSemanticWarning {
+            key: "keybindings",
+            message: format!("keybindings: chord {chord:?} invalid ({e})"),
+        });
+    }
+    if crate::keybinding::is_unbind_action(action) {
+        return shadow.map(|label| ConfigSemanticWarning {
+            key: "keybindings",
+            message: format!(
+                "keybindings: chord {chord:?} unbinds a default but still conflicts with built-in {label}"
+            ),
+        });
+    }
+    if crate::keybinding::Action::parse(action).is_none() {
+        return Some(ConfigSemanticWarning {
+            key: "keybindings",
+            message: format!("keybindings[{chord:?}]: unknown action {action:?}"),
+        });
+    }
+    shadow.map(|label| ConfigSemanticWarning {
+        key: "keybindings",
+        message: format!("keybindings: chord {chord:?} conflicts with built-in {label}"),
+    })
+}
+
+
 /// Semantic checks that require no filesystem, platform service, or ambient
 /// capability. Keeping this subset separate lets the config editor stay pure
 /// and responsive while sharing the exact keybinding/sequence and palette
@@ -387,42 +435,11 @@ pub(crate) fn config_semantic_warnings(
     }
     if let Some(table) = config.keybindings.as_ref() {
         for (chord, action) in table {
-            if let Err(e) = crate::keybinding::Chord::parse(chord) {
-                warnings.push(ConfigSemanticWarning {
-                    key: "keybindings",
-                    message: format!("keybindings: chord {chord:?} invalid ({e})"),
-                });
-            } else if crate::keybinding::is_unbind_action(action) {
-                // `"none"`/`"unbind"` is the documented unbind spelling (it masks
-                // a platform seed), NOT an unknown action — the loader accepts it
-                // silently, so the validator (and the Settings editor's live
-                // diagnostics, which share this pass) must not red-flag it.
-                //
-                // It masks a SEED, though — never a hardcoded built-in. Where
-                // that built-in is compiled in, the conflict caveat is exactly
-                // as true as for any other value, so it still rides (the review
-                // caught `"cmd+c" = "none"` validating fully green on macOS).
-                if let Some(label) = crate::keybinding::builtin_shadow_label(chord) {
-                    warnings.push(ConfigSemanticWarning {
-                        key: "keybindings",
-                        message: format!(
-                            "keybindings: chord {chord:?} unbinds a default but still conflicts with built-in {label}"
-                        ),
-                    });
-                }
-            } else if crate::keybinding::Action::parse(action).is_none() {
-                warnings.push(ConfigSemanticWarning {
-                    key: "keybindings",
-                    message: format!("keybindings[{chord:?}]: unknown action {action:?}"),
-                });
-            } else if let Some(label) = crate::keybinding::builtin_shadow_label(chord) {
-                warnings.push(ConfigSemanticWarning {
-                    key: "keybindings",
-                    message: format!(
-                        "keybindings: chord {chord:?} conflicts with built-in {label}"
-                    ),
-                });
-            }
+            warnings.extend(keybinding_row_warning(
+                chord,
+                action,
+                crate::keybinding::builtin_shadow_label(chord),
+            ));
         }
     }
     if let Some(palette) = config.palette.as_ref() {
@@ -1726,17 +1743,25 @@ pub(crate) fn list_keybinds() -> String {
 /// free a seeded default, and printing `(UNKNOWN action)` for it (the old
 /// behaviour) told the user their working config was broken.
 fn user_keybinding_note(chord: &str, action: &str) -> String {
+    user_keybinding_note_for(action, crate::keybinding::builtin_shadow_label(chord))
+}
+
+/// The note's spelling with the built-in shadow RESOLVED — the same gate-
+/// explicit shape as [`keybinding_row_warning`], and for the same reason: the
+/// Cmd/Super suite is compiled off on Linux, so only a resolved label lets a
+/// test see the macOS-shaped path where the review's escape lived.
+fn user_keybinding_note_for(action: &str, shadow: Option<&'static str>) -> String {
     if crate::keybinding::is_unbind_action(action) {
         // An unbind masks a SEED. Where a hardcoded built-in also claims the
         // chord, that half survives the unbind — say both, or the listing
         // implies the chord is now free (the review's macOS `cmd+c` case).
-        match crate::keybinding::builtin_shadow_label(chord) {
+        match shadow {
             Some(lbl) => format!("  (unbinds a default; still conflicts with {lbl})"),
             None => "  (unbinds a default)".to_string(),
         }
     } else if crate::keybinding::Action::parse(action).is_none() {
         "  (UNKNOWN action)".to_string()
-    } else if let Some(lbl) = crate::keybinding::builtin_shadow_label(chord) {
+    } else if let Some(lbl) = shadow {
         format!("  (conflicts with {lbl})")
     } else {
         String::new()
@@ -2874,6 +2899,119 @@ ink = "rainbow"
             String::new()
         };
         assert_eq!(user_keybinding_note("cmd+c", "copy"), expected);
+
+        // THE macOS SHAPE, ON ANY HOST. Everything above is host-conditional —
+        // on Linux the Cmd/Super suite is compiled off, so the branch the
+        // review's escape lived in is unreachable through the wrapper and the
+        // assertions above prove only the Linux half. The gate-explicit core
+        // resolves the label for us, so the macOS row is testable here.
+        assert_eq!(
+            user_keybinding_note_for("none", Some("Copy")),
+            "  (unbinds a default; still conflicts with Copy)",
+            "an unbind over a live built-in cannot imply the chord is free"
+        );
+        assert_eq!(
+            user_keybinding_note_for("unbind", Some("Next Tab")),
+            "  (unbinds a default; still conflicts with Next Tab)",
+            "both unbind spellings keep the caveat"
+        );
+        assert_eq!(
+            user_keybinding_note_for("none", None),
+            "  (unbinds a default)",
+            "with no built-in claiming the chord there is nothing to add"
+        );
+        // Precedence is unchanged by the caveat: an unknown action still
+        // shouts, and a live binding over a built-in keeps the plain note.
+        assert_eq!(
+            user_keybinding_note_for("no_such_action", Some("Copy")),
+            "  (UNKNOWN action)"
+        );
+        assert_eq!(
+            user_keybinding_note_for("copy", Some("Copy")),
+            "  (conflicts with Copy)"
+        );
+    }
+
+    /// The VALIDATOR half of the same review escape, on the macOS shape from
+    /// any host: `"cmd+c" = "none"` used to validate fully green because the
+    /// unbind arm short-circuited the built-in-conflict caveat. The unbind must
+    /// still not be an "unknown action" (that was the older escape, the other
+    /// way), so both halves have to hold at once.
+    #[test]
+    fn an_unbind_over_a_live_builtin_keeps_the_conflict_caveat() {
+        let unbind = keybinding_row_warning("cmd+c", "none", Some("Copy"))
+            .expect("an unbind cannot swallow the built-in it is unable to mask");
+        assert_eq!(unbind.key, "keybindings");
+        assert!(
+            unbind.message.contains("unbinds a default")
+                && unbind.message.contains("conflicts with built-in Copy"),
+            "{unbind:?}"
+        );
+        assert!(
+            !unbind.message.contains("unknown action"),
+            "the documented unbind spelling is still not an unknown action: {unbind:?}"
+        );
+
+        // Where the suite is compiled off (Linux) the chord conflicts with
+        // NOTHING, so an unbind stays silently valid — a warning there would
+        // tell a user their working binding fights a built-in this build has
+        // no such thing as.
+        assert!(keybinding_row_warning("cmd+c", "none", None).is_none());
+        assert!(keybinding_row_warning("f11", "unbind", None).is_none());
+
+        // The remaining arms keep their precedence with the label resolved.
+        assert!(
+            keybinding_row_warning("cmd+c", "no_such_action", Some("Copy"))
+                .expect("unknown action")
+                .message
+                .contains("unknown action \"no_such_action\"")
+        );
+        assert!(
+            keybinding_row_warning("cmd+c", "find", Some("Copy"))
+                .expect("plain shadow")
+                .message
+                .contains("conflicts with built-in Copy")
+        );
+        assert!(
+            keybinding_row_warning("shift+entr", "none", Some("Copy"))
+                .expect("an invalid chord outranks every later arm")
+                .message
+                .contains("invalid")
+        );
+    }
+
+    /// The Query arm ANSWERS (it stopped being "the GUI drops every Query"
+    /// when the arm was wired), and what it can reach is platform-split — so
+    /// the caveat must not carry Linux's own-selection bound onto a host whose
+    /// read is the whole system pasteboard. Asserted through the SHIPPING
+    /// pass, which is where the wording actually reaches a user.
+    #[test]
+    fn the_osc52_query_caveat_names_this_platforms_real_read_reach() {
+        let config = crate::app_config::Config {
+            allow_osc52_query: Some(true),
+            ..Default::default()
+        };
+        let message = config_semantic_warnings(&config)
+            .into_iter()
+            .find(|w| w.key == "allow_osc52_query")
+            .expect("the caveat rides an enabled key")
+            .message;
+        assert!(
+            !message.contains("drops every") && !message.contains("remain unavailable"),
+            "the Query arm answers; the old claim is retired: {message}"
+        );
+        assert!(message.contains("READ"), "{message}");
+        if cfg!(target_os = "linux") {
+            assert!(
+                message.contains("selections aterm itself owns"),
+                "X11 reads only the slots aterm owns: {message}"
+            );
+        } else {
+            assert!(
+                message.contains("OTHER apps"),
+                "off X11 the read is the whole pasteboard and must not be softened: {message}"
+            );
+        }
     }
 
     #[test]

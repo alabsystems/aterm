@@ -906,17 +906,27 @@ impl SettingsPreviewSpec {
                     "dark" => "Dark window appearance",
                     // Linux Auto follows the TERMINAL THEME, not a live OS
                     // appearance feed (`chrome_theme_for_apprt`); announce the
-                    // side the candidate palette actually resolves to.
-                    _ if cfg!(target_os = "linux") => {
-                        if spec
-                            .terminal_theme
-                            .map_or(spec.system_dark, |theme| theme_bg_is_dark(theme.bg))
-                        {
-                            "window appearance that matches the terminal theme, currently Dark"
-                        } else {
-                            "window appearance that matches the terminal theme, currently Light"
+                    // side the painter resolves through `window_sample_light`,
+                    // never a second opinion of our own.
+                    //
+                    // With no candidate palette the painter falls back to the
+                    // HOST terminal theme — a colour the semantic projection is
+                    // compiled long before any theme is bound to, so it names
+                    // the RULE and no side, rather than substituting the
+                    // `system_dark` OS feed this platform's Auto explicitly does
+                    // not consult. (Every shipping spec carries a candidate:
+                    // `renderer_preview_spec_for_key_with_font` derives one from
+                    // the host theme even when nothing is edited.)
+                    _ if cfg!(target_os = "linux") => match spec.terminal_theme {
+                        Some(candidate) => {
+                            if window_sample_light(&spec, candidate.into_theme()) {
+                                "window appearance that matches the terminal theme, currently Light"
+                            } else {
+                                "window appearance that matches the terminal theme, currently Dark"
+                            }
                         }
-                    }
+                        None => "window appearance that matches the terminal theme",
+                    },
                     _ if spec.system_dark && cfg!(target_os = "macos") => {
                         "window appearance that follows macOS, currently Dark"
                     }
@@ -1359,6 +1369,20 @@ impl SettingsPreviewSpec {
             selection_foreground: self.appearance.selection_foreground,
             selection_inactive: self.appearance.selection_inactive,
         }
+    }
+
+    /// The side the WINDOW SAMPLE paints (`true` = Light) when this spec is
+    /// painted against `host` — the theme [`Self::paint`] falls back to for a
+    /// spec carrying no candidate palette. THE resolver ([`window_sample_light`])
+    /// answering for the pixels, exposed so a fixture that needs a candidate on
+    /// the OPPOSITE side can ask instead of restating the platform rule and
+    /// silently rotting when the rule moves.
+    pub(crate) fn window_sample_is_light(&self, host: Theme) -> bool {
+        let spec = self.normalized();
+        let terminal_theme = spec
+            .terminal_theme
+            .map_or(host, PreviewTerminalTheme::into_theme);
+        window_sample_light(&spec, terminal_theme)
     }
 
     pub(crate) fn paint(

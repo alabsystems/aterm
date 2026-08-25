@@ -196,6 +196,14 @@ pub struct Terminal {
     /// RIS, `clear_scrollback`, `restore_checkpoint` and a width resize from each
     /// acquiring an independent "must also clear the parked one" obligation for a
     /// selection that could outlive them.
+    ///
+    /// The two arms compare the batch's START screen with its END screen, so a
+    /// batch that EXITS and RE-ENTERS runs neither. The ALT screen's own selection
+    /// still dies there — `post_process` clears it on the exit paths' report
+    /// (`alt_screen_left_in_batch`), because a 1049 exit drops that buffer outright
+    /// and a `?47h` re-entry allocates a blank one with no damage of its own — and
+    /// this slot is untouched, which is correct: its main-screen occupant was never
+    /// restored, so it is still parked.
     pub(super) parked_text_selection: crate::selection::TextSelection,
     /// Secure keyboard entry mode.
     ///

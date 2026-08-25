@@ -157,6 +157,52 @@ fn assert_proves_and_catches(m: &Model) {
     tier0_or_skip(verify::prove_and_catch_tiered(m, m.name));
 }
 
+/// PER-INVARIANT non-vacuity: every invariant a model states as a DESIGN CLAIM
+/// must be falsified by the `Buggy = 1` family when it is checked ALONE.
+///
+/// `prove_and_catch` stops at the FIRST violated invariant, so a model can pass it
+/// with one live property carrying the whole catch and every other invariant a
+/// ghost — true by construction, unfalsifiable by any mutant, stating nothing about
+/// the code. That is not hypothetical: `press_custody_model` shipped it once over a
+/// self-reported flag, and `selection_custody_model` shipped it again with five of
+/// eight invariants unfalsifiable. Isolating each invariant is what turns "the
+/// model catches the defect" into "each named law catches its own defect".
+///
+/// `bounds_guards` names the invariants that state the SPACE rather than the design
+/// (`StateBounds` and friends). They are expected NOT to be caught, and the
+/// assertion is two-sided on purpose: adding a real invariant to that list to
+/// silence a failure fails the test instead.
+fn assert_every_invariant_carries_a_mutant(m: &Model, bounds_guards: &[&str]) {
+    for guard in bounds_guards {
+        assert!(
+            m.invariants.iter().any(|inv| inv.name == *guard),
+            "{}: `{guard}` is named as a bounds guard but the model has no such invariant",
+            m.name
+        );
+    }
+    let buggy = aterm_spec::interp::with_buggy(m, 1);
+    for inv in &m.invariants {
+        let mut alone = buggy.clone();
+        alone.invariants.retain(|other| other.name == inv.name);
+        let caught = aterm_spec::interp::bmc(&alone).is_err();
+        if bounds_guards.contains(&inv.name) {
+            assert!(
+                !caught,
+                "{}: `{}` is named as a bounds guard but a Buggy=1 member falsifies it — it is \
+                 a design claim, so move it out of the guard list",
+                m.name, inv.name
+            );
+        } else {
+            assert!(
+                caught,
+                "{}: NO Buggy=1 member falsifies `{}` — it is a ghost invariant that cannot \
+                 fail whatever the code does, exactly the failure this suite exists to prevent",
+                m.name, inv.name
+            );
+        }
+    }
+}
+
 /// Operator models are registered model-checking inputs, not one-off examples:
 /// every committed action must be reachable, both constant settings must stay
 /// exhaustively bounded, and a work-in-progress state must always have a next
@@ -5314,10 +5360,19 @@ fn derived_top_anchored_scroll_proves_history_retention() {
     // margined scrolls that used to kill it unconditionally. This is the reported
     // bug, stated as a model property: a status bar repainting in a scroll region
     // must not destroy a highlight anchored up in scrollback.
-    for choice in [
-        "ChooseInteriorDisjoint",
-        "ChooseMarginedDisjoint",
-        "ChooseEphemeralDisjoint",
+    //
+    // `ChooseArchivalDisjoint` belongs in this loop and used to be missing from it,
+    // because the invariant's archival arm ignored `selection_disjoint` and demanded
+    // the remap for every archival state. Archiving a row and MOVING the selection
+    // are two different questions: the splice shifts rows above its boundary, and a
+    // selection below the region is not one of them. So the archival regime still
+    // retains its displaced row (`expected_history == 1`) while leaving a disjoint
+    // selection exactly where it was.
+    for (choice, expected_history) in [
+        ("ChooseArchivalDisjoint", 1),
+        ("ChooseInteriorDisjoint", 0),
+        ("ChooseMarginedDisjoint", 0),
+        ("ChooseEphemeralDisjoint", 0),
     ] {
         let mut state = model.init_state();
         assert!(model.fire(choice, &mut state));
@@ -5332,7 +5387,23 @@ fn derived_top_anchored_scroll_proves_history_retention() {
             Some(&2),
             "{choice}: and must not be remapped — nothing moved under it"
         );
-        assert_eq!(state.get("history_len"), Some(&0), "{choice}");
+        assert_eq!(
+            state.get("history_len"),
+            Some(&expected_history),
+            "{choice}"
+        );
+    }
+
+    // …and the archival regime's Buggy=1 mutant is still caught through the disjoint
+    // label: it drops the displaced row and kills the selection, and both halves are
+    // named by invariants.
+    {
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut state = buggy.init_state();
+        assert!(buggy.fire("ChooseArchivalDisjoint", &mut state));
+        assert!(buggy.fire("Scroll", &mut state));
+        assert!(!buggy.check_invariant("EligibleDisplacementIsRetained", &state));
+        assert!(!buggy.check_invariant("EligibleSelectionUsesPiecewiseRemap", &state));
     }
 
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
@@ -5577,13 +5648,24 @@ fn derived_focus_modifier_cache_resets_only_at_focus_loss() {
 /// pre-action values, not over a self-reported "did this disturb anything" flag,
 /// so an implementation that moved the viewport silently cannot satisfy them.
 ///
-/// `Buggy=1` is the regression family — inert press, repeat, release and output
-/// each disturbing — so `assert_proves_and_catches` fails unless the invariants
-/// genuinely catch it.
+/// Output and the SELECTION are separate: Phase 4 lets output that REPLACED the
+/// selected rows clear the highlight, and ED 3 / `clear_scrollback` / RIS take the
+/// viewport back outright. Both are their own event kinds, because the earlier
+/// `OutputNeverTakesCustodyOrSelection` asserted the opposite of what shipped — a
+/// model that contradicts the code is worse than no model, since the next reader
+/// deletes the code to satisfy it.
+///
+/// `Buggy=1` is the regression family — inert press, repeat, release, output that
+/// snaps, damaging output that also takes custody, and typing that deselects
+/// without snapping — so `assert_proves_and_catches` fails unless the invariants
+/// genuinely catch it, and `assert_every_invariant_carries_a_mutant` fails unless
+/// each named law catches a member of its own.
 #[test]
 fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
     let model = press_custody_model();
     assert_proves_and_catches(&model);
+    // …and every named law catches its OWN member, not just the model as a whole.
+    assert_every_invariant_carries_a_mutant(&model, &["StateBounds"]);
 
     // The reported bug, replayed as a trace: read history, select, then press ⌘.
     let mut reading = model.init_state();
@@ -5630,6 +5712,43 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
         "output does not drop the selection"
     );
 
+    // Output that REPLACED the selected rows is the Phase-4 case the old
+    // `OutputNeverTakesCustodyOrSelection` denied: the highlight goes, because
+    // leaving it painted over new text makes ⌘-C return text the user never
+    // selected — and the reading position still does not.
+    let mut damaged = model.init_state();
+    for action in ["UserScroll", "UserSelect", "OutputDamagesTheSelectedRows"] {
+        assert!(model.fire(action, &mut damaged), "{action}: {damaged:?}");
+    }
+    assert_eq!(
+        damaged["selection"], 0,
+        "output that replaced the selected rows clears the highlight"
+    );
+    assert_eq!(
+        damaged["owner"], 1,
+        "…and still does not take the viewport back"
+    );
+    assert_eq!(
+        damaged["offset"], 2,
+        "…the repin keeps the same content under the eye"
+    );
+
+    // ED 3 / clear_scrollback / RIS: the coordinate space the offset named is
+    // gone, so this one legitimately DOES hand the viewport back. Modelled as its
+    // own event kind so the custody law above stays true of the shipped engine
+    // rather than being quietly false of it.
+    let mut wiped = model.init_state();
+    for action in [
+        "UserScroll",
+        "UserSelect",
+        "OutputInvalidatesTheCoordinateSpace",
+    ] {
+        assert!(model.fire(action, &mut wiped), "{action}: {wiped:?}");
+    }
+    assert_eq!(wiped["offset"], 0, "the space the offset named is gone");
+    assert_eq!(wiped["owner"], 0);
+    assert_eq!(wiped["selection"], 0);
+
     // …and the one handover is intact: typing still lands at live and deselects.
     let mut typed = model.init_state();
     for action in ["UserScroll", "UserSelect", "TypingPress"] {
@@ -5641,18 +5760,43 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
         typed["owner"], 0,
         "typing hands the viewport back to the tail"
     );
+
+    // The Phase-4 member specifically: output allowed to clear the rows it damaged
+    // must not smuggle the viewport snap in with it. Named here as well as covered
+    // by the per-invariant sweep, because this is the law the previous, false
+    // `OutputNeverTakesCustodyOrSelection` would have been deleted to satisfy.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut snapped = buggy.init_state();
+    for action in ["UserScroll", "UserSelect", "OutputDamagesTheSelectedRows"] {
+        assert!(buggy.fire(action, &mut snapped), "{action}: {snapped:?}");
+    }
+    assert!(
+        !buggy.check_invariant("OutputNeverTakesCustody", &snapped),
+        "damaging output that also snapped to live must violate the custody law"
+    );
 }
 
 /// SELECTION CUSTODY — a highlight is destroyed only by something that destroys the
 /// content it names.
 ///
-/// `Buggy = 1` is the literal shipping defect: ANY region damage clears, whether or
-/// not it overlapped the selected rows. That is what made a status bar repainting at
-/// the bottom of the screen destroy a highlight anchored far up in scrollback.
+/// `Buggy = 1` is a regression FAMILY with one member per destroyer. `RegionDamageLow`
+/// is the literal shipping defect (ANY region damage clears, whether or not it
+/// overlapped — what made a status bar repainting at the bottom of the screen destroy
+/// a highlight anchored far up in scrollback); `RegionDamageHigh` is its inverse (a
+/// highlight left alive over replaced text, so the copy returns something the user
+/// never selected); `InertPress` and `UniformScroll` destroy the selection outright —
+/// the two user complaints; and `Evict` reports the truncation without clamping the
+/// head or dropping a fully-evicted selection.
+///
+/// Each member is asserted against the invariant it falsifies, ONE BY ONE, because
+/// the whole-model verdict stops at the first violation: without that,
+/// `assert_proves_and_catches` passed while five of the eight invariants were ghosts
+/// that no implementation could violate.
 #[test]
 fn derived_selection_custody_spares_damage_that_missed_the_selection() {
     let model = selection_custody_model();
     assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &["StateIsBounded"]);
 
     // THE REPORTED BUG, as a trace: select high, damage low, highlight survives.
     let mut spared = model.init_state();
@@ -5690,6 +5834,38 @@ fn derived_selection_custody_spares_damage_that_missed_the_selection() {
         "…with the head clamped to the new floor"
     );
 
+    // …but eviction that took the WHOLE interval destroys it. This half of the law
+    // was unmodelled until `SelectOldest` existed: with only the two-row selections
+    // no reachable state had `sel_hi == 0`, so `Evict`'s clear branch was dead code
+    // and the invariant's `else` arm was never evaluated.
+    let mut gone = model.init_state();
+    for action in ["SelectOldest", "Evict"] {
+        assert!(model.fire(action, &mut gone), "{action}: {gone:?}");
+    }
+    assert_eq!(
+        gone["alive"], 0,
+        "both endpoints evicted leaves nothing to name"
+    );
+    assert_eq!(
+        gone["truncated"], 0,
+        "…and a destroyed selection records no truncation"
+    );
+
+    // An eviction that missed the selection entirely moves nothing at all.
+    let mut untouched = model.init_state();
+    for action in ["SelectHigh", "Evict"] {
+        assert!(
+            model.fire(action, &mut untouched),
+            "{action}: {untouched:?}"
+        );
+    }
+    assert_eq!(untouched["alive"], 1);
+    assert_eq!(untouched["sel_lo"], 2, "the head never moved");
+    assert_eq!(
+        untouched["truncated"], 0,
+        "nothing was lost, so nothing is recorded"
+    );
+
     // A bare modifier and ordinary output are both inert.
     let mut inert = model.init_state();
     for action in ["SelectHigh", "InertPress", "UniformScroll"] {
@@ -5707,9 +5883,13 @@ fn derived_selection_custody_spares_damage_that_missed_the_selection() {
     }
     assert_eq!(typed["alive"], 0, "typing still deselects");
 
-    // The buggy variant must violate the DISJOINT arm specifically — proving the
-    // model catches the real defect and not merely some arithmetic slip.
+    // THE FAMILY, MEMBER BY MEMBER. Each mutant is driven to the state it breaks
+    // and the NAMED invariant is checked there, so a pass says "this law caught
+    // this defect" rather than "some law caught something". The whole-model verdict
+    // cannot say that: it stops at the first violated invariant.
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // The shipped sentinel: damage that never touched the selected rows clears.
     let mut over_cleared = buggy.init_state();
     for action in ["SelectHigh", "RegionDamageLow"] {
         assert!(buggy.fire(action, &mut over_cleared));
@@ -5717,6 +5897,65 @@ fn derived_selection_custody_spares_damage_that_missed_the_selection() {
     assert!(
         !buggy.check_invariant("DisjointDamagePreserves", &over_cleared),
         "the shipped sentinel cleared on damage it never touched; the model must say so"
+    );
+
+    // The inverse hole: damage that HIT the selected rows leaves the highlight.
+    let mut stale = buggy.init_state();
+    for action in ["SelectHigh", "RegionDamageHigh"] {
+        assert!(buggy.fire(action, &mut stale));
+    }
+    assert!(
+        !buggy.check_invariant("OverlapDamageClears", &stale),
+        "a highlight surviving over replaced text is a wrong-copy path; the model must say so"
+    );
+
+    // Complaint (1): a bare modifier destroying the selection. Unfalsifiable in the
+    // first draft — `InertPress` wrote only `last_event`, so `alive == 1` followed
+    // from the action's own guard whatever the engine did.
+    let mut modifier = buggy.init_state();
+    for action in ["SelectHigh", "InertPress"] {
+        assert!(buggy.fire(action, &mut modifier));
+    }
+    assert!(
+        !buggy.check_invariant("InertPressPreservesTheSelection", &modifier),
+        "a bare modifier that deselects must violate the inert-press law"
+    );
+
+    // Complaint (2): ordinary output taking the highlight.
+    let mut flooded = buggy.init_state();
+    for action in ["SelectHigh", "UniformScroll"] {
+        assert!(buggy.fire(action, &mut flooded));
+    }
+    assert!(
+        !buggy.check_invariant("UniformScrollPreservesTheSelection", &flooded),
+        "output that deselects must violate the uniform-scroll law"
+    );
+
+    // Eviction that reports the loss without acting on it: the head stays below the
+    // new floor (a dangling anchor) and a fully-evicted selection stays alive.
+    let mut dangling = buggy.init_state();
+    for action in ["SelectLow", "Evict"] {
+        assert!(buggy.fire(action, &mut dangling));
+    }
+    assert!(
+        !buggy.check_invariant("PartialEvictionTruncates", &dangling),
+        "an eviction that never clamps the head must violate the truncation law"
+    );
+    assert!(
+        !buggy.check_invariant("NoDanglingAnchors", &dangling),
+        "…and a head below the floor is a dangling anchor"
+    );
+    assert!(
+        !buggy.check_invariant("TruncationImpliesAClampedHead", &dangling),
+        "…and a truncation recorded against an unclamped head is a lie"
+    );
+    let mut kept = buggy.init_state();
+    for action in ["SelectOldest", "Evict"] {
+        assert!(buggy.fire(action, &mut kept));
+    }
+    assert!(
+        !buggy.check_invariant("PartialEvictionTruncates", &kept),
+        "a selection with both endpoints evicted must not survive"
     );
 }
 

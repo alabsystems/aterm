@@ -1208,3 +1208,98 @@ fn test_contains_block_end_left_side_col_zero() {
         "col 1 should not be in a col 0..=0 block"
     );
 }
+
+#[test]
+fn test_adjust_for_rows_shrink_relabels_every_row_by_the_same_amount() {
+    // 10 visible rows shrinking to 6. Since the rows-only shapes anchor at the
+    // CURSOR, the viewport gives up its top four rows to history and EVERY row —
+    // live or already-archived — moves by exactly -4. Measured against the engine
+    // in `probe`-style traces: rel 0 (line-55) -> rel -4, rel 7 (line-62) -> rel 3.
+    let mut live = TextSelection::new();
+    live.start_selection(2, 1, SelectionSide::Left, SelectionType::Simple);
+    live.update_selection(5, 7, SelectionSide::Right);
+    live.complete_selection();
+    assert!(live.adjust_for_rows_shrink(6, 4, 50));
+    assert_eq!(live.start().row, -2, "a live row moves by the rows given up");
+    assert_eq!(live.end().row, 1);
+
+    let mut bottom = TextSelection::new();
+    bottom.start_selection(6, 0, SelectionSide::Left, SelectionType::Simple);
+    bottom.update_selection(9, 3, SelectionSide::Right);
+    bottom.complete_selection();
+    assert!(bottom.adjust_for_rows_shrink(6, 4, 50));
+    assert_eq!(bottom.start().row, 2, "the bottom rows stay live under the cursor");
+    assert_eq!(bottom.end().row, 5);
+    assert_eq!(bottom.start().col, 0, "columns are untouched");
+    assert!(bottom.is_complete(), "and so is the lifecycle state");
+
+    let mut archived = TextSelection::new();
+    archived.start_selection(-20, 0, SelectionSide::Left, SelectionType::Block);
+    archived.update_selection(-7, 2, SelectionSide::Right);
+    assert!(archived.adjust_for_rows_shrink(6, 4, 50));
+    assert_eq!(archived.start().row, -24, "history gains four newer lines");
+    assert_eq!(archived.end().row, -11);
+    assert!(archived.is_in_progress());
+    assert_eq!(archived.selection_type(), SelectionType::Block);
+
+    // The SHAPE claim: one delta describes every regime at once. A live span and an
+    // archived span move by the same 4 rows, which is what makes this a relabel and
+    // not the piecewise map it used to be.
+    let mut degenerate = TextSelection::new();
+    degenerate.start_selection(1, 0, SelectionSide::Left, SelectionType::Simple);
+    degenerate.update_selection(1, 1, SelectionSide::Right);
+    degenerate.complete_selection();
+    assert!(!degenerate.adjust_for_rows_shrink(0, 4, 50));
+    assert!(!degenerate.has_selection());
+
+    // An empty selection is a no-op in every direction.
+    let mut empty = TextSelection::new();
+    assert!(empty.adjust_for_rows_shrink(6, 4, 50));
+    assert!(!empty.has_selection());
+}
+
+/// A rows-only SHRINK is MONOTONIC, so no span can be torn by it.
+///
+/// This test is the negative of one that used to assert the opposite. The shrink
+/// once demoted the bottom live rows into history, INSERTING them between the
+/// existing scrollback and the rows that stayed on screen — a non-monotonic map,
+/// under which a span crossing the cut remapped to a reversed, WIDER range. Since
+/// anchors are a row RANGE rather than a set (the copy walk is
+/// `first_row..=last_row`, and the normalized bounds take min/max independently),
+/// such a span copied rows the user never selected, so the primitive cleared it.
+///
+/// Cursor anchoring makes the map a pure relabel, and a monotonic map cannot
+/// reverse a span. The spans that had to be sacrificed now SURVIVE intact, which is
+/// strictly better for the user: a height drag no longer destroys a highlight that
+/// happens to cross the cut. Should the rows-only shapes ever stop anchoring at the
+/// cursor, this test fails and the guard must come back with them.
+#[test]
+fn a_shrink_spares_a_span_that_crosses_the_cut() {
+    // 10 visible rows -> 6. A span over live rows 4..=7 crosses the old cut.
+    let mut sel = TextSelection::new();
+    sel.start_selection(4, 0, SelectionSide::Left, SelectionType::Simple);
+    sel.update_selection(7, 5, SelectionSide::Right);
+    sel.complete_selection();
+    assert!(sel.adjust_for_rows_shrink(6, 4, 100), "the span survives the shrink");
+    assert_eq!(sel.start().row, 0, "…relabelled by the rows given up");
+    assert_eq!(sel.end().row, 3);
+    assert!(
+        sel.start().row <= sel.end().row,
+        "ORDER is the property the old map could not keep: a reversed range copies \
+         rows the user never selected"
+    );
+
+    // …and the scrollback-into-live span, which the demoted rows used to split.
+    let mut across = TextSelection::new();
+    across.start_selection(-3, 0, SelectionSide::Left, SelectionType::Simple);
+    across.update_selection(2, 5, SelectionSide::Right);
+    across.complete_selection();
+    assert!(
+        across.adjust_for_rows_shrink(6, 4, 100),
+        "a span from scrollback into the live rows is continuous under a relabel"
+    );
+    assert_eq!(across.start().row, -7);
+    assert_eq!(across.end().row, -2);
+    assert!(across.start().row <= across.end().row, "order again");
+}
+

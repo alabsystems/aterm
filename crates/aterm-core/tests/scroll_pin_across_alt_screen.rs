@@ -704,18 +704,46 @@ fn alt_screen_scrolling_does_not_walk_the_parked_selection() {
 /// next batch swaps it out; the batch that swaps it back drains it while
 /// `absolute_rows_before` still names the ALT grid's counter. The debug assert
 /// compares those two, and before the exemption it panicked in every debug build.
+///
+/// The debug assert alone is not an oracle: under `cargo test --release` it is
+/// compiled out, and `scrollback_lines() > 0` — which this test used to assert on
+/// its own — is already true of the fixture before the round trip starts, so in that
+/// profile the test checked nothing at all. What the drain is FOR is pinned instead,
+/// against an ABSOLUTE oracle rather than a same-code control: the splice archives
+/// one more row above the anchor, so the anchor must move by exactly one row and
+/// keep naming the same characters. A stranded splice that is dropped, or applied
+/// against the wrong grid's counter, breaks one of those two — in either profile.
 #[test]
 fn a_stranded_splice_does_not_trip_the_cross_grid_assert_on_exit() {
     let mut term = with_scrollback_selection(6, 24);
+    let text_before = term
+        .selection_to_string()
+        .expect("the fixture's selection resolves");
+    let row_before = term.text_selection().start().row;
 
     // A protected-footer archival scroll: rows 1..=3 move into history while the
-    // rows below stay fixed. Same shape as `processing.rs`'s own splice fixture.
+    // rows below stay fixed (the shape of `processing.rs`'s own splice fixture), in
+    // the SAME batch as the smcup that strands the resulting splice.
     term.process(b"\x1b[r\x1b[1;1HX\x1b[1;3r\x1b[3;1H\n\x1b[?1049h");
     term.process(b"pager\r\n");
     term.process(b"\x1b[?1049l");
 
-    // Reaching here in a debug build IS the assertion; keep a liveness check so the
-    // test cannot pass by doing nothing.
+    // Reaching here in a DEBUG build is the assert half. These two run in both
+    // profiles. LIVENESS first — one row entered history above the anchor, so the
+    // drain must have moved it; an un-drained splice leaves the row untouched.
+    assert_eq!(
+        term.text_selection().start().row,
+        row_before - 1,
+        "the stranded splice must be DRAINED on the batch that swaps the grid back"
+    );
+    // …and CORRECTNESS: moving the anchor is only right if it still names its own
+    // content. Draining against the alt grid's counter moves it off.
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(text_before.as_str()),
+        "the highlight must ride its content across the splice, not slide onto the \
+         neighbouring line"
+    );
     assert!(term.grid().scrollback_lines() > 0);
 }
 
@@ -886,15 +914,22 @@ fn wholesale_destruction_while_on_alt_takes_the_parked_selection_with_it() {
 /// pre-RIS main selection stays in the parked slot and is a candidate to be handed
 /// back on the next `?1049l`, over a grid the reset already erased.
 ///
-/// HONEST SCOPE — this pins the user-visible PROPERTY, not one mechanism. Two
-/// independent things currently enforce it, and this test does not isolate either:
-/// the explicit `parked_text_selection.clear()` in the `pending_parser_reset` block,
-/// and the floor-0 guard in `truncate_to_floor` (RIS erases the scrollback, so the
-/// restored grid's floor is 0 and a clamp is refused). Verified by mutation:
-/// deleting the RIS clear alone leaves this test GREEN. It is kept because the
-/// property is worth pinning and the clear is worth keeping — the guard's coverage
-/// here is incidental, and a future change that gives the restored grid a nonzero
-/// floor would move the load onto the clear.
+/// SCOPE, corrected. The shipped note said two mechanisms enforce this and named
+/// `truncate_to_floor`'s floor-0 guard as the second. Measured by mutation, that is
+/// wrong in both directions: the anchor is on a LIVE row here (in range on any grid
+/// of the same height, so no bounds check and no floor clamp can reach it), and
+/// deleting BOTH explicit `parked_text_selection.clear()` calls — the
+/// `pending_parser_reset` one and `Terminal::reset`'s — still leaves this GREEN.
+///
+/// The real second enforcer is RIS's own `erase_scrollback`, which records
+/// `SelectionDamage::All` on the main grid. That band is not drained while the alt
+/// grid is active, so the exit batch drains it in `post_process` right AFTER the
+/// restore and destroys the handed-back selection on arrival. No black-box test can
+/// separate the two, because the erase and the clear are the same event.
+///
+/// So this stays a PROPERTY test, honestly labelled, and the clear itself is
+/// isolated one batch earlier and one layer down, on the field invariant it exists
+/// to keep: `terminal::processing::tests::ris_empties_the_parked_selection_slot_in_the_batch_that_resets`.
 #[test]
 fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
     use aterm_core::selection::{SelectionSide, SelectionType};
@@ -903,7 +938,9 @@ fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
     for i in 0..40 {
         term.process(format!("line-{i}\r\n").as_bytes());
     }
-    // A selection on the MAIN screen, then park it by entering alt.
+    // A selection on the MAIN screen's LIVE rows — in range before and after the
+    // reset, so nothing but the RIS clear can dispose of it. Then park it by
+    // entering alt.
     {
         let sel = term.text_selection_mut();
         sel.start_selection(0, 0, SelectionSide::Left, SelectionType::Simple);
@@ -925,5 +962,261 @@ fn ris_then_reenter_alt_in_one_batch_leaves_no_surviving_highlight() {
         !term.text_selection().has_selection(),
         "RIS must destroy the parked selection; it cannot survive to be restored \
          over a grid the reset erased"
+    );
+}
+
+// ===========================================================================
+// SELECTION CUSTODY Phase 3, the second audit — the state-machine holes the
+// narrowing left behind.
+// ===========================================================================
+
+/// Every visible row's text, top to bottom — the whole window under the eye.
+///
+/// Same ring-accessor caveat as [`top_row_text`]: sound only for the shallow,
+/// ring-only fixtures in this file.
+fn window_text(term: &Terminal) -> Vec<String> {
+    let grid = term.grid();
+    (0..grid.rows())
+        .map(|r| {
+            (0..grid.cols())
+                .filter_map(|c| grid.cell(r, c).map(|cell| cell.char()))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// A completed selection over `[row, 0]..=[row, cols]`, with its text returned.
+fn select_row(term: &mut Terminal, row: i32, cols: u16) -> String {
+    {
+        let sel = term.text_selection_mut();
+        sel.start_selection(row, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(row, cols, SelectionSide::Right);
+        sel.complete_selection();
+    }
+    term.selection_to_string()
+        .expect("the fixture must select real text")
+}
+
+/// A ROWS-ONLY SHRINK moves a scrollback selection with its content.
+///
+/// The mirror of the rows-GROW case above, and the one the narrowing missed.
+/// `take_last_resize_row_shift()` is only ever set on a grow, so the shrink ran
+/// `adjust_for_scroll(0, ..)` — anchors unchanged — on the premise that a rows-only
+/// resize moves no content. It does: `adjust_row_count_rows_only` pushes the bottom
+/// `old - new` viewport rows on top of history, so every SCROLLBACK anchor gains
+/// that many lines above it. Nothing was cleared and nothing was flagged, so the
+/// highlight silently sat on later text and a copy returned lines the user never
+/// picked.
+#[test]
+fn a_rows_only_shrink_keeps_a_scrollback_selection_over_its_own_text() {
+    let mut term = Terminal::new(10, 24);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    let text_before = select_row(&mut term, -20, 6);
+    // Pin the literal text, so this cannot pass by comparing two wrong answers.
+    assert_eq!(text_before, "line-35");
+
+    // A window-height drag / font zoom / find-bar toggle: four rows shorter,
+    // same width.
+    term.resize(6, 24);
+
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(text_before.as_str()),
+        "the shrink pushed four viewport rows on top of history; the anchor owes \
+         them exactly one compensation each"
+    );
+}
+
+/// The other half of the same map: a selection on a row the shrink DEMOTES.
+///
+/// Those rows are not evicted and they are not still live — they become the newest
+/// history, at `row - old_rows`. A uniform delta cannot describe that and the same
+/// row's live neighbours above the cut at once, which is why this is its own
+/// primitive rather than another `adjust_for_scroll` argument.
+#[test]
+fn a_rows_only_shrink_follows_a_demoted_live_row_into_history() {
+    let mut term = Terminal::new(10, 24);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    // Row 7 of 10 is below the cut at 6 — it is demoted to relative -3.
+    let text_before = select_row(&mut term, 7, 6);
+    assert_eq!(text_before, "line-62");
+
+    term.resize(6, 24);
+
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(text_before.as_str()),
+        "a demoted row keeps its content; the highlight must follow it into history"
+    );
+}
+
+/// The SHRINK direction for the PARKED selection too — `finalize_resize` runs the
+/// identical map against the saved primary grid, which a height drag under `vim`
+/// resizes just the same.
+#[test]
+fn a_rows_only_shrink_under_alt_keeps_the_parked_scrollback_selection() {
+    let mut term = Terminal::new(10, 24);
+    for i in 0..64 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    let text_before = select_row(&mut term, -20, 6);
+
+    term.process(b"\x1b[?1049h");
+    term.resize(6, 24);
+    term.process(b"\x1b[?1049l");
+
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(text_before.as_str()),
+        "the parked grid took the same bottom-push and owes the same compensation"
+    );
+}
+
+/// AN RMCUP MID-BATCH MUST NOT LEAVE THE RESTORED GRID SCROLLED BACK.
+///
+/// The Phase-3 re-pin parks the main grid carrying `display_offset > 0` — that is
+/// how the reading position survives a pager. `exit_alternate_screen` then swaps
+/// that grid back in MID-batch, and every remaining byte is written through
+/// `row_index`, which SUBTRACTS `display_offset`: the `\x1b[K` erased a line of the
+/// user's history 40 rows back and `HELLO` was written into that same row, so the
+/// live screen never showed it. Two secondary consequences rode along — the damage
+/// band named the LIVE row while the erase hit a scrollback row (a stale highlight
+/// over blanked text), and a full-screen scroll in that window snapped the reader
+/// to live with no pin left to restore it.
+#[test]
+fn an_rmcup_mid_batch_writes_to_the_live_screen_not_into_history() {
+    let mut term = scrolled_back(6, 24, 64);
+    let window_before = window_text(&term);
+    assert!(
+        window_before.iter().any(|row| row.starts_with("line-")),
+        "the fixture must be parked over real history"
+    );
+
+    term.process(b"\x1b[?1049h");
+    term.process(b"a pager's screen\r\n");
+    // The rmcup AND the bytes that follow it, in ONE read — the shape every
+    // isolated-`?1049l` test in this file misses.
+    term.process(b"\x1b[?1049l\r\x1b[KHELLO\n");
+
+    assert_eq!(
+        window_text(&term),
+        window_before,
+        "not one row of the user's history may be erased or overwritten by bytes \
+         that belong on the live screen"
+    );
+
+    term.scroll_to_bottom();
+    assert!(
+        window_text(&term).iter().any(|row| row == "HELLO"),
+        "…and the write must have landed on the LIVE screen: {:?}",
+        window_text(&term)
+    );
+}
+
+/// OUTPUT BEFORE THE SMCUP IN THE SAME BATCH COUNTS TOWARD THE RE-PIN.
+///
+/// The parked-grid re-pin hardcoded `lines_added = 0` behind "a grid that has been
+/// swapped out stopped receiving output". It stopped receiving it only AFTER the
+/// swap: batch boundaries are `read()` boundaries, so job output followed by an
+/// app's smcup in one read is routine, and those lines really did enter the MAIN
+/// grid's scrollback.
+#[test]
+fn output_before_an_smcup_in_the_same_batch_still_moves_the_pin() {
+    let mut term = scrolled_back(6, 24, 64);
+    let top_before = top_row_text(&term);
+
+    // Three lines of job output, then the app's smcup — one read.
+    term.process(b"a\r\nb\r\nc\r\n\x1b[?1049h");
+    term.process(b"pager\r\n");
+    term.process(b"\x1b[?1049l");
+
+    assert_eq!(
+        top_row_text(&term),
+        top_before,
+        "the three lines that entered the main grid's scrollback before the smcup \
+         must be part of the restored reading position"
+    );
+}
+
+/// A BATCH THAT EXITS AND RE-ENTERS ALT RUNS NEITHER PARK ARM.
+///
+/// `post_process` compares the batch's start screen with its end screen, so
+/// `\x1b[?1049l\x1b[?47h` looks like "still on alt" and neither `mem::take` fires.
+/// The 1049 exit DROPPED that alt buffer and `?47h` allocated a fresh blank one —
+/// which, unlike `enter_alternate_screen`, records no damage — so the old alt
+/// screen's anchors stayed live over a buffer that never held the selected text.
+#[test]
+fn an_exit_and_re_entry_in_one_batch_kills_the_previous_alt_selection() {
+    let mut term = Terminal::new(6, 24);
+    for i in 0..40 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    // A main-screen selection, parked by the entry — it must SURVIVE all of this.
+    let main_text = select_row(&mut term, -10, 6);
+    term.process(b"\x1b[?1049h");
+    // Home first: 1049 keeps the cursor where main left it (the bottom row), and
+    // this selection has to name text the alt buffer really holds.
+    term.process(b"\x1b[Hpager row\r\n");
+    // …and a selection made ON the alt screen, which must not survive.
+    select_row(&mut term, 0, 4);
+
+    term.process(b"\x1b[?1049l\x1b[?47h");
+
+    assert!(
+        !term.text_selection().has_selection(),
+        "the 1049 exit destroyed that alt buffer; its highlight cannot outlive it"
+    );
+
+    term.process(b"\x1b[?47l");
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(main_text.as_str()),
+        "and the parked MAIN selection is still the one that comes back"
+    );
+}
+
+
+
+/// A shrink that only TRIMS moves nothing, so the selection must not move either.
+///
+/// The relabel distance is the DEMOTE count, not the height delta. Trailing blank
+/// rows strictly below the cursor are not content: the shrink drops them outright
+/// rather than archiving them, because archiving would manufacture blank history a
+/// later grow reveals above real text. When the height delta is absorbed entirely by
+/// that trim, no row changes position at all.
+///
+/// Compensating by the height delta instead would push every anchor up by the
+/// trimmed count — a highlight over text the user never selected, which is the
+/// wrong-copy direction. Cheap to get wrong because the two numbers are equal on a
+/// FULL screen, which is what every other test in this file uses.
+#[test]
+fn a_shrink_absorbed_entirely_by_trailing_blanks_leaves_the_anchor_alone() {
+    let mut term = Terminal::new(10, 24);
+    // Four lines of content; the cursor lands on row 4 and rows 4..9 stay blank.
+    for i in 0..4 {
+        term.process(format!("line-{i}\r\n").as_bytes());
+    }
+    let text_before = select_row(&mut term, 1, 6);
+    assert_eq!(text_before, "line-1");
+
+    // 10 -> 6 is a delta of four, and there are six blank rows below the cursor, so
+    // the trim absorbs the whole shrink: demote == 0.
+    term.resize(6, 24);
+
+    assert_eq!(
+        term.text_selection().start().row,
+        1,
+        "nothing was archived, so the anchor keeps its row"
+    );
+    assert_eq!(
+        term.selection_to_string().as_deref(),
+        Some(text_before.as_str()),
+        "and it still names the same text"
     );
 }
