@@ -140,6 +140,10 @@
 #                                                     # machine that points the updater at
 #                                                     # a private repo (see `token` above)
 #   tools/install.sh --version 0.5.0                  # pin the app release
+#   tools/install.sh --dry-run                        # print the whole install plan —
+#                                                     # elected release, asset + size,
+#                                                     # every destination, the rc edit,
+#                                                     # every endpoint — change NOTHING
 #   tools/install.sh --uninstall                      # reverse everything it installed
 #   tools/install.sh --uninstall --dry-run            # ...show what that would remove
 #   ATERM_REPO_SLUG=my-org/aterm tools/install.sh     # fork / relocated repo
@@ -171,7 +175,7 @@ usage() {
 		# Print the header comment: from line 5 to the first non-comment line, drop it.
 		sed -n '5,/^[^#]/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'
 	else
-		echo "usage: install.sh [--batteries] [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_UPDATE_TOKEN, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
+		echo "usage: install.sh [--batteries] [--no-cli] [--no-app] [--token] [--no-token] [--no-toolchain] [--no-path] [--version X.Y.Z] [--dry-run] [--uninstall [--dry-run]]   (env: ATERM_REPO_SLUG, ATERM_INSTALL_DIR, ATERM_BIN_DIR, ATERM_STORE_DIR, ATERM_MAN_DIR, ATERM_TEAM_ID, ATERM_UPDATE_TOKEN, ATERM_NO_TOOLCHAIN, ATERM_NO_PATH)"
 	fi
 }
 
@@ -713,6 +717,8 @@ download_release_asset_id() {
 # optional fields may occur zero or one time. This intentionally accepts only
 # the release cutter's simple one-line string form rather than implementing a
 # permissive shell TOML parser around security-sensitive identity fields.
+# The file may be `-` — awk's standard stdin spelling — for a caller holding
+# the bytes in a variable (the --dry-run plan, whose contract is zero writes).
 toml_single_str() {
 	local file="$1" key="$2" required="$3"
 	awk -v wanted="$key" -v required="$required" '
@@ -732,6 +738,26 @@ toml_single_str() {
 			if (count == 1) print value
 		}
 	' "$file"
+}
+
+# The manifest's identity fields, parsed into their globals — ONE parse, shared
+# by install_app and the --dry-run plan, so the two can never read different
+# fields. Takes the manifest TEXT rather than a path: the plan holds the bytes
+# in a variable (its contract is zero writes), and the install passes the
+# contents of its size-verified downloaded copy. Each toml_single_str call
+# keeps its own required/optional contract; the first malformed or duplicate
+# field short-circuits non-zero, and the caller owns the loud abort.
+parse_manifest_identity_fields() { # <manifest-text>
+	local manifest_text="$1"
+	VERSION="$(toml_single_str - version 1 <<<"$manifest_text")" &&
+		DMG_NAME="$(toml_single_str - dmg 1 <<<"$manifest_text")" &&
+		SHA_WANT="$(toml_single_str - sha256 1 <<<"$manifest_text")" &&
+		TEAM_MANIFEST="$(toml_single_str - team_id 0 <<<"$manifest_text")" &&
+		MIN_OS="$(toml_single_str - min_os 0 <<<"$manifest_text")" &&
+		ZIP_NAME="$(toml_single_str - zip 0 <<<"$manifest_text")" &&
+		ZIP_SHA="$(toml_single_str - zip_sha256 0 <<<"$manifest_text")" &&
+		DMG_X86_NAME="$(toml_single_str - dmg_x86_64 0 <<<"$manifest_text")" &&
+		DMG_X86_SHA="$(toml_single_str - dmg_x86_64_sha256 0 <<<"$manifest_text")"
 }
 
 # --- publisher identity: the official channel's Developer-ID pin ---------------
@@ -793,6 +819,12 @@ token_provisioning_wanted() { # <do_token> <token_flag> <env_token> <env_owner> 
 	[[ "$2" -eq 1 || -n "$3" || -n "$4" || -n "$5" ]]
 }
 
+# The token half's destination (the update-token section further down owns the
+# story). Defined at library level so the --dry-run plan can NAME the file
+# without running the half.
+UPDATE_TOKEN_DIR="$HOME/Library/Application Support/aterm"
+UPDATE_TOKEN_FILE="$UPDATE_TOKEN_DIR/update-token"
+
 # The idempotence gate for the app half: an UNPINNED run that elected exactly
 # the installed version has nothing to download. Pure — the caller reads the
 # bundle's Info.plist and passes the fields. An explicit --version pin always
@@ -837,6 +869,44 @@ require_free_space() { # <dir> <bytes-needed> <what-for>
 	fi
 }
 
+# Whether `mkdir -p <dir> && [[ -w <dir> ]]` WOULD succeed, without doing it:
+# walk up to the nearest existing path component and judge there. An existing
+# path must BE a writable directory; a missing one needs a writable directory
+# somewhere above it to be created under. Only --dry-run consults this — the
+# real pre-flight keeps `mkdir -p` itself as the probe, because there the
+# creation IS wanted.
+would_create_writable() {
+	local d="$1"
+	while [[ -n "$d" && ! -e "$d" ]]; do
+		case "$d" in
+		*/*) d="${d%/*}" ;;
+		*) return 1 ;; # relative with no existing component: nothing to anchor to
+		esac
+	done
+	[[ -n "$d" ]] || d=/
+	[[ -d "$d" && -w "$d" ]]
+}
+
+# Destination pre-flight, shared by every half: create the dir(s) and prove
+# them writable. `mkdir -p` succeeds on an EXISTING unwritable dir, hence the
+# explicit -w pass. Under install-mode --dry-run — whose contract is ZERO
+# mutations — nothing is created: the verdict comes from would_create_writable
+# instead, so a dry run reports the same skip reasons the real run would hit
+# without manufacturing the directories along the way.
+ensure_dirs_writable() { # <dir>...
+	local d
+	if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+		for d in "$@"; do
+			would_create_writable "$d" || return 1
+		done
+		return 0
+	fi
+	mkdir -p "$@" 2>/dev/null || return 1
+	for d in "$@"; do
+		[[ -w "$d" ]] || return 1
+	done
+}
+
 # The desktop-identity lane's ownership receipt. ~/.local/share/applications
 # and the hicolor icon tree are shared, user-owned space, and the NAME `aterm`
 # has meant other software for decades (the X11 aterm), so a basename can never
@@ -845,6 +915,48 @@ require_free_space() { # <dir> <bytes-needed> <what-for>
 # the same marker-pair discipline as the PATH block. ONE definition, shared by
 # the writer and the sweep, so the two can never drift.
 ATERM_DESKTOP_MARKER="# Managed by aterm install.sh — its uninstall removes only an entry carrying this line."
+
+# The managed shell-profile PATH block's marker PAIR — ONE definition, shared
+# by the writer (wire_shell_path), the uninstall sweep, and the pre-download /
+# --dry-run disclosures, so what is announced, written, and removed can never
+# drift into three spellings.
+ATERM_PATH_BLOCK_START_MARKER="# >>> aterm ALab toolset (managed by install.sh) >>>"
+ATERM_PATH_BLOCK_END_MARKER="# <<< aterm ALab toolset <<<"
+
+# Which profile the managed PATH block lands in for $SHELL — the ONE election,
+# shared by wire_shell_path (which edits the file) and the plans (which
+# disclose the edit), so a disclosure can never name a different file than the
+# write touches. stdout: the rc path; empty for an unrecognised shell, which
+# gets told, not guessed at (a wrong line in a login file is worse than none).
+path_block_rc_target() {
+	# ${SHELL:-}: this runs under `set -u` BEFORE anything is installed (the
+	# pre-download disclosure and the --dry-run plan), where an unset SHELL
+	# must mean "unrecognised — say so", never an unbound-variable abort.
+	local shell_name="${SHELL:-}" rc="" f
+	shell_name="${shell_name##*/}"
+	case "$shell_name" in
+	zsh) rc="$HOME/.zshrc" ;;
+	bash)
+		rc="$HOME/.bashrc"
+		# macOS terminals spawn LOGIN shells, and login bash reads
+		# ~/.bash_profile (then .bash_login, then .profile) — never .bashrc.
+		# Target the first file login bash will actually read; create
+		# .bash_profile only when none exists (nothing is shadowed then).
+		# On Linux, interactive terminals are non-login: .bashrc is right.
+		if [[ "$(uname -s)" == Darwin ]]; then
+			rc="$HOME/.bash_profile"
+			for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+				[[ -f "$f" ]] && { rc="$f"; break; }
+			done
+		fi
+		;;
+	# fish itself resolves its config through XDG_CONFIG_HOME; hardcoding
+	# ~/.config would name a file fish never reads whenever that variable is
+	# set — and a file the uninstaller (which honors XDG) could never find.
+	fish) rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+	esac
+	printf '%s\n' "$rc"
+}
 
 # Whether a binary path may ride the desktop entry's Exec= line UNQUOTED. The
 # desktop-entry spec's quoting/escaping rules are subtle enough (double-escaped
@@ -990,6 +1102,22 @@ elect_container() { # <batteries01> <toolchain01> <apple_silicon01> <version> <d
 		ASSET_SHA="$x86_sha"
 	fi
 	return 0
+}
+
+# elect_container's <apple_silicon01> input, probed from HARDWARE, not the
+# reporting process — the IS_APPLE_SILICON global. `uname -m` answers for the
+# running process: `#!/usr/bin/env bash` takes whatever bash is first on PATH,
+# so an Intel-Homebrew /usr/local/bin/bash — or `arch -x86_64 bash`, or any
+# Rosetta-translated shell — reports x86_64 on an M-series Mac. Deciding the
+# container from that would hand a --batteries Apple Silicon machine the Intel
+# seed, and the user would never know why. `hw.optional.arm64` answers for the
+# CPU. ONE probe, shared by install_app and the --dry-run plan, so the two can
+# never read different hardware.
+probe_apple_silicon() {
+	IS_APPLE_SILICON=0
+	if [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == 1 ]]; then
+		IS_APPLE_SILICON=1
+	fi
 }
 
 # Internal test seam: source this file to exercise the pure functions without
@@ -1279,8 +1407,8 @@ uninstall_everything() {
 	# XDG_CONFIG_HOME. Visiting a file twice is harmless — the marker gate
 	# makes the second pass a no-op.
 	local rc_file rc_tmp start_marker end_marker
-	start_marker="# >>> aterm ALab toolset (managed by install.sh) >>>"
-	end_marker="# <<< aterm ALab toolset <<<"
+	start_marker="$ATERM_PATH_BLOCK_START_MARKER"
+	end_marker="$ATERM_PATH_BLOCK_END_MARKER"
 	for rc_file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" \
 		"$HOME/.bash_login" "$HOME/.profile" "$xdg_config/fish/config.fish" \
 		"$HOME/.config/fish/config.fish"; do
@@ -1341,6 +1469,162 @@ uninstall_everything() {
 	return 0
 }
 
+# --- install-mode --dry-run: the whole plan, with ZERO mutations ---------------
+# The uninstall half has always answered --dry-run; the install half REFUSED
+# it, so the only way to learn what an install would touch was to run one.
+# This prints the full plan from the same pre-flight state the real run acts
+# on — the elected release, the exact container asset and its size, every
+# destination, the shell-profile edit, and every endpoint the run would
+# contact — then the dispatch exits 0.
+# CONTRACT: ZERO mutations — no mkdir, no file writes, no rc edit. Read-only
+# network lookups are the only I/O: the pre-flight's catalog walk already ran,
+# the destination probes ran through ensure_dirs_writable's non-mutating arm,
+# and the manifest fetched here is held in a VARIABLE precisely so this path
+# never needs even a temp file. Anything that cannot be resolved read-only
+# aborts loudly, exactly as the real run would.
+print_install_plan() {
+	local tmp_hint="${TMPDIR:-/tmp}/aterm-install.<random>"
+	local lane_desc="" record asset_id asset_size manifest_text team_want rc
+
+	echo "install.sh: DRY RUN — the full plan; nothing is created, written, or edited"
+	if [[ "${APP_LANE:-}" == gh ]]; then
+		lane_desc="authenticated gh lane"
+	elif [[ "${APP_LANE:-}" == anon ]]; then
+		lane_desc="anonymous public lane"
+	fi
+
+	if [[ "$DO_APP" -eq 0 ]]; then
+		echo "install.sh: app: excluded (--no-app)"
+	elif [[ -n "$APP_SKIP" ]]; then
+		echo "install.sh: app: would be SKIPPED: $APP_SKIP"
+	elif [[ -n "$APP_ALREADY" ]]; then
+		echo "install.sh: app: aterm $APP_ALREADY already installed at $DEST/aterm.app and signature-verified — nothing to download (--version $APP_ALREADY forces a reinstall)"
+	elif [[ "$LINUX_RELEASE" -eq 1 ]]; then
+		# The pre-flight already carried the tarball's exact records; bind them
+		# to one immutable asset here exactly as install_linux_app will.
+		record="$(require_unique_asset_record "$LINUX_TAR_RECORDS" "$LINUX_TAR" 1 2147483648)" || exit 1
+		IFS=$'\t' read -r asset_id asset_size <<<"$record"
+		echo "install.sh: app: $REPO_SLUG $TAG (linux-x86_64, $lane_desc)"
+		echo "  download: $LINUX_TAR — $((asset_size / 1000000)) MB -> $tmp_hint/ (deleted after install)"
+		echo "  verify:   the release's own $LINUX_TAR.sha256 digest asset (the appcast carries no linux keys yet)"
+		echo "  install:  the released ONE binary -> $STORE_DIR/aterm, exposed as the $BIN_DIR/aterm symlink"
+	else
+		# The same read-only resolution install_app performs — one manifest,
+		# the shared container election, one exact container asset — with the
+		# manifest's bytes as the only thing fetched.
+		record="$(release_unique_asset_record "$TAG" 'aterm-appcast.toml' 1 5000000)" ||
+			{ explain_anon_rate_limit; exit 1; }
+		IFS=$'\t' read -r asset_id asset_size <<<"$record"
+		# Read at most one byte past the carried API size — the same exposure
+		# cap download_release_asset_id enforces, applied to memory: pipefail
+		# turns an overrunning producer into this loud abort.
+		manifest_text="$(fetch_asset_octets "$asset_id" | head -c "$((asset_size + 1))")" || {
+			echo "install.sh: exact asset $asset_id download failed" >&2
+			explain_anon_rate_limit
+			exit 1
+		}
+		if ! parse_manifest_identity_fields "$manifest_text"; then
+			echo "install.sh: release $TAG has a malformed or duplicate manifest identity field" >&2
+			exit 1
+		fi
+		validate_manifest_identity "$TAG" "$VERSION" "$DMG_NAME" "$SHA_WANT" || exit 1
+		team_want="$(required_team_for "$REPO_SLUG" "${ATERM_TEAM_ID:-}" "$TEAM_MANIFEST")" || exit 1
+		# The same hardware probe (probe_apple_silicon has the uname-vs-sysctl
+		# rationale) and the same shared election install_app runs, so the
+		# plan can never name a different container than the install downloads.
+		probe_apple_silicon
+		elect_container "$DO_BATTERIES" "$DO_TOOLCHAIN" "$IS_APPLE_SILICON" "$VERSION" \
+			"$DMG_NAME" "$SHA_WANT" "$ZIP_NAME" "$ZIP_SHA" "$DMG_X86_NAME" "$DMG_X86_SHA" || exit 1
+		record="$(release_unique_asset_record "$TAG" "$ASSET_NAME" 1 2147483648)" ||
+			{ explain_anon_rate_limit; exit 1; }
+		IFS=$'\t' read -r asset_id asset_size <<<"$record"
+		echo "install.sh: app: $REPO_SLUG $TAG ($lane_desc)"
+		echo "  download: $ASSET_NAME — $((asset_size / 1000000)) MB -> $tmp_hint/$ASSET_NAME (deleted after the swap)"
+		if [[ -n "$team_want" ]]; then
+			echo "  verify:   manifest SHA-256, then the Developer-ID chain for team $team_want + notarization"
+		else
+			echo "  verify:   manifest SHA-256 and the code seal only — no pinned Team ID (UNVERIFIED publisher)"
+		fi
+		echo "  install:  aterm.app -> $DEST/aterm.app (staged swap; an existing copy is replaced)"
+	fi
+
+	if [[ "$DO_CLI" -eq 0 ]]; then
+		echo "install.sh: cli: excluded (--no-cli)"
+	elif [[ -n "$CLI_SKIP" ]]; then
+		echo "install.sh: cli: would be SKIPPED: $CLI_SKIP"
+	else
+		echo "install.sh: cli: ONE command on PATH — the $BIN_DIR/aterm symlink (bundle-backed when the installed app ships the toolset; otherwise a source build into $STORE_DIR), plus man pages/completions where writable"
+	fi
+
+	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
+		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
+	elif [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 || "${CONTAINER_KIND:-}" == zip ]]; then
+		echo "install.sh: toolset: DEFERRED to first launch — aterm streams the ALab toolset from the signed network index (~4.4 GiB on disk when finished)"
+	else
+		echo "install.sh: toolset: aterm pkg seed + pkg update — unpacks to ~4.4 GiB under your home directory (the app reclaims its ~1 GB sealed payload copy afterwards)"
+	fi
+
+	if [[ "$TOKEN_WANTED" -eq 1 ]]; then
+		echo "install.sh: token: provisions the update token (0600) -> $UPDATE_TOKEN_FILE"
+	elif [[ "$DO_TOKEN" -eq 1 ]]; then
+		echo "install.sh: token: skipped (public channel reads no token file; --token to provision for a repointed updater)"
+	else
+		echo "install.sh: token: excluded (--no-token)"
+	fi
+
+	if [[ "$DO_PATH" -eq 0 ]]; then
+		echo "install.sh: PATH: excluded (--no-path / ATERM_NO_PATH=1)"
+	else
+		rc="$(path_block_rc_target)"
+		if [[ -z "$rc" ]]; then
+			echo "install.sh: PATH: unrecognised shell (${SHELL:-<unset>}) — no profile is edited; a source hint prints instead"
+		elif [[ -f "$rc" ]] && grep -qF "$ATERM_PATH_BLOCK_START_MARKER" "$rc" 2>/dev/null; then
+			echo "install.sh: PATH: already wired — $rc carries the managed block; no edit"
+		else
+			echo "install.sh: PATH: appends ONE marker-fenced block to $rc — the toolset hook + $BIN_DIR (skip with --no-path or ATERM_NO_PATH=1)"
+		fi
+	fi
+
+	if [[ "$DO_APP" -eq 0 ]]; then
+		echo "install.sh: network: no GitHub traffic — the app half is excluded"
+	elif [[ -z "${APP_LANE:-}" ]]; then
+		# The skip that decided against BOTH lanes (no curl and no gh, an
+		# unreleased platform, an unreachable repo) leaves no transport open.
+		echo "install.sh: network: no further GitHub traffic — the app half is skipped with no download lane"
+	elif [[ "$APP_LANE" == gh ]]; then
+		echo "install.sh: network: api.github.com via authenticated gh (release catalog, asset metadata, asset octets), following its release-asset CDN redirects"
+	else
+		echo "install.sh: network: api.github.com over TLS, no credential (release catalog, asset metadata, asset octets — a shared 60 requests/hour/IP budget), following its release-asset CDN redirects"
+	fi
+	if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
+		echo "  and: aterm pkg seed/update resolves the signed atpkg index over its own configured source when no sealed payload covers this machine."
+	fi
+	echo "install.sh: dry run complete — nothing was installed, written, or edited"
+}
+
+# --- WHOLE-FILE EXECUTION GUARD ------------------------------------------------
+# Everything from here down executes ONLY through the `main "$@"` on this
+# file's LITERAL LAST LINE. The documented invocation is `curl … | bash`, and
+# bash runs a pipe as it arrives: without this wrapper, a transfer truncated
+# after the argument loop still executed a PREFIX of the run — empirically,
+# `head -n <pre-dispatch> install.sh | bash` created ~/.local/bin, spent
+# anonymous GitHub API budget, and exited 0. (Round 10 refuted a truncation
+# hazard on the grounds that every DESTRUCTIVE operation lives in a function
+# with the dispatch as the tail — true for the app swap, but the TOP-LEVEL
+# pre-flight between the two already carried side effects, so the refutation
+# did not cover the file. docs/INSTALL-UPDATE-AUDITS-2026-08.md records the
+# original verdict; this guard supersedes it — do not remove it on that
+# document's authority.)
+# Wrapped, truncation has exactly two outcomes, both inert: a cut inside the
+# body is a parse error (bash executes none of an unterminated compound), and
+# a cut that keeps the body but loses the last line defines everything and
+# runs nothing. No side effect can happen unless the final byte arrived — the
+# same tail-call guard rustup and uv ship. Tested by
+# tools/test-install-guard.sh.
+# The body below keeps its pre-wrap indentation ON PURPOSE: re-indenting
+# ~1,600 lines would bury the guard's real diff in mechanical churn and risk
+# pushing literal tabs into multi-line strings.
+main() {
 TAG=""
 TAG_INPUT=""
 TAG_EXPLICIT=0
@@ -1354,7 +1638,12 @@ TOKEN_EXPLICIT=0
 # so `curl … | bash` on a headless box — or by anyone who then uses `aterm` as a
 # CLI and never opens the app — installed the ~1 GB payload and left all ten
 # programs unpacked FOREVER, with nothing printed to say so. Default on; the
-# opt-out exists for CI, which wants the app without the 4.2 GB expansion.
+# opt-out exists for CI, which wants the app without the 4.4 GiB expansion.
+# (Every "~4.4 GiB" this script prints is ONE number: the signed sum of the
+# registry's per-program `[cost].disk_installed` — 4,680,384,013 B at index 15
+# — rendered exactly as atpkg's `cost::human_bytes` renders it at seed time
+# (binary units, one decimal). Re-derive it from the pinned pkg manifests when
+# the published set moves; do not re-estimate.)
 DO_TOOLCHAIN="${ATERM_NO_TOOLCHAIN:+0}"
 DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
 # The container election (2026-08-23 funnel flip — DESIGN-streaming-batteries
@@ -1422,6 +1711,10 @@ while [[ $# -gt 0 ]]; do
 		shift
 		;;
 	--dry-run)
+		# With --uninstall: preview the removals (dispatched just below).
+		# Alone: install-mode dry run — the full plan, zero mutations —
+		# dispatched AFTER the pre-flights, which is when the plan's facts
+		# (lane, elected release, per-half skip reasons) first exist.
 		DRY_RUN=1
 		shift
 		;;
@@ -1435,10 +1728,6 @@ if [[ "$DO_UNINSTALL" -eq 1 ]]; then
 	uninstall_everything
 	exit $?
 fi
-if [[ "$DRY_RUN" -eq 1 ]]; then
-	echo "install.sh: --dry-run is only meaningful with --uninstall" >&2
-	exit 2
-fi
 # The two flags answer the same question in opposite directions, so honoring
 # one would silently discard the other — refuse at the argument gate, before
 # any network or host mutation, like every other input contradiction.
@@ -1446,6 +1735,9 @@ if [[ "$DO_BATTERIES" -eq 1 && "$DO_TOOLCHAIN" -eq 0 ]]; then
 	echo "install.sh: --batteries downloads the sealed toolchain and --no-toolchain excludes it — pick one" >&2
 	exit 2
 fi
+# Install-mode --dry-run deliberately has no dispatch here: the pre-flights
+# below are read-only under DRY_RUN (ensure_dirs_writable), and the plan
+# prints once they have decided everything — see print_install_plan.
 # The token half's arbitration, decided ONCE and consulted by the excludes
 # gate here and the run phase below (see token_provisioning_wanted).
 TOKEN_WANTED=0
@@ -1612,7 +1904,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 				! command -v tar >/dev/null 2>&1 ||
 				! command -v gzip >/dev/null 2>&1; then
 				APP_SKIP="needs sha256sum, tar, and gzip to verify and extract the released Linux binary — install them (coreutils/tar/gzip, in every distro repo) and re-run"
-			elif ! mkdir -p "$STORE_DIR" "$BIN_DIR" 2>/dev/null || [[ ! -w "$STORE_DIR" || ! -w "$BIN_DIR" ]]; then
+			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
 				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR (set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs)"
 			elif ! LINUX_TAR_RECORDS="$(release_asset_records "$TAG" "$LINUX_TAR")"; then
 				APP_SKIP="could not inspect release $TAG for $LINUX_TAR (network, or the GitHub API rate limit)"
@@ -1629,7 +1921,7 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			if [[ -z "$DEST" ]]; then
 				if [[ -w /Applications ]]; then DEST=/Applications; else DEST="$HOME/Applications"; fi
 			fi
-			if ! mkdir -p "$DEST" 2>/dev/null || [[ ! -w "$DEST" ]]; then
+			if ! ensure_dirs_writable "$DEST"; then
 				APP_SKIP="cannot create/write $DEST (set ATERM_INSTALL_DIR to a writable dir)"
 			elif [[ -f "$DEST/aterm.app/Contents/Info.plist" ]] && app_already_current "$TAG" "$TAG_EXPLICIT" \
 				"$(defaults read "$DEST/aterm.app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)" \
@@ -1669,7 +1961,7 @@ ROOT=""
 if [[ "$DO_CLI" -eq 1 ]]; then
 	# The destination gates BOTH sources (symlink + build) — check it first,
 	# BEFORE any install work, so a bad destination skips the half up front.
-	if ! mkdir -p "$BIN_DIR" 2>/dev/null || [[ ! -w "$BIN_DIR" ]]; then
+	if ! ensure_dirs_writable "$BIN_DIR"; then
 		CLI_SKIP="cannot create/write $BIN_DIR (set ATERM_BIN_DIR to a writable dir)"
 	else
 		# Feasibility of the cargo FALLBACK only. The PREFERRED source — an
@@ -1694,14 +1986,25 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 			# HERE as a loud skip naming the acquisition path, never as a
 			# mid-flight abort of a build that cannot succeed.
 			CLI_CARGO_SKIP="building from source needs the pinned '$PINNED_CHANNEL' rustup toolchain, which rustup cannot download — unpack the rustc/cargo/rust-std dist tarballs from https://github.com/alabsystems/trust/releases into one prefix, then: rustup toolchain link $PINNED_CHANNEL <prefix>"
-		elif ! mkdir -p "$STORE_DIR" 2>/dev/null || [[ ! -w "$STORE_DIR" ]]; then
+		elif ! ensure_dirs_writable "$STORE_DIR"; then
 			# Pre-flighted HERE (failsafe policy: an unwritable destination
 			# skips the half up front) — never discovered after the
-			# multi-minute toolset build. Note `mkdir -p` succeeds on an
-			# EXISTING unwritable dir, hence the explicit -w check.
+			# multi-minute toolset build.
 			CLI_CARGO_SKIP="cannot create/write $STORE_DIR (set ATERM_STORE_DIR to a writable dir)"
 		fi
 	fi
+fi
+
+# INSTALL-MODE --dry-run (the uninstall's own is dispatched above): every
+# decision now exists — lane, elected release, per-half skip reasons,
+# destinations — and nothing has been mutated, because the destination probes
+# above ran through ensure_dirs_writable's non-mutating arm. Print the plan
+# and stop, BEFORE the run phase whose halves it describes. A fatal catalog
+# (APP_FATAL) already exited 1 above: a dry run reports skips, never launders
+# a refusal into exit 0.
+if [[ "$DRY_RUN" -eq 1 ]]; then
+	print_install_plan
+	exit 0
 fi
 
 INSTALLED_ANY=0
@@ -1758,15 +2061,9 @@ install_app() {
 		{ explain_anon_rate_limit; exit 1; }
 	IFS=$'\t' read -r MANIFEST_ID MANIFEST_SIZE <<<"$MANIFEST_RECORD"
 	download_release_asset_id "$MANIFEST_ID" "$MANIFEST_SIZE" "$TMP/aterm-appcast.toml"
-	if ! VERSION="$(toml_single_str "$TMP/aterm-appcast.toml" version 1)" ||
-		! DMG_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" dmg 1)" ||
-		! SHA_WANT="$(toml_single_str "$TMP/aterm-appcast.toml" sha256 1)" ||
-		! TEAM_MANIFEST="$(toml_single_str "$TMP/aterm-appcast.toml" team_id 0)" ||
-		! MIN_OS="$(toml_single_str "$TMP/aterm-appcast.toml" min_os 0)" ||
-		! ZIP_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" zip 0)" ||
-		! ZIP_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" zip_sha256 0)" ||
-		! DMG_X86_NAME="$(toml_single_str "$TMP/aterm-appcast.toml" dmg_x86_64 0)" ||
-		! DMG_X86_SHA="$(toml_single_str "$TMP/aterm-appcast.toml" dmg_x86_64_sha256 0)"; then
+	# ONE parse, shared with the --dry-run plan (parse_manifest_identity_fields),
+	# fed the size-verified download's contents.
+	if ! parse_manifest_identity_fields "$(cat "$TMP/aterm-appcast.toml")"; then
 		echo "install.sh: release $TAG has a malformed or duplicate manifest identity field" >&2
 		exit 1
 	fi
@@ -1779,15 +2076,9 @@ install_app() {
 	TEAM_WANT="$(required_team_for "$REPO_SLUG" "${ATERM_TEAM_ID:-}" "$TEAM_MANIFEST")" || exit 1
 
 	# --- pick the container: the LEAN zip by default, DMG pair on --batteries --
-	# HARDWARE, not the reporting process. `uname -m` answers for the running
-	# process: `#!/usr/bin/env bash` takes whatever bash is first on PATH, so an
-	# Intel-Homebrew /usr/local/bin/bash — or `arch -x86_64 bash`, or any
-	# Rosetta-translated shell — reports x86_64 on an M-series Mac. Deciding
-	# the container from that would hand a --batteries Apple Silicon machine
-	# the Intel seed, and the user would never know why. `hw.optional.arm64`
-	# answers for the CPU.
-	IS_APPLE_SILICON=0
-	[[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == 1 ]] && IS_APPLE_SILICON=1
+	# The hardware probe (probe_apple_silicon has the uname-vs-sysctl
+	# rationale) is the ONE the --dry-run plan also runs.
+	probe_apple_silicon
 	# The decision itself lives in elect_container (with the election-order
 	# rationale and every manifest-identity bind), extracted so
 	# tools/test-install-channel.sh pins the whole matrix without a network or
@@ -1900,7 +2191,7 @@ install_app() {
 		echo "install.sh: downloading $ASSET_NAME — $((ASSET_SIZE / 1000000)) MB"
 		echo "  the ALab toolset rides inside the app, so nothing else is downloaded to install it."
 		if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
-			echo "  then: aterm.app -> $DEST, and the toolset unpacks to ~4.2 GB under your home directory."
+			echo "  then: aterm.app -> $DEST, and the toolset unpacks to ~4.4 GiB under your home directory."
 			echo "  the app reclaims its ~1 GB copy of the payload as soon as the toolset is in place."
 		else
 			echo "  then: aterm.app -> $DEST. Toolset skipped (--no-toolchain); \`aterm pkg seed\` installs it later."
@@ -1919,6 +2210,19 @@ install_app() {
 			echo "  instead: rerun with --batteries."
 		else
 			echo "  then: aterm.app -> $DEST. Toolset excluded (--no-toolchain); \`aterm pkg seed\` or \`aterm pkg install --default-set\` installs it later."
+		fi
+	fi
+	# THE ONE WRITE OUTSIDE THE INSTALL DIRS RIDES THE SAME PLAN. By default
+	# wire_shell_path appends the managed PATH block to the user's shell
+	# profile, but its notice printed only AFTER the append — an rc edit
+	# nobody was told about until it had already happened. Disclose it here,
+	# where ^C still costs nothing, with its opt-outs; the rc named is the
+	# SAME election the write acts on (path_block_rc_target). Silent when the
+	# half is off or the shell is unrecognised — then no edit is coming.
+	if [[ "$DO_PATH" -eq 1 ]]; then
+		PLAN_RC="$(path_block_rc_target)"
+		if [[ -n "$PLAN_RC" ]]; then
+			echo "  and: one marker-fenced PATH block is appended to $PLAN_RC unless already present (skip: --no-path / ATERM_NO_PATH=1)."
 		fi
 	fi
 	download_release_asset_id "$ASSET_ID" "$ASSET_SIZE" "$TMP/$ASSET_NAME"
@@ -2547,8 +2851,8 @@ install_linux_desktop_entry() {
 #
 # It is idempotent (a matching token is left alone), it NEVER prints the token,
 # and --no-token is a hard off. No failure here is fatal.
-UPDATE_TOKEN_DIR="$HOME/Library/Application Support/aterm"
-UPDATE_TOKEN_FILE="$UPDATE_TOKEN_DIR/update-token"
+# (UPDATE_TOKEN_DIR/UPDATE_TOKEN_FILE are defined at library level, next to
+# token_provisioning_wanted, so the --dry-run plan can name the file.)
 
 # Whether $1 is a well-formed token by the SAME rule the app enforces
 # (`valid_token` in token.rs: [A-Za-z0-9_-], 1..=512). Keeping the two in step
@@ -2775,30 +3079,12 @@ install_toolchain() {
 # definition of the bin directory: atpkg rewrites the hook whenever the prefix
 # moves, and this line picks that up without the rc file ever being touched again.
 wire_shell_path() {
-	local shell_name hook rc line path_line marker f
+	local shell_name hook rc line path_line marker
 	shell_name="${SHELL##*/}"
 	case "$shell_name" in
-	zsh) hook="$HOME/.aterm/shell.d/00-atpkg.zsh"; rc="$HOME/.zshrc" ;;
-	bash)
-		hook="$HOME/.aterm/shell.d/00-atpkg.bash"
-		rc="$HOME/.bashrc"
-		# macOS terminals spawn LOGIN shells, and login bash reads
-		# ~/.bash_profile (then .bash_login, then .profile) — never .bashrc.
-		# Target the first file login bash will actually read; create
-		# .bash_profile only when none exists (nothing is shadowed then).
-		# On Linux, interactive terminals are non-login: .bashrc is right.
-		if [[ "$(uname -s)" == Darwin ]]; then
-			rc="$HOME/.bash_profile"
-			for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
-				[[ -f "$f" ]] && { rc="$f"; break; }
-			done
-		fi
-		;;
-	# fish itself resolves its config through XDG_CONFIG_HOME; hardcoding
-	# ~/.config wrote the block to a file fish never reads whenever that
-	# variable is set — and to a file the uninstaller (which honors XDG)
-	# could never find.
-	fish) hook="$HOME/.aterm/shell.d/00-atpkg.fish"; rc="${XDG_CONFIG_HOME:-$HOME/.config}/fish/config.fish" ;;
+	zsh) hook="$HOME/.aterm/shell.d/00-atpkg.zsh" ;;
+	bash) hook="$HOME/.aterm/shell.d/00-atpkg.bash" ;;
+	fish) hook="$HOME/.aterm/shell.d/00-atpkg.fish" ;;
 	*)
 		# An unrecognised shell gets told, not guessed at: a wrong line in a
 		# login file is worse than no line.
@@ -2807,6 +3093,12 @@ wire_shell_path() {
 		return 0
 		;;
 	esac
+	# WHICH profile is the ONE election in path_block_rc_target — shared with
+	# the pre-download plan's disclosure and the --dry-run plan, so what was
+	# announced and what is edited here can never be two different files. It
+	# cannot be empty on these arms: every hook-bearing shell above has an rc
+	# election there.
+	rc="$(path_block_rc_target)"
 	# No hook means no toolset was laid down (--no-toolchain, a machine the
 	# index publishes nothing for, or a declined set). Nothing to point at, so
 	# say nothing — UNLESS the toolset is deferred to first launch: that lane
@@ -2818,7 +3110,7 @@ wire_shell_path() {
 		[[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 ]] || return 0
 	fi
 
-	marker="# >>> aterm ALab toolset (managed by install.sh) >>>"
+	marker="$ATERM_PATH_BLOCK_START_MARKER"
 	if [[ -f "$rc" ]] && grep -qF "$marker" "$rc" 2>/dev/null; then
 		echo "install.sh: ALab toolset already on PATH via $rc"
 		PATH_BLOCK_WROTE=1
@@ -2857,10 +3149,10 @@ wire_shell_path() {
 	if ! {
 		if [[ -n "$path_line" ]]; then
 			printf '\n%s\n%s\n%s\n%s\n' \
-				"$marker" "$line" "$path_line" "# <<< aterm ALab toolset <<<"
+				"$marker" "$line" "$path_line" "$ATERM_PATH_BLOCK_END_MARKER"
 		else
 			printf '\n%s\n%s\n%s\n' \
-				"$marker" "$line" "# <<< aterm ALab toolset <<<"
+				"$marker" "$line" "$ATERM_PATH_BLOCK_END_MARKER"
 		fi
 	} >>"$rc" 2>/dev/null; then
 		echo "install.sh: NOTE: could not write $rc — add this line yourself for the ALab toolset on PATH:" >&2
@@ -2962,3 +3254,9 @@ if [[ "$INSTALLED_ANY" -eq 0 ]]; then
 	echo "install.sh: nothing was installed" >&2
 	exit 1
 fi
+}
+
+# The guard's other half — see WHOLE-FILE EXECUTION GUARD above. This call is
+# the file's LAST LINE on purpose: nothing at all runs unless every byte
+# before it arrived, so a truncated `curl … | bash` is inert.
+main "$@"
