@@ -1925,3 +1925,366 @@ fn test_containment_modes_require_tmp_cache() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// WSL + cmd.exe: the two first-class Windows shells that used to detect as
+// `Unknown` and therefore got no injection at all.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_detect_wsl_and_cmd() {
+    // The bare aliases the PTY seam already resolves...
+    assert_eq!(ShellType::detect("wsl"), ShellType::Wsl);
+    assert_eq!(ShellType::detect("cmd"), ShellType::Cmd);
+    // ...and the resolved program paths those aliases turn into.
+    assert_eq!(
+        ShellType::detect("C:\\Windows\\System32\\wsl.exe"),
+        ShellType::Wsl
+    );
+    assert_eq!(
+        ShellType::detect("C:\\Windows\\System32\\CMD.EXE"),
+        ShellType::Cmd
+    );
+    // Neighbours must not be swept in: nu still has no injection.
+    assert_eq!(ShellType::detect("nu.exe"), ShellType::Unknown);
+}
+
+/// `WSLENV` is the ONLY channel into the distro, so getting it wrong is silent:
+/// without the `/p` flag the integration dir arrives as an untranslated `C:\…`
+/// that no Linux shell can read.
+#[test]
+fn test_prepare_wsl_env_carries_path_translated_wslenv() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    let injection = prepare_into(ShellType::Wsl, &base).unwrap().unwrap();
+
+    let env: std::collections::HashMap<&str, &str> = injection
+        .env_add
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    assert_eq!(
+        env.get("ATERM_SHELL_INTEGRATION_DIR").copied(),
+        Some(base.to_string_lossy().as_ref())
+    );
+    let wslenv = env.get("WSLENV").expect("WSLENV must be injected");
+    let entries: Vec<&str> = wslenv.split(':').collect();
+    assert!(
+        entries.contains(&"ATERM_SHELL_INTEGRATION_DIR/p"),
+        "the /p flag is what path-translates the dir into the distro: {wslenv}"
+    );
+    assert!(
+        entries.contains(&"ATERM_SHELL_NONCE"),
+        "the capability nonce must cross too or every mark is dropped: {wslenv}"
+    );
+    assert!(
+        entries.contains(&WSL_CWD_VAR),
+        "the cwd hand-off must cross: {wslenv}"
+    );
+}
+
+/// The launcher must run through `--exec` (argv verbatim) and must reach the
+/// EXISTING bash wrapper rcfile rather than re-implementing the injection.
+#[test]
+fn test_prepare_wsl_argv_execs_the_bash_rcfile() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    let injection = prepare_into(ShellType::Wsl, &base).unwrap().unwrap();
+
+    let argv = injection.argv_override.expect("wsl needs an argv override");
+    assert_eq!(argv[0], "wsl", "argv[0] is the display token");
+    assert_eq!(
+        &argv[1..4],
+        ["--exec", "/bin/sh", "-c"],
+        "`--exec` bypasses the distro login shell so argv arrives byte-for-byte; \
+         plain `wsl -- …` re-quotes every argument into a `bash -c` string"
+    );
+    let script = &argv[4];
+    assert!(
+        script.contains("$ATERM_SHELL_INTEGRATION_DIR/bash/rcfile"),
+        "must source the shipped bash wrapper rcfile: {script}"
+    );
+    assert!(
+        script.contains("--rcfile"),
+        "bash's injection mechanism is --rcfile: {script}"
+    );
+    // The user's own login shell wins unless it IS bash: forcing bash on a zsh
+    // WSL user to gain marks would be a regression, not a feature.
+    assert!(
+        script.contains(r#"case "$__aterm_sh" in */bash|bash)"#),
+        "must gate the bash hijack on the login shell actually being bash: {script}"
+    );
+    assert!(
+        script.contains(r#"exec "$__aterm_sh" -l"#),
+        "non-bash login shells must still start, uninstrumented: {script}"
+    );
+    assert!(
+        script.contains("unset ATERM_WSL_CWD"),
+        "the cwd hand-off must not leak into shells nested inside this one: {script}"
+    );
+    // The bash rcfile the launcher points at has to exist on disk.
+    assert!(base.join("bash").join("rcfile").exists());
+}
+
+#[test]
+fn test_merge_wslenv_is_append_safe_and_idempotent() {
+    // A user's own WSLENV survives, ours goes first.
+    let merged = merge_wslenv("MY_TOOL/p:OTHER");
+    assert!(merged.starts_with("ATERM_SHELL_INTEGRATION_DIR/p:"));
+    assert!(merged.split(':').any(|e| e == "MY_TOOL/p"));
+    assert!(merged.split(':').any(|e| e == "OTHER"));
+
+    // An empty inherited value must not produce an empty trailing entry.
+    let empty = merge_wslenv("");
+    assert!(
+        !empty.ends_with(':') && !empty.contains("::"),
+        "{empty}"
+    );
+
+    // Nesting (aterm inside aterm inside …) must not grow duplicates, and must
+    // not keep a STALE flag spelling for one of our own variables.
+    assert_eq!(merge_wslenv(&empty), empty, "merge must be idempotent");
+    let stale = merge_wslenv("ATERM_SHELL_INTEGRATION_DIR:ATERM_SHELL_NONCE/p");
+    assert_eq!(
+        stale.matches("ATERM_SHELL_INTEGRATION_DIR").count(),
+        1,
+        "{stale}"
+    );
+    assert!(!stale.contains("ATERM_SHELL_NONCE/p"), "{stale}");
+}
+
+#[test]
+fn test_wsl_cwd_env_only_crosses_a_posix_path() {
+    // The case that matters: a WSL tab reports `/home/you/proj` over OSC 7,
+    // Windows cannot use it as a working directory, so it rides the env.
+    assert_eq!(
+        wsl_cwd_env(ShellType::Wsl, Some("/home/you/proj")),
+        Some((WSL_CWD_VAR.to_string(), "/home/you/proj".to_string()))
+    );
+    // A Windows path is wsl.exe's own business (it inherits + translates it).
+    assert_eq!(wsl_cwd_env(ShellType::Wsl, Some("C:\\Users\\x")), None);
+    // `//host/share` is the host-preserving UNC form, not a Linux path.
+    assert_eq!(wsl_cwd_env(ShellType::Wsl, Some("//server/share")), None);
+    assert_eq!(wsl_cwd_env(ShellType::Wsl, None), None);
+    // Never for another shell — bash on Windows gets a Windows cwd.
+    assert_eq!(wsl_cwd_env(ShellType::Bash, Some("/home/you/proj")), None);
+    assert_eq!(wsl_cwd_env(ShellType::Cmd, Some("/home/you/proj")), None);
+}
+
+/// cmd renders `%PROMPT%` on every input line and understands `$E`/`$P`; that
+/// is the whole integration surface it has.
+#[test]
+fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    let mut injection = prepare_into(ShellType::Cmd, &base).unwrap().unwrap();
+    assert!(
+        injection.argv_override.is_none(),
+        "cmd takes no argv override — the injection is entirely %PROMPT%"
+    );
+
+    let nonce = "ab".repeat(32);
+    augment_with_nonce(&mut injection, &nonce);
+    let prompt = injection
+        .env_add
+        .iter()
+        .find(|(k, _)| k == "PROMPT")
+        .map(|(_, v)| v.clone())
+        .expect("cmd injection must set PROMPT");
+
+    assert!(
+        prompt.contains(&format!("$e]133;A;id={nonce}$e\\")),
+        "prompt-start mark (what jump-to-prompt navigates by): {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("$e]133;B;id={nonce}$e\\")),
+        "prompt-end mark: {prompt}"
+    );
+    assert!(
+        prompt.contains(&format!("$e]633;P;Cwd=$P;id={nonce}$e\\")),
+        "cwd via $P — cmd cannot percent-encode a file:// URI: {prompt}"
+    );
+    assert!(
+        prompt.contains("$P$G"),
+        "the user-visible prompt must still be cmd's own: {prompt}"
+    );
+    assert!(
+        !prompt.contains(NONCE_PLACEHOLDER),
+        "every placeholder must be substituted or the marks are dropped: {prompt}"
+    );
+    // C/D are deliberately absent: cmd has no hook for "a command started
+    // executing", and the engine's phase machine needs A→B→C→D in order.
+    assert!(!prompt.contains("]133;C"), "{prompt}");
+    assert!(!prompt.contains("]133;D"), "{prompt}");
+}
+
+#[test]
+fn test_augment_with_nonce_substitutes_the_placeholder() {
+    let mut injection = InjectionEnv {
+        env_add: vec![
+            ("PLAIN".to_string(), "untouched".to_string()),
+            (
+                "MARKED".to_string(),
+                format!("a{NONCE_PLACEHOLDER}b{NONCE_PLACEHOLDER}"),
+            ),
+        ],
+        argv_override: None,
+    };
+    let nonce = "cd".repeat(32);
+    augment_with_nonce(&mut injection, &nonce);
+    assert_eq!(injection.env_add[0].1, "untouched");
+    assert_eq!(injection.env_add[1].1, format!("a{nonce}b{nonce}"));
+    assert_eq!(
+        injection.env_add[2],
+        ("ATERM_SHELL_NONCE".to_string(), nonce)
+    );
+}
+
+/// A POSIX shell reads a script line by line and keeps a trailing CR as part of
+/// the last token, so one `\r` per line shreds the whole file
+/// (`$'\r': command not found`). The scripts are `include_str!`d at build time,
+/// so a Windows build machine with Git's default `core.autocrlf=true` used to
+/// ship exactly that — measured: 446 CRs in the installed
+/// `aterm_shell_integration.bash`, and sourcing it in WSL failed at line 16.
+#[test]
+fn test_posix_scripts_are_written_lf_only() {
+    assert_eq!(lf_only("a\r\nb\r\n"), "a\nb\n");
+    assert_eq!(lf_only("a\nb\n"), "a\nb\n");
+    assert!(
+        matches!(lf_only("no cr here"), std::borrow::Cow::Borrowed(_)),
+        "the Unix path must not allocate"
+    );
+
+    // ...and the writer is actually wired to it.
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    prepare_into(ShellType::Bash, &base).unwrap().unwrap();
+    for name in [
+        "aterm_shell_integration.bash",
+        "aterm_shell_integration.zsh",
+        "aterm_shell_integration.fish",
+    ] {
+        let bytes = std::fs::read(base.join(name)).unwrap();
+        assert!(
+            !bytes.contains(&b'\r'),
+            "{name} reached disk with CR line endings — every POSIX shell that \
+             sources it will fail line by line"
+        );
+    }
+}
+
+/// Functional proof on the real thing: cmd.exe renders the injected `%PROMPT%`
+/// as OSC 133 A/B around its prompt. cmd.exe ships with every Windows, so this
+/// never skips on the target platform.
+#[cfg(windows)]
+#[test]
+fn test_cmd_prompt_emits_real_osc_133_marks() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    let mut injection = prepare_into(ShellType::Cmd, &base).unwrap().unwrap();
+    let nonce = "3f".repeat(32);
+    augment_with_nonce(&mut injection, &nonce);
+
+    let mut cmd = Command::new("cmd.exe");
+    cmd.arg("/k");
+    for (k, v) in &injection.env_add {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("cmd.exe must be spawnable on Windows");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"exit\r\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        text.contains(&format!("\x1b]133;A;id={nonce}\x1b\\")),
+        "cmd must render a real ESC-framed prompt-start mark; got {text:?}"
+    );
+    assert!(
+        text.contains(&format!("\x1b]133;B;id={nonce}\x1b\\")),
+        "cmd must render a real ESC-framed prompt-end mark; got {text:?}"
+    );
+    assert!(
+        text.contains("\x1b]633;P;Cwd="),
+        "cmd must report its cwd; got {text:?}"
+    );
+    // `$P` must have expanded to a real directory, not stayed literal.
+    assert!(!text.contains("Cwd=$P"), "got {text:?}");
+}
+
+/// Functional proof on the real thing: the WSL launcher, run through the
+/// installed `wsl.exe`, lands OSC 133 marks with the session nonce. Skips
+/// (loudly) when WSL is not installed — aterm must never DEPEND on it.
+#[cfg(windows)]
+#[test]
+fn test_wsl_launcher_emits_real_osc_133_marks() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let usable = Command::new("wsl.exe")
+        .args(["--exec", "/bin/true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !usable {
+        eprintln!("SKIP: no working WSL distro on this host");
+        return;
+    }
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let base = dir.path().join("si");
+    let mut injection = prepare_into(ShellType::Wsl, &base).unwrap().unwrap();
+    let nonce = "5c".repeat(32);
+    augment_with_nonce(&mut injection, &nonce);
+    let argv = injection.argv_override.clone().unwrap();
+
+    let mut cmd = Command::new("wsl.exe");
+    cmd.args(&argv[1..]);
+    for (k, v) in &injection.env_add {
+        cmd.env(k, v);
+    }
+    // The cwd hand-off, exercised end to end.
+    cmd.env(WSL_CWD_VAR, "/usr");
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("wsl.exe must be spawnable once the probe above succeeded");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"pwd\nexit\n")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    assert!(
+        text.contains(&format!("\x1b]133;A;id={nonce}")),
+        "the bash integration must load INSIDE the distro and mark the prompt; \
+         got {text:?}"
+    );
+    assert!(
+        text.contains("\x1b]7;file://"),
+        "cwd tracking (OSC 7) must survive the WSL boundary; got {text:?}"
+    );
+    assert!(
+        text.contains("/usr"),
+        "ATERM_WSL_CWD must place the shell in the requested POSIX directory; \
+         got {text:?}"
+    );
+}

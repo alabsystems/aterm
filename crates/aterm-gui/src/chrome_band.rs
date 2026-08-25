@@ -385,6 +385,47 @@ fn forced_band_colors(hc: ForcedChrome) -> BandColors {
 /// ACTIVE tones on purpose: the band does not track window focus (no repaint
 /// exists on focus change for it), and an active-matched band under an inactive
 /// titlebar is the quieter failure than a focus-flickering band.
+///
+/// # The band/page split is INTENDED — do not "fix" it
+///
+/// A recurring audit finding: with a MID-TONE terminal background the band and
+/// the native page rail below it separate hard. Measured, `background =
+/// "#8A8A8A"` under `window_theme = auto`: the band paints `#303030` while the
+/// Settings rail derives `#797676` from the same theme — about 3.4:1, a visible
+/// tone break running the full width of the window one row under the titlebar.
+/// It looks like a bug. It is the correct answer, for one reason:
+///
+/// **The band belongs to the HEADER, not to the page.** On Linux the surface
+/// directly above it is sctk-adwaita's CLIENT-side titlebar, and that titlebar's
+/// only knob is `light | dark` — winit's decoration crate exposes no colour, so
+/// aterm cannot move it toward a mid-tone theme even if it wanted to. Whatever
+/// the band does, the titlebar stays `#303030`/`#EBEBEB`. There are therefore
+/// only two seams available and exactly one of them can be closed:
+///
+///  * band == titlebar, band != page — one solid header sitting on a themed
+///    body. The break lands where a break BELONGS: at the boundary between
+///    window chrome and window content, which is where every GTK application on
+///    the same desktop puts one;
+///  * band == page, band != titlebar — a themed strip wedged between an
+///    unthemeable grey titlebar and the body, i.e. THREE tones stacked, with the
+///    break running through the middle of the header. That is the exact defect
+///    the 2026-08 frame audit found and this constant fixed, at a mismatch of
+///    two luma steps; re-deriving the band from the theme would reopen it at
+///    full strength.
+///
+/// The band also follows the CHROME-RESOLVED palette, not the terminal one: its
+/// caller hands [`band_colors`] `App::chrome_palette_theme`, so config
+/// `window_theme = dark` over a LIGHT terminal theme classifies dark here and
+/// the band goes `#303030` in step with the CSD variant and the native pages.
+/// Band, titlebar and pages therefore move together on the one axis the platform
+/// actually gives us; only the terminal GRID keeps its own palette, which is the
+/// whole point of a terminal theme.
+///
+/// What is NOT settled by this note: the split is only correct while the CSD
+/// titlebar is real. A desktop with server-side decorations (or a future winit
+/// that lets a client colour its headerbar) removes the constraint, and then the
+/// band should follow the page. `linux_band_base_tone_is_the_exact_csd_headerbar_gray`
+/// is the tripwire — it will fail the moment someone re-derives this.
 #[cfg(target_os = "linux")]
 pub(crate) const CSD_HEADERBAR_DARK: [u8; 3] = [0x30, 0x30, 0x30];
 #[cfg(target_os = "linux")]

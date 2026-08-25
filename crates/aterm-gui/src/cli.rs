@@ -114,6 +114,11 @@ const HELP_HEAD: &str = concat!(
     "        --shell <name|path>        Interactive shell to spawn. Discovery-resolved:\n",
     "                                   \"bash\" finds Git Bash even off PATH; \"pwsh\",\n",
     "                                   \"cmd\", \"wsl\", \"nu\", or an absolute path also work.\n",
+    "                                   Shell integration (prompt marks, jump-to-prompt,\n",
+    "                                   command blocks, cwd) is injected for zsh/bash/fish/\n",
+    "                                   pwsh and \"wsl\" (bash login shell). \"cmd\" is partial:\n",
+    "                                   prompt marks, jump-to-prompt and cwd work, but blocks\n",
+    "                                   carry no command text or exit code. \"nu\" gets none.\n",
     "                                       [env: ATERM_SHELL] [config: shell]\n",
     "        --scale <f>                Force the render scale factor (font + padding).\n",
     "                                   In a window this overrides the display scale;\n",
@@ -295,7 +300,7 @@ const HELP_TAIL: &str = concat!(
     "  Text        ligatures, font_features, bidi, ambiguous_width,\n",
     "              text_blending (linear-corrected | linear), font_thicken (macOS),\n",
     "              stem_gamma (aliases $ATERM_STEM_GAMMA),\n",
-    "              font_hinting (Linux: full | light | native | off;\n",
+    "              font_hinting (Linux/Windows: full | light | native | off;\n",
     "              aliases $ATERM_FONT_HINTING),\n",
     "              font_subpixel (Linux CPU renderer: off | rgb | bgr;\n",
     "              aliases $ATERM_FONT_SUBPIXEL),\n",
@@ -348,7 +353,17 @@ const STARTER_CONFIG: &str = "\
 #                       # \"nu\", or an absolute path also work. Unset = platform
 #                       # default (Windows: pwsh > powershell > cmd). Override at
 #                       # launch with --shell or ATERM_SHELL.
-# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (e.g. a login bash)
+#                       # Shell integration (prompt marks, jump-to-prompt, command
+#                       # blocks, cwd tracking) is injected automatically for zsh,
+#                       # bash, fish, pwsh/powershell and \"wsl\" (whose distro must
+#                       # use bash as its login shell). \"cmd\" is PARTIAL: prompt
+#                       # marks, jump-to-prompt and cwd tracking all work, but cmd
+#                       # has no hook for when a command starts or finishes, so
+#                       # `blocks` shows prompt-delimited regions with no command
+#                       # text and no exit code, and `wait` never fires. \"nu\" gets
+#                       # none.
+# shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (e.g. a login bash);
+#                       # for \"wsl\" these are wsl.exe options, e.g. [\"-d\", \"Debian\"]
 
 # --- appearance ---------------------------------------------------------------
 # font_family = \"JetBrains Mono\"  # any installed monospace family, or a .ttf path
@@ -462,7 +477,7 @@ const STARTER_CONFIG: &str = "\
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
 # stem_gamma = 1.0                 # aesthetic stem weight (<1 thicker, >1 thinner);
 #                                  # aliases $ATERM_STEM_GAMMA (env wins)
-# font_hinting = \"full\"           # Linux grid fitting: full (crispest, default) | light
+# font_hinting = \"full\"           # Linux/Windows grid fitting: full (crispest, default) | light
 #                                  # (hintslight look) | native (font bytecode) | off;
 #                                  # aliases $ATERM_FONT_HINTING (env wins)
 # font_subpixel = \"off\"           # Linux subpixel-RGB text (CPU renderer only, stage 1):

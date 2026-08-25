@@ -89,18 +89,30 @@ fn record_shell_integration_outcome(outcome: ShellIntegrationOutcome) {
 /// before spawn — its file I/O is not async-signal-constrained.
 /// Env additions, optional argv override, and the raw capability nonce that
 /// [`prepare_shell_integration`] hands back to the spawn path.
-type ShellIntegrationSetup = (Vec<(String, String)>, Option<Vec<String>>, [u8; 32]);
+type ShellIntegrationSetup = (
+    Vec<(String, String)>,
+    Option<Vec<String>>,
+    [u8; 32],
+    aterm_core::shell_integration::ShellType,
+);
+
+/// The shell this tab will actually spawn, as the integration layer sees it.
+///
+/// Detect from the ACTUALLY-selected shell (config `shell` / `--shell`) so a
+/// non-default shell gets its OWN integration script (bash → the bash hooks),
+/// not PowerShell's. `detect_current()` only sees `ATERM_SHELL`, so a shell
+/// chosen via the CONFIG key would otherwise be misdetected as PowerShell.
+fn detect_spawn_shell(shell_hint: Option<&str>) -> aterm_core::shell_integration::ShellType {
+    use aterm_core::shell_integration as si;
+    match shell_hint.filter(|s| !s.is_empty()) {
+        Some(h) => si::ShellType::detect(h),
+        None => si::ShellType::detect_current(),
+    }
+}
 
 fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegrationSetup> {
     use aterm_core::shell_integration as si;
-    // Detect from the ACTUALLY-selected shell (config `shell` / `--shell`) so a
-    // non-default shell gets its OWN integration script (bash → the bash hooks),
-    // not PowerShell's. `detect_current()` only sees `ATERM_SHELL`, so a shell
-    // chosen via the CONFIG key would otherwise be misdetected as PowerShell.
-    let shell = match shell_hint.filter(|s| !s.is_empty()) {
-        Some(h) => si::ShellType::detect(h),
-        None => si::ShellType::detect_current(),
-    };
+    let shell = detect_spawn_shell(shell_hint);
     let mut injection = match si::prepare(shell) {
         Ok(Some(injection)) => injection,
         Ok(None) => {
@@ -136,6 +148,7 @@ fn prepare_shell_integration(shell_hint: Option<&str>) -> Option<ShellIntegratio
         injection.env_add,
         injection.argv_override,
         nonce.into_parts().0,
+        shell,
     ))
 }
 
@@ -566,9 +579,20 @@ pub(crate) fn spawn_session(
         (Vec::new(), None, None)
     } else if factory.integrate {
         match prepare_shell_integration(factory.shell_override.as_deref()) {
-            Some((si_env, argv_override, nonce)) => {
+            Some((si_env, argv_override, nonce, shell)) => {
                 let mut env = factory.env_add.clone();
                 env.extend(si_env);
+                // WSL only: a POSIX cwd (what a WSL tab reports over OSC 7)
+                // cannot be a `CreateProcessW` working directory, so the spawn
+                // seam drops it and the new tab would land in aterm's own
+                // directory. Hand it to the WSL-side launcher instead, which
+                // `cd`s into it before exec'ing the login shell.
+                if let Some(pair) = aterm_core::shell_integration::wsl_cwd_env(
+                    shell,
+                    cwd_override.or(factory.cwd.as_deref()),
+                ) {
+                    env.push(pair);
+                }
                 (env, argv_override, Some(nonce))
             }
             None => (factory.env_add.clone(), None, None),
@@ -2531,6 +2555,18 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     &last_output_ns,
                     (lat_epoch.elapsed().as_nanos() as u64).max(1),
                 );
+                // ECHO ROUND TRIP (responsiveness audit item 5, tier i): the
+                // first bytes back from THIS session's child after a keystroke's
+                // bytes went out. Stamped on the same leading edge and for the
+                // same reason as the stamp above — before the term-lock wait and
+                // the VT parse — so the published number is the CHILD's round
+                // trip and can never absorb aterm's own ingest backlog. That
+                // separation is the entire point of the metric: it is what lets
+                // "it feels laggy" say whether the program or the terminal owes
+                // the time (see `echo_rtt`). Costs one relaxed load per burst
+                // when no keystroke is outstanding, which is every burst of a
+                // flood.
+                crate::echo_rtt::note_output_burst(id);
                 // THRU-5: deferred-compression backlog after this burst (set under the
                 // process lock below), read afterward to decide whether to wake the worker.
                 let mut backlog = 0usize;

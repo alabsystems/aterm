@@ -158,6 +158,15 @@ pub enum Action {
     /// takes). Default F11 off macOS (keyboard audit #3) — the chord every
     /// Linux/Windows full-screen surface answers; bindable everywhere.
     ToggleFullscreen,
+    /// Find NEXT — step an open find bar forward, or (bar closed) resume the
+    /// last accepted query after it (`App::search_find_again`), the reducer
+    /// Edit ▸ Find Next already drives. Unbound by default: `f3` is the
+    /// Windows-app reflex but it is ALSO a live console key (cmd.exe's
+    /// repeat-last-command, Far/Midnight Commander's view), so the seed is left
+    /// to the user — `f3 = "find_next"` now works.
+    FindNext,
+    /// Find PREVIOUS — the backward twin of [`Action::FindNext`].
+    FindPrev,
 }
 
 /// Every bindable action NAME, in a stable order — the canonical discoverable
@@ -203,6 +212,8 @@ pub(crate) const ACTION_NAMES: &[&str] = &[
     "rename_session",
     "select_all",
     "toggle_fullscreen",
+    "find_next",
+    "find_prev",
 ];
 
 /// Built-in Cmd-* shortcuts hardcoded in `App::on_key` + its helpers, as
@@ -348,7 +359,13 @@ impl Action {
             "toggle_vi_mode" => Action::ToggleViMode,
             "rename_session" => Action::RenameSession,
             "select_all" => Action::SelectAll,
-            "toggle_fullscreen" => Action::ToggleFullscreen,
+            // `fullscreen` is the spelling the `window.fullscreen` command id
+            // and other terminals' configs use; `toggle_fullscreen` is the
+            // ACTION_NAMES canon matching the sibling `toggle_*` names. Both
+            // parse, so neither guess costs an "unknown action" warning.
+            "fullscreen" | "toggle_fullscreen" => Action::ToggleFullscreen,
+            "find_next" => Action::FindNext,
+            "find_prev" | "find_previous" => Action::FindPrev,
             _ => return None,
         })
     }
@@ -763,6 +780,12 @@ impl Keybindings {
         ("ctrl+-", "font_decrease"),
         ("ctrl+0", "font_reset"),
         ("ctrl+shift+s", "toggle_settings"),
+        // The Windows/VS Code/Windows Terminal preferences chord. Nothing in
+        // the tree bound `ctrl+,` before this, and no shell or TUI claims it
+        // (there is no control code for Ctrl+comma — the PTY encoder drops the
+        // modifier and sends a bare `,`, which is not something anyone presses
+        // Ctrl for).
+        ("ctrl+,", "toggle_settings"),
         // Ctrl+Shift+A is SELECT ALL (keyboard audit #5): the Shift-elevated
         // form of the universal ^A, the same pattern every seeded clipboard
         // chord here follows (^C/^V/^F → Ctrl+Shift+…). It used to open About —
@@ -776,6 +799,14 @@ impl Keybindings {
         // default). It does shadow the raw F11 a TUI app could receive — the
         // same trade GNOME Terminal makes — and both escape hatches are one
         // line: rebind it, or `"f11" = "none"` to return the key to the PTY.
+        //
+        // F3/Shift+F3 find-again are deliberately NOT seeded even though they
+        // are the Windows-app reflex: unlike F11 (a window verb no console app
+        // owns), F3 is already owed to the program on the other side of the
+        // PTY (cmd.exe retypes the last command on it; Far and Midnight
+        // Commander put View there), and Windows Terminal does not bind it
+        // either — the same reasoning `ctrl+alt+<digit>` gets below. The
+        // ACTIONS parse, so `f3 = "find_next"` is one config line away.
         ("f11", "toggle_fullscreen"),
         // NOTE: jump-to-tab-N is intentionally NOT seeded, on EITHER spelling.
         // Both candidate chords collide with something a keyboard already owes
@@ -1504,6 +1535,96 @@ mod tests {
             Keybindings::resolved(Some(&table)).lookup(&ch("2"), ctrl_alt),
             Some(Action::SwitchTab(2)),
             "opt-in still works"
+        );
+    }
+
+    /// FULL SCREEN IS BINDABLE AT ALL, on BOTH spellings. The sharp edge was
+    /// never "F11 does nothing" — it was that a user could not RESCUE it:
+    /// before the Action existed, `f11 = "fullscreen"` in `[keybindings]`
+    /// parsed the chord and then DROPPED it with an "unknown action" warning.
+    /// On macOS a menu-only command costs nothing (the menu bar carries it);
+    /// off macOS there is no menu bar, so the asymmetry was a permanent
+    /// capability hole.
+    #[test]
+    fn fullscreen_is_a_bindable_action() {
+        // Both spellings: the command-id/other-terminal one and the
+        // ACTION_NAMES canon that matches the sibling `toggle_*` names.
+        assert_eq!(Action::parse("fullscreen"), Some(Action::ToggleFullscreen));
+        assert_eq!(
+            Action::parse("toggle_fullscreen"),
+            Some(Action::ToggleFullscreen)
+        );
+        // The config rescue path end to end: no warning, and the chord lands.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+shift+f11".to_string(), "fullscreen".to_string());
+        let (kb, warns) = Keybindings::from_config_warn(Some(&table));
+        assert!(warns.is_empty(), "no dropped-rule warning: {warns:?}");
+        assert_eq!(
+            kb.lookup(
+                &WinitKey::Named(NamedKey::F11),
+                ModifiersState::CONTROL | ModifiersState::SHIFT
+            ),
+            Some(Action::ToggleFullscreen),
+        );
+    }
+
+    /// Find-again is bindable for the same reason — it existed only as a
+    /// `MenuAction` too. NOT seeded: `f3` is the Windows-app reflex but it is
+    /// also a live console key (cmd.exe retypes the last command on it;
+    /// Far/Midnight Commander put View there), so the capability ships and the
+    /// chord stays the user's call — `f3 = "find_next"` is one config line.
+    #[test]
+    fn find_again_is_bindable_but_unseeded() {
+        assert_eq!(Action::parse("find_next"), Some(Action::FindNext));
+        assert_eq!(Action::parse("find_prev"), Some(Action::FindPrev));
+        assert_eq!(Action::parse("find_previous"), Some(Action::FindPrev));
+        let kb = Keybindings::resolved(None);
+        for f in [NamedKey::F3, NamedKey::F1, NamedKey::F12] {
+            assert_eq!(
+                kb.lookup(&WinitKey::Named(f), ModifiersState::empty()),
+                None,
+                "{f:?} stays the program's on the other side of the PTY",
+            );
+        }
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("f3".to_string(), "find_next".to_string());
+        table.insert("shift+f3".to_string(), "find_prev".to_string());
+        let kb = Keybindings::resolved(Some(&table));
+        assert_eq!(
+            kb.lookup(&WinitKey::Named(NamedKey::F3), ModifiersState::empty()),
+            Some(Action::FindNext),
+            "the Windows reflex is one config line away",
+        );
+        assert_eq!(
+            kb.lookup(&WinitKey::Named(NamedKey::F3), ModifiersState::SHIFT),
+            Some(Action::FindPrev),
+        );
+    }
+
+    /// F11 and Ctrl+, are seeded off macOS: the universal full-screen reflex
+    /// (the same default Windows Terminal ships) and the Windows/VS Code/WT
+    /// preferences chord, which was bound nowhere in the tree.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn platform_defaults_seed_fullscreen_and_preferences() {
+        let kb = Keybindings::resolved(None);
+        assert_eq!(
+            kb.lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
+            Some(Action::ToggleFullscreen),
+            "F11 toggles full screen",
+        );
+        assert_eq!(
+            kb.lookup(&ch(","), ModifiersState::CONTROL),
+            Some(Action::ToggleSettings),
+            "Ctrl+, opens Settings",
+        );
+        // Still rebindable like every other seed.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("f11".to_string(), "open_palette".to_string());
+        assert_eq!(
+            Keybindings::resolved(Some(&table))
+                .lookup(&WinitKey::Named(NamedKey::F11), ModifiersState::empty()),
+            Some(Action::OpenPalette),
         );
     }
 

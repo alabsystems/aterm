@@ -550,10 +550,12 @@ pub const VERBS: &[VerbSpec] = &[
          `inferences` separates \"the model ran and said technical\" from \
          \"the model never ran\". The typed window's TEXT is never reported)",
     ),
-    // Read-only observability for the cursor-trail ADMISSION GATE: the last N
-    // armed/confirmed/retired decisions from the engine's fixed-size diagnosis
-    // ring. The one-command face of what the rainbow-trail blackout hunt did
-    // with ATERM_TRACE_SPAWN stderr logs.
+    // Read-only observability for the cursor-trail engine: the last N
+    // armed/confirmed/retired decisions from the fixed-size admission diagnosis
+    // ring, and (`trail status`) the engine's standing state. The one-command
+    // face of what the rainbow-trail blackout hunt did with ATERM_TRACE_SPAWN
+    // stderr logs, and of what "I don't see the rainbow cursor trails" needed a
+    // video recording for.
     v(
         "trail",
         Read,
@@ -562,8 +564,42 @@ pub const VERBS: &[VerbSpec] = &[
         "trail [<n>]: the focused window's last <n> (default all, ring cap 32) cursor-trail \
          admission decisions, newest last — one `admission seq= phase=armed|confirmed|retired \
          reason= intent= age_ms= origin= target= gen_base= gen_cur= alt=` row per decision, \
-         from the engine's fixed-size DIAGNOSTIC ring (reasons are the confirm seam's tokens: \
-         row-mismatch, generation-skip, stale, …). Read-only; typed text is never reported",
+         from the engine's fixed-size DIAGNOSTIC ring (reasons are the confirm seam's tokens — \
+         row-mismatch, generation-skip, stale, … — or, with `gen_cur=-`, a candidate the confirm \
+         seam never judged: `superseded` (the next press arrived before any frame observed this \
+         one's echo, so the keys are outrunning the RENDER, not failing a proof), input-cancelled, \
+         input-revoked, reflow, hidden-boundary, unowned-batch). The tally CONSERVES: \
+         armed = candidates_confirmed + retired + at most one still pending. `trail status`: one standing-state row \
+         instead — `trail style= resolved= config_enabled= effective= focused= motion= \
+         motion_stage= shed= intensity= armed= candidates_confirmed= retired= \
+         last_retire_reason= spawns= ribbon_active= ribbon_segments= ribbon_hue_bands= \
+         sparks= momentum= momentum_display= speed= glow_active= pet_active= cat_active=` \
+         (every gate from the config knob to the glass, in the order the frame path walks \
+         them, plus the cumulative tally the ring has forgotten). Read-only; typed text is \
+         never reported",
+    ),
+    // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven
+    // custody-moving events last fired. Several of them leave identical state behind
+    // (an auto-repeat tick, a bare modifier and a key release each change nothing at
+    // all), so `scroll` and `selection` cannot answer "why did my selection
+    // disappear?" between them — only the engine's own record can. No write form: the
+    // record is written by the seams that make the decision.
+    v(
+        "custody",
+        Read,
+        Status,
+        Session,
+        "custody: why the reading position or the highlight last moved — one \
+         `last=<transition|none> event=<0-7|-> changed=<transition|none> offset= \
+         owner=user|tail selection=yes|no max_offset=` line naming the PressCustody \
+         transition the engine recorded: a press (TypingPress, RepeatPress, \
+         InertPress, ReleaseEvent), a gesture (UserScroll, UserSelect, UserClear), or \
+         output (OutputAtLive, OutputWhileReading, OutputDamagesTheSelectedRows, \
+         OutputInvalidatesTheCoordinateSpace, OutputTookTheSelectionUnattributed). \
+         `last` is the most recent event of any kind; `changed` is the most recent one \
+         that actually TOOK the offset or the highlight, so ordinary shell output \
+         cannot bury the answer. `none` means nothing has moved custody yet. \
+         Read-only; reports no screen content",
     ),
     v(
         "hover",

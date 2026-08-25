@@ -37,6 +37,22 @@
 //! A driver detects lag without OS profilers: `metrics reset`, drive the workload,
 //! then `metrics` — if `slow_frames > 0`, or `max_frame_render_ms` is large, or
 //! `backend=cpu` under heavy output, the terminal is lagging.
+//!
+//! ## Two rules this file keeps
+//!
+//! **An instrument that perturbs the system under test proves nothing.** A
+//! counter here must describe ATERM, not the act of measuring it. Where the two
+//! cannot be separated, the contaminated samples get their OWN ledger and both
+//! are published — never a silent filter, never a poisoned average. See
+//! [`record_offscreen_raster`] (a screenshot must not move the on-glass frame
+//! ledger) and the `PRESENT_TAINT_UNTIL_NS` block (an occluded window, or a
+//! `video` capture pacing presents, must not move the output→glass histogram).
+//!
+//! **A number that cannot name its producer cannot end an investigation.** A
+//! last-writer label over a min-fold of ~35 candidates points at whichever one
+//! happened to win; that is how the 2026-08 event-loop spin was reported against
+//! `title_summary` for its first hour. `DEADLINE_ARMS_BY_OWNER` books arms — and
+//! past arms — per owner instead.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -58,6 +74,55 @@ static MAX_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
 static MAX_FRAME_RENDER_NS: AtomicU64 = AtomicU64::new(0);
 static SLOW_FRAMES: AtomicU64 = AtomicU64::new(0);
 static BACKEND_GPU: AtomicBool = AtomicBool::new(false);
+
+// ---- PRESENT-LATENCY HONESTY: the two contaminating EPISODES --------------
+//
+// THE OBSERVED DEFECT (responsiveness audit, item 10). A live read showed
+// `present_p50=1.31ms` next to `present_p95=671ms / p99=1006ms`, with
+// `n_present=5663` against `frames=17706`. A p95 five hundred times the median
+// is not a tail of the same distribution — it is a SECOND distribution mixed
+// into the first, and it made the published output→glass figure unusable in
+// exactly the direction that hides regressions: nobody trusts a number whose
+// tail is already absurd.
+//
+// WHERE THE SECOND DISTRIBUTION COMES FROM. `present_latency_ns` measures
+// PTY-output leading edge → the present that showed it. That is honest only
+// while the window is actually presenting. Two episodes break that:
+//
+//   1. OCCLUSION / PARK. A `GpuOccluded` drop, or any drop the retry scheduler
+//      parked awaiting an external surface stimulus, means frames stopped
+//      reaching glass for an interval nobody was watching. Output keeps arriving
+//      and keeps stamping. The first present after the episode books the whole
+//      unwatched interval as render latency — under the 5 s cap, so the existing
+//      honesty bound passes it straight through.
+//   2. CAPTURE. A `video` recording paces presents on the RECORDER's schedule,
+//      not the output's, and (the 2026-08 blackout's root cause) pins gates the
+//      unrecorded path does not have. A capture-based instrument that moves the
+//      number it is reading proves nothing — see docs/RELEASE-PROOF-DISCIPLINE.md.
+//
+// THE FIX FOLLOWS `record_offscreen_raster` EXACTLY: do not discard the sample,
+// and do not let it touch the on-glass ledger. A sample taken inside an episode
+// goes to its OWN histogram and its own last/max, so introspection and occluded
+// runs stay observable while `present_p95` means what it says. Both ledgers are
+// published, so the split is auditable rather than a silent filter.
+static PRESENT_TAINT_UNTIL_NS: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_DEPTH: AtomicU64 = AtomicU64::new(0);
+static CAPTURE_EPISODES: AtomicU64 = AtomicU64::new(0);
+static TAINTED_PRESENT_SAMPLES: AtomicU64 = AtomicU64::new(0);
+static LAST_TAINTED_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_TAINTED_PRESENT_LATENCY_NS: AtomicU64 = AtomicU64::new(0);
+
+/// How long after an episode ENDS a present-latency sample is still suspect.
+///
+/// The stamp being consumed is per SESSION, and several sessions can hold
+/// stamps armed while the window was off glass; the first present drains the
+/// visible set, but the drop→resume seam is not instantaneous and a park can
+/// re-arm between two of them. One second bounds that drain generously while
+/// staying far below the shortest interval anyone calls a stall, and — unlike a
+/// latch consumed by the next present — it cannot be defeated by a blink
+/// repaint arriving first. Every excluded sample is counted, so an over-broad
+/// tail is visible as `present_tainted` rather than as a missing measurement.
+const PRESENT_TAINT_TAIL_NS: u64 = 1_000_000_000;
 
 // SYNC-1 (DEC-2026 frame-hold) observability. A pathological arm/timeout-release
 // loop pins presents to ~1/timeout (the invisible ~5 fps failure class of
@@ -164,6 +229,24 @@ static LAST_DEADLINE_OWNER: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_DUE_NS: AtomicU64 = AtomicU64::new(0);
 static LAST_DEADLINE_LATE_NS: AtomicU64 = AtomicU64::new(0);
 static PAST_DEADLINE_ARMS: AtomicU64 = AtomicU64::new(0);
+
+// PER-OWNER ARM ATTRIBUTION (responsiveness audit, item 6). WHY: the two facts
+// above are structurally unable to name a spin's producer. `past_deadline_arms`
+// is ONE global counter, and `deadline_owner` is a LAST-WRITER snapshot of
+// whichever candidate won the final min-fold — so during the 2026-08 200 kHz
+// event-loop spin the pair read "31,913 past arms, owner=title_summary" while
+// the actual producer was the session-status observer folded under that same
+// label (see `DeadlineOwner::SessionStatus`), and the investigation spent its
+// first hour in the wrong module. A counter pair per owner makes the producer
+// NAMED rather than inferred: `arms` counts every deadline that owner won the
+// fold with, `past_arms` the subset already in the past when it was armed. The
+// cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
+// turn, on a line only this thread writes.
+const DEADLINE_OWNER_SLOTS: usize = 36;
+static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
+    [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
+static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
+    [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 
 // STALE-ARM HEAL (busy-rearm audit, item 3): the SAME owner arming a deadline
 // more than [`STALE_ARM_HEAL_FLOOR`] in the past on CONSECUTIVE turns is a
@@ -330,6 +413,13 @@ pub(crate) enum DeadlineOwner {
     /// settled, it folds nothing (FL-1: data arrives solely as
     /// `Wake::PkgProgress`, so an idle window never wakes for it).
     PkgProgress = 34,
+    /// The per-session STATUS observer (`SessionStatus::next_wake`): a candidate
+    /// serving its dwell, or a Running session aging into Quiet. Split out of
+    /// `TitleSummary` (item 8) because the two fold at the same seam in
+    /// `about_to_wait` and used to share one label — so the 2026-08 event-loop
+    /// spin, whose producer was THIS observer, was reported as `title_summary`
+    /// and cost the investigation its first hour on the wrong module.
+    SessionStatus = 35,
 }
 
 impl DeadlineOwner {
@@ -369,6 +459,7 @@ impl DeadlineOwner {
             32 => Self::TitleDrift,
             33 => Self::KittyTenure,
             34 => Self::PkgProgress,
+            35 => Self::SessionStatus,
             _ => Self::None,
         }
     }
@@ -411,6 +502,7 @@ impl DeadlineOwner {
             Self::TitleDrift => "title_drift",
             Self::KittyTenure => "kitty_tenure",
             Self::PkgProgress => "pkg_progress",
+            Self::SessionStatus => "session_status",
         }
     }
 }
@@ -1318,6 +1410,9 @@ impl Histogram {
 
 static H_INPUT_PRESENT: Histogram = Histogram::new();
 static H_PRESENT_LATENCY: Histogram = Histogram::new();
+/// The occluded/parked/capture twin of [`H_PRESENT_LATENCY`] — see the
+/// `PRESENT_TAINT_UNTIL_NS` block.
+static H_PRESENT_LATENCY_TAINTED: Histogram = Histogram::new();
 static H_FRAME_RENDER: Histogram = Histogram::new();
 static H_KEY_WRITE: Histogram = Histogram::new();
 static H_PRE_PRESENT: Histogram = Histogram::new();
@@ -1362,6 +1457,79 @@ pub fn resize_reflow_distribution() -> &'static Histogram {
 #[must_use]
 pub fn pre_present_distribution() -> &'static Histogram {
     &H_PRE_PRESENT
+}
+
+/// Output→present samples taken inside an OCCLUSION/PARK or CAPTURE episode:
+/// the second distribution that used to be mixed into `present_*` and put a
+/// 671 ms p95 next to a 1.31 ms p50. Kept rather than dropped so an occluded or
+/// recorded run stays observable; see the `PRESENT_TAINT_UNTIL_NS` block.
+#[must_use]
+pub fn tainted_present_distribution() -> &'static Histogram {
+    &H_PRESENT_LATENCY_TAINTED
+}
+
+/// Arm the suspect window: presents for the next [`PRESENT_TAINT_TAIL_NS`] are
+/// booked to the tainted ledger. `fetch_max` so a later episode can only extend
+/// it, never cut a still-open one short.
+fn arm_present_taint() {
+    PRESENT_TAINT_UNTIL_NS.fetch_max(
+        now_ns().saturating_add(PRESENT_TAINT_TAIL_NS),
+        Ordering::Relaxed,
+    );
+}
+
+/// True while output→present latency cannot be attributed to the terminal:
+/// a capture is live, or an occlusion/park episode ended within the tail.
+fn present_latency_tainted() -> bool {
+    tainted_at(
+        now_ns(),
+        PRESENT_TAINT_UNTIL_NS.load(Ordering::Relaxed),
+        CAPTURE_DEPTH.load(Ordering::Relaxed),
+    )
+}
+
+/// The taint decision, PURE, so the policy has a race-free test that touches no
+/// process-global state (the `wake_owner` precedent). A live capture taints
+/// unconditionally; otherwise the sample is suspect until the tail expires.
+const fn tainted_at(now_ns: u64, taint_until_ns: u64, capture_depth: u64) -> bool {
+    capture_depth != 0 || now_ns < taint_until_ns
+}
+
+/// WHICH present drops make the following output→present samples meaningless.
+///
+/// PURE and deliberately NARROW. Occluded glass, or a drop the retry scheduler
+/// parked awaiting an external surface stimulus, means frames stopped reaching
+/// the screen for an interval nobody was watching — output kept stamping and
+/// the resuming present books the whole unwatched gap. A transient
+/// `CpuAcquire`/`GpuTimeout`/`GpuReconfigured` that retries a millisecond later
+/// is a stall the user genuinely FELT: tainting those would delete exactly the
+/// samples this histogram exists to catch.
+const fn drop_taints_present_latency(reason: PresentDropReason, parked: bool) -> bool {
+    parked || matches!(reason, PresentDropReason::GpuOccluded)
+}
+
+/// A capture episode (`video` recording, paced or offscreen) opened or closed.
+///
+/// THE OBSERVER RULE IN CODE: a recording paces presents on its own schedule
+/// and pins gates the unrecorded path does not have, so every output→present
+/// sample taken while it runs describes the INSTRUMENT, not the terminal. Marking
+/// the episode is what lets `present_p95` stay a statement about aterm while the
+/// recorded numbers remain readable in their own ledger. Nesting-safe (depth,
+/// not a bool) so overlapping captures cannot leave the flag stuck either way,
+/// and the close arms the tail because presents already queued by the pacer land
+/// after it.
+pub fn note_capture_episode(active: bool) {
+    if active {
+        CAPTURE_DEPTH.fetch_add(1, Ordering::Relaxed);
+        CAPTURE_EPISODES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // Saturating: an unpaired close (a recording finalized twice, or one
+        // that began before `reset` zeroed the depth) must not wrap the depth to
+        // u64::MAX and taint the ledger for the rest of the process.
+        let _ = CAPTURE_DEPTH
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)));
+    }
+    arm_present_taint();
 }
 
 /// Swapchain-acquire (`nextDrawable`) WAIT distribution — pure blocking on the
@@ -1454,13 +1622,31 @@ pub(crate) fn record_present(
         }
     }
     if latency_ns != 0 {
-        LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
-        MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
-        H_PRESENT_LATENCY.record(latency_ns);
+        // HONESTY SPLIT (item 10): an output→present slice measured while the
+        // window was occluded/parked, or while a capture was pacing presents,
+        // describes the episode and not the terminal. Book it — visibly — to
+        // the tainted ledger instead of the on-glass one. See the
+        // `PRESENT_TAINT_UNTIL_NS` block.
+        if present_latency_tainted() {
+            TAINTED_PRESENT_SAMPLES.fetch_add(1, Ordering::Relaxed);
+            LAST_TAINTED_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
+            MAX_TAINTED_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
+            H_PRESENT_LATENCY_TAINTED.record(latency_ns);
+        } else {
+            LAST_PRESENT_LATENCY_NS.store(latency_ns, Ordering::Relaxed);
+            MAX_PRESENT_LATENCY_NS.fetch_max(latency_ns, Ordering::Relaxed);
+            H_PRESENT_LATENCY.record(latency_ns);
+        }
         // A CONTENT present: close the pending
         // input→application-present-return slice, if any. A latency of 0
         // (blink/selection repaint) leaves the stamp pending — no attributed
         // content present has completed yet.
+        //
+        // DELIBERATELY NOT taint-gated. The stamp must be CONSUMED either way
+        // (leaving it armed only ages it into the `INPUT_SLICE_CAP_NS` discard),
+        // and input→present already carries its own honesty bound: a keystroke
+        // typed into an occluded window is a real keystroke that really waited.
+        // Only the OUTPUT slice above measures an interval nobody asked for.
         let stamp = INPUT_STAMP_NS.swap(0, Ordering::Relaxed);
         if stamp != 0 {
             let d = now_ns().saturating_sub(stamp);
@@ -1802,6 +1988,15 @@ pub fn note_pre_present(compose_ns: u64) {
 pub fn note_present_drop(reason: PresentDropReason, parked: bool) {
     PRESENT_DROPS.fetch_add(1, Ordering::Relaxed);
     update_present_drop_disposition(reason, parked);
+    // OCCLUSION/PARK taint (item 10). Only drops that stop the present stream
+    // for an UNBOUNDED interval count: occluded glass, or a drop the retry
+    // scheduler parked awaiting an external stimulus. A transient
+    // `CpuAcquire`/`GpuTimeout` that retries a millisecond later is a stall the
+    // user genuinely felt and MUST stay in the on-glass distribution — taint it
+    // and the honesty pass would delete the very samples it exists to protect.
+    if drop_taints_present_latency(reason, parked) {
+        arm_present_taint();
+    }
 }
 
 /// Update the live disposition of an already-counted dropped frame. Recovery
@@ -1824,6 +2019,7 @@ pub fn update_present_drop_disposition(reason: PresentDropReason, parked: bool) 
 /// `deadline_late_ms`/`past_deadline_arms` always describe the REQUESTED
 /// deadline, so the diagnostics stay honest about what the producer asked for
 /// even on healed turns.
+#[must_use = "the RETURNED instant is the healed one — arming the argument re-arms the stale deadline this fn exists to clamp"]
 pub fn record_deadline(
     owner: DeadlineOwner,
     deadline: Option<Instant>,
@@ -1843,11 +2039,13 @@ pub fn record_deadline(
             let ahead = u64::try_from(deadline.duration_since(now).as_nanos()).unwrap_or(u64::MAX);
             STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
             STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
+            note_owner_arm(owner, false);
             (owner, clock_now.saturating_add(ahead), 0)
         }
         Some(deadline) => {
             let late = u64::try_from(now.duration_since(deadline).as_nanos()).unwrap_or(u64::MAX);
             PAST_DEADLINE_ARMS.fetch_add(1, Ordering::Relaxed);
+            note_owner_arm(owner, true);
             if late > STALE_ARM_HEAL_FLOOR_NS && owner as u64 != DeadlineOwner::None as u64 {
                 let streak = STALE_ARM_STREAK_OWNER.swap(owner as u64, Ordering::Relaxed);
                 if streak == owner as u64 {
@@ -1874,6 +2072,63 @@ pub fn record_deadline(
     LAST_DEADLINE_DUE_NS.store(due, Ordering::Relaxed);
     LAST_DEADLINE_LATE_NS.store(late, Ordering::Relaxed);
     armed
+}
+
+/// Book one armed deadline against the owner that WON the fold, and the past
+/// subset separately. Kept next to the global counters it disambiguates so the
+/// two can never drift: every path that bumps `PAST_DEADLINE_ARMS` bumps this.
+fn note_owner_arm(owner: DeadlineOwner, past: bool) {
+    // `owner as u64` is a discriminant of this enum, so the index is in range
+    // for any variant the slot count covers; the guard keeps a future variant
+    // added without bumping `DEADLINE_OWNER_SLOTS` from panicking a release
+    // build's event loop (the unit test below fails loudly instead).
+    let Some(slot) = usize::try_from(owner as u64)
+        .ok()
+        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
+    else {
+        return;
+    };
+    DEADLINE_ARMS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
+    if past {
+        PAST_DEADLINE_ARMS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One owner's arm ledger since the last [`reset`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnerArms {
+    /// The stable wire label (`DeadlineOwner::as_str`).
+    pub owner: &'static str,
+    /// Deadlines this owner won the `about_to_wait` min-fold with.
+    pub arms: u64,
+    /// The subset of those already in the past when armed — the spin signature,
+    /// now attributable to ONE producer instead of the whole event loop.
+    pub past_arms: u64,
+}
+
+/// Per-owner arm attribution, NON-ZERO OWNERS ONLY (item 6).
+///
+/// Deliberately not a [`Snapshot`] field: `snapshot()` is `Copy` and read per
+/// Settings ROW, so folding a 36-entry pair table into it would put ~576 bytes
+/// and 72 atomic loads on a path that wants one bool. Callers that want the
+/// attribution ask for it.
+///
+/// Sparse output keeps the wire field small on a healthy instance — an idle
+/// terminal arms two or three owners — and makes a spin's producer the FIRST
+/// thing a reader sees rather than a needle in 36 zeroes.
+#[must_use]
+pub fn deadline_arm_attribution() -> Vec<OwnerArms> {
+    (0..DEADLINE_OWNER_SLOTS)
+        .filter_map(|slot| {
+            let arms = DEADLINE_ARMS_BY_OWNER[slot].load(Ordering::Relaxed);
+            let past_arms = PAST_DEADLINE_ARMS_BY_OWNER[slot].load(Ordering::Relaxed);
+            (arms != 0 || past_arms != 0).then(|| OwnerArms {
+                owner: DeadlineOwner::from_raw(slot as u64).as_str(),
+                arms,
+                past_arms,
+            })
+        })
+        .collect()
 }
 
 /// Record why winit began this event-loop iteration and attribute a timer wake
@@ -1972,6 +2227,16 @@ pub fn reset() {
     PRE_PRESENT_TOTAL_NS.store(0, Ordering::Relaxed);
     MAX_PRE_PRESENT_NS.store(0, Ordering::Relaxed);
     PRESENT_DROPS.store(0, Ordering::Relaxed);
+    // The tainted ledger is a window stat like its clean twin. `CAPTURE_DEPTH`
+    // is LIVE STATE, not an observation: a reset taken mid-recording must not
+    // pretend the recording ended, or the rest of it lands in the clean
+    // histogram. `PRESENT_TAINT_UNTIL_NS` survives for the same reason — the
+    // episode it describes is still in progress.
+    CAPTURE_EPISODES.store(0, Ordering::Relaxed);
+    TAINTED_PRESENT_SAMPLES.store(0, Ordering::Relaxed);
+    LAST_TAINTED_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
+    MAX_TAINTED_PRESENT_LATENCY_NS.store(0, Ordering::Relaxed);
+    H_PRESENT_LATENCY_TAINTED.reset();
     LAST_PRESENT_DROP_REASON.store(0, Ordering::Relaxed);
     LAST_PRESENT_DROP_PARKED.store(false, Ordering::Relaxed);
     EVENT_WAKES.store(0, Ordering::Relaxed);
@@ -1979,6 +2244,10 @@ pub fn reset() {
     WAIT_CANCELLED_WAKES.store(0, Ordering::Relaxed);
     POLL_WAKES.store(0, Ordering::Relaxed);
     PAST_DEADLINE_ARMS.store(0, Ordering::Relaxed);
+    for slot in 0..DEADLINE_OWNER_SLOTS {
+        DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
+        PAST_DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
+    }
     // The heal counter clears like `wake_heals`; the streak/episode latches are
     // live detection state, reset so a fresh window re-logs a still-live spin.
     STALE_ARM_HEALS.store(0, Ordering::Relaxed);
@@ -2079,6 +2348,19 @@ pub struct Snapshot {
     pub pre_present_total_ns: u64,
     pub max_pre_present_ns: u64,
     pub present_drops: u64,
+    /// Output→present samples diverted to the TAINTED ledger because the window
+    /// was occluded/parked or a capture was pacing presents. A non-zero value
+    /// is why `frames` exceeds `n_present`; see the `PRESENT_TAINT_UNTIL_NS`
+    /// block. These never touch `last_/max_present_latency_ns`.
+    pub tainted_present_samples: u64,
+    pub last_tainted_present_latency_ns: u64,
+    pub max_tainted_present_latency_ns: u64,
+    /// `video` capture episodes opened since reset. Any non-zero value means a
+    /// capture-based instrument ran inside this measurement window — read every
+    /// number in it knowing the recorder was in the loop.
+    pub capture_episodes: u64,
+    /// True while a capture is live RIGHT NOW (a gauge, so it survives `reset`).
+    pub capture_active: bool,
     pub last_present_drop_reason: PresentDropReason,
     pub last_present_drop_parked: bool,
     pub event_wakes: u64,
@@ -2271,6 +2553,11 @@ pub fn snapshot() -> Snapshot {
         pre_present_total_ns: PRE_PRESENT_TOTAL_NS.load(Ordering::Relaxed),
         max_pre_present_ns: MAX_PRE_PRESENT_NS.load(Ordering::Relaxed),
         present_drops: PRESENT_DROPS.load(Ordering::Relaxed),
+        tainted_present_samples: TAINTED_PRESENT_SAMPLES.load(Ordering::Relaxed),
+        last_tainted_present_latency_ns: LAST_TAINTED_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
+        max_tainted_present_latency_ns: MAX_TAINTED_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
+        capture_episodes: CAPTURE_EPISODES.load(Ordering::Relaxed),
+        capture_active: CAPTURE_DEPTH.load(Ordering::Relaxed) != 0,
         last_present_drop_reason: PresentDropReason::from_raw(
             LAST_PRESENT_DROP_REASON.load(Ordering::Relaxed),
         ),
@@ -2958,8 +3245,17 @@ mod histogram_tests {
     /// self-rearming `WaitUntil(past)` spin, and the fold must clamp it to
     /// `now + floor` and count the heal so the loop survives the whole class
     /// visibly.
+    /// `record_deadline` mutates PROCESS-GLOBAL state — the stale-arm streak
+    /// latch and the per-owner arm counters — so the tests that drive it cannot
+    /// interleave: one test's healthy arm clears another's streak, and both
+    /// book arms into the same table. Serialize the drivers.
+    static SCHEDULER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn consecutive_same_owner_stale_arms_heal_to_the_floor() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let now = Instant::now();
         let future = now + Duration::from_millis(5);
         let stale = now - Duration::from_secs(2);
@@ -3007,5 +3303,185 @@ mod histogram_tests {
 
         // Leave no streak behind for other tests.
         assert_eq!(record_deadline(owner, Some(future), now), Some(future));
+    }
+
+    /// ITEM 8, and the append-only wire contract that protects it. `SessionStatus`
+    /// exists so the status observer stops reporting as `title_summary`; the slot
+    /// table behind the per-owner attribution must cover it and every future
+    /// sibling, or `note_owner_arm` silently drops that owner's arms on the floor.
+    #[test]
+    fn every_deadline_owner_has_its_own_label_and_its_own_slot() {
+        assert_eq!(
+            DeadlineOwner::from_raw(DeadlineOwner::SessionStatus as u64),
+            DeadlineOwner::SessionStatus
+        );
+        assert_eq!(DeadlineOwner::SessionStatus.as_str(), "session_status");
+        assert_ne!(
+            DeadlineOwner::SessionStatus.as_str(),
+            DeadlineOwner::TitleSummary.as_str(),
+            "the two folds that shared a label must not share one again"
+        );
+        // Every slot below the count decodes to a DISTINCT owner whose own
+        // discriminant is that slot — this is what makes `note_owner_arm`'s
+        // index a bijection onto the enum.
+        let mut seen = std::collections::BTreeSet::new();
+        for slot in 1..DEADLINE_OWNER_SLOTS {
+            let owner = DeadlineOwner::from_raw(slot as u64);
+            assert_eq!(
+                owner as u64, slot as u64,
+                "slot {slot} does not round-trip: DEADLINE_OWNER_SLOTS is stale"
+            );
+            assert!(
+                seen.insert(owner.as_str()),
+                "duplicate wire label at slot {slot}: {}",
+                owner.as_str()
+            );
+        }
+        // …and the count is EXACTLY one past the last variant: appending a
+        // variant without widening the table fails here instead of losing its
+        // attribution at runtime.
+        assert_eq!(
+            DeadlineOwner::from_raw(DEADLINE_OWNER_SLOTS as u64),
+            DeadlineOwner::None,
+            "DEADLINE_OWNER_SLOTS must be one past the last discriminant"
+        );
+    }
+
+    /// ITEM 6. The failure this prevents: `past_deadline_arms` was one global
+    /// number, so a spin could only ever be reported against `deadline_owner`,
+    /// a last-writer snapshot. Two owners arming in the same window must now
+    /// come back separated, past arms included.
+    #[test]
+    fn arms_are_attributed_to_the_owner_that_armed_them() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = Instant::now();
+        let future = now + Duration::from_millis(5);
+        let stale = now - Duration::from_millis(1);
+
+        let before = |owner: DeadlineOwner| {
+            let slot = owner as usize;
+            (
+                DEADLINE_ARMS_BY_OWNER[slot].load(Ordering::Relaxed),
+                PAST_DEADLINE_ARMS_BY_OWNER[slot].load(Ordering::Relaxed),
+            )
+        };
+        let (status_arms, status_past) = before(DeadlineOwner::SessionStatus);
+        let (blink_arms, blink_past) = before(DeadlineOwner::Blink);
+
+        // One healthy arm from Blink, two PAST arms from SessionStatus. Under
+        // the old single counter this window read "2 past arms, owner=blink".
+        let _ = record_deadline(DeadlineOwner::SessionStatus, Some(stale), now);
+        let _ = record_deadline(DeadlineOwner::Blink, Some(future), now);
+        let _ = record_deadline(DeadlineOwner::SessionStatus, Some(stale), now);
+
+        assert_eq!(
+            before(DeadlineOwner::SessionStatus),
+            (status_arms + 2, status_past + 2),
+            "both stale arms are booked to the observer that armed them"
+        );
+        assert_eq!(
+            before(DeadlineOwner::Blink),
+            (blink_arms + 1, blink_past),
+            "a healthy arm counts as an arm and NOT as a past arm"
+        );
+
+        // The published view names the owner, and never invents one.
+        let published = deadline_arm_attribution();
+        let status = published
+            .iter()
+            .find(|o| o.owner == "session_status")
+            .expect("the arming owner is published by name");
+        assert!(status.past_arms >= 2);
+        assert!(status.arms >= status.past_arms);
+        assert!(
+            published.iter().all(|o| o.arms != 0 || o.past_arms != 0),
+            "the attribution is sparse: silent owners are omitted, not zero-padded"
+        );
+
+        // Leave no streak behind for the healer test.
+        let _ = record_deadline(DeadlineOwner::SessionStatus, Some(future), now);
+    }
+
+    /// ITEM 10, the policy half. A drop only taints the output→present
+    /// distribution when it means the present stream STOPPED for an interval
+    /// nobody was watching. Tainting a transient retry would delete the stalls
+    /// the histogram exists to catch — so this pins the narrow set explicitly.
+    #[test]
+    fn only_unbounded_present_stoppages_taint_the_on_glass_ledger() {
+        for reason in [
+            PresentDropReason::None,
+            PresentDropReason::GpuReconfigured,
+            PresentDropReason::GpuTimeout,
+            PresentDropReason::GpuValidation,
+            PresentDropReason::CpuResize,
+            PresentDropReason::CpuAcquire,
+            PresentDropReason::CpuCommit,
+            PresentDropReason::TargetMismatch,
+            PresentDropReason::Virtual,
+        ] {
+            assert!(
+                !drop_taints_present_latency(reason, false),
+                "{} retries; the stall it caused is REAL and stays on glass",
+                reason.as_str()
+            );
+            assert!(
+                drop_taints_present_latency(reason, true),
+                "{} parked: nothing reaches glass until an external stimulus",
+                reason.as_str()
+            );
+        }
+        assert!(
+            drop_taints_present_latency(PresentDropReason::GpuOccluded, false),
+            "occluded glass is the canonical unwatched interval"
+        );
+    }
+
+    /// ITEM 10, the window half — pure, so it cannot race the process globals.
+    #[test]
+    fn the_taint_window_covers_live_captures_and_the_episode_tail() {
+        assert!(
+            !tainted_at(1_000, 0, 0),
+            "no episode, no capture: the sample is aterm's own"
+        );
+        assert!(tainted_at(1_000, 2_000, 0), "inside the episode tail");
+        assert!(
+            !tainted_at(2_000, 2_000, 0),
+            "the tail is exclusive: the boundary sample is clean again"
+        );
+        assert!(
+            tainted_at(u64::MAX, 0, 1),
+            "a LIVE capture taints regardless of the clock — the recorder is              pacing presents right now"
+        );
+    }
+
+    /// A capture episode must open and close exactly once however the recording
+    /// ends, and an UNPAIRED close must not wrap the depth to `u64::MAX` and
+    /// taint every present for the rest of the process.
+    ///
+    /// This is the one test here that touches the globals; it leaves the depth
+    /// at zero. It does arm the ~1 s taint tail, which is harmless: no other
+    /// test asserts on present-latency VALUES (`record_present` has exactly one
+    /// caller, the real present path).
+    #[test]
+    fn capture_episodes_nest_and_never_underflow() {
+        assert!(!snapshot().capture_active, "no capture is running");
+        note_capture_episode(true);
+        assert!(snapshot().capture_active);
+        note_capture_episode(true); // overlapping capture
+        note_capture_episode(false);
+        assert!(
+            snapshot().capture_active,
+            "one close does not end two overlapping captures"
+        );
+        note_capture_episode(false);
+        assert!(!snapshot().capture_active, "the last close ends the episode");
+        note_capture_episode(false); // unpaired: a double finalize
+        assert!(
+            !snapshot().capture_active,
+            "an unpaired close saturates at zero instead of wrapping"
+        );
+        assert!(present_latency_tainted(), "the closing tail is still armed");
     }
 }

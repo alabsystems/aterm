@@ -22,23 +22,85 @@
 //!   4. alt-screen ESC7/ESC8 token streamer, typing  → effect ink PRESENT
 //!      (the "unowned batch" cadence that tripped the ownership fence; kept
 //!      as a matrix row so that regression class stays dead)
+//!   5. UNFOCUSED alt-screen fake-Claude, typed over the control socket,
+//!      captured WITHOUT a recording                 → RAINBOW ink PRESENT
+//!   6. UNFOCUSED alt-screen cold spinner, nothing typed, same unpinned
+//!      capture                                      → NOT ink (row 5's control)
+//!
+//! WHY ROWS 5 AND 6 EXIST — THE OBSERVER RULE (docs/RELEASE-PROOF-DISCIPLINE.md).
+//! Rows 1-4 drive `ctl video`, and an in-flight recording PINS the motion-focus
+//! input for the recorded window (`App::motion_focus` = `focused || this window
+//! is being recorded`). So those rows animate the cursor effects even when the
+//! gate they depend on is broken. That is not hypothetical: it is how v0.48-v0.50
+//! shipped the trail dark past this very matrix — the instrument healed the bug
+//! it was sent to find. A second healer sat behind it: a `--headless` window
+//! seeds `focused: true` and only a real `WindowEvent::Focused` corrects it, so
+//! even an unrecorded headless take was a FOCUSED take.
+//!
+//! Rows 5 and 6 remove both. `--capture image` takes a BURST of `ctl image`
+//! captures — a queued render, no recording, `motion_focus` untouched — and
+//! `--focus out` routes through the same `App::on_focus` the OS event calls, so
+//! `WindowState::focused` is genuinely false while control-socket typing (which
+//! never grants OS key focus) keeps driving the window. That is the owner's real
+//! shape, and it is the only row in this file that can go red for the reason the
+//! file exists.
+//!
+//! PROVEN RED, 2026-08-24. HEAD's `cursor_fx_focus` typed-wake term was removed
+//! in a scratch worktree (the v0.48-v0.50 blackout, reproduced) and the RELEASE
+//! binary rebuilt there; the healthy arm is the SAME worktree restored and
+//! rebuilt, so the two binaries differ in that term and nothing else.
+//!
+//!   row 2's shape, `ctl video` (pinned)      broken: total_ink=4930 hues=9 PASS
+//!   row 5's shape, unpinned but still FOCUSED broken: total_ink=1100 hues=9 PASS
+//!   row 5's shape, unpinned AND unfocused     broken: total_ink=1470 hues=1 FAIL
+//!   row 5's shape, unpinned AND unfocused    healthy: total_ink=1553 hues=9 PASS
+//!   row 6's shape (control)                  healthy: total_ink<=196 hues=1 PASS
+//!
+//! The first line is the blindness itself, measured: the gate that exists to
+//! catch this bug passed the bug. The second is the second healer, measured.
+//! Only the third arm — both healers removed — goes red.
+//!
+//! Note what the discriminator is in row 5: HUE SPREAD, not raw pixel count.
+//! An unfocused typed window still moves a saturated block cursor and echoes
+//! glyphs, and that lands ~1500 single-hue dynamic-saturated px in the take
+//! whether or not the trail paints. The RAINBOW trail is what spreads ink
+//! across the hue wheel — 9 of 12 buckets healthy, 1 dark — so row 5 is gated
+//! on `--min-hues` with a floor of 4 sitting between the two arms with margin
+//! on both sides.
 //!
 //! INK means dynamic saturated pixels: saturated AND changing against frame 0
 //! (static syntax color is saturated but byte-identical; echoed monochrome
 //! glyphs change but are unsaturated; only an effect is both). The thresholds
-//! live in the probe (and are re-pinned here): a healthy take carries ≥150
-//! dynamic saturated px across ≥4 of 12 hue buckets — measured 2026-08-24 at
-//! ~1450-1650 px / 9-10 buckets on a healthy HEAD, and exactly 0 on the dark
-//! control, so the floor has ~10x margin on one side and no noise on the other.
-//! (Calibration note: the ≥150/≥4 floor gates the recorded TAKE; a single
-//! 584x350 headless frame of a healthy trail peaks at ~22 saturated px, so a
-//! per-frame floor of 150 would be vacuously red on healthy builds.)
+//! live in the probe: ≥150 dynamic saturated px across ≥4 of 12 hue buckets.
+//! Re-measured 2026-08-24 across this whole matrix on a healthy HEAD (RELEASE
+//! profile, headless 584x350) — a stale calibration is a lie the next reader
+//! inherits, so these are the numbers the rows actually produced:
+//!
+//!   rows 1-4, capture=video   129-177 frames  total_ink 3856-5788  hues 8-10
+//!   row 5,    capture=image        29 frames  total_ink 1425-1553  hues 9
+//!   row 3,    the dark control     31 frames  total_ink 0
+//!   row 6,    the quiet control    25 frames  total_ink 0-196      hues 0-1
+//!
+//! The busiest SINGLE frame runs 98-136 px on every ink arm, which is why the
+//! ≥150 floor gates the TAKE and not a frame — a per-frame floor of 150 would
+//! be vacuously red on healthy builds.
 //!
 //! WIRING: the pre-push gate covers this matrix through the `guards` lane of
 //! `xtask gate lint` (which `.githooks/pre-push` runs on every push) —
 //! `tools/paint_guard.sh` re-runs `cargo test -p aterm-conformance --test
 //! paint` whenever the paint-relevant trees (aterm-effects / aterm-render /
 //! aterm-gui / this gate itself) differ from the last take it proved green.
+//!
+//! RUNTIME, and why it moved: the probe's whole-run watchdog used to sleep out
+//! the full `--budget` and be killed on exit, which orphaned its `sleep` — and
+//! the orphan kept the probe's stdout/stderr open, so `Command::output()`
+//! below did not RETURN until the budget elapsed no matter how fast the row
+//! decided. Every row cost its 180 s budget; this file's four rows cost ~12
+//! min of pure waiting. The watchdog now retires itself off a sentinel.
+//! MEASURED 2026-08-24 after the fix: this whole SIX-row matrix, serialized,
+//! against the release binary, `finished in 47.69s`. The four-row matrix it
+//! replaces could not finish in under 720 s (4 x its own 180 s budget) no
+//! matter how fast the rows decided.
 //!
 //! macOS-ONLY LANE, honestly: the scanner decodes frames by shelling to
 //! `sips`, so elsewhere the suite compiles to one loud not-run notice instead
@@ -154,16 +216,45 @@ enum Expect {
     Ink,
     /// The dark control: ZERO dynamic saturated px in EVERY frame.
     Dark,
+    /// The control for a path that carries an unavoidable cursor-cell
+    /// artifact: the take FAILS the ink gate — the same three numbers, read
+    /// the other way. See the probe's `--expect quiet` note for the
+    /// measurements; on the unpinned path the deciding term is hue spread
+    /// (1 bucket vs the trail's 9), not pixel count.
+    Quiet,
 }
 
-/// Drive one shape through `tools/paint-conformance/paint_probe.sh` and
-/// assert its verdict.
-///
-/// Serialized: each case launches its own headless instance and records
-/// video, and two concurrent recorders would contend for frames and CPU —
-/// a paint gate must never fail because of its own harness load.
+/// Drive one shape through the probe on the ORIGINAL (recorded) capture path —
+/// rows 1-4. See [`Capture::PinnedVideo`] for what that path perturbs, and
+/// [`probe_with`] for the rest.
 #[cfg(target_os = "macos")]
 fn probe(shape: &str, keys: &str, expect: Expect) {
+    probe_with(shape, keys, expect, Capture::PinnedVideo);
+}
+
+/// How the take is captured — and therefore WHAT THE INSTRUMENT PERTURBS.
+/// See the observer-rule note at the top of this file.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum Capture {
+    /// `ctl video` — the recording PINS `motion_focus` for the recorded
+    /// window. Fine for proving a focused window paints; structurally unable
+    /// to catch a motion-gate regression, because recording repairs it.
+    PinnedVideo,
+    /// A burst of `ctl image` captures with the window driven UNFOCUSED
+    /// (`ctl focus out`). Nothing about the motion gate is touched: this is
+    /// the arm that can go red.
+    UnpinnedUnfocused,
+}
+
+/// Drive one shape through `tools/paint-conformance/paint_probe.sh` on the
+/// given capture path and assert its verdict.
+///
+/// Serialized: each case launches its own headless instance and captures from
+/// it, and two concurrent takes would contend for frames and CPU — a paint
+/// gate must never fail because of its own harness load.
+#[cfg(target_os = "macos")]
+fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -175,11 +266,21 @@ fn probe(shape: &str, keys: &str, expect: Expect) {
     let (expect_arg, what) = match expect {
         Expect::Ink => ("ink", "effect ink present"),
         Expect::Dark => ("dark", "zero effect ink in every frame"),
+        Expect::Quiet => (
+            "quiet",
+            "a take that the ink gate itself would NOT score as effect ink",
+        ),
     };
     let mut cmd = Command::new(&script);
     cmd.arg(&bin)
         .args(["--shape", shape, "--record", "5", "--expect", expect_arg])
         .args(["--min-ink", "150", "--min-hues", "4", "--budget", "180"]);
+    match capture {
+        Capture::PinnedVideo => {}
+        Capture::UnpinnedUnfocused => {
+            cmd.args(["--capture", "image", "--focus", "out"]);
+        }
+    }
     if !keys.is_empty() {
         cmd.args(["--keys", keys]);
     }
@@ -194,12 +295,23 @@ fn probe(shape: &str, keys: &str, expect: Expect) {
         .find(|l| l.starts_with("PAINT"))
         .unwrap_or("<no PAINT report line>")
         .to_string();
+    // What a RED on this row actually means. Rows 1-4 and rows 5-6 fail for
+    // different reasons and send a reader to different code, so they say so
+    // rather than sharing one message that fits neither.
+    let meaning = match capture {
+        Capture::PinnedVideo => {
+            "the shipped binary does not paint its flagship effect at all — this row's window              was FOCUSED and RECORDED, i.e. every excuse was already granted"
+        }
+        Capture::UnpinnedUnfocused => {
+            "an UNFOCUSED window being typed into does not paint its trail — the v0.48-v0.50              blackout class, back. Look at `App::cursor_fx_focus`'s typed-wake term and the              W11b demotion it exists to override; note that `ctl video` would have HIDDEN this              (its recording pin un-suppresses the same gate), which is why this row does not              use one"
+        }
+    };
     match out.status.code() {
         Some(0) => eprintln!("paint[{shape}]: {report}"),
         Some(1) => panic!(
-            "PAINT CONFORMANCE FAILED [{shape}]: expected {what}, and the recorded take says \
-             otherwise — the shipped binary does not paint its flagship effect \
-             (docs/RELEASE-PROOF-DISCIPLINE.md).\n  {report}\n--- probe stderr ---\n{stderr}"
+            "PAINT CONFORMANCE FAILED [{shape}]: expected {what}, and the take says otherwise — \
+             {meaning} (docs/RELEASE-PROOF-DISCIPLINE.md).\n  {report}\n\
+             --- probe stderr ---\n{stderr}"
         ),
         Some(2) => panic!(
             "PAINT CONFORMANCE COULD NOT RUN [{shape}]: the probe decided nothing, which is not \
@@ -246,4 +358,55 @@ fn alt_screen_cold_spinner_paints_zero_ink() {
 #[test]
 fn alt_screen_esc7_esc8_streamer_typing_paints_trail_ink() {
     probe("streamer", "h,e,l,l,o,space,w,o,r,l,d", Expect::Ink);
+}
+
+/// Matrix row 5 — THE ONE ROW THAT CAN GO RED. An UNFOCUSED window
+/// (`ctl focus out` → the same `App::on_focus` a winit `Focused(false)` calls)
+/// being typed into over the control socket, captured by an UNPINNED burst of
+/// `ctl image` renders that leaves `motion_focus` exactly as the un-observed
+/// app has it. This is the owner's real shape and the v0.48-v0.50 blackout's
+/// exact condition; see the observer-rule note at the top of this file.
+///
+/// MEASURED 2026-08-24, both arms, RELEASE profile, headless 584x350:
+///   healthy HEAD                 frames=29 total_ink=1553 union_hues=9  PASS
+///   typed-wake term removed      frames=29 total_ink=1470 union_hues=1  FAIL
+/// The pixel COUNT barely moves (an unfocused typed window still drags a
+/// saturated block cursor and echoes glyphs); the HUE SPREAD is the witness,
+/// and `--min-hues 4` sits between 1 and 9 with margin on both sides.
+#[cfg(target_os = "macos")]
+#[test]
+fn unfocused_typed_window_paints_its_trail_under_an_unpinned_capture() {
+    probe_with(
+        "fake-claude",
+        "r,a,i,n,b,o,w,space,o,n",
+        Expect::Ink,
+        Capture::UnpinnedUnfocused,
+    );
+}
+
+/// Matrix row 6, row 5's control: the SAME unfocused window under the SAME
+/// unpinned capture, with NOTHING typed, is a take the ink gate would not
+/// score as ink. Without it row 5 could be satisfied by a scanner that counts
+/// the client's own repaints; with it, row 5's 9 hue buckets are provably the
+/// typed trail and nothing else. It also pins the other half of the contract
+/// the typed wake must not break — an IDLE unfocused window still demotes
+/// (W11b), so the fix bought the trail back without turning background
+/// decoration on.
+///
+/// `Expect::Quiet`, not `Expect::Dark`, and the reason is measured rather than
+/// assumed. The client hides its caret (DECTCEM) inside every DEC-2026
+/// bracket, so an `image` capture landing mid-bracket sees the cursor cell
+/// differ from frame 0 — exactly 98 px, one 7x14 cell, in one or two frames of
+/// ~25, varying run to run: `total_ink` came back 0, 0, 0, 98, 98, 196, 196
+/// over seven runs of this shape on 2026-08-24. `total_ink == 0` would flake
+/// one run in three, and a raw ink ceiling is no better (196 straddles the 150
+/// floor). The trail's signature is HUE SPREAD, and that separation is not
+/// close: 1 bucket here, 9 in row 5.
+///
+/// NOT VACUOUS, checked: pointed at row 5's typed shape, `--expect quiet`
+/// FAILS (`total_ink=577 union_hues=8`).
+#[cfg(target_os = "macos")]
+#[test]
+fn unfocused_idle_window_paints_nothing_under_an_unpinned_capture() {
+    probe_with("cold-spinner", "", Expect::Quiet, Capture::UnpinnedUnfocused);
 }

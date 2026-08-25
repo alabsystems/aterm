@@ -940,9 +940,10 @@ pub(crate) const DEFERRED_CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     (
         "font_hinting",
-        "the Linux glyph grid-fitting mode (full|light|native|off, R2) — inert on \
-         macOS/Windows, and this registry has no platform-gated-row precedent yet: a knob \
-         that visibly does nothing on two of three platforms would read as broken. It is a \
+        "the glyph grid-fitting mode (full|light|native|off, R2) — LIVE on Linux and \
+         Windows, inert on macOS, where CoreText applies its own grid discipline. This \
+         registry has no platform-gated-row precedent yet: a knob that visibly does nothing \
+         on the platform this Settings surface is authored on would read as broken. It is a \
          full config key (aterm.toml, $ATERM_FONT_HINTING alias, hot-reload); it joins the \
          Typography section when per-platform row visibility exists",
     ),

@@ -366,9 +366,17 @@ pub(crate) struct Config {
     /// used verbatim. Unset → the platform default (Windows: pwsh → powershell →
     /// cmd; Unix: `$SHELL`). Overridden by the `--shell` flag and, on Windows,
     /// still by `%ATERM_SHELL%` when this is unset. See `windows::shell`.
+    ///
+    /// Shell-integration tier by shell: zsh/bash/fish/pwsh and `"wsl"` (whose
+    /// distro must use bash as its login shell) get the full OSC 7 + OSC 133
+    /// set; `"cmd"` is PARTIAL — prompt marks, jump-to-prompt and cwd tracking
+    /// work, but cmd has no hook for when a command starts or finishes, so its
+    /// blocks carry no command text and no exit code and `wait` never fires;
+    /// `"nu"` gets none. See `aterm_shell_integration::ShellType`.
     pub(crate) shell: Option<String>,
     /// Extra argv passed to the `shell` after argv[0] (config `shell_args`), e.g.
-    /// `["-l", "-i"]` for a login+interactive bash. Ignored when `-e` runs a
+    /// `["-l", "-i"]` for a login+interactive bash — or, for `shell = "wsl"`,
+    /// `wsl.exe`'s own options (`["-d", "Debian"]`). Ignored when `-e` runs a
     /// command. Unset → the bare interactive shell.
     pub(crate) shell_args: Option<Vec<String>>,
     /// Initial window width in columns (default 80, clamped 20..=500).
@@ -743,16 +751,16 @@ pub(crate) struct Config {
     /// env-over-config-over-default order). ABSENT = `1.0` (identity — the
     /// linear-light pipeline needs no correction). Hot-reloadable.
     pub(crate) stem_gamma: Option<f32>,
-    /// Linux glyph grid-fitting mode (W13/R2): `"full"` (the default — the
+    /// Native (Linux/Windows) glyph grid-fitting mode (W13/R2): `"full"` (the
     /// autohinter snaps stems in BOTH axes, the crispest grayscale result,
     /// measured side-by-side against `light`/`native`/`off` in the R2
     /// evidence), `"light"` (vertical-only — the desktop `hintslight` look),
     /// `"native"` (the font's own bytecode when it has one), or `"off"` (no
     /// grid fitting — the raw fontdue raster). The config alias of the
     /// `ATERM_FONT_HINTING` env var, which still takes precedence. ABSENT (or
-    /// an unrecognized spelling) = `"full"`. Inert on macOS (CoreText applies
-    /// its own grid discipline) and Windows. Hot-reloadable (drops the glyph
-    /// atlas).
+    /// an unrecognized spelling) = `"full"`. LIVE on Linux and Windows; inert
+    /// on macOS, where CoreText applies its own grid discipline.
+    /// Hot-reloadable (drops the glyph atlas).
     pub(crate) font_hinting: Option<String>,
     /// Linux subpixel-RGB text (RFC-linux-subpixel-text stage 1): `"off"`
     /// (the DEFAULT — grayscale everywhere, byte-identical to before),
@@ -4133,7 +4141,7 @@ impl Config {
         aterm_render::clamp_stem_gamma(g)
     }
 
-    /// EFFECTIVE Linux grid-fitting mode with the startup precedence every key
+    /// EFFECTIVE native grid-fitting mode with the startup precedence every key
     /// follows: `$ATERM_FONT_HINTING` (the historical env knob, now an alias)
     /// wins over the `font_hinting` config key, which wins over `"full"`. The
     /// renderer's own parser resolves unrecognized spellings to the default, so

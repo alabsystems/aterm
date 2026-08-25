@@ -6398,11 +6398,15 @@ fn handle(
         // the classifier. Read-only and App-level like `rain status` (`@peer tone`
         // reads the peer's front window).
         "tone" => control_media::cmd_tone(proxy, rest),
-        // `trail [<n>]`: the FOCUSED window's last n cursor-trail admission
-        // decisions from the engine's diagnostic ring — armed/confirmed/retired
-        // + reason + generation + origin/target. Read-only and App-level like
-        // `tone` (`@peer trail` reads the peer's focused window); the
-        // one-command face of the ATERM_TRACE_SPAWN confirm-seam sensor.
+        // `trail [status|<n>]`: the FOCUSED window's cursor-trail diagnostics.
+        // The `<n>` form prints the last n admission decisions from the
+        // engine's diagnostic ring — armed/confirmed/retired + reason +
+        // generation + origin/target; `status` prints ONE line of standing
+        // engine state (style, every gate to the glass, cumulative admission
+        // tally, live ribbon). Read-only and App-level like `tone` (`@peer
+        // trail` reads the peer's focused window); the one-command face of the
+        // ATERM_TRACE_SPAWN confirm-seam sensor and of "I don't see the
+        // rainbow cursor trails".
         "trail" => control_media::cmd_trail(proxy, rest),
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
@@ -6451,6 +6455,9 @@ fn handle(
         "lines" => control_query::cmd_lines(term),
         "line" => control_query::cmd_line(term, rest),
         "modes" => control_query::cmd_modes(term),
+        // `custody` -> WHO last took the reading position or the highlight, by name.
+        // Read-side: it reports the engine's own custody record and no screen content.
+        "custody" => control_query::cmd_custody(term),
         "title" => control_query::cmd_title(term),
         "cwd" => control_query::cmd_cwd(term),
         "blocks" => control_selection::cmd_blocks(&host, session, rest),
@@ -6586,6 +6593,7 @@ fn json_unsupported(verb: &str) -> Option<String> {
     matches!(
         verb,
         "modes"
+            | "custody"
             | "selection"
             | "colors"
             | "cell"
@@ -10513,6 +10521,7 @@ mod tests {
                 "cursor",
                 "dims",
                 "modes",
+                "custody",
                 "title",
                 "cwd",
                 "colors",
@@ -10544,9 +10553,11 @@ mod tests {
                 // `tone` OBSERVES the mood classifier; the knob it reports is
                 // rewritten through `settings` (ConfigWrite), never here.
                 "tone",
-                // `trail` OBSERVES the cursor-trail admission diagnosis ring;
-                // it has no write form at all (the ring is engine-written
-                // diagnostic state beside decisions already made).
+                // `trail` OBSERVES the cursor-trail engine — the admission
+                // diagnosis ring and (`trail status`) its standing state. It
+                // has no write form at all (both are engine-written diagnostic
+                // state beside decisions already made; the knobs it reports are
+                // rewritten through `settings`, never here).
                 "trail",
                 "scroll",
                 "select",

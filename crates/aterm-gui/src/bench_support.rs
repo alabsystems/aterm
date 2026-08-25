@@ -465,6 +465,97 @@ impl BenchApp {
         h
     }
 
+
+    /// THE TAB-STRIP FRAME (D-2 SPLICE / DMG-1 reach), modelled at exactly the
+    /// three seams the strip-lane fix touches and in the shipping order —
+    /// `redraw_window`'s resident-scratch reclaim (hoisted ahead of LOCK A), the
+    /// damage-scoped re-extract under LOCK B, and `splice_tab_strip_with` — then
+    /// the same REAL CPU raster through the window's persistent damage cache that
+    /// [`Self::present_frame`] uses.
+    ///
+    /// This is the one workload in this crate's benches that has a tab strip at
+    /// all: every other one runs at `tab_strip_rows == 0`, which the module header
+    /// lists among the honest cuts, and which is exactly why they cannot price
+    /// this change. Both halves of the fix are inside the timed span — the
+    /// extraction arm (`FrameRefill::Scoped` vs `Full`) and the dirty-row diff the
+    /// spliced revision lane feeds (inside `render_input_cached`).
+    ///
+    /// `unsplice: false` is the PRE-FIX reclaim verbatim: salvage the surplus
+    /// TAIL and hand the extractor a scratch that is still `strip` rows too tall
+    /// with its continuity tokens broken, so every frame falls back to the full
+    /// re-extract. The two arms are otherwise byte-identical work in one binary,
+    /// which makes the A/B free of any build or binary difference at all.
+    ///
+    /// Returns whether the extract took the SCOPED arm, so the bench can assert
+    /// REACH on both sides instead of trusting that it did.
+    pub fn strip_present(&mut self, strip: usize, unsplice: bool) -> bool {
+        let term = self
+            .app
+            .pool
+            .get(0)
+            .expect("bench fixture session 0")
+            .term
+            .clone();
+        let (rows, cols) = {
+            let t = term_lock(&term);
+            (usize::from(t.rows()), usize::from(t.cols()))
+        };
+        let scoped = {
+            let ws = self
+                .app
+                .windows
+                .get_mut(&self.wid)
+                .expect("bench fixture window");
+            let unspliced = unsplice
+                && strip > 0
+                && ws
+                    .input_scratch
+                    .undo_host_row_prepend(rows, &mut ws.strip_row_pool, strip);
+            if !unspliced && strip > 0 && ws.input_scratch.cells.len() > rows {
+                let pool = &mut ws.strip_row_pool;
+                for buf in ws.input_scratch.cells.drain(rows..) {
+                    if pool.len() >= strip {
+                        break;
+                    }
+                    pool.push(buf);
+                }
+            }
+            let mut t = term_lock(&term);
+            let refill = t.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
+            matches!(refill, aterm_core::render::FrameRefill::Scoped { .. })
+        };
+        self.app.tab_strip_rows = u16::try_from(strip).unwrap_or(0);
+        self.app.splice_tab_strip_with(self.wid, 1);
+        // Disjoint sub-borrows — the `present_input_scratch` idiom, exactly as
+        // `raster_frame` takes them.
+        let App {
+            backend, windows, ..
+        } = &mut self.app;
+        let ws = windows.get_mut(&self.wid).expect("bench fixture window");
+        let BackendSlot::Ready(Backend::Cpu(renderer)) = backend else {
+            unreachable!("headless_for_test always builds a ready CPU backend");
+        };
+        let view = renderer.render_input_cached(&mut ws.cpu_cache, &ws.input_scratch);
+        std::hint::black_box(view.width());
+        scoped
+    }
+
+    /// The strip workload's UNTIMED arm: one keystroke echo on the bottom row —
+    /// real damage every tick, exactly one damaged row, no wrap or scroll (a wrap
+    /// would advance `base_y` and honestly force the full arm on both sides).
+    pub fn strip_echo(&mut self, tick: &mut u8) {
+        *tick = tick.wrapping_add(1);
+        let bytes: &[u8] = if tick.is_multiple_of(2) { b"\rx" } else { b"\ry" };
+        let term = self
+            .app
+            .pool
+            .get(0)
+            .expect("bench fixture session 0")
+            .term
+            .clone();
+        term_lock(&term).process(bytes);
+    }
+
     /// RE-1's PARITY WITNESS (the damage_differential idiom, in-bench): hash
     /// the per-window damage cache's CURRENT pixels (the frame the model just
     /// presented) against a from-scratch FULL repaint of the SAME scratch

@@ -273,6 +273,78 @@ fn accent_over_its_own_wash(accent: [u8; 3], elevated: [u8; 3]) -> [u8; 3] {
     accent
 }
 
+/// The shared semantic angle of the `danger` family.
+const DANGER_HUE_DEGREES: f32 = 25.0;
+/// The shared semantic angle of the `success` family.
+const SUCCESS_HUE_DEGREES: f32 = 145.0;
+
+/// A status hue as [`roles`] seeds it, BEFORE the ink floor: one shared semantic
+/// angle, at a lightness this chrome side chooses and a chroma the accessibility
+/// preferences choose.
+fn status_seed(dark: bool, high_contrast: bool, hue_degrees: f32) -> [u8; 3] {
+    oklch_to_rgb(Oklch {
+        l: if dark { 0.72 } else { 0.49 },
+        c: if high_contrast { 0.16 } else { 0.14 },
+        h: hue_degrees.to_radians(),
+    })
+}
+
+/// The `success` family as DECORATION rather than as ink — the same seed
+/// [`roles`] conditions into [`NativeRoles::success`], WITHOUT the 4.5:1 floor.
+///
+/// [`NativeRoles::success`] is an INK role: it labels, it rules, it draws marks,
+/// so [`roles`] holds it to 4.5:1 against `surface` and that is right. But
+/// [`ensure_contrast`] reaches a target by moving LIGHTNESS, and against a
+/// MID-TONE surface — the neutral `#8F8F8F`..`#A3A3A3` band a real terminal
+/// theme lands on — 4.5:1 is simply unreachable upward, so the only route left
+/// is down and the role arrives as a NEAR-BLACK green (`#000901` on `#777777`).
+/// Correct for a label. Useless as a tint: a surface washed toward near-black is
+/// not a shade of green, it is a shade of grey, and pouring 14 % of it into the
+/// Settings hero banner turned the banner into a slab DARKER than the cards
+/// standing on it.
+///
+/// So decoration takes the hue and leaves the floor behind. Nothing here paints
+/// text or a UI mark — a caller that wants either must use the role, and hold
+/// its own result to its own surface.
+///
+/// `dark` is the side of the chrome the DECORATION lands on, which is the
+/// caller's own question and not necessarily [`roles`]' answer for the window:
+/// in the mid-tone band one step of the surface ramp can cross the classifier.
+/// Chroma follows the live accessibility preferences, the same ones
+/// [`default_roles`] resolves a palette with.
+pub(crate) fn success_tint(dark: bool) -> [u8; 3] {
+    status_seed(
+        dark,
+        current_preferences().normalized().high_contrast,
+        SUCCESS_HUE_DEGREES,
+    )
+}
+
+/// Hold a surface at or above the OPENNESS of the surface it has to stay above,
+/// moving lightness only — the same hue- and chroma-preserving nudge
+/// [`ensure_contrast`] makes for ink, aimed at a floor that is a LUMINANCE
+/// rather than a ratio.
+///
+/// Contrast against black is `(L + 0.05) / 0.05`, monotone in relative
+/// luminance, so "as open as `floor`" IS a contrast target and the existing
+/// solver reaches it: the dark pole can never satisfy it, so the search returns
+/// the SMALLEST lift that clears the floor, or the colour untouched when it
+/// already does.
+///
+/// This exists because a decorative wash moves lightness whether or not it was
+/// asked to. [`crate::native_ui::rainbow_banner_sky`] pours [`success_tint`]
+/// into the palette's most open neutral, and when that neutral is `elevated` the
+/// base IS the tone the cards standing on the banner are painted in — so the sky
+/// starts with no headroom whatsoever. Any wash toward a tint darker than the
+/// base sinks the banner below its own cards, and even a LIFTING pour can come
+/// back a hair under, because a chromatic mix is not monotone in luminance: near
+/// the crossover the green's low red and blue cost more than its green gains.
+/// The wash is wanted for its HUE; the lightness it happens to spend is not part
+/// of the ask, and this gives it back.
+pub(crate) fn at_least_as_open_as(color: [u8; 3], floor: [u8; 3]) -> [u8; 3] {
+    ensure_contrast(color, [0, 0, 0], contrast_ratio(floor, [0, 0, 0]))
+}
+
 /// Build the native palette.  Neutral roles preserve the theme's perceptual hue;
 /// chromatic roles keep the theme accent hue but cap its chroma for large controls.
 pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeRoles {
@@ -328,27 +400,13 @@ pub(crate) fn roles(theme: Theme, preferences: AppearancePreferences) -> NativeR
 
     // Status hues use a shared semantic angle, while lightness/chroma and final
     // contrast remain conditioned by this theme.  They are not fixed RGB tokens.
-    let status_l = if dark { 0.72 } else { 0.49 };
-    let status_c = if preferences.high_contrast {
-        0.16
-    } else {
-        0.14
-    };
     let danger = ensure_contrast(
-        oklch_to_rgb(Oklch {
-            l: status_l,
-            c: status_c,
-            h: 25.0_f32.to_radians(),
-        }),
+        status_seed(dark, preferences.high_contrast, DANGER_HUE_DEGREES),
         surface,
         4.5,
     );
     let success = ensure_contrast(
-        oklch_to_rgb(Oklch {
-            l: status_l,
-            c: status_c,
-            h: 145.0_f32.to_radians(),
-        }),
+        status_seed(dark, preferences.high_contrast, SUCCESS_HUE_DEGREES),
         surface,
         4.5,
     );

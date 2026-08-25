@@ -395,6 +395,31 @@ pub(crate) fn cmd_dims(
 /// and `perf_reduced` + `shed_transitions` (the load-shed latch; engaged during light
 /// typing, or flapping at idle, are both wrong).
 ///
+/// THE TAIL, ON THE SUMMARY LINE. `last_` is a momentary reading and `max_` is
+/// an unbounded worst case; neither brackets a distribution. During the 2026-08
+/// spin `last_input_present_ms=8.1` read healthy while the live p99 was 335 ms.
+/// So the summary now also carries `n_input` + `input_p50/p95/p99_ms` and
+/// `n_present` + `present_p50/p95/p99_ms` — the same histograms `percentiles`
+/// publishes, so a healthy median cannot mask a sick tail from a reader who
+/// asked only one question.
+///
+/// PRESENT-LATENCY HONESTY. `present_*` describes aterm ONLY while the window is
+/// actually presenting, so an output→present sample taken while the window was
+/// occluded/parked, or while a `video` capture was pacing presents, is booked to
+/// a separate ledger: `present_tainted` / `last_/max_present_tainted_ms`, with
+/// its own `present_tainted_p50/p95/p99_ms` under `percentiles`. `capture_episodes`
+/// counts recordings opened in this window and `capture_active` is the live
+/// gauge — any non-zero `capture_episodes` means a capture-based instrument ran
+/// inside your measurement window. Nothing is discarded: `n_present +
+/// n_present_tainted` still accounts for every content present.
+///
+/// SCHEDULER ATTRIBUTION. `past_deadline_arms` is the global spin witness;
+/// `deadline_arms_by_owner=<owner>:<arms>/<past>,...` (a JSON object in the
+/// structured twin) names WHICH producer armed them. `deadline_owner` alone is a
+/// last-writer snapshot and cannot do that — it reported the 2026-08 spin as
+/// `title_summary` when the producer was the session-status observer, now its
+/// own `session_status` owner.
+///
 /// STARTUP: `first_present_ms` keeps the compatibility-stable GUI
 /// `main_entry` → startup-metrics publication point inside the first
 /// successful-present finalizer. That point follows a successful submit and
@@ -416,8 +441,8 @@ pub(crate) fn cmd_dims(
 /// input→application-present-return, output→application-present-return,
 /// frame-render, key→write, and pre-present compose histograms
 /// as `n_*` + p50/p95/p99 ms fields, conservative by construction (bucket upper
-/// edge). Same funnel and honesty bounds as the scalars; zeroed by `metrics
-/// reset` like the maxima.
+/// edge), plus the occluded/parked/capture twin `present_tainted_*`. Same funnel
+/// and honesty bounds as the scalars; zeroed by `metrics reset` like the maxima.
 pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     let wants_json = rest
@@ -454,6 +479,12 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         // trails the window edge for exactly this long, and a width drag keeps it
         // deliberately long (the throttle bounding scrollback rewrap).
         let reflow = crate::metrics::resize_reflow_distribution();
+        // The occluded/parked/capture twin of `present`. It is published rather
+        // than dropped so an occluded or RECORDED run stays observable — and so
+        // `n_present + n_present_tainted` still accounts for every content
+        // present, which is what makes the split auditable instead of a silent
+        // filter. See `metrics::tainted_present_distribution`.
+        let tainted = crate::metrics::tainted_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return format!(
             "OK n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
@@ -464,7 +495,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              pre_present_p95_ms={:.2} pre_present_p99_ms={:.2} \
              n_acquire={} acquire_p50_ms={:.2} acquire_p95_ms={:.2} acquire_p99_ms={:.2} \
              n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
-             n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2}\n",
+             n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
+             n_present_tainted={} present_tainted_p50_ms={:.2} \
+             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -497,16 +530,36 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(reflow, 0.50),
             p(reflow, 0.95),
             p(reflow, 0.99),
+            tainted.count(),
+            p(tainted, 0.50),
+            p(tainted, 0.95),
+            p(tainted, 0.99),
+            // ECHO ROUND TRIP (audit item 5): the one slice on this line that is
+            // NOT aterm's own cost — bytes out to the PTY, first bytes back from
+            // the child. Formatted by `echo_rtt` itself so its percentiles can
+            // never be published apart from the counters that qualify them.
+            crate::echo_rtt::percentile_fields_text(),
         );
     }
     if rest.trim() == "reset" {
         crate::metrics::reset();
+        crate::echo_rtt::reset();
     }
     let (rows, cols) = try_metrics_dims(term).map_or_else(
         || ("busy".to_string(), "busy".to_string()),
         |(rows, cols)| (rows.to_string(), cols.to_string()),
     );
     let m = crate::metrics::snapshot();
+    // TAIL SURFACING (audit item 10). The summary used to publish only `last_`
+    // and `max_`, and during the 2026-08 spin `last_input_present_ms=8.1` read
+    // perfectly healthy while the live p99 was 335 ms — a momentary reading and
+    // an unbounded worst case cannot bracket a distribution between them. The
+    // p95/p99 the `percentiles` verb already computed now ride the SUMMARY, so
+    // a healthy median can never again mask a sick tail from a reader who did
+    // not think to ask a second question.
+    let (h_input, h_present, _) = crate::metrics::distributions();
+    let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    let arms = crate::metrics::deadline_arm_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     format!(
         "OK backend={backend} rows={rows} cols={cols} frames={} \
@@ -514,6 +567,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          last_frame_render_ms={:.2} max_frame_render_ms={:.2} \
          slow_frames={} slow_threshold_ms={:.1} \
          last_input_present_ms={:.2} max_input_present_ms={:.2} \
+         n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
+         n_present={} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} \
          last_key_write_ms={:.2} max_key_write_ms={:.2} \
          last_resize_present_ms={:.2} max_resize_present_ms={:.2} \
          last_resize_reflow_ms={:.2} max_resize_reflow_ms={:.2} \
@@ -525,9 +580,12 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          pre_present_attempts={} last_pre_present_ms={:.2} pre_present_total_ms={:.2} \
          max_pre_present_ms={:.2} \
          present_drops={} last_present_drop_reason={} last_present_drop_parked={} \
+         present_tainted={} last_present_tainted_ms={:.2} max_present_tainted_ms={:.2} \
+         capture_episodes={} capture_active={} \
          event_wakes={} timer_wakes={} wait_cancelled_wakes={} poll_wakes={} \
          wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
+         deadline_arms_by_owner={} \
          stale_arm_heals={} \
          max_frame_gap_ms={:.2} \
          rust_main_to_first_present_ms={:.2} \
@@ -571,6 +629,14 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(crate::metrics::SLOW_FRAME_THRESHOLD_NS),
         ms(m.last_input_present_ns),
         ms(m.max_input_present_ns),
+        h_input.count(),
+        pct(h_input, 0.50),
+        pct(h_input, 0.95),
+        pct(h_input, 0.99),
+        h_present.count(),
+        pct(h_present, 0.50),
+        pct(h_present, 0.95),
+        pct(h_present, 0.99),
         ms(m.last_key_write_ns),
         ms(m.max_key_write_ns),
         ms(m.last_resize_present_ns),
@@ -599,6 +665,11 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         u8::from(m.last_present_drop_parked),
+        m.tainted_present_samples,
+        ms(m.last_tainted_present_latency_ns),
+        ms(m.max_tainted_present_latency_ns),
+        m.capture_episodes,
+        u8::from(m.capture_active),
         m.event_wakes,
         m.timer_wakes,
         m.wait_cancelled_wakes,
@@ -610,6 +681,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.deadline_in_ns),
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
+        deadline_arm_pairs(&arms),
         m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
@@ -670,6 +742,41 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     )
 }
 
+/// Render the per-owner deadline arm ledger as `owner:arms/past` pairs,
+/// comma-joined — the same ONE self-labelling field discipline as
+/// [`cell_pipeline_pairs`], for the same reason: a reader never has to know an
+/// order, and a new `DeadlineOwner` cannot silently shift someone else's column.
+///
+/// WHY IT EXISTS (audit item 6). `past_deadline_arms` is a single global number
+/// and `deadline_owner` is a last-writer snapshot, so the two together cannot
+/// name a spin's producer — during the 2026-08 200 kHz spin they read
+/// "31,913 past arms, owner=title_summary" while the producer was the
+/// session-status observer folded under that label. This field names it.
+/// Non-zero owners only, so a healthy instance prints two or three pairs and a
+/// sick one puts its culprit in plain sight.
+fn deadline_arm_pairs(arms: &[crate::metrics::OwnerArms]) -> String {
+    if arms.is_empty() {
+        // Never emit a bare `key=` — every field in this line carries a token,
+        // so a whitespace-splitting reader always gets a value to parse.
+        return "none".to_string();
+    }
+    arms.iter()
+        .map(|a| format!("{}:{}/{}", a.owner, a.arms, a.past_arms))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same ledger as a JSON object, so the structured twin stays parseable
+/// without splitting a string.
+fn deadline_arm_object(arms: &[crate::metrics::OwnerArms]) -> String {
+    let body = arms
+        .iter()
+        .map(|a| format!("\"{}\":{{\"arms\":{},\"past\":{}}}", a.owner, a.arms, a.past_arms))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
 /// Render the per-cell-pipeline split as `name:ms` pairs, comma-joined.
 ///
 /// ONE self-labelling wire field rather than twelve positional ones: a reader
@@ -710,6 +817,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         // Both forms now carry the same set.
         let acquire = crate::metrics::acquire_wait_distribution();
         let resize = crate::metrics::resize_present_distribution();
+        let tainted = crate::metrics::tainted_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return json_ok(&format!(
             "{{\"n_input\":{},\"input_p50_ms\":{:.2},\"input_p95_ms\":{:.2},\
@@ -723,7 +831,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"acquire_p50_ms\":{:.2},\"acquire_p95_ms\":{:.2},\
              \"acquire_p99_ms\":{:.2},\"n_resize\":{},\
              \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
-             \"resize_p99_ms\":{:.2}}}",
+             \"resize_p99_ms\":{:.2},\"n_present_tainted\":{},\
+             \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
+             \"present_tainted_p99_ms\":{:.2}{}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
@@ -752,23 +862,38 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(resize, 0.50),
             p(resize, 0.95),
             p(resize, 0.99),
+            tainted.count(),
+            p(tainted, 0.50),
+            p(tainted, 0.95),
+            p(tainted, 0.99),
+            // Field-for-field twin of the text form's echo fragment.
+            crate::echo_rtt::percentile_fields_json(),
         ));
     }
     if command.trim() == "reset" {
         crate::metrics::reset();
+        crate::echo_rtt::reset();
     }
     let (rows, cols) = try_metrics_dims(term).map_or_else(
         || ("null".to_string(), "null".to_string()),
         |(rows, cols)| (rows.to_string(), cols.to_string()),
     );
     let m = crate::metrics::snapshot();
+    // Same tail surfacing and same honesty split as the text form: the two
+    // stay field-for-field twins so automation never has to scrape the line.
+    let (h_input, h_present, _) = crate::metrics::distributions();
+    let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    let arms = crate::metrics::deadline_arm_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     json_ok(&format!(
         "{{\"backend\":\"{backend}\",\"rows\":{rows},\"cols\":{cols},\
          \"frames\":{},\"last_present_latency_ms\":{:.2},\"max_present_latency_ms\":{:.2},\
          \"last_frame_render_ms\":{:.2},\"max_frame_render_ms\":{:.2},\"slow_frames\":{},\
          \"slow_threshold_ms\":{:.1},\"last_input_present_ms\":{:.2},\
-         \"max_input_present_ms\":{:.2},\"last_key_write_ms\":{:.2},\
+         \"max_input_present_ms\":{:.2},\"n_input\":{},\"input_p50_ms\":{:.2},\
+         \"input_p95_ms\":{:.2},\"input_p99_ms\":{:.2},\"n_present\":{},\
+         \"present_p50_ms\":{:.2},\"present_p95_ms\":{:.2},\"present_p99_ms\":{:.2},\
+         \"last_key_write_ms\":{:.2},\
          \"max_key_write_ms\":{:.2},\"last_resize_present_ms\":{:.2},\
          \"max_resize_present_ms\":{:.2},\"last_resize_reflow_ms\":{:.2},\
          \"max_resize_reflow_ms\":{:.2},\"sync_armed\":{},\"sync_rel_end\":{},\
@@ -780,10 +905,14 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"last_pre_present_ms\":{:.2},\"pre_present_total_ms\":{:.2},\
          \"max_pre_present_ms\":{:.2},\"present_drops\":{},\
          \"last_present_drop_reason\":\"{}\",\"last_present_drop_parked\":{},\
+         \"present_tainted\":{},\"last_present_tainted_ms\":{:.2},\
+         \"max_present_tainted_ms\":{:.2},\"capture_episodes\":{},\
+         \"capture_active\":{},\
          \"event_wakes\":{},\"timer_wakes\":{},\"wait_cancelled_wakes\":{},\
          \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
-         \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\"stale_arm_heals\":{},\
+         \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\
+         \"deadline_arms_by_owner\":{},\"stale_arm_heals\":{},\
          \"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
          \"rust_main_to_first_visible_ms\":{:.2},\
@@ -826,6 +955,14 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(crate::metrics::SLOW_FRAME_THRESHOLD_NS),
         ms(m.last_input_present_ns),
         ms(m.max_input_present_ns),
+        h_input.count(),
+        pct(h_input, 0.50),
+        pct(h_input, 0.95),
+        pct(h_input, 0.99),
+        h_present.count(),
+        pct(h_present, 0.50),
+        pct(h_present, 0.95),
+        pct(h_present, 0.99),
         ms(m.last_key_write_ns),
         ms(m.max_key_write_ns),
         ms(m.last_resize_present_ns),
@@ -854,6 +991,11 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.present_drops,
         m.last_present_drop_reason.as_str(),
         m.last_present_drop_parked,
+        m.tainted_present_samples,
+        ms(m.last_tainted_present_latency_ns),
+        ms(m.max_tainted_present_latency_ns),
+        m.capture_episodes,
+        m.capture_active,
         m.event_wakes,
         m.timer_wakes,
         m.wait_cancelled_wakes,
@@ -865,6 +1007,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.deadline_in_ns),
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
+        deadline_arm_object(&arms),
         m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
@@ -2017,6 +2160,92 @@ fn store_search_snapshot(snapshot: SearchSnapshot) {
     cache.push_back(snapshot);
 }
 
+/// `custody` -> ONE status line answering "why did my selection disappear?".
+///
+/// `OK last=<transition|none> event=<0-7|-> changed=<transition|none>
+/// took_selection=<transition|none> offset=<n>
+/// owner=<user|tail> selection=<yes|no> max_offset=<n>`.
+///
+/// The verb exists because offset and selection are observable after the fact and the
+/// DECISION that moved them is not. Ten different events can take the reading position
+/// or the highlight — typing, an auto-repeat tick, a bare modifier, a key release, a
+/// wheel notch, a drag, a deselecting click, output re-pinning, output replacing the
+/// selected rows, and an ED 3 / RIS that destroys the coordinate space — and several of
+/// them leave IDENTICAL state behind, so no amount of reading `selection` and `scroll`
+/// can tell them apart. `last` is the engine's own record of which one it was, written
+/// by the site that made the decision.
+///
+/// `changed` is the last transition that actually TOOK something — the offset moved,
+/// or a live highlight died. It is a separate slot because `last` alone cannot answer
+/// the question the verb exists for: the record's most frequent writer is
+/// `OutputAtLive`, an identity transition that every shell prompt, every `cat` and
+/// every `tail -f` line writes, so a human typing `custody` a second after their
+/// selection vanished reads back the last line of shell output. Press Enter and the
+/// shell's newline overwrites `last=TypingPress` before the user can finish the word.
+/// `changed` survives that, and the two together show both the raw sequence and the
+/// event being asked about. When the two agree the last event is also the last one
+/// that took anything.
+///
+/// `event` is the same fact as the `PressCustody` model's `last_event` tag, so a
+/// driving client can compare a live terminal against the spec's own vocabulary:
+/// 0 a user gesture, 1 typing, 2 an auto-repeat tick, 3 a bare modifier, 4 a release,
+/// 5 output that missed the selected rows, 6 output that REPLACED them, 7 output that
+/// invalidated the coordinate space. It reads `-` for
+/// `OutputTookTheSelectionUnattributed`, which is a real answer with NO model action:
+/// output took the highlight for one of the five reasons `post_process` cannot
+/// attribute to a damage band, so the model has no name for it and the tag space has
+/// no room for it. That is still strictly better than the `last=none` this case used
+/// to print, which was indistinguishable from a terminal that had never done
+/// anything — and it rules out the keyboard, which is what the user wanted to know.
+///
+/// `owner` is DERIVED from the offset (`TailOwnerAtBottom`: an offset above the tail
+/// means the user owns the viewport), never carried separately — the same derivation
+/// the Tier-1 conformance uses, for the same reason: a self-reported ownership flag
+/// would agree with itself no matter what the viewport did.
+///
+/// Read-only; it reports no screen content, so it says nothing about what was typed
+/// or what was selected — only what class of event last moved custody.
+pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
+    let t = term_lock(term);
+    let offset = t.grid().display_offset();
+    let (last, event) = t.last_custody_transition().map_or_else(
+        || ("none".to_string(), "-".to_string()),
+        |c| {
+            let tag = c.last_event();
+            // A negative tag is deliberately outside the model's `0..=7` space — see
+            // `CustodyTransition::OutputTookTheSelectionUnattributed`.
+            let event = if tag < 0 {
+                "-".to_string()
+            } else {
+                tag.to_string()
+            };
+            (c.action().to_string(), event)
+        },
+    );
+    let changed = t
+        .last_custody_change()
+        .map_or_else(|| "none".to_string(), |c| c.action().to_string());
+    // The field the verb is actually FOR. `changed` means "the last thing that moved
+    // custody", so a deliberate deselect overwrites it — and then "why did my
+    // highlight vanish?" answers "you cleared it", which is true of the click and
+    // useless about the loss. `took_selection` survives later activity so the
+    // explanation is still there when someone gets round to asking.
+    let took = t
+        .last_selection_taker()
+        .map_or_else(|| "none".to_string(), |c| c.action().to_string());
+    format!(
+        "OK last={last} event={event} changed={changed} took_selection={took} \
+         offset={offset} owner={} selection={} max_offset={}\n",
+        if offset > 0 { "user" } else { "tail" },
+        if t.text_selection().has_selection() {
+            "yes"
+        } else {
+            "no"
+        },
+        t.grid().scrollback_lines(),
+    )
+}
+
 /// `modes` -> `OK\n` then one `key=value` line per introspected mode:
 /// `alt_screen`, `cursor_visible`, `app_cursor_keys` (DECCKM),
 /// `app_keypad` (DECPAM), `bracketed_paste` (2004), `mouse_mode`
@@ -2757,6 +2986,11 @@ fn _styled_frame_covers_every_render_input_field(ri: &aterm_core::render::Render
         // different every time the revision advanced.
         row_rev: _,
         row_rev_lane: _,
+        // D-2 SPLICE bookkeeping: how many host chrome rows are prepended and
+        // the provenance token that says the prepend is all that happened.
+        // Host composition state, not the terminal model a wire frame reports.
+        row_shift: _,
+        shifted_fill_seq: _,
     } = ri;
 }
 
@@ -2880,10 +3114,211 @@ mod tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        cmd_cell, cmd_search, gather_styled_frame, serialize_dims, serialize_dims_json,
-        styled_frame_payload,
+        cmd_cell, cmd_custody, cmd_search, gather_styled_frame, serialize_dims,
+        serialize_dims_json, styled_frame_payload,
     };
     use crate::term_lock;
+
+    /// The `custody` verb's whole reason to exist: it separates events that leave
+    /// IDENTICAL state behind.
+    ///
+    /// A bare modifier, an auto-repeat tick and a key release each change nothing at
+    /// all, so `scroll` and `selection` report the same three numbers after every one
+    /// of them. Only the engine's own record can say which one just happened, and
+    /// "which one just happened" is exactly what a user asking "why did my selection
+    /// disappear?" needs. If this ever collapses to one answer the verb is a
+    /// decoration.
+    #[test]
+    fn custody_names_the_three_events_that_change_nothing() {
+        use crate::app_input::{PressKind, apply_press_custody};
+
+        let mut t = Terminal::new(6, 20);
+        for i in 0..10 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        t.scroll_display(1);
+        {
+            let sel = t.text_selection_mut();
+            sel.start_selection(
+                0,
+                0,
+                aterm_core::selection::SelectionSide::Left,
+                aterm_core::selection::SelectionType::Simple,
+            );
+            sel.update_selection(1, 5, aterm_core::selection::SelectionSide::Right);
+            sel.complete_selection();
+        }
+        let term = Arc::new(Mutex::new(t));
+
+        let mut seen = Vec::new();
+        for kind in [PressKind::Inert, PressKind::Repeat, PressKind::Release] {
+            apply_press_custody(&mut term_lock(&term), kind);
+            seen.push(cmd_custody(&term));
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "OK last=InertPress event=3 changed=UserScroll took_selection=none offset=1 owner=user \
+                 selection=yes max_offset=5\n"
+                    .to_string(),
+                "OK last=RepeatPress event=2 changed=UserScroll took_selection=none offset=1 owner=user \
+                 selection=yes max_offset=5\n"
+                    .to_string(),
+                "OK last=ReleaseEvent event=4 changed=UserScroll took_selection=none offset=1 owner=user \
+                 selection=yes max_offset=5\n"
+                    .to_string(),
+            ],
+            "three events that moved NOTHING must still be told apart by name — and \
+             none of them may claim to have CHANGED anything: the scroll that really \
+             took the viewport is still the answer to `changed`"
+        );
+
+        // …and the one press that really does take custody says so, with the state it
+        // left behind changing in the same line.
+        apply_press_custody(&mut term_lock(&term), PressKind::Typing);
+        assert_eq!(
+            cmd_custody(&term),
+            "OK last=TypingPress event=1 changed=TypingPress took_selection=TypingPress offset=0 owner=tail \
+             selection=no max_offset=5\n",
+            "typing is the one handover, and the verb shows both the name and the effect"
+        );
+
+        // THE SHELL'S NEXT PROMPT MUST NOT ERASE THE ANSWER. This is the batch that
+        // follows every Enter, and it is the record's most frequent writer by orders
+        // of magnitude. `last` moves to it, truthfully; `changed` does not, because
+        // an `OutputAtLive` at offset 0 with nothing selected took NOTHING — and the
+        // user asking "what took my selection" is asking one second later, not inside
+        // the same step a harness reads back in.
+        term_lock(&term).process(b"$ \r\n");
+        assert_eq!(
+            cmd_custody(&term),
+            "OK last=OutputAtLive event=5 changed=TypingPress took_selection=TypingPress offset=0 owner=tail \
+             selection=no max_offset=6\n",
+            "ordinary output is the last EVENT but must not become the last CHANGE"
+        );
+
+        // Output records too, so "my selection vanished and I never touched the
+        // keyboard" has an answer as well. This ED 3 lands on a live, unselected
+        // prompt, so it names itself in `last` and — correctly — takes nothing.
+        term_lock(&term).process(b"\x1b[3J");
+        assert_eq!(
+            cmd_custody(&term),
+            "OK last=OutputInvalidatesTheCoordinateSpace event=7 changed=TypingPress \
+             took_selection=OutputInvalidatesTheCoordinateSpace \
+             offset=0 owner=tail selection=no max_offset=0\n",
+            "ED 3 destroyed the coordinate space; the verb names that, not a press"
+        );
+    }
+
+    /// FINDING 9's arm: output destroys a highlight for a reason that is NOT damage
+    /// overlap — here a whole-interval eviction at the history floor.
+    ///
+    /// This is the flagship complaint, the one a user is most likely to be typing
+    /// `custody` about, and the record used to answer it by setting itself to `None`:
+    /// `last=none`, indistinguishable from a terminal that has never done anything,
+    /// with whatever true record was standing destroyed on the way out. It must name
+    /// itself instead — with a tag OUTSIDE the model's `0..=7` space, because the
+    /// model genuinely has no action for this shape and a false model action would be
+    /// worse than no answer.
+    /// The explanation of an INVOLUNTARY loss must survive whatever the user does
+    /// next — because "why did my highlight vanish?" is asked after the vanishing,
+    /// and by then the user has usually clicked something.
+    ///
+    /// `changed=` cannot answer it. That latch means "the last thing that moved
+    /// custody", and a deliberate deselect really does move custody, so one ordinary
+    /// left-click overwrites the answer with `UserClear` — true of the click, useless
+    /// about the loss, and the evidence is gone. `took_selection=` is latched only by
+    /// the transitions that take a highlight the user did NOT release, so it keeps
+    /// pointing at the culprit.
+    #[test]
+    fn a_later_click_does_not_erase_why_the_selection_actually_died() {
+        let mut t = Terminal::new(4, 20);
+        for i in 0..8 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        {
+            let sel = t.text_selection_mut();
+            sel.start_selection(
+                1,
+                0,
+                aterm_core::selection::SelectionSide::Left,
+                aterm_core::selection::SelectionType::Simple,
+            );
+            sel.update_selection(1, 4, aterm_core::selection::SelectionSide::Right);
+            sel.complete_selection();
+        }
+        let term = Arc::new(Mutex::new(t));
+
+        // Output replaces the selected row: an involuntary loss with a real culprit.
+        term_lock(&term).process(b"\x1b[2;1H\x1b[Kreplaced");
+        assert!(
+            !term_lock(&term).text_selection().has_selection(),
+            "precondition: the output really did take the highlight"
+        );
+        let before = cmd_custody(&term);
+        assert!(
+            before.contains("took_selection=OutputDamagesTheSelectedRows"),
+            "the culprit is named while it is fresh: {before}"
+        );
+
+        // …now the user clicks somewhere, which is a deliberate deselect.
+        crate::app_mouse::note_selection_custody(&mut term_lock(&term), false);
+
+        let after = cmd_custody(&term);
+        assert!(
+            after.contains("changed=UserClear"),
+            "the click IS the last thing that moved custody, and `changed` says so: {after}"
+        );
+        assert!(
+            after.contains("took_selection=OutputDamagesTheSelectedRows"),
+            "…but the explanation of the involuntary loss must SURVIVE it: {after}"
+        );
+    }
+
+    #[test]
+    fn custody_names_output_that_took_the_selection_with_no_action_to_blame() {
+        let mut t = Terminal::new(4, 20);
+        t.set_scrollback_line_limit(Some(2));
+        for i in 0..8 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.grid().scrollback_lines(), 2, "a two-line history floor");
+        {
+            let sel = t.text_selection_mut();
+            sel.start_selection(
+                -2,
+                0,
+                aterm_core::selection::SelectionSide::Left,
+                aterm_core::selection::SelectionType::Simple,
+            );
+            sel.update_selection(-2, 5, aterm_core::selection::SelectionSide::Right);
+            sel.complete_selection();
+            assert!(sel.has_selection(), "the oldest retained row is selected");
+        }
+        let term = Arc::new(Mutex::new(t));
+        // A true prior record, so the erasure this test is about would be visible.
+        crate::app_input::apply_press_custody(
+            &mut term_lock(&term),
+            crate::app_input::PressKind::Inert,
+        );
+
+        // Three more lines: the selected row falls off the floor. Nothing REPLACED
+        // it — it was evicted — so no damage band names it.
+        term_lock(&term).process(b"a\r\nb\r\nc\r\n");
+        assert!(
+            !term_lock(&term).text_selection().has_selection(),
+            "the eviction really did take the highlight"
+        );
+        assert_eq!(
+            cmd_custody(&term),
+            "OK last=OutputTookTheSelectionUnattributed event=- \
+             changed=OutputTookTheSelectionUnattributed \
+             took_selection=OutputTookTheSelectionUnattributed offset=0 owner=tail \
+             selection=no max_offset=2\n",
+            "output took it for a reason the model cannot name — which is a real \
+             answer that rules out the keyboard, and `last=none` was not"
+        );
+    }
 
     #[test]
     fn dims_serializers_expose_explicit_bottom_padding() {
@@ -3422,6 +3857,22 @@ mod tests {
             "wake_owner=",
             "deadline_owner=",
             "past_deadline_arms=",
+            // ITEM 6: the per-owner ledger that names a spin's producer.
+            "deadline_arms_by_owner=",
+            // ITEM 10 tail surfacing: a healthy median must never again be the
+            // only thing the summary shows.
+            "n_input=",
+            "input_p50_ms=",
+            "input_p95_ms=",
+            "input_p99_ms=",
+            "n_present=",
+            "present_p95_ms=",
+            "present_p99_ms=",
+            // ITEM 10 honesty split: the diverted samples stay VISIBLE.
+            "present_tainted=",
+            "max_present_tainted_ms=",
+            "capture_episodes=",
+            "capture_active=",
             "stale_arm_heals=",
             "rust_main_to_first_present_ms=",
             "startup_phase_schema=",
@@ -3496,6 +3947,19 @@ mod tests {
             "deadline_in_ms",
             "deadline_late_ms",
             "past_deadline_arms",
+            "deadline_arms_by_owner",
+            "n_input",
+            "input_p50_ms",
+            "input_p95_ms",
+            "input_p99_ms",
+            "n_present",
+            "present_p95_ms",
+            "present_p99_ms",
+            "present_tainted",
+            "last_present_tainted_ms",
+            "max_present_tainted_ms",
+            "capture_episodes",
+            "capture_active",
             "stale_arm_heals",
             "rust_main_to_first_present_ms",
             "startup_phase_schema",
@@ -3564,6 +4028,27 @@ mod tests {
             "acquire_p99_ms",
             "n_resize",
             "resize_p99_ms",
+            // ECHO ROUND TRIP (audit item 5): the only slice on this line that
+            // measures the CHILD rather than aterm. Its counters are asserted
+            // alongside its percentiles because a percentile published without
+            // its sample/expiry ledger cannot be read honestly.
+            "n_echo",
+            "echo_p50_ms",
+            "echo_p95_ms",
+            "echo_p99_ms",
+            "echo_total",
+            "echo_arms",
+            "echo_coalesced",
+            "echo_expired",
+            "echo_dropped_locked",
+            // ITEM 10 honesty split. The tainted twin is published BESIDE the
+            // clean distribution, never instead of it: `n_present +
+            // n_present_tainted` still accounts for every content present, so
+            // the exclusion is auditable rather than a silent filter.
+            "n_present_tainted",
+            "present_tainted_p50_ms",
+            "present_tainted_p95_ms",
+            "present_tainted_p99_ms",
         ] {
             assert!(
                 pct_value.get(key).is_some(),
@@ -3579,12 +4064,60 @@ mod tests {
             "n_acquire=",
             "n_resize=",
             "resize_p99_ms=",
+            "n_echo=",
+            "echo_p50_ms=",
+            "echo_p99_ms=",
+            "echo_expired=",
+            "echo_coalesced=",
+            "n_present_tainted=",
+            "present_tainted_p95_ms=",
+            "present_tainted_p99_ms=",
         ] {
             assert!(
                 text_pct.contains(field),
                 "text percentiles omitted `{field}`: {text_pct}"
             );
         }
+    }
+
+    /// ITEM 6 wire shape. The per-owner ledger is a self-labelling field in
+    /// both forms — an OBJECT in JSON, `owner:arms/past` pairs in text — so a
+    /// reader never depends on position and a newly appended `DeadlineOwner`
+    /// cannot shift someone else's column. `deadline_arms_by_owner` is spelled
+    /// out in full precisely so a naive `grep deadline_arms=` still finds only
+    /// the global `past_deadline_arms`.
+    #[test]
+    fn the_per_owner_arm_ledger_is_self_labelling_in_both_forms() {
+        let reply = super::cmd_metrics_json(None, "");
+        let body = reply.strip_prefix("OK 1\n").expect("status frame").trim_end();
+        let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
+        let arms = value
+            .get("deadline_arms_by_owner")
+            .expect("the per-owner ledger is published");
+        assert!(
+            arms.is_object(),
+            "the ledger must be a keyed object, not a scraped string: {arms}"
+        );
+        for (owner, entry) in arms.as_object().expect("object") {
+            assert!(!owner.is_empty(), "every entry is named");
+            assert!(
+                entry.get("arms").and_then(serde_json::Value::as_u64).is_some(),
+                "{owner} publishes its arm count"
+            );
+            assert!(
+                entry.get("past").and_then(serde_json::Value::as_u64).is_some(),
+                "{owner} publishes its PAST arm count — the spin signature"
+            );
+        }
+
+        // The text twin never emits a bare `key=`: a whitespace-splitting
+        // reader (the spin probe is a shell one-liner) always gets a token.
+        let text = super::cmd_metrics(None, "");
+        let field = text
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("deadline_arms_by_owner="))
+            .expect("the text form publishes the ledger");
+        assert!(!field.is_empty(), "empty ledgers render as `none`, not `\"\"`");
     }
 
     #[test]

@@ -86,12 +86,22 @@ fn host_preedit(input: &mut RenderInput) {
 }
 
 /// The TAB-STRIP SPLICE shape: shift every per-row channel down by one and
-/// prepend a host-painted row. Row identity moves, so the lane must be disowned
-/// — which is exactly what `aterm_gui::app_render::prepend_strip_rows` does.
+/// prepend a host-painted row, exactly as
+/// `aterm_gui::app_render::prepend_strip_rows` does — including the D-2 SPLICE
+/// bookkeeping, which is the part that makes this a shift rather than a
+/// disowning. `note_host_row_prepend` gives the chrome row the `0`/UNKNOWN
+/// sentinel and moves every engine stamp to its new index, so the frame after a
+/// strip appears is judged on stamps that still describe their own rows.
+///
+/// The FULL strip lifecycle (a persistent strip across frames, a strip whose row
+/// COUNT changes, the un-splice that hands the scratch back to the engine) is
+/// oracled against the real splice in `aterm_gui::app_render::strip_lane_oracle`,
+/// which is where that code lives; this step exists so THIS corpus keeps meeting
+/// a spliced frame from every prior state it can reach.
 fn host_strip_splice(input: &mut RenderInput) {
     let blank = input.cells.first().and_then(|r| r.first()).copied();
     let Some(blank) = blank else { return };
-    input.invalidate_row_revisions();
+    let blessed = input.host_prepend_blessing();
     input.cells.insert(0, vec![blank; input.cols]);
     input.clusters.insert(0, Vec::new());
     input.combining.insert(0, Vec::new());
@@ -103,6 +113,7 @@ fn host_strip_splice(input: &mut RenderInput) {
     input.default_bg_spans.insert(0, Vec::new());
     input.rows += 1;
     input.snapshot_seq = input.snapshot_seq.wrapping_add(1);
+    input.note_host_row_prepend(1, blessed);
 }
 
 fn corpus() -> Vec<Step> {

@@ -2969,12 +2969,6 @@ fn paint_landing_glints(prims: &mut Vec<DrawPrim>, phase: u32, w: f32, h: f32, c
     }
 }
 
-/// The §L.5 composition as a NATIVE Settings hero banner: the mint world in a
-/// bounded card — a pastel rainbow arch cresting through a small constellation
-/// of star glints. Deliberately STATIC: the native scheduler keeps idle routes
-/// at 0% and this banner never asks for a frame. Painted through the audited
-/// custom-node lowering (`native_ui::RAINBOW_BANNER_AUDIT`); everything clips
-/// to `rect`.
 /// The Settings surface's aurora: the wallpaper treatment, procedurally — a
 /// dim DIAGONAL spectrum wash over the whole canvas, exactly the hue ramp the
 /// user's rainbow terminal wears (`hue ∝ x + y`). Painted as a coarse tile
@@ -3019,14 +3013,49 @@ pub(crate) fn paint_settings_aurora(
     }
 }
 
-pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w: f32, h: f32) {
+/// The §L.5 composition as a NATIVE Settings hero banner: a pastel rainbow arch
+/// cresting through a small constellation of star glints. Deliberately STATIC:
+/// the native scheduler keeps idle routes at 0% and this banner never asks for a
+/// frame. Painted through the audited custom-node lowering
+/// (`native_ui::RAINBOW_BANNER_AUDIT`); everything clips to `rect`.
+///
+/// `sky` and `rim` arrive RESOLVED from the caller's role palette, exactly as
+/// [`paint_settings_aurora`] takes `surface` — this banner is a Settings CARD,
+/// and a card that does not follow the resolved chrome palette is a hole in the
+/// page. It used to fill with the landing page's authored `#EDF6EC` mint and a
+/// `#C9DDC8` hairline, byte-identical in all four appearance states, which put a
+/// near-white slab in the middle of the forced-DARK Settings page (the 2026-08
+/// cold visual audit's headline defect, and the last place config `window_theme`
+/// was still a no-op).
+///
+/// The ARCH and the GLINTS keep their authored spectrum — they are the identity,
+/// and a rainbow that re-tints per theme stops being a rainbow — but their alpha
+/// is conditioned on the sky they land on: saturated trim at ~27 % over a pale
+/// sky reads as a pastel wash, while the same alpha over a dark sky all but
+/// vanishes, so the dark side gets the deeper pour that lands it in the same
+/// place perceptually.
+pub(crate) fn paint_rainbow_banner(
+    prims: &mut Vec<DrawPrim>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    sky: [u8; 3],
+    rim: [u8; 3],
+) {
+    let dark_sky = crate::native_appearance::surface_is_dark(sky);
+    let (arch_alpha, glint_alpha) = if dark_sky {
+        (0x86, 0xC4)
+    } else {
+        (0x46, 0x6E)
+    };
     prims.push(DrawPrim::Panel {
         x,
         y,
         w,
         h,
         radius: 12.0,
-        fill: rgba(LANDING_MINT, 0xFF),
+        fill: rgba(sky, 0xFF),
         blur: false,
     });
     prims.push(DrawPrim::Stroke {
@@ -3036,7 +3065,7 @@ pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w:
         h,
         radius: 12.0,
         width: 1.0,
-        color: rgba(LANDING_LINE, 0xFF),
+        color: rgba(rim, 0xFF),
     });
     prims.push(DrawPrim::ClipPush { x, y, w, h });
     // The rainbow arch, cresting inside the banner from its bottom edge.
@@ -3061,13 +3090,13 @@ pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w:
                 cx: acx + th.cos() * r,
                 cy: acy + th.sin() * r,
                 r: st * 0.62,
-                color: rgba(*c, 0x46),
+                color: rgba(*c, arch_alpha),
                 breathe: false,
             });
             a += step;
         }
     }
-    // A small static constellation in the mint sky, both sides of the arch.
+    // A small static constellation in the sky, both sides of the arch.
     let glints: [(f32, f32, f32, [u8; 3]); 6] = [
         (0.070, 0.30, 0.16, BLOB_MARIGOLD),
         (0.155, 0.62, 0.11, BLOB_VIOLET),
@@ -3086,7 +3115,7 @@ pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w:
             h: 1.5,
             radius: 0.75,
             width: 1.5,
-            color: rgba(c, 0x6E),
+            color: rgba(c, glint_alpha),
         });
         prims.push(DrawPrim::Stroke {
             x: sx - 0.75,
@@ -3095,7 +3124,7 @@ pub(crate) fn paint_rainbow_banner(prims: &mut Vec<DrawPrim>, x: f32, y: f32, w:
             h: len * 2.0,
             radius: 0.75,
             width: 1.5,
-            color: rgba(c, 0x6E),
+            color: rgba(c, glint_alpha),
         });
     }
     prims.push(DrawPrim::ClipPop);

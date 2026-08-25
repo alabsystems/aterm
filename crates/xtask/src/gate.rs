@@ -1829,11 +1829,12 @@ impl LaneVerdict {
 }
 
 /// Run the repo guard scripts (`tools/grep_guard.sh`, `tools/license_check.sh`,
-/// `tools/paint_guard.sh`), FAILING CLOSED when one is missing.
+/// `tools/paint_guard.sh`, `tools/spin_guard.sh`), FAILING CLOSED when one is
+/// missing.
 ///
-/// Both take the repo root as their argument, and both are executed directly so
-/// their `#!/usr/bin/env bash` shebang is honored — they use bash-only process
-/// substitution and break under `sh`.
+/// Each takes the repo root as its argument, and each is executed directly so
+/// its `#!/usr/bin/env bash` shebang is honored — they use bash-only process
+/// substitution and arrays, and break under `sh`.
 ///
 /// A missing guard is never a silent pass: `ok &= …` inside an `if …exists()`
 /// with no `else` let `gate lint` print GREEN with two of its four components
@@ -1858,6 +1859,19 @@ fn run_repo_guards(root: &Path) -> LaneVerdict {
         // push keeps the hook's affordability rule; the script itself owns the
         // macOS-only honesty and the loud ATERM_SKIP_PAINT_GUARD escape.
         ("paint_guard", "tools/paint_guard.sh"),
+        // The spin-conformance tooth (2026-08 responsiveness audit, item A3).
+        // The freeze-safety gate watches for loops that BLOCK; a loop spinning
+        // at 200 kHz read as vigor, and shipped — 31,913 stale deadline
+        // re-arms/sec, 79% CPU on an IDLE instance, input p99 335 ms. This
+        // guard launches the RELEASE binary headless, lets a steady repainter
+        // arrive on it (output without grid movement — the shape the spin was
+        // made of), and asserts that `past_deadline_arms` stays ~0 across the
+        // measured window. Proven able to go RED: 7929 arms with the fix
+        // reverted, 0 with it in place. Same affordability shape as paint_guard:
+        // unchanged loop-relevant trees cost one content hash, and the script
+        // owns its own POSIX-only honesty and the loud ATERM_SKIP_SPIN_GUARD
+        // escape.
+        ("spin_guard", "tools/spin_guard.sh"),
     ] {
         let script = root.join(rel);
         let lane = if script.exists() {
@@ -2187,7 +2201,7 @@ fn gate_lint_args(args: &[String]) -> bool {
 fn gate_lint_with(lanes: &mut dyn LintLanes, include_fmt: bool) -> bool {
     eprintln!(
         "=== gate lint (tippy -D warnings + trustfmt + \
-         guards[grep_guard,license_check,paint_guard]) ==="
+         guards[grep_guard,license_check,paint_guard,spin_guard]) ==="
     );
     let mut findings: Vec<&str> = Vec::new();
     let mut blocked_not_run: Vec<&str> = Vec::new();

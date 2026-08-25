@@ -25,6 +25,8 @@
 //! | bash  | `--rcfile` | Wrapper rcfile sources profiles then ours |
 //! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
 //! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles |
+//! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs INSIDE the distro |
+//! | cmd   | `PROMPT` | `$e` OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
 //!
 //! # Usage
 //!
@@ -73,6 +75,15 @@ pub enum ShellType {
     /// PowerShell / pwsh (injected via `-NoExit -Command` argv override
     /// that dot-sources the embedded `.ps1` after profiles load).
     PowerShell,
+    /// `wsl.exe` — the Windows front door to a Linux distro. The shell that
+    /// ends up running is a LINUX bash, so the injected script is the bash one;
+    /// the Windows→Linux boundary is crossed by `WSLENV` (see [`prepare_wsl`]).
+    Wsl,
+    /// Windows `cmd.exe`. cmd has no preexec hook, so this is a PARTIAL
+    /// integration: prompt marks and cwd, woven into `%PROMPT%` (see
+    /// [`prepare_cmd`]). Jump-to-prompt and cwd tracking work; the blocks it
+    /// produces carry no command text and no exit code.
+    Cmd,
     /// Unknown shell (no injection available).
     Unknown,
 }
@@ -102,6 +113,14 @@ impl ShellType {
             "bash" | "bash5" => Self::Bash,
             "fish" => Self::Fish,
             "pwsh" | "powershell" => Self::PowerShell,
+            // The `shell = "wsl"` / `"cmd"` aliases the Windows PTY seam already
+            // resolves first-class (`aterm_pty::windows::shell::discover_shell`).
+            // Before these arms both fell to `Unknown`, `prepare()` injected
+            // NOTHING, and every OSC 133 consumer — jump-to-prompt, command
+            // blocks, `blocks`/`wait`, cwd inherit — was silently dead in a WSL
+            // or cmd tab even though the tab looked like any other.
+            "wsl" => Self::Wsl,
+            "cmd" => Self::Cmd,
             _ => Self::Unknown,
         }
     }
@@ -246,13 +265,31 @@ const fn nibble_to_hex(n: u8) -> char {
     }
 }
 
-/// Append `ATERM_SHELL_NONCE=<hex>` to an [`InjectionEnv`]'s env list.
+/// The token an injector writes where the per-session nonce hex must end up,
+/// for the shells that cannot read `$ATERM_SHELL_NONCE` at mark-emission time.
+///
+/// The zsh/bash/fish/pwsh scripts interpolate `$ATERM_SHELL_NONCE` themselves
+/// (and then scrub it from the environment). `cmd.exe` has no scripting hook at
+/// all: its marks live in the `%PROMPT%` string, which cmd renders with `$`
+/// codes only — a `%VAR%` inside an INHERITED `PROMPT` is emitted verbatim, not
+/// expanded (verified on Windows 11). So the cmd injector writes this
+/// placeholder and [`augment_with_nonce`] — the single place the nonce is
+/// wired — substitutes it.
+pub const NONCE_PLACEHOLDER: &str = "@ATERM_SHELL_NONCE@";
+
+/// Append `ATERM_SHELL_NONCE=<hex>` to an [`InjectionEnv`]'s env list, and
+/// substitute [`NONCE_PLACEHOLDER`] wherever an injector left it.
 ///
 /// Idempotent with respect to the `ATERM_SHELL_NONCE` key — a prior entry
 /// for that key is removed before the new one is appended. Other entries
 /// are preserved in order.
 pub fn augment_with_nonce(injection: &mut InjectionEnv, hex: &str) {
     injection.env_add.retain(|(k, _)| k != "ATERM_SHELL_NONCE");
+    for (_, value) in &mut injection.env_add {
+        if value.contains(NONCE_PLACEHOLDER) {
+            *value = value.replace(NONCE_PLACEHOLDER, hex);
+        }
+    }
     injection
         .env_add
         .push(("ATERM_SHELL_NONCE".to_string(), hex.to_string()));
@@ -328,6 +365,8 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
         ShellType::Bash => Some(prepare_bash(base)),
         ShellType::Fish => Some(prepare_fish(base)),
         ShellType::PowerShell => Some(prepare_powershell(base)),
+        ShellType::Wsl => Some(prepare_wsl(base)),
+        ShellType::Cmd => Some(prepare_cmd()),
         ShellType::Unknown => None,
     }
 }
@@ -408,14 +447,46 @@ fn write_script(path: &Path, contents: &str) -> Result<(), std::io::Error> {
     file.write_all(contents.as_bytes())
 }
 
+/// Strip CR from a POSIX shell script's line endings, borrowing when there is
+/// nothing to strip (the Unix case, and any correctly-configured checkout).
+///
+/// A POSIX shell reads a script line-by-line and treats a trailing CR as part
+/// of the last token, so ONE `\r` per line is enough to shred the whole file:
+/// `$'\r': command not found`, then `syntax error near unexpected token
+/// $'do\r'`, and the integration silently never loads. The scripts are
+/// [`include_str!`]d at compile time, so their line endings are whatever the
+/// BUILD MACHINE's checkout had — and Git for Windows defaults to
+/// `core.autocrlf=true`, which materialises them as CRLF. `.gitattributes`
+/// pins them to LF for a fresh checkout; this normalises what actually reaches
+/// the disk, so a binary built from an already-CRLF tree still ships a shell
+/// script the shell can read. (Measured before the fix: the shipped Windows
+/// build wrote a 446-CR `aterm_shell_integration.bash`, and sourcing it in
+/// WSL produced exactly the errors above.)
+fn lf_only(contents: &str) -> std::borrow::Cow<'_, str> {
+    if contents.contains('\r') {
+        std::borrow::Cow::Owned(contents.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(contents)
+    }
+}
+
 /// Write embedded scripts and wrapper files to the cache directory.
 fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(base)?;
 
-    // Write canonical scripts
-    write_script(&base.join("aterm_shell_integration.zsh"), scripts::ZSH)?;
-    write_script(&base.join("aterm_shell_integration.bash"), scripts::BASH)?;
-    write_script(&base.join("aterm_shell_integration.fish"), scripts::FISH)?;
+    // Write canonical scripts (LF-normalised — see `lf_only`).
+    write_script(
+        &base.join("aterm_shell_integration.zsh"),
+        &lf_only(scripts::ZSH),
+    )?;
+    write_script(
+        &base.join("aterm_shell_integration.bash"),
+        &lf_only(scripts::BASH),
+    )?;
+    write_script(
+        &base.join("aterm_shell_integration.fish"),
+        &lf_only(scripts::FISH),
+    )?;
     // No BOM on purpose: the script is ASCII-only so Windows PowerShell 5.1
     // (which decodes BOM-less source as ANSI) reads it correctly.
     write_script(
@@ -438,7 +509,7 @@ fn ensure_scripts(base: &Path) -> Result<(), std::io::Error> {
     std::fs::create_dir_all(&fish_conf)?;
     write_script(
         &fish_conf.join("aterm_shell_integration.fish"),
-        scripts::FISH,
+        &lf_only(scripts::FISH),
     )?;
 
     Ok(())
@@ -647,6 +718,204 @@ fn prepare_powershell(base: &Path) -> InjectionEnv {
             ". (Join-Path $env:ATERM_SHELL_INTEGRATION_DIR 'aterm_shell_integration.ps1')"
                 .to_string(),
         ]),
+    }
+}
+
+/// The env var carrying a POSIX cwd across the WSL boundary for the launcher
+/// to `cd` into (see [`wsl_cwd_env`]).
+pub const WSL_CWD_VAR: &str = "ATERM_WSL_CWD";
+
+/// The `WSLENV` entries [`prepare_wsl`] contributes, in order.
+///
+/// `WSLENV` is the ONLY documented channel for Win32→Linux environment, and
+/// the `/p` flag is what makes the crossing work at all: it translates
+/// `C:\Users\x\AppData\Local\aterm\shell-integration` into
+/// `/mnt/c/Users//x/AppData/Local/aterm/shell-integration` using the DISTRO's
+/// own mount table — so aterm never has to guess `/mnt/c`, never has to know
+/// about a custom `automount.root`, and never has to spawn `wslpath` (which
+/// would put a process launch on the tab-open path).
+///
+/// The nonce and the cwd carry NO flag: both are already values, not paths the
+/// Windows side owns.
+const WSLENV_ENTRIES: [&str; 3] = [
+    "ATERM_SHELL_INTEGRATION_DIR/p",
+    "ATERM_SHELL_NONCE",
+    WSL_CWD_VAR,
+];
+
+/// The `sh -c` program `wsl.exe --exec` runs inside the distro.
+///
+/// Deliberately inline rather than a file in the cache dir: the dir lives on
+/// `/mnt/c`, and every read there crosses the 9p/DrvFs boundary. Two crossings
+/// (the wrapper rcfile + the integration script) are unavoidable; a third for
+/// the launcher itself is not.
+///
+/// It runs under `--exec`, which bypasses the distro's login shell entirely, so
+/// argv arrives byte-for-byte (verified: `wsl.exe -- …` instead re-quotes every
+/// argument into a `bash -c` string, where `$VAR` expands and a naive argv
+/// would be re-interpreted). What it does, in order:
+///
+/// 1. `cd` into [`WSL_CWD_VAR`] when the host handed us one, then unset it so a
+///    shell nested inside this one does not jump back;
+/// 2. run the user's OWN login shell (`$SHELL`, which WSL sets from `passwd`
+///    even under `--exec`), NOT a hardcoded bash — forcing bash on a WSL user
+///    whose login shell is zsh or fish would be a real regression, and getting
+///    integration is not worth it;
+/// 3. only when that login shell IS bash, start it on the wrapper rcfile that
+///    already sources `/etc/profile` + `.bash_profile`/`.profile` + `.bashrc`
+///    (so the `-i` non-login shell still sees a login shell's environment) and
+///    then the integration script;
+/// 4. otherwise `exec $SHELL -l` — byte-for-byte today's behaviour, no
+///    integration, nothing lost.
+const WSL_LAUNCH_SH: &str = concat!(
+    r#"if [ -n "$ATERM_WSL_CWD" ] && [ -d "$ATERM_WSL_CWD" ]; then cd "$ATERM_WSL_CWD"; fi; "#,
+    "unset ATERM_WSL_CWD; ",
+    r#"__aterm_sh="${SHELL:-/bin/bash}"; "#,
+    r#"__aterm_rc="$ATERM_SHELL_INTEGRATION_DIR/bash/rcfile"; "#,
+    r#"case "$__aterm_sh" in */bash|bash) "#,
+    r#"if [ -r "$__aterm_rc" ]; then exec "$__aterm_sh" --rcfile "$__aterm_rc" -i; fi;; "#,
+    "esac; ",
+    r#"exec "$__aterm_sh" -l"#,
+);
+
+/// Merge [`WSLENV_ENTRIES`] into an existing `WSLENV` value, append-safely.
+///
+/// A user (or VS Code, or another tool up the launch chain) may already be
+/// exporting `WSLENV`; clobbering it would silently break THEIR Win32→Linux
+/// variables. Our entries go first, then every existing entry that does not
+/// name one of our variables — so the merge is idempotent under nesting
+/// (aterm inside aterm inside …) instead of growing a duplicate every hop.
+#[must_use]
+fn merge_wslenv(existing: &str) -> String {
+    // An entry is `NAME` or `NAME/flags`; identity is the NAME.
+    fn name_of(entry: &str) -> &str {
+        entry.split('/').next().unwrap_or(entry)
+    }
+    let mut out = WSLENV_ENTRIES.join(":");
+    for entry in existing.split(':') {
+        let name = name_of(entry);
+        if name.is_empty() || WSLENV_ENTRIES.iter().any(|ours| name_of(ours) == name) {
+            continue;
+        }
+        out.push(':');
+        out.push_str(entry);
+    }
+    out
+}
+
+/// The `ATERM_WSL_CWD` pair for a tab that should open in `cwd`, or `None`.
+///
+/// Only meaningful for [`ShellType::Wsl`] and only for a POSIX-absolute path:
+/// a WSL shell reports `/home/you/proj` over OSC 7, and Windows cannot use
+/// that as a `CreateProcessW` working directory (the spawn seam correctly
+/// drops it and the new tab lands in aterm's own directory instead). Handing
+/// it to the WSL-side launcher is what makes "new tab inherits the cwd" work
+/// for a WSL tab. A Windows path is left alone — `wsl.exe` already inherits and
+/// translates the Win32 working directory itself.
+///
+/// `//server/share` is refused: that is the host-preserving UNC form, not a
+/// Linux path.
+#[must_use]
+pub fn wsl_cwd_env(shell: ShellType, cwd: Option<&str>) -> Option<(String, String)> {
+    if shell != ShellType::Wsl {
+        return None;
+    }
+    let cwd = cwd?;
+    if !cwd.starts_with('/') || cwd.starts_with("//") {
+        return None;
+    }
+    Some((WSL_CWD_VAR.to_string(), cwd.to_string()))
+}
+
+/// WSL injection: cross the Win32→Linux boundary with `WSLENV`, then run the
+/// EXISTING bash injection on the far side.
+///
+/// `shell = "wsl"` is a first-class alias the PTY seam resolves, but the shell
+/// it lands on is a Linux one — so none of the Windows-side mechanisms (a
+/// `--rcfile` holding a `C:\` path, a `ZDOTDIR`) can reach it. `WSLENV` can:
+/// see [`WSLENV_ENTRIES`] for why `/p` is the whole trick, and
+/// [`WSL_LAUNCH_SH`] for what runs inside.
+///
+/// argv[0] is a display token (the PTY seam keeps the RESOLVED `wsl.exe` and
+/// uses this vector as argv), matching the bash/pwsh contract.
+fn prepare_wsl(base: &Path) -> InjectionEnv {
+    let existing = std::env::var("WSLENV").unwrap_or_default();
+    InjectionEnv {
+        env_add: vec![
+            (
+                "ATERM_SHELL_INTEGRATION_DIR".to_string(),
+                path_env_value(base),
+            ),
+            ("WSLENV".to_string(), merge_wslenv(&existing)),
+        ],
+        argv_override: Some(vec![
+            "wsl".to_string(),
+            "--exec".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            WSL_LAUNCH_SH.to_string(),
+        ]),
+    }
+}
+
+/// The prompt cmd.exe renders when nothing else is configured (`C:\dir>`).
+const CMD_DEFAULT_PROMPT: &str = "$P$G";
+
+/// cmd.exe injection: prompt marks and cwd only, woven into `%PROMPT%`.
+///
+/// cmd has no profile, no preexec hook and no scripting seam — so the honest
+/// ceiling here is a PARTIAL integration, and shipping it beats today's
+/// silence. `PROMPT` is the one string cmd re-renders on every input line, and
+/// it understands `$E` (ESC) and `$P` (the live current directory), which is
+/// exactly enough for:
+///
+/// * `OSC 633;P;Cwd=` — the cwd, so the tab label tracks `cd` and a new tab
+///   opens where this one is. `$P` yields a native `C:\dir`, which the engine
+///   stores verbatim; building a `file://` URI would need percent-encoding cmd
+///   cannot do.
+/// * `OSC 133;A` / `133;B` — prompt start/end, which is what jump-to-prompt
+///   (Ctrl+Shift+Up/Down) navigates by.
+///
+/// NOT emitted: `133;C` and `133;D`. `C` marks the moment a command starts
+/// EXECUTING, and cmd gives no hook between "Enter pressed" and "command
+/// running"; the engine's phase machine requires A→B→C→D in order, so a `D`
+/// without a `C` would be dropped anyway. The consequence, measured on a live
+/// cmd tab: `blocks` lists prompt-delimited regions with correct row ranges and
+/// cwd, but every one stays `entering` with `exit=-` and an empty `cmdline`,
+/// and `wait` never fires. Faking a `C`+`D` pair to complete the cycle was
+/// considered and REJECTED: cmd cannot expand `%ERRORLEVEL%` in an inherited
+/// `PROMPT` (verified — `%VAR%` renders literally), so every block would
+/// report a fabricated `exit=0`, and a lie in an introspection surface agents
+/// read is worse than an honest gap. The gap is documented at the `shell`
+/// config key rather than left for the user to discover.
+///
+/// An inherited `%PROMPT%` is WRAPPED, not replaced, so a user who set their
+/// own prompt keeps it; a `PROMPT` that already carries our marks (a nested
+/// aterm) is returned untouched so nesting cannot double-wrap.
+///
+/// Unlike the script-driven shells, cmd cannot scrub `ATERM_SHELL_NONCE` from
+/// its environment after reading it — the nonce is IN the prompt string, so it
+/// is visible to child processes of a cmd tab either way. This is a genuinely
+/// weaker guarantee than bash/zsh/fish/pwsh get, and it is the price of cmd
+/// having no code of its own to run.
+fn prepare_cmd() -> InjectionEnv {
+    let user = std::env::var("PROMPT")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| CMD_DEFAULT_PROMPT.to_string());
+    if user.contains("]133;A") {
+        // Already instrumented (nested aterm): leave it exactly as inherited.
+        return InjectionEnv {
+            env_add: vec![("PROMPT".to_string(), user)],
+            argv_override: None,
+        };
+    }
+    let id = NONCE_PLACEHOLDER;
+    let prompt =
+        format!("$e]633;P;Cwd=$P;id={id}$e\\$e]133;A;id={id}$e\\{user}$e]133;B;id={id}$e\\");
+    InjectionEnv {
+        env_add: vec![("PROMPT".to_string(), prompt)],
+        argv_override: None,
     }
 }
 

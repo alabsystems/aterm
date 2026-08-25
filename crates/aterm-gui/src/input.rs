@@ -269,14 +269,30 @@ pub enum ScrollIntent {
 }
 
 /// Resolve the target absolute row for a prompt-to-prompt jump: the nearest
-/// OSC-133 command mark whose prompt row is strictly ABOVE (`prev = true`) or
-/// BELOW (`prev = false`) the current top visible row. `None` when no mark lies
-/// in that direction (an edge, or a bare shell with no integration marks). The
-/// single source of truth shared by the seam's `ScrollView` handler and the
-/// control-socket `scroll` verb so their prompt-jump semantics can't drift.
+/// recorded PROMPT row strictly ABOVE (`prev = true`) or BELOW (`prev = false`)
+/// the current top visible row. `None` when no prompt lies in that direction
+/// (an edge, or a bare shell with no integration marks). The single source of
+/// truth shared by the seam's `ScrollView` handler and the control-socket
+/// `scroll` verb so their prompt-jump semantics can't drift.
+///
+/// Prompt rows come from BOTH indexes, deliberately. `command_marks()` is
+/// populated only by `shell_command_finished` — i.e. only by OSC 133;**D** — so
+/// on its own it indexes COMPLETED COMMANDS, not prompts. That is the wrong
+/// index for a feature whose name and behaviour are "jump to the prompt": a
+/// shell that can mark where its prompt is but cannot mark when a command
+/// starts EXECUTING (cmd.exe has no hook between Enter and the command running,
+/// so it emits A/B and no C/D) records prompts the engine can see and this
+/// reducer could not. `all_blocks()` carries `prompt_start_row` from the instant
+/// A arrives, including the in-progress block. For a fully-marked shell the two
+/// sets agree row-for-row and the union changes nothing — verified by the
+/// bash/zsh/fish/pwsh/wsl path landing on identical targets.
 pub(crate) fn jump_prompt_target(t: &Terminal, prev: bool) -> Option<u64> {
     let top = t.grid().top_visible_absolute_row();
-    let rows = t.command_marks().iter().map(|m| m.prompt_start_row);
+    let rows = t
+        .command_marks()
+        .iter()
+        .map(|m| m.prompt_start_row)
+        .chain(t.all_blocks().map(|b| b.prompt_start_row));
     if prev {
         rows.filter(|&r| r < top).max()
     } else {
@@ -2131,6 +2147,93 @@ mod tests {
             px_off: PixelOffset::CELL_ORIGIN,
         };
         assert_eq!(egress_bytes(&term, &press), b"\x1b[<0;31;41M");
+    }
+
+    /// Jump-to-prompt must navigate by PROMPTS, not by finished commands.
+    ///
+    /// `command_marks()` is filled only by OSC 133;D, so a shell that marks
+    /// where its prompt is but has no hook for "the command started executing"
+    /// — cmd.exe, whose `%PROMPT%` can emit A and B and nothing else — recorded
+    /// prompts that Ctrl+Shift+Up/Down could not reach. Measured before the fix
+    /// on a real cmd tab: four prompt marks at rows 3/50/97/100 and
+    /// `scroll prev-prompt` reporting `OK 0 71` at every step (never moved).
+    #[test]
+    fn jump_prompt_target_finds_prompts_from_an_a_b_only_shell() {
+        let mut t = Terminal::new(4, 20);
+        // Two A/B-only prompts separated by enough output to build scrollback,
+        // exactly the shape cmd.exe's PROMPT produces.
+        t.process(b"\x1b]133;A\x1b\\p1>\x1b]133;B\x1b\\\r\n");
+        for _ in 0..6 {
+            t.process(b"out\r\n");
+        }
+        t.process(b"\x1b]133;A\x1b\\p2>\x1b]133;B\x1b\\\r\n");
+        for _ in 0..6 {
+            t.process(b"out\r\n");
+        }
+        // No command mark exists: nothing ever emitted 133;D.
+        assert!(
+            t.command_marks().is_empty(),
+            "an A/B-only shell records no completed-command marks — that is the \
+             whole point of the union"
+        );
+        let prompts: Vec<u64> = t.all_blocks().map(|b| b.prompt_start_row).collect();
+        assert_eq!(prompts.len(), 2, "two prompts were marked: {prompts:?}");
+
+        t.scroll_to_bottom();
+        let top = t.grid().top_visible_absolute_row();
+        let older: Vec<u64> = prompts.iter().copied().filter(|&r| r < top).collect();
+        assert!(
+            !older.is_empty(),
+            "the fixture must leave a prompt above the viewport: top={top} \
+             prompts={prompts:?}"
+        );
+        assert_eq!(
+            jump_prompt_target(&t, true),
+            older.iter().copied().max(),
+            "prev-prompt must reach the nearest prompt above the viewport"
+        );
+
+        // And from the top, next-prompt walks forward again.
+        t.scroll_to_top();
+        let top = t.grid().top_visible_absolute_row();
+        assert_eq!(
+            jump_prompt_target(&t, false),
+            prompts.iter().copied().filter(|&r| r > top).min(),
+            "next-prompt must reach the nearest prompt below the viewport"
+        );
+    }
+
+    /// The union must not change a fully-marked shell: blocks and command marks
+    /// carry the SAME `prompt_start_row`, so bash/zsh/fish/pwsh/wsl land exactly
+    /// where they did before.
+    #[test]
+    fn jump_prompt_target_is_unchanged_for_a_fully_marked_shell() {
+        let mut t = Terminal::new(4, 20);
+        for n in 0..3 {
+            t.process(b"\x1b]133;A\x1b\\$ \x1b]133;B\x1b\\cmd\r\n\x1b]133;C\x1b\\");
+            for _ in 0..5 {
+                t.process(b"out\r\n");
+            }
+            let _ = n;
+            t.process(b"\x1b]133;D;0\x1b\\");
+        }
+        let marks: Vec<u64> = t
+            .command_marks()
+            .iter()
+            .map(|m| m.prompt_start_row)
+            .collect();
+        assert_eq!(marks.len(), 3, "three completed commands: {marks:?}");
+        t.scroll_to_bottom();
+        let top = t.grid().top_visible_absolute_row();
+        // The mark-only answer and the union answer must agree.
+        assert_eq!(
+            jump_prompt_target(&t, true),
+            marks.iter().copied().filter(|&r| r < top).max()
+        );
+        assert_eq!(
+            jump_prompt_target(&t, false),
+            marks.iter().copied().filter(|&r| r > top).min()
+        );
     }
 
     /// `report_coords` is the SOLE coordinate selector: pixel for 1016, cell for

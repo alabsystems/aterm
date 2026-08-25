@@ -111,7 +111,7 @@ use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
 use aterm_spec::derive::selection_custody_model;
 
-use crate::app_input::apply_press_custody;
+use crate::app_input::{PressKind, apply_press_custody};
 use crate::{App, WindowId, term_lock};
 
 /// The spec variables, in the model's declared order.
@@ -419,7 +419,7 @@ fn gui_gesture_chain(validated: &mut usize) {
     {
         let mut t = term_lock(&terminal);
         assert_eq!(
-            apply_press_custody(&mut t, false),
+            apply_press_custody(&mut t, PressKind::Inert),
             (false, false),
             "an inert press must neither snap the viewport nor clear the selection"
         );
@@ -438,7 +438,7 @@ fn gui_gesture_chain(validated: &mut usize) {
     {
         let mut t = term_lock(&terminal);
         assert!(
-            apply_press_custody(&mut t, true).1,
+            apply_press_custody(&mut t, PressKind::Typing).1,
             "a disturbing press must clear a live selection"
         );
     }

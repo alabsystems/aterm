@@ -357,6 +357,22 @@ impl StatusFsm {
             return Some(*first_seen + self.policy.dwell);
         }
         if self.published.phase == Phase::Running {
+            // A PINNED verdict is immovable, so it owes no wake. `classify`
+            // answers a user pin with `Confidence::Exact` BEFORE either
+            // activity clock is consulted, so the arithmetic below would return
+            // `max(movement, output) + quiet_after` — an instant that recedes
+            // further into the past on every turn while nothing can ever change
+            // the answer. That is a permanent wake plus a pool sweep, a
+            // `try_lock` and a `tcgetpgrp` per session, forever, for a status
+            // that is by definition immovable. The clamp would bound it to the
+            // observation rate; arming only where the verdict can actually
+            // change is the law this whole accessor exists to obey.
+            //
+            // Removing the pin is an EDGE (a control command), which drives its
+            // own observation — nothing here is needed to notice it.
+            if self.published.reasons.contains(&Reason::Pin) {
+                return None;
+            }
             return match (self.last_movement, self.last_output) {
                 (Some(movement), Some(output)) => {
                     Some(movement.max(output) + self.policy.quiet_after)
@@ -855,6 +871,40 @@ impl StatusObserver {
             .is_none_or(|slot| now >= slot.next_due)
     }
 
+    /// Charge a session's observation interval for a sample that could NOT be
+    /// taken — the sweep reached it and refused, rather than never reaching it.
+    ///
+    /// THE CLAMP NEEDS A FLOOR THAT ALWAYS ADVANCES (busy-rearm audit, item 2).
+    /// [`StatusObserver::next_wake`] clamps each slot to `next_due` and calls
+    /// that a structural bound of the observation rate — but `next_due` moves
+    /// in exactly one place, [`StatusObserver::observe`], and the sweep has a
+    /// second refusal that never reaches it: the terminal `try_lock` lost to
+    /// the PTY reader. A slot whose owed instant is already past and whose lock
+    /// stays contended therefore re-arms the SAME past instant on every turn —
+    /// `WaitUntil(past)` fires, the sweep skips, nothing advances — which is
+    /// the event-loop-rate spin the clamp was written to make impossible, under
+    /// precisely the sustained-output workload that contends the lock.
+    ///
+    /// Charging the interval is also the honest accounting: this subsystem's
+    /// contract is at most one classification attempt per session per
+    /// `min_interval`, and a sample we could not take is an attempt spent. It
+    /// costs a contended session one interval of delay in a transition it could
+    /// not have observed anyway.
+    ///
+    /// Only a KNOWN session is charged. A slot-less session contributes no
+    /// deadline, so it cannot spin the loop, and inserting a slot here would
+    /// bank the pool epoch over a session that has never been classified — the
+    /// exact defect [`StatusObserver::note_swept`] refuses.
+    pub(crate) fn note_skipped(&mut self, session: u64, now: Instant) {
+        let Some(slot) = self.sessions.get_mut(&session) else {
+            return;
+        };
+        let due = now + self.min_interval;
+        slot.next_due = due;
+        // Same LOWER-bound fold as `observe`; `note_swept` restores exactness.
+        self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
+    }
+
     /// Fold one observation in. Returns `true` when the published status changed.
     ///
     /// A recorded exit OVERRIDES the caller's `lifecycle` field: the PTY ending
@@ -1063,16 +1113,40 @@ impl crate::App {
         let mut changed = Vec::new();
         for (id, master, pid) in due {
             let Some(session) = self.pool.get(id) else {
+                self.session_status.note_skipped(id, now);
                 continue;
             };
             let term = session.term.clone();
             // Real PTY-output age from the session's existing activity atomic —
             // overwritten for EVERY consumed burst and never cleared by
             // presentation, so a hidden pane's output still ages honestly.
-            let last_output = match session
+            let latest_output_ns = session
                 .latest_output_activity_ns
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // THE REFUSAL COMES FIRST. Contention is a SKIP, and everything
+            // below the lock is evidence this sweep will throw away — so a
+            // contended session must cost one atomic try and nothing else. Read
+            // the other way round, the `tcgetpgrp` syscall and the O(windows)
+            // focus scan were paid per due session on every turn under exactly
+            // the output flood that makes the lock contended, inside the
+            // workload the O(1) gate exists to survive.
+            //
+            // A refusal also CHARGES the observation interval
+            // (`note_skipped`): without it `next_due` never advances on this
+            // path, and `next_wake`'s structural clamp — which floors every
+            // armed instant at `next_due` — has nothing to floor against.
+            let Ok(guard) = term.try_lock() else {
+                self.session_status.note_skipped(id, now);
+                continue;
+            };
+            // Two field reads and a block peek, then the lock is released:
+            // nothing below it needs the terminal, and the PTY reader must not
+            // wait behind a syscall.
+            let shell = shell_evidence(&guard);
+            let alt_screen = guard.is_alternate_screen();
+            let content_seq = guard.content_seq();
+            drop(guard);
+            let last_output = match latest_output_ns {
                 0 => None,
                 ns => self
                     .lat_epoch
@@ -1095,24 +1169,20 @@ impl crate::App {
                     pid,
                 )
             });
-            let Ok(guard) = term.try_lock() else {
-                continue;
-            };
             let evidence = Evidence {
                 pin: None,
-                shell: shell_evidence(&guard),
+                shell,
                 // The exit fact arrives as an EVENT (`note_session_exit`) and is
                 // held sticky on the slot, so the sweep never has to discover it.
                 lifecycle: None,
                 foreground_job,
                 activity: ActivitySample {
-                    alt_screen: guard.is_alternate_screen(),
-                    content_seq: guard.content_seq(),
+                    alt_screen,
+                    content_seq,
                     last_output,
                     last_input,
                 },
             };
-            drop(guard);
             if self.session_status.observe(id, &evidence, now) {
                 changed.push(id);
             }
@@ -2583,5 +2653,108 @@ mod tests {
         // The clamped wake still publishes: dwell was served well before it.
         assert!(observer.observe(1, &ev, owed), "the transition lands");
         assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Idle));
+    }
+
+    /// An IMMOVABLE verdict owes no wake. A user pin of `Running` bypasses both
+    /// activity clocks, so arming off them produced an instant that receded
+    /// further into the past on every turn while nothing could change the
+    /// answer — a permanent wake, a pool sweep, a `try_lock` and a `tcgetpgrp`
+    /// per session, forever.
+    #[test]
+    fn a_pinned_running_session_owes_no_time_driven_wake() {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+
+        // First, the UNPINNED shape, so the assertion below cannot pass just
+        // because this fixture never reaches Running.
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        fsm.observe(&ev, t0);
+        ev.activity.content_seq = 2;
+        settle(&mut fsm, &ev, t0 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Running);
+        assert!(
+            fsm.owed_wake().is_some(),
+            "an inferred Running owes its retirement"
+        );
+
+        // Now pin it. The verdict is `Exact` and clock-free, so no instant
+        // exists at which it could change on its own.
+        ev.pin = Some(Phase::Running);
+        let pinned = t0 + QUIET + Duration::from_secs(30);
+        fsm.observe(&ev, pinned);
+        assert_eq!(fsm.status().phase, Phase::Running);
+        assert!(
+            fsm.status().reasons.contains(&Reason::Pin),
+            "the record carries the pin"
+        );
+        assert_eq!(
+            fsm.owed_wake(),
+            None,
+            "a pin sustains Running with no clock, so it arms nothing"
+        );
+    }
+
+    /// The clamp's floor must ADVANCE on the sweep's other refusal. The sweep
+    /// skips a session whose terminal `try_lock` is held by the PTY reader, and
+    /// that path never reaches `observe` — so before `note_skipped` the slot's
+    /// `next_due` stood still, `next_wake` re-armed the same already-past
+    /// instant every turn, and the "at most the observation rate" bound the
+    /// clamp advertises did not hold under exactly the sustained-output
+    /// workload that contends the lock.
+    #[test]
+    fn a_refused_sample_still_advances_the_observation_gate() {
+        let t0 = Instant::now();
+        let interval = Duration::from_millis(250);
+        let mut observer = StatusObserver::new(policy(), interval);
+
+        // A Running session whose clocks then go stale: `owed_wake` returns
+        // `last_activity + quiet_after`, which recedes into the past.
+        let mut ev = evidence(blank(1));
+        ev.foreground_job = Some(true);
+        observer.observe(1, &ev, t0);
+        // Movement is only inferable between two samples, and the candidate then
+        // serves its dwell before publishing — so the third observation is what
+        // makes `Running` the PUBLISHED phase (`owed_wake` reads the published
+        // record, not the candidate).
+        let moved_at = t0 + Duration::from_millis(10);
+        ev.activity.content_seq = 2;
+        observer.observe(1, &ev, moved_at);
+        observer.observe(1, &ev, moved_at + DWELL);
+        assert_eq!(observer.status(1).map(|s| s.phase), Some(Phase::Running));
+
+        // Long past the retirement instant, with the lock contended ever since.
+        let now = t0 + QUIET + Duration::from_secs(30);
+        assert!(
+            observer.next_wake().is_some_and(|wake| wake < now),
+            "the shape under test: an owed wake already deep in the past"
+        );
+
+        observer.note_skipped(1, now);
+        // Every sweep ends in `note_swept`, which restores `next_due_any` to the
+        // exact minimum (`note_skipped` only folds a lower bound, exactly as
+        // `observe` does). Mirrored here so the O(1) gate is asserted in the
+        // state production actually leaves it in.
+        observer.note_swept(None);
+        let wake = observer.next_wake().expect("the slot still owes a wake");
+        assert!(
+            wake >= now + interval,
+            "a refused sample charges its interval, so the re-arm is in the future"
+        );
+        assert!(
+            !observer.due(1, now),
+            "and the gate that refused it is closed for that interval"
+        );
+        assert!(
+            !observer.any_due(now),
+            "the O(1) gate agrees, so the sweep itself stops running per turn"
+        );
+        assert!(observer.due(1, wake), "the armed wake is admissible when it fires");
+
+        // An unknown session is NOT charged: it holds no slot, so it owes no
+        // deadline and cannot spin the loop, and inserting one here would bank
+        // the pool epoch over a session that was never classified.
+        observer.note_skipped(404, now);
+        assert!(!observer.knows(404), "a refusal never invents a classification");
     }
 }

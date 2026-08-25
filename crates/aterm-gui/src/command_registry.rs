@@ -281,9 +281,13 @@ pub(crate) const fn keybinding_command(action: keybinding::Action) -> CommandSpe
         K::ToggleViMode => spec("terminal.vi.toggle", S::View, A::LocalUi, C::Terminal),
         K::RenameSession => spec("session.rename", S::Tab, A::LocalUi, C::Terminal),
         // Same identities as the menu faces (M::SelectAll / M::ToggleFullScreen
-        // above): one command each, two faces, converging on the same verbs.
+        // / M::FindNext / M::FindPrev above): one command each, two faces,
+        // converging on the same verbs — the join `menu_binding` (app_palette)
+        // rides to label a palette row with the chord that actually fires it.
         K::SelectAll => spec("selection.select_all", S::View, A::Clipboard, C::Any),
         K::ToggleFullscreen => spec("window.fullscreen", S::Window, A::LocalUi, C::Any),
+        K::FindNext => spec("view.find_next", S::View, A::LocalUi, C::Any),
+        K::FindPrev => spec("view.find_previous", S::View, A::LocalUi, C::Any),
     }
 }
 

@@ -207,11 +207,16 @@ pub fn model_registry() -> Vec<Model> {
         // conformance driving real gestures and real `Terminal::process` batches
         // (`aterm_gui::selection_custody_conformance`), run by the gate.
         //
-        // `PressCustody` is deliberately REPORT-ONLY. Five of its eleven actions have
-        // no seam at which their state change is observable — the grid layer owns no
-        // selection, and `OutputAtLive` is an identity transition any function
-        // satisfies — so anchoring it would buy a green ledger line rather than a
-        // check. Its regressions are covered by mutation-checked unit tests instead.
+        // `PressCustody` is ACTIVELY-BOUND too, as of the custody RECORD. It was
+        // report-only for a real reason rather than a procedural one: five of its
+        // eleven actions had no seam at which their state change could be told from
+        // another's — `RepeatPress`, `InertPress` and `ReleaseEvent` are identical in
+        // every observable variable, and `OutputAtLive` is an identity transition any
+        // function satisfies — so anchoring bought a green ledger line rather than a
+        // check. `Terminal::note_custody` closes that: the site that DECIDES a
+        // transition records which one it was, so the conformance validates each step
+        // against the action the engine itself named. 11/11 anchored on the four
+        // recorders, Tier-1 in `aterm_gui::press_custody_conformance`, run by the gate.
         //
         // Registration alone (independent of anchoring) is what puts BOTH under
         // `ty check --strict-vacuity` in the repo-wide gate.

@@ -78,14 +78,35 @@ const SHED_FADE_IN_SECS: f32 = 0.25;
 const SYNC_HOLD_CAP: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// How long one key/text egress holds the cursor-effect TYPED WAKE
-/// ([`App::cursor_fx_focus`]) for its window. Must outlive every cursor
-/// effect's visible decay so expiry never chops live light: the comet trail's
-/// lifetime clamps at 2 s (`cursor_trail_ms_or_default`), and the aurora /
-/// rainbow-momentum tails drain within a couple of seconds of the last key —
-/// 5 s covers all of them with margin while still returning an idle unfocused
-/// window to W11b's demoted-static state (FL-1's settle re-engages once the
-/// engines drain).
-pub(crate) const CURSOR_FX_TYPED_WAKE: std::time::Duration = std::time::Duration::from_secs(5);
+/// ([`App::cursor_fx_focus`]) for its window.
+///
+/// MUST OUTLIVE EVERY CURSOR EFFECT'S VISIBLE DECAY, so expiry demotes a window
+/// whose light has already drained instead of chopping a live one: at expiry the
+/// policy hard-zeroes (amplitude EXACTLY 0 — only the load-shed contribution is
+/// enveloped), so anything still lit is cut, not faded.
+///
+/// The bound is set by the two longest-lived effects, not by the trail:
+///
+/// * THE FORGE EMBER. `CursorGlow::is_active` holds while
+///   `cursor_temp > FORGE_MIN_TEMP` (0.12); the display temperature decays on
+///   `FIRE_HEAT_TAU` (2.8 s) and the metal chases it with `TEMP_RELEASE_TAU`
+///   (1.4 s) of lag. From a sustained-typing peak that is ~2.8·ln(1/0.12) ≈ 5.9 s
+///   plus the lag — call it ~7.3 s. The engine's own regression pins the shape:
+///   2.5 s after typing stops the metal still holds >45% of peak heat.
+/// * THE RAINBOW CHAIN. `RAINBOW_CHAIN_GAP_MAX` is exactly 5.0 s — "one key
+///   every five seconds still counts, so even glacial hunt-and-peck keeps the
+///   rainbow four letters long" — and the exit swoosh is `RAINBOW_SWOOSH_LIFE`
+///   (1.55 s) after that. A wake of exactly 5 s died ON the boundary the chain
+///   constant exists to cover, so an unfocused hunt-and-peck typist lost the
+///   four-letter guarantee at precisely the cadence it was written for.
+///
+/// Eight seconds covers both with margin. It does NOT extend the demoted-static
+/// state's cost: the scheduler term is `(focused || wake) && cursor_fx_active`,
+/// so a drained window parks the moment its engines go quiet whatever this says
+/// — the constant only bounds how long a window may stay lit, never how long a
+/// dark one stays awake. Raising it further is cheap; lowering it below the two
+/// bounds above re-opens the chop, so change it only with those constants.
+pub(crate) const CURSOR_FX_TYPED_WAKE: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// One window's decision after comparing two non-destructive terminal scroll
 /// snapshots. `translated_rows` carries the exact cumulative distance (up to
@@ -5704,11 +5725,15 @@ pub(crate) fn prepend_strip_rows(
     if strip == 0 {
         return;
     }
-    // D-2: the splice shifts every per-row channel down by `strip`, so terminal
-    // row `r` becomes frame row `r + strip`. The revision lane is stamped in
-    // ENGINE row space and is not shifted here — disown it rather than let a
-    // consumer read row `r`'s revision against row `r + strip`'s content.
-    dst.invalidate_row_revisions();
+    // D-2 SPLICE: the prepend shifts every per-row channel down by `strip`, so
+    // terminal row `r` becomes frame row `r + strip`. The revision lane is
+    // stamped in ENGINE row space, so it must be shifted BY THE SAME OPERATION
+    // or it would answer row `r`'s revision against row `r + strip`'s content.
+    // `note_host_row_prepend` (below, after every channel has moved) does that:
+    // it prepends `strip` UNKNOWN sentinels for the chrome rows and re-arms the
+    // provenance token. The blessing is read HERE, before anything moves,
+    // because it is a statement about the snapshot the prepend is applied to.
+    let blessed = dst.host_prepend_blessing();
     dst.cells.splice(
         0..0,
         strip_rows.iter().map(|src| match pool.pop() {
@@ -5844,6 +5869,14 @@ pub(crate) fn prepend_strip_rows(
     // The strip changes the presented pixels; bump the snapshot seq so the renderer's
     // content cache sees the new frame.
     dst.snapshot_seq = dst.snapshot_seq.wrapping_add(1);
+    // …and, with every channel now shifted and the bump applied, record the
+    // prepend on the snapshot: the lane gains `strip` leading UNKNOWNs and the
+    // D-2 provenance token follows `snapshot_seq` — but ONLY under the blessing
+    // read at the top. Unblessed (some host had already overwritten engine
+    // cells before this ran), the lane is disowned exactly as it was before the
+    // splice existed. Either way `row_shift` records the physical prepend, so
+    // the frontend's un-splice knows what to remove.
+    dst.note_host_row_prepend(strip, blessed);
 }
 
 /// Shrink one frame-space selection clip so an overlay band's rows are excluded,
@@ -10031,6 +10064,267 @@ mod motion_policy_tests {
         );
     }
 
+    /// THE OTHER HALF OF THE TYPED WAKE — the SCHEDULER, not the policy.
+    ///
+    /// `cursor_fx_focus` decides the trail may paint; `terminal_effect_frame_active`
+    /// decides another frame gets scheduled to paint it, and folds the SAME
+    /// predicate for exactly that reason ("a wake that painted but never
+    /// scheduled would freeze the comet mid-decay between echoes"). Nothing
+    /// proved the second half: every other test of this predicate sets
+    /// `focused = true`, and a capture-based artifact gate structurally cannot
+    /// see it — in headless the CAPTURE supplies the animation clock, so the
+    /// engines advance at capture cadence whatever `about_to_wait` decides.
+    /// Delete the wake term from the fold and the owner's real glass freezes
+    /// between echoes while every pixel gate stays green.
+    #[test]
+    fn typed_wake_arms_the_frame_train_on_an_unfocused_window() {
+        use std::time::{Duration, Instant};
+
+        use super::CursorFxInputs;
+        use crate::WindowId;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("comet".into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        app.windows.get_mut(&wid).expect("window").focused = false;
+
+        // Seed the engines' position the way a real window does, so the live
+        // tick below is a genuine MOVE rather than a first sighting.
+        let mut seed = CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
+
+        // Charge the engines the way the typed window really does: a keystroke
+        // stamps the wake, the engines see the move, one tick commits it.
+        let typed = t0 + Duration::from_millis(1);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.last_key_at = Some(typed);
+            ws.typing_cadence.on_keystroke(typed);
+            ws.cursor_glow.note_synthetic_move(typed);
+            ws.cursor_trail.note_synthetic_move(typed);
+        }
+        let mut live = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(2));
+        live.cur = Some((2, 5));
+        app.tick_cursor_fx(wid, live).expect("live cursor tick");
+
+        let at = t0 + Duration::from_millis(3);
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_fx_active(at, false),
+            "precondition: the lane HAS work to schedule (glow={} trail={})",
+            ws.cursor_glow.is_active(),
+            ws.cursor_trail.is_active(),
+        );
+        assert!(
+            ws.terminal_effect_frame_active(at, false),
+            "the typed wake arms the frame train, not just the paint policy"
+        );
+
+        // W11b, unchanged: the SAME live engines on an unwatched window park.
+        // Asserted against a charged engine set, so the park is the focus fold's
+        // doing and not an empty lane.
+        app.windows.get_mut(&wid).expect("window").last_key_at = None;
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(ws.cursor_fx_active(at, false), "the engines are still live");
+        assert!(
+            !ws.terminal_effect_frame_active(at, false),
+            "unfocused and untyped: W11b parks the 60 fps lane"
+        );
+
+        // And the wake EXPIRES with the policy: past the hold the lane parks
+        // again, again asserted against a live engine set.
+        let late = typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1);
+        app.windows.get_mut(&wid).expect("window").last_key_at = Some(typed);
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_fx_active(late, false),
+            "the engine set is still charged at the expiry instant"
+        );
+        assert!(
+            !ws.terminal_effect_frame_active(late, false),
+            "an expired wake parks the lane again (FL-1's settle)"
+        );
+
+        // The two halves agree on the SAME instant — the invariant the fold's
+        // doc-comment claims. A wake that painted but never scheduled, or
+        // scheduled but never painted, is the drift that blacked the trail out.
+        for probe in [t0, typed, typed + Duration::from_secs(1), late] {
+            let ws = app.windows.get(&wid).expect("window");
+            assert_eq!(
+                ws.cursor_fx_typed_wake(probe),
+                app.cursor_fx_focus(wid, false, probe),
+                "policy and scheduler read one predicate at {probe:?}"
+            );
+        }
+    }
+
+    /// The `trail status` row resolves FOCUS through the frame path's own fold
+    /// (`cursor_fx_focus`), not the bare `motion_focus` seam — the difference
+    /// being the exact window the v0.48–v0.50 blackout hid in: unfocused, typed
+    /// into over the control socket, and painting. A sensor that answered
+    /// `focused=false motion_stage=reduced intensity=0.00` there would accuse
+    /// the motion gate while the frames were lit, which is worse than no
+    /// sensor: the verb's whole promise is that the first field reading wrong
+    /// names the bug.
+    #[test]
+    fn trail_status_reads_the_focus_the_frame_path_used() {
+        use std::time::{Duration, Instant};
+
+        use super::CursorFxInputs;
+        use crate::WindowId;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("comet".into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        let t0 = Instant::now();
+        app.windows.get_mut(&wid).expect("window").focused = false;
+
+        // Seed the engines' position the way a real window does, so the live
+        // tick below is a genuine MOVE rather than a first sighting.
+        let mut seed = CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
+
+        // Charge the engines the way the typed window really does: a keystroke
+        // stamps the wake, the engines see the move, one tick commits it.
+        let typed = t0 + Duration::from_millis(1);
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.last_key_at = Some(typed);
+            ws.typing_cadence.on_keystroke(typed);
+            ws.cursor_glow.note_synthetic_move(typed);
+            ws.cursor_trail.note_synthetic_move(typed);
+        }
+        let mut live = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(2));
+        live.cur = Some((2, 5));
+        app.tick_cursor_fx(wid, live).expect("live cursor tick");
+
+        let at = t0 + Duration::from_millis(3);
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_fx_active(at, false),
+            "precondition: the lane HAS work to schedule (glow={} trail={})",
+            ws.cursor_glow.is_active(),
+            ws.cursor_trail.is_active(),
+        );
+        assert!(
+            ws.terminal_effect_frame_active(at, false),
+            "the typed wake arms the frame train, not just the paint policy"
+        );
+
+        // W11b, unchanged: the SAME live engines on an unwatched window park.
+        // Asserted against a charged engine set, so the park is the focus fold's
+        // doing and not an empty lane.
+        app.windows.get_mut(&wid).expect("window").last_key_at = None;
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(ws.cursor_fx_active(at, false), "the engines are still live");
+        assert!(
+            !ws.terminal_effect_frame_active(at, false),
+            "unfocused and untyped: W11b parks the 60 fps lane"
+        );
+
+        // And the wake EXPIRES with the policy: past the hold the lane parks
+        // again, again asserted against a live engine set.
+        let late = typed + super::CURSOR_FX_TYPED_WAKE + Duration::from_millis(1);
+        app.windows.get_mut(&wid).expect("window").last_key_at = Some(typed);
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_fx_active(late, false),
+            "the engine set is still charged at the expiry instant"
+        );
+        assert!(
+            !ws.terminal_effect_frame_active(late, false),
+            "an expired wake parks the lane again (FL-1's settle)"
+        );
+
+        // The two halves agree on the SAME instant — the invariant the fold's
+        // doc-comment claims. A wake that painted but never scheduled, or
+        // scheduled but never painted, is the drift that blacked the trail out.
+        for probe in [t0, typed, typed + Duration::from_secs(1), late] {
+            let ws = app.windows.get(&wid).expect("window");
+            assert_eq!(
+                ws.cursor_fx_typed_wake(probe),
+                app.cursor_fx_focus(wid, false, probe),
+                "policy and scheduler read one predicate at {probe:?}"
+            );
+        }
+
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        let wid = WindowId(0);
+        assert_eq!(
+            app.frontmost_window,
+            Some(wid),
+            "the fixture's front window"
+        );
+
+        // UNFOCUSED and idle — W11b's demotion is real, and the row says so.
+        {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            ws.focused = false;
+            ws.last_key_at = None;
+        }
+        let idle = app.trail_status().expect("a front window exists");
+        for key in [" focused=false", " motion_stage=reduced", " intensity=0.00"] {
+            assert!(idle.contains(key), "missing {key:?} in {idle}");
+        }
+
+        // …then ONE keystroke lands on that same unfocused window. The frame
+        // path now composes at full amplitude — `typed_wake_lets_an_unfocused_
+        // window_paint_its_trail` proves the cells — so the sensor must agree
+        // with the glass rather than re-deriving a darker answer.
+        app.windows.get_mut(&wid).expect("window").last_key_at = Some(Instant::now());
+        let typed = app.trail_status().expect("a front window exists");
+        for key in [" focused=true", " motion_stage=full"] {
+            assert!(typed.contains(key), "missing {key:?} in {typed}");
+        }
+        assert!(
+            !typed.contains(" intensity=0.00"),
+            "a typed-into window is not dark: {typed}"
+        );
+    }
+
+    /// `intensity` is the row's PROVABLY-DARK number, so it folds the ENABLE
+    /// gate beside the policy and shed multiplies. `enabled = false` is the
+    /// engine's sole gate — the teardown emits no geometry whatever amplitude
+    /// the config carries — so an unfolded row printed `intensity=0.70` two
+    /// fields away from its own `glow_active=false`.
+    #[test]
+    fn trail_status_intensity_folds_the_enable_gate() {
+        use crate::WindowId;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).expect("window").focused = true;
+
+        app.config.cursor_trail = Some(false);
+        let dark = app.trail_status().expect("a front window exists");
+        for key in [
+            " config_enabled=false",
+            " effective=false",
+            " intensity=0.00",
+            " glow_active=false",
+        ] {
+            assert!(dark.contains(key), "missing {key:?} in {dark}");
+        }
+
+        // NEGATIVE CONTROL: the fold is the enable gate, not a hard zero — the
+        // same window with the knob on reports the live amplitude again.
+        app.config.cursor_trail = Some(true);
+        let lit = app.trail_status().expect("a front window exists");
+        assert!(lit.contains(" effective=true"), "{lit}");
+        assert!(
+            !lit.contains(" intensity=0.00"),
+            "an enabled, focused, full-motion trail is not dark: {lit}"
+        );
+    }
+
     /// The `motion_focus` RECORDING PIN: an in-flight `video` capture feeds
     /// `true` into the policy's FOCUS input for the RECORDED window only — a
     /// control-socket recording is a watcher, so the unfocused demotion (W11b)
@@ -11424,7 +11718,17 @@ impl App {
     /// [`Self::motion_focus`] (OS focus OR the recording pin) OR'd with a LIVE
     /// TYPED WAKE — a key/text egress into THIS window within
     /// [`CURSOR_FX_TYPED_WAKE`] (`WindowState::last_key_at`, stamped on the
-    /// PTY-bound key path for BOTH input sources, physical and control-socket).
+    /// PTY-bound KEY path — `App::input_to_session`'s
+    /// `Key | Text | KeySequence` arm — for both input sources, physical and
+    /// control-socket).
+    ///
+    /// KNOWN GAP, do not read the line above as more than it says: the stamp is
+    /// on that arm ONLY. `InputEvent::Paste` takes `App::input_paste`, which
+    /// does not stamp — so `ctl paste`, the TEXT phase of `ctl turn`, Cmd-V and
+    /// the X11 async paste worker arm no wake, and an unfocused window pasted
+    /// into is still hard-zeroed. See item 2 of
+    /// `docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`; the repair belongs in
+    /// `app_input.rs`.
     ///
     /// W11b demotes an unfocused window because BACKGROUND motion is pure
     /// decoration — but a window RECEIVING typed input is being driven, and
@@ -11438,7 +11742,9 @@ impl App {
     ///
     /// The wake fires only on typing and expires: an idle unfocused window
     /// still demotes (FL-1's settle is intact — the hold outlives every
-    /// effect's decay, so expiry never chops live light), and OS Reduce-Motion
+    /// effect's decay, so expiry never chops live light; see
+    /// [`CURSOR_FX_TYPED_WAKE`], which is bounded by the FORGE EMBER and the
+    /// rainbow chain, not by the trail), and OS Reduce-Motion
     /// / `motion = "reduced"` / load-shed still zero the amplitude exactly as
     /// [`crate::motion::MotionPolicy::resolve`] proves — like the recording
     /// pin, the wake touches the FOCUS input only, never the mode.
@@ -11789,6 +12095,121 @@ impl App {
             intensity: 0.0,
             warmth: 0.0,
         }
+    }
+
+    /// The `trail status` control-socket verb ([`crate::Wake::TrailStatus`]):
+    /// ONE line of the FOCUSED window's cursor-trail engine truth — the
+    /// resolved style, every gate between the `cursor_trail` knob and the
+    /// glass, the cumulative admission scoreboard, and what light is alive
+    /// right now ([`crate::cursor_glow::TrailStatus`]).
+    ///
+    /// It exists because the trail was the one big effect aterm could NOT
+    /// introspect. `rain status` answers "is the matrix rain on and running",
+    /// `tone status` answers "what did the typing classifier hear", but the
+    /// standing owner report — *"I don't see the rainbow cursor trails"* —
+    /// had no verb at all, so it was investigated by recording video and
+    /// scanning frames for hue diversity. The chain a dark ribbon can break at
+    /// is long (config → serious mode → motion policy → load shed → the
+    /// content proof → the spawn seam → ribbon morphology), and this prints
+    /// every link of it in the order the frame path walks them.
+    ///
+    /// A SIBLING of `trail [<n>]`, not a replacement: that verb prints the
+    /// per-decision ring (what the last few keystrokes decided and why), this
+    /// one prints the standing state (what is true right now, plus totals the
+    /// 32-slot ring has already forgotten). Read-only; the engine records
+    /// everything reported here beside decisions it already made, and no
+    /// admission, morphology or rendering path reads any of it back.
+    ///
+    /// COSTS NOTHING UNASKED — the `rain status` rule. There is no per-frame
+    /// bookkeeping behind it: the tallies are `u64` adds on the admission and
+    /// spawn EDGES (at most twice per keystroke, never per frame), and the
+    /// live-light figures are counted here, on demand, over a bounded resident
+    /// vector.
+    ///
+    /// Reports the CURSOR-EFFECT focus fold ([`Self::cursor_fx_focus`]), not
+    /// raw OS focus: a status read taken during an in-flight `video` capture
+    /// reports the same focus the recorded frames were rendered under, and a
+    /// window being TYPED INTO without OS key focus reports the focus its live
+    /// typed wake earned it — the same bit the frame path fed the policy.
+    /// Never reports typed TEXT — positions, counts, and reason tokens only,
+    /// exactly like the ring.
+    ///
+    /// `Err` when there is no focused window — an honest refusal, never a
+    /// fabricated idle row.
+    pub(crate) fn trail_status(&self) -> Result<String, String> {
+        let Some(id) = self.frontmost_window else {
+            return Err("no focused window".to_string());
+        };
+        let Some(ws) = self.windows.get(&id) else {
+            return Err("no focused window".to_string());
+        };
+        let now = std::time::Instant::now();
+        // The SAME resolution order `tick_cursor_fx` runs — `cursor_fx_focus`,
+        // the full fold (OS focus OR the recording pin OR a LIVE TYPED WAKE),
+        // not the bare `motion_focus` seam — so the row reports the gates the
+        // last frame actually applied rather than a parallel re-derivation that
+        // could drift from it. The difference is the one case this verb was
+        // built to adjudicate: an UNFOCUSED window being TYPED INTO
+        // (control-socket driving, a handoff-adopted window that never saw
+        // `Focused(true)`) is drawing its earned trail, and a row resolved off
+        // `motion_focus` alone would print `focused=false motion_stage=reduced
+        // intensity=0.00` over a lit ribbon — the exact blackout-shaped reading
+        // the sensor exists to disprove.
+        let win_focused = self.cursor_fx_focus(id, ws.focused, now);
+        let mode = self.config.motion_mode();
+        let policy =
+            crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, win_focused);
+        let shed = if mode != crate::motion::MotionMode::Full
+            && self.config.load_adaptive_motion_or_default()
+        {
+            self.shed_envelope(now)
+        } else {
+            1.0
+        };
+        let glow_cfg = self.glow_config();
+        Ok(crate::cursor_glow::TrailStatus {
+            style_raw: self.config.cursor_trail_style_raw(),
+            style: glow_cfg.style,
+            config_enabled: self.config.cursor_trail_or_default(),
+            effective: glow_cfg.enabled,
+            focused: win_focused,
+            motion_stage: match self.motion_policy(win_focused) {
+                crate::motion::MotionPolicy::Full => "full",
+                crate::motion::MotionPolicy::Reduced => "reduced",
+            },
+            motion_mode: match mode {
+                crate::motion::MotionMode::Auto => "auto",
+                crate::motion::MotionMode::Full => "full",
+                crate::motion::MotionMode::Reduced => "reduced",
+            },
+            shed,
+            // 0 EXACTLY when the aurora is provably dark, which means the
+            // ENABLE gate folds in beside the multiplies: `enabled = false` is
+            // the engine's sole gate (`!cfg.enabled` tears the state down and
+            // emits no geometry at all), so the configured amplitude behind it
+            // is a number about a frame that is never drawn. Unfolded, a
+            // `cursor_trail = false` window printed `intensity=0.70` two fields
+            // away from `glow_active=false` — the row contradicting itself.
+            intensity: if glow_cfg.enabled {
+                glow_cfg.intensity
+                    * policy.amplitude(crate::motion::MotionEffect::CursorGlow)
+                    * shed
+            } else {
+                0.0
+            },
+            tally: ws.cursor_glow.admission_tally(),
+            spawns: ws.cursor_glow.spawns(),
+            ribbon_segments: ws.cursor_glow.ribbon_segments(),
+            ribbon_hue_bands: ws.cursor_glow.ribbon_hue_bands(),
+            sparks: ws.cursor_glow.live_sparks(),
+            momentum: ws.cursor_glow.typing_momentum(now),
+            momentum_display: ws.cursor_glow.momentum_display(),
+            speed: ws.cursor_glow.glide_speed(),
+            glow_active: ws.cursor_glow.is_active(),
+            pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
+            cat_active: ws.cursor_cat.is_active(),
+        }
+        .line())
     }
 
     /// The per-frame CURSOR-EFFECT pass for one window, EXTRACTED VERBATIM from
@@ -14843,7 +15264,32 @@ impl App {
             // rows`, so each `cell_frame_into` refills in place and the splice reuses
             // the pooled capacity. The `drain` removes the whole surplus range
             // regardless of the `strip_rows_n` cap (the cap only bounds pool growth).
-            if strip_rows_n > 0 && ws.input_scratch.cells.len() > rows {
+            //
+            // D-2 SPLICE / DMG-1 REACH: when the prior present's prepend was
+            // BLESSED and is still the only host write on this scratch, the
+            // reclaim is upgraded from "salvage the surplus tail" to the exact
+            // INVERSE of the prepend — drain the `row_shift` CHROME rows off the
+            // FRONT (cells, clusters and combining, the three channels a scoped
+            // refill retains), restore the engine row count, and re-arm the
+            // continuity tokens. That is what lets a tab-strip window take the
+            // damage-scoped arm at all: the prepend used to leave the scratch
+            // `strip` rows too tall with `snapshot_seq != engine_fill_seq`, so
+            // `cell_frame_damage_scoped_into` fell back to a FULL re-extract on
+            // literally every frame — the residue a78dd8a1 recorded, and the
+            // reason D-2's keystroke win was muted everywhere
+            // `DEFAULT_TAB_STRIP_ROWS` is not 0.
+            //
+            // Draining the FRONT is what makes the inverse an inverse: the old
+            // tail drain salvaged the same number of buffers but left engine row
+            // `r` sitting at index `r + strip`, which is a stale row waiting to
+            // happen — hence `undo_host_row_prepend` refuses unless every clause
+            // of the inverse holds, and hence the extractor's own `row_shift`
+            // clause refuses a shifted scratch by name.
+            let unspliced = strip_rows_n > 0
+                && ws
+                    .input_scratch
+                    .undo_host_row_prepend(rows, &mut ws.strip_row_pool, strip_rows_n);
+            if !unspliced && strip_rows_n > 0 && ws.input_scratch.cells.len() > rows {
                 let pool = &mut ws.strip_row_pool;
                 for buf in ws.input_scratch.cells.drain(rows..) {
                     if pool.len() >= strip_rows_n {
@@ -16626,6 +17072,47 @@ impl App {
                 && !ws.stream_fade.is_active(frame_started)
             {
                 metrics::note_redraw_early_out();
+                // WHY THE EFFECT TICK MAY NOT STAND DOWN HERE, AND WHY IT NEED
+                // NOT (2026-08-24 responsiveness audit, item 9: "57% of redraws
+                // are effect ticks killed by the early-out").
+                //
+                // MEASURED on this return, at the audit machine's own geometry
+                // (72x150, M5 Max): 18.37 us mean / 49.21 us max, n=3984 — and
+                // 22.30 us mean at 24x80, i.e. the cost does NOT scale with the
+                // grid, because this path never extracts it (that is LOCK B,
+                // below). Split: 6.61 us prologue, 1.41 us inside LOCK A, 10.33
+                // us assembling the RepaintKey — and that last part IS the
+                // decision, so it cannot be skipped by anything that still wants
+                // to make it. A PRESENTED frame on the same instance costs
+                // 0.36-1.17 ms, so an early-out is ~5% of the frame it refuses:
+                // this gate is the saving, not the cost.
+                //
+                // The RATIO is high because the gate works; the RATE is what
+                // spends CPU, and it is small. On the audited live instance:
+                // 34,060 early-outs across 4 h 45 m = ~2/s = ~37 us/s = 0.004% of
+                // one core. The 57% reading was an EPISODE, not a steady state —
+                // over the interval after it the same instance ran 9,304 /
+                // 51,839 = 17.9% — and it was taken while the event loop was
+                // re-arming ~100k stale deadlines/sec (fixed in 420e4164). The
+                // spin was the redraw SOURCE; the effect lane was its passenger.
+                //
+                // Standing the TICK down is refused on the contract, not the
+                // cost. `WindowState::note_deco_animating` arms UPSTREAM of this
+                // gate precisely so a pose whose sub-pixel advance bakes to the
+                // same sprite still owes the next frame, and the ink-decay lane
+                // bypasses this gate outright (`fade_shown` / `stream_fade`
+                // above), so the ticks that MUST present never reach this return.
+                // A tick that stood down on "nothing visible resulted" would be
+                // deciding the next frame from this frame's evidence.
+                //
+                // ACCEPTANCE (reproduces the numbers above):
+                //   aterm ctl --pid <p> resize 72 150
+                //   aterm ctl --pid <p> metrics reset
+                //   # OSC-0 title churn: requests a redraw the RepaintKey cannot
+                //   # distinguish, so every frame lands here.
+                //   while :; do printf '\033]0;probe\007'; sleep 0.004; done
+                //   aterm ctl --pid <p> metrics   # redraw_early_outs/redraw_attempts
+                //
                 // Nothing visible changed since the last present. No lock is held
                 // (LOCK A already dropped, LOCK B not yet taken), so no damage was
                 // consumed — refresh only the window chrome (a title-only change
@@ -28585,5 +29072,907 @@ mod settled_compose_early_out_tests {
         now += Duration::from_millis(16);
         assert!(compose(&mut app, wid, now), "a resize repaints");
         settle(&mut app, wid, &mut now);
+    }
+}
+
+/// THE STRIP-LANE DIFFERENTIAL ORACLE (D-2 SPLICE / DMG-1 reach).
+///
+/// The in-grid tab strip PREPENDS `strip` chrome rows to the composed frame, so
+/// engine row `r` is presented at index `r + strip`. Two separate carriers are
+/// indexed by ENGINE row and were therefore disowned by that prepend, on every
+/// frame, on every platform whose `DEFAULT_TAB_STRIP_ROWS` is not 0:
+///
+///   * DMG-1 — `Terminal::cell_frame_damage_scoped_into` retains the rows the
+///     engine proves untouched. The prepend left the scratch `strip` rows too
+///     tall with `snapshot_seq != engine_fill_seq`, so every frame took the FULL
+///     re-extract arm.
+///   * D-2 — `compute_dirty_rows` answers "did row `r` change?" from the engine's
+///     per-row revision. The lane is stamped in engine row space and the prepend
+///     shifted every OTHER channel, so the length mismatch failed the frame closed.
+///
+/// The fix splices the lane instead of disowning it, and inverts the prepend
+/// before the next refill. THE BAR IS NOT PERFORMANCE: a wrong index here serves
+/// row `r`'s pixels under row `r + strip`'s number — content from a different row
+/// presented as current, which is strictly worse than the work being saved. So
+/// this module is a differential oracle, not a behaviour test: every frame the
+/// incremental path produces is compared, cell for cell, against the same frame
+/// built from a FULL re-extract of the identical terminal state, and the dirty-row
+/// verdict is compared against the lane-disowned brute force.
+///
+/// NON-VACUITY is asserted explicitly, because a corpus that silently fell back
+/// to `Full` on every step would satisfy every equality above while proving
+/// nothing at all: the strip-ON steady state must be OBSERVED taking the scoped
+/// arm and the stamp lane, and the fail-closed steps must be observed failing.
+#[cfg(test)]
+mod strip_lane_oracle {
+    use super::{App, WindowId, term_lock};
+    use aterm_core::render::{FrameRefill, RenderInput};
+    use aterm_render::{DirtyDecision, compute_dirty_rows, row_revisions_comparable};
+
+    const CELL_H: usize = 16;
+
+    /// What a corpus step does to the composed frame AFTER the strip splice —
+    /// the shipping chrome that runs later in the same seam.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Chrome {
+        /// Nothing after the strip: the frame the fix is for.
+        None,
+        /// `splice_find_bar` — overwrites terminal cells in place and bumps
+        /// `snapshot_seq`. MUST cost the next frame its scoped arm.
+        FindBar,
+        /// `splice_settings_panel` — a composited card; it writes NO cells, so
+        /// it must NOT cost the next frame anything.
+        SettingsPanel,
+    }
+
+    struct Step {
+        name: &'static str,
+        strip: usize,
+        engine: fn(&mut aterm_core::terminal::Terminal),
+        chrome: Chrome,
+    }
+
+    /// A window whose scratch and strip state start from nothing, over a
+    /// terminal with a SETTLED damage session — a fresh terminal sits in
+    /// `Damage::Full`, which publishes no lane at all and would make the reach
+    /// floors below vacuous.
+    fn fixture() -> (App, WindowId, usize, usize) {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let (rows, cols) = {
+            let t = term_lock(&terminal);
+            (usize::from(t.rows()), usize::from(t.cols()))
+        };
+        if let Some(ws) = app.windows.get_mut(&wid) {
+            ws.rows = u16::try_from(rows).expect("fixture rows");
+            ws.cols = u16::try_from(cols).expect("fixture cols");
+            ws.input_scratch = RenderInput::empty();
+        }
+        {
+            let mut t = term_lock(&terminal);
+            t.process(b"seed one\r\nseed two\r\nseed three\r\n");
+            t.take_damage();
+        }
+        (app, wid, rows, cols)
+    }
+
+    /// ONE presented frame of the single-pane strip window, modelled at exactly
+    /// the three seams this fix touches and in the shipping order: the resident
+    /// scratch's reclaim/UN-SPLICE (hoisted ahead of LOCK A in `redraw_window`),
+    /// the damage-scoped re-extract under LOCK B, and the tab-strip prepend.
+    ///
+    /// The fallback branch is the pre-fix reclaim verbatim, so a step whose
+    /// prepend could not be inverted still salvages its buffers exactly as before.
+    fn strip_frame(
+        app: &mut App,
+        wid: WindowId,
+        rows: usize,
+        cols: usize,
+        strip: usize,
+        strip_fp: u64,
+    ) -> FrameRefill {
+        strip_frame_with(app, wid, rows, cols, strip, strip_fp, true)
+    }
+
+    /// [`strip_frame`] with the un-splice switchable, so the SCOPED SHARE can be
+    /// measured on the same corpus with and without this fix: `unsplice: false`
+    /// is the pre-fix reclaim verbatim (salvage the surplus TAIL, leave the
+    /// scratch `strip` rows too tall and its continuity tokens broken).
+    fn strip_frame_with(
+        app: &mut App,
+        wid: WindowId,
+        rows: usize,
+        cols: usize,
+        strip: usize,
+        strip_fp: u64,
+        unsplice: bool,
+    ) -> FrameRefill {
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let refill = {
+            let ws = app.windows.get_mut(&wid).expect("fixture window");
+            let unspliced = unsplice
+                && strip > 0
+                && ws
+                    .input_scratch
+                    .undo_host_row_prepend(rows, &mut ws.strip_row_pool, strip);
+            if !unspliced && strip > 0 && ws.input_scratch.cells.len() > rows {
+                let pool = &mut ws.strip_row_pool;
+                for buf in ws.input_scratch.cells.drain(rows..) {
+                    if pool.len() >= strip {
+                        break;
+                    }
+                    pool.push(buf);
+                }
+            }
+            let mut term = term_lock(&terminal);
+            term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols)
+        };
+        app.tab_strip_rows = u16::try_from(strip).expect("fixture strip");
+        app.splice_tab_strip_with(wid, strip_fp);
+        refill
+    }
+
+    /// THE REFERENCE: a full, unconditional re-extract of the SAME terminal
+    /// state, taken before the incremental frame consumes the damage session —
+    /// the exact idiom aterm-core's own DMG-1 oracle uses. `cell_frame` retains
+    /// nothing, so every row of it is freshly resolved from the grid.
+    fn reference(app: &mut App, wid: WindowId, rows: usize, cols: usize) -> RenderInput {
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let mut term = term_lock(&terminal);
+        term.cell_frame(rows, cols)
+    }
+
+    /// Every engine row of the composed frame must be byte-identical to the same
+    /// row of a full re-extract, at its SHIFTED index — the whole correctness
+    /// claim, checked on every channel a damage-scoped refill is allowed to
+    /// retain plus the two it rebuilds (so a rebuild that silently truncated
+    /// would be caught here too).
+    fn assert_engine_band_matches(
+        composed: &RenderInput,
+        reference: &RenderInput,
+        rows: usize,
+        strip: usize,
+        what: &str,
+    ) {
+        assert_eq!(composed.rows, rows + strip, "{what}: composed frame height");
+        assert_eq!(
+            composed.cells.len(),
+            rows + strip,
+            "{what}: composed cell rows"
+        );
+        for r in 0..rows {
+            let f = r + strip;
+            assert_eq!(
+                composed.cells[f], reference.cells[r],
+                "{what}: engine row {r} at composed index {f} is NOT the row a full \
+                 re-extract resolves — a stale row on the user's screen"
+            );
+            assert_eq!(
+                composed.clusters[f], reference.clusters[r],
+                "{what}: engine row {r} clusters diverged at composed index {f}"
+            );
+            assert_eq!(
+                composed.combining[f], reference.combining[r],
+                "{what}: engine row {r} combining marks diverged at composed index {f}"
+            );
+            assert_eq!(
+                composed.images[f], reference.images[r],
+                "{what}: engine row {r} images diverged at composed index {f}"
+            );
+            assert_eq!(
+                composed.line_sizes[f], reference.line_sizes[r],
+                "{what}: engine row {r} line size diverged at composed index {f}"
+            );
+        }
+    }
+
+    /// The lane-disowned verdict: `compute_dirty_rows` down its exact whole-grid
+    /// compare, which is the path every frame the stamp gate refuses still takes.
+    fn brute_force(prev: &RenderInput, cur: &RenderInput, dirty: &mut Vec<bool>) -> DirtyDecision {
+        let mut p = prev.clone();
+        let mut c = cur.clone();
+        p.invalidate_row_revisions();
+        c.invalidate_row_revisions();
+        compute_dirty_rows(&p, &c, false, None, false, None, CELL_H, dirty)
+    }
+
+    fn corpus() -> Vec<Step> {
+        vec![
+            // ---- STRIP OFF: the macOS shape, and the no-regression floor. ----
+            Step {
+                name: "off_idle",
+                strip: 0,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "off_type",
+                strip: 0,
+                engine: |t| t.process(b"x"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "off_type_again",
+                strip: 0,
+                engine: |t| t.process(b"y"),
+                chrome: Chrome::None,
+            },
+            // ---- STRIP ON (1 row): the shape the whole fix is about. ----
+            Step {
+                name: "on1_appear",
+                strip: 1,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_idle",
+                strip: 1,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_type",
+                strip: 1,
+                engine: |t| t.process(b"a"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_type_again",
+                strip: 1,
+                engine: |t| t.process(b"b"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_home_overwrite",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[1;1Hoverwrite"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_newline",
+                strip: 1,
+                engine: |t| t.process(b"\r\nline\r\n"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_erase_line",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[3;1H\x1b[2K"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_sgr_run",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[4;1H\x1b[31;44mred on blue\x1b[0m"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_wide_combining",
+                strip: 1,
+                engine: |t| t.process("\x1b[5;1H漢字 e\u{0301}\u{0302} 🚀".as_bytes()),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_decdwl",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[6;1H\x1b#6wide"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_decdwl_off",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[6;1H\x1b#5"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_after_wide",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[7;1Hplain"),
+                chrome: Chrome::None,
+            },
+            // ---- The chrome that runs AFTER the strip in the shipping seam. ----
+            Step {
+                name: "on1_settings_panel",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[8;1Hpanel"),
+                chrome: Chrome::SettingsPanel,
+            },
+            Step {
+                name: "on1_after_settings",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[8;6H!"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_find_bar",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[9;1Hfindme"),
+                chrome: Chrome::FindBar,
+            },
+            Step {
+                name: "on1_after_find_bar",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[9;8H."),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_settle_after_find",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[9;9H."),
+                chrome: Chrome::None,
+            },
+            // ---- The STRIP ROW COUNT changing mid-session. ----
+            Step {
+                name: "on2_grow",
+                strip: 2,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on2_idle",
+                strip: 2,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on2_type",
+                strip: 2,
+                engine: |t| t.process(b"\x1b[2;1Htwo-row strip"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on2_type_again",
+                strip: 2,
+                engine: |t| t.process(b"!"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_shrink",
+                strip: 1,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_after_shrink",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[2;1Hback to one"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "off_disappear",
+                strip: 0,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "off_after_disappear",
+                strip: 0,
+                engine: |t| t.process(b"\x1b[2;1Hno strip"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_reappear",
+                strip: 1,
+                engine: |_| {},
+                chrome: Chrome::None,
+            },
+            // ---- A SCROLLED-BACK viewport under the strip: must fail closed. ----
+            Step {
+                name: "on1_scroll_back",
+                strip: 1,
+                engine: |t| {
+                    // Build real scrollback first — `scroll_display` on a grid
+                    // with no history is a no-op, and a corpus step that
+                    // silently does nothing proves nothing.
+                    for _ in 0..40 {
+                        t.process(b"scrollback line\r\n");
+                    }
+                    t.grid_mut().scroll_display(3);
+                },
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_scrolled_output",
+                strip: 1,
+                engine: |t| t.process(b"streamed while scrolled\r\n"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_scroll_bottom",
+                strip: 1,
+                engine: |t| {
+                    t.grid_mut().scroll_to_bottom();
+                },
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_settle_after_scroll",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[10;1Hsettled"),
+                chrome: Chrome::None,
+            },
+            // ---- Alt screen: an independent grid AND an independent clock. ----
+            Step {
+                name: "on1_alt_enter",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[?1049h\x1b[1;1Halt buffer"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_alt_write",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[2;1Hmore alt"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_alt_write_again",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[3;1Hstill alt"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_alt_leave",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[?1049l"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_post_alt",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[11;1Hprimary again"),
+                chrome: Chrome::None,
+            },
+            // ---- Glyph-free recolours: the sharpest attack on a content stamp. ----
+            Step {
+                name: "on1_palette_osc4",
+                strip: 1,
+                engine: |t| t.process(b"\x1b]4;1;rgb:00/ff/00\x07"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_default_bg_osc11",
+                strip: 1,
+                engine: |t| t.process(b"\x1b]11;rgb:10/20/30\x07"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_reverse_video_on",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[?5h"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_reverse_video_off",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[?5l"),
+                chrome: Chrome::None,
+            },
+            Step {
+                name: "on1_final_settle",
+                strip: 1,
+                engine: |t| t.process(b"\x1b[12;1Hdone"),
+                chrome: Chrome::None,
+            },
+        ]
+    }
+
+    #[test]
+    fn a_strip_frames_retained_rows_match_a_full_re_extract_over_the_corpus() {
+        let (mut app, wid, rows, cols) = fixture();
+
+        let mut presented: Option<RenderInput> = None;
+        let mut prev_strip = usize::MAX;
+        let mut stamped_dirty: Vec<bool> = Vec::new();
+        let mut brute_dirty: Vec<bool> = Vec::new();
+
+        // Non-vacuity ledgers.
+        let mut scoped_on = 0usize;
+        let mut full_on = 0usize;
+        let mut scoped_off = 0usize;
+        let mut lane_on = 0usize;
+        let mut lane_reported_work = 0usize;
+        let mut prev_offset = 0i32;
+        let mut scrolled_frames = 0usize;
+
+        let steps = corpus();
+        // Two passes: the second re-enters every step from a DIFFERENT prior
+        // state, which is where an order-dependent index bug shows up.
+        for pass in 0..2 {
+            for (i, step) in steps.iter().enumerate() {
+                let terminal = app
+                    .front_terminal(wid)
+                    .expect("front terminal")
+                    .term
+                    .clone();
+                {
+                    let mut t = term_lock(&terminal);
+                    (step.engine)(&mut t);
+                }
+                let what = format!("pass {pass} step {i} ({})", step.name);
+                let reference_frame = reference(&mut app, wid, rows, cols);
+                // The strip fingerprint moves with the row count, so the cached
+                // strip rows are rebuilt whenever the count changes.
+                let fp = u64::try_from(step.strip).unwrap_or(0).wrapping_add(1);
+                let refill = strip_frame(&mut app, wid, rows, cols, step.strip, fp);
+                match step.chrome {
+                    Chrome::None => {}
+                    Chrome::FindBar => {
+                        app.search_enter();
+                        app.splice_find_bar(wid);
+                    }
+                    Chrome::SettingsPanel => app.splice_settings_panel(wid),
+                }
+                if step.chrome != Chrome::FindBar {
+                    app.search_exit();
+                }
+
+                let composed = app.windows[&wid].input_scratch.clone();
+
+                // ---- THE CORRECTNESS CLAIM. ----
+                // (The find-bar step deliberately overwrites terminal cells, so
+                // its band cannot match a re-extract; that step exists for the
+                // FAIL-CLOSED assertion on the frame after it.)
+                if step.chrome != Chrome::FindBar {
+                    assert_engine_band_matches(
+                        &composed,
+                        &reference_frame,
+                        rows,
+                        step.strip,
+                        &what,
+                    );
+                }
+                if step.strip > 0 {
+                    let chrome_rows = app.windows[&wid].cached_strip_rows.clone();
+                    assert_eq!(
+                        chrome_rows.len(),
+                        step.strip,
+                        "{what}: cached strip row count"
+                    );
+                    for (r, want) in chrome_rows.iter().enumerate() {
+                        assert_eq!(
+                            &composed.cells[r], want,
+                            "{what}: composed row {r} is not the painted chrome row"
+                        );
+                    }
+                    assert_eq!(
+                        composed.row_shift, step.strip,
+                        "{what}: the frame must record its own prepend"
+                    );
+                    if composed.row_rev_lane != 0 {
+                        assert_eq!(
+                            composed.row_rev.len(),
+                            rows + step.strip,
+                            "{what}: a live lane must cover the COMPOSED rows"
+                        );
+                        for r in 0..step.strip {
+                            assert_eq!(
+                                composed.row_rev[r], 0,
+                                "{what}: chrome row {r} must read as UNKNOWN, never as a stamp"
+                            );
+                        }
+                        for r in 0..rows {
+                            assert_eq!(
+                                composed.row_rev[r + step.strip],
+                                reference_frame.row_rev[r],
+                                "{what}: engine row {r}'s revision landed at the wrong index"
+                            );
+                        }
+                    }
+                }
+
+                // ---- THE DIRTY-ROW CLAIM, against the lane-disowned brute force. ----
+                if let Some(prev) = presented.as_ref() {
+                    let lane = row_revisions_comparable(prev, &composed);
+                    let got = compute_dirty_rows(
+                        prev,
+                        &composed,
+                        false,
+                        None,
+                        false,
+                        None,
+                        CELL_H,
+                        &mut stamped_dirty,
+                    );
+                    let want = brute_force(prev, &composed, &mut brute_dirty);
+                    assert_eq!(
+                        std::mem::discriminant(&got),
+                        std::mem::discriminant(&want),
+                        "{what}: dirty decision shape diverged"
+                    );
+                    if matches!(got, DirtyDecision::Rows(_)) {
+                        assert_eq!(
+                            stamped_dirty.len(),
+                            brute_dirty.len(),
+                            "{what}: dirty length"
+                        );
+                        for (r, (&g, &w)) in stamped_dirty.iter().zip(&brute_dirty).enumerate() {
+                            assert!(
+                                g || !w,
+                                "{what}: composed row {r} is dirty by CONTENT but clean under \
+                                 the spliced lane — a stale row on the user's screen"
+                            );
+                        }
+                        if lane {
+                            if step.strip > 0 {
+                                lane_on += 1;
+                            }
+                            if stamped_dirty.iter().any(|d| *d) {
+                                lane_reported_work += 1;
+                            }
+                        }
+                    }
+                    // A STRIP-COUNT CHANGE must INVALIDATE, not shift: the rows
+                    // above and below move relative to each other, so the stamps
+                    // of two frames with different shifts may never be compared.
+                    if prev_strip != step.strip {
+                        assert!(
+                            !lane,
+                            "{what}: the lane stayed comparable across a strip-count change \
+                             {prev_strip} -> {} — engine rows moved under their numbers",
+                            step.strip
+                        );
+                    }
+                }
+
+                match (step.strip > 0, refill) {
+                    (true, FrameRefill::Scoped { .. }) => scoped_on += 1,
+                    (true, FrameRefill::Full) => full_on += 1,
+                    (false, FrameRefill::Scoped { .. }) => scoped_off += 1,
+                    (false, FrameRefill::Full) => {}
+                }
+                // FAIL-CLOSED, asserted rather than assumed: the frame AFTER a
+                // find bar overwrote engine cells may not retain anything.
+                if step.name == "on1_after_find_bar" {
+                    assert!(
+                        matches!(refill, FrameRefill::Full),
+                        "{what}: the frame after an in-place cell overwrite MUST re-extract in full"
+                    );
+                }
+                // …and a SCROLLED-BACK viewport likewise, as a law over every
+                // step rather than a guess about which one scrolls: the
+                // revision lane is indexed by LIVE grid row, so a frame filled
+                // at a non-zero display offset may never be retained by the
+                // next one. Counted for non-vacuity below, because a corpus
+                // that never actually scrolled would satisfy this vacuously.
+                if prev_offset != 0 {
+                    assert!(
+                        matches!(refill, FrameRefill::Full),
+                        "{what}: the frame after a SCROLLED-BACK viewport                          (display_offset {prev_offset}) MUST re-extract in full"
+                    );
+                    scrolled_frames += 1;
+                }
+                prev_offset = composed.display_offset;
+
+                prev_strip = step.strip;
+                match presented.as_mut() {
+                    Some(p) => p.clone_from(&composed),
+                    None => presented = Some(composed),
+                }
+            }
+        }
+
+        // ---- NON-VACUITY. A corpus that silently fell back to Full on every
+        // strip frame would satisfy every equality above and prove nothing. ----
+        assert!(
+            scoped_on >= 20,
+            "the strip-ON corpus reached the damage-scoped arm on only {scoped_on} frames — \
+             the oracle is not testing what this fix added (full_on={full_on})"
+        );
+        assert!(
+            full_on >= 4,
+            "the strip-ON corpus never exercised the FALL-BACK arm ({full_on}) — the \
+             fail-closed direction is untested"
+        );
+        assert!(
+            scoped_off >= 2,
+            "the strip-OFF corpus stopped reaching the scoped arm ({scoped_off}) — this fix \
+             regressed the platform that already had it"
+        );
+        assert!(
+            lane_on >= 15,
+            "the SPLICED revision lane was comparable on only {lane_on} strip frames — vacuous"
+        );
+        assert!(
+            lane_reported_work >= 4,
+            "the spliced lane never reported a dirty row ({lane_reported_work}) — vacuous"
+        );
+        assert!(
+            scrolled_frames >= 2,
+            "the corpus never presented a SCROLLED-BACK viewport ({scrolled_frames}) — the              offset clause is untested"
+        );
+        eprintln!(
+            "STRIP-LANE ORACLE: scoped_on={scoped_on} full_on={full_on} scoped_off={scoped_off} \
+             lane_on={lane_on} lane_work={lane_reported_work}"
+        );
+    }
+
+
+    /// THE METRIC THIS FIX IS ACCOUNTABLE TO, pinned rather than reported once:
+    /// the SCOPED SHARE (`frame_refills_scoped` / `frame_refills_full`, the
+    /// counters `metrics::note_frame_refill` publishes) on a TAB-STRIP window.
+    ///
+    /// A time is not the claim here. a78dd8a1 wired the damage-scoped extraction
+    /// into the shipping frontend and recorded its own residue — "strip-band
+    /// windows bump every frame by design" — which is a scoped share of exactly
+    /// ZERO everywhere `DEFAULT_TAB_STRIP_ROWS` is not 0. This test runs the same
+    /// steady-state keystroke corpus twice on one fixture: once with the
+    /// PRE-FIX reclaim (salvage the surplus tail; the prepend is never inverted)
+    /// and once with the un-splice, and prints both shares. If the share does not
+    /// move, the fix did not work regardless of what any timer says.
+    #[test]
+    fn the_strip_window_scoped_share_moves_off_zero() {
+        fn steady_state_share(unsplice: bool) -> (usize, usize) {
+            let (mut app, wid, rows, cols) = fixture();
+            let terminal = app
+                .front_terminal(wid)
+                .expect("front terminal")
+                .term
+                .clone();
+            let mut scoped = 0usize;
+            let mut full = 0usize;
+            // One settling frame, then 64 keystroke echoes — the shape the
+            // frontend produces while a human types into a strip window.
+            let _ = strip_frame_with(&mut app, wid, rows, cols, 1, 1, unsplice);
+            for i in 0..64u8 {
+                {
+                    let mut t = term_lock(&terminal);
+                    t.process(if i.is_multiple_of(2) { b"\rx" } else { b"\ry" });
+                }
+                match strip_frame_with(&mut app, wid, rows, cols, 1, 1, unsplice) {
+                    FrameRefill::Scoped { .. } => scoped += 1,
+                    FrameRefill::Full => full += 1,
+                }
+            }
+            (scoped, full)
+        }
+
+        let (before_scoped, before_full) = steady_state_share(false);
+        let (after_scoped, after_full) = steady_state_share(true);
+        eprintln!(
+            "STRIP SCOPED SHARE  before: scoped={before_scoped} full={before_full} \
+             ({:.0}%)  after: scoped={after_scoped} full={after_full} ({:.0}%)",
+            100.0 * before_scoped as f64 / (before_scoped + before_full) as f64,
+            100.0 * after_scoped as f64 / (after_scoped + after_full) as f64,
+        );
+        assert_eq!(
+            before_scoped, 0,
+            "the PRE-FIX reclaim is supposed to score zero scoped frames on a strip \
+             window; if it does not, this test is measuring the wrong thing"
+        );
+        assert!(
+            after_scoped >= 60,
+            "a settled strip window reached the damage-scoped arm on only \
+             {after_scoped}/64 keystroke frames — the fix did not reach the shipping shape"
+        );
+    }
+
+    /// THE SHARPEST SHAPE, isolated from the corpus so it can never be diluted:
+    /// a strip window in a settled steady state must take the scoped arm, and the
+    /// row it retains must be the row a full re-extract resolves — while a
+    /// strip-count CHANGE on the very next frame must throw the retention away.
+    #[test]
+    fn a_strip_count_change_invalidates_rather_than_shifts() {
+        let (mut app, wid, rows, cols) = fixture();
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&terminal).process(b"\x1b[1;1HROW-ZERO\x1b[2;1HROW-ONE");
+
+        // Settle: two strip-1 frames, the second of which must retain.
+        let _ = strip_frame(&mut app, wid, rows, cols, 1, 1);
+        term_lock(&terminal).process(b"\x1b[2;9H!");
+        let settled_ref = reference(&mut app, wid, rows, cols);
+        let refill = strip_frame(&mut app, wid, rows, cols, 1, 1);
+        assert!(
+            matches!(refill, FrameRefill::Scoped { .. }),
+            "a settled strip window must reach the damage-scoped arm; got {refill:?}"
+        );
+        let one = app.windows[&wid].input_scratch.clone();
+        assert_engine_band_matches(&one, &settled_ref, rows, 1, "settled strip-1");
+        assert!(
+            one.cells[1]
+                .iter()
+                .map(|c| c.ch)
+                .collect::<String>()
+                .starts_with("ROW-ZERO"),
+            "the retained top engine row must sit at composed index 1"
+        );
+
+        // Grow the strip to 2. Composed index 2 is now engine row 0, which the
+        // PREVIOUS frame served at index 1: comparing stamps across that would
+        // serve one row's pixels under another row's number.
+        let grown_ref = reference(&mut app, wid, rows, cols);
+        let _ = strip_frame(&mut app, wid, rows, cols, 2, 2);
+        let two = app.windows[&wid].input_scratch.clone();
+        assert_engine_band_matches(&two, &grown_ref, rows, 2, "grown strip-2");
+        assert!(
+            !row_revisions_comparable(&one, &two),
+            "the stamp gate compared two frames whose engine rows are one index apart"
+        );
+        assert_eq!(one.row_shift, 1, "the strip-1 frame records its own prepend");
+        assert_eq!(two.row_shift, 2, "the strip-2 frame records its own prepend");
+    }
+
+    /// The token that carries the whole proof: only an engine fill and a BLESSED
+    /// prepend may leave `snapshot_seq == shifted_fill_seq`. Any other host cell
+    /// write bumps the seq alone, and both gates then fail closed — the
+    /// fail-closed direction is the DEFAULT, not a case somebody remembered.
+    #[test]
+    fn any_host_cell_write_before_the_prepend_disowns_the_lane() {
+        let (mut app, wid, rows, cols) = fixture();
+        let terminal = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        term_lock(&terminal).process(b"\x1b[1;1Hcontent");
+
+        // A clean prepend keeps the lane.
+        let _ = strip_frame(&mut app, wid, rows, cols, 1, 1);
+        let clean = app.windows[&wid].input_scratch.clone();
+        assert_ne!(clean.row_rev_lane, 0, "a blessed prepend keeps the lane");
+        assert_eq!(
+            clean.snapshot_seq, clean.shifted_fill_seq,
+            "a blessed prepend re-arms the provenance token"
+        );
+
+        // Now the ghost-paint shape: a host writes a cell (bumping the seq, the
+        // established discipline) BEFORE the prepend runs.
+        term_lock(&terminal).process(b"\x1b[1;1Hcontent2");
+        {
+            let ws = app.windows.get_mut(&wid).expect("fixture window");
+            let unspliced = ws
+                .input_scratch
+                .undo_host_row_prepend(rows, &mut ws.strip_row_pool, 1);
+            assert!(unspliced, "the clean prepend must be invertible");
+            let mut t = term_lock(&terminal);
+            let _ = t.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
+            drop(t);
+            ws.input_scratch.cells[0][0].ch = '~';
+            ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
+        }
+        app.tab_strip_rows = 1;
+        app.splice_tab_strip_with(wid, 1);
+        let dirty = app.windows[&wid].input_scratch.clone();
+        assert_eq!(
+            dirty.row_rev_lane, 0,
+            "a prepend applied on top of a host cell write must DISOWN the lane"
+        );
+        assert_eq!(
+            dirty.shifted_fill_seq, 0,
+            "…and must not leave a provenance token behind"
+        );
+        assert_eq!(
+            dirty.row_shift, 1,
+            "…while still recording the physical prepend, so it can be counted"
+        );
+        assert!(
+            !row_revisions_comparable(&clean, &dirty),
+            "the stamp gate accepted a frame whose cells a host had overwritten"
+        );
+
+        // …and the un-splice refuses it, so the NEXT extract cannot retain rows
+        // whose bytes the host changed.
+        let ws = app.windows.get_mut(&wid).expect("fixture window");
+        let mut pool = Vec::new();
+        assert!(
+            !ws.input_scratch.undo_host_row_prepend(rows, &mut pool, 1),
+            "the un-splice accepted an unblessed prepend"
+        );
     }
 }

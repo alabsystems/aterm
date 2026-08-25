@@ -48,10 +48,12 @@ pub mod font_catalog;
 pub mod font_chain;
 pub mod font_file;
 pub mod hdr;
-/// LINUX CRISPNESS (W13): grid-fitted (hinted) glyph outlines for the native
-/// non-macOS raster path — fontdue has no hinting, so 1.0-scale desktop text
-/// read fuzzy there. The Linux twin of the `ct_glyph` seam; see its docs.
-#[cfg(all(unix, not(target_os = "macos")))]
+/// NATIVE CRISPNESS (W13 Linux, then Windows): grid-fitted (hinted) glyph
+/// outlines for the native non-macOS raster paths — fontdue has no hinting, so
+/// 1.0-scale desktop text read fuzzy there. The non-CoreText twin of the
+/// `ct_glyph` seam; see its docs. The wasm consumer keeps the plain fontdue
+/// path and compiles none of it (the dependency is target-gated to match).
+#[cfg(any(all(unix, not(target_os = "macos")), windows))]
 mod hinted;
 pub mod ligature_shaping;
 pub mod procedural;
@@ -228,6 +230,14 @@ fn interned_parsed_font_lookup(bytes: &[u8]) -> Option<InternedFace> {
 
 /// One entry of [`SHARED_PARSED_FACES`]: the source bytes that were parsed, the
 /// collection index they were parsed at, and a WEAK handle to the parse.
+///
+/// `font` may be DEAD (including [`std::sync::Weak::new`], never yet armed)
+/// while `bytes` is very much alive: a face whose fontdue parse is DEFERRED
+/// ([`LazyFontdue`]) registers its byte handle here the moment it is READ
+/// ([`shared_face_bytes`]), long before anything parses it. That registration is
+/// what makes the eventual parse — the styled tier materialising, or the GUI
+/// chrome asking [`shared_parsed_face`] for the same `-Bold.ttf` — ADOPT this
+/// handle instead of publishing a second copy of the file.
 struct SharedFace {
     bytes: std::sync::Arc<[u8]>,
     index: u32,
@@ -261,10 +271,12 @@ struct SharedFace {
 /// another thread's font parse would be worse than the duplicate.
 static SHARED_PARSED_FACES: std::sync::Mutex<Vec<SharedFace>> = std::sync::Mutex::new(Vec::new());
 
-/// Hard cap on live cache entries. A terminal has one primary face plus the
-/// chrome's; the slack covers split panes mid-font-change. Never a correctness
-/// bound — an evicted entry only costs a re-parse, never a wrong face.
-const SHARED_PARSED_FACE_SLOTS: usize = 8;
+/// Hard cap on live cache entries. A terminal has one primary face, the
+/// chrome's, and up to three styled siblings whose byte handles live here
+/// BEFORE any parse does ([`shared_face_bytes`]); the slack covers split panes
+/// mid-font-change. Never a correctness bound — an evicted entry only costs a
+/// re-parse or a second byte copy, never a wrong face.
+const SHARED_PARSED_FACE_SLOTS: usize = 12;
 
 /// The parsed face for `bytes` at `index`, reusing a live parse of the IDENTICAL
 /// bytes when one exists. Returns the shared source-byte handle alongside it, so
@@ -278,42 +290,155 @@ pub fn shared_parsed_face(
     bytes: &[u8],
     index: u32,
 ) -> Result<(std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>), String> {
-    {
-        let mut store = SHARED_PARSED_FACES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Prune first: a dead weak handle also releases its key bytes.
-        store.retain(|entry| entry.font.strong_count() > 0);
-        if let Some((src, font)) = store.iter().find_map(|entry| {
-            (entry.index == index && entry.bytes.len() == bytes.len() && &*entry.bytes == bytes)
-                .then(|| entry.font.upgrade().map(|font| (entry.bytes.clone(), font)))
-                .flatten()
-        }) {
-            return Ok((src, font));
-        }
+    if let Some(hit) = shared_parsed_face_lookup(bytes, index) {
+        return Ok(hit);
     }
     // Parse OUTSIDE the lock (a broad face costs hundreds of ms); a racer's
-    // duplicate result is dropped by the re-check below.
-    let parsed = fontdue::Font::from_bytes(
+    // duplicate result is dropped by the re-check inside the publish.
+    let font = parse_face_at(bytes, index)?;
+    Ok(shared_parsed_face_publish(
+        bytes,
+        || std::sync::Arc::from(bytes),
+        index,
+        font,
+    ))
+}
+
+/// [`shared_parsed_face`] for a caller that ALREADY holds the source bytes in an
+/// `Arc<[u8]>` — the styled tier, whose faces carry their own handle. The
+/// caller's handle becomes the store's key, so a materialised face costs ZERO
+/// extra bytes; the plain entry point has only a slice and must copy.
+fn shared_parsed_face_owned(
+    bytes: &std::sync::Arc<[u8]>,
+    index: u32,
+) -> Result<std::sync::Arc<fontdue::Font>, String> {
+    if let Some((_, font)) = shared_parsed_face_lookup(bytes, index) {
+        return Ok(font);
+    }
+    let font = parse_face_at(bytes, index)?;
+    Ok(shared_parsed_face_publish(bytes, || bytes.clone(), index, font).1)
+}
+
+/// The one parse both entry points use, at the requested COLLECTION index.
+fn parse_face_at(bytes: &[u8], index: u32) -> Result<std::sync::Arc<fontdue::Font>, String> {
+    fontdue::Font::from_bytes(
         bytes,
         fontdue::FontSettings {
             collection_index: index,
             ..fontdue::FontSettings::default()
         },
     )
-    .map_err(|e| e.to_string())?;
-    let font = std::sync::Arc::new(parsed);
-    let src: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    .map(std::sync::Arc::new)
+    .map_err(|e| e.to_string())
+}
+
+/// The store's byte handle for `bytes` at `index` WITHOUT parsing anything: an
+/// identical live registration when one exists (two renderers discovering the
+/// same `-Bold.ttf` share ONE copy of the file), otherwise a fresh copy that is
+/// itself registered.
+///
+/// This is the half of [`shared_parsed_face`] that a DEFERRED face needs. Its
+/// parse is the thing being avoided, so it cannot reach the store the usual way
+/// — and a face the store has never heard of is invisible to it: whoever parses
+/// those same bytes FIRST (the GUI chrome's `chrome_bold_face` →
+/// [`shared_parsed_face`], which in the shipping order runs before any terminal
+/// cell asks) publishes a SECOND copy, and the file is resident twice for the
+/// life of the process. Registering the handle at READ time closes that: the
+/// eventual parse adopts this entry ([`shared_parsed_face_publish`]).
+fn shared_face_bytes(bytes: &[u8], index: u32) -> std::sync::Arc<[u8]> {
     let mut store = SHARED_PARSED_FACES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some((src, font)) = store.iter().find_map(|entry| {
-        (entry.index == index && entry.bytes.len() == bytes.len() && &*entry.bytes == bytes)
+    shared_faces_prune(&mut store);
+    if let Some(entry) = store
+        .iter()
+        .find(|entry| shared_face_is(entry, bytes, index))
+    {
+        return entry.bytes.clone();
+    }
+    let src: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
+    if store.len() >= SHARED_PARSED_FACE_SLOTS {
+        store.remove(0);
+    }
+    store.push(SharedFace {
+        bytes: src.clone(),
+        index,
+        // Unarmed: nothing has parsed these bytes yet. The first publisher of a
+        // parse for them takes this slot over rather than allocating its own.
+        font: std::sync::Weak::new(),
+    });
+    src
+}
+
+/// The ONE keying predicate for [`SHARED_PARSED_FACES`], so no lookup, publish
+/// or byte-handle path can drift from another. Byte equality, never a digest
+/// (see [`shared_parsed_face`]); the length pre-filters the compare.
+fn shared_face_is(entry: &SharedFace, bytes: &[u8], index: u32) -> bool {
+    entry.index == index && entry.bytes.len() == bytes.len() && &*entry.bytes == bytes
+}
+
+/// Drop entries nothing outside the store still needs.
+///
+/// An entry whose parse is dead but whose BYTES another holder still retains
+/// STAYS: that is a deferred face's registration ([`shared_face_bytes`]), and
+/// dropping it is precisely what makes the eventual parse of those bytes
+/// allocate a second copy of the file. Once the last outside holder lets go,
+/// `strong_count` falls to the store's own reference and the entry goes.
+fn shared_faces_prune(store: &mut Vec<SharedFace>) {
+    store.retain(|entry| {
+        entry.font.strong_count() > 0 || std::sync::Arc::strong_count(&entry.bytes) > 1
+    });
+}
+
+/// The live shared parse for `(bytes, index)`, pruning entries whose last holder
+/// has dropped. `None` for a byte-handle-only entry — those carry no parse yet,
+/// and the caller must make one.
+fn shared_parsed_face_lookup(
+    bytes: &[u8],
+    index: u32,
+) -> Option<(std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>)> {
+    let mut store = SHARED_PARSED_FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared_faces_prune(&mut store);
+    store.iter().find_map(|entry| {
+        shared_face_is(entry, bytes, index)
             .then(|| entry.font.upgrade().map(|font| (entry.bytes.clone(), font)))
             .flatten()
-    }) {
-        return Ok((src, font));
+    })
+}
+
+/// Publish a freshly parsed face, re-checking under the lock so a racer that
+/// interned identical bytes while we parsed wins and our duplicate is dropped.
+/// `key` supplies the store's byte handle ONLY when there is no entry for these
+/// bytes at all — which is what lets a caller that already owns an `Arc` hand it
+/// over without the plain entry point's copy.
+///
+/// An entry that exists WITHOUT a live parse — a deferred face's byte handle, or
+/// a parse whose last holder dropped between the lookup and here — is ADOPTED:
+/// our parse arms it, and the handle we hand back is the copy already resident.
+/// That is what keeps a materialising styled slot and the chrome's parse of the
+/// same `-Bold.ttf` on ONE copy of the file whichever of them gets there first.
+fn shared_parsed_face_publish(
+    bytes: &[u8],
+    key: impl FnOnce() -> std::sync::Arc<[u8]>,
+    index: u32,
+    font: std::sync::Arc<fontdue::Font>,
+) -> (std::sync::Arc<[u8]>, std::sync::Arc<fontdue::Font>) {
+    let mut store = SHARED_PARSED_FACES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = store
+        .iter_mut()
+        .find(|entry| shared_face_is(entry, bytes, index))
+    {
+        if let Some(live) = entry.font.upgrade() {
+            return (entry.bytes.clone(), live);
+        }
+        entry.font = std::sync::Arc::downgrade(&font);
+        return (entry.bytes.clone(), font);
     }
+    let src = key();
     if store.len() >= SHARED_PARSED_FACE_SLOTS {
         store.remove(0);
     }
@@ -322,7 +447,7 @@ pub fn shared_parsed_face(
         index,
         font: std::sync::Arc::downgrade(&font),
     });
-    Ok((src, font))
+    (src, font)
 }
 
 /// Colours as 0x00RR_GGBB: default foreground/background, the block cursor
@@ -1319,16 +1444,17 @@ pub struct Renderer {
     /// (byte-identical to before); `false` renders such cells with the regular
     /// face. Real styled faces are unaffected (they are not synthesis).
     synthetic_styles: bool,
-    /// LINUX CRISPNESS (W13): how the native raster path grid-fits outlines
-    /// (`ATERM_FONT_HINTING`, resolved once at construction; `Off` under
-    /// `ATERM_RASTERIZER=fontdue`, so the portable/deterministic path the
-    /// golden/parity tests export stays bit-stable). See [`hinted`].
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// NATIVE CRISPNESS (W13 Linux, then Windows): how the native raster path
+    /// grid-fits outlines (`ATERM_FONT_HINTING`, resolved once at construction;
+    /// `Off` under `ATERM_RASTERIZER=fontdue`, so the portable/deterministic
+    /// path the golden/parity tests export stays bit-stable). See [`hinted`].
+    #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     hint_mode: hinted::HintMode,
-    /// Per-(face, px) skrifa `HintingInstance` memo — the [`hinted`] twin of
-    /// `ct_cache` (building one replays `fpgm`/`prep`, so never per glyph).
-    /// CLEARED on `set_px` (instances are size-specific), like `ct_cache`.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// Per-(face, px, variation slot) skrifa `HintingInstance` memo — the
+    /// [`hinted`] twin of `ct_cache` (building one replays `fpgm`/`prep`, so
+    /// never per glyph). CLEARED on `set_px` (instances are size-specific) and
+    /// on `refresh_variations` (they are instance-specific), like `ct_cache`.
+    #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     hint_bank: hinted::HintBank,
     /// LINUX SUBPIXEL stage 1 ([`subpixel`], RFC-linux-subpixel-text §4.1):
     /// panel geometry for per-channel coverage in the CPU compositor
@@ -1375,6 +1501,25 @@ pub struct Renderer {
     primary_path: Option<String>,
     /// Whether [`ensure_styled_faces`] has run (it tries the disk read exactly once).
     styled_loaded: bool,
+    /// Per styled slot: the [`StyledFaceId`] of a face whose DEFERRED fontdue
+    /// parse turned out to fail, awaiting [`Renderer::apply_pending_styled_retires`]
+    /// at the next frame boundary. `None` = nothing condemned in that slot.
+    ///
+    /// The discovery is made mid-frame, in [`Renderer::rasterize`], where the
+    /// slot CANNOT be dropped on the spot: [`Renderer::run_face_pick`] reads
+    /// slot PRESENCE, so dropping it would make the plan already in flight
+    /// re-pick another face for glyph ids only the dropped face owns. While the
+    /// condemnation stands the slot stays present and every such id is refused
+    /// instead; [`Renderer::begin_frame_boundary`] — the seam every backend
+    /// crosses exactly once per frame, BEFORE it plans its first row — is where
+    /// the retire actually happens.
+    ///
+    /// The ID, not a bare flag, because the two moments are a frame apart and the
+    /// slot can be REPLACED in between ([`Renderer::set_styled_font_bytes`]): a
+    /// verdict about the old face must not execute on its successor. The apply
+    /// retires only while the slot still holds the condemned face, and drops the
+    /// condemnation either way.
+    styled_retire_pending: [Option<StyledFaceId>; 3],
     /// A worker has settled every path-backed primary/style/fallback/symbol/emoji
     /// source and closed runtime system discovery.  Only such a generation may
     /// be reconstructed by [`Self::rebuild_from_admitted`]; otherwise a zoom
@@ -2618,24 +2763,93 @@ fn select_rasterizer() -> RasterKind {
     }
 }
 
+/// Process-unique identity of ONE installed [`StyledFace`], minted at
+/// construction and never reused.
+///
+/// A deferred parse can only be found to FAIL mid-frame, where the slot cannot
+/// be dropped on the spot, so the retire it earns is recorded as pending
+/// ([`Renderer::styled_retire_pending`]) and applied at the next frame boundary.
+/// A pending retire is therefore a fact about the face that was in the slot WHEN
+/// THE CONDEMNATION WAS RECORDED — and between the two moments the slot may be
+/// REPLACED outright ([`Renderer::set_styled_font_bytes`], a host injection whose
+/// bytes were eagerly parsed and never failed anything). The condemnation carries
+/// this id so the apply can check it still names the face in the slot; otherwise
+/// the innocent replacement is dropped for its predecessor's failure.
+///
+/// NOT the bytes' ADDRESS: [`Renderer::retire_unparsable_styled`] frees a face's
+/// bytes and a later allocation can land on the same address — the exact aliasing
+/// hazard [`Renderer::clear_face_address_caches`] exists for, and one a pointer
+/// identity would walk straight into. A monotonic counter cannot alias.
+type StyledFaceId = u64;
+
+/// Mint the next [`StyledFaceId`]. Process-global on purpose: styled faces are
+/// CLONED between renderers ([`Renderer::fork_semantic_surface`],
+/// [`Renderer::rebuild_from_admitted`]) — a clone is the same face and keeps its
+/// id, and no renderer may ever mint an id another one already handed out.
+/// Relaxed: the counter needs uniqueness, not ordering against other state.
+fn next_styled_face_id() -> StyledFaceId {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A REAL styled (bold / italic / bold-italic) face plus everything needed to
-/// rasterize it FAITHFULLY: the parsed fontdue font, its raw bytes, and its
-/// collection index. The bytes + index let us resolve a glyph id through the
-/// face's own UNICODE cmap (ttf-parser) — fontdue's by-char lookup prefers the
-/// legacy Mac-Roman cmap on Apple `.ttc` faces (`é`→`È`, …), so rasterizing a
-/// styled cell by char would re-introduce on the styled path the very mis-map the
-/// primary path fixes. They are also what a macOS CoreText rasterizer needs to
-/// build a `CTFont` whose glyph order matches these ids. `gid_cache` memoizes the
-/// per-char Unicode-cmap lookup so the hot path pays it once.
+/// rasterize it FAITHFULLY: the (lazily materialised) fontdue font, its raw
+/// bytes, and its collection index. The bytes + index let us resolve a glyph id
+/// through the face's own UNICODE cmap (ttf-parser) — fontdue's by-char lookup
+/// prefers the legacy Mac-Roman cmap on Apple `.ttc` faces (`é`→`È`, …), so
+/// rasterizing a styled cell by char would re-introduce on the styled path the
+/// very mis-map the primary path fixes. They are also what a macOS CoreText
+/// rasterizer needs to build a `CTFont` whose glyph order matches these ids.
+/// `gid_cache` memoizes the per-char Unicode-cmap lookup so the hot path pays
+/// it once.
+///
+/// `font` is a [`LazyFontdue`] for the same reason the fallback chain's is:
+/// `fontdue::Font::from_bytes` materialises every glyph outline, MEASURED on
+/// this machine at 8.7 / 6.7 / 6.5 MB of live heap for DejaVu Sans Mono's
+/// Bold / Oblique / BoldOblique siblings — 21.9 MB an idle terminal paid at
+/// seal for three faces it may never draw. The DISK READ stays where it was
+/// (`ensure_styled_faces`, on the font worker), so the render thread still
+/// never does font I/O; only the parse moves to the first caller that
+/// genuinely needs a fontdue face.
 #[derive(Clone)]
 struct StyledFace {
-    font: std::sync::Arc<fontdue::Font>,
+    font: LazyFontdue,
     bytes: std::sync::Arc<[u8]>,
     index: u32,
     gid_cache: FxHashMap<char, Option<u16>>,
+    /// WHICH face this is ([`StyledFaceId`]) — what a pending retire condemns,
+    /// so replacing the slot cannot leave the replacement wearing the
+    /// predecessor's sentence. Carried through `Clone`: a cloned face IS the
+    /// same face (same bytes, same index, same parse verdict).
+    id: StyledFaceId,
 }
 
 impl StyledFace {
+    /// The parsed face, materialised from the resident bytes on first call.
+    /// `None` means fontdue REJECTED bytes [`fontdue_admissible`] admitted —
+    /// the permissive-error case [`Renderer::retire_unparsable_styled`] acts on.
+    ///
+    /// Call this only where a fontdue face is genuinely ABOUT TO DRAW. Coverage
+    /// questions go to [`Self::covers`], which answers the same thing off the
+    /// cmap without materialising anything.
+    fn parsed(&self) -> Option<&std::sync::Arc<fontdue::Font>> {
+        self.font.get_at(&self.bytes, self.index)
+    }
+
+    /// Whether this face has a glyph for `ch` — fontdue's own verdict, computed
+    /// WITHOUT fontdue's parse ([`fontdue_cmap_covers`]).
+    ///
+    /// The styled tier's twin of `fallback_has`: routing runs on the render
+    /// thread, and asking [`Self::parsed`] there would materialise 6.5–8.7 MB of
+    /// outlines mid-frame for a face the macOS path then never draws from
+    /// (CoreText rasterizes from the bytes). `ttf_parser::Face::parse` is a lazy
+    /// table-directory read with no outline work, and this runs once per glyph
+    /// CACHE MISS — never per cell — which is the same deal `fallback_has`
+    /// already takes uncached.
+    fn covers(&self, ch: char) -> bool {
+        fontdue_cmap_covers(&self.bytes, self.index, ch)
+    }
+
     /// Glyph id for `ch` on this face via its Unicode cmap (ttf-parser, NOT
     /// fontdue's Mac-Roman-prone lookup), memoized. `None` (incl. a `.notdef`/0
     /// mapping) means this face has no glyph for `ch`.
@@ -2853,6 +3067,32 @@ impl LazyFontdue {
         self.0.get().and_then(Option::as_ref)
     }
 
+    /// [`Self::get`] for a face at `index` INSIDE `bytes` (a `.ttc` sibling, or
+    /// a styled sibling file at its own index 0), materialising through
+    /// [`shared_parsed_face`] — the store the eager styled parse already used,
+    /// so a `-Bold.ttf` the GUI chrome also draws bold labels from stays ONE
+    /// parse. [`Self::get`]'s `intern_parsed_font` cannot serve this: it parses
+    /// at collection index 0 unconditionally, which is the WRONG FACE for a
+    /// collection slot.
+    ///
+    /// The caller's own `Arc` becomes the store's key
+    /// ([`shared_parsed_face_owned`]), so materialising adds NO copy of bytes
+    /// the face is already holding — and a later chrome parse of the same
+    /// `-Bold.ttf` converges on this handle instead of allocating its own.
+    fn get_at(
+        &self,
+        bytes: &std::sync::Arc<[u8]>,
+        index: u32,
+    ) -> Option<&std::sync::Arc<fontdue::Font>> {
+        if self.0.get().is_none() {
+            // Parse OUTSIDE the cell, exactly as `get` does and for the same
+            // reason (never block a render thread behind another's parse).
+            let parsed = shared_parsed_face_owned(bytes, index).ok();
+            let _ = self.0.set(parsed);
+        }
+        self.0.get().and_then(Option::as_ref)
+    }
+
     /// Whether materialisation has already been ATTEMPTED and FAILED. Never
     /// parses — a pure read of the cached verdict, safe on the render thread.
     fn known_bad(&self) -> bool {
@@ -3037,6 +3277,51 @@ fn fontdue_admissible(bytes: &[u8], index: u32) -> bool {
         }
     }
     ok
+}
+
+/// Whether `fontdue::Font::lookup_glyph_index(ch)` would answer NON-ZERO for the
+/// face at `index` in `bytes` — read off the cmap with ttf-parser, WITHOUT
+/// fontdue's parse.
+///
+/// WHY IT EXISTS. Coverage is a RENDER-THREAD question (`styled_face_slot`,
+/// `glyph_key_styled`), and asking a [`LazyFontdue`] face is what MATERIALISES
+/// it: 8.7 MB of outlines and a synchronous mid-frame stall for the first styled
+/// cell, on a macOS path where CoreText then draws from the bytes and the fontdue
+/// face is never used at all. That is moving the cost, not removing it. The
+/// fallback tier already refuses that deal — `fallback_has` and
+/// `symbol_fallback_has` read the ttf-parser cmap — and this gives the styled
+/// tier the same escape.
+///
+/// EXACTLY FONTDUE'S ANSWER, NOT A BETTER ONE. fontdue 0.9.3 builds its
+/// `char_to_glyph` map by walking EVERY cmap subtable and inserting only
+/// NON-ZERO mappings; a later subtable overwrites an earlier one, but since zero
+/// is never stored, the map holds `ch` iff SOME subtable maps it non-zero. That
+/// is the predicate here. It is deliberately NOT ttf-parser's
+/// `Face::glyph_index` (best UNICODE subtable only): on an Apple `.ttc` the two
+/// disagree — that is the Mac-Roman mis-map [`StyledFace::unicode_gid`] exists
+/// for — and changing which face a styled cell ROUTES to is not something
+/// deferring a parse is allowed to do. The routing lattice is proven against
+/// fontdue's answer, so fontdue's answer is what this reproduces.
+///
+/// CAVEATS, in the same spirit as [`fontdue_admissible`]'s. The workspace links
+/// ttf-parser 0.25 and fontdue links 0.21, so the cmap is read by a different
+/// parser version. And fontdue ENUMERATES each subtable (`codepoints`) where
+/// this QUERIES it, which differs for a format-4 subtable at `U+FFFF` (the
+/// segment sentinel `codepoints` stops at, a noncharacter no cell ever holds)
+/// and after a malformed mid-table sentinel. Both can only make this too
+/// PERMISSIVE — an extra route to the real styled face, which then draws the
+/// same `.notdef` the primary would. `styled_coverage_probe_agrees_with_fontdue`
+/// holds it against fontdue itself over every real face on the machine.
+fn fontdue_cmap_covers(bytes: &[u8], index: u32, ch: char) -> bool {
+    let Ok(face) = ttf_parser::Face::parse(bytes, index) else {
+        return false;
+    };
+    let Some(cmap) = face.tables().cmap else {
+        return false;
+    };
+    cmap.subtables
+        .into_iter()
+        .any(|subtable| subtable.glyph_index(ch as u32).is_some_and(|g| g.0 != 0))
 }
 
 /// Runtime per-codepoint font-fallback resolver (M3 FONT-DISCOVERY).
@@ -4874,6 +5159,26 @@ pub enum FacePick {
 /// A REGULAR request is always `Primary`.
 #[must_use]
 pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool; 3]) -> FacePick {
+    resolve_styled_face_lazy(style, injected_bold, |slot| covers[slot])
+}
+
+/// [`resolve_styled_face`] over a coverage ORACLE instead of a precomputed
+/// array — the SAME decision tree and the only implementation of it, so nothing
+/// can drift between the two forms and the exhaustive proofs of the eager one
+/// are proofs of this one.
+///
+/// It exists because asking a styled slot whether it covers a char MATERIALISES
+/// that slot's deferred fontdue parse (6.5–8.7 MB per DejaVu sibling), and the
+/// eager `[bool; 3]` asked all THREE for every styled cell — so one bold prompt
+/// paid for italic and bold-italic faces nothing ever drew. Evaluated through
+/// the tree, a BOLD cell probes slot 0 only, an ITALIC cell slot 1 only, and a
+/// BOLD-ITALIC cell stops at slot 2 when a real bold-italic face exists. That
+/// probe set is pinned by `lazy_styled_face_probes_only_the_slots_it_needs`.
+fn resolve_styled_face_lazy(
+    style: StyleBits,
+    injected_bold: bool,
+    mut covers: impl FnMut(usize) -> bool,
+) -> FacePick {
     let bold = style.contains(StyleBits::BOLD);
     let italic = style.contains(StyleBits::ITALIC);
     match (bold, italic) {
@@ -4883,7 +5188,7 @@ pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool;
                 FacePick::InjectedBold {
                     synthetic: StyleBits::REGULAR,
                 }
-            } else if covers[0] {
+            } else if covers(0) {
                 FacePick::Styled {
                     slot: 0,
                     synthetic: StyleBits::REGULAR,
@@ -4893,7 +5198,7 @@ pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool;
             }
         }
         (false, true) => {
-            if covers[1] {
+            if covers(1) {
                 FacePick::Styled {
                     slot: 1,
                     synthetic: StyleBits::REGULAR,
@@ -4903,7 +5208,7 @@ pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool;
             }
         }
         (true, true) => {
-            if covers[2] {
+            if covers(2) {
                 // The EXACT bold-italic face wins outright — even over the
                 // injected bold, which would need a synthetic shear on top.
                 FacePick::Styled {
@@ -4914,12 +5219,12 @@ pub fn resolve_styled_face(style: StyleBits, injected_bold: bool, covers: [bool;
                 FacePick::InjectedBold {
                     synthetic: StyleBits::ITALIC,
                 }
-            } else if covers[0] {
+            } else if covers(0) {
                 FacePick::Styled {
                     slot: 0,
                     synthetic: StyleBits::ITALIC, // real bold + synthetic slant
                 }
-            } else if covers[1] {
+            } else if covers(1) {
                 FacePick::Styled {
                     slot: 1,
                     synthetic: StyleBits::BOLD, // real italic + synthetic embolden
@@ -5760,9 +6065,9 @@ impl Renderer {
             runtime_discovery: true,
             styled_faces: [None, None, None],
             synthetic_styles: true,
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(any(all(unix, not(target_os = "macos")), windows))]
             hint_mode: hinted::HintMode::from_env(),
-            #[cfg(all(unix, not(target_os = "macos")))]
+            #[cfg(any(all(unix, not(target_os = "macos")), windows))]
             hint_bank: hinted::HintBank::default(),
             #[cfg(all(unix, not(target_os = "macos")))]
             subpix_mode: subpixel::SubpixelMode::from_env(),
@@ -5778,6 +6083,7 @@ impl Renderer {
             ct_cache: FxHashMap::default(),
             primary_path: None,
             styled_loaded: false,
+            styled_retire_pending: [None; 3],
             admitted_sources_sealed: false,
             shapeable_scratch: Vec::new(),
             break_mask_scratch: Vec::new(),
@@ -6045,14 +6351,11 @@ impl Renderer {
         // Styled ligature RUNS route through the run-face policy (W6), which now
         // prefers this face for BOLD runs: gids cached from the old face are wrong.
         self.shaped_runs.clear();
-        // The CT cache keys faces by their bytes POINTER; the old bold Arc is
-        // freed here, so a later allocation could alias its address and resurrect
-        // the stale CtFont. Same discipline as `set_primary_font`.
-        #[cfg(target_os = "macos")]
-        self.ct_cache.clear();
-        // The hint bank shares the pointer-keying and the aliasing hazard.
-        #[cfg(target_os = "linux")]
-        self.hint_bank.clear();
+        // The CT cache and the hint banks key faces by their bytes POINTER; the
+        // old bold Arc is freed here, so a later allocation could alias its
+        // address and resurrect a stale CtFont / HintingInstance. Same discipline
+        // as `set_primary_font`.
+        self.clear_face_address_caches();
         Ok(())
     }
 
@@ -6072,25 +6375,33 @@ impl Renderer {
                 "styled slot {slot} out of range (0 = bold, 1 = italic, 2 = bold-italic)"
             ));
         }
+        // EAGER, like `FallbackFace::from_bytes`: injection is a host API whose
+        // contract is "a bad blob fails loudly AT THE CALL, never later", so an
+        // injected face must never be the one that parses mid-frame.
         let font = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
             .map_err(|e| e.to_string())?;
         self.styled_faces[slot] = Some(StyledFace {
-            font: std::sync::Arc::new(font),
+            font: LazyFontdue::ready(std::sync::Arc::new(font)),
             bytes: std::sync::Arc::from(bytes),
             index: 0,
             gid_cache: FxHashMap::default(),
+            id: next_styled_face_id(),
         });
+        // A pending retire condemns the face that WAS here, and that face is gone.
+        // Dropping the condemnation with it keeps the two facts from outliving each
+        // other: this face was parsed EAGERLY, three lines up, so it has failed
+        // nothing and must not inherit its predecessor's sentence. (The apply also
+        // checks the condemned id against the slot, so a forgotten clear cannot
+        // retire the wrong face — this keeps the state honest rather than merely
+        // inert, and stops a dead id lingering across the slot's whole life.)
+        self.styled_retire_pending[slot] = None;
         // Same discipline as `set_bold_font`: styled per-char decisions, their
         // bitmaps, and styled-run gids all referenced the old face set — and the
-        // pointer-keyed CT cache could alias a freed slot's address.
+        // address-keyed caches could alias a freed slot's address.
         self.styled_keys.clear();
         self.glyphs.clear();
         self.shaped_runs.clear();
-        #[cfg(target_os = "macos")]
-        self.ct_cache.clear();
-        // Pointer-keyed like the CT cache — same swap, same aliasing hazard.
-        #[cfg(target_os = "linux")]
-        self.hint_bank.clear();
+        self.clear_face_address_caches();
         Ok(())
     }
 
@@ -6310,6 +6621,9 @@ impl Renderer {
         // the new primary re-derives (no path → none, falling to synthetic), and the
         // styled-glyph caches so no styled glyph of the old face survives.
         self.styled_faces = [None, None, None];
+        // Every condemned face just left with the slots it was condemned in. A
+        // verdict outliving its defendant could only ever hit an innocent.
+        self.styled_retire_pending = [None; 3];
         self.styled_loaded = false;
         self.primary_path = None;
         self.admitted_sources_sealed = false;
@@ -6326,13 +6640,9 @@ impl Renderer {
         // The new face re-derived `cell_w`/`cell_h`; deco masks keyed by
         // `(glyph, cell_w, cell_h)` at the old box are dead — drop them too.
         self.deco_masks.borrow_mut().clear();
-        // The old primary's CoreText fonts are keyed by its (now dropped) bytes ptr;
-        // drop them so the new face's CtFonts build fresh.
-        #[cfg(target_os = "macos")]
-        self.ct_cache.clear();
-        // The hint bank keys by the same dropped pointer — clear it with them.
-        #[cfg(target_os = "linux")]
-        self.hint_bank.clear();
+        // The old primary's CoreText fonts and hinting instances are keyed by its
+        // (now dropped) bytes ptr; drop them so the new face's build fresh.
+        self.clear_face_address_caches();
         // W9: instantiate the NEW face (config requests + nudge carry over);
         // re-derives the geometry again only when it is actually variable.
         self.refresh_variations();
@@ -6686,7 +6996,9 @@ impl Renderer {
                 let _ = self.glyph_image(key);
             }
         }
-        self.evict_caches_if_large();
+        // Bound the caches only — a warm-up is not a frame boundary (see
+        // `begin_frame_boundary`); it may not move face presence under a caller.
+        self.evict_glyph_caches_if_large();
     }
 
     /// Settle and warm every terminal typography style used by a semantic
@@ -6722,7 +7034,11 @@ impl Renderer {
                 let _ = self.glyph_image(glyph.key);
             }
         }
-        self.evict_caches_if_large();
+        // Bound the caches only. NOT the frame boundary: the keys handed back by
+        // the loop above are still being rasterized by this very function on the
+        // next iteration, so a face may not be dropped here. Each
+        // `semantic_ascii_glyph_plan` call crosses the boundary itself, on entry.
+        self.evict_glyph_caches_if_large();
     }
 
     /// Resolve one semantic-surface character only when the cascade owns a
@@ -6743,6 +7059,13 @@ impl Renderer {
     /// and therefore aimed at ASCII operator/style specimens; grapheme/CJK/
     /// emoji layout remains the caller's display-column path. Unsupported
     /// scalars keep their column but yield no glyph, never `.notdef`.
+    ///
+    /// This call is the semantic surface's FRAME BOUNDARY (see
+    /// [`Self::begin_frame_boundary`]): a specimen pass plans once and hands the
+    /// keys back for the caller to rasterize, so entry — before anything is
+    /// planned — is the semantic surface's only moment with no plan in flight, and
+    /// a fork that never renders a terminal frame would otherwise carry a failed
+    /// styled parse (and refuse every gid of that style) for its whole life.
     #[must_use]
     pub fn semantic_ascii_glyph_plan(
         &mut self,
@@ -6754,6 +7077,7 @@ impl Renderer {
         if chars.is_empty() || chars.iter().any(|ch| !ch.is_ascii()) {
             return Vec::new();
         }
+        self.apply_pending_styled_retires();
         let bold = style.contains(StyleBits::BOLD);
         let italic = style.contains(StyleBits::ITALIC);
         let cells: Vec<RenderCell> = chars
@@ -6794,7 +7118,9 @@ impl Renderer {
                 out.push(SemanticGlyph { column, key });
             }
         }
-        self.evict_caches_if_large();
+        // Bound the caches only: `out` is a plan IN FLIGHT (the caller rasterizes
+        // these keys), so the boundary's face-retire half already ran on entry.
+        self.evict_glyph_caches_if_large();
         out
     }
 
@@ -6928,16 +7254,41 @@ impl Renderer {
                 if self.styled_faces[slot].is_some() {
                     break;
                 }
+                // The READ stays here (this runs on the font worker, and the
+                // render thread must never do font I/O); the fontdue PARSE is
+                // deferred to the first styled cell that actually draws — 21.9 MB
+                // of outlines an idle terminal used to materialise at seal. The
+                // parse lands in `shared_parsed_face`, so a `-Bold.ttf` the GUI
+                // chrome also draws bold labels from is still ONE parse — and the
+                // BYTES go through the same store (`shared_face_bytes`, below) so
+                // they are one COPY as well.
+                //
+                // ADMISSION IS NOT WEAKENED, exactly as on the fallback tier:
+                // `fontdue_admissible` replays fontdue's own failure modes over
+                // the bytes, so a face fontdue would REJECT cannot take a slot and
+                // silently turn a synthetic style into a wrong one.
                 if let Ok(bytes) = font_file::read_font_file(std::path::Path::new(&p))
-                    // Shared parse: the GUI chrome draws bold labels from the same
-                    // `-Bold.ttf` sibling, so this face was materialised twice.
-                    && let Ok((bytes, font)) = shared_parsed_face(bytes.as_slice(), 0)
+                    // Path-backed, so the verdict comes from the persistent
+                    // admission cache (mtime+size identity) before paying the
+                    // cmap walk — the same deal `FallbackFace::from_path_bytes`
+                    // makes, and the reason the walk is not a new startup cost.
+                    && admission_cache::admissible_cached(&p, 0, || fontdue_admissible(&bytes, 0))
                 {
                     self.styled_faces[slot] = Some(StyledFace {
-                        font,
-                        bytes,
+                        font: LazyFontdue::deferred(),
+                        // THROUGH THE SHARED STORE, even though the parse is
+                        // deferred. Handing the slot a private `Arc` would make
+                        // the file invisible to the store until something
+                        // materialised it — and the GUI chrome parses this exact
+                        // `-Bold.ttf` FIRST (`sync_chrome_fonts` →
+                        // `chrome_bold_face` → `shared_parsed_face`), so it would
+                        // publish a second copy and the sibling would be resident
+                        // TWICE. Registering the handle here also collapses the
+                        // copies a second renderer's discovery would otherwise add.
+                        bytes: shared_face_bytes(&bytes, 0),
                         index: 0,
                         gid_cache: FxHashMap::default(),
+                        id: next_styled_face_id(),
                     });
                     break;
                 }
@@ -7312,13 +7663,13 @@ impl Renderer {
 
     /// TEST/DEBUG: force the deterministic fontdue rasterizer on this renderer
     /// (no process-global env var, so it can't race other tests). On macOS it
-    /// switches off the CoreText backend; on Linux it switches off the
-    /// grid-fitted [`hinted`] path (W13) — either way the portable fontdue
-    /// bytes are what rasterize afterwards. No-op on the remaining targets,
-    /// where fontdue is already the only backend.
+    /// switches off the CoreText backend; on Linux and Windows it switches off
+    /// the grid-fitted [`hinted`] path — either way the portable fontdue
+    /// bytes are what rasterize afterwards. No-op on the remaining targets
+    /// (wasm), where fontdue is already the only backend.
     #[doc(hidden)]
     pub fn debug_force_fontdue(&mut self) {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             self.hint_mode = hinted::HintMode::Off;
             self.hint_bank.clear();
@@ -7328,10 +7679,14 @@ impl Renderer {
             self.glyphs.clear();
             self.keys.clear();
             // Subpixel off with it: forced-fontdue means "the byte-stable
-            // portable bytes", which per-channel fringes are not.
-            self.subpix_mode = subpixel::SubpixelMode::Off;
-            self.subpx_bank.clear();
-            self.subpx_glyphs.clear();
+            // portable bytes", which per-channel fringes are not. (Linux-only:
+            // Windows shares the widened hint seam but has no LCD overlay.)
+            #[cfg(all(unix, not(target_os = "macos")))]
+            {
+                self.subpix_mode = subpixel::SubpixelMode::Off;
+                self.subpx_bank.clear();
+                self.subpx_glyphs.clear();
+            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -7434,56 +7789,96 @@ impl Renderer {
             // `vf_bold_gid_raster` below: `coords` is already in hand here, and
             // re-entering the helper would only re-unwrap the same field.
             let gid = self.primary_unicode_gid(ch)?;
+            // WINDOWS CRISPNESS: grid-fit the bold INSTANCE (slot 2). This is
+            // the arm ordinary BOLD Windows text takes — a styled primary cell
+            // is re-keyed by CHAR, and the platform default (Cascadia Mono) is
+            // one variable file with no Bold sibling, so without this the
+            // heaviest text on screen would be the only text left unhinted.
+            // The instantiated outline fill below stays the fail-safe. Linux
+            // keeps the shipped unhinted instance here for the same reason its
+            // by-char/by-id arms decline varied cells (see
+            // `hinted_primary_char`).
+            #[cfg(windows)]
+            if let Some(bytes) = self.rb_primary_bytes.clone()
+                && let Some(t) =
+                    self.hinted_glyph(bytes.as_ptr() as usize, &bytes, 0, gid, &coords, 2)
+            {
+                return Some(t);
+            }
             let bytes = self.rb_primary_bytes.as_deref()?;
             variation::varied_glyph_raster(bytes, 0, &coords, gid, self.px)
         }
     }
 
-    /// LINUX CRISPNESS (W13): rasterize glyph `gid` of a PRIMARY-FAMILY face
+    /// NATIVE CRISPNESS: rasterize glyph `gid` of a PRIMARY-FAMILY face
     /// (primary / injected bold / styled sibling — the faces that draw at the
     /// renderer's own px) through the grid-fitted skrifa path ([`hinted`]) —
-    /// the Linux twin of [`Self::ct_glyph`], in the same fontdue-convention
-    /// tuple. `None` (hinting `Off`, unparseable face, missing glyph, draw
-    /// failure) always falls back to the untouched fontdue raster, so this is
-    /// a safe enhancement exactly like the CoreText seam.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// the non-CoreText twin of [`Self::ct_glyph`], in the same
+    /// fontdue-convention tuple and with the same `(variations, var_slot)`
+    /// instance discipline: slot `0` = the face as authored, `1` = the
+    /// resolved primary coords, `2` = the W9 bold instance. `None` (hinting
+    /// `Off`, unparseable face, missing glyph, draw failure) always falls back
+    /// to the untouched fontdue / instantiated-outline raster, so this is a
+    /// safe enhancement exactly like the CoreText seam.
+    #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     fn hinted_glyph(
         &mut self,
         key_ptr: usize,
         bytes: &[u8],
         index: u32,
         gid: u16,
+        variations: &[(u32, f32)],
+        var_slot: u8,
     ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-        let inst = self
-            .hint_bank
-            .instance(key_ptr, bytes, index, self.px, self.hint_mode)?;
-        hinted::hinted_glyph_raster(bytes, index, gid, self.px, &inst)
+        let inst = self.hint_bank.instance(
+            key_ptr,
+            bytes,
+            index,
+            self.px,
+            self.hint_mode,
+            variations,
+            var_slot,
+        )?;
+        hinted::hinted_glyph_raster(bytes, index, gid, self.px, &inst, variations)
     }
 
-    /// LINUX CRISPNESS (W13): the by-CHAR hinted raster for a PRIMARY-source
-    /// Mono key — glyph id resolved through the primary's own Unicode cmap
+    /// NATIVE CRISPNESS: the by-CHAR hinted raster for a PRIMARY-source Mono
+    /// key — glyph id resolved through the primary's own Unicode cmap
     /// ([`Self::primary_unicode_gid`], memoized; NOT fontdue's Mac-Roman-prone
-    /// lookup, the same discipline as the styled/fallback paths). A VARIABLE
-    /// primary with resolved coords is excluded: the FONT-2 instantiated
-    /// raster owns those cells, and hinting the `fvar` default would silently
-    /// reset the configured instance.
-    #[cfg(all(unix, not(target_os = "macos")))]
+    /// lookup, the same discipline as the styled/fallback paths). On Windows a
+    /// VARIABLE primary is hinted AT ITS RESOLVED INSTANCE (slot 1), which is
+    /// how Cascadia Mono — one variable file, the platform default — gets
+    /// grid-fitted at all. On Linux a resolved instance still declines: the
+    /// FONT-2 instantiated raster has owned those cells since W13 and this
+    /// wave deliberately does not re-cut the shipped Linux bytes.
+    ///
+    /// Ordered BEFORE [`Self::vf_primary_char_raster`] in the raster chain,
+    /// which is what makes the Windows instance case reachable; on Linux the
+    /// decline above hands the same cells straight back to it, so that
+    /// platform's chain is unchanged.
+    #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     fn hinted_primary_char(
         &mut self,
         key: GlyphKey,
         ch: char,
     ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
-        if key.source != FaceId::Primary || self.var_coords.is_some() {
+        if key.source != FaceId::Primary {
+            return None;
+        }
+        #[cfg(unix)]
+        if self.var_coords.is_some() {
             return None;
         }
         let gid = self.primary_unicode_gid(ch)?;
         let bytes = self.rb_primary_bytes.clone()?;
-        self.hinted_glyph(bytes.as_ptr() as usize, &bytes, 0, gid)
+        let coords = self.var_coords.clone();
+        let (vars, slot) = coords.as_deref().map_or((&[][..], 0u8), |c| (c, 1));
+        self.hinted_glyph(bytes.as_ptr() as usize, &bytes, 0, gid, vars, slot)
     }
 
-    /// Inert twin (macOS: CoreText owns the native path; Windows/wasm: fontdue
-    /// is the only backend) so the raster chain reads identically everywhere.
-    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    /// Inert twin (macOS: CoreText owns the native path; wasm: fontdue is the
+    /// only backend) so the raster chain reads identically everywhere.
+    #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
     #[allow(clippy::unused_self)]
     fn hinted_primary_char(
         &mut self,
@@ -7609,6 +8004,8 @@ impl Renderer {
                 index,
                 self.px,
                 Some(subpixel::lcd_hint_options()),
+                &[],
+                0,
             )
         };
         let bgr = self.subpix_mode == subpixel::SubpixelMode::Bgr;
@@ -7779,6 +8176,13 @@ impl Renderer {
     /// would hand back the retired face's old bitmap. Doing this from inside
     /// `rasterize` is safe: `glyph_image` computes the image and inserts
     /// afterwards, so no cache iteration is in flight.
+    ///
+    /// The POINTER-KEYED caches go with them, for the reason
+    /// [`Self::set_fallback_bytes`] and [`Self::set_bold_font`] state: `ct_cache`
+    /// and the hint banks key a face by its bytes ADDRESS, the removal here drops
+    /// the last chain reference to those bytes, and a later allocation can alias
+    /// the freed address and resurrect a `CtFont`/`HintingInstance` built for the
+    /// retired face. (This clearing is new; the retire shipped without it.)
     fn retire_unparsable_fallback(&mut self, bytes: &std::sync::Arc<Vec<u8>>) -> bool {
         let Some(i) = self
             .fallback_chain
@@ -7791,8 +8195,124 @@ impl Renderer {
         self.fallback_pick.clear();
         self.keys.clear();
         self.glyphs.clear();
+        self.clear_face_address_caches();
         self.font_epoch += 1;
         true
+    }
+
+    /// Drop the STYLED slot whose DEFERRED fontdue parse failed, returning
+    /// whether a face was actually removed.
+    ///
+    /// The styled twin of [`Self::retire_unparsable_fallback`], and it exists for
+    /// the same reason: under the eager parse this state was unreachable — a face
+    /// fontdue rejected never took a slot — so the deferred parse must be able to
+    /// reach the same OUTCOME (that style goes synthetic), not draw a stranger's
+    /// glyph ids from the primary face.
+    ///
+    /// The caches dropped are [`Self::set_styled_font_bytes`]'s, and for its
+    /// reasons: `styled_keys` memoizes the per-char routing that picked this
+    /// slot, `glyphs` holds bitmaps under those byte-identical keys, and
+    /// `shaped_runs` holds gids SHAPED on the retired face. `keys` joins them
+    /// because a `mono_gid` key is built from the same pick, and
+    /// [`Self::clear_face_address_caches`] joins them because this frees the
+    /// slot's bytes and those caches key faces by ADDRESS — the aliasing hazard
+    /// `set_styled_font_bytes` clears them for, which this retire (unlike that
+    /// swap) is the one that actually FREES a face.
+    ///
+    /// NOT called from inside `rasterize`, unlike its fallback twin. Removing a
+    /// slot changes what [`Self::run_face_pick`] answers, and a plan already in
+    /// flight carries glyph ids shaped on the face being removed — so this runs
+    /// at a FRAME BOUNDARY ([`Self::begin_frame_boundary`] →
+    /// [`Self::apply_pending_styled_retires`]) and the mid-frame discovery only
+    /// records the condemned face in `styled_retire_pending`.
+    ///
+    /// Unconditional on identity: the caller decides WHICH face it means, and by
+    /// the time it does the slot holds that face or nothing worth keeping (the
+    /// direct test/`apply` callers both already resolved that question).
+    fn retire_unparsable_styled(&mut self, slot: usize) -> bool {
+        if slot >= 3 {
+            return false;
+        }
+        self.styled_retire_pending[slot] = None;
+        if self.styled_faces[slot].is_none() {
+            return false;
+        }
+        self.styled_faces[slot] = None;
+        self.styled_keys.clear();
+        self.keys.clear();
+        self.glyphs.clear();
+        self.shaped_runs.clear();
+        self.clear_face_address_caches();
+        self.font_epoch += 1;
+        true
+    }
+
+    /// Drop the styled slots [`Self::rasterize`] found unparsable, at a moment
+    /// when no plan is in flight. Returns whether anything was retired.
+    ///
+    /// This is the second half of the two-step the mid-frame discovery needs.
+    /// [`Self::run_face_pick`] answers from slot PRESENCE and the run planner and
+    /// the by-ID rasterizer MUST agree on it, so the slot cannot vanish between
+    /// the two: while the condemnation stands, the slot is still there and its
+    /// orphaned glyph ids are refused rather than drawn from a face that does not
+    /// own them. Here — at [`Self::begin_frame_boundary`], before the frame plans
+    /// its first row — the slot really goes, and the next run shapes on the
+    /// primary with a synthetic style instead.
+    ///
+    /// A condemnation is a verdict on ONE face, not on a slot number. Between the
+    /// mid-frame discovery and this apply the slot may have been REPLACED — the
+    /// host answering the very same missing style with real bytes
+    /// ([`Self::set_styled_font_bytes`], eagerly parsed) — and dropping that face
+    /// for its predecessor's failure would take away a style that works and hand
+    /// it back to synthetic for the rest of the session. So the id decides: retire
+    /// only while the slot still holds the condemned face. Either way the
+    /// condemnation is spent here — it named a face, and that face is now gone or
+    /// acquitted.
+    ///
+    /// Each call empties at least one of three slots (or nothing), so it settles.
+    fn apply_pending_styled_retires(&mut self) -> bool {
+        if self.styled_retire_pending.iter().all(Option::is_none) {
+            return false; // the whole-frame common case: one array read
+        }
+        let mut retired = false;
+        for slot in 0..3 {
+            let Some(condemned) = self.styled_retire_pending[slot].take() else {
+                continue;
+            };
+            if self.styled_faces[slot]
+                .as_ref()
+                .is_some_and(|face| face.id == condemned)
+            {
+                retired |= self.retire_unparsable_styled(slot);
+            }
+        }
+        retired
+    }
+
+    /// Drop every cache keyed by a face's BYTES ADDRESS rather than its content:
+    /// the CoreText font cache on macOS, and the two skrifa hinting banks (plus
+    /// the subpixel overlay they feed) elsewhere.
+    ///
+    /// Mandatory wherever a face's bytes are FREED. The keys are
+    /// `bytes.as_ptr() as usize`, so once the allocation is released a later one
+    /// can land on the same address and every entry built for the dead face
+    /// becomes a live-looking hit for the new one — a stale `CtFont` or
+    /// `HintingInstance` silently rasterizing the wrong outlines.
+    fn clear_face_address_caches(&mut self) {
+        #[cfg(target_os = "macos")]
+        self.ct_cache.clear();
+        // The hint bank is pointer-keyed on Linux AND Windows — the Windows raster
+        // grid-fits too (win/parity-grid-fit), and a stale HintingInstance for a
+        // freed face is exactly the aliasing this helper exists to prevent.
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
+        self.hint_bank.clear();
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            // The LCD-target bank is pointer-keyed the same way, and its overlay
+            // is keyed like `glyphs` (both documented "cleared wherever ... is").
+            self.subpx_bank.clear();
+            self.subpx_glyphs.clear();
+        }
     }
 
     /// W8 (c): the rasterization SCALE for a fallback face at the current
@@ -7924,18 +8444,18 @@ impl Renderer {
             if self.styled_faces[slot].is_some() {
                 continue;
             }
-            if let Ok(font) = fontdue::Font::from_bytes(
-                bytes.as_ref(),
-                fontdue::FontSettings {
-                    collection_index: i,
-                    ..Default::default()
-                },
-            ) {
+            // Deferred parse + `fontdue_admissible` admission, exactly as the
+            // sibling-FILE scan above: these are the same discovery, and an Apple
+            // `.ttc` costs three MORE full-face parses at seal for styles the
+            // session may never draw. `ttf_parser::Face::parse` already succeeded
+            // above, so this only adds fontdue's own bound check.
+            if fontdue_admissible(bytes, i) {
                 self.styled_faces[slot] = Some(StyledFace {
-                    font: std::sync::Arc::new(font),
+                    font: LazyFontdue::deferred(),
                     bytes: bytes.clone(),
                     index: i,
                     gid_cache: FxHashMap::default(),
+                    id: next_styled_face_id(),
                 });
             }
         }
@@ -7945,17 +8465,27 @@ impl Renderer {
     /// `styled_faces` slot to rasterize from plus the style bits NOT provided by
     /// that face (which the synthetic pass must still apply). `None` when no real
     /// styled face covers `ch` (caller uses the regular face + full synthetic). The
-    /// slots are `0 = bold, 1 = italic, 2 = bold-italic`. Pure (loads nothing) —
-    /// the DECISION is the exhaustively-proven [`resolve_styled_face`] policy over
+    /// slots are `0 = bold, 1 = italic, 2 = bold-italic`. Reads no FILE — the
+    /// DECISION is the exhaustively-proven [`resolve_styled_face`] policy over
     /// per-char coverage facts (`injected_bold = false`: the injected-bold routing
     /// happens earlier, at key-build time in [`Self::glyph_key_styled`]).
+    ///
+    /// PARSES NOTHING EITHER. The coverage fact stays fontdue's — the whole
+    /// routing lattice is proven against `lookup_glyph_index` — but it is read
+    /// off the cmap ([`StyledFace::covers`]) rather than by materialising the
+    /// face. Asking [`StyledFace::parsed`] here is what used to drop a full
+    /// 8.7 MB fontdue parse on the RENDER THREAD for the first styled cell, on a
+    /// macOS path where CoreText draws from the bytes and that parse is never
+    /// used; the fallback tier escapes the same trap through `fallback_has`.
+    /// Probing goes through [`resolve_styled_face_lazy`] so a BOLD cell asks the
+    /// BOLD face only — the eager `[bool; 3]` asked all three.
     fn styled_face_slot(&self, ch: char, style: StyleBits) -> Option<(usize, StyleBits)> {
-        let covers = std::array::from_fn(|i| {
-            self.styled_faces[i]
+        let pick = resolve_styled_face_lazy(style, false, |slot| {
+            self.styled_faces[slot]
                 .as_ref()
-                .is_some_and(|sf| sf.font.lookup_glyph_index(ch) != 0)
+                .is_some_and(|sf| sf.covers(ch))
         });
-        match resolve_styled_face(style, false, covers) {
+        match pick {
             FacePick::Styled { slot, synthetic } => Some((slot, synthetic)),
             FacePick::Primary | FacePick::InjectedBold { .. } => None,
         }
@@ -7970,7 +8500,11 @@ impl Renderer {
     /// from it): both derive it from this one policy, and every mutation of the
     /// availability facts (`set_bold_font` / `set_styled_font_bytes` /
     /// `set_primary_font`) clears `shaped_runs` + `glyphs`, so a cached gid can
-    /// never meet a different face.
+    /// never meet a different face. The one mutation that is not a host setter —
+    /// [`Self::retire_unparsable_styled`] — is held to the same rule by running
+    /// only at a frame boundary ([`Self::begin_frame_boundary`]); until then the
+    /// doomed slot stays PRESENT here, so the ids already shaped on it keep
+    /// resolving to it and are refused rather than re-picked.
     fn run_face_pick(&self, style: StyleBits) -> FacePick {
         resolve_styled_face(
             style,
@@ -8299,6 +8833,12 @@ impl Renderer {
         self.undercurl_masks.borrow_mut().clear();
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
+        // Hinting instances are INSTANCE-keyed too (the bank's variation slot
+        // discriminates the coords, not their values), so an instance that
+        // changed under a fixed slot must not be served from the memo — the
+        // exact hazard the CT clear one line up exists for.
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
+        self.hint_bank.clear();
         true
     }
 
@@ -8574,7 +9114,7 @@ impl Renderer {
         #[cfg(target_os = "macos")]
         self.ct_cache.clear();
         // Hinting instances likewise (W13): size-specific, rebuild at `px`.
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         self.hint_bank.clear();
         // Subpixel overlay + its LCD instances: size-specific like the above.
         #[cfg(all(unix, not(target_os = "macos")))]
@@ -9392,9 +9932,13 @@ impl Renderer {
         let bold_italic_real =
             real_bold && style.contains(StyleBits::ITALIC) && self.bold_font.is_some() && {
                 self.ensure_styled_faces();
+                // Coverage off the cmap, not by materialising the face
+                // (`StyledFace::covers`) — this is key-BUILD time on the render
+                // thread, the worst possible place for an 8.7 MB fontdue parse,
+                // and it is the same verdict `lookup_glyph_index` would give.
                 self.styled_faces[2]
                     .as_ref()
-                    .is_some_and(|sf| sf.font.lookup_glyph_index(ch) != 0)
+                    .is_some_and(|sf| sf.covers(ch))
             };
         // Procedural (cell-exact) and ColorEmojiMono (an emoji silhouette, no real
         // weight/slant) ignore synthetic styling; every other coverage glyph gets
@@ -9638,7 +10182,7 @@ impl Renderer {
         self.stem_gamma
     }
 
-    /// Set the Linux grid-fitting mode (config `font_hinting`, aliased by the
+    /// Set the native grid-fitting mode (config `font_hinting`, aliased by the
     /// `ATERM_FONT_HINTING` env var — the host resolves env > config and
     /// passes the winner here, the `stem_gamma` discipline). Spellings:
     /// `"full"` (the default — and, like the env, what any unrecognized value
@@ -9651,9 +10195,9 @@ impl Renderer {
     /// construction-time-only rule existed to prevent); a same-value call is
     /// free. Returns whether the mode changed (the GPU wrapper invalidates
     /// its atlas on `true`). On macOS (CoreText applies its own grid
-    /// discipline) and Windows/wasm (no hint seam) this is an inert `false`.
+    /// discipline) and wasm (no hint seam) this is an inert `false`.
     pub fn set_font_hinting(&mut self, mode: &str) -> bool {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             let mode = if hinted::HintMode::fontdue_forced() {
                 hinted::HintMode::Off
@@ -9673,24 +10217,33 @@ impl Renderer {
             self.styled_keys.clear();
             // The subpixel raster follows the Off↔hinted boundary of this
             // mode (LCD-hinted vs unhinted outlines), so its overlay is
-            // mode-specific too.
+            // mode-specific too. (Linux-only: Windows shares the widened hint
+            // seam but has no LCD overlay.)
+            #[cfg(all(unix, not(target_os = "macos")))]
             self.subpx_glyphs.clear();
             true
         }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
         {
             let _ = mode;
             false
         }
     }
 
-    /// The active Linux grid-fitting mode's canonical spelling (`"full"` /
+    /// The active grid-fitting mode's canonical spelling (`"full"` /
     /// `"light"` / `"native"` / `"off"`) — the [`Self::set_font_hinting`]
-    /// round-trip, for change detection and diagnostics. Always `"full"` (the
-    /// inert default) on the targets without the hint seam.
+    /// round-trip, for change detection and diagnostics.
+    ///
+    /// HONESTY: on a target with NO hint seam this reports `"off"`, not the
+    /// live default. It used to answer `"full"` everywhere, which meant
+    /// `--show-config` / the settings UI told a macOS or Windows user that
+    /// their text was being grid-fitted while nothing hinted — the config
+    /// key's most visible symptom of doing nothing. macOS is `"off"` in the
+    /// sense this key means it: CoreText applies its OWN grid discipline, not
+    /// `font_hinting`'s.
     #[must_use]
     pub fn font_hinting(&self) -> &'static str {
-        #[cfg(all(unix, not(target_os = "macos")))]
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             match self.hint_mode {
                 hinted::HintMode::Full => "full",
@@ -9699,9 +10252,9 @@ impl Renderer {
                 hinted::HintMode::Off => "off",
             }
         }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
         {
-            "full"
+            "off"
         }
     }
 
@@ -9820,6 +10373,22 @@ impl Renderer {
     /// `CursorDisabled`, so the cursor never sits on a ligature glyph). When
     /// ligatures are globally off the plan is all `PerCell` (byte-identical to the
     /// pre-ligature path). SHARED by both renderers so they place identical glyphs.
+    ///
+    /// STABLE in the face set, which is the property the callers actually need:
+    /// planning row `r` cannot change what planning row `r+1` — or the cursor
+    /// cut-out's re-plan of a row already drawn — resolves to. That is what lets
+    /// `draw_cursor` reuse the base pass's plan and assert (debug) that a fresh
+    /// one matches it.
+    ///
+    /// Not the same as PURE, and the difference is load-bearing. Face REMOVAL
+    /// happens only at [`Self::begin_frame_boundary`] — a retire mid-frame would
+    /// strand the gids earlier rows already planned. Face INSTALL is different:
+    /// `ensure_styled_faces` runs at the top of this call, before anything is
+    /// shaped, and is idempotent and row-independent, so the first row of a
+    /// frame settles the lazy sibling discovery and every later row (and the
+    /// re-plan) resolves against exactly that set. Deferring the install to the
+    /// boundary would move font-file I/O onto a path that has not yet been asked
+    /// for a styled cell.
     pub fn row_glyph_plan(
         &mut self,
         input: &RenderInput,
@@ -10275,10 +10844,13 @@ impl Renderer {
                             self.ct_glyph(kp, &b, idx, g, self.px, &[], 0)
                         })
                     };
-                    // LINUX CRISPNESS (W13): the grid-fitted raster is this
-                    // arm's CoreText twin — same face bytes, same by-id
-                    // addressing, same fail-safe to fontdue below.
-                    #[cfg(all(unix, not(target_os = "macos")))]
+                    // NATIVE CRISPNESS: the grid-fitted raster is this arm's
+                    // CoreText twin — same face bytes, same by-id addressing,
+                    // same fail-safe to fontdue below. Styled sibling FILES
+                    // are separate, non-instantiated faces (the W9 coords
+                    // belong to the primary), so slot 0 / no coords, exactly
+                    // like the CoreText block above.
+                    #[cfg(any(all(unix, not(target_os = "macos")), windows))]
                     let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = {
                         let src = match (gid, self.styled_faces[slot].as_ref()) {
                             (Some(g), Some(sf)) => {
@@ -10286,17 +10858,32 @@ impl Renderer {
                             }
                             _ => None,
                         };
-                        src.and_then(|(kp, b, idx, g)| self.hinted_glyph(kp, &b, idx, g))
+                        src.and_then(|(kp, b, idx, g)| self.hinted_glyph(kp, &b, idx, g, &[], 0))
                     };
-                    #[cfg(not(unix))]
+                    // The arms above are macOS, then (unix AND NOT macOS) OR windows.
+                    // Their union is `unix OR windows`, so the fallback must exclude
+                    // exactly that. Written as `not(any(all(unix, not(macos)), windows))`
+                    // it stayed TRUE on macOS, where it re-bound `ct` to `None` AFTER the
+                    // CoreText arm had already produced a hinted glyph — shadowing it and
+                    // throwing the result away on every styled-face lookup. The compiler
+                    // said so ("unused variable: `ct`"); the warning was the visible half
+                    // of a real macOS rendering regression.
+                    #[cfg(not(any(unix, windows)))]
                     let ct: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
                     if let Some(t) = ct {
                         t
                     } else {
-                        let (m, b) = match self.styled_faces[slot].as_ref() {
-                            Some(sf) => match gid {
-                                Some(g) => sf.font.rasterize_indexed(g, self.px),
-                                None => sf.font.rasterize(ch, self.px),
+                        // BY CHAR on either face, so a slot whose deferred parse
+                        // failed falls back to the RIGHT character (unstyled) —
+                        // the same fail-safe an absent slot always took. Only the
+                        // by-ID arm below can be handed gids no other face owns.
+                        let (m, b) = match self.styled_faces[slot]
+                            .as_ref()
+                            .and_then(StyledFace::parsed)
+                        {
+                            Some(font) => match gid {
+                                Some(g) => font.rasterize_indexed(g, self.px),
+                                None => font.rasterize(ch, self.px),
                             },
                             None => self.font.rasterize(ch, self.px),
                         };
@@ -10324,17 +10911,22 @@ impl Renderer {
                     // normalized px, wide glyphs centred in the 2-cell box and
                     // the coverage clamped to the cell row band.
                     self.fallback_mono_raster(key.source, ch)
+                } else if let Some(t) = self.hinted_primary_char(key, ch) {
+                    // NATIVE CRISPNESS: grid-fitted primary raster — crisp
+                    // stems/crossbars where unhinted fontdue smears across
+                    // fractional pixel phases. Ordered ABOVE the FONT-2
+                    // instance raster because on Windows it grid-fits THAT
+                    // instance (it takes the resolved coords); on Linux it
+                    // declines for a varied primary and hands the cell
+                    // straight down, so that chain is unchanged. The two
+                    // rasters below stay the fail-safes (and fontdue stays the
+                    // byte-stable test backend).
+                    t
                 } else if key.source == FaceId::Primary
                     && let Some(t) = self.vf_primary_char_raster(ch)
                 {
                     // FONT-2: portable path — the primary char's RESOLVED variable
                     // instance (fontdue below would draw only the fvar default).
-                    t
-                } else if let Some(t) = self.hinted_primary_char(key, ch) {
-                    // LINUX CRISPNESS (W13): grid-fitted primary raster —
-                    // crisp stems/crossbars where unhinted fontdue smears
-                    // across fractional pixel phases. Fontdue below stays the
-                    // fail-safe (and the byte-stable test backend).
                     t
                 } else {
                     let face = match key.source {
@@ -10546,7 +11138,8 @@ impl Renderer {
                             .as_ref()
                             .map(|sf| (sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index)),
                     };
-                    let hinted = src.and_then(|(kp, b, idx)| self.hinted_glyph(kp, &b, idx, gid));
+                    let hinted =
+                        src.and_then(|(kp, b, idx)| self.hinted_glyph(kp, &b, idx, gid, &[], 0));
                     (hinted, false)
                 };
                 // WINDOWS (the `not(unix)` third of the split): the portable twin of
@@ -10562,17 +11155,69 @@ impl Renderer {
                 // instantiated axis. `ct` is the shared name for "a native/instanced
                 // raster the fail-safes below should not override"; there is no
                 // CoreText here.
+                //
+                // WINDOWS CRISPNESS: it is also the arm PLAIN primary text takes,
+                // so it is where grid fitting had to land to be felt at all. The
+                // hinted raster is tried FIRST, at the same instance the CoreText
+                // block picks (bold coords for a bold primary, the resolved coords
+                // otherwise, none for a real bold/styled FILE), and the pre-existing
+                // instantiated-outline raster stays underneath it as the fail-safe —
+                // so a face skrifa declines still draws its real `wght` cut exactly
+                // as it did before. `drawn` remains gated on the pick actually BEING
+                // the bold instance, so a hinted REGULAR glyph never strips the
+                // synthetic bold from a face with no usable `wght` axis.
                 #[cfg(not(unix))]
                 #[allow(clippy::type_complexity)]
                 let (ct, vf_bold_drawn): (
                     Option<(usize, usize, i32, i32, f32, Vec<u8>)>,
                     bool,
                 ) = {
-                    let ct = (matches!(pick, FacePick::Primary)
-                        && key.style.contains(StyleBits::BOLD))
-                    .then(|| self.vf_bold_gid_raster(gid))
-                    .flatten();
-                    let drawn = ct.is_some();
+                    let bold_instance = matches!(pick, FacePick::Primary)
+                        && key.style.contains(StyleBits::BOLD)
+                        && self.vf_bold_coords.is_some();
+                    #[cfg(windows)]
+                    let hinted = {
+                        let src: Option<(usize, std::sync::Arc<[u8]>, u32)> = match &pick {
+                            FacePick::Primary => self
+                                .rb_primary_bytes
+                                .clone()
+                                .map(|b| (b.as_ptr() as usize, b, 0)),
+                            FacePick::InjectedBold { .. } => self
+                                .bold_font_bytes
+                                .clone()
+                                .map(|b| (b.as_ptr() as usize, b, 0)),
+                            FacePick::Styled { slot, .. } => self.styled_faces[*slot]
+                                .as_ref()
+                                .map(|sf| (sf.bytes.as_ptr() as usize, sf.bytes.clone(), sf.index)),
+                        };
+                        src.and_then(|(kp, b, idx)| {
+                            let (vars, slot): (VarCoords, u8) = match &pick {
+                                FacePick::Primary if bold_instance => {
+                                    (self.vf_bold_coords.clone(), 2)
+                                }
+                                FacePick::Primary if self.var_coords.is_some() => {
+                                    (self.var_coords.clone(), 1)
+                                }
+                                _ => (None, 0),
+                            };
+                            self.hinted_glyph(
+                                kp,
+                                &b,
+                                idx,
+                                gid,
+                                vars.as_deref().unwrap_or(&[]),
+                                slot,
+                            )
+                        })
+                    };
+                    #[cfg(not(windows))]
+                    let hinted: Option<(usize, usize, i32, i32, f32, Vec<u8>)> = None;
+                    let ct = hinted.or_else(|| {
+                        bold_instance
+                            .then(|| self.vf_bold_gid_raster(gid))
+                            .flatten()
+                    });
+                    let drawn = bold_instance && ct.is_some();
                     (ct, drawn)
                 };
                 let (gw, gh, gxmin, gymin, gadv, mut bytes) = if let Some(t) = ct {
@@ -10585,15 +11230,76 @@ impl Renderer {
                     // primary glyph (fontdue below would draw only the fvar default).
                     t
                 } else {
+                    // THIS is the "first actual use" that materialises a deferred
+                    // STYLED parse — reached only where a fontdue face is genuinely
+                    // about to draw, after the native/grid-fitted rasters declined.
+                    //
+                    // `gid` was SHAPED ON THE PICKED STYLED FACE, so it means
+                    // nothing anywhere else: the primary's glyph number `gid` is a
+                    // DIFFERENT letter. `fontdue_admissible` can err PERMISSIVELY,
+                    // so a slot whose deferred parse fails here has to be caught
+                    // rather than assumed away — and the only honest raster for a
+                    // glyph id whose face cannot be opened is NO INK.
+                    //
+                    // REFUSED, NOT RE-DRAWN. Retiring the slot and re-entering
+                    // `rasterize(key)` would be the bug this guard exists to
+                    // prevent: `pick` is re-derived from face PRESENCE, so on
+                    // re-entry the shortened slot set picks a DIFFERENT face and
+                    // rasterizes this face's gid from it — a stranger's glyphs, on
+                    // every input that reaches the branch. Falling through to the
+                    // `map_or(self.font, ..)` fail-safe below is the same mistake
+                    // with fewer steps, which is why the refusal covers an ABSENT
+                    // slot too and not only an unparsable one: there is no face in
+                    // this renderer that a styled gid may be borrowed from.
+                    //
+                    // When the slot is merely unparsable it is left IN PLACE and
+                    // the retire made PENDING, because presence is what
+                    // `run_face_pick` reads: while the slot stands, every remaining
+                    // gid of the plan already in flight reaches this same refusal
+                    // rather than a re-pick. The retire lands at the next FRAME
+                    // boundary (`begin_frame_boundary`), before that frame plans
+                    // anything — and the epoch bump here stamps the frame cache
+                    // stale so the NEXT frame full-repaints against the shortened
+                    // set, with that style synthetic: exactly the outcome the eager
+                    // parse produced by never installing the face.
+                    //
+                    // The condemnation names the FACE (`StyledFaceId`), not the slot:
+                    // a host may answer this very style with real bytes before the
+                    // boundary arrives, and the innocent replacement must not be
+                    // retired for this one's failure.
+                    if let FacePick::Styled { slot, .. } = pick
+                        && !self.styled_faces[slot]
+                            .as_ref()
+                            .is_some_and(|sf| sf.parsed().is_some())
+                    {
+                        if let Some(id) = self.styled_faces[slot].as_ref().map(|sf| sf.id)
+                            && self.styled_retire_pending[slot] != Some(id)
+                        {
+                            self.styled_retire_pending[slot] = Some(id);
+                            self.font_epoch += 1;
+                        }
+                        return GlyphImage::Mono {
+                            width: 0,
+                            height: 0,
+                            xmin: 0,
+                            ymin: 0,
+                            advance: 0.0,
+                            bytes: Vec::new(),
+                        };
+                    }
                     // Fail safe to the primary face when a picked face is somehow
-                    // absent (it never is on the paths that build these keys).
+                    // absent (it never is on the paths that build these keys). The
+                    // STYLED arm is unreachable now — such a pick was refused
+                    // outright above rather than handed to a face that does not own
+                    // its gids — and is kept only so the match stays total.
                     let face = match &pick {
                         FacePick::InjectedBold { .. } => {
                             self.bold_font.as_ref().unwrap_or(&self.font)
                         }
                         FacePick::Styled { slot, .. } => self.styled_faces[*slot]
                             .as_ref()
-                            .map_or(self.font.as_ref(), |sf| sf.font.as_ref()),
+                            .and_then(StyledFace::parsed)
+                            .map_or(self.font.as_ref(), |f| f.as_ref()),
                         FacePick::Primary => &self.font,
                     };
                     let (m, b) = face.rasterize_indexed(gid, self.px);
@@ -10870,15 +11576,44 @@ impl Renderer {
         }
     }
 
-    /// Bound the shared shaping/glyph caches from OUTSIDE the CPU render path.
+    /// THE FRAME BOUNDARY: everything the shared `Renderer` owes a frame BEFORE
+    /// that frame plans its first row, and the only place a face may be REMOVED
+    /// under a backend. (Installing a lazily discovered styled sibling is not
+    /// removal and stays where it is useful — see [`Self::row_glyph_plan`],
+    /// which settles that discovery before it shapes anything.)
+    ///
+    /// Crossed exactly once per frame by each backend — the CPU path at the top of
+    /// [`render_core`](Self::render_core), the GPU path through
+    /// [`evict_caches_if_large`](Self::evict_caches_if_large) at the top of its
+    /// `encode_frame` — and by the semantic surface once per specimen pass
+    /// ([`semantic_ascii_glyph_plan`](Self::semantic_ascii_glyph_plan)). Both
+    /// duties want the SAME moment, which is why they share one seam:
+    ///
+    /// * the glyph caches are bounded before anything consults them, and
+    /// * a styled face whose deferred parse failed mid-frame is finally dropped
+    ///   ([`apply_pending_styled_retires`](Self::apply_pending_styled_retires)) —
+    ///   here, where NO plan is in flight. It cannot be done per row: the GPU
+    ///   builds every row's plan before rasterizing any of them, so a retire
+    ///   between two rows would leave the earlier rows' plans carrying gids of a
+    ///   face `run_face_pick` no longer answers with, and they would be re-picked
+    ///   onto a stranger. Per row it also breaks `row_glyph_plan`'s purity, which
+    ///   `draw_cursor`'s plan reuse (and its debug re-plan assert) depends on.
+    fn begin_frame_boundary(&mut self) {
+        self.evict_glyph_caches_if_large();
+        self.apply_pending_styled_retires();
+    }
+
+    /// The GPU backend's crossing of [`begin_frame_boundary`](Self::begin_frame_boundary).
+    ///
     /// The GPU backend drives glyph planning through this same `Renderer` (held as
     /// `GpuRenderer.cpu`) but never routes through [`render_input_cached`], the only
-    /// place [`evict_glyph_caches_if_large`](Self::evict_glyph_caches_if_large) runs —
-    /// so the GPU encode path must call this each frame, or the caches would grow for
-    /// the whole process lifetime on the default (GPU) backend. Cheap: a length check
-    /// that only clears once past the cap.
+    /// place the CPU path crosses that boundary — so the GPU encode path must call
+    /// this each frame, before it plans any row: otherwise the caches would grow for
+    /// the whole process lifetime on the default (GPU) backend, and a failed styled
+    /// parse would never be retired there at all. Cheap: a length check that only
+    /// clears once past the cap, plus one array read.
     pub fn evict_caches_if_large(&mut self) {
-        self.evict_glyph_caches_if_large();
+        self.begin_frame_boundary();
     }
 
     pub fn render_input(&mut self, input: &RenderInput) -> Frame {
@@ -10954,8 +11689,12 @@ impl Renderer {
         )
     )]
     fn render_core(&mut self, wc: &mut WindowCpu, input: &RenderInput) -> (usize, usize) {
-        // Bound the otherwise-unbounded glyph caches before they're consulted below.
-        self.evict_glyph_caches_if_large();
+        // The CPU backend's FRAME BOUNDARY crossing: bound the otherwise-unbounded
+        // glyph caches before they're consulted below, and land any styled retire
+        // the last frame left pending — both before a single row is planned, and
+        // before the dirty decision below reads `font_epoch` (a retire bumps it, so
+        // the frame that drops a face repaints in full against the shortened set).
+        self.begin_frame_boundary();
         // Install any background fallback parse that landed since the last
         // frame BEFORE the dirty decision: the epoch bump it applies is what
         // forces the repaint that turns provisional `.notdef` cells into real
@@ -15975,15 +16714,24 @@ fn row_differs_shifted(
 ///   that changed hands would otherwise read one pane's revision as the other's.
 ///   Zero means "no engine fill vouches for this snapshot" — `RenderInput::empty`,
 ///   and every host-composed frame.
-/// * LANE LENGTH equals the frame's row count on BOTH sides. A host that
-///   prepends rows (the in-grid tab strip) shifts every channel EXCEPT this one,
-///   so the mismatch fails the whole frame closed rather than reading row `r`'s
-///   stamp against row `r + strip`'s content.
-/// * NO POST-FILL HOST CELL WRITE (`snapshot_seq == engine_fill_seq`, the
-///   existing DMG-1 token). Stream fade, the IME preedit overlay and prediction
-///   ghosts all write cells the engine never saw and all bump `snapshot_seq` by
-///   the established discipline; the engine's revision cannot vouch for those
-///   rows and must not be asked to.
+/// * LANE LENGTH equals the frame's row count on BOTH sides.
+/// * NO POST-FILL HOST CELL WRITE (`snapshot_seq == shifted_fill_seq`, the D-2
+///   SPLICE token). Stream fade, the IME preedit overlay, prediction ghosts, the
+///   find bar, the config notice and the settings panel all write cells the
+///   engine never saw and all bump `snapshot_seq` by the established discipline
+///   WITHOUT re-arming this token; the engine's revision cannot vouch for those
+///   rows and must not be asked to. The in-grid TAB STRIP is the one host
+///   mutator this admits, because it is not a write into an engine row at all:
+///   it prepends chrome and slides the engine's rows down together, and it
+///   splices the lane in the same operation (`note_host_row_prepend`), so the
+///   stamps still describe the rows they are attached to.
+/// * EQUAL ROW SHIFT (`row_shift`). Admitting the strip makes its ROW COUNT a
+///   continuity term: a frame whose strip grew from 1 chrome row to 2 has the
+///   same total row count as its predecessor (the terminal lost a row to pay for
+///   it) and the same lane length, but every engine row has moved one index
+///   relative to the previous frame — comparing stamps across that would serve
+///   one row's pixels under another row's number. The count must INVALIDATE, not
+///   shift, and this is the clause that makes it.
 /// * ROW IDENTITY: equal `base_y` (a scroll that archives rows marks ONLY the
 ///   exposed strip — `mark_scroll_damage` — so the stamps describe rows that
 ///   have since slid out from under their indices), equal `absolute_row_revision`
@@ -16013,8 +16761,9 @@ fn row_stamps_usable(prev_input: &RenderInput, input: &RenderInput, rows: usize)
         && prev_input.row_rev_lane == input.row_rev_lane
         && prev_input.row_rev.len() == rows
         && input.row_rev.len() == rows
-        && prev_input.snapshot_seq == prev_input.engine_fill_seq
-        && input.snapshot_seq == input.engine_fill_seq
+        && prev_input.snapshot_seq == prev_input.shifted_fill_seq
+        && input.snapshot_seq == input.shifted_fill_seq
+        && prev_input.row_shift == input.row_shift
         && prev_input.engine_alt == input.engine_alt
         && prev_input.engine_row_order == aterm_core::render::RowOrder::Logical
         && input.engine_row_order == aterm_core::render::RowOrder::Logical
@@ -21550,6 +22299,15 @@ mod tests {
             eprintln!("SKIP: no system mono font found");
             return;
         };
+        // SETTLE THE ASYNC FALLBACK INSTALL FIRST. The row carries CJK, whose
+        // chain face is parsed on a background thread; landing it BETWEEN the two
+        // renders below re-routes those cells (provisional `.notdef` → the real
+        // face) and bumps `font_epoch`, so the pair differs for a reason that has
+        // nothing to do with the damaged path this test is the oracle for. That
+        // race made this test fail 4 runs in 5 of the full suite on this machine.
+        // Convergence after a mid-frame parse has its own coverage
+        // (`font_epoch_bump_forces_full_repaint_of_cached_frame`).
+        r.debug_block_on_lazy_fallbacks();
         let mut term = Terminal::new(4, 12);
         term.process("ab \u{4E2D}\u{6587} cd".as_bytes()); // wide CJK mid-row
         term.process(b"\r\nsecond line");
@@ -22945,6 +23703,750 @@ mod tests {
                 sym.path
             );
         }
+    }
+
+    /// LAZY-FONT-PARSE, the probe set: asking a styled slot for coverage
+    /// MATERIALISES its deferred fontdue parse, so the policy must ask only the
+    /// slots its own decision tree reaches. Pinned over the COMPLETE input space
+    /// (4 styles × injected × 2^3 coverage), together with the equivalence to the
+    /// eager `[bool; 3]` form that carries `resolve_styled_face`'s proofs over.
+    #[test]
+    fn lazy_styled_face_probes_only_the_slots_it_needs() {
+        const BOLD_ITALIC: StyleBits = StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0);
+        for (si, style) in [
+            StyleBits::REGULAR,
+            StyleBits::BOLD,
+            StyleBits::ITALIC,
+            BOLD_ITALIC,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            for injected in [false, true] {
+                for bits in 0u8..8 {
+                    let covers = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0];
+                    let mut probed = [false; 3];
+                    let lazy = resolve_styled_face_lazy(style, injected, |slot| {
+                        probed[slot] = true;
+                        covers[slot]
+                    });
+                    assert_eq!(
+                        lazy,
+                        resolve_styled_face(style, injected, covers),
+                        "lazy and eager forms disagree at style {si} injected={injected} covers={covers:?}"
+                    );
+                    // The tree's reach, style by style. A REGULAR cell never asks;
+                    // a single-style cell asks its own slot; a bold-italic cell
+                    // asks slot 2 first and stops there when a real one exists.
+                    let expected: [bool; 3] = match (si, injected, covers[2]) {
+                        (0, _, _) => [false, false, false],
+                        (1, true, _) => [false, false, false],
+                        (1, false, _) => [true, false, false],
+                        (2, _, _) => [false, true, false],
+                        (3, _, true) => [false, false, true],
+                        (3, true, false) => [false, false, true],
+                        (3, false, false) => [true, !covers[0], true],
+                        _ => unreachable!("only four styles exist"),
+                    };
+                    assert_eq!(
+                        probed, expected,
+                        "probe set drifted at style {si} injected={injected} covers={covers:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A path-backed renderer on DejaVu Sans Mono, which ships all three real
+    /// styled siblings — or `None` → SKIP on a host without it.
+    #[cfg(target_os = "linux")]
+    fn dejavu_path_backed_renderer() -> Option<Renderer> {
+        let path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf";
+        let bytes = std::fs::read(path).ok()?;
+        let mut r = Renderer::from_bytes(&bytes, 32.0, Theme::default()).ok()?;
+        r.primary_path = Some(path.to_string());
+        Some(r)
+    }
+
+    /// LAZY-FONT-PARSE, the styled tier: DISCOVERING the real `[bold, italic,
+    /// bold-italic]` siblings must fill the slots without fontdue-parsing them.
+    ///
+    /// The three DejaVu Sans Mono siblings cost a MEASURED 8.7 + 6.7 + 6.5 =
+    /// 21.9 MB of live heap once fontdue converts their outlines, and an idle
+    /// terminal that never draws a styled cell used to pay all of it at seal.
+    /// The disk READ has to stay where it is (the render thread must never do
+    /// font I/O); only the parse moves.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn discovering_styled_siblings_does_not_fontdue_parse_them() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        r.ensure_styled_faces();
+        assert!(
+            r.styled_faces.iter().any(Option::is_some),
+            "DejaVu ships -Bold/-Oblique/-BoldOblique: discovery must fill slots"
+        );
+        for (slot, face) in r.styled_faces.iter().enumerate() {
+            if let Some(sf) = face {
+                assert!(
+                    !sf.font.is_materialised(),
+                    "styled slot {slot} fontdue-parsed at DISCOVERY time"
+                );
+            }
+        }
+    }
+
+    /// The same, through the real startup path — `seal_admitted_font_sources` is
+    /// what the GUI's backend-build thread runs — and the slots must still be
+    /// ADMITTED there (the sources a device-loss rebuild replays come from it).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sealing_a_generation_does_not_fontdue_parse_the_styled_siblings() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        let sources = r.seal_admitted_font_sources();
+        assert!(
+            sources.styled.iter().any(Option::is_some),
+            "sealing must still ADMIT the real styled siblings"
+        );
+        for (slot, face) in r.styled_faces.iter().enumerate() {
+            if let Some(sf) = face {
+                assert!(
+                    !sf.font.is_materialised(),
+                    "seal fontdue-parsed styled slot {slot}"
+                );
+            }
+        }
+    }
+
+    /// The end-to-end laziness claim: drawing a BOLD cell parses NO styled face
+    /// at all on the native/grid-fitted path, and the portable fontdue path
+    /// parses exactly the ONE face it draws from.
+    ///
+    /// A terminal whose prompt is bold — most of them — used to pay for the
+    /// italic and bold-italic siblings too (6.7 + 6.5 MB MEASURED on DejaVu) for
+    /// styles the session may never show. It then still paid 8.7 MB for the BOLD
+    /// sibling even where the grid-fitted raster (Linux) or CoreText (macOS)
+    /// draws straight from the bytes and the fontdue face is never touched —
+    /// because ROUTING asked `StyledFace::parsed()`. Routing now reads the cmap
+    /// ([`StyledFace::covers`]), so on those paths the tier is never parsed.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_bold_cell_parses_only_the_face_it_actually_draws_from() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let img = r.glyph_image(key);
+        let GlyphImage::Mono { bytes, .. } = img else {
+            panic!("a bold 'A' is a Mono glyph");
+        };
+        assert!(bytes.iter().any(|&b| b != 0), "bold 'A' must draw ink");
+        assert_eq!(
+            r.debug_styled_face_indices()[0],
+            Some(0),
+            "the bold sibling must have been ROUTED to (else this proves nothing)"
+        );
+        for (slot, face) in r.styled_faces.iter().enumerate() {
+            if let Some(sf) = face {
+                assert!(
+                    !sf.font.is_materialised(),
+                    "the grid-fitted path drew from the BYTES, yet styled slot \
+                     {slot} was fontdue-parsed"
+                );
+            }
+        }
+
+        // LAZINESS MUST END WHERE THE FACE IS ACTUALLY USED: forced onto the
+        // portable fontdue backend, the same cell parses the bold face — and
+        // still not the italic or bold-italic ones.
+        r.debug_force_fontdue();
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let _ = r.glyph_image(key);
+        assert!(
+            r.styled_faces[0]
+                .as_ref()
+                .is_some_and(|sf| sf.font.is_materialised()),
+            "the fontdue raster path must materialise the face it draws from"
+        );
+        for slot in [1usize, 2] {
+            if let Some(sf) = r.styled_faces[slot].as_ref() {
+                assert!(
+                    !sf.font.is_materialised(),
+                    "a BOLD cell fontdue-parsed styled slot {slot}"
+                );
+            }
+        }
+    }
+
+    /// DEFERRAL IS NOT A RENDERING CHANGE: the coverage bytes a styled cell
+    /// draws are byte-identical whether the face was parsed at discovery (what
+    /// the eager path did) or on first use (what ships now).
+    ///
+    /// Two renderers over the same font, one with every styled slot FORCED to
+    /// materialise the instant it is discovered — the eager path's exact state —
+    /// and one left lazy. Every style, every glyph, same bytes and same metrics.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deferred_styled_parse_draws_the_same_bytes_as_an_eager_one() {
+        let Some(mut eager) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        let Some(mut lazy) = dejavu_path_backed_renderer() else {
+            return;
+        };
+        eager.ensure_styled_faces();
+        for sf in eager.styled_faces.iter().flatten() {
+            assert!(sf.parsed().is_some(), "the eager twin must parse its faces");
+        }
+
+        // `GlyphImage` is not `PartialEq` (and a public derive is not this
+        // test's business): compare every field it carries.
+        fn facts(g: &GlyphImage) -> (bool, usize, usize, i32, i32, f32, Vec<u8>) {
+            match g {
+                GlyphImage::Mono {
+                    width,
+                    height,
+                    xmin,
+                    ymin,
+                    advance,
+                    bytes,
+                } => (true, *width, *height, *xmin, *ymin, *advance, bytes.clone()),
+                GlyphImage::Rgba {
+                    width,
+                    height,
+                    xmin,
+                    ymin,
+                    advance,
+                    bytes,
+                } => (
+                    false,
+                    *width,
+                    *height,
+                    *xmin,
+                    *ymin,
+                    *advance,
+                    bytes.clone(),
+                ),
+            }
+        }
+
+        const BOLD_ITALIC: StyleBits = StyleBits(StyleBits::BOLD.0 | StyleBits::ITALIC.0);
+        for style in [StyleBits::BOLD, StyleBits::ITALIC, BOLD_ITALIC] {
+            for ch in "AaGgMm019@#_|/\\".chars() {
+                let ke = eager.glyph_key_styled(ch, style);
+                let kl = lazy.glyph_key_styled(ch, style);
+                assert_eq!(ke, kl, "styled routing differed for {ch:?} @ {style:?}");
+                let ie = facts(eager.glyph_image(ke));
+                let il = facts(lazy.glyph_image(kl));
+                assert_eq!(
+                    ie, il,
+                    "deferred parse changed the raster for {ch:?} @ {style:?}"
+                );
+            }
+        }
+        assert_eq!(
+            eager.debug_styled_face_indices(),
+            lazy.debug_styled_face_indices(),
+            "the two twins must have resolved the same styled faces"
+        );
+    }
+
+    /// The second line of defence behind `fontdue_admissible`: a styled slot
+    /// whose DEFERRED parse turns out to FAIL must be retired, not left to hand
+    /// the by-ID raster path gids only that face owns. Retiring drops the slot
+    /// and every memo taken against it, and bumps the font epoch.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_styled_slot_whose_deferred_parse_fails_is_retired() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        r.ensure_styled_faces();
+        let Some(sf) = r.styled_faces[0].as_mut() else {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        };
+        // `fontdue_admissible` is written so this verdict is unreachable from
+        // real bytes, so the retire path can only be exercised by manufacturing it.
+        sf.font = LazyFontdue::failed_parse();
+        let epoch = r.font_epoch;
+        assert!(r.retire_unparsable_styled(0), "a present slot must retire");
+        assert!(r.styled_faces[0].is_none(), "the retired slot must be empty");
+        assert!(r.font_epoch > epoch, "retiring must bump the font epoch");
+        assert!(
+            !r.retire_unparsable_styled(0),
+            "an already-empty slot retires nothing (the recursion must terminate)"
+        );
+        // Bold still renders — through the primary + synthetic style, exactly the
+        // outcome the eager parse produced by never installing the face.
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let GlyphImage::Mono { bytes, .. } = r.glyph_image(key) else {
+            panic!("bold 'A' must still be a Mono glyph after the retire");
+        };
+        assert!(
+            bytes.iter().any(|&b| b != 0),
+            "bold 'A' must still draw ink after the retire"
+        );
+    }
+
+    /// DEFECT 4 — THE POINTER-KEYED CACHES. Retiring FREES the slot's bytes, and
+    /// `ct_cache` / the hinting banks key a face by its bytes ADDRESS, so a later
+    /// allocation landing on that address would resurrect instances built for the
+    /// dead face. `set_styled_font_bytes` clears them for exactly this hazard
+    /// (and it only SWAPS a face); the retire shipped clearing neither.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retiring_a_styled_slot_drops_the_pointer_keyed_caches() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        r.ensure_styled_faces();
+        if r.styled_faces[0].is_none() {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        }
+        // Draw a bold cell so the grid-fitted path banks an instance keyed by the
+        // styled face's bytes ADDRESS.
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let _ = r.glyph_image(key);
+        let (bytes, index) = r.styled_faces[0]
+            .as_ref()
+            .map(|sf| (sf.bytes.clone(), sf.index))
+            .expect("slot 0 is loaded");
+        let kp = bytes.as_ptr() as usize;
+        let (px, mode) = (r.px, r.hint_mode);
+        // The bank is private, so observe it through its own seam: a HIT hands
+        // back the SAME `Arc`, a cleared bank rebuilds a different one.
+        let banked = r
+            .hint_bank
+            .instance(kp, &bytes, index, px, mode, &[], 0)
+            .expect("a bold cell must have banked a hinting instance");
+        let hit = r
+            .hint_bank
+            .instance(kp, &bytes, index, px, mode, &[], 0)
+            .expect("the bank must serve the same instance twice");
+        assert!(
+            std::sync::Arc::ptr_eq(&banked, &hit),
+            "the bank must be memoizing for this test to be a test"
+        );
+        // Note `subpx_glyphs` too: keyed like `glyphs`, cleared wherever it is.
+        r.subpx_glyphs.insert(key, None);
+
+        assert!(r.retire_unparsable_styled(0), "a present slot must retire");
+
+        let rebuilt = r
+            .hint_bank
+            .instance(kp, &bytes, index, px, mode, &[], 0)
+            .expect("the instance still builds from the bytes this test holds");
+        assert!(
+            !std::sync::Arc::ptr_eq(&banked, &rebuilt),
+            "the retire freed the slot's bytes but left ADDRESS-keyed instances behind — \
+             a later allocation at that address would resurrect them"
+        );
+        assert!(
+            r.subpx_glyphs.is_empty(),
+            "the subpixel overlay is keyed like `glyphs`, cleared with it"
+        );
+    }
+
+    /// DEFECT 2 — THE WORST ONE. A glyph id shaped on a styled face whose
+    /// deferred parse FAILS must never be drawn from a different face.
+    ///
+    /// The shipped code retired the slot and re-entered `rasterize(key)` with the
+    /// same key. The re-entry re-derives the face from PRESENCE, so with the slot
+    /// gone it landed on the primary and rasterized the styled face's glyph id
+    /// there — a different letter, on 100% of that branch's inputs, and exactly
+    /// what the retire's own comment says it prevents.
+    ///
+    /// The draw is refused instead (no ink), the slot stays present so the REST
+    /// of the plan already in flight is refused too rather than re-picked, and
+    /// the retire lands at the next FRAME boundary — after which bold draws again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_styled_gid_whose_parse_fails_is_refused_not_drawn_from_another_face() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        // The grid-fitted raster draws by-ID straight from the BYTES and never
+        // needs the fontdue parse, so the branch under test is the portable one.
+        r.debug_force_fontdue();
+        r.ensure_styled_faces();
+        let Some(sf) = r.styled_faces[0].as_mut() else {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        };
+        let Some(gid) = sf.unicode_gid('A') else {
+            eprintln!("SKIP: the -Bold sibling has no 'A'");
+            return;
+        };
+        // Manufactured: `fontdue_admissible` is written so real bytes cannot
+        // produce this verdict.
+        sf.font = LazyFontdue::failed_parse();
+
+        // What the PRIMARY face would draw for that same glyph number — the
+        // stranger's glyph the old code returned. It must have ink, or this test
+        // could pass for the wrong reason.
+        let (pm, pb) = r.font.rasterize_indexed(gid, r.px);
+        assert!(
+            pb.iter().any(|&b| b != 0),
+            "the primary's glyph #{gid} must have ink for this test to be a test"
+        );
+
+        let key = r.ligature_key(gid, StyleBits::BOLD);
+        assert!(
+            matches!(r.run_face_pick(key.style), FacePick::Styled { slot: 0, .. }),
+            "the key must route to the doomed styled slot"
+        );
+        let epoch = r.font_epoch;
+        let GlyphImage::Mono {
+            width,
+            height,
+            bytes,
+            ..
+        } = r.glyph_image(key).clone()
+        else {
+            panic!("a MonoGid key rasterizes to a Mono glyph");
+        };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "a gid whose face cannot be opened must draw NO ink; got {} set bytes",
+            bytes.iter().filter(|&&b| b != 0).count()
+        );
+        assert_ne!(
+            (width, height, bytes.as_slice()),
+            (pm.width, pm.height, pb.as_slice()),
+            "the refused gid was drawn from the PRIMARY face — a stranger's glyph"
+        );
+        assert!(
+            r.font_epoch > epoch,
+            "the refusal must stamp the frame cache stale so the next frame re-plans"
+        );
+        assert!(
+            r.styled_faces[0].is_some(),
+            "the slot must STAY present until a frame boundary: dropping it mid-frame \
+             is what lets the rest of the in-flight plan re-pick another face"
+        );
+        // Every other id of that in-flight plan gets the same refusal, not a
+        // re-pick — the property the pending retire buys.
+        let other = r.ligature_key(gid.wrapping_add(1), StyleBits::BOLD);
+        let GlyphImage::Mono { bytes, .. } = r.glyph_image(other).clone() else {
+            panic!("a MonoGid key rasterizes to a Mono glyph");
+        };
+        assert!(
+            bytes.iter().all(|&b| b == 0),
+            "a second orphaned gid was drawn from another face"
+        );
+
+        // PLANNING IS NOT A BOUNDARY. `row_glyph_plan` is a pure planning seam
+        // called once per ROW, and the GPU plans every row before rasterizing any
+        // of them — a retire between two rows would strand the earlier rows' gids.
+        let mut term = Terminal::new(1, 8);
+        term.process(b"ab");
+        let input = term.cell_frame(1, 8);
+        let mut plan = Vec::new();
+        r.row_glyph_plan(&input, 0, &[], &mut plan);
+        assert!(
+            r.styled_faces[0].is_some(),
+            "planning a row must NOT move face presence — only the frame boundary may"
+        );
+
+        // The FRAME boundary — a real CPU frame — retires the slot, and bold text
+        // draws again: primary + synthetic, the eager path's own outcome.
+        let _ = r.render_input(&input);
+        assert!(
+            r.styled_faces[0].is_none(),
+            "the pending retire must land at the frame boundary"
+        );
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let GlyphImage::Mono { bytes, .. } = r.glyph_image(key) else {
+            panic!("bold 'A' must be a Mono glyph after the retire");
+        };
+        assert!(
+            bytes.iter().any(|&b| b != 0),
+            "bold 'A' must draw ink again once the slot is retired"
+        );
+    }
+
+    /// A PENDING RETIRE CONDEMNS A FACE, NOT A SLOT NUMBER.
+    ///
+    /// The condemnation is recorded mid-frame and executed at the next frame
+    /// boundary, and the slot can be REPLACED in between — the host resolving
+    /// `font_family_bold` and pushing real bytes is exactly that, and it lands on
+    /// the render thread between two frames. Retiring on the slot alone dropped
+    /// the newcomer for its predecessor's parse failure: bold went synthetic and
+    /// STAYED synthetic (nothing re-discovers an injected face), so a config the
+    /// user just set silently did nothing.
+    ///
+    /// Two halves are pinned here: the injection drops the stale condemnation, and
+    /// the apply checks identity anyway — so a future writer that forgets the first
+    /// still cannot execute a verdict on the wrong face.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_pending_styled_retire_never_condemns_a_replacement_face() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        // The portable branch is the one that materialises the deferred parse.
+        r.debug_force_fontdue();
+        r.ensure_styled_faces();
+        let Some(sf) = r.styled_faces[0].as_mut() else {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        };
+        let Some(gid) = sf.unicode_gid('A') else {
+            eprintln!("SKIP: the -Bold sibling has no 'A'");
+            return;
+        };
+        // Manufactured: `fontdue_admissible` is written so real bytes cannot
+        // produce this verdict.
+        sf.font = LazyFontdue::failed_parse();
+        let doomed_id = sf.id;
+
+        // Mid-frame discovery: the refused draw condemns THIS face.
+        let _ = r.glyph_image(r.ligature_key(gid, StyleBits::BOLD)).clone();
+        assert_eq!(
+            r.styled_retire_pending[0],
+            Some(doomed_id),
+            "the refusal must condemn the face it actually failed to open"
+        );
+
+        // The host answers the same style with real bytes, before the boundary.
+        let primary = r
+            .rb_primary_bytes
+            .clone()
+            .expect("a byte-loaded primary retains its bytes");
+        r.set_styled_font_bytes(0, &primary)
+            .expect("the primary's own bytes are a parseable styled face");
+        let fresh_id = r.styled_faces[0]
+            .as_ref()
+            .expect("the injected face took the slot")
+            .id;
+        assert_ne!(fresh_id, doomed_id, "a new face is a new identity");
+        assert_eq!(
+            r.styled_retire_pending[0], None,
+            "replacing the slot must drop the condemnation with the face it named"
+        );
+
+        // Re-arm the STALE condemnation by hand: identity alone must acquit the
+        // replacement even if some future writer forgets the clear above.
+        r.styled_retire_pending[0] = Some(doomed_id);
+        assert!(
+            !r.apply_pending_styled_retires(),
+            "a condemnation whose face has left the slot must retire NOTHING"
+        );
+        assert!(
+            r.styled_faces[0].is_some(),
+            "the innocent replacement must survive the boundary"
+        );
+        assert_eq!(
+            r.styled_retire_pending[0], None,
+            "a spent condemnation must not linger to fire at a later boundary"
+        );
+
+        // And what survived is the HEALTHY face, not the doomed one wearing a new
+        // id: it opens, it is what `run_face_pick` still answers bold with, and it
+        // draws.
+        assert!(
+            r.styled_faces[0]
+                .as_ref()
+                .is_some_and(|sf| sf.parsed().is_some()),
+            "the surviving face must be the one that parses"
+        );
+        assert!(
+            matches!(
+                r.run_face_pick(StyleBits::BOLD),
+                FacePick::Styled { slot: 0, .. }
+            ),
+            "bold must still be answered by the injected styled face"
+        );
+        let key = r.glyph_key_styled('A', StyleBits::BOLD);
+        let GlyphImage::Mono { bytes, .. } = r.glyph_image(key) else {
+            panic!("bold 'A' must be a Mono glyph");
+        };
+        assert!(
+            bytes.iter().any(|&b| b != 0),
+            "the surviving face must actually draw"
+        );
+    }
+
+    /// EVERY BACKEND CROSSES THE BOUNDARY. The GPU backend never routes through
+    /// `render_core`; it reaches the shared `Renderer` through
+    /// `evict_caches_if_large` at the top of its `encode_frame`, before it plans a
+    /// single row — so that call is its crossing and must land the pending retire.
+    /// Without it the GPU path would refuse every gid of a failed style forever
+    /// (the slot stays present, so every id keeps hitting the refusal), while the
+    /// CPU path recovered on its next frame.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_gpu_backends_frame_boundary_lands_a_pending_styled_retire() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        r.debug_force_fontdue();
+        r.ensure_styled_faces();
+        let Some(sf) = r.styled_faces[0].as_mut() else {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        };
+        let Some(gid) = sf.unicode_gid('A') else {
+            eprintln!("SKIP: the -Bold sibling has no 'A'");
+            return;
+        };
+        sf.font = LazyFontdue::failed_parse();
+
+        let _ = r.glyph_image(r.ligature_key(gid, StyleBits::BOLD)).clone();
+        assert!(
+            r.styled_retire_pending[0].is_some(),
+            "the refusal must leave a pending retire for the boundary to land"
+        );
+        r.evict_caches_if_large();
+        assert!(
+            r.styled_faces[0].is_none(),
+            "the GPU backend's per-frame crossing must land the pending retire"
+        );
+        assert_eq!(
+            r.styled_retire_pending[0], None,
+            "the condemnation is spent at the boundary"
+        );
+    }
+
+    /// DEFECT 1 — ONE COPY OF THE FILE. The styled tier's bytes go through the
+    /// shared store even though its PARSE is deferred, so the GUI chrome's later
+    /// parse of the same `-Bold.ttf` adopts that handle instead of publishing a
+    /// second copy of the file.
+    ///
+    /// The lazy-parse commit handed the slot a PRIVATE `Arc`, which made the
+    /// sibling invisible to the store until something materialised it — and in
+    /// the shipping order `sync_chrome_fonts` gets there first, so the file was
+    /// resident TWICE for the life of the process.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_deferred_styled_face_and_the_chrome_share_one_copy_of_the_file() {
+        let Some(mut r) = dejavu_path_backed_renderer() else {
+            eprintln!("SKIP: DejaVu Sans Mono is not installed on this machine");
+            return;
+        };
+        // Exactly what `native_font_catalog` asks for at chrome-font install.
+        let Some((chrome_bytes, index)) = r.chrome_bold_face() else {
+            eprintln!("SKIP: no real -Bold sibling on this machine");
+            return;
+        };
+        let slot_bytes = r.styled_faces[0]
+            .as_ref()
+            .map(|sf| sf.bytes.clone())
+            .expect("chrome_bold_face returned the slot's bytes");
+        assert!(
+            std::sync::Arc::ptr_eq(&chrome_bytes, &slot_bytes),
+            "the chrome must be handed the slot's own handle, not a copy"
+        );
+        assert!(
+            r.styled_faces[0]
+                .as_ref()
+                .is_some_and(|sf| !sf.font.is_materialised()),
+            "the slot must still be UNPARSED — that is the case the store used to miss"
+        );
+
+        // The chrome parses (`tray_raster::ChromeFace::from_bytes`) BEFORE any
+        // terminal cell asks. Its byte handle must be the slot's, not a new copy.
+        let (published, chrome_font) =
+            shared_parsed_face(&chrome_bytes, index).expect("the bold sibling parses");
+        assert!(
+            std::sync::Arc::ptr_eq(&published, &slot_bytes),
+            "the chrome's parse published a SECOND copy of the -Bold file"
+        );
+
+        // And when the styled tier finally materialises, it converges on the
+        // chrome's parse rather than making a second one.
+        let styled_font = r.styled_faces[0]
+            .as_ref()
+            .and_then(StyledFace::parsed)
+            .cloned()
+            .expect("the admitted sibling parses");
+        assert!(
+            std::sync::Arc::ptr_eq(&styled_font, &chrome_font),
+            "the styled tier re-parsed a face the chrome had already parsed"
+        );
+        assert!(
+            r.styled_faces[0]
+                .as_ref()
+                .is_some_and(|sf| std::sync::Arc::ptr_eq(&sf.bytes, &slot_bytes)),
+            "materialising must not have moved the slot to different bytes"
+        );
+    }
+
+    /// DEFECT 5 — THE PROBE MUST NOT PARSE, AND MUST NOT LIE. Styled routing asks
+    /// coverage on the RENDER THREAD, so it reads the cmap
+    /// ([`fontdue_cmap_covers`]) instead of materialising 6.5–8.7 MB of outlines
+    /// for a face the native raster then never touches. That is only allowed if
+    /// it gives fontdue's OWN answer — the routing lattice is proven against
+    /// `lookup_glyph_index` — so it is checked against fontdue itself, over every
+    /// real face on this machine and a broad character sample.
+    #[test]
+    fn styled_coverage_probe_agrees_with_fontdue() {
+        let mut paths: Vec<String> = present_fallback_paths();
+        paths.extend(
+            symbol_discovery_paths()
+                .into_iter()
+                .filter(|p| std::path::Path::new(p).is_file()),
+        );
+        paths.extend(
+            font_files()
+                .into_iter()
+                .filter_map(|p| p.to_str().map(str::to_string))
+                .filter(|p| {
+                    std::fs::metadata(p).is_ok_and(|m| m.len() > 0 && m.len() < 2 * 1024 * 1024)
+                })
+                .take(30),
+        );
+        paths.sort();
+        paths.dedup();
+        // ASCII, Latin-1 accents (the Mac-Roman mis-map's own inputs), Greek,
+        // Cyrillic, CJK, symbols, an emoji, and code points nothing covers.
+        let sample: Vec<char> = ('\u{20}'..='\u{7E}')
+            .chain("éÈàñöÿ£¥§°±µ¶".chars())
+            .chain("αβγΔΩ".chars())
+            .chain("абвЯ".chars())
+            .chain("中文한국어".chars())
+            .chain("←→↔∑√∞≈⌘⏸⏹⏺".chars())
+            .chain("🚀🎉".chars())
+            .chain(['\u{0378}', '\u{E000}', '\u{10FFFD}'])
+            .collect();
+        let mut checked = 0usize;
+        for p in &paths {
+            let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
+                continue;
+            };
+            let Ok(font) =
+                fontdue::Font::from_bytes(bytes.as_slice(), fontdue::FontSettings::default())
+            else {
+                continue;
+            };
+            for &ch in &sample {
+                assert_eq!(
+                    fontdue_cmap_covers(&bytes, 0, ch),
+                    font.lookup_glyph_index(ch) != 0,
+                    "coverage probe disagreed with fontdue for {ch:?} on {p}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "no font file was readable to check against");
+        eprintln!(
+            "coverage probe agreed with fontdue on {checked} face(s) x {} chars",
+            sample.len()
+        );
     }
 
     /// DEFECT 2 — THE SYMBOL SLOT. `symbol_fallback_has` runs on the RENDER
@@ -25132,7 +26634,10 @@ mod tests {
         r.set_pad(P);
         r.set_head(H);
         let top = r.grid_top();
-        assert!(top > 0, "the strip above the grid must exist to be extended");
+        assert!(
+            top > 0,
+            "the strip above the grid must exist to be extended"
+        );
 
         let flat = {
             r.set_chrome_bleed(Some(ChromeBleed {

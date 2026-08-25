@@ -129,6 +129,26 @@ impl GlowStyle {
         Self::style_names_kitty_pet(s) || Self::style_names_dog_pet(s)
     }
 
+    /// The RESOLVED style's diagnostic name — what `trail status` prints
+    /// beside the raw config string, so a spelling that fell back to the
+    /// default is legible as a fallback rather than as an endorsement. Stable
+    /// wire tokens (hyphenated, lower case); not a config spelling.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lumen => "lumen",
+            Self::Phaser => "phaser",
+            Self::RainbowKitty => "rainbow-kitty",
+            Self::Sparkle => "sparkle",
+            Self::Fire => "fire",
+            Self::Laser => "laser",
+            Self::Beam => "beam",
+            Self::Water => "water",
+            Self::Comet => "comet",
+            Self::Custom => "pack",
+        }
+    }
+
     pub fn parse(s: &str) -> Self {
         // Case-insensitive WITHOUT allocating (called every redraw via `glow_config`):
         // `eq_ignore_ascii_case` instead of a `to_ascii_lowercase()` heap alloc per frame.
@@ -3461,6 +3481,16 @@ pub struct CursorGlow {
     /// generation + endpoints), served by the `trail` control verb. Purely
     /// diagnostic — written beside decisions, never read by one.
     admission_log: AdmissionLog,
+    /// CUMULATIVE count of moves [`Self::spawn`] actually admitted (it returned
+    /// `true` — a witnessed move that laid light). The number that separates
+    /// "the proof confirmed but the move was never paired at the spawn seam"
+    /// from "light was laid and something downstream ate it": a
+    /// `confirmed`-heavy [`AdmissionTally`] with `spawns == 0` means admission
+    /// and morphology disagree. Diagnostic only, like the ring beside it —
+    /// never read by an admission, morphology, or rendering path, and (also
+    /// like the ring) deliberately outliving every transient teardown, because
+    /// a ledger that resets on the next unowned batch answers nothing.
+    spawns: u64,
     /// Resident, bounded swept-cell scratch. Built backward from the landing
     /// point so an outlier cursor jump never walks or allocates the discarded prefix.
     path_scratch: Vec<(i32, i32)>,
@@ -3699,6 +3729,27 @@ pub struct CursorGlow {
     /// input-time baseline and next-generation row diff. This bypasses the
     /// older presented-row span detector, whose suffix may predate the key.
     confirmed_delete_span: Option<(Instant, u16, u16)>,
+    /// The cells the LAST CONFIRMED typed candidate proved it materialized:
+    /// `(row, first column, one past the last)`. Written only where
+    /// [`Self::confirm_content_candidate`] returns `Confirmed` for a typed
+    /// intent, consumed one-shot by the Owned arm of
+    /// [`Self::observe_content_generation`], and cleared by every fail-closed
+    /// revocation — so no batch but the one the proof belongs to can ever read it.
+    ///
+    /// THE RIBBON'S OWN CELL. The generation fence keeps a resident wake cell
+    /// iff the probe pair shows its content BYTE-STEADY across the batch. That
+    /// is the right test for every cell the batch had no business touching,
+    /// and the wrong test for exactly one: the cell the keystroke itself just
+    /// wrote. Rainbow kitty lays its ribbon head AT the caret — the cell the
+    /// NEXT glyph will land in — so every key's own echo condemned the
+    /// previous key's head, the four-letter tail memory was pruned with it,
+    /// and the banded rainbow could never reach two cells during ordinary
+    /// typing. The span is therefore not a hole in the fence but the fence's
+    /// missing evidence: the confirm seam has already verified that these
+    /// exact cells hold the exact committed glyphs and that every cell before
+    /// the caret is untouched, which is a STRONGER attestation than
+    /// byte-steadiness, not a weaker one.
+    owned_write_span: Option<(u16, u16, u16)>,
     /// A fresh REPAINT-BLINK hint ([`Self::note_repaint_blink`]): the host saw
     /// the attached app's DECTCEM-hide-inside-DEC-2026 repaint bracket (the
     /// terminal's `repaint_blink_epoch` advanced — Claude Code wraps EVERY
@@ -4104,7 +4155,12 @@ pub struct AdmissionRecord {
     pub seq: u64,
     pub phase: AdmissionPhase,
     /// The confirm seam's reason token (`confirmed`, `row-mismatch`,
-    /// `generation-skip`, …) or the arming intent's own name for `Armed`.
+    /// `generation-skip`, …), the DROP reason for a candidate the confirm seam
+    /// never judged (`superseded`, `input-cancelled`, `input-revoked`,
+    /// `reflow`, `hidden-boundary`, `unowned-batch` — see
+    /// [`CursorGlow::discard_move_candidate`]), or the arming intent's own name
+    /// for `Armed`. A drop row is told apart from a confirm-seam verdict by
+    /// `gen_cur=-`: nothing was compared.
     pub reason: &'static str,
     /// The candidate's intent class (`typed` / `delete` / …).
     pub intent: &'static str,
@@ -4164,12 +4220,70 @@ struct AdmissionLog {
     head: usize,
     /// Total records ever pushed; stamps each record's `seq`.
     seq: u64,
+    /// CUMULATIVE tally, which the 32-slot ring alone cannot answer: a burst
+    /// of fast typing overwrites its own history long before anyone reads it,
+    /// so "did ANY candidate ever confirm on this window" would otherwise be
+    /// unanswerable a second later. Counters never wrap in practice (one
+    /// keystroke is at most two events).
+    tally: AdmissionTally,
+}
+
+/// The CUMULATIVE admission scoreboard behind [`CursorGlow::admission_tally`]
+/// — the `trail status` verb's headline numbers, and the one reading that
+/// survives the ring wrapping.
+///
+/// A dark ribbon has exactly two honest explanations and these three numbers
+/// separate them: `confirmed == 0` with `armed > 0` means the content proof
+/// never admitted a keystroke (read `last_retire_reason` for which gate), while
+/// `confirmed > 0` over a dark screen means admission is fine and the failure
+/// is downstream — morphology, tuning, or the compositor.
+///
+/// NO ARMED CANDIDATE LEAVES WITHOUT A VERDICT. Every candidate counted in
+/// `armed` is later counted in `confirmed` or in `retired`, or is the one still
+/// pending — so an ordinary typed run reads
+///
+/// > `armed == confirmed + retired + (0 or 1 still pending)`
+///
+/// It used to be possible for a candidate to leave with none: destroyed by the
+/// next press before any frame ran, with no ring entry and no counter. The
+/// resulting `armed=7 confirmed=2 retired=0` was read on a live box as "five
+/// keystrokes never armed" when in truth five armed and were superseded
+/// unobserved, and a whole blackout investigation went down that road.
+/// `superseded` is now a first-class retire reason (see
+/// [`CursorGlow::discard_move_candidate`]), and a RUN of them says the
+/// keystrokes are outrunning the RENDER, not failing a proof — the frame train
+/// is starved, or the keys are arriving faster than frames.
+///
+/// `retired` can additionally exceed `armed` by the alt-screen MOTION
+/// DOWNGRADE, which retires a content claim (a recorded verdict) and installs a
+/// jump-shaped candidate in its place that binds no baseline and is therefore
+/// never `armed`. That candidate's own eventual verdict lands in `retired` too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdmissionTally {
+    /// Content-bound candidates ARMED (one per authored keystroke that bound
+    /// an input-time baseline).
+    pub armed: u64,
+    /// Candidates the confirm seam ADMITTED.
+    pub confirmed: u64,
+    /// Candidates the confirm seam RETIRED (any reason).
+    pub retired: u64,
+    /// The most recent retire reason token (`row-mismatch`, `generation-skip`,
+    /// `stale`, …), or `None` while nothing has ever retired.
+    pub last_retire_reason: Option<&'static str>,
 }
 
 impl AdmissionLog {
     fn push(&mut self, mut record: AdmissionRecord) {
         self.seq += 1;
         record.seq = self.seq;
+        match record.phase {
+            AdmissionPhase::Armed => self.tally.armed += 1,
+            AdmissionPhase::Confirmed => self.tally.confirmed += 1,
+            AdmissionPhase::Retired => {
+                self.tally.retired += 1;
+                self.tally.last_retire_reason = Some(record.reason);
+            }
+        }
         self.records[self.head] = Some(record);
         self.head = (self.head + 1) % ADMISSION_LOG_CAP;
     }
@@ -4180,6 +4294,137 @@ impl AdmissionLog {
             .iter()
             .chain(&self.records[..self.head])
             .filter_map(Option::as_ref)
+    }
+}
+
+/// ONE READING of the cursor-trail / glow engine's live truth, as the
+/// `trail status` control verb prints it: what the style resolves to, every
+/// gate between the config knob and the glass, the cumulative admission
+/// scoreboard, and what light is actually alive right now.
+///
+/// WHY IT EXISTS. aterm could introspect the matrix rain (`rain status`) and
+/// the tone of typing (`tone status`) but not the cursor trail, so the standing
+/// owner report — *"I don't see the rainbow cursor trails"* — could only be
+/// investigated by recording video and squinting at hue histograms. Every
+/// field here is one link in the chain a dark ribbon could break at, in the
+/// order the frame path walks them, so the FIRST field that reads wrong names
+/// the bug.
+///
+/// A pure record with a pure [`Self::line`]: the host fills it, nothing here
+/// touches the clock or the engine, and it is built ONLY when asked (the
+/// `rain status` cheapness rule — an unasked status costs nothing at all).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrailStatus<'a> {
+    /// The `cursor_trail_style` config string VERBATIM, before resolution —
+    /// so a typo that silently fell back to the default is visible as itself.
+    pub style_raw: &'a str,
+    /// What that string resolved to.
+    pub style: GlowStyle,
+    /// `cursor_trail` master knob.
+    pub config_enabled: bool,
+    /// The resolved `GlowConfig::enabled` this frame — config AND serious mode.
+    pub effective: bool,
+    /// Whether the window the reading came from is focused AS THE CURSOR-EFFECT
+    /// SEAM RESOLVES IT — the same fold the frame path feeds the motion policy,
+    /// so an in-flight `video` recording's focus pin shows here, and so does a
+    /// live typed wake (a window being driven through the control socket, or a
+    /// handoff-adopted window that never saw an OS focus event, is focused for
+    /// the purpose of the trail it just earned).
+    pub focused: bool,
+    /// The resolved motion policy: `full` or `reduced`. Reduced ⇒ the aurora
+    /// runs at amplitude 0 and NOTHING draws, whatever the rest of the row says.
+    pub motion_stage: &'static str,
+    /// The `motion` config mode (`auto` / `full` / `reduced`).
+    pub motion_mode: &'static str,
+    /// The soft load-shed envelope in 0..1 (1.0 = not shedding).
+    pub shed: f32,
+    /// The live effect intensity after every multiply AND after the [`Self::effective`]
+    /// enable gate — the one number that is 0 exactly when the aurora is provably
+    /// dark. The enable gate belongs INSIDE it: `enabled = false` is the engine's
+    /// sole gate (the `!cfg.enabled` teardown emits no geometry whatever the
+    /// amplitude says), so a row that multiplied only the policy and the shed
+    /// envelope reported a bright `intensity` for frames that were never drawn.
+    /// Fillers must fold it; `effective == false` ⇒ `intensity == 0.0`.
+    pub intensity: f32,
+    /// The cumulative admission scoreboard.
+    pub tally: AdmissionTally,
+    /// Moves the spawn seam admitted ([`CursorGlow::spawns`]).
+    pub spawns: u64,
+    /// Live TYPING sparks ([`CursorGlow::ribbon_segments`]).
+    pub ribbon_segments: usize,
+    /// Distinct hue bands among them ([`CursorGlow::ribbon_hue_bands`]).
+    pub ribbon_hue_bands: usize,
+    /// Live sparks of every kind ([`CursorGlow::live_sparks`]).
+    pub sparks: usize,
+    /// The canonical typing-momentum metric ([`CursorGlow::typing_momentum`]).
+    pub momentum: f32,
+    /// Its eased display spine ([`CursorGlow::momentum_display`]).
+    pub momentum_display: f32,
+    /// The glide velocity spine in cells/sec ([`CursorGlow::glide_speed`]).
+    pub speed: f32,
+    /// [`CursorGlow::is_active`] — any live light at all.
+    pub glow_active: bool,
+    /// Whether the full-body pet companion is drawn and animating.
+    pub pet_active: bool,
+    /// Whether the flying cursor cat is animating.
+    pub cat_active: bool,
+}
+
+impl TrailStatus<'_> {
+    /// Whether a BANDED rainbow is on glass right now: at least two ribbon
+    /// cells in at least two distinct hues. One cell is a glow under the
+    /// caret; four cells all one hue is a monochrome bar. Two bands is the
+    /// weakest thing a human would still call a rainbow trail, so this is the
+    /// verb's headline verdict and the bar any fix has to clear.
+    #[must_use]
+    pub fn ribbon_active(&self) -> bool {
+        self.ribbon_segments >= 2 && self.ribbon_hue_bands >= 2
+    }
+
+    /// The wire tail after `OK ` — one line, `key=value` pairs in a fixed
+    /// order, the shape `rain status` established and `tone` followed.
+    #[must_use]
+    pub fn line(&self) -> String {
+        // The sensor's one arithmetic contract, guarded where the row is built
+        // rather than trusted at each fill site: a disabled engine draws
+        // nothing, so it must not advertise light.
+        debug_assert!(
+            self.effective || self.intensity == 0.0,
+            "a disabled trail reported intensity {}",
+            self.intensity
+        );
+        format!(
+            "trail style={:?} resolved={} config_enabled={} effective={} focused={} \
+             motion={} motion_stage={} shed={:.2} intensity={:.2} \
+             armed={} candidates_confirmed={} retired={} last_retire_reason={} spawns={} \
+             ribbon_active={} ribbon_segments={} ribbon_hue_bands={} sparks={} \
+             momentum={:.2} momentum_display={:.2} speed={:.1} \
+             glow_active={} pet_active={} cat_active={}",
+            self.style_raw,
+            self.style.label(),
+            self.config_enabled,
+            self.effective,
+            self.focused,
+            self.motion_mode,
+            self.motion_stage,
+            self.shed,
+            self.intensity,
+            self.tally.armed,
+            self.tally.confirmed,
+            self.tally.retired,
+            self.tally.last_retire_reason.unwrap_or("none"),
+            self.spawns,
+            self.ribbon_active(),
+            self.ribbon_segments,
+            self.ribbon_hue_bands,
+            self.sparks,
+            self.momentum,
+            self.momentum_display,
+            self.speed,
+            self.glow_active,
+            self.pet_active,
+            self.cat_active,
+        )
     }
 }
 
@@ -5389,7 +5634,7 @@ impl CursorGlow {
         // admit an unrelated program move later in the freshness window.
         self.user_gesture_hint = None;
         self.nav_hint = Some(now);
-        self.move_candidate = None;
+        self.discard_move_candidate("superseded");
     }
 
     /// HOST KEY-HINT: one PLAIN typed-glyph keypress (Character/Space echoes
@@ -5435,7 +5680,7 @@ impl CursorGlow {
         // Text-blind width/cadence feeds never admit movement. A native or
         // embedder host with exact committed cells upgrades this below through
         // `note_typed_expected`.
-        self.move_candidate = None;
+        self.discard_move_candidate("superseded");
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
         self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some((now, credits));
         self.rainbow.type_press_head =
@@ -5508,7 +5753,7 @@ impl CursorGlow {
         self.return_hint = None;
         self.reflow_hint = None;
         self.user_gesture_hint = Some(now);
-        self.move_candidate = None;
+        self.discard_move_candidate("superseded");
     }
 
     /// A COMPOSER NEWLINE landed — an alt-screen Shift+Enter, which agent
@@ -5537,7 +5782,7 @@ impl CursorGlow {
         self.clear_typed(now);
         self.unsettle();
         self.reflow_hint = Some(now);
-        self.move_candidate = None;
+        self.discard_move_candidate("reflow");
     }
 
     /// A USER MOTION press: the host saw a key whose whole purpose is to move
@@ -5707,6 +5952,13 @@ impl CursorGlow {
     }
 
     fn arm_move_candidate(&mut self, at: Instant, intent: GlowMoveIntent) {
+        // A live candidate is never OVERWRITTEN into silence. Every production
+        // caller reaches here with the slot already empty (the press path's
+        // `clear_typed`, or `note_typed_expected`'s pending early-return), so
+        // this is a no-op today; it is here so a future arming seam — or an
+        // embedder driving `note_delete_candidate` directly — cannot reopen the
+        // hole [`Self::discard_move_candidate`] just closed.
+        self.discard_move_candidate("replaced");
         self.move_candidate = self.cursor_anchor().map(|origin| GlowMoveCandidate {
             at,
             origin,
@@ -5746,6 +5998,65 @@ impl CursorGlow {
             self.bs_poof_hint = None;
             self.bs_baseline = None;
             self.confirmed_delete_span = None;
+        }
+    }
+
+    /// DROP the pending content candidate and RECORD the drop, naming `reason`.
+    ///
+    /// THE SCOREBOARD USED TO LOSE KEYSTROKES HERE. Every seam below once wrote
+    /// a bare `self.move_candidate = None`: a candidate destroyed before any
+    /// generation ever reached the confirm seam left `armed` incremented,
+    /// `confirmed` and `retired` both untouched, and NO ring entry at all. On a
+    /// live box that reads as `armed=7 candidates_confirmed=2 retired=0
+    /// last_retire_reason=none` over twelve keystrokes — five candidates gone
+    /// with no verdict — and the honest conclusion "five presses were
+    /// superseded before a frame ever ran" is indistinguishable from the false
+    /// one "five presses never armed". That ambiguity is what a diagnostic ring
+    /// exists to remove, and it cost a whole blackout investigation.
+    ///
+    /// BOOKKEEPING ONLY. The candidate dies exactly where it died before, at
+    /// the same instant, for the same reason; no admission, no proof, no pixel
+    /// moves. What changes is that an ordinary typed run now reads
+    ///
+    /// > `armed == confirmed + retired + (0 or 1 still pending)`
+    ///
+    /// so a keystroke can never again leave the engine without a verdict. See
+    /// [`AdmissionTally`], whose doc carries the same law and its one
+    /// documented asymmetry.
+    fn discard_move_candidate(&mut self, reason: &'static str) {
+        let Some(candidate) = self.move_candidate.take() else {
+            return;
+        };
+        self.admission_log.push(AdmissionRecord {
+            seq: 0,
+            phase: AdmissionPhase::Retired,
+            reason,
+            intent: candidate.intent.diagnostic_name(),
+            at: candidate.at,
+            origin: candidate.origin,
+            target: candidate.target,
+            baseline_generation: candidate
+                .baseline_generation
+                .map(|generation| generation.process_sequence),
+            // NOTHING was compared. The confirm seam never ran on this
+            // candidate, so `gen_cur=-` in the row is the honest reading — and
+            // it is exactly what separates these rows from a confirm-seam
+            // retire, which always names the generation it judged.
+            decided_generation: None,
+            alternate_screen: candidate
+                .baseline_generation
+                .is_some_and(|generation| generation.alternate_screen),
+        });
+        if Self::trace_confirm_enabled() {
+            eprintln!(
+                "DISCARD reason={reason} intent={} base={:?} origin={:?} target={:?}",
+                candidate.intent.diagnostic_name(),
+                candidate
+                    .baseline_generation
+                    .map(|generation| generation.process_sequence),
+                candidate.origin,
+                candidate.target,
+            );
         }
     }
 
@@ -5831,7 +6142,7 @@ impl CursorGlow {
         if moves_cursor {
             self.nav_hint = Some(now);
         } else {
-            self.move_candidate = None;
+            self.discard_move_candidate("superseded");
         }
     }
 
@@ -5922,6 +6233,21 @@ impl CursorGlow {
     /// the next repaint) would otherwise survive into a following Ctrl-A/E press
     /// and misclassify a later exact candidate. A content-confirmed deletion
     /// consumes the hint at its own echo, before any later navigation press.
+    ///
+    /// THIS IS ALSO THE PRESS-PATH SUPERSEDE. The GUI host calls it on EVERY
+    /// press before any class-specific code arms, so a candidate whose echo the
+    /// render path has not yet observed dies here — and the ribbon material
+    /// that keystroke would have earned dies with it. That is correct: a ribbon
+    /// segment is drawn light between two positions the engine has ACTUALLY
+    /// observed, so it can never lay more segments than it has observations.
+    /// The ceiling is therefore one confirmed keystroke per rendered frame —
+    /// 16.7 ms/key at 60 Hz, far below anything a human produces (measured:
+    /// 24/24 keys arm AND confirm at 50, 60 and 100 ms/key; 12/12 at 150, 200
+    /// and 250 ms/key). Only a starved frame train, or a scripted burst
+    /// outrunning the compositor, reaches it.
+    ///
+    /// What was NOT correct is that the drop was SILENT — see
+    /// [`Self::discard_move_candidate`], which now records it.
     pub fn clear_typed(&mut self, now: Instant) {
         // Supersession closes the typed cohort just as decisively as an
         // observed echo. If a swallowed glyph's one-shot is dropped while its
@@ -5937,7 +6263,7 @@ impl CursorGlow {
         self.return_hint = None;
         self.reflow_hint = None;
         self.newline_hint = None;
-        self.move_candidate = None;
+        self.discard_move_candidate("superseded");
         // The quench hint is dropped only once its OWN echo had a fair chance
         // to land (~2 frames): a fast backspace→Enter pair must not lose the
         // deletion steam to a disarm racing the echo.
@@ -5968,7 +6294,7 @@ impl CursorGlow {
         self.user_gesture_hint = None;
         self.reflow_hint = None;
         self.newline_hint = None;
-        self.move_candidate = None;
+        self.discard_move_candidate("input-cancelled");
     }
 
     /// Discharge a supersession boundary whose triggering input was itself
@@ -6022,7 +6348,12 @@ impl CursorGlow {
             // alt-screen darkness dossier). The one-shot candidate, its
             // Backspace span, and its key-time audio dedup credit are
             // preserved for the imminent admitted spawn, exactly as before.
-            self.retire_geometry_keeping_validated_wake();
+            // …and so are the cells the proof itself materialized: this is the
+            // ONE caller that may pass them, because it is the one whose batch
+            // the proof belongs to. One-shot (`take`), so nothing downstream
+            // can re-use a span whose batch has passed.
+            let owned_write = self.owned_write_span.take();
+            self.retire_geometry_keeping_validated_wake(owned_write);
             return GenerationOwnership::Owned;
         }
         let identity_held = previous.terminal_id == generation.terminal_id
@@ -6128,7 +6459,7 @@ impl CursorGlow {
             self.rainbow.last_committed_type = None;
         }
         if self.move_candidate.is_some_and(|candidate| candidate.at == at) {
-            self.move_candidate = None;
+            self.discard_move_candidate("input-revoked");
         }
     }
 
@@ -6143,7 +6474,7 @@ impl CursorGlow {
         self.return_hint = None;
         self.user_gesture_hint = None;
         self.newline_hint = None;
-        self.move_candidate = None;
+        self.discard_move_candidate("hidden-boundary");
         self.reflow_hint = None;
         self.rainbow.type_press_ring.fill(None);
         self.rainbow.type_press_head = 0;
@@ -6519,6 +6850,76 @@ impl CursorGlow {
         self.admission_log.iter()
     }
 
+    /// The CUMULATIVE admission scoreboard — what the 32-slot ring above has
+    /// already forgotten. See [`AdmissionTally`]; served by `trail status`.
+    #[must_use]
+    pub fn admission_tally(&self) -> AdmissionTally {
+        self.admission_log.tally
+    }
+
+    /// Moves [`Self::spawn`] has admitted over this engine's life — see
+    /// [`Self::spawns`].
+    #[must_use]
+    pub fn spawns(&self) -> u64 {
+        self.spawns
+    }
+
+    /// How many live TYPING sparks the ribbon is currently made of — the
+    /// number of cells a `rainbow kitty` band spans right now, and the field
+    /// `trail status` reports as `ribbon_segments`. Jump/comet sparks are
+    /// excluded: they are a leap's streak, not the typed band the config docs
+    /// promise. `0` while nothing was typed recently.
+    #[must_use]
+    pub fn ribbon_segments(&self) -> usize {
+        self.sparks.iter().filter(|spark| spark.typing).count()
+    }
+
+    /// Distinct HUE BANDS among the live ribbon cells, quantized to
+    /// twentieths of a turn — "how many colours would a human actually count".
+    ///
+    /// The number that settles a rainbow report, because `ribbon_segments`
+    /// alone cannot: four cells all laid in the same hue are a monochrome bar,
+    /// and four cells a hue step apart are the banded rainbow. A spark holds
+    /// the hue it was LAID in for life (see [`Spark::hue`]), so this is a
+    /// reading of the spectrum on glass, not of the emitter's live phase.
+    #[must_use]
+    pub fn ribbon_hue_bands(&self) -> usize {
+        let mut seen = [false; 20];
+        for spark in self.sparks.iter().filter(|spark| spark.typing) {
+            let band = (spark.hue.rem_euclid(1.0) * 20.0) as usize;
+            if let Some(slot) = seen.get_mut(band) {
+                *slot = true;
+            }
+        }
+        seen.iter().filter(|seen| **seen).count()
+    }
+
+    /// Total live sparks (ribbon + jump/comet cells) — the whole per-cell
+    /// light population, so `trail status` can say whether a dark ribbon is
+    /// "no light at all" or "light, but not the typed band".
+    #[must_use]
+    pub fn live_sparks(&self) -> usize {
+        self.sparks.len()
+    }
+
+    /// The EASED momentum spine the ribbon's width / wave / brightness all
+    /// read (`rainbow.disp`) — the display twin of [`Self::typing_momentum`],
+    /// which is the raw metric. Reported beside it because they differ during
+    /// the attack and the long release, and a "why is the ribbon thin" answer
+    /// needs to name which one is low.
+    #[must_use]
+    pub fn momentum_display(&self) -> f32 {
+        self.rainbow.disp
+    }
+
+    /// The fast-glide VELOCITY spine in cells/sec (rainbow-kitty only): the
+    /// EMA-attacked speed of observed cursor moves. The "is this fast enough"
+    /// term for any speed-gated morphology; `0.0` for every other style.
+    #[must_use]
+    pub fn glide_speed(&self) -> f32 {
+        self.glide.vel
+    }
+
     /// Record a freshly ARMED content-bound candidate in the diagnosis ring.
     /// Called by the arming seams after the candidate's baseline is bound, so
     /// the ring shows the keystroke even when no decision ever runs (the E5
@@ -6735,7 +7136,11 @@ impl CursorGlow {
                 origin: candidate.origin,
             });
         }
-        let (confirmed, row_changed) = match candidate.intent {
+        // The third element is the PROVEN WRITE SPAN — the cells this
+        // candidate's own proof shows it materialized — which the generation
+        // fence needs so a keystroke's echo stops condemning the ribbon head
+        // sitting on the cell it just wrote. See [`Self::owned_write_span`].
+        let (confirmed, row_changed, write_span) = match candidate.intent {
             GlowMoveIntent::Typed(expected) => {
                 let material = candidate.material?;
                 let current = captured_probe_row(
@@ -6856,7 +7261,14 @@ impl CursorGlow {
                         current.len(),
                     );
                 }
-                (exact, changed)
+                (
+                    exact,
+                    changed,
+                    // Bounded by construction: `start` is a u16 column and
+                    // `expected` is capped at `EXPECTED_MOVE_CELLS_MAX`, so
+                    // the saturating cast can only bind on a degenerate grid.
+                    Some((material.0, material.1, end.min(usize::from(u16::MAX)) as u16)),
+                )
             }
             GlowMoveIntent::Delete => {
                 let current = captured_probe_row(
@@ -6884,9 +7296,13 @@ impl CursorGlow {
                     && (0..width).all(|i| {
                         i == col || padded_probe_cell(baseline, i) == padded_probe_cell(current, i)
                     });
-                (exact, changed)
+                // An ERASE leaves a blank where a glyph was; the ribbon never
+                // lays on a deletion echo (it poofs instead), so there is no
+                // wake cell here whose survival the exemption would decide.
+                // Narrower is safer: no span.
+                (exact, changed, None)
             }
-            _ => (false, false),
+            _ => (false, false, None),
         };
         if !confirmed {
             // The first post-input processing batch completed without the exact
@@ -6956,6 +7372,10 @@ impl CursorGlow {
         {
             self.confirmed_delete_span = Some((candidate.at, row, col));
         }
+        // ASSIGN, never `get_or_insert`: a confirmed DELETE must CLEAR any
+        // span a previous typed confirm left, so the fence can only ever
+        // honour the batch it is actually fencing.
+        self.owned_write_span = write_span;
         self.log_confirm("confirmed", &candidate, current_generation, now);
         Some(ContentCandidateDecision::Confirmed {
             at: candidate.at,
@@ -7293,12 +7713,13 @@ impl CursorGlow {
             self.move_candidate.map(|candidate| candidate.intent),
             Some(GlowMoveIntent::Motion)
         ) {
-            self.move_candidate = None;
+            self.discard_move_candidate("unowned-batch");
         }
         self.candidate_superseded = false;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
         self.confirmed_delete_span = None;
+        self.owned_write_span = None;
     }
 
     /// Clear output-bearing geometry and the per-frame accessor caches, while
@@ -7352,7 +7773,23 @@ impl CursorGlow {
     /// stay on the wholesale rule: they are sub-second at-cursor flashes whose
     /// retirement was never the darkness, and a row probe cannot attest their
     /// sub-cell positions anyway.
-    fn retire_geometry_keeping_validated_wake(&mut self) {
+    ///
+    /// `owned_write` is the ONE narrow exemption, and only the Owned path may
+    /// pass it: the cells the candidate confirmed THIS batch materialized (see
+    /// [`Self::owned_write_span`]). Byte-steadiness is the right evidence for
+    /// every cell the batch was not supposed to touch — but it is the WRONG
+    /// evidence for the one cell the keystroke itself wrote, and rainbow kitty
+    /// lays its ribbon head AT the caret, on exactly the cell the NEXT glyph
+    /// lands in. So each key's own echo condemned the previous key's head, the
+    /// four-letter tail memory was pruned with it, and the banded ribbon was
+    /// structurally impossible during ordinary typing: measured live, it was
+    /// pinned at `ribbon_segments=1` after every keystroke, forever
+    /// (`aterm-ctl trail status`). The exemption is not a relaxation — that
+    /// cell's blank→glyph transition is the very edit the exact content proof
+    /// verified, so it is the strongest attestation in the frame, not the
+    /// weakest. `None` everywhere else keeps ambient repaints and TUI redraws
+    /// retiring byte-for-byte as before.
+    fn retire_geometry_keeping_validated_wake(&mut self, owned_write: Option<(u16, u16, u16)>) {
         let attested = match (self.row_prev_meta, self.row_cur_meta) {
             (Some(prev), Some(cur)) if prev.row == cur.row => Some((cur.row, cur.caret)),
             _ => None,
@@ -7381,8 +7818,14 @@ impl CursorGlow {
         let steady = |cell_row: u16, cell_col: u16| {
             cell_row == row
                 && cell_col < caret
-                && padded_probe_cell(&prev_cells, cell_col as usize)
+                && (padded_probe_cell(&prev_cells, cell_col as usize)
                     == padded_probe_cell(&cur_cells, cell_col as usize)
+                    // …or this batch's own PROVEN write: the confirmed
+                    // candidate's exact span, which the proof already checked
+                    // materialized here and nowhere else before the caret.
+                    || owned_write.is_some_and(|(write_row, start, end)| {
+                        cell_row == write_row && (start..end).contains(&cell_col)
+                    }))
         };
         self.sparks.retain(|spark| steady(spark.row, spark.col));
         self.rainbow.retire_keeping_validated_wake(&steady, row);
@@ -7411,7 +7854,11 @@ impl CursorGlow {
     /// repaints instead of only the first one.
     fn retire_denied_move_keeping_validated_wake(&mut self) {
         let sound_cues = std::mem::take(&mut self.sound_cues);
-        self.retire_geometry_keeping_validated_wake();
+        // `None`: this batch is UNOWNED, so nothing in it is a proven write
+        // and byte-steadiness is the only evidence on offer. (The span itself
+        // is dropped by `revoke_unowned_hints` below, with the rest of the
+        // fail-closed cohort.)
+        self.retire_geometry_keeping_validated_wake(None);
         self.rainbow.clear_admission();
         self.clear_keyed_clicks();
         self.revoke_unowned_hints();
@@ -8747,6 +9194,11 @@ impl CursorGlow {
             let drop = self.particles.len() - Self::MAX_PARTICLES;
             self.particles.drain(0..drop);
         }
+        // The move was witnessed and its light is laid: score it for
+        // `trail status` (see [`Self::spawns`]). One `u64` add on the spawn
+        // edge — not the frame path — so an idle or non-moving cursor pays
+        // nothing at all.
+        self.spawns += 1;
         true
     }
 
@@ -39997,5 +40449,586 @@ halo = "add"
 
     fn typed_scratch() -> Vec<GlowQuad> {
         Vec::new()
+    }
+
+    fn typed_generation(process_sequence: u32) -> ContentGeneration {
+        ContentGeneration {
+            process_sequence,
+            terminal_id: 4,
+            alternate_screen: false,
+        }
+    }
+
+    /// Type one exact, content-confirmed printable key, walking the SAME seam
+    /// order the GUI host walks every frame: feed the row probe, confirm the
+    /// candidate, hand the batch to the generation fence, then tick the cursor
+    /// onto its landing.
+    ///
+    /// THE FENCE CALL IS THE POINT. A fixture that confirms and ticks without
+    /// [`CursorGlow::observe_content_generation`] passes over the seam that
+    /// actually decides whether the previous keystroke's light survives this
+    /// one — which is how a ribbon pinned at ONE cell on every real box
+    /// (`aterm-ctl trail status`: `ribbon_segments=1`, forever) went on
+    /// satisfying an engine test that laid four. Every ribbon fixture goes
+    /// through here.
+    ///
+    /// Returns the batch's ownership verdict so a caller can pin it.
+    fn type_one_key(
+        glow: &mut CursorGlow,
+        cfg: &GlowConfig,
+        g: Geom,
+        at: Instant,
+        row: u16,
+        col: u16,
+        gen_base: u32,
+    ) -> GenerationOwnership {
+        // The row as input time saw it: glyphs already typed, blanks after.
+        let mut before = [' '; 40];
+        before[..usize::from(col)].fill('x');
+        let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        glow.note_typed_expected(
+            at,
+            expected,
+            (row, col + 1),
+            (row, col),
+            baseline,
+            typed_generation(gen_base),
+        );
+        let mut after = before;
+        after[usize::from(col)] = 'x';
+        glow.observe_row(row, col + 1, &after, at);
+        assert!(
+            matches!(
+                glow.confirm_content_candidate(
+                    Some((row, col + 1)),
+                    at,
+                    typed_generation(gen_base + 1)
+                ),
+                Some(ContentCandidateDecision::Confirmed { .. })
+            ),
+            "the exact typed proof must confirm at col {col}"
+        );
+        let ownership = glow.observe_content_generation(
+            typed_generation(gen_base + 1),
+            Some((row, col + 1)),
+            true,
+        );
+        glow.tick(Some((row, col + 1)), at, cfg, g, &mut typed_scratch());
+        ownership
+    }
+
+    /// THE `trail status` CONTRACT, driven through the real engine: an ordinary
+    /// typed burst must leave a BANDED ribbon — several cells, in several
+    /// hues — and the verb's numbers must say so.
+    ///
+    /// This is the proof behind the standing owner report *"I don't see the
+    /// rainbow cursor trails"*. Every earlier answer to it was a pixel
+    /// argument (record video, histogram the hues, squint); this asserts the
+    /// engine's own truth at the seam the control verb reads, so a regression
+    /// that darkens the ribbon fails here instead of in someone's eyes.
+    #[test]
+    fn a_typed_burst_earns_a_banded_ribbon_the_status_verb_reports() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        // Seed the fence's baseline exactly as the host's per-frame observation
+        // does; without it the FIRST batch is only ever `Steady` (nothing to
+        // compare against) and the ownership assertion below would be vacuous
+        // for the one key that matters least.
+        assert_eq!(
+            glow.observe_content_generation(typed_generation(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the baseline"
+        );
+        // Four keys at a comfortable human cadence (~120 ms, ~8 chars/sec),
+        // each echo advancing the content generation by exactly one batch —
+        // the shape every real shell produces.
+        for i in 0..4u32 {
+            let ownership = type_one_key(
+                &mut glow,
+                &c,
+                g,
+                t0 + Duration::from_millis(u64::from(i) * 120 + 1),
+                2,
+                i as u16,
+                10 + i,
+            );
+            assert_eq!(
+                ownership,
+                GenerationOwnership::Owned,
+                "key {i}: the confirmed echo owns its batch"
+            );
+        }
+        let tally = glow.admission_tally();
+        assert_eq!(tally.armed, 4, "one armed candidate per key");
+        assert_eq!(tally.confirmed, 4, "every exact proof confirms");
+        assert_eq!(tally.retired, 0, "nothing retires on a clean typed run");
+        assert_eq!(tally.last_retire_reason, None);
+        assert_eq!(glow.spawns(), 4, "every confirmed key lays light");
+        // The BAND itself: the four-letter guarantee plus the head, in
+        // successive hues. Two cells in two hues is the floor a human would
+        // still call a rainbow; a real burst clears it comfortably.
+        assert!(
+            glow.ribbon_segments() >= 4,
+            "four typed keys must leave a four-cell ribbon, got {}",
+            glow.ribbon_segments()
+        );
+        assert!(
+            glow.ribbon_hue_bands() >= 2,
+            "the ribbon must be BANDED, not one flat colour: {} band(s) over {} cells",
+            glow.ribbon_hue_bands(),
+            glow.ribbon_segments()
+        );
+        assert!(glow.is_active(), "live ribbon ⇒ live engine");
+        assert!(
+            glow.typing_momentum(t0 + Duration::from_millis(361)) > 0.0,
+            "a typed burst builds the canonical momentum metric"
+        );
+    }
+
+    /// A WHOLE WORD AT HUMAN CADENCE — the case the burst fixture above cannot
+    /// carry, and the one the standing report is actually about.
+    ///
+    /// [`a_typed_burst_earns_a_banded_ribbon_the_status_verb_reports`] types
+    /// four keys; four keys is a burst. Ordinary typing is 150-250 ms per
+    /// character and a fast typist is around 100 ms, so a fixture that only
+    /// ever proves the burst can silently narrow to burst-only while a person
+    /// sees nothing. Twelve keys at 100, 150 and 250 ms per key — fast,
+    /// average and slow — must ALL earn the full banded ribbon, and the
+    /// scoreboard must conserve at every one of them.
+    ///
+    /// MEASURED FIRST, ON A LIVE INSTANCE, before this test was written
+    /// (headless, own XDG + own control socket, a `video … pace` frame train
+    /// so the engine ticks the way a window's present loop makes it tick,
+    /// `ctl key` at each cadence, `ctl trail status` after; shipped default
+    /// config, `rainbow kitty pet`):
+    ///
+    /// | ms/key | armed | confirmed | retired | momentum | segments | bands |
+    /// |-------:|------:|----------:|--------:|---------:|---------:|------:|
+    /// |     50 |    24 |        24 |       0 |     0.72 |       24 |    18 |
+    /// |     60 |    24 |        24 |       0 |     0.78 |       24 |    18 |
+    /// |    100 |    12 |        12 |       0 |     0.68 |       12 |    12 |
+    /// |    150 |    12 |        12 |       0 |     0.81 |       12 |    12 |
+    /// |    200 |    12 |        12 |       0 |     0.91 |       10 |    10 |
+    /// |    250 |    12 |        12 |       0 |     0.88 |       10 |    10 |
+    ///
+    /// MOMENTUM IS NOT THE GATE, and this pins that too. The suspicion the
+    /// hunt started from was that the ribbon is momentum-gated above what a
+    /// typist reaches; the numbers say the opposite — the SLOW cadences read
+    /// the HIGHER momentum, because momentum is fed per confirmed echo and a
+    /// slow run confirms just as reliably. Nothing here is retuned, and a
+    /// future change that starts gating the ribbon on speed fails below.
+    ///
+    /// This fixture REPRODUCES those live numbers rather than approximating
+    /// them — 12 segments / 12 bands / momentum 0.70 at 100 ms, 12 / 12 / 0.86
+    /// at 150 ms, 10 / 10 / 1.00 at 250 ms — so it is a bind on the shipped
+    /// behaviour, not a private model of it. The floors asserted below sit
+    /// well under those values so ordinary decay has room, and well over one
+    /// cell, which is the shape the blackout actually had.
+    #[test]
+    fn a_word_typed_at_human_cadence_earns_the_full_banded_ribbon() {
+        for ms in [100u64, 150, 250] {
+            let g = geom();
+            let c = cfg(GlowStyle::RainbowKitty, true);
+            let mut glow = CursorGlow::default();
+            let t0 = Instant::now();
+            glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+            assert_eq!(
+                glow.observe_content_generation(typed_generation(10), Some((2, 0)), false),
+                GenerationOwnership::Steady,
+                "{ms} ms/key: the first observation establishes the baseline"
+            );
+            // Twelve keys — "rainbowkitty", the word every lane in this hunt
+            // has typed at a real terminal — one rendered frame per key, which
+            // is what a present loop gives even at its most frugal.
+            const KEYS: u32 = 12;
+            for i in 0..KEYS {
+                let at = t0 + Duration::from_millis(u64::from(i) * ms + 1);
+                assert_eq!(
+                    type_one_key(&mut glow, &c, g, at, 2, i as u16, 10 + i),
+                    GenerationOwnership::Owned,
+                    "{ms} ms/key, key {i}: the confirmed echo owns its batch"
+                );
+            }
+            let end = t0 + Duration::from_millis(u64::from(KEYS - 1) * ms + 1);
+            let tally = glow.admission_tally();
+            assert_eq!(
+                (tally.armed, tally.confirmed, tally.retired),
+                (u64::from(KEYS), u64::from(KEYS), 0),
+                "{ms} ms/key: every key arms and confirms; nothing is lost"
+            );
+            assert_eq!(tally.last_retire_reason, None, "{ms} ms/key");
+            assert_eq!(glow.spawns(), u64::from(KEYS), "{ms} ms/key: every key lays light");
+            // What a person SEES: a multi-cell band in several hues. The floor
+            // is deliberately well under the measured 10-12 cells so natural
+            // decay at the slow end has room, and well over "one cell", which
+            // is the shape the blackout actually had.
+            assert!(
+                glow.ribbon_segments() >= 6,
+                "{ms} ms/key: a typed word must leave a multi-cell ribbon, got {}",
+                glow.ribbon_segments()
+            );
+            assert!(
+                glow.ribbon_hue_bands() >= 4,
+                "{ms} ms/key: the ribbon must be BANDED: {} band(s) over {} cells",
+                glow.ribbon_hue_bands(),
+                glow.ribbon_segments()
+            );
+            assert!(glow.is_active(), "{ms} ms/key: live ribbon ⇒ live engine");
+            // The momentum spine an ordinary typist earns. 0.25 is far below
+            // every measured value (0.68-0.91) and far above the 0.23 a
+            // frame-starved instance reported while its ribbon was dark.
+            let momentum = glow.typing_momentum(end);
+            assert!(
+                momentum > 0.25,
+                "{ms} ms/key: an ordinary typist earns real momentum, got {momentum:.2}"
+            );
+        }
+    }
+
+    /// A CANDIDATE SUPERSEDED BEFORE ITS ECHO WAS EVER OBSERVED MUST BE
+    /// RECORDED — the scoreboard hole that made the blackout unreadable.
+    ///
+    /// The GUI host calls [`CursorGlow::clear_typed`] on EVERY press before any
+    /// class-specific code arms, so a candidate whose echo no frame has yet
+    /// observed dies there. That is correct — a ribbon segment is light between
+    /// two positions the engine actually observed, so it can never lay more
+    /// segments than it has observations. What was NOT correct is that the drop
+    /// was silent: `armed` counted the keystroke, `confirmed` and `retired`
+    /// both ignored it, and the ring held nothing. On a live box that printed
+    /// `armed=7 candidates_confirmed=2 retired=0 last_retire_reason=none` for
+    /// twelve keys, and the true reading ("five were superseded before a frame
+    /// ran — the frame train is starved") is indistinguishable there from the
+    /// false one ("five never armed"). A whole investigation went down the
+    /// second road.
+    #[test]
+    fn a_candidate_superseded_before_its_echo_is_recorded_not_silently_dropped() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        let baseline = ExpectedRowSnapshot::from_slice(&[' '; 40]).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let press = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(
+            press,
+            expected,
+            (2, 1),
+            (2, 0),
+            baseline,
+            typed_generation(10),
+        );
+        assert!(glow.move_candidate_pending(), "the press armed its proof");
+        let armed_only = glow.admission_tally();
+        assert_eq!((armed_only.armed, armed_only.confirmed, armed_only.retired), (1, 0, 0));
+        // The NEXT press, arriving before any frame observed the first echo —
+        // the host's press-path supersede, verbatim.
+        glow.clear_typed(t0 + Duration::from_millis(9));
+        assert!(!glow.move_candidate_pending(), "the candidate is gone");
+        let tally = glow.admission_tally();
+        assert_eq!(
+            (tally.armed, tally.confirmed, tally.retired),
+            (1, 0, 1),
+            "the scoreboard conserves: armed = confirmed + retired + pending"
+        );
+        assert_eq!(
+            tally.last_retire_reason,
+            Some("superseded"),
+            "and it NAMES the cause, so 'starved frame train' is readable off the verb"
+        );
+        let last = glow.admission_log().last().copied().expect("a ring entry");
+        assert_eq!(last.phase, AdmissionPhase::Retired);
+        assert_eq!(last.reason, "superseded");
+        assert_eq!(last.origin, (2, 0));
+        assert_eq!(last.baseline_generation, Some(10));
+        assert_eq!(
+            last.decided_generation, None,
+            "gen_cur=- is what separates a DROP from a confirm-seam verdict: \
+             nothing was ever compared"
+        );
+    }
+
+    /// The conservation law over a whole starved run: keys arriving faster than
+    /// frames lose their ribbon material — that ceiling is real and honest —
+    /// but not one of them may vanish from the scoreboard. This is the exact
+    /// shape a live burst produces (12 keys in 16 ms, no frame in between).
+    #[test]
+    fn keys_outrunning_the_frame_train_are_all_accounted_for() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        for i in 0..12u32 {
+            let at = t0 + Duration::from_millis(u64::from(i) + 1);
+            // The host supersedes first, then arms — the press path's order.
+            glow.clear_typed(at);
+            let baseline = ExpectedRowSnapshot::from_slice(&[' '; 40]).unwrap();
+            glow.note_typed_expected(at, expected, (2, 1), (2, 0), baseline, typed_generation(10 + i));
+        }
+        let tally = glow.admission_tally();
+        let pending = u64::from(glow.move_candidate_pending());
+        assert_eq!(
+            tally.armed,
+            tally.confirmed + tally.retired + pending,
+            "armed={} confirmed={} retired={} pending={pending}",
+            tally.armed,
+            tally.confirmed,
+            tally.retired
+        );
+        assert_eq!(
+            tally.last_retire_reason,
+            Some("superseded"),
+            "a starved run says SUPERSEDED — the keys outran the render, they did \
+             not fail a proof"
+        );
+    }
+
+    /// THE FENCE REGRESSION, cell by cell: a keystroke's own echo must not
+    /// condemn the ribbon head that was sitting on the cell it just wrote.
+    ///
+    /// Rainbow kitty lays its head AT the caret — the cell the NEXT glyph
+    /// lands in — so the generation fence's byte-steadiness test found the
+    /// previous head "rewritten" on every single key and retired it, along
+    /// with the four-letter tail memory. Measured on a live box the ribbon
+    /// was pinned at exactly one cell after every keystroke forever
+    /// (`ribbon_segments=1`), which is what the standing report *"I don't see
+    /// the rainbow cursor trails"* was looking at. The exemption is not a hole
+    /// in the fence: the confirm seam has already proved those exact cells
+    /// hold the exact committed glyphs.
+    ///
+    /// The assertion is on CELL IDENTITY, not on a count, so a future change
+    /// that merely re-lays a new head somewhere cannot satisfy it.
+    #[test]
+    fn a_keystroke_echo_no_longer_condemns_the_ribbon_head_it_wrote_over() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        type_one_key(&mut glow, &c, g, t0 + Duration::from_millis(1), 2, 0, 10);
+        // The first key's head sits AT its landing caret — column 1 — which is
+        // exactly the cell the second key's glyph will occupy.
+        let head_cells: Vec<(u16, u16)> = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing)
+            .map(|spark| (spark.row, spark.col))
+            .collect();
+        assert_eq!(
+            head_cells,
+            [(2, 1)],
+            "the first key lays its head at the caret"
+        );
+        type_one_key(&mut glow, &c, g, t0 + Duration::from_millis(121), 2, 1, 11);
+        let after: Vec<(u16, u16)> = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing)
+            .map(|spark| (spark.row, spark.col))
+            .collect();
+        assert!(
+            after.contains(&(2, 1)),
+            "the cell the second key wrote over still carries the first key's \
+             ribbon light — this is THE regression: {after:?}"
+        );
+        assert!(
+            after.contains(&(2, 2)),
+            "…and the second key laid its own head: {after:?}"
+        );
+        assert!(
+            glow.ribbon_hue_bands() >= 2,
+            "two cells a hue step apart is a BAND: {} band(s)",
+            glow.ribbon_hue_bands()
+        );
+        // The span is ONE-SHOT: the fence consumed it, so a second fence in
+        // the same state cannot re-use a proof whose batch has passed.
+        assert!(
+            glow.owned_write_span.is_none(),
+            "the proven-write span is consumed by the batch it belongs to"
+        );
+    }
+
+    /// THE OTHER HALF OF THE SAME LAW, and the reason the exemption is narrow:
+    /// an UNOWNED batch — ambient output, a TUI redraw — rewrites the very same
+    /// cell with no proof behind it, and there the fence must still retire the
+    /// light. The exemption follows the PROOF, never the cell.
+    #[test]
+    fn an_unproved_rewrite_of_that_same_cell_still_retires_the_light() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        type_one_key(&mut glow, &c, g, t0 + Duration::from_millis(1), 2, 0, 10);
+        assert_eq!(glow.ribbon_segments(), 1, "one key, one ribbon cell");
+        // A program batch rewrites the lit cell under an unmoved caret. No key,
+        // no candidate, no proof — the same pixels, the opposite provenance.
+        let at = t0 + Duration::from_millis(60);
+        let mut repaint = [' '; 40];
+        repaint[0] = 'x';
+        repaint[1] = '#';
+        glow.observe_row(2, 1, &repaint, at);
+        let ownership = glow.observe_content_generation(typed_generation(12), Some((2, 1)), false);
+        assert_eq!(
+            ownership,
+            GenerationOwnership::UnownedRewrite,
+            "an unproved rewrite under an unmoved caret is a rewrite"
+        );
+        assert_eq!(
+            glow.ribbon_segments(),
+            0,
+            "light over a cell nothing proved must die"
+        );
+    }
+
+    /// The NEGATIVE control the soundness essays demand: ambient program
+    /// output moves the cursor with no authored key behind it, so the status
+    /// verb must report a retirement and a DARK ribbon. A verb that reported a
+    /// ribbon here would be buying pixels with correctness.
+    #[test]
+    fn unauthored_output_retires_and_the_status_verb_shows_it_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut typed_scratch());
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 4,
+            alternate_screen: false,
+        };
+        let baseline = ExpectedRowSnapshot::from_slice(&[' '; 40]).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let at = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(at, expected, (2, 1), (2, 0), baseline, generation(10));
+        // A TUI redraw rewrote the row instead of echoing the key.
+        let mut redrawn = [' '; 40];
+        redrawn[..8].fill('#');
+        glow.observe_row(2, 1, &redrawn, at);
+        assert!(
+            matches!(
+                glow.confirm_content_candidate(Some((2, 1)), at, generation(11)),
+                Some(ContentCandidateDecision::Retired { .. })
+            ),
+            "a redraw is not an echo"
+        );
+        glow.tick(Some((2, 1)), at, &c, g, &mut typed_scratch());
+        let tally = glow.admission_tally();
+        assert_eq!(tally.armed, 1);
+        assert_eq!(tally.confirmed, 0);
+        assert_eq!(tally.retired, 1);
+        assert_eq!(
+            tally.last_retire_reason,
+            Some("row-mismatch"),
+            "the verb names the gate that stopped it"
+        );
+        assert_eq!(glow.spawns(), 0, "a denied move lays no light");
+        assert_eq!(glow.ribbon_segments(), 0);
+        assert_eq!(glow.ribbon_hue_bands(), 0);
+    }
+
+    /// The status ROW: fixed key order, every gate present, and the
+    /// `ribbon_active` verdict derived (never asserted) — one cell, or four
+    /// cells in one hue, is not a rainbow.
+    #[test]
+    fn the_status_row_names_every_gate_and_derives_the_ribbon_verdict() {
+        let base = TrailStatus {
+            style_raw: "rainbow kitty pet",
+            style: GlowStyle::RainbowKitty,
+            config_enabled: true,
+            effective: true,
+            focused: true,
+            motion_stage: "full",
+            motion_mode: "auto",
+            shed: 1.0,
+            intensity: 0.7,
+            tally: AdmissionTally {
+                armed: 9,
+                confirmed: 8,
+                retired: 1,
+                last_retire_reason: Some("generation-skip"),
+            },
+            spawns: 8,
+            ribbon_segments: 4,
+            ribbon_hue_bands: 4,
+            sparks: 4,
+            momentum: 0.5,
+            momentum_display: 0.44,
+            speed: 12.0,
+            glow_active: true,
+            pet_active: true,
+            cat_active: false,
+        };
+        let line = base.line();
+        for key in [
+            "trail style=",
+            " resolved=rainbow-kitty",
+            " config_enabled=true",
+            " effective=true",
+            " focused=true",
+            " motion=auto",
+            " motion_stage=full",
+            " shed=1.00",
+            " intensity=0.70",
+            " armed=9",
+            " candidates_confirmed=8",
+            " retired=1",
+            " last_retire_reason=generation-skip",
+            " spawns=8",
+            " ribbon_active=true",
+            " ribbon_segments=4",
+            " ribbon_hue_bands=4",
+            " sparks=4",
+            " momentum=0.50",
+            " momentum_display=0.44",
+            " speed=12.0",
+            " glow_active=true",
+            " pet_active=true",
+            " cat_active=false",
+        ] {
+            assert!(line.contains(key), "missing {key:?} in {line}");
+        }
+        // The raw style string is quoted, so a trailing space or an empty
+        // setting is legible as itself rather than as a broken row.
+        assert!(
+            line.contains(r#"style="rainbow kitty pet""#),
+            "the raw config string is reported verbatim: {line}"
+        );
+        // ONE LINE — a status the caller can grep without reassembly.
+        assert!(!line.contains('\n'), "the status row is one line: {line}");
+        // Never a fabricated reason.
+        let quiet = TrailStatus {
+            tally: AdmissionTally::default(),
+            ..base
+        };
+        assert!(quiet.line().contains(" last_retire_reason=none"));
+        // The RIBBON VERDICT is derived from what is on glass, not asserted:
+        // one lone cell is a glow under the caret, and four same-hue cells are
+        // a monochrome bar. Neither is the banded rainbow the docs promise.
+        assert!(base.ribbon_active());
+        assert!(
+            !TrailStatus {
+                ribbon_segments: 1,
+                ribbon_hue_bands: 1,
+                ..base
+            }
+            .ribbon_active(),
+            "one cell is a glow, not a trail"
+        );
+        assert!(
+            !TrailStatus {
+                ribbon_segments: 4,
+                ribbon_hue_bands: 1,
+                ..base
+            }
+            .ribbon_active(),
+            "four cells in one hue is a bar, not a rainbow"
+        );
     }
 }

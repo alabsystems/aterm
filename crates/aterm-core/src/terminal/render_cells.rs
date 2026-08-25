@@ -960,6 +960,17 @@ impl Terminal {
             && scratch.terminal_id == self.extract_identity
             && scratch.extract_gen == self.extract_gen
             && scratch.snapshot_seq == scratch.engine_fill_seq
+            // No host row PREPEND is still in force. A spliced scratch holds
+            // engine row `r` at index `r + row_shift`, so retaining "row r"
+            // would serve a DIFFERENT row's content — the exact stale-row
+            // defect this whole carrier exists to make impossible. The
+            // frontend inverts its tab-strip prepend
+            // (`RenderInput::undo_host_row_prepend`) before handing the scratch
+            // back; anything it could not invert arrives here still shifted and
+            // takes the full arm. The `rows`/`cells.len()` clauses below
+            // already reject the common shape, but they reject it by arithmetic
+            // coincidence — this clause rejects it by name.
+            && scratch.row_shift == 0
             && scratch.engine_alt == self.is_alternate_screen()
             && scratch.rows == rows
             && scratch.cols == cols
@@ -1188,6 +1199,15 @@ impl Terminal {
         scratch.extract_gen = self.extract_gen;
         scratch.engine_alt = self.is_alternate_screen();
         scratch.engine_fill_seq = scratch.snapshot_seq;
+        // D-2 SPLICE: an engine fill is, by definition, an UNSHIFTED engine
+        // fill — every host row prepend this scratch may have carried is gone
+        // (the frontend either inverted it or the resize above dropped it), so
+        // the shift count returns to zero and the provenance token is re-armed
+        // beside `engine_fill_seq`. From here only a blessed prepend
+        // (`note_host_row_prepend`) can keep the two in step; every other host
+        // cell write bumps `snapshot_seq` alone and thereby disowns the lane.
+        scratch.row_shift = 0;
+        scratch.shifted_fill_seq = scratch.snapshot_seq;
 
         // D-2 PER-ROW REVISION LANE. The grid already knows which rows changed;
         // publish that fact instead of letting every consumer re-derive it by

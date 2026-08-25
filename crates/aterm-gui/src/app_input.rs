@@ -10,7 +10,7 @@
 use std::sync::{Arc, Mutex};
 
 use aterm_core::selection::SelectionType;
-use aterm_core::terminal::Terminal;
+use aterm_core::terminal::{CustodyTransition, Terminal};
 use aterm_session::sink::SinkWriter;
 use winit::event::{ElementState, KeyEvent};
 use winit::event_loop::ActiveEventLoop;
@@ -1604,6 +1604,127 @@ pub(crate) enum PressPhase {
     Repeat,
 }
 
+/// PRESS CUSTODY — the four-way press classification the custody record carries.
+///
+/// `apply_press_custody` used to take a bare `disturbs: bool`, and a bool is a
+/// two-way channel for a four-way fact: an auto-repeat tick, a bare modifier and a
+/// key release all arrive as `false` and all three leave the viewport, the ownership
+/// and the selection exactly as they found them. They are indistinguishable in every
+/// observable variable at every site that has a `Terminal`, so a recorder downstream
+/// of this type could not tell them apart, and "a repeat is inert" would be an
+/// invariant no implementation could ever falsify. The kind is CARRIED, not inferred.
+///
+/// PRIORITY. The bits overlap. `aterm_types::keyboard::is_modifier_or_lock_key`
+/// matches on the KEY alone — there is no event-type term in it — so a Shift key-UP
+/// is `is_release && inert_modifier` at once, and a held Shift's auto-repeat is
+/// `is_repeat && inert_modifier` at once. `press_disturbs`'s `!a && !b && !c` is
+/// order-free, but a four-way tag is not, and the model's variants are disjoint, so
+/// [`PressKind::of`] resolves them Release > Repeat > Inert > Typing. Any other order
+/// re-labels the same physical event — a modifier key-up recorded as `InertPress`
+/// instead of `ReleaseEvent` — without changing whether it disturbs, which is a
+/// silent trace corruption a passing model check would never catch.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PressKind {
+    /// A byte-producing press landing for the first time: the ONE handover.
+    Typing,
+    /// An auto-repeat tick of a hold whose press already took custody.
+    Repeat,
+    /// A bare modifier or lock key.
+    Inert,
+    /// A Kitty `REPORT_EVENT_TYPES` key-up.
+    Release,
+}
+
+impl PressKind {
+    /// Resolve the three overlapping press bits into one disjoint kind, in the fixed
+    /// priority documented on [`PressKind`].
+    ///
+    /// The bits themselves are computed identically at both press seams
+    /// (`input_to_session` and [`App::input_to_hidden_session`]); this is the shared
+    /// resolution so the two cannot disagree about what to call the same event.
+    pub(crate) fn of(is_release: bool, is_repeat: bool, inert_modifier: bool) -> Self {
+        if is_release {
+            Self::Release
+        } else if is_repeat {
+            Self::Repeat
+        } else if inert_modifier {
+            Self::Inert
+        } else {
+            Self::Typing
+        }
+    }
+
+    /// Whether this press may DISTURB the user's reading position — exactly the old
+    /// `press_disturbs` predicate, `!is_release && !is_repeat && !inert_modifier`,
+    /// which is `Typing` and nothing else under the priority above.
+    pub(crate) fn disturbs(self) -> bool {
+        matches!(self, Self::Typing)
+    }
+}
+
+/// PRESS CUSTODY — the press half of the custody RECORD: which of the four press
+/// classes this delivery was.
+///
+/// Anchored here rather than on [`apply_press_custody`] because this is the function
+/// that RECORDS the variant, and because `apply_press_custody` already carries
+/// `SelectionCustody`'s same-named `TypingPress`/`InertPress` anchors (the macro's
+/// generated const is `__aterm_spec_refines_{fn}_{action}` with no machine name in
+/// it, so two machines' same-named actions cannot share one function).
+///
+/// The record is what makes `RepeatPressIsInert`, `InertPressIsInert` and
+/// `ReleaseIsInert` checkable at all. All three post-states are bit-identical, so a
+/// conformance that inferred the action from the state change would have to GUESS
+/// which of the three it was looking at, and an invariant it cannot aim is an
+/// invariant nothing can falsify. Tier-1 drives all four kinds through the real seam
+/// in [`crate::press_custody_conformance`].
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "TypingPress",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "RepeatPress",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "InertPress",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "ReleaseEvent",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+pub(crate) fn note_press_custody(t: &mut Terminal, kind: PressKind) {
+    t.note_custody(press_transition(kind));
+}
+
+/// The `PressCustody` transition a press class IS — the one mapping, shared by the
+/// recorder above and `apply_press_custody`'s took-something promotion so the two can
+/// never name the same press differently.
+fn press_transition(kind: PressKind) -> CustodyTransition {
+    match kind {
+        PressKind::Typing => CustodyTransition::TypingPress,
+        PressKind::Repeat => CustodyTransition::RepeatPress,
+        PressKind::Inert => CustodyTransition::InertPress,
+        PressKind::Release => CustodyTransition::ReleaseEvent,
+    }
+}
+
 /// SELECTION CUSTODY (R1) — the ONE implementation of "what a disturbing press
 /// does to the terminal's reading position", shared by the seam's consolidated
 /// press scope and [`App::input_to_hidden_session`] so the two can never drift
@@ -1612,22 +1733,29 @@ pub(crate) enum PressPhase {
 /// window whose tab had since changed reset a BACKGROUND session's viewport.)
 ///
 /// Returns `(scrolled, cleared)` for the caller's change-gated repaint. Both
-/// are `false` when `disturbs` is false, and the `&&` short-circuits before the
-/// reads, so an inert press pays nothing inside a lock it already holds.
+/// are `false` for every kind but `Typing`, and the `&&` short-circuits before the
+/// reads, so an inert press pays nothing inside a lock it already holds beyond the
+/// one-byte custody store.
 ///
 /// Takes `&mut Terminal` rather than the guard so the caller owns the lock
 /// scope — this must never acquire one of its own.
 ///
 /// SELECTION CUSTODY — this ONE function is BOTH press arms of the
-/// `SelectionCustody` machine, selected by `disturbs`:
+/// `SelectionCustody` machine, selected by `kind`:
 ///
-/// * `TypingPress` (`disturbs == true`) — the one handover. Typing means "take me
+/// * `TypingPress` ([`PressKind::Typing`]) — the one handover. Typing means "take me
 ///   to the prompt", so the viewport snaps and the selection goes.
-/// * `InertPress` (`disturbs == false`) — a bare modifier expresses no intent and
+/// * `InertPress` (every other kind) — a bare modifier expresses no intent and
 ///   may DESTROY NOTHING. The `&&` short-circuits before the reads, so an inert
 ///   press does not even look at the selection; the spec states the law as "the
 ///   event changed nothing", which is falsifiable, rather than "a selection still
 ///   exists", which would be free.
+///
+/// PRESS CUSTODY — `kind` replaced a `disturbs: bool` so the RECORD can name which
+/// of the four press classes fired. `SelectionCustody` only ever needed the two-way
+/// split; `PressCustody` separates the three inert classes, which are identical in
+/// every observable variable and can therefore only be told apart by what the seam
+/// KNEW. [`note_press_custody`] is the recorder and carries those anchors.
 ///
 /// Anchored HERE rather than on `TextSelection::clear`: the clear primitive is
 /// shared by every destroyer in the workspace and could not witness WHICH press
@@ -1649,7 +1777,9 @@ pub(crate) enum PressPhase {
         project = "aterm_gui::selection_custody_conformance::project_selection_custody"
     )
 )]
-pub(crate) fn apply_press_custody(t: &mut Terminal, disturbs: bool) -> (bool, bool) {
+pub(crate) fn apply_press_custody(t: &mut Terminal, kind: PressKind) -> (bool, bool) {
+    note_press_custody(t, kind);
+    let disturbs = kind.disturbs();
     let scrolled = disturbs && t.grid().display_offset() != 0 && {
         t.scroll_to_bottom();
         true
@@ -1658,6 +1788,21 @@ pub(crate) fn apply_press_custody(t: &mut Terminal, disturbs: bool) -> (bool, bo
         t.text_selection_mut().clear();
         true
     };
+    // PRESS CUSTODY, the `changed=` half: a typing press is the only press class that
+    // may take something, and it does not always — most keystrokes land on a viewport
+    // already at live with nothing selected and take nothing at all. This is the one
+    // site that knows which it was, so the promotion happens here rather than being
+    // guessed from the variant (`CustodyTransition::always_takes_custody` is `false`
+    // for all four press classes for exactly this reason).
+    //
+    // Promoted under the kind's OWN transition, not a hardcoded `TypingPress`. Under
+    // the committed classification the two are the same thing — only `Typing`
+    // disturbs — but a regression that let an inert class disturb must show up as
+    // `InertPress` moving something it may not, which is what the Tier-1 conformance
+    // rejects, rather than being relabelled on its way into the record.
+    if scrolled || cleared {
+        t.note_custody_took(press_transition(kind));
+    }
     (scrolled, cleared)
 }
 
@@ -2198,10 +2343,23 @@ impl App {
                 InputEvent::Key { event_type, .. }
                     if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
             );
-        let press_disturbs = !is_release && !is_repeat && !inert_modifier;
-        if press_disturbs {
+        // PRESS CUSTODY: resolved through the same shared `PressKind::of` the
+        // visible seam uses, so the two paths cannot disagree about what to CALL an
+        // event any more than they can disagree about what to DO with it.
+        //
+        // The lock is now unconditional, where it used to be taken only for a
+        // disturbing press. That is one uncontended acquisition per delivery on a
+        // path whose traffic is auto-repeat ticks at the ~30 Hz repeat rate — the
+        // same unconditional acquisition the visible seam already pays for every
+        // press, because it needs the predictor's cursor sample regardless. What it
+        // buys is that a background session's custody record is as real as a front
+        // one's: without it, a hidden session could only ever report the LAST
+        // disturbing press, and the three inert classes — the ones this design is
+        // about — would be invisible there.
+        let press_kind = PressKind::of(is_release, is_repeat, inert_modifier);
+        {
             let mut terminal = term_lock(&term);
-            let _ = apply_press_custody(&mut terminal, true);
+            let _ = apply_press_custody(&mut terminal, press_kind);
         }
         let (egress, _) =
             paste_order::ordered_or_inline(&term, &sink, &ev, input::EgressMode::Interactive);
@@ -2580,7 +2738,15 @@ impl App {
                         InputEvent::Key { event_type, .. }
                             if matches!(event_type, aterm_types::keyboard::KeyEventType::Repeat)
                     );
-                let press_disturbs = !is_release && !is_repeat && !inert_modifier;
+                // PRESS CUSTODY: the same three bits, resolved into the ONE
+                // disjoint four-way kind that both the side-effect gate and the
+                // custody record read. `PressKind::disturbs()` is
+                // `!is_release && !is_repeat && !inert_modifier` exactly — the gate
+                // below is byte-identical to the `press_disturbs` bool it replaced —
+                // but the KIND additionally separates the three inert classes, which
+                // are indistinguishable in every observable variable and can
+                // therefore only be told apart by what this seam knew.
+                let press_kind = PressKind::of(is_release, is_repeat, inert_modifier);
                 // The exact pre-write proofs are produced only on a press-like
                 // event. Keep them available across the PTY dispatch below so
                 // the synchronous post-write fence can upgrade them; releases
@@ -2702,12 +2868,22 @@ impl App {
                         delete_move_proof,
                     ) = {
                         let mut t = term_lock(&term);
-                        // SELECTION CUSTODY (R1). `press_disturbs` short-circuits
-                        // BEFORE the two reads, so an inert modifier / repeat /
-                        // release costs nothing extra inside a lock it is already
-                        // holding for the predictor sample. Shared with
-                        // `input_to_hidden_session` so the two cannot drift.
-                        let (scrolled, cleared) = apply_press_custody(&mut t, press_disturbs);
+                        // SELECTION CUSTODY (R1). The kind short-circuits BEFORE
+                        // the two reads, so an inert modifier / repeat / release
+                        // costs nothing extra inside a lock it is already holding
+                        // for the predictor sample beyond the one-byte custody
+                        // store. Shared with `input_to_hidden_session` so the two
+                        // cannot drift.
+                        //
+                        // PRESS CUSTODY: this is the only site in the process where
+                        // the press classification and the terminal are BOTH in
+                        // hand — the four bits are named 130 lines above, where no
+                        // lock is held, and the terminal is here, where the bits
+                        // would otherwise be a single bool. Recording inside the
+                        // guard also means the pre- and post-state a conformance
+                        // reads cannot have output from the PTY reader interleaved
+                        // between them.
+                        let (scrolled, cleared) = apply_press_custody(&mut t, press_kind);
                         // The NARROW `REPORT_EVENT_TYPES | REPORT_ALL_KEYS_AS_ESC`
                         // projection, read ONCE here (it feeds both the predictor's
                         // no-echo gate below and the release-relevance publication
@@ -2863,7 +3039,19 @@ impl App {
                         ws.input_hot_until = Some(input_now + INPUT_HOT_WINDOW);
                         // The classifier's typing evidence: a plain stamp, not
                         // a pacing deadline (see `WindowState::last_key_at`).
-                        ws.last_key_at = Some(input_now);
+                        //
+                        // A BARE MODIFIER IS NOT TYPING. This stamp also arms
+                        // the cursor-effect typed wake (`cursor_fx_focus`), so
+                        // stamping it here unconditionally meant every Cmd-Tab
+                        // AWAY from a window re-armed ~60fps effects on the
+                        // window being left — the modifier press that opens the
+                        // switcher is the last thing that window ever sees.
+                        // `inert_modifier` is the same predicate the blink reset
+                        // two arms up already trusts for "this key changed
+                        // nothing".
+                        if !inert_modifier {
+                            ws.last_key_at = Some(input_now);
+                        }
                         crate::metrics::note_input();
                         // Stamp the arrival for the `metrics` verb's input→present
                         // slice — the latency a human FEELS when typing. The same
@@ -3213,6 +3401,30 @@ impl App {
                         delete_move_proof,
                     )
                 } else {
+                    // PRESS CUSTODY — the RELEASE arm. `input_now.is_some()` is
+                    // exactly `!is_release` (debug-asserted above), so this else is
+                    // the key-up path and nothing else, and the whole press block
+                    // above — lock included — is unreachable from it.
+                    //
+                    // That left `ReleaseIsInert` with no seam: the release path took
+                    // no terminal lock of its own, so "a key-up moved nothing" could
+                    // only ever be asserted WITHOUT looking, which is an invariant no
+                    // mutant can falsify. This arm now runs the same one authority
+                    // every other press class runs, which both records the release
+                    // and gives a conformance a guard inside which the before/after
+                    // pair is real.
+                    //
+                    // COST: one uncontended mutex acquisition per key RELEASE, on a
+                    // path that goes on to take the same lock again inside
+                    // `seam_egress` to read the keyboard mode and then writes to the
+                    // PTY. Releases are delivered only while the app has Kitty
+                    // `REPORT_EVENT_TYPES` enabled, at human key-up rates.
+                    // `apply_press_custody` disturbs nothing for a `Release` kind —
+                    // the two `&&` reads short-circuit exactly as before.
+                    {
+                        let mut t = term_lock(&term);
+                        let _ = apply_press_custody(&mut t, press_kind);
+                    }
                     (true, None, None)
                 };
                 // If a paste is currently draining for THIS session, submit this
@@ -3563,13 +3775,27 @@ impl App {
             ev @ InputEvent::Wheel { .. } => self.input_wheel(wid, &ev, &term, &sink),
             // --- Explicit, tracking-agnostic scrollback nav (A.6) --------------
             InputEvent::ScrollView(intent) => self.input_scroll_view(wid, intent, &term),
-            ev @ InputEvent::Paste(_) => self.input_paste(
-                wid,
-                ev,
-                &term,
-                &sink,
-                input_now.expect("paste dispatch owns an injected input timestamp"),
-            ),
+            ev @ InputEvent::Paste(_) => {
+                // A PASTE IS TYPING, for the cursor-effect wake's purposes: the
+                // text lands at the caret and the cursor walks it, which is
+                // exactly the movement the trail exists to draw. The wake stamp
+                // lives on the Key/Text/KeySequence arm, and paste is a
+                // different arm — so `ctl paste` (and Cmd-V) into a window
+                // without OS key focus armed nothing and painted nothing, the
+                // same blackout shape the typed wake was written to end.
+                if let Some(now) = input_now
+                    && let Some(ws) = self.windows.get_mut(&wid)
+                {
+                    ws.last_key_at = Some(now);
+                }
+                self.input_paste(
+                    wid,
+                    ev,
+                    &term,
+                    &sink,
+                    input_now.expect("paste dispatch owns an injected input timestamp"),
+                )
+            }
             // --- Geometry (range-reject reportable) ----------------------------
             InputEvent::Resize {
                 rows,
@@ -4119,6 +4345,13 @@ impl App {
         {
             let mut term = term_lock(term);
             let page = i32::from(term.rows()).max(1);
+            // PRESS CUSTODY: nothing to do here any more. The recorder moved DOWN
+            // into `Terminal::scroll_display` / `scroll_to_top` /
+            // `scroll_to_absolute_row`, which is what every arm below calls, so this
+            // seam records by construction — and so do the six that used to bypass
+            // it: the wheel's instant arm, the wheel's glide tick,
+            // `settle_scroll_motion_at_target`, `control::apply_scroll_intent`, the
+            // cross-session `mouse` wheel fallback and the search jump.
             match intent {
                 ScrollIntent::Up => term.scroll_display(page),
                 ScrollIntent::Down => term.scroll_display(-page),
@@ -7720,6 +7953,12 @@ impl App {
             Action::RenameSession => {
                 self.begin_active_session_rename(wid);
             }
+            // Find Next/Previous step an OPEN find bar and otherwise reopen the
+            // last accepted query and resume after its anchor — the identical
+            // reducer `MenuAction::FindNext` runs, so a chord and the menu item
+            // cannot diverge.
+            Action::FindNext => self.search_find_again(true),
+            Action::FindPrev => self.search_find_again(false),
             // Same verb + same find gate as the menu's SelectAll arm: the find
             // bar borrows the terminal selection for its match highlight, so
             // under an open find this is deliberately inert rather than wrong.
@@ -8915,6 +9154,109 @@ mod serious_mode_command_tests {
     }
 }
 
+/// The `[keybindings]` vocabulary that used to exist only as menu items. On
+/// macOS a `MenuAction` with no `Action` twin costs nothing — the menu bar
+/// carries it — but off macOS there is no menu bar, so each of these was
+/// reachable ONLY through the palette and could not be given a chord at all.
+#[cfg(test)]
+mod menu_only_action_dispatch_tests {
+    use crate::keybinding::Action;
+    use crate::{App, WindowId, term_lock};
+
+    fn app_with_three_matches() -> (App, WindowId) {
+        let app = App::headless_for_test();
+        let wid = WindowId(0);
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        term_lock(&term).process(b"hit one\r\nhit two\r\nhit three");
+        (app, wid)
+    }
+
+    fn current(app: &App, wid: WindowId) -> usize {
+        app.windows[&wid]
+            .search
+            .as_ref()
+            .expect("open find bar")
+            .current
+    }
+
+    /// `find_next` / `find_prev` reach the SAME reducer Edit ▸ Find Next drives,
+    /// in both of its states: stepping an open bar, and reopening the last
+    /// accepted query after Enter closed it (the state a chord is actually for —
+    /// with the bar open the arrow keys already work).
+    #[test]
+    fn find_again_actions_step_an_open_bar_and_resume_a_closed_one() {
+        let (mut app, wid) = app_with_three_matches();
+        app.search_enter();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .query = "hit".into();
+        app.search_recompute();
+        let first = current(&app, wid);
+
+        app.dispatch_action(wid, Action::FindNext);
+        let second = current(&app, wid);
+        assert_ne!(second, first, "find_next stepped the open bar");
+        app.dispatch_action(wid, Action::FindPrev);
+        assert_eq!(current(&app, wid), first, "find_prev stepped back");
+
+        app.search_accept();
+        assert!(
+            app.windows[&wid].search.is_none(),
+            "Enter closed the bar and remembered the query"
+        );
+        app.dispatch_action(wid, Action::FindNext);
+        assert_eq!(
+            app.windows[&wid]
+                .search
+                .as_ref()
+                .expect("find_next reopened the accepted query")
+                .query,
+            "hit",
+        );
+    }
+
+    /// `select_all` selects the visible screen, and — exactly like the
+    /// `MenuAction::SelectAll` arm it mirrors — stays inert while the find bar
+    /// owns input, whose match highlight IS the terminal selection.
+    #[test]
+    fn select_all_action_selects_the_screen_and_defers_to_an_open_find() {
+        let (mut app, wid) = app_with_three_matches();
+        let term = app.pool.get(0).expect("session 0").term.clone();
+        assert!(
+            term_lock(&term).selection_to_string().is_none(),
+            "negative control: nothing selected yet"
+        );
+        app.dispatch_action(wid, Action::SelectAll);
+        let all = term_lock(&term)
+            .selection_to_string()
+            .expect("select_all selected the screen");
+        assert!(all.contains("hit three"), "{all:?}");
+
+        app.search_enter();
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .search
+            .as_mut()
+            .unwrap()
+            .query = "hit one".into();
+        app.search_recompute();
+        let marked = term_lock(&term)
+            .selection_to_string()
+            .expect("the find marked its match");
+        app.dispatch_action(wid, Action::SelectAll);
+        assert_eq!(
+            term_lock(&term).selection_to_string(),
+            Some(marked),
+            "select_all must not eat the find bar's match highlight",
+        );
+    }
+}
+
 #[cfg(test)]
 mod native_keyboard_boundary_tests {
     use std::fs;
@@ -8955,6 +9297,9 @@ mod native_keyboard_boundary_tests {
             keybinding::Action::Find,
             keybinding::Action::ScrollPageDown,
             keybinding::Action::ToggleSettings,
+            // F11 is a WINDOW command — it owes the terminal nothing, so it
+            // keeps working over a Settings or markdown tab.
+            keybinding::Action::ToggleFullscreen,
         ] {
             assert!(native_binding_allowed(allowed), "{allowed:?}");
         }
@@ -8964,6 +9309,11 @@ mod native_keyboard_boundary_tests {
             keybinding::Action::JumpPrevPrompt,
             keybinding::Action::JumpNextPrompt,
             keybinding::Action::ToggleViMode,
+            // Find-again and Select All act on the TERMINAL's search/selection,
+            // which a native view does not own — consumed as no-ops there.
+            keybinding::Action::FindNext,
+            keybinding::Action::FindPrev,
+            keybinding::Action::SelectAll,
         ] {
             assert!(!native_binding_allowed(terminal_only), "{terminal_only:?}");
         }
@@ -12946,7 +13296,7 @@ mod press_path_lock_elision_tests {
         live.process("line\r\n".repeat(64).as_bytes());
         assert_eq!(live.grid().display_offset(), 0, "precondition: at the tail");
         assert_eq!(
-            super::apply_press_custody(&mut live, true),
+            super::apply_press_custody(&mut live, super::PressKind::Typing),
             (false, false),
             "nothing to snap and nothing to clear: a disturbing press changed nothing"
         );
@@ -12962,7 +13312,7 @@ mod press_path_lock_elision_tests {
             sel.complete_selection();
         }
         assert_eq!(
-            super::apply_press_custody(&mut scrolled, false),
+            super::apply_press_custody(&mut scrolled, super::PressKind::Inert),
             (false, false),
             "a NON-disturbing press must short-circuit before either read"
         );
@@ -12974,7 +13324,7 @@ mod press_path_lock_elision_tests {
         assert!(scrolled.text_selection().has_selection());
 
         assert_eq!(
-            super::apply_press_custody(&mut scrolled, true),
+            super::apply_press_custody(&mut scrolled, super::PressKind::Typing),
             (true, true),
             "a disturbing press over a scrolled-back selection reports BOTH effects"
         );

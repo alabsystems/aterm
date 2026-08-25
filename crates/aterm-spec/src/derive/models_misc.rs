@@ -1224,14 +1224,27 @@ pub fn press_custody_model() -> Model {
             // and a model that forbade it would contradict the code it stands for.
             // What it still may not do is take the reading position: the repin
             // rides the new lines exactly as for undamaged output.
+            //
+            // BOTH OWNERSHIPS. The guard used to read `owner == 1`, which disabled
+            // the action outright at live — and at live is where its commonest real
+            // instance happens: a status line or progress bar repainting the rows a
+            // highlight sits on, which is the shipped defect this design came from.
+            // The engine records that shape unconditionally, so the narrow guard
+            // meant the dominant instance of one of the eleven actions was a step the
+            // spec could not admit, while the gate called the machine 11/11 bound.
+            // The OFFSET clause carries the ownership split instead of the guard: the
+            // repin rides the arriving lines only for a reader, and at live the view
+            // was already at live and stays there. The `Buggy = 1` member survives
+            // unchanged — at `owner == 1` it still snaps the reader to live, which is
+            // what `OutputNeverTakesCustody` catches.
             action OutputDamagesTheSelectedRows
-                when (owner == 1 && selection == 1 && offset <= MaxOffset - 1)
+                when (selection == 1 && offset <= MaxOffset - 1)
             {
                 prev_owner = owner;
                 prev_offset = offset;
                 prev_selection = selection;
-                offset = if Buggy == 1 { 0 } else { offset + 1 };
-                owner = if Buggy == 1 { 0 } else { 1 };
+                offset = if Buggy == 1 { 0 } else { if owner == 1 { offset + 1 } else { 0 } };
+                owner = if Buggy == 1 { 0 } else { owner };
                 selection = 0;
                 last_event = 6;
             }

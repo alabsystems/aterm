@@ -41,6 +41,8 @@ fn menu_binding(action: crate::menu::MenuAction) -> Option<crate::keybinding::Ac
         M::Paste => K::Paste,
         M::SelectAll => K::SelectAll,
         M::Find => K::Find,
+        M::FindNext => K::FindNext,
+        M::FindPrev => K::FindPrev,
         M::ToggleFullScreen => K::ToggleFullscreen,
         M::FontIncrease => K::FontIncrease,
         M::FontDecrease => K::FontDecrease,
@@ -568,6 +570,95 @@ mod tests {
         assert!(app.windows.get(&wid).unwrap().palette().is_some(), "opened");
         app.toggle_palette();
         assert!(app.windows.get(&wid).unwrap().palette().is_none(), "closed");
+    }
+
+    /// END TO END through the real `App`: the window's live keybinding table
+    /// reaches the painted card AND the `controls menu` introspection lines,
+    /// which are the same rows a screen reader is handed. Off macOS this is the
+    /// only way to learn a chord without leaving the app.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn palette_rows_carry_the_live_chord() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        // The harness constructs with an EMPTY table; a real launch installs
+        // `Keybindings::resolved(config)` — install exactly that.
+        app.keybindings = crate::keybinding::Keybindings::resolved(None);
+        let accel_of = |app: &App, label: &str| {
+            app.palette_snapshot(wid)
+                .controls_lines()
+                .into_iter()
+                .find(|line| line.contains(&format!("label={label:?}")))
+                .unwrap_or_else(|| panic!("{label} row"))
+        };
+        assert!(
+            accel_of(&app, "Enter Full Screen").contains(r#"accel="F11""#),
+            "{}",
+            accel_of(&app, "Enter Full Screen"),
+        );
+        assert!(
+            accel_of(&app, "New Terminal Tab").contains(r#"accel="Ctrl+Shift+T""#),
+            "{}",
+            accel_of(&app, "New Terminal Tab"),
+        );
+        // A user rebind is what the running app displays — the thing a static
+        // menu bar's key-equivalents structurally cannot do.
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+alt+n".to_string(), "new_window".to_string());
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
+        assert!(
+            accel_of(&app, "New Window").contains(r#"accel="Ctrl+Shift+N""#),
+            "the seeded chord still fires it, so it is still the label: {}",
+            accel_of(&app, "New Window"),
+        );
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("ctrl+shift+n".to_string(), "rename_session".to_string());
+        table.insert("ctrl+alt+n".to_string(), "new_window".to_string());
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
+        assert!(
+            accel_of(&app, "New Window").contains(r#"accel="Ctrl+Alt+N""#),
+            "with the default rebound away, the user's own chord shows: {}",
+            accel_of(&app, "New Window"),
+        );
+    }
+
+    /// The join covers the find-again rows too: `find_next`/`find_prev` ship
+    /// UNSEEDED (F3 is owed to the program on the other side of the PTY), so
+    /// their rows are blank by default — and the moment a user binds them, the
+    /// palette says so. This is the new-vocabulary half of the F11 work: a
+    /// command that used to be menu-only now round-trips config → chord → row.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn find_again_rows_show_a_user_bound_chord() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let accel_of = |app: &App, label: &str| {
+            app.palette_snapshot(wid)
+                .controls_lines()
+                .into_iter()
+                .find(|line| line.contains(&format!("label={label:?}")))
+                .unwrap_or_else(|| panic!("{label} row"))
+        };
+        app.keybindings = crate::keybinding::Keybindings::resolved(None);
+        assert!(
+            accel_of(&app, "Find Next").contains(r#"accel="""#),
+            "unseeded by default — blank, never a guess: {}",
+            accel_of(&app, "Find Next"),
+        );
+        let mut table = std::collections::BTreeMap::new();
+        table.insert("f3".to_string(), "find_next".to_string());
+        table.insert("shift+f3".to_string(), "find_prev".to_string());
+        app.keybindings = crate::keybinding::Keybindings::resolved(Some(&table));
+        assert!(
+            accel_of(&app, "Find Next").contains(r#"accel="F3""#),
+            "{}",
+            accel_of(&app, "Find Next"),
+        );
+        assert!(
+            accel_of(&app, "Find Previous").contains(r#"accel="Shift+F3""#),
+            "{}",
+            accel_of(&app, "Find Previous"),
+        );
     }
 
     #[test]

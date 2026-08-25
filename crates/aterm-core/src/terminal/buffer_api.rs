@@ -281,16 +281,39 @@ impl Terminal {
     }
 
     /// Scroll display by delta lines.
+    ///
+    /// PRESS CUSTODY: this is one of the three entry points that can RAISE
+    /// `display_offset`, so it samples the offset around the move and records
+    /// [`crate::terminal::CustodyTransition::UserScroll`] on a rise
+    /// (`Terminal::note_scroll_custody`). A negative delta lowers the offset and
+    /// records nothing. Recording here rather than at the GUI seams is what makes the
+    /// wheel — which reaches this function directly from `input_wheel`'s instant arm
+    /// and from its glide tick, and used to record nothing at all — impossible to
+    /// bypass.
     pub fn scroll_display(&mut self, delta: i32) {
+        let before = self.grid.display_offset();
         self.grid.scroll_display(delta);
+        self.note_scroll_custody(before);
     }
 
     /// Scroll to top of scrollback.
+    ///
+    /// PRESS CUSTODY: records `UserScroll` on a rise — see [`Self::scroll_display`].
+    /// A terminal already at the top of its history records nothing, because nothing
+    /// moved.
     pub fn scroll_to_top(&mut self) {
+        let before = self.grid.display_offset();
         self.grid.scroll_to_top();
+        self.note_scroll_custody(before);
     }
 
     /// Scroll to bottom (live content).
+    ///
+    /// PRESS CUSTODY: deliberately NOT a recording site. This can only LOWER the
+    /// offset, and no `PressCustody` action admits a move toward live except
+    /// `TypingPress`, which clears the selection on the way and is recorded by the
+    /// press seam that called this. In particular `apply_press_custody`'s snap runs
+    /// through here, and must not file a `UserScroll` on top of its own record.
     pub fn scroll_to_bottom(&mut self) {
         self.grid.scroll_to_bottom();
     }
@@ -298,8 +321,15 @@ impl Terminal {
     /// Scroll the viewport so `target_abs_row` (an absolute row number, e.g. a
     /// command mark's `prompt_start_row`) sits at the top visible line, clamped
     /// to the retained history — the primitive behind prompt-to-prompt navigation.
+    ///
+    /// PRESS CUSTODY: records `UserScroll` on a rise — see [`Self::scroll_display`].
+    /// A jump back DOWN toward live (a search hit below the current view, the find
+    /// bar's ⎋ restore landing lower than the current position) lowers the offset and
+    /// records nothing.
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
+        let before = self.grid.display_offset();
         self.grid.scroll_to_absolute_row(target_abs_row);
+        self.note_scroll_custody(before);
     }
 
     /// Take pending response data.

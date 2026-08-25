@@ -1096,11 +1096,34 @@ pub fn spawn_background_check(
                             )
                             .ok()
                         });
-                        if checker_staging
-                            .as_ref()
-                            .is_some_and(|s| another_process_checked(s, schedule.base()))
+                        // THE WINDOW MUST BE SIZED FOR THE LANE THIS MACHINE IS
+                        // ACTUALLY ON (2026-08-24 audit). `Cadence` is always
+                        // constructed at the AUTHENTICATED base, and only adopts the
+                        // anonymous one after a check has completed and revealed the
+                        // lane — but `github::lane()` is a process-local static, so a
+                        // freshly spawned process ALWAYS starts on the fast base, and
+                        // every terminal session runs this loop. Sizing the dedup
+                        // window off 75 s meant each new session more than ~52 s after
+                        // the last one spent a full 5-request check: twelve launches in
+                        // an hour is the whole ~60/hour anonymous per-IP budget, which
+                        // is precisely the "update check deferred: GitHub rate limit"
+                        // an owner sees. Guessing FAST costs the shared budget;
+                        // guessing SLOW only delays a first check a sibling has already
+                        // made — so while the lane is unknown, assume the slow one.
+                        //
+                        // This cannot starve the process: it has not completed a check
+                        // yet, so it has no stamp of its own in the ledger to mistake
+                        // for another checker's, and the first completed check both
+                        // stamps the ledger and reveals the lane.
+                        let dedup_base = dedup_window_base(
+                            configured.is_some(),
+                            github::lane(),
+                            schedule.base(),
+                        );
+                        if let Some(reason) =
+                            checker_staging.as_ref().and_then(|s| checker_skip(s, dedup_base))
                         {
-                            log("another aterm process completed this interval's update check");
+                            log(reason);
                             // Release the flock BEFORE sleeping — holding it through
                             // the wait would serialize every other process on OUR
                             // timer — then take the same jittered wait the loop tail
@@ -1678,27 +1701,97 @@ fn reconcile_status_outcome(
     }
 }
 
-/// Whether the shared ledger records a check completed WITHIN the freshness
-/// window — i.e. another aterm process (the window, or a sibling session) has
-/// already spent this interval's network budget. The window is 70% of the base
-/// interval: strictly below the jittered minimum wait (80% of nominal), so a
-/// process can never mistake its OWN previous cycle's stamp for another
-/// checker's and starve itself. Deferrals (rate limit, stranded) also stamp the
-/// ledger, so a machine that was just told to slow down is not immediately
-/// re-poked by a sibling.
+/// The base interval the cross-process dedup window is measured against.
+///
+/// NOT always `schedule.base()`. [`cadence::Cadence`] is always constructed at
+/// the AUTHENTICATED interval and only adopts the anonymous one once a completed
+/// check has revealed the lane — and the lane lives in a PROCESS-LOCAL static, so
+/// every freshly spawned process starts on the fast base no matter what this
+/// machine has already learned. Since the one-binary era each terminal SESSION
+/// runs the check loop, so sizing the window off 75 s made every launch more than
+/// ~52 s after the last one spend a full 5-request check: a dozen launches in an
+/// hour is the entire ~60/hour anonymous per-IP budget, and the machine lives in
+/// "update check deferred: GitHub rate limit" — the invariant the loop's own
+/// comment promises ("N processes cost one check per interval, not N") failing
+/// for precisely the check every short-lived process makes.
+///
+/// So while the lane is UNKNOWN, assume the slow one: guessing fast spends a
+/// budget shared with every other machine on the IP, while guessing slow only
+/// defers a first check that a sibling has already made. It cannot starve the
+/// caller — a process with no completed check has no stamp of its own in the
+/// ledger to mistake for another checker's, and the first completed check both
+/// stamps the ledger and reveals the lane. An explicitly configured interval is
+/// never second-guessed: an operator who set one owns the consequence.
+#[cfg(any(target_os = "macos", test))]
+fn dedup_window_base(
+    configured: bool,
+    lane: github::Lane,
+    base: std::time::Duration,
+) -> std::time::Duration {
+    if configured || lane != github::Lane::Unknown {
+        return base;
+    }
+    std::time::Duration::from_secs(cadence::ANONYMOUS_INTERVAL_SECS).max(base)
+}
+
+/// How much a RECORDED DEFERRAL widens the machine-wide freshness window, as a
+/// multiple of the base interval.
+///
+/// A rate limit is measured per IP, so the retreat has to be measured per
+/// MACHINE. `Cadence::failed` lengthens the wait of the one process that saw the
+/// 429 — but the ledger stamp it leaves behind was, until this constant existed,
+/// judged against every sibling's own un-backed-off base, so siblings kept poking
+/// GitHub at full cadence for the whole backoff and the machine never actually
+/// slowed to the rate it had just computed. One doubling mirrors the first rung
+/// of `Cadence`'s ladder, applied to every process rather than to one.
 #[cfg(target_os = "macos")]
-fn another_process_checked(staging: &paths::Staging, base: std::time::Duration) -> bool {
-    let Some(text) = read_ledger_text(&staging.status) else {
-        return false;
+const DEFERRED_WINDOW_INTERVALS: u32 = 2;
+
+/// Why this cycle must NOT spend a network check, if it must not — i.e. whether
+/// the shared ledger records a check completed WITHIN the freshness window, so
+/// another aterm process (the window, or a sibling session) has already spent
+/// this interval's network budget.
+///
+/// The window is 70% of the base interval: strictly below the jittered minimum
+/// wait (80% of nominal), so a process can never mistake its OWN previous
+/// cycle's stamp for another checker's and starve itself.
+///
+/// Deferrals (rate limit, stranded) also stamp the ledger, AND widen the window
+/// by [`DEFERRED_WINDOW_INTERVALS`]: a machine that was just told to slow down
+/// must not be re-poked by a sibling on the sibling's own faster timer. The
+/// widened window is still bounded — the next healthy check overwrites the
+/// outcome and the window returns to the base — so the retreat self-heals
+/// exactly as the per-process backoff does.
+#[cfg(target_os = "macos")]
+fn checker_skip(
+    staging: &paths::Staging,
+    base: std::time::Duration,
+) -> Option<&'static str> {
+    let text = read_ledger_text(&staging.status)?;
+    let v = text.parse::<toml::Value>().ok()?;
+    let updated = v.get("updated_at").and_then(toml::Value::as_str)?;
+    if updated.is_empty() {
+        return None;
+    }
+    let deferred = v
+        .get("outcome")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|outcome| outcome.contains("deferred"));
+    let window = if deferred {
+        base.saturating_mul(DEFERRED_WINDOW_INTERVALS)
+    } else {
+        base
     };
-    let Ok(v) = text.parse::<toml::Value>() else {
-        return false;
-    };
-    let Some(updated) = v.get("updated_at").and_then(toml::Value::as_str) else {
-        return false;
-    };
-    let fresh_window = base.as_secs().saturating_mul(7) / 10;
-    !updated.is_empty() && !rfc3339_older_than(updated, fresh_window)
+    let fresh_window = window.as_secs().saturating_mul(7) / 10;
+    if rfc3339_older_than(updated, fresh_window) {
+        return None;
+    }
+    Some(if deferred {
+        "the shared update ledger records a deferred check — this machine is \
+         holding off GitHub for the rest of the backoff"
+    } else {
+        "another aterm process completed this interval's update check"
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1904,6 +1997,168 @@ pub(crate) mod log_capture {
     /// clear residue from earlier code on the same thread, and again after to read.
     pub(crate) fn take() -> Vec<(aterm_log::Level, String)> {
         LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    }
+}
+
+#[cfg(test)]
+mod checker_gate_tests {
+    use std::time::Duration;
+
+    use super::dedup_window_base;
+    use crate::cadence;
+    use crate::github::Lane;
+
+    const AUTH: Duration = Duration::from_secs(cadence::AUTHENTICATED_INTERVAL_SECS);
+    const ANON: Duration = Duration::from_secs(cadence::ANONYMOUS_INTERVAL_SECS);
+
+    /// THE LAUNCH-COST OBLIGATION the steady-state budget test cannot express.
+    /// A process that has not completed a check does not know its lane, and its
+    /// `Cadence` is still on the authenticated base — so the dedup window it is
+    /// judged against must be the SLOW one, or N launches cost N × 5 anonymous
+    /// requests instead of one.
+    #[test]
+    fn an_unknown_lane_is_deduped_at_the_anonymous_interval() {
+        assert_eq!(
+            dedup_window_base(false, Lane::Unknown, AUTH),
+            ANON,
+            "a freshly spawned process must not spend the shared budget on a guess"
+        );
+        // Twelve launches in an hour, against the ~60 req/hour anonymous budget:
+        // the freshness window (70% of the base) must exceed the spacing, so at
+        // most one of them reaches the network.
+        let window = dedup_window_base(false, Lane::Unknown, AUTH).as_secs() * 7 / 10;
+        let spacing = 3600 / 12;
+        assert!(
+            window > spacing,
+            "12 launches/hour ({spacing}s apart) must dedup inside a {window}s window"
+        );
+    }
+
+    #[test]
+    fn a_known_lane_and_a_configured_interval_are_taken_at_face_value() {
+        assert_eq!(dedup_window_base(false, Lane::Authenticated, AUTH), AUTH);
+        assert_eq!(dedup_window_base(false, Lane::Anonymous, ANON), ANON);
+        // An operator interval owns its own consequence, fast or slow.
+        let configured = Duration::from_secs(10);
+        assert_eq!(dedup_window_base(true, Lane::Unknown, configured), configured);
+    }
+
+    /// The window may only ever GROW relative to the schedule's own base, so this
+    /// gate can never shorten a cadence the lane or the operator already accepted.
+    #[test]
+    fn the_dedup_window_never_undercuts_the_schedules_own_base() {
+        for lane in [Lane::Unknown, Lane::Authenticated, Lane::Anonymous] {
+            for base in [Duration::from_secs(1), AUTH, ANON, Duration::from_secs(7200)] {
+                for configured in [false, true] {
+                    assert!(
+                        dedup_window_base(configured, lane, base) >= base,
+                        "{lane:?} {base:?} configured={configured}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod checker_skip_tests {
+    use std::time::Duration;
+
+    use super::{checker_skip, paths::Staging};
+
+    fn staging(name: &str) -> Staging {
+        let root = std::env::temp_dir().join(format!(
+            "aterm-checker-{}-{name}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&root).expect("scratch root");
+        Staging {
+            apply_lock: root.join("apply.lock"),
+            stage_lock: root.join("stage.lock"),
+            download: root.join("download"),
+            staged_app: root.join("staged").join("aterm.app"),
+            ready: root.join("ready.toml"),
+            status: root.join("status.toml"),
+            root,
+        }
+    }
+
+    fn write_ledger(s: &Staging, age_secs: u64, outcome: &str) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let stamp = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(age_secs));
+        std::fs::write(
+            &s.status,
+            format!("schema = 1
+updated_at = \"{stamp}\"
+outcome = \"{outcome}\"
+"),
+        )
+        .expect("write ledger");
+    }
+
+    const BASE: Duration = Duration::from_secs(30 * 60);
+
+    #[test]
+    fn a_fresh_stamp_skips_and_a_stale_one_checks() {
+        let s = staging("fresh");
+        write_ledger(&s, 60, "up to date");
+        assert!(
+            checker_skip(&s, BASE).is_some(),
+            "a sibling checked a minute ago — this cycle owes GitHub nothing"
+        );
+        // 70% of 30 min is 21 min; 25 minutes is past it.
+        write_ledger(&s, 25 * 60, "up to date");
+        assert!(
+            checker_skip(&s, BASE).is_none(),
+            "past the freshness window the check is this process's to make"
+        );
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    /// THE RETREAT IS MEASURED PER MACHINE, because the rate limit is. Without
+    /// this a sibling on its own un-backed-off timer re-poked GitHub at full
+    /// cadence for the whole backoff, so a machine that had just been told to
+    /// slow down never actually did.
+    #[test]
+    fn a_recorded_deferral_holds_off_every_process_not_just_the_one_that_saw_it() {
+        let s = staging("deferred");
+        write_ledger(&s, 25 * 60, "update check deferred: GitHub rate limit");
+        let reason = checker_skip(&s, BASE).expect("the deferral widens the window");
+        assert!(
+            reason.contains("deferred"),
+            "the log line names the real reason: {reason}"
+        );
+        // It is bounded, not permanent: past the widened window (70% of 2×base
+        // = 42 min) the machine tries again, and one healthy check overwrites
+        // the outcome and restores the base window.
+        write_ledger(&s, 50 * 60, "update check deferred: GitHub rate limit");
+        assert!(
+            checker_skip(&s, BASE).is_none(),
+            "the machine-wide retreat self-heals"
+        );
+        write_ledger(&s, 25 * 60, "up to date");
+        assert!(
+            checker_skip(&s, BASE).is_none(),
+            "a healthy check returns the window to the base interval"
+        );
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
+    #[test]
+    fn a_missing_or_empty_ledger_never_defers_a_check() {
+        let s = staging("missing");
+        assert!(checker_skip(&s, BASE).is_none(), "no ledger: check");
+        std::fs::write(&s.status, "schema = 1
+updated_at = \"\"
+").expect("write");
+        assert!(checker_skip(&s, BASE).is_none(), "empty stamp: check");
+        std::fs::write(&s.status, "not toml at all {{{").expect("write");
+        assert!(checker_skip(&s, BASE).is_none(), "unparseable: check");
+        let _ = std::fs::remove_dir_all(&s.root);
     }
 }
 

@@ -4988,8 +4988,8 @@ impl GpuRenderer {
         }
     }
 
-    /// Set the Linux grid-fitting mode (config `font_hinting` /
-    /// `ATERM_FONT_HINTING`, W13/R2) on the wrapped CPU face and drop the
+    /// Set the native (Linux/Windows) grid-fitting mode (config `font_hinting`
+    /// / `ATERM_FONT_HINTING`, W13/R2) on the wrapped CPU face and drop the
     /// resident atlas on a change (grid fitting bakes into the cached coverage
     /// bytes the atlas holds). Inert on the targets without the hint seam,
     /// exactly like the wrapped setter.

@@ -69,14 +69,16 @@ aterm-spec = { workspace = true, optional = true }
 # keeps the capability out of spawned children.
 libc = { workspace = true }
 
-[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-# LINUX CRISPNESS (see src/hinted.rs): grid-fitted glyph outlines for the native
-# Linux raster path. fontdue has NO hinting, so at desktop sizes (~12px, scale 1.0)
-# stems and crossbars land at fractional pixel phases and read fuzzy; skrifa runs
-# the font's TrueType bytecode / FreeType-ported autohinter and hands back a
-# grid-fitted outline that the SAME ab_glyph_rasterizer coverage fill (as the
-# FONT-2 variation path) turns into crisp masks. Target-gated so the macOS
-# (CoreText) and Windows/wasm builds compile not one byte of it.
+[target.'cfg(any(all(unix, not(target_os = "macos")), windows))'.dependencies]
+# NATIVE CRISPNESS (see src/hinted.rs): grid-fitted glyph outlines for the two
+# native raster paths that are NOT CoreText — Linux (W13) and Windows. fontdue
+# has NO hinting, so at desktop sizes (~12px, scale 1.0) stems and crossbars land
+# at fractional pixel phases and read fuzzy; skrifa runs the font's TrueType
+# bytecode / FreeType-ported autohinter and hands back a grid-fitted outline that
+# the SAME ab_glyph_rasterizer coverage fill (as the FONT-2 variation path) turns
+# into crisp masks. Target-gated so the macOS (CoreText) build and the wasm
+# consumer — which trims its closure deliberately, see `disk-tier` above —
+# compile not one byte of it.
 skrifa = "0.46.2"
 
 [dev-dependencies]

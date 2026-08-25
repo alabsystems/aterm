@@ -15,6 +15,7 @@
 
 use std::time::Instant;
 
+use crate::app_mouse::note_selection_custody;
 use crate::{App, term_lock};
 use aterm_core::search::{SearchDirection as EngineSearchDirection, SearchMatch};
 use aterm_core::terminal::Terminal;
@@ -281,7 +282,11 @@ pub(crate) fn apply_field_edit(text: &mut String, cursor: &mut usize, edit: Sear
 /// `live_top_abs` is `absolute_row_counter − rows`, i.e. `Grid::base_y()`, NOT
 /// `top_visible_absolute_row()` — the latter folds in `display_offset`, which would make
 /// the predicate depend on where the user happens to be looking.
-fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) {
+///
+/// Returns whether a highlight was actually destroyed — the caller records a
+/// `UserClear` when it was (PRESS CUSTODY), and a refusal that found nothing to clear
+/// must not claim one.
+fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) -> bool {
     let live_top_abs = u64::try_from(term.grid().base_y()).unwrap_or(u64::MAX);
     let live_bottom_abs = live_top_abs.saturating_add(u64::from(term.rows().saturating_sub(1)));
     if term
@@ -289,7 +294,9 @@ fn clear_selection_if_content_is_mutable(term: &mut crate::TermGuard<'_>) {
         .intersects_absolute_band(live_top_abs, live_top_abs, live_bottom_abs)
     {
         term.text_selection_mut().clear();
+        return true;
     }
+    false
 }
 
 /// The viewport a find was OPENED from, as an ABSOLUTE anchor rather than a
@@ -661,7 +668,13 @@ impl App {
             }
         }
         if let Some(term) = term {
-            clear_selection_if_content_is_mutable(&mut term_lock(&term));
+            // PRESS CUSTODY: same rule as the navigation refusal — this clears the
+            // highlight only when the live screen could have moved under it, and it
+            // records a `UserClear` exactly when it does.
+            let mut t = term_lock(&term);
+            if clear_selection_if_content_is_mutable(&mut t) {
+                crate::app_mouse::note_selection_custody(&mut t, false);
+            }
         }
     }
 
@@ -1126,7 +1139,13 @@ impl App {
                 // unconditional — nothing below may be recomputed from `mat` — but the
                 // highlight already on glass is only destroyed when the output could
                 // have reached it.
-                clear_selection_if_content_is_mutable(&mut term);
+                // PRESS CUSTODY: the refusal path can DESTROY a live highlight, so
+                // it records a `UserClear` when it does. `clear_selection_if_content_is_mutable`
+                // reports whether it cleared, because "nothing was selected" and "the
+                // find bar took your selection" are different answers to the verb.
+                if clear_selection_if_content_is_mutable(&mut term) {
+                    note_selection_custody(&mut term, false);
+                }
                 return;
             }
             // Re-anchor the stored (frame-relative) selection row to THIS frame: if output
@@ -1138,10 +1157,23 @@ impl App {
             let row = mat.and_then(|(r, _, _)| i32::try_from(i64::from(r) - delta).ok());
             {
                 let sel = term.text_selection_mut();
+                let had = sel.has_selection();
                 sel.clear();
-                if let (Some(row), Some((_, c0, c1))) = (row, mat) {
+                let armed = if let (Some(row), Some((_, c0, c1))) = (row, mat) {
                     sel.start_selection(row, c0, SelectionSide::Left, SelectionType::Simple);
                     sel.update_selection(row, c1, SelectionSide::Right);
+                    true
+                } else {
+                    false
+                };
+                // PRESS CUSTODY: a search jump reaches the `TextSelection` primitive
+                // directly, with no mouse gesture around it, so the projected
+                // `selection` moved 0 -> 1 (a hit) or 1 -> 0 (an empty query over a
+                // previous hit) with nothing recorded. Same guard as the mutation.
+                if armed {
+                    note_selection_custody(&mut term, true);
+                } else if had {
+                    note_selection_custody(&mut term, false);
                 }
             }
             // MOVE THE CONTENT, NOT THE CHROME. The panel rides the TOP rows

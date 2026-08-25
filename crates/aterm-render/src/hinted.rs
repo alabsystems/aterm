@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! LINUX CRISPNESS (W13): grid-fitted (hinted) glyph rasterization for the
-//! native non-macOS raster path.
+//! NATIVE CRISPNESS (W13 Linux, then Windows): grid-fitted (hinted) glyph
+//! rasterization for the native non-macOS raster paths.
 //!
 //! fontdue rasterizes an outline faithfully but has NO hinting: at desktop
 //! sizes (DejaVu Sans Mono 12px on a scale-1.0 display) stems land at
@@ -13,7 +13,11 @@
 //! the macOS path never shows, because CoreText applies its own grid
 //! discipline + smoothing.
 //!
-//! This module is the Linux twin of the macOS `ct_glyph` seam: skrifa runs the
+//! Windows had no grid fitting at all until this module reached it — the raw
+//! outline fill, on the one platform whose reference renderers (Windows
+//! Terminal, VS Code, conhost) are all DirectWrite-hinted in the next window.
+//!
+//! This module is the non-CoreText twin of the macOS `ct_glyph` seam: skrifa runs the
 //! font's OWN TrueType bytecode or the FreeType-ported autohinter
 //! ([`skrifa::outline::HintingInstance`]) and hands back a grid-fitted outline
 //! in pixel space, which the SAME `ab_glyph_rasterizer` coverage fill as the
@@ -33,19 +37,42 @@
 //! wide-glyph centering and spill accounting are byte-identical to the
 //! unhinted path. Only the coverage and its integer placement change.
 //!
-//! Gated to `cfg(all(unix, not(target_os = "macos")))` at the module
-//! declaration AND in Cargo.toml (target-gated dependency): macOS keeps
-//! CoreText byte-identically, Windows/wasm keep fontdue byte-identically.
+//! VARIABLE INSTANCES (Windows): every entry point carries the user-space
+//! variation coords, so the outline that gets grid-fitted is the INSTANTIATED
+//! one — `HintingInstance::new` takes the normalized location, and skrifa's
+//! hinted draw reads size + location back off the instance. That matters on
+//! Windows specifically: the default face there
+//! (`C:\Windows\Fonts\CascadiaMono.ttf`) is a variable font with no separate
+//! Bold file, so BOTH the regular cut and the `wght`≈700 cut the real-bold
+//! path (W9) draws are instances, and a hinter pinned to `LocationRef::default()`
+//! would silently reset the configured weight. Linux passes an empty coord
+//! slice, which normalizes to the same default location it always used.
+//!
+//! Gated to `cfg(any(all(unix, not(target_os = "macos")), windows))` at the
+//! module declaration AND in Cargo.toml (target-gated dependency): macOS keeps
+//! CoreText byte-identically, the wasm consumer keeps fontdue byte-identically
+//! and compiles none of it.
 
 use skrifa::{
-    instance::{LocationRef, Size},
+    FontRef, MetadataProvider, Tag,
+    instance::{Location, Size},
     outline::{
         DrawSettings, Engine, HintingInstance, HintingOptions, OutlinePen, SmoothMode, Target,
     },
-    FontRef, MetadataProvider,
 };
 
-/// How the native Linux raster path grid-fits outlines. Resolved ONCE per
+/// Normalize user-space `(tag, value)` variation coords against `font`'s
+/// `fvar`/`avar` — the skrifa twin of `ttf_parser::Face::set_variation`, which
+/// the portable [`variation`](crate::variation) raster uses on the very same
+/// coord slice. An EMPTY slice yields the font's default location, i.e. exactly
+/// what `LocationRef::default()` meant before instances were plumbed through;
+/// tags the face does not carry are ignored, same as the ttf-parser path.
+fn location_of(font: &FontRef, coords: &[(u32, f32)]) -> Location {
+    font.axes()
+        .location(coords.iter().map(|&(tag, v)| (Tag::from_u32(tag), v)))
+}
+
+/// How the native (Linux / Windows) raster path grid-fits outlines. Resolved ONCE per
 /// renderer from `ATERM_FONT_HINTING` (construction-time, like
 /// `ATERM_RASTERIZER`); rasterized coverage is cached per glyph, so a
 /// mid-flight env flip must not split the atlas between two modes.
@@ -138,20 +165,30 @@ impl HintMode {
     }
 }
 
-/// Per-face-and-size [`HintingInstance`] cache — the skrifa twin of the
-/// CoreText `ct_cache`. Building an instance replays `fpgm`/`prep` (or
+/// Per-face-size-and-INSTANCE [`HintingInstance`] cache — the skrifa twin of
+/// the CoreText `ct_cache`. Building an instance replays `fpgm`/`prep` (or
 /// computes autohinter glyph styles), so it must not happen per glyph; keyed
 /// like `ct_cache` on the face bytes' POINTER identity (faces are immutable
-/// `Arc`s), collection index, and the raster px bits.
+/// `Arc`s), collection index, the raster px bits, and the variation SLOT
+/// (`0` = default instance, `1` = the resolved primary coords, `2` = the bold
+/// instance — the same three-slot discipline, and the same caller, as
+/// `ct_cache`; one face can hold several instantiations of the same bytes).
 #[derive(Default)]
 pub(crate) struct HintBank {
-    map: aterm_hash::FxHashMap<(usize, u32, u32), Option<std::sync::Arc<HintingInstance>>>,
+    map: aterm_hash::FxHashMap<(usize, u32, u32, u8), Option<std::sync::Arc<HintingInstance>>>,
 }
 
 impl HintBank {
-    /// Fetch (or build + memoize) the hinting instance for one face at `px`.
-    /// A face skrifa cannot parse (or a degenerate px) memoizes `None`, so the
-    /// fontdue fallback is taken WITHOUT re-attempting the build every glyph.
+    /// Fetch (or build + memoize) the hinting instance for one face at `px`,
+    /// at the variation `coords` discriminated by `slot`. A face skrifa cannot
+    /// parse (or a degenerate px) memoizes `None`, so the fontdue fallback is
+    /// taken WITHOUT re-attempting the build every glyph.
+    ///
+    /// The arity is the face's identity spelled out (`key_ptr`/`bytes`/`index`
+    /// pin WHICH face, `px`/`mode` WHICH instance, `coords`/`slot` WHICH
+    /// variation); a params struct here would be the same fields with one more
+    /// name to keep in step at every call site.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn instance(
         &mut self,
         key_ptr: usize,
@@ -159,15 +196,20 @@ impl HintBank {
         index: u32,
         px: f32,
         mode: HintMode,
+        coords: &[(u32, f32)],
+        slot: u8,
     ) -> Option<std::sync::Arc<HintingInstance>> {
-        self.instance_with(key_ptr, bytes, index, px, mode.options())
+        self.instance_with(key_ptr, bytes, index, px, mode.options(), coords, slot)
     }
 
     /// [`Self::instance`] with the skrifa options handed in directly — the seam
     /// the subpixel raster ([`crate::subpixel`]) uses to memoize LCD-target
     /// instances in its OWN bank (the map key does not carry the target, so one
     /// bank must never hold two targets for the same face+px). `None` options =
-    /// hinting disabled = no instance.
+    /// hinting disabled = no instance. The `(coords, slot)` instance discipline
+    /// is the same as [`Self::instance`]'s; the subpixel raster's stage-1 set
+    /// excludes variable instances, so it always passes `(&[], 0)`.
+    #[allow(clippy::too_many_arguments)] // see `instance`
     pub(crate) fn instance_with(
         &mut self,
         key_ptr: usize,
@@ -175,23 +217,21 @@ impl HintBank {
         index: u32,
         px: f32,
         options: Option<HintingOptions>,
+        coords: &[(u32, f32)],
+        slot: u8,
     ) -> Option<std::sync::Arc<HintingInstance>> {
         let options = options?;
         if !px.is_finite() || px <= 0.0 {
             return None;
         }
         self.map
-            .entry((key_ptr, index, px.to_bits()))
+            .entry((key_ptr, index, px.to_bits(), slot))
             .or_insert_with(|| {
                 let font = FontRef::from_index(bytes, index).ok()?;
-                HintingInstance::new(
-                    &font.outline_glyphs(),
-                    Size::new(px),
-                    LocationRef::default(),
-                    options,
-                )
-                .ok()
-                .map(std::sync::Arc::new)
+                let location = location_of(&font, coords);
+                HintingInstance::new(&font.outline_glyphs(), Size::new(px), &location, options)
+                    .ok()
+                    .map(std::sync::Arc::new)
             })
             .clone()
     }
@@ -224,19 +264,26 @@ pub(crate) fn unicode_gid(bytes: &[u8], index: u32, ch: char) -> Option<u16> {
 /// the fitted outline at pixel phase < 1 ulp — hinted edges land ON texel
 /// boundaries instead of between them. A blank glyph (space) is `(0, 0, ..)`
 /// with just the advance; `None` on any parse/draw failure = fontdue fallback.
+///
+/// `coords` must be the SAME user-space variation coords `hint` was built at
+/// (the caller's slot discipline guarantees it): the outline comes from the
+/// instance, so the advance has to be measured at that instance too — an
+/// `HVAR`-varying face would otherwise report the default cut's width.
 pub(crate) fn hinted_glyph_raster(
     bytes: &[u8],
     index: u32,
     gid: u16,
     px: f32,
     hint: &HintingInstance,
+    coords: &[(u32, f32)],
 ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
     let font = FontRef::from_index(bytes, index).ok()?;
     let glyph_id = skrifa::GlyphId::from(gid);
+    let location = location_of(&font, coords);
     // LINEAR advance (scaled hmtx — fontdue's exact math), never the hinted
     // one: metrics upstream must not move when hinting lands (module doc).
     let advance = font
-        .glyph_metrics(Size::new(px), LocationRef::default())
+        .glyph_metrics(Size::new(px), &location)
         .advance_width(glyph_id)
         .unwrap_or(0.0);
     let outline = font.outline_glyphs().get(glyph_id)?;
@@ -333,8 +380,8 @@ impl PathPen {
         let mut last = ab_glyph_rasterizer::point(0.0, 0.0);
         let mut start = last;
         let close = |ras: &mut ab_glyph_rasterizer::Rasterizer,
-                         last: &mut ab_glyph_rasterizer::Point,
-                         start: ab_glyph_rasterizer::Point| {
+                     last: &mut ab_glyph_rasterizer::Point,
+                     start: ab_glyph_rasterizer::Point| {
             if *last != start {
                 ras.draw_line(*last, start);
                 *last = start;
@@ -401,6 +448,10 @@ impl OutlinePen for PathPen {
 mod tests {
     use super::*;
 
+    /// The `wght` axis tag, in the same big-endian `u32` spelling the renderer
+    /// stores coords in ([`crate::variation::WGHT_TAG`]).
+    const WGHT: u32 = u32::from_be_bytes(*b"wght");
+
     /// The embedded DejaVu Sans Mono — present under the (default)
     /// `embedded-font` feature, so these tests never depend on system font
     /// files (and vanish, rather than break, on a --no-default-features run).
@@ -413,7 +464,7 @@ mod tests {
         HintingInstance::new(
             &font.outline_glyphs(),
             Size::new(px),
-            LocationRef::default(),
+            &location_of(&font, &[]),
             HintMode::Full.options().unwrap(),
         )
         .unwrap()
@@ -430,7 +481,7 @@ mod tests {
                 continue;
             };
             let (w, h, _xmin, _ymin, adv, cov) =
-                hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
+                hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
             assert_eq!(cov.len(), w * h, "coverage is width*height for {ch:?}");
             assert!(adv > 0.0, "printable ASCII advances are positive ({ch:?})");
             assert!(w <= 32 && h <= 32, "sane 12px ink box for {ch:?}: {w}x{h}");
@@ -454,7 +505,7 @@ mod tests {
     fn full_hinting_snaps_the_l_stem_at_12px() {
         let hint = full_instance(12.0);
         let gid = unicode_gid(dejavu(), 0, 'l').unwrap();
-        let (w, h, _, _, _, cov) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
+        let (w, h, _, _, _, cov) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
         let hinted_rows = rows_with_peak(&cov, w, h, 240);
         let fd = fontdue::Font::from_bytes(dejavu(), fontdue::FontSettings::default()).unwrap();
         let (m, b) = fd.rasterize('l', 12.0);
@@ -479,7 +530,7 @@ mod tests {
         let fd = fontdue::Font::from_bytes(dejavu(), fontdue::FontSettings::default()).unwrap();
         for ch in ['M', 'i', 'W', '0'] {
             let gid = unicode_gid(dejavu(), 0, ch).unwrap();
-            let (.., adv, _) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
+            let (.., adv, _) = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
             let fd_adv = fd.metrics(ch, 12.0).advance_width;
             assert!(
                 (adv - fd_adv).abs() < 0.01,
@@ -496,7 +547,7 @@ mod tests {
         let hint = full_instance(12.0);
         let gid = unicode_gid(dejavu(), 0, ' ').unwrap();
         let (w, h, xmin, ymin, adv, cov) =
-            hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
+            hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
         assert_eq!((w, h, xmin, ymin), (0, 0, 0, 0));
         assert!(cov.is_empty());
         assert!(adv > 0.0);
@@ -508,8 +559,8 @@ mod tests {
     fn raster_is_deterministic() {
         let hint = full_instance(12.0);
         let gid = unicode_gid(dejavu(), 0, 'g').unwrap();
-        let a = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
-        let b = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint).unwrap();
+        let a = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
+        let b = hinted_glyph_raster(dejavu(), 0, gid, 12.0, &hint, &[]).unwrap();
         assert_eq!(a, b);
     }
 
@@ -519,11 +570,103 @@ mod tests {
     fn off_mode_disables_the_bank() {
         let mut bank = HintBank::default();
         let bytes = dejavu();
-        assert!(bank
-            .instance(bytes.as_ptr() as usize, bytes, 0, 12.0, HintMode::Off)
-            .is_none());
-        assert!(bank
-            .instance(bytes.as_ptr() as usize, bytes, 0, 12.0, HintMode::Full)
-            .is_some());
+        let key = bytes.as_ptr() as usize;
+        assert!(
+            bank.instance(key, bytes, 0, 12.0, HintMode::Off, &[], 0)
+                .is_none()
+        );
+        assert!(
+            bank.instance(key, bytes, 0, 12.0, HintMode::Full, &[], 0)
+                .is_some()
+        );
+    }
+
+    /// A VARIABLE system face — Windows' platform default (Cascadia Mono) or
+    /// any other `%WINDIR%\Fonts` face with a `wght` axis. Panics rather than
+    /// skipping: a test that silently returns when its fixture is missing
+    /// passes forever and proves nothing, and the embedded DejaVu (no `fvar`)
+    /// cannot stand in — every location on it normalizes to empty, which is
+    /// exactly the vacuity this guards against.
+    #[cfg(windows)]
+    fn variable_system_face() -> (String, Vec<u8>) {
+        let dir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let mut candidates = vec![format!("{dir}\\Fonts\\CascadiaMono.ttf")];
+        if let Ok(rd) = std::fs::read_dir(format!("{dir}\\Fonts")) {
+            candidates.extend(rd.flatten().filter_map(|e| {
+                let p = e.path();
+                (p.extension().is_some_and(|x| x.eq_ignore_ascii_case("ttf")))
+                    .then(|| p.to_str().map(str::to_string))
+                    .flatten()
+            }));
+        }
+        for path in candidates {
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let usable = FontRef::new(&bytes).is_ok_and(|f| {
+                f.axes()
+                    .iter()
+                    .any(|a| a.tag() == Tag::from_u32(WGHT) && a.max_value() >= 600.0)
+            });
+            if usable {
+                return (path, bytes);
+            }
+        }
+        panic!("no variable font with a `wght` axis under {dir}\\Fonts");
+    }
+
+    /// The coord seam, on a face that can actually show it: an EMPTY slice is
+    /// the `fvar` DEFAULT location (the pre-instance behaviour this module
+    /// shipped with, which Linux still relies on byte-for-byte), and a REAL
+    /// request moves off it. Without the second half the first is vacuous —
+    /// a static face normalizes everything to the default.
+    #[cfg(windows)]
+    #[test]
+    fn coords_normalize_into_the_location() {
+        let (path, bytes) = variable_system_face();
+        let font = FontRef::new(&bytes).unwrap();
+        let default = location_of(&font, &[]);
+        assert!(
+            !default.coords().is_empty(),
+            "{path}: fixture precondition — a variable face has fvar coords"
+        );
+        assert!(
+            default.coords().iter().all(|c| c.to_f32() == 0.0),
+            "{path}: empty coords must be the fvar default location, got {:?}",
+            default.coords()
+        );
+        let bold = location_of(&font, &[(WGHT, 700.0)]);
+        assert!(
+            bold.coords().iter().any(|c| c.to_f32() != 0.0),
+            "{path}: a real wght request must move off the default location \
+             (the hinter would otherwise fit the wrong cut)"
+        );
+    }
+
+    /// The bank keys on the variation SLOT, so two instantiations of the SAME
+    /// bytes at the same px are distinct instances — the invariant that lets
+    /// the regular cut and the `wght`≈700 bold cut coexist in one atlas
+    /// (Windows' Cascadia Mono ships as one variable file with no Bold
+    /// sibling, so both cuts come out of these very bytes).
+    #[test]
+    fn bank_keys_on_the_variation_slot() {
+        let mut bank = HintBank::default();
+        let bytes = dejavu();
+        let ptr = bytes.as_ptr() as usize;
+        let a = bank
+            .instance(ptr, bytes, 0, 12.0, HintMode::Full, &[], 0)
+            .unwrap();
+        let b = bank
+            .instance(ptr, bytes, 0, 12.0, HintMode::Full, &[(WGHT, 700.0)], 2)
+            .unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&a, &b),
+            "slot 0 and slot 2 must not share one hinting instance"
+        );
+        // …and the same slot memoizes, so `fpgm`/`prep` is not replayed per glyph.
+        let a2 = bank
+            .instance(ptr, bytes, 0, 12.0, HintMode::Full, &[], 0)
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&a, &a2));
     }
 }

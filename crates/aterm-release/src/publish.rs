@@ -9701,6 +9701,17 @@ impl PaintProbe for RealPaintProbe {
             .arg(bundle_binary)
             .args(["--shape", "fake-claude"])
             .args(["--keys", "r,a,i,n,b,o,w,space,o,n"])
+            // UNPINNED, UNFOCUSED — the only configuration that can catch the
+            // failure this smoke exists for. `--capture video` drives
+            // `ctl video`, and an in-flight recording PINS `App::motion_focus`
+            // for the recorded window: the gate would un-suppress the very
+            // motion demotion that blacked out the trail in v0.48, v0.49 and
+            // v0.50, and pass all three. `--capture image` leaves the gate
+            // exactly as the un-observed app has it, and `--focus out` puts the
+            // window in the state the owner's real windows are in (typed into
+            // without OS key focus — control-socket input and handoff-adopted
+            // windows never hold it).
+            .args(["--capture", "image", "--focus", "out"])
             .args(["--record", "3", "--expect", "ink", "--budget", "25"])
             .output()
             .map_err(|e| format!("could not spawn {}: {e}", script.display()))?;

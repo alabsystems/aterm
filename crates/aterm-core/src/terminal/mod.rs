@@ -25,6 +25,7 @@ mod config_api;
 mod constructors;
 mod content;
 mod csi_dispatch_table;
+pub mod custody;
 pub(crate) mod dcs_auth;
 mod grouped_state;
 mod handler;
@@ -115,6 +116,7 @@ pub use callbacks::{
 };
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
+pub use custody::CustodyTransition;
 pub use checkpoint::{GridCursorRepr, HostBindings, StyleRepr, TerminalCheckpoint};
 // The injected-clock seam, re-exported so an out-of-crate replay/lash harness
 // can feed a FIXED ClockReading and get bit-deterministic state regardless of

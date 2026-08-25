@@ -2272,6 +2272,117 @@ fn finish_text_fit(
     }
 }
 
+/// Does this [`StyleRef::Navigation`] control paint as a TOOLBAR CHIP?
+///
+/// `Navigation` covers two different shapes, and the painter already tells them
+/// apart by exactly these two fields:
+///
+/// * a RAIL ROW — a leading pictogram and/or a left-aligned label, one of a
+///   STACK that runs down a column of its own: the Settings rail, the compact
+///   Settings category list, the markdown reader's outline. It has a rail edge,
+///   because the column it is stacked in is the rail.
+/// * a TOOLBAR CHIP — a `visual_label` CENTERED in a slot the AUTHOR measured
+///   for that exact label (`markdown_toolbar_label_width` = the REGULAR advance
+///   of the word plus a fixed pad; `compact_toolbar_leading_width` the same
+///   idea), one of a group laid out along a single toolbar ROW. There is no rail
+///   under it and no edge for anything to dock to.
+///
+/// This is the scope of the INDICATOR BAR, and of that alone: a 4pt full-bleed
+/// bar seated at the row's leading edge is read as structure — this row is
+/// docked to the rail — and on a chip it is a stripe shoved against a word. It
+/// costs no width either way, so every rail row can wear it.
+///
+/// Whether a row can afford to grow INK is a separate and narrower question,
+/// and a stack is not enough to answer it: see
+/// [`navigation_is_rail_destination`].
+fn navigation_is_chip(control: &Control<ButtonSpec>) -> bool {
+    control.style == StyleRef::Navigation
+        && control.spec.visual_icon.is_none()
+        && control.spec.visual_label.is_some()
+}
+
+/// Is this [`StyleRef::Navigation`] control a rail DESTINATION — one of a fixed,
+/// authored set of places the rail can go?
+///
+/// The tell is the LEADING PICTOGRAM, and it is not decoration: a glyph exists
+/// only where an author sat down with a CLOSED vocabulary and drew one per
+/// member. That same author wrote each member's label and sized the column the
+/// set lands in, so the labels and the slot were measured against each other and
+/// the slack between them is deliberate. `route_icon` and `SettingsRoute::label`
+/// are that vocabulary — 16 members, longest `Keyboard & Input`, which clears
+/// the narrower of the two rails by 7pt in SEMIBOLD.
+///
+/// (Other `Navigation` controls carry a pictogram — the compact toolbar's
+/// leading Home/Back button, the reader's history and copy buttons — but none of
+/// them is ever `selected`, so none of them reaches the one state
+/// [`navigation_label_type`] spends this on. They are icon-ONLY besides: under
+/// the 96pt the painter needs for a label beside a glyph, they draw the glyph
+/// and nothing else.)
+///
+/// A `Navigation` row WITHOUT a pictogram is one of two other things, and
+/// neither has that slack:
+///
+/// * a TOOLBAR CHIP ([`navigation_is_chip`]) — `Length::Fixed` at
+///   `markdown_toolbar_label_width`, the REGULAR advance of its own word plus a
+///   fixed pad. There is no slack by construction; the slot IS the word.
+/// * a row carrying text the app did not AUTHOR — a markdown outline heading, a
+///   link label, an image alt. `bounded_markdown_label` caps it at 32 characters
+///   and the column is sized by the reader's measure, not by the words, so the
+///   label arrives at the brim of its slot as a matter of course:
+///   `Getting started with aterm` measures 159.7pt regular in the outline's
+///   166pt slot, and 173.1pt semibold.
+///
+/// See [`navigation_label_type`], which spends the distinction.
+fn navigation_is_rail_destination(control: &Control<ButtonSpec>) -> bool {
+    control.style == StyleRef::Navigation && control.spec.visual_icon.is_some()
+}
+
+/// THE decision about what type a button's label is painted in — read by
+/// [`paint_compiled_node`], which draws it, and by [`text_fit_audit`], which
+/// measures and elides it. One function, so the repo's own paint-truth audit
+/// cannot measure a different face from the one that reaches the glass.
+///
+/// Only ONE state moves it off the regular UI face: a SELECTED rail
+/// DESTINATION. That row's ink IS the accent, and the accent is floored at
+/// [`crate::native_appearance::ACCENT_INK_FLOOR`] (3.0) against its own wash —
+/// a legibility guarantee, not a selection signal, which left the selected row
+/// measuring as the QUIETEST row in the column. Semibold carries at any contrast
+/// ratio; it just is not free, and only a destination row has the width to pay.
+///
+/// THE WHOLE `Navigation` + `selected` SET, and what each member gets:
+///
+/// * `settings/nav{path}` — the Settings rail, wide (216pt) and medium (196pt).
+///   A route pictogram always, plus the full label. SEMIBOLD, and this is the
+///   row the mark was measured on and repaired for.
+/// * `settings/categories{path}` — the compact category list, and the
+///   side-by-side pager that shows one of it at a time. Route pictogram plus the
+///   same 16 authored labels. SEMIBOLD.
+/// * `markdown/outline-item/{i}` — the reader's outline. A bare document
+///   heading, capped at 32 characters, in a column sized for the reader. NO
+///   semibold: it fits at rest and elides in bold, so the mark meant to say
+///   "selected" would say it by deleting a word. It keeps the rail bar, the
+///   accent wash, the accent rim and the accent ink — every mark that costs it
+///   no width.
+/// * `markdown/preview-mode`, `/source-mode`, `/split-mode`, `/mode-compact`,
+///   `/selection-button` — toolbar chips in author-measured fixed slots. NO
+///   semibold (and no rail bar): a chip is the selected cell of a segmented
+///   control, and it reads as one on the wash, the rim and the ink alone.
+///
+/// The rest of `Navigation` is never `selected` and so never reaches this
+/// branch at all: the compact Settings toolbar's leading button, and the
+/// reader's link rows, image rows, history, edit, copy and paging buttons.
+fn navigation_label_type(
+    control: &Control<ButtonSpec>,
+) -> (crate::widget::TextWeight, crate::widget::TextFace) {
+    use crate::widget::{TextFace, TextWeight};
+
+    if control.state.selected && navigation_is_rail_destination(control) {
+        (TextWeight::Bold, TextFace::UiBold)
+    } else {
+        (TextWeight::Regular, TextFace::Ui)
+    }
+}
+
 fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
     match &node.content {
         UiContent::Text(spec) => {
@@ -2289,6 +2400,12 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
         }
         UiContent::Button(control) => {
             let navigation = control.style == StyleRef::Navigation;
+            // Measure the face that is PAINTED. A selected rail row wears
+            // semibold, a different font with wider advances, so an audit that
+            // measured the regular metrics would report a fit the painter never
+            // draws — the one row that grew ink is exactly the row this audit
+            // exists to catch overflowing.
+            let (_, face) = navigation_label_type(control);
             let size = native_type_px(TypeStep::Secondary).get();
             let (label, text_x, text_right) = if control.spec.visual_icon.is_some() {
                 if navigation && node.rect.width >= 96.0 {
@@ -2311,7 +2428,7 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
                     .as_ref()
                     .unwrap_or(&control.spec.label);
                 let text_x = if navigation && control.spec.visual_label.is_some() {
-                    let width = crate::tray_raster::ui_text_width(label, size);
+                    let width = crate::tray_raster::ui_text_width_for(face, label, size);
                     node.rect.x + ((node.rect.width - width) / 2.0).max(0.0)
                 } else {
                     node.rect.x + if navigation { 12.0 } else { 10.0 }
@@ -2325,13 +2442,13 @@ fn text_fit_audit(node: &PaintNode) -> Option<TextFitAudit> {
             };
             let authored_available = (text_right - text_x).max(0.0);
             let available = effective_horizontal_width(node, text_x, text_right);
-            let painted = elide_ui_label(label, authored_available, size);
+            let painted = elide_text_label(label, authored_available, size, face);
             Some(finish_text_fit(
                 node,
                 "button",
                 label,
                 painted,
-                crate::tray_raster::ui_text_width(label, size),
+                crate::tray_raster::ui_text_width_for(face, label, size),
                 authored_available,
                 available,
             ))
@@ -2977,6 +3094,51 @@ fn paint_compiled_node(
             let selected = control.state.selected;
             let navigation = control.style == StyleRef::Navigation;
             let quiet = control.style == StyleRef::Quiet;
+            // HOW THE SELECTED RAIL ROW SPELLS "SELECTED".
+            //
+            // Its ink IS the accent, and the accent is floored at
+            // [`crate::native_appearance::ACCENT_INK_FLOOR`] (3.0) against the
+            // wash it is inked on. That floor is a LEGIBILITY guarantee, not a
+            // selection signal: on the shipping forced palettes it settles the
+            // selected row at 3.03:1 (forced-light) / 3.12:1 (forced-dark) while
+            // its unselected siblings sit near 10:1 on the same rail — so the
+            // selected row measured as the QUIETEST row in the column and read
+            // as "disabled", the exact inversion of what it means.
+            //
+            // Raising that floor to 4.5 is the repair a previous pass already
+            // rejected, and rightly: the accent is one global identity colour
+            // and pushing it there pastels it everywhere it lands on dark
+            // chrome. So the answer is local and structural — selection is
+            // spelled by things that carry at ANY contrast ratio: SEMIBOLD ink,
+            // which thickens every stem the way a native sidebar's selected row
+            // does, and a real rail indicator seated against the rail edge
+            // instead of a 3pt stub floating inside it. The accent identity, the
+            // wash, and the floor are all untouched.
+            //
+            // SCOPE, and it is not one scope but three, because the marks do not
+            // all cost the same thing.
+            //
+            // The WASH, the accent INK and the RIM cost nothing but colour, so
+            // every selected `Navigation` control wears them; on a toolbar chip
+            // the three of them together are exactly a segmented control's
+            // selected cell.
+            //
+            // The BAR costs no width either, but it asserts a rail edge to dock
+            // to, so it goes to every row that is stacked in a column of its own
+            // and to no chip ([`navigation_is_chip`]) — a 4pt full-bleed stripe
+            // shoved against a word in a toolbar reads as damage.
+            //
+            // SEMIBOLD costs WIDTH, in a slot that was measured in the regular
+            // face, so it goes only where an author left slack to spend: a rail
+            // DESTINATION, whose label and whose column were sized against each
+            // other out of one closed vocabulary ([`navigation_label_type`] names
+            // the whole set). A row carrying a document heading is stacked in the
+            // same shape and has no such slack — it arrives at the brim of its
+            // slot at rest — so growing its ink would spell "selected" by
+            // deleting a word, which is not a selection mark but a loss.
+            let nav_selected = navigation && selected;
+            let nav_selected_row = nav_selected && !navigation_is_chip(control);
+            let (nav_weight, nav_face) = navigation_label_type(control);
             // The two accent-tinted states a SELECTED navigation row can be in
             // paint the accent as their own ink, so their mix amounts are the
             // ones `native_appearance` floors that accent against.
@@ -3015,8 +3177,24 @@ fn paint_compiled_node(
             }
             if primary
                 || control.state.focus_visible
+                || nav_selected
                 || matches!(control.style, StyleRef::Secondary | StyleRef::Setting)
             {
+                // The selected rail row earns a rim of its own — quieter than the
+                // focus ring (which must stay unmistakably louder than any resting
+                // state) but in the accent hue, so the row reads as an OBJECT
+                // sitting on the rail rather than as a patch of tint on it. Edge
+                // is the cheapest contrast there is: it works at the 3:1 the
+                // accent is floored to, and it costs the accent identity nothing.
+                let (rim, rim_alpha) = if control.state.focus_visible {
+                    (roles.accent, 255)
+                } else if primary {
+                    (roles.accent, 176)
+                } else if nav_selected {
+                    (roles.accent, 150)
+                } else {
+                    (roles.separator, 176)
+                };
                 prims.push(DrawPrim::Stroke {
                     x: rect.x + 0.5,
                     y: rect.y + 0.5,
@@ -3028,32 +3206,25 @@ fn paint_compiled_node(
                     } else {
                         1.0
                     },
-                    color: rgba(
-                        if primary || control.state.focus_visible {
-                            roles.accent
-                        } else {
-                            roles.separator
-                        },
-                        if control.state.focus_visible {
-                            255
-                        } else {
-                            176
-                        },
-                    ),
+                    color: rgba(rim, rim_alpha),
                 });
             }
-            if navigation && selected {
+            if nav_selected_row {
+                // The rail indicator. 4pt and nearly full-bleed: a bar this
+                // shape is read as structure (the row is docked to the rail's
+                // edge) rather than as decoration, and structure survives the
+                // accent's floor being only 3:1 against its own wash.
                 prims.push(DrawPrim::Panel {
                     x: rect.x,
-                    y: rect.y + 7.0,
-                    w: 3.0,
-                    h: (rect.height - 14.0).max(0.0),
-                    radius: 1.5,
+                    y: rect.y + 4.0,
+                    w: 4.0,
+                    h: (rect.height - 8.0).max(0.0),
+                    radius: 2.0,
                     fill: rgba(roles.accent, 255),
                     blur: false,
                 });
             }
-            let color = if navigation && selected {
+            let color = if nav_selected {
                 roles.accent
             } else {
                 control_text_color(control.state, &roles)
@@ -3072,15 +3243,23 @@ fn paint_compiled_node(
                         .visual_label
                         .as_ref()
                         .unwrap_or(&control.spec.label);
-                    let label =
-                        elide_ui_label(visual_label, (rect.width - 52.0).max(0.0), size.get());
+                    // Measured on the face it is PAINTED in: the semibold a
+                    // selected row wears is a different font with different
+                    // advances, so eliding against the regular metrics would
+                    // let the one row that grew ink overflow its own slot.
+                    let label = elide_text_label(
+                        visual_label,
+                        (rect.width - 52.0).max(0.0),
+                        size.get(),
+                        nav_face,
+                    );
                     prims.push(text_prim(
                         rect.x + 40.0,
                         row_baseline(rect.y, rect.height, size.get()),
                         label,
                         size,
-                        TextWeight::Regular,
-                        TextFace::Ui,
+                        nav_weight,
+                        nav_face,
                         rgba(color, 255),
                     ));
                 } else {
@@ -3094,7 +3273,7 @@ fn paint_compiled_node(
                     .as_ref()
                     .unwrap_or(&control.spec.label);
                 let text_x = if navigation && control.spec.visual_label.is_some() {
-                    let width = crate::tray_raster::ui_text_width(label, size.get());
+                    let width = crate::tray_raster::ui_text_width_for(nav_face, label, size.get());
                     rect.x + ((rect.width - width) / 2.0).max(0.0)
                 } else {
                     rect.x + if navigation { 12.0 } else { 10.0 }
@@ -3104,18 +3283,19 @@ fn paint_compiled_node(
                 } else {
                     10.0
                 };
-                let painted_label = elide_ui_label(
+                let painted_label = elide_text_label(
                     label,
                     (rect.right() - trailing_reserve - text_x).max(0.0),
                     size.get(),
+                    nav_face,
                 );
                 prims.push(text_prim(
                     text_x,
                     row_baseline(rect.y, rect.height, size.get()),
                     painted_label,
                     size,
-                    TextWeight::Regular,
-                    TextFace::Ui,
+                    nav_weight,
+                    nav_face,
                     rgba(color, 255),
                 ));
                 if let Some(icon) = control.spec.trailing_icon {
@@ -3387,12 +3567,15 @@ fn paint_compiled_node(
             // keeps the plain label projection below. The rainbow banner is
             // pure static decoration — its semantics live entirely on the node.
             if spec.audit_id == RAINBOW_BANNER_AUDIT {
+                let (sky, rim) = rainbow_banner_sky(&roles);
                 crate::settings::paint_rainbow_banner(
                     prims,
                     rect.x,
                     rect.y,
                     rect.width,
                     rect.height,
+                    sky,
+                    rim,
                 );
                 return;
             }
@@ -4727,6 +4910,101 @@ fn mix_rgb(a: [u8; 3], b: [u8; 3], amount: f32) -> [u8; 3] {
     crate::native_appearance::mix_srgb(a, b, amount)
 }
 
+/// The Top Settings hero banner's `(sky, rim)` — the ONE place the rainbow
+/// banner's surface is decided, resolved from the SAME role palette every other
+/// Settings card paints from ([`crate::settings::paint_rainbow_banner`] takes
+/// them the way [`crate::settings::paint_settings_aurora`] takes `surface`).
+///
+/// A SKY is the most OPEN neutral the palette has, so the base is whichever of
+/// `surface` and `elevated` MEASURES lighter. It used to be picked by proxy —
+/// `elevated` when the chrome classifies dark, `surface` otherwise — on the
+/// reasoning that both are built by walking the window background toward the
+/// ink, so the page paper is the open one on light chrome and the card is the
+/// open one on dark chrome. That reasoning is sound and the proxy still gets it
+/// wrong, because the two questions are answered by DIFFERENT predicates: the
+/// ramp's direction is fixed by which of `bg` and `fg` is lighter, while the
+/// proxy classifies one derived neutral against a fixed luma threshold, and one
+/// step of ramp is enough to cross it. A theme at `#979797` on dark ink builds
+/// `surface #8F8F8F` over `elevated #868686` while `elevated` itself classifies
+/// dark, so the proxy chose the darker of the two and the banner sank below its
+/// own cards. Measuring answers the question the doc always asked.
+///
+/// The POUR is picked by measuring too, and against the same base, which is the
+/// half the proxy kept. `surface_is_dark(base)` asks a 150-luma threshold to
+/// stand in for "will this green lift the sky or shade it" — a question about
+/// two specific colours, one of which is the green. So the code asks it of the
+/// two colours instead: pour the leaf green when it MEASURES more open than the
+/// base, and the deep one otherwise. On the light-ink half of the mid-tone band
+/// the threshold said "light" of an `#A1A1A1` base and poured the forest green
+/// into it, and because that base is `elevated` — the very tone the cards on the
+/// banner are painted in — the shade had nowhere to come from and the banner
+/// sank below its own cards across the whole upper band.
+///
+/// The tint is the palette's own green, from the same OKLCH conditioning every
+/// other role goes through, so the mint identity survives on BOTH sides instead
+/// of importing the landing page's authored `#EDF6EC` — which was byte-identical
+/// in all four appearance states and left a near-white slab in the middle of the
+/// forced-DARK page. It takes that green from
+/// [`crate::native_appearance::success_tint`] and NOT from the `success` role:
+/// the role is ink and carries ink's 4.5:1 floor, which against a mid-tone
+/// surface is unreachable upward and pushes the role to a near-black green — a
+/// wash toward THAT is not mint, it is mud. The tint is the same seed with the
+/// floor left off, which is what decoration is entitled to.
+///
+/// The two wash amounts are NOT a fudge, they follow from where the tint SITS
+/// relative to the sky, which is the same measurement that chose it. A sky
+/// already above the leaf green — near-white paper — can only take the
+/// `0.49`-lightness one, and every part of a wash toward it is a SHADE: pour
+/// much and the sky turns sage and sits heavier than the white cards it is
+/// supposed to float above, which is what a first pass at a flat 0.14 did. A sky
+/// below the leaf green takes the `0.72`-lightness one and the same wash is a
+/// TINT that lifts — it can take three times as much before it stops reading as
+/// a neutral with weather in it. A whisper where the green can only shade and a
+/// real pour where it can lift is what lands both in the same perceptual place,
+/// which is the point.
+///
+/// The rim is the card `separator` carrying the same tint at double strength, so
+/// the banner's hairline is the same material as every other card's edge with
+/// one step of green in it, not a second colour.
+///
+/// And the sky is HELD to the property its name states rather than trusted to
+/// land on it. When `elevated` is the most open neutral the base IS the cards,
+/// so the sky begins with no headroom whatsoever and even the lifting pour can
+/// come back a hair under: a chromatic mix is not monotone in luminance — near
+/// the crossover the leaf green's low red and blue cost more than its green
+/// gains. A pour is wanted for its HUE; the height it happens to spend is not
+/// part of the ask, and [`crate::native_appearance::at_least_as_open_as`] hands
+/// that back, against the cards themselves. Where the base is `surface` it is a
+/// full ramp step above the cards, the intended SHADE fits inside that step and
+/// the hold never fires — all four shipping appearance states are byte-identical
+/// with it and without it.
+fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
+    // `contrast_ratio` against black is monotone in relative luminance, so this
+    // is a luminance probe — the same one the banner's test uses to state the
+    // property "a sky is never heavier than the cards standing on it".
+    let openness = |c: [u8; 3]| crate::native_appearance::contrast_ratio(c, [0, 0, 0]);
+    let base = if openness(roles.elevated) >= openness(roles.surface) {
+        roles.elevated
+    } else {
+        roles.surface
+    };
+    // Which way does the pour go? MEASURE it, on the same probe and against the
+    // same palette the base was chosen with: the leaf green either sits above
+    // this base, in which case pouring it LIFTS the sky and it can take a real
+    // pour, or it does not, and every part of the pour is a SHADE the sky pays
+    // for in height. That comparison is the question `success_tint` is asking
+    // when it asks for a side — and unlike `surface_is_dark`, it is asked of the
+    // two colours that are actually about to be mixed, so it cannot be right
+    // about the window and wrong about the mix.
+    let lift = openness(crate::native_appearance::success_tint(true)) >= openness(base);
+    let tint = crate::native_appearance::success_tint(lift);
+    let wash = if lift { 0.14 } else { 0.045 };
+    (
+        crate::native_appearance::at_least_as_open_as(mix_rgb(base, tint, wash), roles.elevated),
+        mix_rgb(roles.separator, tint, wash * 2.0),
+    )
+}
+
 fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
     // Native apps carry more low-density prose than terminal chrome. Lift the
     // conditioned secondary role enough to stay effortless at 1× while keeping
@@ -4982,6 +5260,600 @@ fn resolve_length(length: Length, available: f32, intrinsic: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hero banner's sky survives a MID-TONE terminal theme.
+    ///
+    /// The banner tints its sky with the palette's own green, and the first pass
+    /// took that green from the `success` ROLE. `success` is INK — it labels and
+    /// it rules — so [`crate::native_appearance::roles`] holds it to 4.5:1
+    /// against `surface`, and [`crate::native_appearance::ensure_contrast`]
+    /// reaches a target by moving LIGHTNESS. Against the neutral
+    /// `#8F8F8F`..`#A3A3A3` band a real terminal theme lands on, 4.5:1 is
+    /// unreachable upward: the only route left is DOWN, and the role arrives as
+    /// a near-black green (`#000901` over `#777777`). Pouring 14 % of that into
+    /// the banner did not tint it mint, it turned it into a slab measurably
+    /// DARKER than the cards standing on it — 3.32 against the cards' 4.12 — the
+    /// same "a card that does not follow the page" defect the banner's authored
+    /// `#EDF6EC` was replaced to fix, arriving from the other side.
+    ///
+    /// The banner now takes the un-floored hue
+    /// ([`crate::native_appearance::success_tint`]) and picks BOTH its base and
+    /// its pour by MEASURING — which neutral is the more open, and which of the
+    /// two greens is more open than that — so both halves of "a sky is the most
+    /// open neutral, with green weather in it" hold on every theme rather than
+    /// only on the four the shipping palettes produce. Where the base IS the
+    /// cards there is no height to spend and the pour is held to that
+    /// ([`crate::native_appearance::at_least_as_open_as`]), so the first
+    /// assertion below is a property of the code and not of where a particular
+    /// theme's green happened to land.
+    #[test]
+    fn the_hero_banner_sky_survives_a_mid_tone_terminal_theme() {
+        use crate::native_appearance::contrast_ratio;
+        use aterm_render::Theme;
+
+        // `contrast_ratio` against black is monotone in relative luminance, so
+        // it reads as a luminance probe.
+        let openness = |c: [u8; 3]| contrast_ratio(c, [0, 0, 0]);
+        // How far a colour leans green, in the crude channel terms the wash
+        // actually moves. A tint the eye can see has to beat rounding by more
+        // than a step or two.
+        let green_lean = |c: [u8; 3]| i32::from(c[1]) * 2 - i32::from(c[0]) - i32::from(c[2]);
+        const VISIBLE_LEAN: i32 = 6;
+
+        // The band where a terminal background classifies neither light nor
+        // dark with any margin, swept in BOTH ink polarities at every step and
+        // with one chromatic member in each so the assertions cannot lean on a
+        // neutral base.
+        //
+        // Both halves are load-bearing and the light-ink half is the one a
+        // previous pass sampled too thinly: it stopped at `#808080`, and the
+        // sky sank below its cards from `#8C8C8C` up — `#9C9C9C on light ink`
+        // measured 8.21 against the cards' 8.53. The classifier that chose the
+        // pour crosses at a different place on each side, so a band sampled on
+        // one side is not a band.
+        let mut band = Vec::new();
+        let mut bg = 0x60_u32;
+        while bg <= 0xB0 {
+            let neutral = (bg << 16) | (bg << 8) | bg;
+            let name = format!("#{bg:02X}{bg:02X}{bg:02X}");
+            band.push((format!("{name} on light ink"), neutral, 0x00EE_EEEE_u32));
+            band.push((format!("{name} on dark ink"), neutral, 0x0011_1111));
+            bg += 4;
+        }
+        band.push(("#797676 on light ink".to_string(), 0x0079_7676, 0x00EE_EEEE));
+        band.push(("#999955 on dark ink".to_string(), 0x0099_9955, 0x0022_2211));
+        band.push(("#999955 on light ink".to_string(), 0x0099_9955, 0x00EE_EEEE));
+
+        for (label, bg, fg) in band {
+            let theme = Theme {
+                fg,
+                bg,
+                cursor: 0x0085_9900,
+                selection: 0x00EE_E8D5,
+            };
+            let roles = crate::settings::Roles::from_theme(theme);
+            let (sky, rim) = rainbow_banner_sky(&roles);
+
+            // A SKY, never a slab: the banner is the most open surface on the
+            // page, so it can never sit heavier than the cards on it.
+            assert!(
+                openness(sky) >= openness(roles.elevated),
+                "{label}: the banner sky {sky:?} ({:.2}) sits heavier than the cards {:?} ({:.2})",
+                openness(sky),
+                roles.elevated,
+                openness(roles.elevated),
+            );
+            // And it is MINT, not mud — the wash has to arrive as green, which
+            // a wash toward a contrast-clamped near-black green does not.
+            let base = if openness(roles.elevated) >= openness(roles.surface) {
+                roles.elevated
+            } else {
+                roles.surface
+            };
+            assert!(
+                green_lean(sky) - green_lean(base) >= VISIBLE_LEAN,
+                "{label}: the banner sky {sky:?} carries no visible green over its base {base:?}",
+            );
+            // The hairline keeps the same job it has on every other state.
+            let rim_vs_sky = contrast_ratio(rim, sky);
+            assert!(
+                rim_vs_sky > 1.08,
+                "{label}: the banner rim {rim:?} vanishes into its own sky ({rim_vs_sky:.2}:1)"
+            );
+            assert!(
+                rim_vs_sky <= contrast_ratio(roles.text_primary, sky),
+                "{label}: the banner rim outshouts the page's own ink"
+            );
+        }
+    }
+
+    /// SEMIBOLD is a rail DESTINATION's mark, and only a destination's.
+    ///
+    /// `StyleRef::Navigation` dresses three shapes, and the marks are not all
+    /// affordable on all of them. The wash, the accent ink and the rim cost
+    /// nothing but colour and go everywhere. The rail BAR costs no width either
+    /// but asserts a rail edge, so it goes to the rows that are stacked in a
+    /// column of their own and not to a toolbar chip. SEMIBOLD costs WIDTH, in a
+    /// slot that was measured in the regular face, so it goes only where an
+    /// author left slack to spend:
+    ///
+    /// * the Settings rail row — one of 16 authored labels in a rail the same
+    ///   author sized. `Keyboard & Input`, the longest, clears the narrower rail
+    ///   by 7pt in semibold. It grows ink.
+    /// * the markdown OUTLINE row — a document heading capped at 32 characters,
+    ///   in a column sized for the reader. It is rail-SHAPED and keeps the bar,
+    ///   but `Getting started with aterm` measures 159.7pt regular in its 166pt
+    ///   slot and 173.1pt semibold, so growing its ink would spell "selected" by
+    ///   deleting the last word. It does not.
+    /// * the markdown mode CHIP — `Length::Fixed` at
+    ///   `markdown_toolbar_label_width`, the regular advance of its own word plus
+    ///   a fixed pad. No slack exists by construction; it was painting `Previ…`
+    ///   in a slot that fits `Preview`. No semibold, and no bar either.
+    ///
+    /// The two that give up semibold keep every mark that costs them no width.
+    #[test]
+    fn semibold_goes_only_where_a_slot_was_sized_with_room_to_grow_ink() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::{DrawPrim, TextFace};
+        use aterm_render::Theme;
+
+        // Measure on the faces the app really installs — a semibold that is
+        // silently the regular face proves nothing about a slot measured for
+        // regular.
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+
+        let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
+        let node = |spec: ButtonSpec, selected: bool| {
+            let mut control =
+                Control::new(spec, ActionId::new("chrome/nav")).style(StyleRef::Navigation);
+            control.state.selected = selected;
+            PaintNode {
+                key: UiKey::new("chrome/nav"),
+                rect,
+                clip: rect,
+                content: UiContent::Button(control),
+            }
+        };
+        // The three shapes that actually ship, exactly as their authors build
+        // them: the Settings rail row (a route pictogram, and a label only at
+        // large Dynamic Type), the markdown outline row (a bare document
+        // heading, left aligned), and the markdown mode chip (a centred
+        // `visual_label` in a measured slot).
+        let rail_row = || ButtonSpec::new("Appearance").visual_icon(ButtonIcon::Home);
+        let outline_row = || ButtonSpec::new("A document heading");
+        let mode_chip = || ButtonSpec::new("Preview mode").visual_label("Preview");
+
+        let theme = forced_chrome_theme(Theme::default(), false);
+        let roles = crate::settings::Roles::from_theme(theme);
+        let paint = |spec: ButtonSpec, selected: bool| {
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &node(spec, selected), roles, theme, 14.0);
+            prims
+        };
+        let semibold = |prims: &[DrawPrim]| {
+            prims
+                .iter()
+                .any(|p| matches!(p, DrawPrim::Text { face, .. } if *face == TextFace::UiBold))
+        };
+        let rail_bar = |prims: &[DrawPrim]| {
+            prims.iter().any(|p| {
+                matches!(
+                    p,
+                    DrawPrim::Panel { x, w, h, fill, .. }
+                        if (*x - rect.x).abs() < 0.01
+                            && *w <= 6.0
+                            && *h >= rect.height * 0.5
+                            && fill[..3] == roles.accent
+                )
+            })
+        };
+        let accent_rim = |prims: &[DrawPrim]| {
+            prims.iter().any(|p| {
+                matches!(
+                    p,
+                    DrawPrim::Stroke { w, color, .. }
+                        if *w >= rect.width - 2.0 && color[..3] == roles.accent
+                )
+            })
+        };
+        let accent_ink = |prims: &[DrawPrim]| {
+            prims
+                .iter()
+                .any(|p| matches!(p, DrawPrim::Text { color, .. } if color[..3] == roles.accent))
+        };
+
+        // THE RAIL BAR is every stacked row's, on both rail shapes.
+        for (label, spec) in [
+            ("settings rail row", rail_row as fn() -> ButtonSpec),
+            ("markdown outline row", outline_row),
+        ] {
+            let selected = paint(spec(), true);
+            assert!(
+                rail_bar(&selected),
+                "{label}: the selected row has no rail indicator"
+            );
+            assert!(
+                accent_rim(&selected),
+                "{label}: the selected row has no accent rim"
+            );
+            assert!(
+                accent_ink(&selected),
+                "{label}: the selected row is not inked in the accent"
+            );
+            let resting = paint(spec(), false);
+            assert!(
+                !rail_bar(&resting),
+                "{label}: a resting row grew a rail indicator"
+            );
+            assert!(
+                !semibold(&resting),
+                "{label}: a resting row is already semibold"
+            );
+        }
+
+        // SEMIBOLD is only the destination's.
+        assert!(
+            semibold(&paint(rail_row(), true)),
+            "the selected rail destination is not semibold — selection reads as nothing"
+        );
+        assert!(
+            !semibold(&paint(outline_row(), true)),
+            "a selected outline row grew semibold ink in a slot its heading already fills"
+        );
+
+        let chip = paint(mode_chip(), true);
+        assert!(
+            !semibold(&chip),
+            "a selected toolbar chip grew semibold ink in a slot measured for regular"
+        );
+        assert!(
+            !rail_bar(&chip),
+            "a selected toolbar chip grew a rail indicator, and it is not on a rail"
+        );
+        // It still has to READ as selected, on marks that cost it no width.
+        assert!(
+            accent_rim(&chip),
+            "a selected toolbar chip lost its accent rim"
+        );
+        assert!(
+            accent_ink(&chip),
+            "a selected toolbar chip lost its accent ink"
+        );
+        assert!(
+            !accent_rim(&paint(mode_chip(), false)),
+            "a resting toolbar chip already wears the selected rim"
+        );
+
+        // The defect itself, at the AUTHORED slot: `markdown_toolbar_label_width`
+        // is the regular advance of the word plus a fixed pad, floored at the
+        // touch minimum. The selected chip has to paint the whole word in it.
+        let px = native_type_px(TypeStep::Secondary).get();
+        let slot = (crate::tray_raster::ui_text_width("Preview", 13.0) + 20.0)
+            .ceil()
+            .max(62.0);
+        let chip_rect = LogicalRect::new(8.0, 40.0, slot, 34.0);
+        let mut control = Control::new(mode_chip(), ActionId::new("markdown/mode/preview"))
+            .style(StyleRef::Navigation);
+        control.state.selected = true;
+        let chip_node = PaintNode {
+            key: UiKey::new("markdown/preview-mode"),
+            rect: chip_rect,
+            clip: chip_rect,
+            content: UiContent::Button(control),
+        };
+        let mut prims = Vec::new();
+        paint_compiled_node(&mut prims, &chip_node, roles, theme, 14.0);
+        let painted = prims.iter().find_map(|p| match p {
+            DrawPrim::Text { s, .. } => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            painted.as_deref(),
+            Some("Preview"),
+            "the selected mode chip elided its own word inside its authored {slot}pt slot \
+             (semibold in a space measured for regular at {px}px)"
+        );
+
+        // And the SECOND defect of the same shape, at the outline's real
+        // geometry: a 220pt column with 16pt of padding is a 188pt row, whose
+        // label slot is `width - 22`. `bounded_markdown_label` caps a heading at
+        // 32 characters, so a heading that runs to the brim of that slot is the
+        // ordinary case rather than a contrived one — and SELECTING it must not
+        // be what deletes its last word.
+        let outline_rect = LogicalRect::new(16.0, 40.0, 220.0 - 32.0, 32.0);
+        let outline_slot = outline_rect.width - 22.0;
+        let heading = "Getting started with aterm";
+        let outline_painted = |selected: bool| {
+            let mut control = Control::new(
+                ButtonSpec::new(heading),
+                ActionId::new("markdown/outline/3"),
+            )
+            .style(StyleRef::Navigation);
+            control.state.selected = selected;
+            let node = PaintNode {
+                key: UiKey::new("markdown/outline-item/3"),
+                rect: outline_rect,
+                clip: outline_rect,
+                content: UiContent::Button(control),
+            };
+            let mut prims = Vec::new();
+            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+            let painted = prims.iter().find_map(|p| match p {
+                DrawPrim::Text { s, .. } => Some(s.clone()),
+                _ => None,
+            });
+            // The repo's own overflow sensor has to agree, on the same node.
+            assert_eq!(
+                painted,
+                text_fit_audit(&node).map(|audit| audit.painted),
+                "outline row (selected={selected}): the paint-truth audit and the \
+                 painter disagree about the label that reaches the glass"
+            );
+            painted
+        };
+        // The premise: it FITS at rest, and it does not fit in semibold. Without
+        // both halves the assertion below is vacuous.
+        let regular = crate::tray_raster::ui_text_width_for(TextFace::Ui, heading, px);
+        let bold = crate::tray_raster::ui_text_width_for(TextFace::UiBold, heading, px);
+        assert!(
+            regular <= outline_slot && bold > outline_slot,
+            "the premise moved: {heading:?} measures {regular:.1}pt regular / {bold:.1}pt \
+             semibold against a {outline_slot:.1}pt slot"
+        );
+        assert_eq!(
+            outline_painted(true).as_deref(),
+            Some(heading),
+            "selecting an outline row cost it a word: {bold:.1}pt of semibold in the \
+             {outline_slot:.1}pt slot its {regular:.1}pt heading already fits"
+        );
+        assert_eq!(
+            outline_painted(true),
+            outline_painted(false),
+            "an outline row paints a different label selected than at rest"
+        );
+    }
+
+    /// The paint-truth audit measures the face the painter DRAWS.
+    ///
+    /// [`text_fit_audit`] is the repo's own overflow sensor: it re-derives the
+    /// label's slot and re-runs the elision, and its answer is what
+    /// introspection reports. A selected rail row paints in semibold — a
+    /// different font with different advances — so an audit that elided with the
+    /// REGULAR metrics would report a fit for a string the painter never draws,
+    /// and would be blindest at exactly the row that grew ink. Both now go
+    /// through [`navigation_label_type`], so this compares the two answers
+    /// directly, on labels long enough that the elision is doing work.
+    #[test]
+    fn the_paint_audit_elides_the_same_label_the_painter_paints() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::DrawPrim;
+        use aterm_render::Theme;
+
+        // On the real faces, so regular and semibold have different advances and
+        // a divergence between the two paths has somewhere to show up.
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+
+        let theme = forced_chrome_theme(Theme::default(), true);
+        let roles = crate::settings::Roles::from_theme(theme);
+        let rect = LogicalRect::new(8.0, 40.0, 132.0, 34.0);
+        let specs = [
+            ButtonSpec::new("Appearance and window theme").visual_icon(ButtonIcon::Home),
+            ButtonSpec::new("A document heading long enough to elide"),
+            ButtonSpec::new("Preview mode").visual_label("Preview"),
+            ButtonSpec::new("Software Update").trailing_icon(ButtonIcon::Forward),
+        ];
+        for spec in specs {
+            for selected in [false, true] {
+                let mut control = Control::new(spec.clone(), ActionId::new("chrome/nav"))
+                    .style(StyleRef::Navigation);
+                control.state.selected = selected;
+                let node = PaintNode {
+                    key: UiKey::new("chrome/nav"),
+                    rect,
+                    clip: rect,
+                    content: UiContent::Button(control),
+                };
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+                let painted = prims.iter().find_map(|p| match p {
+                    DrawPrim::Text { s, .. } => Some(s.clone()),
+                    _ => None,
+                });
+                let audited = text_fit_audit(&node).map(|audit| audit.painted);
+                assert_eq!(
+                    painted, audited,
+                    "{:?} (selected={selected}): the paint-truth audit and the painter \
+                     disagree about the label that reaches the glass",
+                    spec.label
+                );
+            }
+        }
+    }
+
+    /// The Top Settings hero banner follows the RESOLVED chrome palette.
+    ///
+    /// It used to fill with the landing page's authored `#EDF6EC` mint and a
+    /// `#C9DDC8` hairline — byte-identical in auto-dark, auto-light, forced-light
+    /// and forced-dark alike, which put a near-white slab in the middle of the
+    /// forced-DARK Settings page and made it the last surface where config
+    /// `window_theme` was still a no-op. This pins the property that repaired it:
+    /// the sky is a function of the palette, so the two chrome SIDES cannot paint
+    /// the same banner, and each side's sky stays on its own side.
+    #[test]
+    fn the_hero_banner_sky_follows_the_resolved_chrome_palette() {
+        use crate::native_appearance::{contrast_ratio, forced_chrome_theme, surface_is_dark};
+        use aterm_render::Theme;
+
+        let terminal_dark = Theme::default();
+        let terminal_light = Theme {
+            fg: 0x0065_7B83,
+            bg: 0x00FD_F6E3,
+            cursor: 0x0085_9900,
+            selection: 0x00EE_E8D5,
+        };
+        let sky_for = |theme: Theme| {
+            let roles = crate::settings::Roles::from_theme(theme);
+            let (sky, rim) = rainbow_banner_sky(&roles);
+            (sky, rim, roles)
+        };
+
+        let (light_sky, light_rim, light_roles) =
+            sky_for(forced_chrome_theme(terminal_dark, false));
+        let (dark_sky, dark_rim, dark_roles) = sky_for(forced_chrome_theme(terminal_light, true));
+
+        assert_ne!(
+            light_sky, dark_sky,
+            "the two forced chrome sides paint the same sky — window_theme is a no-op here again"
+        );
+        assert!(
+            !surface_is_dark(light_sky),
+            "the forced-LIGHT banner sky {light_sky:?} classifies dark"
+        );
+        assert!(
+            surface_is_dark(dark_sky),
+            "the forced-DARK banner sky {dark_sky:?} classifies light"
+        );
+
+        for (label, sky, rim, roles) in [
+            ("forced-light", light_sky, light_rim, light_roles),
+            ("forced-dark", dark_sky, dark_rim, dark_roles),
+        ] {
+            // A SKY, not another card: on BOTH sides it stays at least as open
+            // as the cards standing on the same page, never darker than them.
+            // (`contrast_ratio` against black is monotone in relative
+            // luminance, so it reads as a luminance probe here.)
+            let openness = |c: [u8; 3]| contrast_ratio(c, [0, 0, 0]);
+            assert!(
+                openness(sky) >= openness(roles.elevated),
+                "{label}: the banner sky {sky:?} sits heavier than the cards {:?}",
+                roles.elevated
+            );
+            // The hairline has to be visible on the sky it encloses, and it must
+            // not turn into a second, louder border than every other card wears.
+            let rim_vs_sky = contrast_ratio(rim, sky);
+            assert!(
+                rim_vs_sky > 1.08,
+                "{label}: the banner rim {rim:?} vanishes into its own sky ({rim_vs_sky:.2}:1)"
+            );
+            assert!(
+                rim_vs_sky <= contrast_ratio(roles.text_primary, sky),
+                "{label}: the banner rim outshouts the page's own ink"
+            );
+        }
+    }
+
+    /// The SELECTED rail row has to read as selected at the contrast the accent
+    /// is actually floored to.
+    ///
+    /// Its ink IS the accent, and the accent is held to
+    /// [`crate::native_appearance::ACCENT_INK_FLOOR`] (3.0) against its own
+    /// wash — a legibility floor, not a selection signal. On the shipping forced
+    /// palettes that settles at 3.03:1 (forced-light) / 3.12:1 (forced-dark)
+    /// while the row's unselected siblings sit near 10:1, so the selected row
+    /// measured as the QUIETEST row in the rail and read as disabled. Raising the
+    /// global floor to 4.5 was rejected — it pastels the accent everywhere it
+    /// lands on dark chrome — so the selection is carried instead by three marks
+    /// that are indifferent to the ratio: a semibold label, an accent indicator
+    /// bar docked to the rail edge, and an accent rim around the row.
+    ///
+    /// This pins all three, and pins that the UNSELECTED sibling wears none of
+    /// them, on both forced sides.
+    #[test]
+    fn the_selected_rail_row_is_spelled_by_marks_the_accent_floor_cannot_dim() {
+        use crate::native_appearance::forced_chrome_theme;
+        use crate::widget::{DrawPrim, TextFace};
+        use aterm_render::Theme;
+
+        let terminal_dark = Theme::default();
+        let terminal_light = Theme {
+            fg: 0x0065_7B83,
+            bg: 0x00FD_F6E3,
+            cursor: 0x0085_9900,
+            selection: 0x00EE_E8D5,
+        };
+        let rect = LogicalRect::new(8.0, 40.0, 180.0, 34.0);
+        let row = |selected: bool| {
+            // The rail row as its author builds it: a route pictogram and the
+            // route's own label. The pictogram is what makes it a rail
+            // DESTINATION and so what entitles it to grow ink
+            // ([`navigation_label_type`]).
+            let mut control = Control::new(
+                ButtonSpec::new("Top Settings").visual_icon(ButtonIcon::Home),
+                ActionId::new("settings/nav/top"),
+            )
+            .style(StyleRef::Navigation);
+            control.state.selected = selected;
+            PaintNode {
+                key: UiKey::new("settings/nav/top"),
+                rect,
+                clip: rect,
+                content: UiContent::Button(control),
+            }
+        };
+
+        for (label, theme) in [
+            ("forced-light", forced_chrome_theme(terminal_dark, false)),
+            ("forced-dark", forced_chrome_theme(terminal_light, true)),
+        ] {
+            let roles = crate::settings::Roles::from_theme(theme);
+            let paint = |selected: bool| {
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, &row(selected), roles, theme, 14.0);
+                prims
+            };
+            let selected = paint(true);
+            let resting = paint(false);
+
+            // 1. The indicator bar: accent, docked to the row's left edge.
+            let bar = |prims: &[DrawPrim]| {
+                prims.iter().any(|p| {
+                    matches!(
+                        p,
+                        DrawPrim::Panel { x, w, h, fill, .. }
+                            if (*x - rect.x).abs() < 0.01
+                                && *w <= 6.0
+                                && *h >= rect.height * 0.5
+                                && fill[..3] == roles.accent
+                    )
+                })
+            };
+            assert!(bar(&selected), "{label}: the selected row has no rail indicator");
+            assert!(!bar(&resting), "{label}: a resting row grew a rail indicator");
+
+            // 2. The rim: an accent stroke around the row itself.
+            let rim = |prims: &[DrawPrim]| {
+                prims.iter().any(|p| {
+                    matches!(
+                        p,
+                        DrawPrim::Stroke { w, color, .. }
+                            if *w >= rect.width - 2.0 && color[..3] == roles.accent
+                    )
+                })
+            };
+            assert!(rim(&selected), "{label}: the selected row has no accent rim");
+            assert!(!rim(&resting), "{label}: a resting rail row grew an accent rim");
+
+            // 3. The label: semibold, and painted in the accent.
+            let bold_accent = selected.iter().any(|p| {
+                matches!(
+                    p,
+                    DrawPrim::Text { face, color, .. }
+                        if *face == TextFace::UiBold && color[..3] == roles.accent
+                )
+            });
+            assert!(
+                bold_accent,
+                "{label}: the selected rail label is not semibold accent ink"
+            );
+            let resting_is_regular = resting
+                .iter()
+                .all(|p| !matches!(p, DrawPrim::Text { face, .. } if *face == TextFace::UiBold));
+            assert!(
+                resting_is_regular,
+                "{label}: a resting rail row is already semibold — selection reads as nothing"
+            );
+        }
+    }
 
     #[test]
     fn button_visual_labels_elide_utf8_to_the_authored_width_budget() {

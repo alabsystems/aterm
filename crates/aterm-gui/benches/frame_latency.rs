@@ -758,6 +758,69 @@ fn verify_echo() -> (BenchApp, Instant, u32) {
     (b, now, k)
 }
 
+/// THE TAB-STRIP FRAME fixture, PROVEN before it is timed.
+///
+/// A screenful of text (so a full re-extract has real work to skip), then the
+/// two arms are run alternately for a warm-up and CHECKED for two things a
+/// timer cannot see:
+///
+///   * REACH — `strip_frame_full` really takes the full re-extract arm and
+///     `strip_frame_scoped` really takes the scoped one. Two arms that both fall
+///     back would price identical work and report a confident zero.
+///   * PARITY — the damage-tracked raster the timed loop prices is byte-identical
+///     to a full repaint of the same scratch, on every verify frame. That is the
+///     same `damage_differential` witness `verify_echo` carries, and here it is
+///     load-bearing twice over: the scoped arm RETAINS rows, so a wrong retention
+///     would show up as a raster that no longer matches the full repaint.
+fn verify_strip() -> BenchApp {
+    let mut b = BenchApp::headless();
+    b.enable_tab_strip();
+    for i in 0..20 {
+        b.feed(0, &bland_line(i));
+    }
+    b.feed(0, b"user@host demo $ ");
+    let mut tick = 0u8;
+    // The full arm never chains, so every one of its frames must read Full.
+    let _ = b.strip_present(1, false);
+    for _ in 0..WARM_FRAMES {
+        b.strip_echo(&mut tick);
+        assert!(
+            !b.strip_present(1, false),
+            "strip_frame_full: the pre-fix reclaim took the scoped arm — the A/B \
+             would be pricing the same path twice"
+        );
+        let (cached_fnv, full_fnv) = b.parity_hashes();
+        assert_eq!(
+            cached_fnv, full_fnv,
+            "strip_frame_full: damage-tracked raster diverged from the full repaint"
+        );
+    }
+    // The scoped arm chains from its second frame on.
+    let _ = b.strip_present(1, true);
+    let mut scoped = 0usize;
+    for _ in 0..WARM_FRAMES {
+        b.strip_echo(&mut tick);
+        if b.strip_present(1, true) {
+            scoped += 1;
+        }
+        let (cached_fnv, full_fnv) = b.parity_hashes();
+        assert_eq!(
+            cached_fnv, full_fnv,
+            "strip_frame_scoped: damage-tracked raster diverged from the full repaint"
+        );
+    }
+    assert_eq!(
+        scoped, WARM_FRAMES,
+        "strip_frame_scoped reached the damage-scoped arm on only {scoped}/{WARM_FRAMES} \
+         warm frames — the arm does not price what it is named for"
+    );
+    report(
+        "strip_frame",
+        &format!("full arm Full on {WARM_FRAMES}/{WARM_FRAMES}, scoped arm Scoped on {scoped}/{WARM_FRAMES}"),
+    );
+    b
+}
+
 /// The keystroke arm: one HUMAN key through the real input seam, its echo fed
 /// by hand (the loop a real PTY closes), a `\r\n` every `ECHO_LINE` strokes so
 /// the line never hits the right margin. Returns the echoed char, `None` on
@@ -1155,6 +1218,7 @@ fn frame_latency(c: &mut Criterion) {
     let (mut sb_deep, mut sb_deep_now, sb_depth) = verify_scrolled_back();
     let (mut sb_live, mut sb_live_now) = verify_live_bottom();
     let (mut sb_wheel, mut sb_wheel_now, mut sb_wheel_dir) = verify_wheel();
+    let mut strip = verify_strip();
 
     {
         let mut group = c.benchmark_group("frame_latency");
@@ -1232,6 +1296,68 @@ fn frame_latency(c: &mut Criterion) {
                 total
             });
         });
+        // 4b. THE TAB-STRIP FRAME (D-2 SPLICE / DMG-1 reach). The only workload
+        // in this group with `tab_strip_rows != 0` — every other one runs at 0,
+        // which the header lists among the honest cuts and which is exactly why
+        // none of them can price this seam.
+        //
+        // ONE BINARY, TWO ARMS, so the A/B carries no build difference at all:
+        // `strip_frame_full` is the PRE-FIX reclaim (the prepend is never
+        // inverted, so the extractor falls back to a full re-extract on
+        // literally every frame — a78dd8a1's recorded residue),
+        // `strip_frame_scoped` inverts it. Everything else — the same keystroke
+        // arm, the same splice, the same real CPU raster through the persistent
+        // damage cache — is identical.
+        //
+        // REACH, asserted on BOTH sides rather than assumed: an arm that
+        // silently stopped taking the arm it is named for would mis-price this
+        // seam in whichever direction the noise happened to point.
+        {
+            let mut strip_tick = 0u8;
+            assert!(
+                !strip.strip_present(1, false),
+                "strip_frame_full must take the FULL arm"
+            );
+            strip.strip_echo(&mut strip_tick);
+            assert!(
+                !strip.strip_present(1, false),
+                "strip_frame_full must keep taking the FULL arm"
+            );
+            group.bench_function("strip_frame_full", |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        strip.strip_echo(&mut strip_tick);
+                        let t0 = Instant::now();
+                        black_box(strip.strip_present(1, false));
+                        total += t0.elapsed();
+                    }
+                    total
+                });
+            });
+            // Re-establish the chain for the scoped arm: the first inverted
+            // frame is still Full (the scratch it inherits was never blessed),
+            // the second must be Scoped.
+            let _ = strip.strip_present(1, true);
+            strip.strip_echo(&mut strip_tick);
+            assert!(
+                strip.strip_present(1, true),
+                "strip_frame_scoped must take the SCOPED arm — the bench would \
+                 otherwise price two identical full re-extracts against each other"
+            );
+            group.bench_function("strip_frame_scoped", |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        strip.strip_echo(&mut strip_tick);
+                        let t0 = Instant::now();
+                        black_box(strip.strip_present(1, true));
+                        total += t0.elapsed();
+                    }
+                    total
+                });
+            });
+        }
         // 5. Steady state as resident state scales.
         for (n, b_app, now) in tabs.iter_mut() {
             group.bench_function(BenchmarkId::new("many_tabs_idle", *n), |b| {

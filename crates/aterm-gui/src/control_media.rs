@@ -2160,24 +2160,70 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     }
 }
 
-/// `trail [<n>]` -> the FOCUSED window's last `n` cursor-trail ADMISSION
-/// decisions (default: the whole diagnostic ring, cap 32), one
-/// `admission seq= phase= reason= …` row each, newest last
-/// ([`crate::App::trail_admissions`]).
+/// Which reading of the cursor-trail engine `trail …` was asked for.
+///
+/// Split out of [`cmd_trail`] as a pure parse so the vocabulary is provable
+/// without an event loop: `status` must not be swallowed as a malformed count,
+/// and a count must not be swallowed as an unknown keyword.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TrailForm {
+    /// `trail [<n>]` — the per-decision admission ring.
+    Admissions(Option<usize>),
+    /// `trail status` — the standing engine-state line.
+    Status,
+}
+
+/// Parse the `trail` verb's tail. `Err` carries the whole usage line, so the
+/// caller never rebuilds it (and the two forms cannot document themselves
+/// differently).
+pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
+    match rest.trim() {
+        "" => Ok(TrailForm::Admissions(None)),
+        "status" => Ok(TrailForm::Status),
+        n => n
+            .parse::<usize>()
+            .map(|n| TrailForm::Admissions(Some(n)))
+            .map_err(|_| format!("usage: trail [status|<n>] (got {n:?})")),
+    }
+}
+
+/// `trail [status|<n>]` -> the FOCUSED window's cursor-trail diagnostics, in
+/// the two shapes a "the trail went dark" report needs.
+///
+/// * `trail [<n>]` — the last `n` ADMISSION decisions (default: the whole
+///   diagnostic ring, cap 32), one `admission seq= phase= reason= …` row each,
+///   newest last ([`crate::App::trail_admissions`]). What the last few
+///   keystrokes DECIDED.
+/// * `trail status` — ONE `trail style= … ribbon_active= …` line of standing
+///   engine state ([`crate::App::trail_status`]): the resolved style, every
+///   gate from the `cursor_trail` knob to the glass, the cumulative admission
+///   scoreboard, and the light alive right now. What is TRUE.
 ///
 /// The one-command face of the confirm-seam sensor: the rainbow-trail
-/// blackout was diagnosed with `ATERM_TRACE_SPAWN` stderr logs; this verb
-/// reads the same decisions from the engine's resident ring, so "the trail
-/// went dark" is answered by `aterm-ctl trail` instead of a rebuild-and-hunt.
-/// Read-only, main-thread hop like `tone` (the ring lives in per-window App
-/// state); works headless. `OK <n>` + n rows, the `chrome` framing.
+/// blackout was diagnosed with `ATERM_TRACE_SPAWN` stderr logs, and the
+/// standing owner report *"I don't see the rainbow cursor trails"* was
+/// investigated by recording video and scanning frames for hue diversity.
+/// Both now read the engine's own truth, so a user report is ONE COMMAND.
+/// Read-only, main-thread hop like `tone` (the state lives in per-window App
+/// state); works headless. The ring form answers `OK <n>` + n rows and the
+/// status form the single-line `OK <line>` `rain status` established.
 pub(crate) fn cmd_trail(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
-    let count = match rest.trim() {
-        "" => None,
-        n => match n.parse::<usize>() {
-            Ok(n) => Some(n),
-            Err(_) => return format!("ERR usage: trail [<n>] (got {n:?})\n"),
-        },
+    let count = match parse_trail_form(rest) {
+        Ok(TrailForm::Admissions(count)) => count,
+        Ok(TrailForm::Status) => {
+            // ONE FRAMING PER VERB: `trail` is declared `Lines` in the verb
+            // catalog, so the status form answers `OK 1` + its single row
+            // rather than the bare `OK <line>` of a natively Status-framed
+            // verb like `rain`. A sub-form that flipped framing would need a
+            // matching `framing_of` special case or the shipping client would
+            // read the row as a count — the `temporal status` footgun.
+            return match call_main(proxy, |tx| Wake::TrailStatus { reply: tx }) {
+                Ok(Ok(msg)) => format!("OK 1\n{msg}\n"),
+                Ok(Err(e)) => format!("ERR {e}\n"),
+                Err(e) => format!("ERR {e}\n"),
+            };
+        }
+        Err(usage) => return format!("ERR {usage}\n"),
     };
     let lines = match call_main(proxy, |tx| Wake::TrailAdmissions { count, reply: tx }) {
         Ok(Ok(lines)) => lines,
@@ -2481,6 +2527,43 @@ pub(crate) fn cmd_panes(proxy: &EventLoopProxy<Wake>, session: Option<u64>) -> S
         out.push('\n');
     }
     out
+}
+
+#[cfg(test)]
+mod trail_parse_tests {
+    use super::{TrailForm, parse_trail_form};
+
+    /// The two forms of one verb must not swallow each other: `status` is a
+    /// keyword, not a malformed count, and a count is a count, not an unknown
+    /// keyword. Before the status form existed, `trail status` answered
+    /// `ERR usage: trail [<n>] (got "status")` — which is exactly what a user
+    /// reaching for the obvious spelling would have typed first.
+    #[test]
+    fn the_status_keyword_and_a_ring_count_are_separate_forms() {
+        assert_eq!(parse_trail_form("status"), Ok(TrailForm::Status));
+        assert_eq!(parse_trail_form("  status  "), Ok(TrailForm::Status));
+        assert_eq!(parse_trail_form(""), Ok(TrailForm::Admissions(None)));
+        assert_eq!(parse_trail_form("   "), Ok(TrailForm::Admissions(None)));
+        assert_eq!(parse_trail_form("8"), Ok(TrailForm::Admissions(Some(8))));
+        assert_eq!(parse_trail_form("0"), Ok(TrailForm::Admissions(Some(0))));
+    }
+
+    /// An unknown tail is refused with ONE usage line naming BOTH forms — so
+    /// the error teaches the vocabulary it just rejected.
+    #[test]
+    fn an_unknown_tail_names_both_forms_in_one_usage_line() {
+        for bad in ["stats", "Status", "on", "-1", "3 4"] {
+            let err = parse_trail_form(bad).expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                err.starts_with("usage: trail [status|<n>] (got "),
+                "{bad:?} -> {err}"
+            );
+            assert!(
+                err.contains(bad.trim()),
+                "the usage line echoes the input: {err}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

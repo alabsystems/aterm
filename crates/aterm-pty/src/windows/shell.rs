@@ -66,6 +66,16 @@ pub(crate) fn aterm_exec_argv(shell: &OsStr, cmd: &OsStr) -> Vec<OsString> {
     }
 }
 
+/// Whether the resolved shell is `wsl.exe` (by file stem, case-insensitive) —
+/// the one shell whose `shell_args` are launcher options rather than shell
+/// options. See [`resolve_spawn_target`].
+pub(crate) fn is_wsl_shell(shell: &OsStr) -> bool {
+    Path::new(shell)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("wsl"))
+}
+
 /// Whether `name` is used VERBATIM (an explicit absolute/relative path) rather
 /// than PATH-searched: it contains a separator (`\` or `/`) or a drive colon.
 pub(crate) fn is_path_like(name: &str) -> bool {
@@ -282,7 +292,29 @@ pub(crate) fn resolve_spawn_target(
     }
     let shell = select_shell(shell_override.map(OsStr::new));
     if let Some(ov) = argv_override {
-        let argv = ov.iter().map(OsString::from).collect();
+        // `wsl.exe` is the one shell whose `shell_args` are OPTIONS OF THE
+        // LAUNCHER rather than of the interactive shell: `-d <distro>`,
+        // `-u <user>`, `--system` choose WHICH Linux the tab is. The historical
+        // "an argv override REPLACES argv" rule would silently drop them the
+        // moment shell integration started supplying an override, quietly
+        // moving a `shell = "wsl"` + `shell_args = ["-d", "Debian"]` user from
+        // Debian to their default distro. Splice them in ahead of the override's
+        // own arguments (wsl.exe takes options before the command), keeping
+        // argv[0] — the display token — first.
+        //
+        // Deliberately WSL-only. bash's override is `bash --rcfile <wrapper>`,
+        // and splicing a `shell_args = ["-l"]` in front of it would make bash a
+        // LOGIN shell, which reads `.bash_profile` INSTEAD of the `--rcfile` —
+        // i.e. it would disable the very integration the override installs.
+        let args = shell_args.unwrap_or(&[]);
+        if args.is_empty() || !is_wsl_shell(&shell) {
+            let argv = ov.iter().map(OsString::from).collect();
+            return (shell, argv);
+        }
+        let mut argv: Vec<OsString> = Vec::with_capacity(ov.len() + args.len());
+        argv.extend(ov.first().map(OsString::from));
+        argv.extend(args.iter().map(OsString::from));
+        argv.extend(ov.iter().skip(1).map(OsString::from));
         return (shell, argv);
     }
     // Configured `shell_args` (e.g. `["-l", "-i"]` for a login bash) — argv[0] is
@@ -492,6 +524,78 @@ mod tests {
         // `bash` discovery is environment-dependent (Git for Windows may or may
         // not be installed on CI), so we only assert the None path here; the
         // positive path is covered by the live smoke on the owner's machine.
+    }
+
+    #[test]
+    fn wsl_shell_args_survive_the_integration_argv_override() {
+        // `shell = "wsl"` + `shell_args = ["-d", "Debian"]` chooses WHICH distro
+        // the tab is. Once shell integration started supplying an argv override,
+        // the historical "override replaces argv" rule silently moved that user
+        // to their DEFAULT distro. The options must be spliced in ahead of the
+        // override's own arguments (wsl.exe takes options before the command).
+        let args = vec!["-d".to_string(), "Debian".to_string()];
+        let ov = vec![
+            "wsl".to_string(),
+            "--exec".to_string(),
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exec bash".to_string(),
+        ];
+        let (program, argv) = resolve_spawn_target(Some("wsl"), Some(&args), Some(&ov), None);
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .contains("wsl"),
+            "override 'wsl' still resolves to wsl.exe: {program:?}"
+        );
+        assert_eq!(
+            argv,
+            [
+                "wsl",
+                "-d",
+                "Debian",
+                "--exec",
+                "/bin/sh",
+                "-c",
+                "exec bash"
+            ]
+            .map(OsString::from)
+            .to_vec()
+        );
+        // No shell_args → the override is used exactly as given.
+        let (_, plain) = resolve_spawn_target(Some("wsl"), None, Some(&ov), None);
+        assert_eq!(plain, ov.iter().map(OsString::from).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn non_wsl_argv_override_still_replaces_argv_entirely() {
+        // bash's override IS the integration: splicing `-l` in front of
+        // `--rcfile` would make bash a LOGIN shell, which reads .bash_profile
+        // instead of the rcfile — i.e. it would disable the injection. Only
+        // wsl.exe gets the splice.
+        let args = vec!["-l".to_string()];
+        let ov = vec![
+            "bash".to_string(),
+            "--rcfile".to_string(),
+            "C:\\cache\\bash\\rcfile".to_string(),
+        ];
+        let (_, argv) = resolve_spawn_target(Some("cmd"), Some(&args), Some(&ov), None);
+        assert_eq!(
+            argv,
+            ["bash", "--rcfile", "C:\\cache\\bash\\rcfile"]
+                .map(OsString::from)
+                .to_vec(),
+            "a non-wsl override must be verbatim, shell_args dropped as before"
+        );
+    }
+
+    #[test]
+    fn is_wsl_shell_matches_the_stem_case_insensitively() {
+        assert!(is_wsl_shell(OsStr::new("wsl")));
+        assert!(is_wsl_shell(OsStr::new("C:\\Windows\\System32\\WSL.EXE")));
+        assert!(!is_wsl_shell(OsStr::new("C:\\x\\wslconfig.exe")));
+        assert!(!is_wsl_shell(OsStr::new("bash.exe")));
     }
 
     #[test]

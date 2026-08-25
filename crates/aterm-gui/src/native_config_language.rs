@@ -641,11 +641,11 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // pages, previously "unknown to this aterm build" in Manual.
     manual(
         "font_hinting",
-        "Linux glyph grid-fitting",
+        "Glyph grid-fitting (Linux/Windows)",
         ConfigSchemaKind::Scalar(EditKind::Enum {
             options: FONT_HINTINGS,
         }),
-        &["hint", "grid", "autohinter", "crisp", "linux", "stem"],
+        &["hint", "grid", "autohinter", "crisp", "linux", "windows", "stem"],
         true,
     ),
     manual(

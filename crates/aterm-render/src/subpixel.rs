@@ -239,6 +239,8 @@ mod tests {
                 0,
                 px,
                 Some(lcd_hint_options()),
+                &[],
+                0,
             )
             .expect("LCD instance builds for the embedded face")
     }

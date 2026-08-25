@@ -1358,6 +1358,48 @@ pub struct RenderInput {
     /// writes (`snapshot_seq == engine_fill_seq`). Metadata, EXCLUDED from
     /// `PartialEq`/`Eq`.
     pub row_rev_lane: u64,
+    /// How many HOST-owned rows have been PREPENDED to this snapshot since the
+    /// engine filled it — the in-grid tab strip's chrome rows (D-2 SPLICE).
+    ///
+    /// Engine row `r` therefore lives at index `r + row_shift`, and indices
+    /// `0..row_shift` are host-built chrome that no engine fill ever vouched
+    /// for. `0` for every un-spliced snapshot, which is every snapshot on a
+    /// platform whose `DEFAULT_TAB_STRIP_ROWS` is 0.
+    ///
+    /// PHYSICAL, not a claim of provenance: it counts rows actually prepended
+    /// whether or not the prepend was blessed (see
+    /// [`shifted_fill_seq`](Self::shifted_fill_seq)), so an un-splice always
+    /// knows exactly how many rows to remove. Two consumers require it:
+    /// `aterm_render::compute_dirty_rows` compares it across frames (a strip
+    /// whose ROW COUNT changed slides the engine rows relative to each other,
+    /// so the stamps must NOT be compared), and the frontend's un-splice reads
+    /// it to invert the prepend before the next engine refill. Metadata,
+    /// EXCLUDED from `PartialEq`/`Eq`.
+    pub row_shift: usize,
+    /// `snapshot_seq` as of the last operation that left this snapshot equal to
+    /// an ENGINE fill shifted down by [`row_shift`](Self::row_shift) host rows —
+    /// i.e. the engine fill itself, or a pure row PREPEND applied directly on
+    /// top of one.
+    ///
+    /// This is the D-2 SPLICE's provenance token, and it is deliberately a
+    /// SECOND clock rather than a relaxation of `engine_fill_seq`. The strip
+    /// splice does not write into any engine row — it prepends chrome and slides
+    /// the engine's rows down — so the engine's per-row revisions still describe
+    /// composed index `r + row_shift` exactly. Every OTHER host mutator (stream
+    /// fade, IME preedit overlay, prediction ghosts, the find bar, the config
+    /// notice, the settings panel, every in-place band) DOES overwrite engine
+    /// cells, and all of them bump `snapshot_seq` by the established discipline
+    /// WITHOUT touching this field. So `snapshot_seq != shifted_fill_seq` means
+    /// "some host wrote engine cells", and both the D-2 stamp gate and the
+    /// frontend's un-splice fail closed — the fail-closed direction is the
+    /// default, because only [`note_host_row_prepend`](Self::note_host_row_prepend)
+    /// and an engine fill ever advance this.
+    ///
+    /// `0` is the NEVER-BLESSED sentinel: `empty()`, every composed frame (see
+    /// [`invalidate_row_revisions`](Self::invalidate_row_revisions)), and any
+    /// prepend applied on top of already-mutated cells. Metadata, EXCLUDED from
+    /// `PartialEq`/`Eq`.
+    pub shifted_fill_seq: u64,
 }
 
 /// The column order a [`RenderInput`]'s rows are in, as left by the last ENGINE
@@ -1466,6 +1508,8 @@ impl Clone for RenderInput {
             engine_row_order: self.engine_row_order,
             row_rev: self.row_rev.clone(),
             row_rev_lane: self.row_rev_lane,
+            row_shift: self.row_shift,
+            shifted_fill_seq: self.shifted_fill_seq,
         }
     }
 
@@ -1542,6 +1586,8 @@ impl Clone for RenderInput {
         self.engine_row_order = source.engine_row_order;
         self.row_rev.clone_from(&source.row_rev);
         self.row_rev_lane = source.row_rev_lane;
+        self.row_shift = source.row_shift;
+        self.shifted_fill_seq = source.shifted_fill_seq;
     }
 }
 
@@ -1772,6 +1818,8 @@ impl RenderInput {
             engine_row_order: RowOrder::Logical,
             row_rev: Vec::new(),
             row_rev_lane: 0,
+            row_shift: 0,
+            shifted_fill_seq: 0,
         }
     }
 
@@ -1779,22 +1827,148 @@ impl RenderInput {
     /// the rows an engine fill stamped, so nothing may be concluded from their
     /// revisions.
     ///
-    /// The seam every HOST producer that RE-SHAPES rows must call — the split
-    /// compositor (which rebuilds the grid from several terminals' panes) and
-    /// the in-grid tab-strip splice (which shifts every row down by the strip).
-    /// Both reuse a scratch that a single-pane engine fill may have stamped, and
-    /// both leave row `r` meaning something entirely different; without this the
+    /// The seam every HOST producer that REBUILDS rows must call — the split
+    /// compositor, which composes the grid out of several terminals' panes and
+    /// leaves row `r` meaning something entirely different; without this the
     /// stale lane would answer for rows it never saw.
+    ///
+    /// A pure row PREPEND (the in-grid tab strip) is the ONE re-shaping that no
+    /// longer lands here: it does not rewrite any engine row, it slides them
+    /// down by a known count, so
+    /// [`note_host_row_prepend`](Self::note_host_row_prepend) SPLICES the lane
+    /// instead of disowning it (prepending the `0`/UNKNOWN sentinel for the
+    /// chrome rows). That path still falls back here whenever it cannot prove
+    /// the shift is the only thing that happened.
     ///
     /// Host mutators that write cells IN PLACE (stream fade, the IME preedit
     /// overlay, prediction ghosts) do not need this — they keep row identity and
-    /// already self-report through `snapshot_seq != engine_fill_seq`, which the
+    /// already self-report through `snapshot_seq != shifted_fill_seq`, which the
     /// consumer's gate requires — but calling it is always sound: the only cost
     /// of a disowned lane is the exact whole-grid compare the lane exists to
     /// avoid.
+    ///
+    /// The prepend bookkeeping is reset with the lane: a composed frame's rows
+    /// are not "an engine fill shifted down", so `row_shift` is meaningless for
+    /// it and `shifted_fill_seq` returns to its never-blessed `0`.
     pub fn invalidate_row_revisions(&mut self) {
         self.row_rev_lane = 0;
         self.row_rev.clear();
+        self.row_shift = 0;
+        self.shifted_fill_seq = 0;
+    }
+
+    /// Record that a host just PREPENDED `prepended` rows to this snapshot (the
+    /// in-grid tab strip), splicing the D-2 revision lane to match instead of
+    /// disowning it.
+    ///
+    /// Call it from the prepend itself, AFTER every per-row channel has been
+    /// shifted and after the `snapshot_seq` bump the prepend owes the renderer's
+    /// content cache. `blessed` is the caller's proof, taken BEFORE it mutated
+    /// anything, that the snapshot was still exactly an engine fill (or an
+    /// already-blessed shift of one) — see
+    /// [`host_prepend_blessing`](Self::host_prepend_blessing), which is that
+    /// predicate.
+    ///
+    /// Blessed, the lane gains `prepended` leading `0`s. `0` is the NO-STAMP
+    /// sentinel and means UNKNOWN, never "unchanged", so the chrome rows fall
+    /// back to the exact content compare — which is the right answer, because
+    /// the chrome IS host-written on every frame — while engine row `r` keeps
+    /// its revision at its new index `r + row_shift`. Unblessed, the lane is
+    /// disowned outright: some host had already overwritten engine cells, so
+    /// the stamps no longer describe the rows they are attached to.
+    ///
+    /// `row_shift` advances either way, because it is the physical row count an
+    /// un-splice must remove, not a claim about provenance.
+    pub fn note_host_row_prepend(&mut self, prepended: usize, blessed: bool) {
+        self.row_shift = self.row_shift.saturating_add(prepended);
+        if blessed {
+            self.row_rev.splice(0..0, (0..prepended).map(|_| 0u64));
+            self.shifted_fill_seq = self.snapshot_seq;
+        } else {
+            self.row_rev_lane = 0;
+            self.row_rev.clear();
+            self.shifted_fill_seq = 0;
+        }
+    }
+
+    /// Whether a host row PREPEND about to be applied to this snapshot may keep
+    /// the D-2 revision lane — i.e. whether the snapshot is, right now, exactly
+    /// what the last engine fill left (possibly already shifted by an earlier
+    /// blessed prepend) with a lane that still covers every row.
+    ///
+    /// Read BEFORE the prepend mutates anything, and handed to
+    /// [`note_host_row_prepend`](Self::note_host_row_prepend).
+    #[must_use]
+    pub fn host_prepend_blessing(&self) -> bool {
+        self.row_rev_lane != 0
+            && self.row_rev.len() == self.rows
+            && self.cells.len() == self.rows
+            && self.snapshot_seq == self.shifted_fill_seq
+            && (self.row_shift > 0 || self.snapshot_seq == self.engine_fill_seq)
+    }
+
+    /// UNDO a blessed host row prepend, restoring this snapshot to the engine
+    /// fill it was made from — the inverse the frontend runs on its persistent
+    /// scratch before handing it back to
+    /// [`Terminal::cell_frame_damage_scoped_into`](crate::terminal::Terminal::cell_frame_damage_scoped_into),
+    /// so a tab-strip window can take the damage-scoped arm at all.
+    ///
+    /// Returns `false` — changing NOTHING — unless every clause of the inverse
+    /// holds: something was prepended, the prepend was BLESSED and is still the
+    /// only thing that has happened since the engine fill
+    /// (`snapshot_seq == shifted_fill_seq`, non-zero), and the three channels a
+    /// damage-scoped refill RETAINS are all exactly `engine_rows + row_shift`
+    /// long. Any doubt costs only the full refill this is trying to avoid.
+    ///
+    /// SCOPE, stated exactly: this restores the channels a scoped refill retains
+    /// — `cells`, `clusters`, `combining` — plus the row count and the
+    /// continuity tokens. It does NOT un-shift `cursor_row`, the selections, or
+    /// the row-tagged effect streams, because the very next fill restamps every
+    /// one of them unconditionally (`cell_frame_fill` re-reads the cursor, the
+    /// selection, the clip and the pane list; the frontend re-publishes every
+    /// effect stream per frame). An un-spliced scratch is therefore an
+    /// INTERMEDIATE, never a presentable frame.
+    ///
+    /// The drained chrome-row buffers are handed to `pool` (up to `pool_cap`
+    /// entries) so the next prepend reuses their capacity; the drain removes the
+    /// whole range regardless of the cap.
+    pub fn undo_host_row_prepend(
+        &mut self,
+        engine_rows: usize,
+        pool: &mut Vec<Vec<RenderCell>>,
+        pool_cap: usize,
+    ) -> bool {
+        let strip = self.row_shift;
+        if strip == 0
+            || self.shifted_fill_seq == 0
+            || self.snapshot_seq != self.shifted_fill_seq
+            || self.rows != engine_rows.saturating_add(strip)
+            || self.cells.len() != self.rows
+            || self.clusters.len() != self.rows
+            || self.combining.len() != self.rows
+        {
+            return false;
+        }
+        for buf in self.cells.drain(0..strip) {
+            if pool.len() >= pool_cap {
+                break;
+            }
+            pool.push(buf);
+        }
+        self.clusters.drain(0..strip);
+        self.combining.drain(0..strip);
+        if self.row_rev.len() >= strip {
+            self.row_rev.drain(0..strip);
+        }
+        self.rows = engine_rows;
+        self.row_shift = 0;
+        // The snapshot's CELLS are once again byte-for-byte the engine's, so the
+        // DMG-1 token that says exactly that becomes true again. This is the one
+        // place it may be re-armed, and only after the clauses above have proven
+        // the prepend was the sole host write.
+        self.snapshot_seq = self.engine_fill_seq;
+        self.shifted_fill_seq = self.engine_fill_seq;
+        true
     }
 
     /// Whether ANY selection is live on this frame — the scalar one or any pane

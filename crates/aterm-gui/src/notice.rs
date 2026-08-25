@@ -568,6 +568,17 @@ pub(crate) fn on_fill(fill: [u8; 3]) -> [u8; 3] {
 /// The minimum luminance gap (0..255) the badge must hold against the card surface.
 const BADGE_CONTRAST: f32 = 52.0;
 
+/// The WCAG floor a non-text UI mark owes its background — the chevron on the
+/// clickable notice is the card's only affordance, so it is held to it against
+/// the card's OWN surface (`elevated`), not against the page the card floats on.
+/// `chevron_ink_clears_the_ui_floor_on_every_forced_side` pins it.
+const CHEVRON_INK_FLOOR: f64 = 3.0;
+/// The chevron's stroke width. A 1.5 px hairline spends most of its coverage on
+/// anti-aliasing, so the ratio the [`CHEVRON_INK_FLOOR`] math promises is not
+/// the ratio the eye gets; 1.75 px puts a full-strength core inside the stroke
+/// without turning the mark into a caret.
+const CHEVRON_STROKE: f32 = 1.75;
+
 /// `fill` pushed away from `surface` until the two can be told apart.
 ///
 /// `pub(crate)` — shared with the provisioning progress card, whose rainbow
@@ -666,8 +677,17 @@ fn layout(
     let pad_x = s * 0.80;
     let gap_badge = s * 0.52;
     let gap_detail = s * 0.46;
+    // The chevron's own gap has to beat the gap INSIDE the sentence, or the
+    // affordance joins the sentence. At 0.62 em it cleared the detail by
+    // 0.62 - arm/2 = 0.48 em of ink-to-ink air against the 0.46 em that
+    // separates the title from the detail — a two-hundredths-of-an-em
+    // difference, i.e. none, so "Update ready v0.48.0 ›" read as one text run
+    // with a stray glyph on the end rather than a caption and a control (the
+    // 2026-08 cold visual audit's collision). At 1.15 em the ink gap is
+    // 1.01 em: better than double the word gap, which is what makes the eye
+    // parse the chevron as a separate, pressable thing.
     let (chev_w, chev_gap) = if n.is_update_ready() {
-        (s * 0.30, s * 0.62)
+        (s * 0.30, s * 1.15)
     } else {
         (0.0, 0.0)
     };
@@ -1061,16 +1081,31 @@ pub(crate) fn notice_tray(
     }
     // The chevron: two round-capped strokes, the standard "this row goes somewhere" mark.
     // Only the clickable notice gets one, so the affordance is honest.
+    //
+    // Its ink is floored against the surface it ACTUALLY lands on. `text_tertiary`
+    // is conditioned to 3.0 against `surface` — the PAGE — and this card is not
+    // the page: it is `elevated`, a step further from the ink on both sides, so
+    // the chevron arrived at 2.76:1 on the forced-light chrome and 3.27:1 on the
+    // forced-dark one, i.e. under (or inside the anti-aliasing margin of) the 3:1
+    // floor a non-text UI mark owes — on the ONE notice that is a button. This is
+    // the same discipline `chrome_band::band_colors` states for the band's inks
+    // and `tab_bar::strip_colors` for the strip's: every ink floored against its
+    // own surface, never against a single notional background. `text_tertiary`
+    // stays the SEED, so the chevron keeps its place under the caption in the
+    // hierarchy — the floor only stops it from falling out of sight.
     if let Some(cx) = p.chevron_cx {
         let arm = p.size.get() * 0.28;
         let cy = p.badge_cy;
-        let color = rgba(r.text_tertiary, sa(0xFF));
+        let color = rgba(
+            crate::chrome_band::ensure_contrast(r.text_tertiary, r.elevated, CHEVRON_INK_FLOOR),
+            sa(0xFF),
+        );
         prims.push(DrawPrim::Line {
             x1: cx - arm * 0.5,
             y1: cy - arm,
             x2: cx + arm * 0.5,
             y2: cy,
-            width: 1.5,
+            width: CHEVRON_STROKE,
             color,
         });
         prims.push(DrawPrim::Line {
@@ -1078,7 +1113,7 @@ pub(crate) fn notice_tray(
             y1: cy,
             x2: cx - arm * 0.5,
             y2: cy + arm,
-            width: 1.5,
+            width: CHEVRON_STROKE,
             color,
         });
     }
@@ -1091,6 +1126,106 @@ pub(crate) fn notice_tray(
 
 #[cfg(test)]
 mod tests {
+
+    /// The chevron is the clickable notice's ONLY affordance, and it lands on the
+    /// card's `elevated` surface, not on the page `text_tertiary` is conditioned
+    /// against. Before it was floored here it measured 2.76:1 on the forced-light
+    /// chrome and 2.79:1 on a light terminal theme — under the 3:1 a non-text UI
+    /// mark owes its background, on the one pill a user is meant to press.
+    ///
+    /// Walks the same four appearance states the 2026-08 cold visual audit did:
+    /// both forced chrome palettes, and both sides reached automatically.
+    #[test]
+    fn chevron_ink_clears_the_ui_floor_on_every_forced_side() {
+        use super::{CHEVRON_INK_FLOOR, Roles};
+        use aterm_render::Theme;
+
+        let terminal_dark = Theme::default();
+        let terminal_light = Theme {
+            fg: 0x0065_7B83,
+            bg: 0x00FD_F6E3,
+            cursor: 0x0085_9900,
+            selection: 0x00EE_E8D5,
+        };
+        for (label, theme) in [
+            (
+                "forced-light",
+                crate::native_appearance::forced_chrome_theme(terminal_dark, false),
+            ),
+            (
+                "forced-dark",
+                crate::native_appearance::forced_chrome_theme(terminal_light, true),
+            ),
+            ("auto-dark", terminal_dark),
+            ("auto-light", terminal_light),
+        ] {
+            let r = Roles::from_theme(theme);
+            let ink = crate::chrome_band::ensure_contrast(
+                r.text_tertiary,
+                r.elevated,
+                CHEVRON_INK_FLOOR,
+            );
+            let got = crate::chrome_band::contrast(ink, r.elevated);
+            assert!(
+                got >= CHEVRON_INK_FLOOR,
+                "{label}: chevron {ink:?} on card {:?} is {got:.2}:1, under the \
+                 {CHEVRON_INK_FLOOR}:1 UI floor",
+                r.elevated,
+            );
+            // The floor lifts the seed; it must never INVERT the hierarchy by
+            // pushing the chevron past the caption it sits under.
+            let caption = crate::chrome_band::contrast(r.text_secondary, r.elevated);
+            assert!(
+                got <= caption,
+                "{label}: chevron ({got:.2}:1) outshouts the detail caption ({caption:.2}:1)"
+            );
+        }
+    }
+
+    /// The chevron must read as a CONTROL beside the caption, not as the last
+    /// glyph of it: its air has to beat the gap that separates the title from the
+    /// detail inside the same sentence. It used to clear it by 0.02 em.
+    #[test]
+    fn the_chevron_stands_off_the_subtitle_further_than_the_words_stand_off_each_other() {
+        use super::{SettingsGeom, TransientNotice, layout};
+        use std::time::Instant;
+
+        let g = SettingsGeom {
+            cw: 8.0,
+            ch: 17.0,
+            font_px: 14.0,
+            cols: 150,
+            panel_rows: 40,
+        };
+        let now = Instant::now();
+        let n = TransientNotice::update_ready("0.48.0".to_string(), 1_234_567, now);
+        let p = layout(&n, &g, now, 1.0, 0.0);
+        let s = p.size.get();
+        let (detail, detail_x) = p.detail.clone().expect("the ready pill carries a version");
+        let detail_end =
+            detail_x + crate::tray_raster::ui_text_width_for(crate::widget::TextFace::Ui, &detail, s);
+        let chevron_cx = p.chevron_cx.expect("the ready pill is the clickable one");
+        // Half the drawn chevron's horizontal reach — the arms span `arm` total.
+        let chevron_left = chevron_cx - s * 0.28 * 0.5;
+        let word_gap = detail_x
+            - (p.title_x
+                + crate::tray_raster::ui_text_width_for(
+                    crate::widget::TextFace::UiBold,
+                    &p.title,
+                    s,
+                ));
+        let chevron_gap = chevron_left - detail_end;
+        assert!(
+            chevron_gap >= word_gap * 2.0,
+            "the chevron sits {chevron_gap:.2}px off the subtitle against a {word_gap:.2}px \
+             word gap — it reads as part of the sentence"
+        );
+        // ...and it still fits inside the card it is measured into.
+        assert!(
+            chevron_cx + s * 0.28 * 0.5 <= p.x + p.w,
+            "the chevron overflows the pill"
+        );
+    }
 
     /// The gesture-failure card's text contract: one line, elided at 160
     /// chars — a raw io::Error must never stretch or wrap the card; the full

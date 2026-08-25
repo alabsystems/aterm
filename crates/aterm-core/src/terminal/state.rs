@@ -205,6 +205,35 @@ pub struct Terminal {
     /// this slot is untouched, which is correct: its main-screen occupant was never
     /// restored, so it is still parked.
     pub(super) parked_text_selection: crate::selection::TextSelection,
+    /// PRESS CUSTODY — which custody transition last fired (see
+    /// [`super::custody`]). One byte: a fieldless enum in an `Option`, written by a
+    /// single store at each site that DECIDES custody and read by the `custody`
+    /// control verb and the Tier-1 `PressCustody` conformance.
+    ///
+    /// Session-only and deliberately NOT checkpointed: it describes the last event
+    /// this session observed, not any VT protocol state, so a restored checkpoint
+    /// starts with no recorded transition rather than a stale one from another run.
+    pub(super) last_custody: Option<super::custody::CustodyTransition>,
+    /// PRESS CUSTODY — the last recorded transition that actually TOOK the reading
+    /// position or the highlight, as opposed to merely being the most recent event.
+    ///
+    /// A second byte in the same padding, latched by the subset of recordings whose
+    /// own condition proves something moved (see
+    /// [`super::custody::CustodyTransition::always_takes_custody`] and
+    /// `Terminal::note_custody_at`). Without it the single slot is a truthful but
+    /// useless answer to the question the design exists for: `OutputAtLive` writes it
+    /// on every prompt, every `cat` and every `tail -f` line, so by the time a human
+    /// types `custody` the event they are asking about is thousands of no-ops in the
+    /// past.
+    ///
+    /// Session-only and deliberately NOT checkpointed, for the same reason as
+    /// [`Self::last_custody`].
+    pub(super) last_custody_change: Option<super::custody::CustodyTransition>,
+    /// The last transition that took a live highlight the user did NOT release —
+    /// the question the `custody` verb exists to answer. Kept apart from
+    /// `last_custody_change` because that one is overwritten by a deliberate
+    /// deselect, which is never the answer anyone is looking for.
+    pub(super) last_selection_taker: Option<super::custody::CustodyTransition>,
     /// Secure keyboard entry mode.
     ///
     /// When enabled, indicates that the UI layer should enable platform-specific

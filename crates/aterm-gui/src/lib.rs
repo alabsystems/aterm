@@ -156,6 +156,11 @@ mod control_connection_conformance;
 // TRUST_NATIVE_TLA Tier-1: the `SelectionCustody` binding (real App gesture/press seams
 // + real `Terminal` damage/scroll/eviction batches). Test-only, like its siblings.
 mod selection_custody_conformance;
+// TRUST_NATIVE_TLA Tier-1: the `PressCustody` binding — who owns the reading position
+// and the highlight, driven through the real scroll/gesture/press seams and real
+// `Terminal::process` batches, with every step named by the engine's own custody
+// record (`Terminal::last_custody_transition`). Test-only, like its siblings.
+mod press_custody_conformance;
 mod crash_signal;
 mod cwd_native;
 /// The DefTerm handoff broker: an STA thread with its own Win32 message pump,
@@ -206,6 +211,8 @@ mod app_documents;
 mod app_restore;
 mod closed_recovery;
 mod diagnostics;
+// The write->first-output-back clock (responsiveness audit item 5).
+mod echo_rtt;
 #[cfg(test)]
 mod document_journal_conformance;
 mod document_store;
@@ -2531,6 +2538,16 @@ enum Wake {
         count: Option<usize>,
         reply: std::sync::mpsc::Sender<Result<Vec<String>, String>>,
     },
+    /// `trail status` (control socket): the FOCUSED window's cursor-trail
+    /// engine truth as ONE `key=value` line — resolved style, every gate from
+    /// the config knob to the glass, the cumulative admission scoreboard, and
+    /// the light alive right now ([`App::trail_status`]). The standing-state
+    /// sibling of [`Self::TrailAdmissions`]' per-decision ring, and the answer
+    /// to "I don't see the rainbow cursor trails" that used to need a video
+    /// recording. Pure read; costs nothing unasked.
+    TrailStatus {
+        reply: std::sync::mpsc::Sender<Result<String, String>>,
+    },
     /// `status` (control socket): the target session's SUBJECT + classified
     /// STATUS record ([`App::session_status_record`]). A main-thread hop rather
     /// than a control-thread read like `meta`, because the classifier's state is
@@ -4089,8 +4106,8 @@ impl Backend {
         }
     }
 
-    /// Install the Linux grid-fitting mode (config `font_hinting` /
-    /// `$ATERM_FONT_HINTING`, W13/R2) on the live renderer. A change
+    /// Install the native (Linux/Windows) grid-fitting mode (config
+    /// `font_hinting` / `$ATERM_FONT_HINTING`, W13/R2) on the live renderer. A change
     /// re-rasterizes (glyph caches / GPU atlas dropped); inert on the targets
     /// without the hint seam.
     fn set_font_hinting(&mut self, mode: &str) {
@@ -8090,8 +8107,20 @@ impl WindowState {
     /// BOTH input sources). The scheduler below and the motion-policy focus
     /// fold ([`App::cursor_fx_focus`]) consume this SAME predicate, so the
     /// policy that admits a typed trail on an unfocused window and the frame
-    /// train that animates it can never disagree — a wake that painted but
-    /// never scheduled would freeze the comet mid-decay between echoes.
+    /// train that animates it can never disagree ON THE WAKE TERM — a wake
+    /// that painted but never scheduled would freeze the comet mid-decay
+    /// between echoes.
+    ///
+    /// The two folds are NOT identical, and the difference is deliberate but
+    /// unproven: `cursor_fx_focus` is `motion_focus || wake`, and
+    /// `motion_focus` also ORs in the `ctl video` RECORDING PIN, which this
+    /// predicate does not. An unfocused, untyped window under an in-flight
+    /// recording therefore resolves Full motion at the policy seam with no
+    /// frame train behind it — safe today only because `VideoRec::next_frame`
+    /// paces that window's presents itself. Do NOT add a third focus-pinning
+    /// term to one side without the other; that drift is exactly how the trail
+    /// went dark for three releases. See item 14 of
+    /// `docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`.
     pub(crate) fn cursor_fx_typed_wake(&self, now: Instant) -> bool {
         self.last_key_at.is_some_and(|at| {
             now.saturating_duration_since(at) <= crate::app_render::CURSOR_FX_TYPED_WAKE
@@ -11161,6 +11190,10 @@ impl App {
         let Some(rec) = self.video_rec.take() else {
             return;
         };
+        // The capture episode is over (item 10). Paired with the `note_capture_
+        // episode(true)` at the recording's start; the close arms a short tail
+        // because presents the pacer already queued land after this.
+        crate::metrics::note_capture_episode(false);
         let mut take = None;
         if let (Some(gpu), Some(ws)) = (self.backend.gpu_mut(), self.windows.get_mut(&rec.window))
             && let Some(
@@ -11234,6 +11267,9 @@ impl App {
         let Some(rec) = self.video_rec.take() else {
             return false;
         };
+        // The OTHER exit from a capture episode. Both `take()` sites must close
+        // it, or a device loss mid-recording leaves the ledger tainted forever.
+        crate::metrics::note_capture_episode(false);
         if let Some(ws) = self.windows.get_mut(&rec.window)
             && matches!(ws.present, Some(PresentTarget::Virtual { .. }))
         {
@@ -15784,14 +15820,27 @@ impl ApplicationHandler<Wake> for App {
         // (a candidate serving its dwell, or Running aging into Quiet), so an
         // idle machine still parks indefinitely instead of spinning.
         if let Some(status_wake) = self.session_status.next_wake() {
+            // ITEM 8: this used to fold under `TitleSummary`. The two are
+            // different producers that happen to fold at the same seam, and
+            // sharing one label is what reported the 2026-08 spin — whose
+            // producer was THIS observer — as `deadline_owner=title_summary`,
+            // sending the investigation into the title module for an hour.
             fold_owned_deadline(
                 &mut deadline,
                 &mut deadline_owner,
                 status_wake,
-                metrics::DeadlineOwner::TitleSummary,
+                metrics::DeadlineOwner::SessionStatus,
             );
         }
-        metrics::record_deadline(deadline_owner, deadline, Instant::now());
+        // BIND THE HEAL. `record_deadline` CLAMPS a stale same-owner arm to
+        // `now + STALE_ARM_HEAL_FLOOR` and returns the healed instant — and
+        // this site used to DISCARD that return and arm the raw one, so the
+        // general backstop against the 200 kHz spin class logged "healed a
+        // stale deadline arm", incremented its counter, and healed exactly
+        // nothing. The unit tests could not see it: they assert the RETURN
+        // VALUE, which was correct all along. Only the ~36-variant fold here
+        // decides what the loop actually waits on.
+        let deadline = metrics::record_deadline(deadline_owner, deadline, Instant::now());
         match deadline {
             Some(d) => el.set_control_flow(ControlFlow::WaitUntil(d)),
             None => el.set_control_flow(ControlFlow::Wait),
@@ -16398,6 +16447,15 @@ impl ApplicationHandler<Wake> for App {
                     match began {
                         Ok(mode) => {
                             let now = Instant::now();
+                            // THE OBSERVER RULE (item 10): from here until
+                            // finalize, presents are paced by the RECORDER and
+                            // the recorded window carries capture-only pins, so
+                            // every output→present sample describes the
+                            // instrument. Mark the episode; `record_present`
+                            // routes those samples to the tainted ledger and
+                            // leaves `present_p50/p95/p99` a statement about
+                            // aterm.
+                            crate::metrics::note_capture_episode(true);
                             self.video_rec = Some(VideoRec {
                                 window: wid,
                                 deadline: now + Duration::from_millis(dur_ms),
@@ -17138,6 +17196,9 @@ impl ApplicationHandler<Wake> for App {
             Wake::TrailAdmissions { count, reply } => {
                 let _ = reply.send(self.trail_admissions(count));
             }
+            Wake::TrailStatus { reply } => {
+                let _ = reply.send(self.trail_status());
+            }
             Wake::ReadSessionStatus { session, reply } => {
                 let _ = reply.send(self.session_status_record(session));
             }
@@ -17186,6 +17247,12 @@ impl ApplicationHandler<Wake> for App {
                 let Some(wid) = self.frontmost_window else {
                     return;
                 };
+                // ECHO ROUND TRIP (audit item 5, tier i): bracket the whole batch
+                // so a DRIVEN keystroke is measured exactly like a typed one —
+                // without this arm the metric would be readable only by a human
+                // at the glass, and no proof harness (or agent driving a session
+                // through the control socket) could ever exercise it.
+                let echo = self.echo_probe_open(wid, session);
                 let mut outcome = InputOutcome::Ok;
                 for ev in batch {
                     // A controller `focus <in|out>` drives the WHOLE focus seam,
@@ -17230,6 +17297,9 @@ impl ApplicationHandler<Wake> for App {
                         crate::app_input::PressPhase::Initial,
                     );
                 }
+                // Arms the echo clock iff this batch actually put bytes on the
+                // target session's PTY (the sink's input epoch moved).
+                self.echo_probe_close(echo);
                 // Esc and close-button paths can defer a logical window close until
                 // after the input batch; finish that transaction here.
                 self.escalate_pending_close(el);
@@ -17484,7 +17554,17 @@ impl ApplicationHandler<Wake> for App {
                         ));
                     }
                 }
+                // ECHO ROUND TRIP (audit item 5, tier i): bracket the dispatch so
+                // the write->first-output-back clock arms only when this key
+                // really put bytes on the focused pane's PTY. Gating on the sink's
+                // input epoch (not on "a key happened") is what keeps a UI
+                // shortcut or a swallowed chord from harvesting an unrelated
+                // output burst as its own echo — which under a flood would make
+                // the instrument publish its best numbers at the terminal's worst
+                // moment, the failure class this audit round exists to stop.
+                let echo = self.echo_probe_open(wid, None);
                 self.on_key(wid, event);
+                self.echo_probe_close(echo);
                 // A key whose dispatch ended WITHOUT a PTY write (a UI
                 // shortcut, a swallowed chord) must not leave its arrival
                 // armed: a later control-verb `send` would inherit it via
@@ -31943,6 +32023,96 @@ mod spec_xref_gate {
              names a seam without anything checking it sits on the right one. The \
              conformance is what carries real weight: it drives shipping code and is \
              falsified by a regression in it."
+        );
+
+        // PRESS CUSTODY. The `#[refines]` anchors sit on the four RECORDERS — the
+        // functions that write `Terminal::note_custody` — rather than on the seams
+        // that mutate: `app_input::note_press_custody` (the four press classes),
+        // `app_mouse::note_selection_custody` (select/clear),
+        // `Terminal::note_scroll_custody` (the user taking the viewport, in aterm-core
+        // inside the three primitives that can raise `display_offset`, so no GUI scroll
+        // seam can bypass it — the wheel used to) and
+        // `Terminal::note_output_custody` (the four output kinds). They are separate
+        // functions from `SelectionCustody`'s seams by NECESSITY as well as by
+        // design: the `#[refines]` macro's generated const is
+        // `__aterm_spec_refines_{fn}_{action}` with no machine name in it, so the
+        // same-named `TypingPress`/`InertPress`/`UserClear` actions of the two
+        // machines cannot share `apply_press_custody` / `finish_selection`.
+        //
+        // `PressCustody` was REPORT-ONLY until the custody RECORD existed, and the
+        // reason was real rather than procedural: `RepeatPress`, `InertPress` and
+        // `ReleaseEvent` are identical in every observable variable, and
+        // `OutputAtLive` is an identity transition on all three of them, so five of
+        // the eleven actions had no seam at which their state change could be told
+        // from another's. Recording WHICH transition fired is what changed that, and
+        // it earns its place outside the gate too — it is the `custody` control verb's
+        // answer to "why did my selection vanish".
+        {
+            let press = report
+                .coverage
+                .iter()
+                .find(|c| aterm_spec::xref::machine_matches("PressCustody", &c.machine))
+                .expect("PressCustody must be in the coverage ledger");
+            assert!(
+                press.active,
+                "PressCustody must be ACTIVELY-BOUND (>= 1 refinement on the real custody \
+                 recorders), not report-only"
+            );
+            assert_eq!(
+                press.total_actions, 11,
+                "PressCustody action inventory drifted; update the anchors AND the Tier-1 \
+                 conformance, found {}",
+                press.total_actions
+            );
+            assert_eq!(
+                press.ratio(),
+                1.0,
+                "PressCustody must be fully bound-or-waived; uncovered = {:?}",
+                press.uncovered
+            );
+            for action in [
+                "UserScroll",
+                "UserSelect",
+                "UserClear",
+                "TypingPress",
+                "RepeatPress",
+                "InertPress",
+                "ReleaseEvent",
+                "OutputAtLive",
+                "OutputWhileReading",
+                "OutputDamagesTheSelectedRows",
+                "OutputInvalidatesTheCoordinateSpace",
+            ] {
+                assert!(
+                    press.bound.contains(action),
+                    "PressCustody action `{action}` must carry a #[refines] anchor on the \
+                     REAL recorder (it is bound, not waived: the custody record gives every \
+                     one of the eleven an observable site)"
+                );
+            }
+            assert!(
+                press.waived.is_empty(),
+                "PressCustody carries no waivers — `OutputAtLive` is anchored and DRIVEN \
+                 rather than waived, because the record makes its transition nameable at \
+                 all: a batch that destroyed the highlight it was not entitled to \
+                 destroy comes back under a DIFFERENT variant, so the step fails on the \
+                 recorded name; found {:?}",
+                press.waived
+            );
+        }
+        super::press_custody_conformance::run_conformance();
+        eprintln!(
+            "spec_xref_closure: PressCustody is actively-bound (11/11 actions, zero \
+             waivers) AND its Tier-1 conformance (real scroll/wheel/gesture/press seams — \
+             all four press classes delivered as real key events — plus real \
+             `Terminal::process` batches, every step named by the ENGINE's own custody \
+             record rather than by the harness) was RUN by the gate. As with \
+             SelectionCustody the COVERAGE half is a claim about anchor STRINGS; the \
+             conformance is the half that drives shipping code and goes red on a \
+             regression in it. Its per-step verdict is a REFINEMENT check (the action's \
+             guard and its exact update image) PLUS an evaluation of every model \
+             invariant over the observed pre- and post-states; whole-reachable-space \
+             invariant checking is Tier-0's, in `aterm-spec/tests/derived_ring_ty.rs`."
         );
 
         // ---- Proof #3b (Phase 4): the UNIFIED VERIFIER LEDGER over ty + kani. ----

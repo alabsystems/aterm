@@ -14,12 +14,58 @@ use aterm_types::mouse::WheelDir;
 use winit::event::{ElementState, MouseButton as WinitMouseButton, MouseScrollDelta};
 use winit::window::CursorIcon;
 
+use aterm_core::terminal::{CustodyTransition, Terminal};
+
 use crate::app_render::{pixel_to_term_cell, strip_col_for_pixel};
 use crate::input::{InputEvent, Source};
 use crate::{
     App, GestureOrigin, MULTI_CLICK_MS, WindowId, control, is_safe_url, pane, plain_url_at,
     term_lock,
 };
+
+/// PRESS CUSTODY — the mouse half of the custody RECORD: a user gesture that left a
+/// selection behind, or one that deliberately took it away.
+///
+/// Anchored here rather than on [`App::finish_selection`] because this is the
+/// function that RECORDS the variant, and because `finish_selection` already carries
+/// `SelectionCustody`'s same-named `UserClear` anchor (the macro's generated const is
+/// `__aterm_spec_refines_{fn}_{action}` with no machine name in it, so two machines'
+/// same-named actions cannot share one function).
+///
+/// `kept` is the discriminator and it is WINDOW-side: `ws.sel_dragged` says whether
+/// the pointer ever left the press cell, and nothing inside `TextSelection` carries
+/// that fact. A recorder placed in the selection primitive could see the state change
+/// but not the intent behind it — and "a press and release inside one cell" is
+/// exactly the intent that makes a `clear()` legitimate rather than a bug.
+///
+/// Neither variant touches the viewport, which is the model's own claim about them:
+/// `UserSelect` and `UserClear` assign `selection` and leave `offset` and `owner`
+/// alone. Tier-1 drives the real
+/// `begin_selection` → `drag_selection` → `finish_selection` gesture in
+/// [`crate::press_custody_conformance`].
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "UserSelect",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "PressCustody",
+        action = "UserClear",
+        project = "aterm_gui::press_custody_conformance::project_press_custody"
+    )
+)]
+pub(crate) fn note_selection_custody(t: &mut Terminal, kept: bool) {
+    t.note_custody(if kept {
+        CustodyTransition::UserSelect
+    } else {
+        CustodyTransition::UserClear
+    });
+}
 
 /// Map a winit mouse button to the engine's [`aterm_types::mouse::MouseButton`]
 /// for an [`InputEvent::MouseButton`].
@@ -2270,6 +2316,14 @@ impl App {
         };
         let sel_row = {
             let mut term = term_lock(&term);
+            // SELECTION CUSTODY — a drag is a `UserSelect` PRODUCER, not merely an
+            // extender. Every gesture arm below re-issues `start_selection` on each
+            // pointer move with NO state test, and `start_selection` sets `InProgress`
+            // unconditionally — so a drag turns `has_selection()` back on from off
+            // whenever something cleared it mid-gesture. `Some(g)` guards a live
+            // GESTURE, never a live SELECTION. This module argued the seam away twice
+            // before recording it; the argument was false both times.
+            let selection_before = term.text_selection().has_selection();
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
             // SELECTION CUSTODY Phase 2: re-derive the gesture ORIGIN from the LIVE
             // selection each move, instead of trusting `GestureOrigin.row`.
@@ -2348,6 +2402,13 @@ impl App {
                     }
                 }
             }
+            // Record only the 0 -> 1 EDGE. A drag that merely widens a selection
+            // already alive changes no projected variable, so filing `UserSelect` on
+            // every pointer move would bury the answer the `custody` verb exists to
+            // give under motion noise.
+            if !selection_before && term.text_selection().has_selection() {
+                note_selection_custody(&mut term, true);
+            }
             sel_row
         };
         if (sel_row, col) != fws.sel_press_cell {
@@ -2412,6 +2473,11 @@ impl App {
         let moved = {
             let mut term = term_lock(&term);
             let before = term.grid().display_offset();
+            // PRESS CUSTODY: the one gesture that both raises the offset AND grows
+            // the selection. `Terminal::scroll_display` records the `UserScroll`
+            // itself, and only on a RISE, so the downward half of an autoscroll
+            // (dragging back toward live) records nothing rather than claiming a
+            // transition the model does not admit.
             term.scroll_display(lines);
             term.grid().display_offset() != before
         };
@@ -2547,7 +2613,14 @@ impl App {
         };
         let (start_col, end_col) = {
             let mut term = term_lock(&term);
-            control::select_word(&mut term, sel_row, col)
+            let cols = control::select_word(&mut term, sel_row, col);
+            // PRESS CUSTODY: the double-click PRESS is where the highlight comes into
+            // existence. `arm_gesture_drag` below pre-sets `sel_dragged`, so the
+            // RELEASE eventually records a `UserSelect` — but that is the end of the
+            // gesture, and until it arrives the record named an event that did not
+            // make this selection.
+            note_selection_custody(&mut term, true);
+            cols
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.gesture = Some(GestureOrigin {
@@ -2572,6 +2645,9 @@ impl App {
         let end_col = {
             let mut term = term_lock(&term);
             control::select_line(&mut term, sel_row);
+            // PRESS CUSTODY: as for the double-click above — the press that made the
+            // highlight records it, not only the release that ends the gesture.
+            note_selection_custody(&mut term, true);
             term.cols().saturating_sub(1)
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -2604,6 +2680,14 @@ impl App {
     /// (`Simple`, or `Block` for alt-drag) at the cell under the pointer,
     /// mapped to live-screen selection coords (viewport row minus
     /// `display_offset`, so a scrolled-back press lands in scrollback).
+    ///
+    /// PRESS CUSTODY: this is where a selection comes into EXISTENCE under the
+    /// `has_selection()` projection the conformance uses — `start_selection` leaves
+    /// `SelectionState::InProgress`, which is already "a selection exists" — so the
+    /// record is stamped here as well as on the release. `finish_selection`'s
+    /// complete arm then re-stamps the same `UserSelect`, which is idempotent in the
+    /// model (`selection = 1` from `selection == 1`) and is the honest report: the
+    /// release really is another user gesture that leaves a selection behind.
     pub(crate) fn begin_selection(&mut self, wid: WindowId, kind: SelectionType) {
         let Some(term) = self
             .front_terminal(wid)
@@ -2620,6 +2704,9 @@ impl App {
             let sel_row = i32::from(row) - term.grid().display_offset() as i32;
             term.text_selection_mut()
                 .start_selection(sel_row, col, SelectionSide::Left, kind);
+            // Inside the SAME guard as the mutation, so no PTY-reader output can
+            // land between the selection appearing and the record naming it.
+            note_selection_custody(&mut term, true);
             sel_row
         };
         ws.selecting = true;
@@ -2725,6 +2812,11 @@ impl App {
             } else {
                 sel.clear();
             }
+            // PRESS CUSTODY: `ws.sel_dragged` is the ONLY thing that separates
+            // `UserSelect` from `UserClear` — nothing inside `TextSelection` carries
+            // it, which is why the record is stamped at this seam and not down in
+            // the selection primitive. Same guard as the mutation.
+            note_selection_custody(&mut term, completed);
         }
         ws.selecting = false;
         ws.gesture = None;
@@ -3922,6 +4014,12 @@ impl App {
             sel.update_selection(last - off, max_col, SelectionSide::Right);
             sel.expand_lines(max_col);
             sel.complete_selection();
+            // PRESS CUSTODY: ⌘-A reaches the `TextSelection` primitive directly —
+            // there is no mouse-down before it and no `finish_selection` after it —
+            // so without this the projected `selection` went 0 -> 1 with nothing
+            // recorded, and the verb named whatever came before. Same guard as the
+            // mutation.
+            note_selection_custody(&mut term, true);
         }
         if let Some(w) = &ws.os_window {
             w.request_redraw();
