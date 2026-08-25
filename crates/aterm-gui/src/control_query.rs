@@ -2164,7 +2164,13 @@ fn store_search_snapshot(snapshot: SearchSnapshot) {
 ///
 /// `OK last=<transition|none> event=<0-7|-> changed=<transition|none>
 /// took_selection=<transition|none> offset=<n>
-/// owner=<user|tail> selection=<yes|no> max_offset=<n>`.
+/// owner=<user|tail> selection=<yes|no> scrollback=<n>`.
+///
+/// `scrollback` is the grid's retained history depth. It was called `max_offset`,
+/// which read as the `PressCustody` model's constant `MaxOffset` — a bound of 2 in
+/// the abstract state space, not a line count — in a line whose other fields the doc
+/// invites clients to read against the spec's vocabulary. A driving client comparing
+/// the two would have been comparing a live terminal against a model constant.
 ///
 /// The verb exists because offset and selection are observable after the fact and the
 /// DECISION that moved them is not. Ten different events can take the reading position
@@ -2235,7 +2241,7 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
         .map_or_else(|| "none".to_string(), |c| c.action().to_string());
     format!(
         "OK last={last} event={event} changed={changed} took_selection={took} \
-         offset={offset} owner={} selection={} max_offset={}\n",
+         offset={offset} owner={} selection={} scrollback={}\n",
         if offset > 0 { "user" } else { "tail" },
         if t.text_selection().has_selection() {
             "yes"
@@ -3159,13 +3165,13 @@ mod tests {
             seen,
             vec![
                 "OK last=InertPress event=3 changed=UserScroll took_selection=none offset=1 owner=user \
-                 selection=yes max_offset=5\n"
+                 selection=yes scrollback=5\n"
                     .to_string(),
                 "OK last=RepeatPress event=2 changed=UserScroll took_selection=none offset=1 owner=user \
-                 selection=yes max_offset=5\n"
+                 selection=yes scrollback=5\n"
                     .to_string(),
                 "OK last=ReleaseEvent event=4 changed=UserScroll took_selection=none offset=1 owner=user \
-                 selection=yes max_offset=5\n"
+                 selection=yes scrollback=5\n"
                     .to_string(),
             ],
             "three events that moved NOTHING must still be told apart by name — and \
@@ -3179,7 +3185,7 @@ mod tests {
         assert_eq!(
             cmd_custody(&term),
             "OK last=TypingPress event=1 changed=TypingPress took_selection=TypingPress offset=0 owner=tail \
-             selection=no max_offset=5\n",
+             selection=no scrollback=5\n",
             "typing is the one handover, and the verb shows both the name and the effect"
         );
 
@@ -3193,7 +3199,7 @@ mod tests {
         assert_eq!(
             cmd_custody(&term),
             "OK last=OutputAtLive event=5 changed=TypingPress took_selection=TypingPress offset=0 owner=tail \
-             selection=no max_offset=6\n",
+             selection=no scrollback=6\n",
             "ordinary output is the last EVENT but must not become the last CHANGE"
         );
 
@@ -3205,7 +3211,7 @@ mod tests {
             cmd_custody(&term),
             "OK last=OutputInvalidatesTheCoordinateSpace event=7 changed=TypingPress \
              took_selection=OutputInvalidatesTheCoordinateSpace \
-             offset=0 owner=tail selection=no max_offset=0\n",
+             offset=0 owner=tail selection=no scrollback=0\n",
             "ED 3 destroyed the coordinate space; the verb names that, not a press"
         );
     }
@@ -3314,7 +3320,7 @@ mod tests {
             "OK last=OutputTookTheSelectionUnattributed event=- \
              changed=OutputTookTheSelectionUnattributed \
              took_selection=OutputTookTheSelectionUnattributed offset=0 owner=tail \
-             selection=no max_offset=2\n",
+             selection=no scrollback=2\n",
             "output took it for a reason the model cannot name — which is a real \
              answer that rules out the keyboard, and `last=none` was not"
         );

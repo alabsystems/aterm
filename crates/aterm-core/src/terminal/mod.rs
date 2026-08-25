@@ -116,8 +116,8 @@ pub use callbacks::{
 };
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
-pub use custody::CustodyTransition;
 pub use checkpoint::{GridCursorRepr, HostBindings, StyleRepr, TerminalCheckpoint};
+pub use custody::CustodyTransition;
 // The injected-clock seam, re-exported so an out-of-crate replay/lash harness
 // can feed a FIXED ClockReading and get bit-deterministic state regardless of
 // real wall-clock pacing (the determinism a faithful replay relies on).

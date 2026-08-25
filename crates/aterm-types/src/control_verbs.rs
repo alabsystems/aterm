@@ -591,7 +591,7 @@ pub const VERBS: &[VerbSpec] = &[
         Session,
         "custody: why the reading position or the highlight last moved — one \
          `last=<transition|none> event=<0-7|-> changed=<transition|none> offset= \
-         owner=user|tail selection=yes|no max_offset=` line naming the PressCustody \
+         owner=user|tail selection=yes|no scrollback=` line naming the PressCustody \
          transition the engine recorded: a press (TypingPress, RepeatPress, \
          InertPress, ReleaseEvent), a gesture (UserScroll, UserSelect, UserClear), or \
          output (OutputAtLive, OutputWhileReading, OutputDamagesTheSelectedRows, \

@@ -2348,8 +2348,15 @@ impl App {
         // event any more than they can disagree about what to DO with it.
         //
         // The lock is now unconditional, where it used to be taken only for a
-        // disturbing press. That is one uncontended acquisition per delivery on a
-        // path whose traffic is auto-repeat ticks at the ~30 Hz repeat rate — the
+        // disturbing press. MEASURED rather than asserted, because "uncontended" is
+        // not something this path can promise — the PTY reader holds the same mutex
+        // for a whole `process` batch: 200 inert deliveries take ~180us, and a thread
+        // taking the lock in bursts beside them does not measurably change that
+        // (`an_inert_press_to_a_hidden_session_does_not_outlast_the_lock_holder`).
+        // The reason it stays cheap is that the critical section is EMPTY for an
+        // inert press — `disturbs` short-circuits before every read — so contention
+        // costs a handoff, not a batch. One acquisition per delivery on a path whose
+        // traffic is auto-repeat ticks at the ~30 Hz repeat rate — the
         // same unconditional acquisition the visible seam already pays for every
         // press, because it needs the predictor's cursor sample regardless. What it
         // buys is that a background session's custody record is as real as a front
@@ -13208,6 +13215,93 @@ mod press_path_lock_elision_tests {
     /// held over a window whose tab had since changed reset a BACKGROUND session's
     /// reading position ~30 times a second. Nothing in the gui suite constructed that
     /// state, so deleting `press_disturbs` from this path was invisible.
+    /// MEASURED, because the hidden-session lock was made UNCONDITIONAL and I had
+    /// only reasoned about its cost.
+    ///
+    /// The claim under test is not the uncontended acquisition — that is tens of
+    /// nanoseconds against a ~30 Hz repeat rate and could never matter. It is that
+    /// this path runs on the UI thread, so if the PTY reader holds the terminal lock
+    /// through a long output batch, an INERT press aimed at a BACKGROUND session now
+    /// blocks the thread that also serves the FRONT one. Before the change, an inert
+    /// press took no lock at all.
+    ///
+    /// This pins the shape of the answer rather than a wall-clock number, which would
+    /// be flaky: a delivery must not be serialised behind a lock holder for longer
+    /// than the holder actually holds it. If someone later widens the critical section
+    /// inside `apply_press_custody`, this is what notices.
+    #[test]
+    fn an_inert_press_to_a_hidden_session_does_not_outlast_the_lock_holder() {
+        use crate::stub_session;
+        use aterm_types::keyboard::{Key as EngineKey, KeyEventType, Modifiers};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc as StdArc;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let hidden_session = 0u64;
+        let term = scrolled_back_with_a_selection(&mut app, wid);
+        let sid = app.next_session_id;
+        app.push_stub_tab(wid, stub_session(sid));
+
+        let bare_shift = InputEvent::Key {
+            key: EngineKey::Named(aterm_types::keyboard::NamedKey::ShiftLeft),
+            mods: Modifiers::SHIFT,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+
+        // Baseline: uncontended.
+        let t0 = std::time::Instant::now();
+        for _ in 0..200 {
+            app.input_to_hidden_session(
+                hidden_session,
+                bare_shift.clone(),
+                crate::app_input::PressPhase::Initial,
+            );
+        }
+        let uncontended = t0.elapsed();
+
+        // Now with a competing holder that takes the lock in short bursts, the way a
+        // PTY reader does between batches.
+        let stop = StdArc::new(AtomicBool::new(false));
+        let holder_term = term.clone();
+        let holder_stop = StdArc::clone(&stop);
+        let holder = std::thread::spawn(move || {
+            while !holder_stop.load(Ordering::Relaxed) {
+                {
+                    let _guard = term_lock(&holder_term);
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let t1 = std::time::Instant::now();
+        for _ in 0..200 {
+            app.input_to_hidden_session(
+                hidden_session,
+                bare_shift.clone(),
+                crate::app_input::PressPhase::Initial,
+            );
+        }
+        let contended = t1.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        holder.join().expect("holder thread");
+
+        eprintln!(
+            "hidden-session inert press x200: uncontended={uncontended:?} contended={contended:?}"
+        );
+        // A generous bound: the point is that the critical section is EMPTY for an
+        // inert press (`disturbs` short-circuits before every read), so contention
+        // costs a handoff, not a batch. 200 deliveries against a burst-holder must
+        // stay well under a second; a regression that did real work under the lock,
+        // or held it across the PTY write, would blow through this.
+        assert!(
+            contended < std::time::Duration::from_secs(1),
+            "200 inert hidden-session deliveries took {contended:?} under contention — \
+             the critical section is supposed to be empty for an inert press"
+        );
+    }
+
     #[test]
     fn a_repeat_into_a_hidden_session_leaves_its_viewport_and_selection_alone() {
         use crate::stub_session;

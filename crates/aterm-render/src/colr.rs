@@ -903,7 +903,12 @@ mod tests {
         f: 0.0,
     };
 
-    fn ramp(extend: GradientExtend, stops: &[(f32, (u8, u8, u8, u8))]) -> ColorRamp {
+    /// A gradient stop as the fixtures below write it: an offset plus a raw RGBA
+    /// quadruple, before `RgbaColor::new` gives it a type. Named because the tuple
+    /// nests two deep and `-D warnings` counts that as a complex type.
+    type RawStop = (f32, (u8, u8, u8, u8));
+
+    fn ramp(extend: GradientExtend, stops: &[RawStop]) -> ColorRamp {
         ColorRamp {
             extend,
             stops: stops

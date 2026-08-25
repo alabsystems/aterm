@@ -46,7 +46,7 @@
 //! Invariants over all reachable states are TIER-0's job (`derived_ring_ty.rs`). But
 //! Tier-0 quantifies over the MODEL's reachable states and this module supplies
 //! OBSERVED ones, so [`validate_transition`] additionally evaluates every invariant
-//! over `prev` and `next` here — eleven expression evaluations per step, and the only
+//! over `prev` and `next` here — eighteen expression evaluations per step (nine invariants over two states), and the only
 //! thing that can reject a projection which drifted out of `0..=MaxOffset`. Negative
 //! control (l) is a step the refinement check admits and only an invariant rejects.
 //!
@@ -135,10 +135,15 @@
 //!   (`Model::successors` panics on an unknown action name, so an attempt would be
 //!   loud rather than quiet). It is a real answer for the `custody` verb and a
 //!   deliberate non-step for the trace.
-//! * A DAMAGING batch whose SCR-1 re-pin saturated at the history floor — the user
-//!   parked at the top of a full scrollback, the arriving line evicting the oldest —
-//!   is unmodelled: its offset does not rise, and `OutputDamagesTheSelectedRows`
-//!   mandates the rise at `owner == 1`. It is recorded anyway, because
+//! * A DAMAGING batch that ADVANCED NO ROWS while the user is reading is unmodelled:
+//!   `OutputDamagesTheSelectedRows` mandates `offset' = offset + 1` at `owner == 1`,
+//!   and an offset that did not move cannot satisfy it. An earlier draft of this
+//!   bullet named only ONE way to reach that state — an SCR-1 re-pin saturated at the
+//!   history floor, the user parked at the top of a full scrollback — but the
+//!   condition is simply `lines_added == 0`, which ALSO covers the commonest shape by
+//!   far: an in-place rewrite. `\r` plus EL over the selected row, a DECERA, a status
+//!   line repainting itself — none of them scroll, all of them damage. The narrower
+//!   sentence made a routine case sound exotic. It is recorded anyway, because
 //!   `OutputDamagesTheSelectedRows` is a TRUE statement about what happened and only
 //!   the offset arithmetic is out of range; the undamaged twin of the same shape
 //!   records NOTHING, because its only alternative name (`OutputAtLive`) would be a
@@ -269,7 +274,7 @@ fn as_state(s: [i64; 7]) -> BTreeMap<&'static str, i64> {
 /// `display_offset == 7` is the exact update image of `InertPress` at that state and
 /// used to validate cleanly even though `StateBounds` says `offset <= MaxOffset` (= 2).
 /// So the invariants are evaluated HERE as well, over `prev` AND `next`, at the cost of
-/// eleven expression evaluations per step. Negative control (l) is a step no refinement
+/// eighteen expression evaluations per step (nine invariants over two states). Negative control (l) is a step no refinement
 /// check can reject and only an invariant can, so this tier is not decorative either.
 fn validate_transition(action: &str, prev: [i64; 7], next: [i64; 7]) -> (bool, String) {
     let model = press_custody_model();
@@ -696,10 +701,14 @@ fn gui_gesture_chain(validated: &mut usize) {
 /// clears and re-anchors the highlight with no gesture around it at all. All three
 /// moved the projected `selection` 0 -> 1 with nothing recorded.
 ///
-/// Two of the three are driven here as real validated steps. The search jump records
-/// at its own seam (`app_search`'s navigation apply, and its refusal path records the
-/// matching `UserClear`) but needs a populated find-bar match vector to reach, so it
-/// is covered by its seam's assertion rather than by a step — stated, not implied.
+/// Two of the three are driven here as real validated steps. The search jump needs a
+/// populated find-bar match vector and its freshness stamps, which this module cannot
+/// assemble, so it is driven from its own crate instead:
+/// `app_search::tests::a_search_jump_records_who_took_the_selection` builds that state
+/// and asserts the recorded transition. An earlier version of this sentence said the
+/// seam was "covered by its seam's assertion rather than by a step" — there was no
+/// such assertion, and four recorder call sites in `app_search` were exercised by
+/// nothing at all.
 fn silent_select_seams(validated: &mut usize) {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);

@@ -286,7 +286,7 @@ impl Terminal {
     /// change are in hand — by the time anyone else looks, the "before" is gone,
     /// which is the same reason the record exists at all.
     #[inline]
-    pub fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
+    pub(crate) fn note_custody_at(&mut self, transition: CustodyTransition, took: bool) {
         self.last_custody = Some(transition);
         if took {
             self.last_custody_change = Some(transition);
@@ -428,6 +428,7 @@ impl Terminal {
     /// actually RECORDED, instead of the harness reading a stale tag left by an
     /// earlier step that happens to carry the name it expected.
     #[inline]
+    #[cfg(any(test, feature = "spec-anchors"))]
     pub fn take_custody_transition(&mut self) -> Option<CustodyTransition> {
         self.last_custody.take()
     }
@@ -506,6 +507,10 @@ impl Terminal {
     /// the offset arithmetic is out of the model's range. A user whose highlight was
     /// just overwritten gets the true answer; the modelling gap is listed in
     /// `press_custody_conformance`'s KNOWN GAPS.
+    ///
+    /// That gap is `lines_added == 0`, which is NOT an exotic corner: an in-place
+    /// rewrite — `\r` plus EL, a DECERA, a status line repainting itself — damages
+    /// without scrolling and reaches it every time.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -589,5 +594,32 @@ impl Terminal {
         // one-line `tail` at live both took nothing, and both say so.
         let took = after != pinned_offset || (selection_before && !selection_now);
         self.note_custody_at(transition, took);
+    }
+}
+
+/// The cost claim, ASSERTED rather than asserted-in-prose.
+///
+/// The record is justified as a few `Option<CustodyTransition>` slots costing almost
+/// nothing beside a `Terminal`. That was a sentence with nothing holding it, so a
+/// future variant — or a field added beside these — could quietly turn "a few bytes"
+/// into something worth arguing about while the sentence still read the same.
+#[cfg(test)]
+mod cost {
+    use super::CustodyTransition;
+
+    #[test]
+    fn the_record_is_as_small_as_its_justification_claims() {
+        assert_eq!(
+            std::mem::size_of::<CustodyTransition>(),
+            1,
+            "the transition is a fieldless enum and must stay one byte"
+        );
+        assert_eq!(
+            std::mem::size_of::<Option<CustodyTransition>>(),
+            1,
+            "`Option` must ride the enum's niche — if this grows, every slot on \
+             `Terminal` grows with it and the header's cost argument needs rewriting \
+             rather than repeating"
+        );
     }
 }

@@ -2740,4 +2740,63 @@ mod tests {
         assert_eq!(restored.matches.len(), 2);
         assert_eq!(restored.current, 0);
     }
+
+    /// PRESS CUSTODY — the search-jump seam RECORDS, and this drives it.
+    ///
+    /// `search_apply_current_in` reaches `TextSelection` directly with no mouse
+    /// gesture around it, so it is a `UserSelect` producer that no gesture seam can
+    /// account for. The conformance module could not drive it (it needs a populated
+    /// match vector) and said so — but "stated, not implied" is not the same as
+    /// tested, and four recorder call sites in this file were exercised by nothing.
+    #[test]
+    fn a_search_jump_records_who_took_the_selection() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let Some(terminal) = app.front_terminal(wid).map(|t| t.term.clone()) else {
+            panic!("headless app must front a terminal");
+        };
+        {
+            let mut t = crate::term_lock(&terminal);
+            for i in 0..6 {
+                t.process(format!("needle{i} tail\r\n").as_bytes());
+            }
+        }
+
+        // A find-bar state with a real hit, as the recompute would have produced.
+        // The freshness stamps matter: without them `search_stamp_mismatch` sends this
+        // down the REFUSAL path and the jump never happens.
+        let (base_y, revision, seq) = {
+            let t = crate::term_lock(&terminal);
+            (
+                t.grid().base_y() as i64,
+                t.absolute_row_revision(),
+                t.content_seq(),
+            )
+        };
+        let st = SearchState {
+            query: "needle".to_string(),
+            matches: vec![(1, 0, 5)],
+            current: 0,
+            match_base_y: base_y,
+            match_absolute_row_revision: revision,
+            match_content_seq: seq,
+            ..SearchState::default()
+        };
+        app.windows.get_mut(&wid).unwrap().search = Some(st);
+
+        app.search_apply_current_in(wid);
+
+        let t = crate::term_lock(&terminal);
+        assert!(
+            t.text_selection().has_selection(),
+            "precondition: the jump really did select the hit"
+        );
+        assert_eq!(
+            t.last_custody_transition(),
+            Some(aterm_core::terminal::CustodyTransition::UserSelect),
+            "the search jump is a UserSelect producer and must say so — without this \
+             the `custody` verb answers a stale transition beside a changed selection"
+        );
+    }
+
 }
