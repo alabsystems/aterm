@@ -41,7 +41,8 @@ use aterm_render::{
 };
 
 use crate::cursor_glow::{
-    ContentCandidateDecision, CursorGlow, Geom, GlowConfig, GlowStyle, RAINBOW_WAKE_PERSIST,
+    ContentCandidateDecision, ContentGenerationEvidence, CursorGlow, Geom, GlowConfig, GlowStyle,
+    RAINBOW_WAKE_PERSIST,
 };
 use crate::cursor_trail::{
     ContentGeneration, CursorTrail, ExpectedCellSpan, ExpectedRowSnapshot, TrailConfig,
@@ -726,7 +727,7 @@ impl EffectsPipeline {
             terminal_id: term.render_identity(),
             alternate_screen: term.is_alternate_screen(),
         };
-        let candidate_confirmed = if self.glow.move_candidate_pending() {
+        let generation_evidence = if self.glow.move_candidate_pending() {
             let Some((row, col)) = cur else {
                 self.glow.cancel_authored_move_candidate();
                 self.trail.cancel_authored_move_candidate();
@@ -763,29 +764,32 @@ impl EffectsPipeline {
             {
                 Some(ContentCandidateDecision::Confirmed { at, origin, target }) => {
                     self.trail.confirm_content_candidate(at, origin, target);
-                    true
+                    ContentGenerationEvidence::Exact
                 }
                 Some(ContentCandidateDecision::Retired { at, origin }) => {
                     self.trail.retire_content_candidate(at, origin);
-                    false
+                    ContentGenerationEvidence::None
                 }
                 Some(ContentCandidateDecision::Downgraded { at, origin }) => {
                     // The refuted echo proved the press was a MOTION command;
                     // both engines now hold the same jump-shaped candidate.
                     self.trail.arm_motion(at, origin);
-                    false
+                    ContentGenerationEvidence::AuthoredMotion
                 }
-                None => false,
+                Some(ContentCandidateDecision::Deferred { .. }) => {
+                    ContentGenerationEvidence::DeferredProbe
+                }
+                None => ContentGenerationEvidence::None,
             }
         } else {
-            false
+            ContentGenerationEvidence::None
         };
         // ONE ownership verdict, computed by the probe-holding glow engine
         // and projected verbatim onto the classic trail twin — the same
         // single-authority seam the native host uses.
         let ownership = self
             .glow
-            .observe_content_generation(generation, cur, candidate_confirmed);
+            .observe_content_generation_with_evidence(generation, cur, generation_evidence);
         let witness = self.glow.batch_wake_witness();
         self.trail
             .observe_content_generation(generation, ownership, witness.as_ref());

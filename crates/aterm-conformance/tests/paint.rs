@@ -26,6 +26,18 @@
 //!      captured WITHOUT a recording                 → RAINBOW ink PRESENT
 //!   6. UNFOCUSED alt-screen cold spinner, nothing typed, same unpinned
 //!      capture                                      → NOT ink (row 5's control)
+//!   7. shipped-default style, first still + typing   → resident PET in every
+//!      frame, including frame zero, AND rainbow ink with no interior blackout
+//!   8. classic flying-kitty style, sustained typing → kitty is EARNED and its
+//!      whole-head bitmap survives into three isolated final stills
+//!
+//! Rows 7 and 8 close a different false-green class. The first six rows pin
+//! `rainbow kitty` and accept generic dynamic rainbow pixels; they neither run
+//! the shipped default (`rainbow kitty pet`) nor type long enough to earn the
+//! classic flying cat. The companion rows pair every `ctl image` with the
+//! engine's exact `trail status`, then demand BOTH the semantic claim and a
+//! tall foreground connected component in that captured frame. A live pet/cat
+//! state with an omitted sprite fails; rainbow ink with no animal also fails.
 //!
 //! WHY ROWS 5 AND 6 EXIST — THE OBSERVER RULE (docs/RELEASE-PROOF-DISCIPLINE.md).
 //! Rows 1-4 drive `ctl video`, and an in-flight recording PINS the motion-focus
@@ -97,10 +109,11 @@
 //! below did not RETURN until the budget elapsed no matter how fast the row
 //! decided. Every row cost its 180 s budget; this file's four rows cost ~12
 //! min of pure waiting. The watchdog now retires itself off a sentinel.
-//! MEASURED 2026-08-24 after the fix: this whole SIX-row matrix, serialized,
-//! against the release binary, `finished in 47.69s`. The four-row matrix it
-//! replaces could not finish in under 720 s (4 x its own 180 s budget) no
-//! matter how fast the rows decided.
+//! MEASURED 2026-08-24 after the watchdog fix: the historical SIX-row matrix,
+//! serialized against the release binary, `finished in 47.69s`. The four-row
+//! matrix it replaced could not finish in under 720 s (4 x its own 180 s
+//! budget) no matter how fast the rows decided. Rows 7 and 8 are bounded image
+//! bursts (36 and 108 frames respectively), not additional five-second videos.
 //!
 //! macOS-ONLY LANE, honestly: the scanner decodes frames by shelling to
 //! `sips`, so elsewhere the suite compiles to one loud not-run notice instead
@@ -208,17 +221,39 @@ fn release_bin() -> PathBuf {
     .clone()
 }
 
+/// The bitmap morphology and continuity classifiers have their own negative
+/// controls. Keep this beside the artifact rows so a future threshold edit
+/// cannot silently let a one-cell cursor impersonate a whole kitty, or erase
+/// an interior two-frame blackout from the score.
+#[cfg(target_os = "macos")]
+#[test]
+fn paint_scanner_semantic_classifiers_keep_their_negative_controls() {
+    let dir = workspace_root().join("tools/paint-conformance");
+    let out = Command::new("python3")
+        .args(["-m", "unittest", "-v", "scan_test.py"])
+        .current_dir(&dir)
+        .output()
+        .unwrap_or_else(|e| panic!("could not run {}: {e}", dir.join("scan_test.py").display()));
+    assert!(
+        out.status.success(),
+        "paint scanner semantic self-tests failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 /// What one matrix row expects of its take.
 #[cfg(target_os = "macos")]
 enum Expect {
     /// Effect ink present: ≥150 dynamic saturated px across the take, ≥4 of
-    /// 12 hue buckets, and a visible clump in some single frame.
+    /// 12 hue buckets, a visible clump in some single frame, and no interior
+    /// multi-frame rainbow blackout or status/raster contradiction.
     Ink,
     /// The dark control: ZERO dynamic saturated px in EVERY frame.
     Dark,
     /// The control for a path that carries an unavoidable cursor-cell
-    /// artifact: the take FAILS the ink gate — the same three numbers, read
-    /// the other way. See the probe's `--expect quiet` note for the
+    /// artifact: the take FAILS the exact ink predicate, read the other way.
+    /// See the probe's `--expect quiet` note for the
     /// measurements; on the unpinned path the deciding term is hue spread
     /// (1 bucket vs the trail's 9), not pixel count.
     Quiet,
@@ -241,10 +276,24 @@ enum Capture {
     /// window. Fine for proving a focused window paints; structurally unable
     /// to catch a motion-gate regression, because recording repairs it.
     PinnedVideo,
+    /// An unpinned image burst which leaves the headless window's initial
+    /// focused state intact. Used by the companion rows: they are proving the
+    /// presentation, not the unfocused wake seam.
+    UnpinnedFocused,
     /// A burst of `ctl image` captures with the window driven UNFOCUSED
     /// (`ctl focus out`). Nothing about the motion gate is touched: this is
     /// the arm that can go red.
     UnpinnedUnfocused,
+}
+
+/// A companion whose engine state and captured bitmap are both obligations.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum Companion {
+    /// The shipped-default full-body resident cat, present from frame zero.
+    Pet,
+    /// The classic flying head, earned by a sustained typing run.
+    Cat,
 }
 
 /// Drive one shape through `tools/paint-conformance/paint_probe.sh` on the
@@ -255,6 +304,17 @@ enum Capture {
 /// gate must never fail because of its own harness load.
 #[cfg(target_os = "macos")]
 fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
+    probe_with_companion(shape, keys, expect, capture, None);
+}
+
+#[cfg(target_os = "macos")]
+fn probe_with_companion(
+    shape: &str,
+    keys: &str,
+    expect: Expect,
+    capture: Capture,
+    companion: Option<Companion>,
+) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -277,8 +337,20 @@ fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
         .args(["--min-ink", "150", "--min-hues", "4", "--budget", "180"]);
     match capture {
         Capture::PinnedVideo => {}
+        Capture::UnpinnedFocused => {
+            cmd.args(["--capture", "image"]);
+        }
         Capture::UnpinnedUnfocused => {
             cmd.args(["--capture", "image", "--focus", "out"]);
+        }
+    }
+    match companion {
+        None => {}
+        Some(Companion::Pet) => {
+            cmd.args(["--style", "default", "--companion", "pet"]);
+        }
+        Some(Companion::Cat) => {
+            cmd.args(["--style", "classic", "--companion", "cat"]);
         }
     }
     if !keys.is_empty() {
@@ -301,6 +373,9 @@ fn probe_with(shape: &str, keys: &str, expect: Expect, capture: Capture) {
     let meaning = match capture {
         Capture::PinnedVideo => {
             "the shipped binary does not paint its flagship effect at all — this row's window              was FOCUSED and RECORDED, i.e. every excuse was already granted"
+        }
+        Capture::UnpinnedFocused => {
+            "the engine and captured pixels disagree about the cursor companion, or the              rainbow contains an interior blackout — this row pairs every status read with its              exact unpinned frame and generic rainbow pixels cannot satisfy the animal obligation"
         }
         Capture::UnpinnedUnfocused => {
             "an UNFOCUSED window being typed into does not paint its trail — the v0.48-v0.50              blackout class, back. Look at `App::cursor_fx_focus`'s typed-wake term and the              W11b demotion it exists to override; note that `ctl video` would have HIDDEN this              (its recording pin un-suppresses the same gate), which is why this row does not              use one"
@@ -409,4 +484,45 @@ fn unfocused_typed_window_paints_its_trail_under_an_unpinned_capture() {
 #[test]
 fn unfocused_idle_window_paints_nothing_under_an_unpinned_capture() {
     probe_with("cold-spinner", "", Expect::Quiet, Capture::UnpinnedUnfocused);
+}
+
+/// Matrix row 7: THE SHIPPED DEFAULT, not the classic style the historical
+/// rows pin. The resident pet owes a full-body bitmap in the very first
+/// requested still (before typing has created any generic rainbow ink), stays
+/// present through every paired status/frame, and rides a continuous rainbow
+/// while a human-sized word is typed.
+#[cfg(target_os = "macos")]
+#[test]
+fn shipped_default_first_still_and_typing_carry_the_resident_pet() {
+    probe_with_companion(
+        "prompt",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        Some(Companion::Pet),
+    );
+}
+
+/// Matrix row 8: the old flying kitty is rare by design and needs a sustained
+/// high-band run. Four repetitions are 48 forward keys at the image probe's
+/// 80ms cadence — comfortably past its ~2.6s earn law. The row requires at
+/// least four `cat_active` captures and three consecutive isolated final
+/// stills with a whole-head bitmap. Generic rainbow pixels alone satisfy none
+/// of those terms.
+#[cfg(target_os = "macos")]
+#[test]
+fn classic_style_sustained_typing_earns_and_paints_the_flying_kitty() {
+    const RUN: &str = concat!(
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y,",
+        "r,a,i,n,b,o,w,k,i,t,t,y",
+    );
+    probe_with_companion(
+        "prompt",
+        RUN,
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        Some(Companion::Cat),
+    );
 }

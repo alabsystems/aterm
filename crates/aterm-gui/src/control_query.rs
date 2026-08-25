@@ -303,7 +303,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
             |(g, s, f)| (g.clone(), format!("{s:.2}"), f.to_string()),
         );
     format!(
-        "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} window={} \
+        "OK {} {} {} {} session={} cell_w={} cell_h={} font_px={:.2} scale={:.2} window={} \
          window_rows={} window_cols={} composed_rows={} grid_w={} grid_h={} \
          frame_w={} frame_h={} surface_w={} surface_h={} offset_x={} offset_y={} \
          band_left={} band_right={} band_top={} band_bottom={} crop_left={} \
@@ -320,6 +320,7 @@ pub(crate) fn serialize_dims(snapshot: &DimsSnapshot) -> String {
         snapshot.cell_w,
         snapshot.cell_h,
         snapshot.font_px,
+        snapshot.scale,
         window,
         snapshot.window_rows,
         snapshot.window_cols,
@@ -3027,7 +3028,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         .map_or_else(|| "null".to_string(), |delay| delay.to_string());
     json_ok(&format!(
         "{{\"rows\":{},\"cols\":{},\"pixel_w\":{},\"pixel_h\":{},\
-         \"session\":{},\"cell_w\":{},\"cell_h\":{},\"font_px\":{:.2},\
+         \"session\":{},\"cell_w\":{},\"cell_h\":{},\"font_px\":{:.2},\"scale\":{:.2},\
          \"window\":{},\"window_rows\":{},\"window_cols\":{},\"composed_rows\":{},\
          \"grid_w\":{},\"grid_h\":{},\"frame_w\":{},\"frame_h\":{},\
          \"surface_w\":{},\"surface_h\":{},\"offset_x\":{},\"offset_y\":{},\
@@ -3045,6 +3046,7 @@ pub(crate) fn serialize_dims_json(snapshot: &DimsSnapshot) -> String {
         snapshot.cell_w,
         snapshot.cell_h,
         snapshot.font_px,
+        snapshot.scale,
         window,
         snapshot.window_rows,
         snapshot.window_cols,

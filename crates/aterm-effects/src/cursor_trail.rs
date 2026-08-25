@@ -114,9 +114,11 @@ pub fn hide_bridge_reach(typed_hint_fresh: bool) -> u16 {
 /// closed instead of allocating an unbounded proof beside the cursor engine.
 pub const EXPECTED_MOVE_CELLS_MAX: usize = 8;
 
-/// Maximum terminal width for an exact deletion proof. Wider rows still edit
-/// normally, but their cursor cosmetics fail closed instead of storing an
-/// unbounded input-time snapshot in the cursor engine.
+/// Maximum row PREFIX one exact movement proof may retain. Typed proofs need
+/// only the cells through their materialization frontier; deletion proofs still
+/// require the complete visible row. Keeping one shared fixed cap makes both
+/// candidates bounded without making a wide terminal structurally dark while
+/// its caret is still inside this prefix.
 pub const EXPECTED_ROW_CELLS_MAX: usize = 256;
 
 /// Identity of the terminal content generation around one authored input.
@@ -149,9 +151,16 @@ pub struct ContentGeneration {
 pub enum GenerationOwnership {
     /// The generation did not change (or this observation set the baseline).
     Steady,
-    /// The change was exactly the candidate confirmed this same frame: old
-    /// visual geometry retires, and the admitted spawn forges fresh light.
+    /// The change was exactly the candidate confirmed this same frame, or a
+    /// held save/restore candidate completed against its rebased input-row
+    /// baseline in the same generation. Only per-cell-attested resident wake
+    /// survives; the admitted spawn forges fresh light.
     Owned,
+    /// One exact pending-wrap candidate crossed one authenticated upward row
+    /// scroll. The resident cell wake was already translated with that scroll,
+    /// so it survives without a row probe; the candidate still has to prove
+    /// the fresh bottom-row material before it may forge anything new.
+    TranslatedScroll,
     /// An unowned batch left the coordinate space intact (same terminal, same
     /// screen), the cursor anchor unmoved, and the probed anchor row
     /// content-identical under the implicit-blank lens: resident light
@@ -162,6 +171,19 @@ pub enum GenerationOwnership {
     /// not be attested (no coherent probe pair this frame): every resident
     /// visual retires, exactly the original fence.
     UnownedRewrite,
+    /// A submitted alt-screen key crossed more than one parser generation,
+    /// so its exact CONTENT claim was downgraded to a MOTION candidate. The
+    /// batch may have advanced the caret, but it cannot buy typed light: only
+    /// already-resident wake cells individually attested byte-steady by the
+    /// row probe survive. The downgraded motion candidate also survives for
+    /// the independently bounded jump-shaped admission path.
+    AuthoredMotion,
+    /// The sole next alt-screen generation was captured on an unrelated
+    /// cursor-save/status row. One tick holds resident light, the old anchor,
+    /// and the still-content-bound candidate; it admits and births nothing.
+    /// The same generation may complete after cursor restore, but no second
+    /// hold or later generation is accepted.
+    DeferredProbe,
     /// An unowned batch moved the cursor or changed terminal/screen identity:
     /// resident light retires and the cursor companion's earned flight is
     /// disowned with it.
@@ -203,9 +225,11 @@ impl ExpectedCellSpan {
     }
 }
 
-/// Exact input-time row material used to prove a simple end-of-line deletion.
-/// The fixed cap keeps the one-shot candidate bounded; this is copied only for
-/// Backspace, never on the render hot path.
+/// Exact input-time row material used to prove one committed move. For typed
+/// input this is the complete prefix through the expected cells; for a simple
+/// end-of-line deletion it is the complete visible row. The fixed cap keeps the
+/// one-shot candidate bounded; this is copied only at input time, never on the
+/// render hot path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExpectedRowSnapshot {
     cells: [char; EXPECTED_ROW_CELLS_MAX],
@@ -213,7 +237,7 @@ pub struct ExpectedRowSnapshot {
 }
 
 impl ExpectedRowSnapshot {
-    /// Capture one complete visible row. Oversized rows deliberately decline.
+    /// Capture one exact bounded row or row prefix. Oversized spans decline.
     pub fn from_slice(cells: &[char]) -> Option<Self> {
         if cells.is_empty() || cells.len() > EXPECTED_ROW_CELLS_MAX {
             return None;
@@ -236,6 +260,9 @@ impl ExpectedRowSnapshot {
 enum MoveIntent {
     Typed(ExpectedCellSpan),
     Delete,
+    /// Exact DECSET-45 Backspace inverse, admitted only after the glow twin's
+    /// two-row next-generation proof confirms it.
+    ReverseDelete,
     Synthetic,
     SyntheticTyped,
     /// A USER-INITIATED MOTION (the glow twin's `GlowMoveIntent::Motion`,
@@ -246,6 +273,16 @@ enum MoveIntent {
     Motion,
 }
 
+/// Two-step credential for the sole pending-wrap shape whose material row is
+/// created by a terminal scroll. Input arms `AwaitUniformUpOne`; only the
+/// host's exact cumulative-scroll projection may advance it to
+/// `AwaitMaterialProbe`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BottomScrollProof {
+    AwaitUniformUpOne,
+    AwaitMaterialProbe,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MoveCandidate {
     at: Instant,
@@ -254,6 +291,7 @@ struct MoveCandidate {
     target: Option<(u16, u16)>,
     material: Option<(u16, u16)>,
     content_confirmed: bool,
+    bottom_scroll: Option<BottomScrollProof>,
 }
 
 impl MoveCandidate {
@@ -267,7 +305,7 @@ impl MoveCandidate {
             return false;
         }
         match self.intent {
-            MoveIntent::Typed(_) | MoveIntent::Delete => {
+            MoveIntent::Typed(_) | MoveIntent::Delete | MoveIntent::ReverseDelete => {
                 self.content_confirmed && self.target == Some(to)
             }
             MoveIntent::Synthetic | MoveIntent::SyntheticTyped => true,
@@ -280,6 +318,41 @@ impl MoveCandidate {
                 dr >= 2 || dc >= u32::from(Self::MOTION_MIN_SWEEP_COLS)
             }
         }
+    }
+
+    /// Material cell for the one exact typewriter fold the input host can
+    /// prove from a pre-existing DECAWM pending-wrap bit. Unlike a generic
+    /// one-row/large-column repaint, this candidate was captured against the
+    /// NEXT row before delivery and confirmed the expected glyph there. The
+    /// input seam admits only a one-cell grapheme for this shape, so the sole
+    /// swept cell is the material cell immediately before the landing caret.
+    fn exact_deferred_fold_material(self, from: (u16, u16), to: (u16, u16)) -> Option<(u16, u16)> {
+        let MoveIntent::Typed(expected) = self.intent else {
+            return None;
+        };
+        if expected.as_slice().len() != 1
+            || self.origin != from
+            || self.target != Some(to)
+            || from.0.checked_add(1) != Some(to.0)
+        {
+            return None;
+        }
+        let material = self.material?;
+        (material.0 == to.0 && material.1.checked_add(1) == Some(to.1)).then_some(material)
+    }
+
+    /// Departure cell for the exact DECSET-45 Backspace inverse confirmed by
+    /// the glow twin's two-row proof. The cursor crosses from column zero to
+    /// the preceding row's right edge; the classic trail must never interpolate
+    /// that coordinate fold diagonally through unrelated cells.
+    fn exact_reverse_fold_departure(self, from: (u16, u16), to: (u16, u16)) -> Option<(u16, u16)> {
+        (matches!(self.intent, MoveIntent::ReverseDelete)
+            && self.origin == from
+            && self.target == Some(to)
+            && from.1 == 0
+            && to.0.checked_add(1) == Some(from.0)
+            && to.1 > 0)
+            .then_some(from)
     }
 }
 
@@ -391,6 +464,27 @@ pub struct CursorTrail {
     /// their classifier roles, but no style may birth trail geometry unless
     /// this candidate also matches the seeded origin and the observed landing.
     move_candidate: Option<MoveCandidate>,
+    /// One-frame exception attached only to an authenticated alt-screen
+    /// typed-to-MOTION downgrade. If its observed relocation is too small to
+    /// satisfy the motion jump gate, consume it dark without wiping the
+    /// already probe-attested comet. A jump-shaped landing still admits
+    /// normally. Cleared on that first tick and by every reset/fence.
+    preserve_wake_on_denied_motion: bool,
+    /// One-frame, endpoint-bound exception after the fresh-line material proof
+    /// rejects an otherwise authenticated bottom scroll. The candidate may no
+    /// longer birth light, but its already-translated resident cells still own
+    /// their coordinates; consume the now-visible landing dark without wiping
+    /// that earlier wake. `(origin, target)`, spent by the next tick only.
+    preserve_wake_on_rejected_bottom_scroll: Option<((u16, u16), (u16, u16))>,
+    /// One-frame cursor-save/status hold projected from CursorGlow's coherent
+    /// proof seam. Consumed by the next tick without moving the anchor or
+    /// candidate; never an admission licence.
+    deferred_probe_hold: bool,
+    /// Deferred generation still awaiting CursorGlow's exact restored-row
+    /// verdict. Kept after the one transient tick so a missing second-frame
+    /// proof cannot silently leave resident sparks alive at a temporary
+    /// cursor coordinate.
+    deferred_probe_pending: Option<ContentGeneration>,
     /// Last coherent terminal content generation presented to this engine.
     /// Resident sparks are valid only while this identity stays unchanged, or
     /// while the host proves the change was the exact candidate it just
@@ -423,6 +517,11 @@ pub struct CursorTrail {
     /// zeroed fresh table (every slot at epoch 0) can never read as claimed
     /// against a counter that starts its life at 1.
     dedup_epoch: u64,
+    /// Resident bounded Bresenham scratch used by [`Self::spawn`]. Walking
+    /// backward from the destination keeps both work and retained capacity at
+    /// O(`max_len`) even for a hostile full-u16 coordinate jump, and avoids a
+    /// heap allocation on every ordinary typed move after warm-up.
+    spawn_path: Vec<(i32, i32)>,
 }
 
 impl CursorTrail {
@@ -454,13 +553,52 @@ impl CursorTrail {
     /// fail closed because no swept path can be reconstructed.
     #[must_use]
     pub fn cursor_anchor(&self) -> Option<(u16, u16)> {
-        self.last.or_else(|| self.last_visible.map(|(cell, _)| cell))
+        self.last
+            .or_else(|| self.last_visible.map(|(cell, _)| cell))
     }
 
     /// Whether one authored move is still awaiting its first observation.
     #[must_use]
     pub fn move_candidate_pending(&self) -> bool {
         self.move_candidate.is_some()
+    }
+
+    /// Whether one exact authored CONTENT candidate explains a cursor move that
+    /// landed between a host's coherent effect observation and final frame
+    /// extraction. This is a retention witness only: it neither confirms the
+    /// candidate nor admits a spark. The next coherent probe must still prove
+    /// the expected material before either engine may draw fresh light.
+    ///
+    /// The glow twin additionally binds its input-time generation baseline.
+    /// This classic twin owns the other half of the proof: the same authored
+    /// candidate must still be pending at the observed origin, predict exactly
+    /// the committed target, and cross only the sole next parser generation.
+    /// Scroll-created folds are excluded because their coordinate transform is
+    /// witnessed through the separate bottom-scroll protocol.
+    #[must_use]
+    pub fn pending_content_echo_straddles(
+        &self,
+        observed_generation: ContentGeneration,
+        observed_cursor: Option<(u16, u16)>,
+        committed_generation: ContentGeneration,
+        committed_cursor: Option<(u16, u16)>,
+    ) -> bool {
+        observed_cursor != committed_cursor
+            && observed_generation.terminal_id == committed_generation.terminal_id
+            && observed_generation.alternate_screen == committed_generation.alternate_screen
+            && committed_generation.process_sequence
+                == observed_generation.process_sequence.wrapping_add(1)
+            && self.last_content_generation == Some(observed_generation)
+            && self.move_candidate.is_some_and(|candidate| {
+                !candidate.content_confirmed
+                    && candidate.bottom_scroll.is_none()
+                    && matches!(
+                        candidate.intent,
+                        MoveIntent::Typed(_) | MoveIntent::Delete | MoveIntent::ReverseDelete
+                    )
+                    && Some(candidate.origin) == observed_cursor
+                    && candidate.target == committed_cursor
+            })
     }
 
     fn arm_candidate(&mut self, at: Instant, intent: MoveIntent) {
@@ -471,6 +609,7 @@ impl CursorTrail {
             target: None,
             material: None,
             content_confirmed: false,
+            bottom_scroll: None,
         });
     }
 
@@ -513,6 +652,27 @@ impl CursorTrail {
         if let Some(candidate) = self.move_candidate.as_mut() {
             candidate.target = Some(target);
             candidate.material = Some(material);
+        }
+    }
+
+    /// Arm the one-cell DECAWM pending wrap whose landing row will be created
+    /// by one full-screen upward scroll. It remains inadmissible until
+    /// [`Self::note_scroll`] receives exactly one row and the glow twin later
+    /// confirms the sole-next-generation material proof.
+    pub fn note_bottom_scroll_typed_expected(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        target: (u16, u16),
+        material: (u16, u16),
+    ) {
+        self.note_typed_expected(now, expected, target, material);
+        if expected.as_slice().len() == 1
+            && let Some(candidate) = self.move_candidate.as_mut()
+            && candidate.at == now
+            && matches!(candidate.intent, MoveIntent::Typed(_))
+        {
+            candidate.bottom_scroll = Some(BottomScrollProof::AwaitUniformUpOne);
         }
     }
 
@@ -564,6 +724,7 @@ impl CursorTrail {
         self.nav_hint = None;
         self.move_hint = None;
         self.move_candidate = None;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
     }
 
     /// Fail-closed boundary for an input with no exact movement proof.
@@ -588,10 +749,16 @@ impl CursorTrail {
     /// two engines and the cursor companion must agree; both host seams
     /// project it). [`GenerationOwnership::Owned`] retires only the visual
     /// sparks — the confirmed candidate forges the fresh ones this tick.
+    /// [`GenerationOwnership::TranslatedScroll`] keeps only resident cells
+    /// already translated by an authenticated one-row scroll, and only while
+    /// this twin still holds the matching material-probe candidate.
     /// [`GenerationOwnership::UnownedSteady`] keeps the resident comet (the
     /// batch provably left the anchor row and the cursor alone) while the
-    /// hint/candidate cohort still revokes fail-closed. Every other unowned
-    /// verdict retires the comet wholesale, exactly the original fence. A
+    /// hint/candidate cohort still revokes fail-closed.
+    /// [`GenerationOwnership::AuthoredMotion`] likewise keeps only
+    /// probe-attested resident cells, while preserving its downgraded MOTION
+    /// candidate; it can neither arm nor birth typed light. Every other
+    /// unowned verdict retires the comet wholesale, exactly the original fence. A
     /// scroll signal still translates geometry when no parser generation
     /// changed; a parser batch that also scrolls is conservatively retired.
     /// The first observation is a silent baseline; an authority verdict that
@@ -606,9 +773,6 @@ impl CursorTrail {
             .last_content_generation
             .is_some_and(|previous| previous != generation);
         self.last_content_generation = Some(generation);
-        if !changed {
-            return;
-        }
         // The proportionate fence, mirroring the glow twin: a spark survives
         // a judged batch iff the shared probe witness attests its cell was
         // not rewritten. No witness = the old wholesale wipe, unchanged.
@@ -616,6 +780,65 @@ impl CursorTrail {
             Some(witness) => sparks.retain(|spark| witness.steady(spark.row, spark.col)),
             None => sparks.clear(),
         };
+        if !changed {
+            if ownership == GenerationOwnership::TranslatedScroll {
+                // A translated-scroll verdict necessarily belongs to the
+                // sole next parser generation. Even a locally matching
+                // candidate cannot authenticate that authority on a steady
+                // generation: a forged/desynchronized projection therefore
+                // retires both wake and the candidate fail-closed.
+                self.sparks.clear();
+                self.type_hint = None;
+                self.nav_hint = None;
+                self.move_hint = None;
+                self.move_candidate = None;
+                self.preserve_wake_on_denied_motion = false;
+                self.preserve_wake_on_rejected_bottom_scroll = None;
+                self.deferred_probe_hold = false;
+                self.deferred_probe_pending = None;
+                return;
+            }
+            if self.deferred_probe_pending == Some(generation) {
+                match ownership {
+                    GenerationOwnership::Owned
+                        if self
+                            .move_candidate
+                            .is_some_and(|candidate| candidate.content_confirmed) =>
+                    {
+                        retain_attested(&mut self.sparks);
+                        self.deferred_probe_pending = None;
+                    }
+                    GenerationOwnership::AuthoredMotion
+                        if matches!(
+                            self.move_candidate.map(|candidate| candidate.intent),
+                            Some(MoveIntent::Motion)
+                        ) =>
+                    {
+                        retain_attested(&mut self.sparks);
+                        self.type_hint = None;
+                        self.nav_hint = None;
+                        self.move_hint = None;
+                        self.revoke_non_motion_candidate();
+                        self.preserve_wake_on_denied_motion = true;
+                        self.deferred_probe_pending = None;
+                    }
+                    GenerationOwnership::UnownedRelocation => {
+                        self.sparks.clear();
+                        self.type_hint = None;
+                        self.nav_hint = None;
+                        self.move_hint = None;
+                        self.move_candidate = None;
+                        self.deferred_probe_pending = None;
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        self.preserve_wake_on_denied_motion = false;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
+        self.deferred_probe_hold = false;
+        self.deferred_probe_pending = None;
         match ownership {
             GenerationOwnership::Owned => {
                 // Even an exact candidate owns only the cells it will forge
@@ -623,6 +846,27 @@ impl CursorTrail {
                 // parser batch — but the witness can, per column, and a comet
                 // must outlive the keystroke that follows it.
                 retain_attested(&mut self.sparks);
+            }
+            GenerationOwnership::TranslatedScroll => {
+                // `note_scroll(1)` already moved every resident cell with the
+                // authenticated terminal scroll. There is deliberately no row
+                // witness on that frame, but applying the ordinary Owned arm
+                // would therefore clear the translated comet and black out the
+                // fold it exists to preserve. Birth still waits on the pending
+                // candidate's fresh-bottom-row material proof.
+                if !self.move_candidate.is_some_and(|candidate| {
+                    candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                        && !candidate.content_confirmed
+                }) {
+                    // The glow verdict is authoritative, but this no-probe arm
+                    // is intentionally non-forgeable at the twin too: a torn or
+                    // cold handoff cannot preserve arbitrary resident cells.
+                    self.sparks.clear();
+                    self.type_hint = None;
+                    self.nav_hint = None;
+                    self.move_hint = None;
+                    self.move_candidate = None;
+                }
             }
             GenerationOwnership::UnownedSteady => {
                 // The batch is proven steady at the anchor: the resident
@@ -637,11 +881,56 @@ impl CursorTrail {
                 // An identity-and-anchor-held rewrite (a streaming TUI
                 // repainting around a parked cursor): attested cells keep
                 // their light; the classifier cohort still fails closed.
+                // The glow fence also routes the E2 split-batch echo here
+                // when its revoked-target tombstone consumes
+                // (`echo-after-stream`) — this twin needs no edit for that:
+                // taking the verdict verbatim IS the proportionate retention.
                 retain_attested(&mut self.sparks);
                 self.type_hint = None;
                 self.nav_hint = None;
                 self.move_hint = None;
                 self.revoke_non_motion_candidate();
+            }
+            GenerationOwnership::AuthoredMotion => {
+                // Trust the shared verdict only while this twin holds the
+                // downgraded candidate the host projected in the same seam.
+                // A desynchronized/minted verdict fails closed.
+                if matches!(
+                    self.move_candidate.map(|candidate| candidate.intent),
+                    Some(MoveIntent::Motion)
+                ) {
+                    retain_attested(&mut self.sparks);
+                    self.type_hint = None;
+                    self.nav_hint = None;
+                    self.move_hint = None;
+                    self.revoke_non_motion_candidate();
+                    self.preserve_wake_on_denied_motion = true;
+                } else {
+                    self.sparks.clear();
+                    self.type_hint = None;
+                    self.nav_hint = None;
+                    self.move_hint = None;
+                    self.revoke_non_motion_candidate();
+                }
+            }
+            GenerationOwnership::DeferredProbe => {
+                if matches!(
+                    self.move_candidate.map(|candidate| candidate.intent),
+                    Some(MoveIntent::Typed(_))
+                ) {
+                    // No witness exists for the temporarily unprobed input
+                    // row. This narrow verdict is bounded by CursorGlow's
+                    // exact candidate/generation check and holds, rather than
+                    // adding or reclassifying, the existing comet.
+                    self.deferred_probe_hold = true;
+                    self.deferred_probe_pending = Some(generation);
+                } else {
+                    self.sparks.clear();
+                    self.type_hint = None;
+                    self.nav_hint = None;
+                    self.move_hint = None;
+                    self.move_candidate = None;
+                }
             }
             // `Steady` while THIS engine observed a change is a
             // desynchronized authority — fail closed like a relocation.
@@ -714,6 +1003,24 @@ impl CursorTrail {
         }
     }
 
+    /// Arm the exact reverse-wrap Backspace twin. It remains pending until the
+    /// glow engine confirms both adjacent rows and hands back the same
+    /// origin/target token through [`Self::confirm_content_candidate`].
+    pub fn note_reverse_delete_expected(&mut self, now: Instant, target: (u16, u16)) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.type_hint = None;
+            return;
+        }
+        self.type_hint = Some(now);
+        self.nav_hint = None;
+        self.move_hint = None;
+        self.arm_candidate(now, MoveIntent::ReverseDelete);
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+        }
+    }
+
     /// Classify a plain Return. Return has no exact landing proof here, so this
     /// timestamp alone cannot birth a trail.
     pub fn note_return(&mut self, now: Instant) {
@@ -757,7 +1064,7 @@ impl CursorTrail {
             && candidate.origin == origin
             && matches!(
                 candidate.intent,
-                MoveIntent::Typed(_) | MoveIntent::Delete
+                MoveIntent::Typed(_) | MoveIntent::Delete | MoveIntent::ReverseDelete
             )
         {
             candidate.content_confirmed = true;
@@ -780,6 +1087,7 @@ impl CursorTrail {
             target: None,
             material: None,
             content_confirmed: false,
+            bottom_scroll: None,
         });
         self.candidate_superseded = false;
         // The press's typed hint retires with its content claim, exactly as
@@ -790,10 +1098,15 @@ impl CursorTrail {
     }
 
     pub fn retire_content_candidate(&mut self, at: Instant, origin: (u16, u16)) {
-        if self
+        if let Some(candidate) = self
             .move_candidate
-            .is_some_and(|candidate| candidate.at == at && candidate.origin == origin)
+            .filter(|candidate| candidate.at == at && candidate.origin == origin)
         {
+            if candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && let Some(target) = candidate.target
+            {
+                self.preserve_wake_on_rejected_bottom_scroll = Some((origin, target));
+            }
             self.move_candidate = None;
             for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
                 if *hint == Some(at) {
@@ -801,6 +1114,20 @@ impl CursorTrail {
                 }
             }
         }
+    }
+
+    /// Clock-bound twin of CursorGlow's bottom-scroll expiry. The classic
+    /// engine has no independent row probe, but it owns the matching candidate
+    /// and must not leave it available after the glow scheduler's one proof
+    /// window closes merely because the cursor stayed hidden.
+    fn retire_expired_bottom_scroll_probe(&mut self, now: Instant) {
+        let Some(candidate) = self.move_candidate.filter(|candidate| {
+            candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && now.saturating_duration_since(candidate.at).as_secs_f32() > Self::TYPE_HINT_FRESH
+        }) else {
+            return;
+        };
+        self.retire_content_candidate(candidate.at, candidate.origin);
     }
 
     /// Cancel only the classifier/candidate written by one not-yet-egressed
@@ -811,7 +1138,10 @@ impl CursorTrail {
                 *hint = None;
             }
         }
-        if self.move_candidate.is_some_and(|candidate| candidate.at == at) {
+        if self
+            .move_candidate
+            .is_some_and(|candidate| candidate.at == at)
+        {
             self.move_candidate = None;
         }
     }
@@ -832,12 +1162,25 @@ impl CursorTrail {
         self.last_visible = self
             .last_visible
             .and_then(|((row, col), at)| row.checked_sub(rows).map(|row| ((row, col), at)));
-        if let Some(candidate) = self.move_candidate.take() {
-            // Live sparks translate; a pre/post input content proof does not.
-            // Retire its exact one-shot at the content-generation boundary.
-            for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
-                if *hint == Some(candidate.at) {
-                    *hint = None;
+        if let Some(mut candidate) = self.move_candidate.take() {
+            // The sole exception is the input seam's pending-wrap candidate:
+            // one exact uniform row is part of its proof, not an unrelated
+            // boundary. Translate only the departure anchor; its target and
+            // material remain on the freshly created bottom row.
+            if rows == 1
+                && candidate.bottom_scroll == Some(BottomScrollProof::AwaitUniformUpOne)
+                && let Some(origin_row) = candidate.origin.0.checked_sub(1)
+            {
+                candidate.origin.0 = origin_row;
+                candidate.bottom_scroll = Some(BottomScrollProof::AwaitMaterialProbe);
+                self.move_candidate = Some(candidate);
+            } else {
+                // Live sparks translate; every other pre/post input content
+                // proof retires at the content-generation boundary.
+                for hint in [&mut self.type_hint, &mut self.nav_hint, &mut self.move_hint] {
+                    if *hint == Some(candidate.at) {
+                        *hint = None;
+                    }
                 }
             }
         }
@@ -868,6 +1211,10 @@ impl CursorTrail {
         self.nav_hint = None;
         self.move_hint = None;
         self.move_candidate = None;
+        self.preserve_wake_on_denied_motion = false;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
+        self.deferred_probe_hold = false;
+        self.deferred_probe_pending = None;
         self.candidate_superseded = false;
         self.blink_hint = None;
         self.ctx_alt = false;
@@ -899,10 +1246,15 @@ impl CursorTrail {
             self.nav_hint = None;
             self.move_hint = None;
             self.move_candidate = None;
+            self.preserve_wake_on_denied_motion = false;
+            self.preserve_wake_on_rejected_bottom_scroll = None;
+            self.deferred_probe_hold = false;
+            self.deferred_probe_pending = None;
             self.candidate_superseded = false;
             self.blink_hint = None;
             return 0;
         }
+        self.retire_expired_bottom_scroll_probe(now);
 
         // Select the source for a move between two VISIBLE positions — where
         // "visible" BRIDGES ConPTY's per-echo hide window: if the previous
@@ -932,7 +1284,34 @@ impl CursorTrail {
         let completed_hidden_reappearance =
             self.last.is_none() && cur.is_some() && self.last_visible.is_some();
         let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
-        if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
+        let awaiting_bottom_scroll_probe = self.move_candidate.is_some_and(|candidate| {
+            candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && !candidate.content_confirmed
+                && now.saturating_duration_since(candidate.at).as_secs_f32()
+                    <= Self::TYPE_HINT_FRESH
+        });
+        let deferred_probe_hold = std::mem::take(&mut self.deferred_probe_hold);
+        if self.deferred_probe_pending.is_some() && !deferred_probe_hold {
+            // CursorGlow did not project the required same-generation restore
+            // verdict before the second tick. Retire the classic twin in this
+            // frame instead of letting an off-row/expired candidate carry old
+            // cells across the temporary cursor relocation.
+            self.sparks.clear();
+            self.type_hint = None;
+            self.nav_hint = None;
+            self.move_hint = None;
+            self.move_candidate = None;
+            self.deferred_probe_pending = None;
+        }
+        if deferred_probe_hold {
+            // One transient cursor-save frame: keep the old anchor and exact
+            // candidate, run no classifier/spawn, and decay/emit below.
+        } else if awaiting_bottom_scroll_probe {
+            // The scroll frame has the landing coordinate but deliberately no
+            // content probe. Hold the translated departure anchor for the
+            // glow twin's scheduled proof frame; neither consume the candidate
+            // nor manufacture any light during this hold.
+        } else if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
             && (pr != cr || pc != cc)
         {
             self.spawn(pr, pc, cr, cc, now, cfg);
@@ -971,10 +1350,23 @@ impl CursorTrail {
             self.move_candidate = None;
             self.candidate_superseded = false;
         }
-        self.last = cur;
-        if let Some(c) = cur {
-            self.last_visible = Some((c, now));
+        if !awaiting_bottom_scroll_probe && !deferred_probe_hold {
+            self.last = cur;
+            if let Some(c) = cur {
+                self.last_visible = Some((c, now));
+            }
         }
+        // An AuthoredMotion generation with no visible delta still completes
+        // the one-shot downgrade boundary. It may not lend its candidate or
+        // wake-preservation credit to a later unrelated program move.
+        if self.preserve_wake_on_denied_motion {
+            self.preserve_wake_on_denied_motion = false;
+            self.move_candidate = None;
+        }
+        // A rejected bottom-scroll material proof licenses exactly this one
+        // landing observation. Hidden/stationary frames spend it too, so it
+        // can never escape and preserve wake across an unrelated later CUP.
+        self.preserve_wake_on_rejected_bottom_scroll = None;
 
         // Decay: drop fully-faded sparks (age >= its own baked lifetime). An
         // ignited spark carries a longer `life_ms`, so it lingers past the base fade.
@@ -1111,17 +1503,32 @@ impl CursorTrail {
         // to a later CUP, and an exact-but-ignored navigation target cannot be
         // retried against the following move.
         self.candidate_superseded = false;
+        let preserve_denied_motion = std::mem::take(&mut self.preserve_wake_on_denied_motion);
+        let preserve_rejected_bottom_scroll = self
+            .preserve_wake_on_rejected_bottom_scroll
+            .take()
+            .is_some_and(|(origin, target)| origin == (pr, pc) && target == (cr, cc));
         let candidate = self.move_candidate.take();
-        let admitted_intent = candidate
-            .filter(|candidate| {
-                candidate.admits((pr, pc), (cr, cc), now, Self::MOVE_HINT_FRESH)
-            })
-            .map(|candidate| candidate.intent);
+        let authenticated_motion_origin = candidate.is_some_and(|candidate| {
+            candidate.intent == MoveIntent::Motion && candidate.origin == (pr, pc)
+        });
+        let admitted_candidate = candidate
+            .filter(|candidate| candidate.admits((pr, pc), (cr, cc), now, Self::MOVE_HINT_FRESH));
+        let exact_deferred_fold = admitted_candidate
+            .and_then(|candidate| candidate.exact_deferred_fold_material((pr, pc), (cr, cc)));
+        let exact_reverse_fold = admitted_candidate
+            .and_then(|candidate| candidate.exact_reverse_fold_departure((pr, pc), (cr, cc)));
+        let admitted_intent = admitted_candidate.map(|candidate| candidate.intent);
         let paired = self.type_hint.take().is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::TYPE_HINT_FRESH
         }) && matches!(
             admitted_intent,
-            Some(MoveIntent::Typed(_) | MoveIntent::Delete | MoveIntent::SyntheticTyped)
+            Some(
+                MoveIntent::Typed(_)
+                    | MoveIntent::Delete
+                    | MoveIntent::ReverseDelete
+                    | MoveIntent::SyntheticTyped
+            )
         );
         // ALT-SCREEN blink requirement (the glow classifier's twin): on the
         // alt screen only a repaint-BLINKING app (Claude Code's
@@ -1161,23 +1568,46 @@ impl CursorTrail {
         // could leave its prior cells stranded. Fail closed and retire the old
         // cell bed unless a current correlated candidate owns this exact move.
         if !paired && !move_paired {
-            self.sparks.clear();
+            // A real alt-screen key may cross two parser batches yet finish
+            // as an ordinary one-cell caret advance. Its content claim was
+            // correctly downgraded and its MOTION candidate correctly fails
+            // the jump-shape gate, but the same authenticated generation has
+            // already retained the older comet cell-by-cell through the row
+            // probe. Consume this small relocation dark without destroying
+            // that wake. Any missing/mismatched candidate keeps the original
+            // fail-closed wholesale clear.
+            if !(preserve_denied_motion && authenticated_motion_origin)
+                && !preserve_rejected_bottom_scroll
+            {
+                self.sparks.clear();
+            }
             return false;
         }
-        if paired && dr_abs <= 1 && raw_dist > 2 && (!self.ctx_alt || blink_fresh) {
-            return false;
-        }
-        let mut path = line_cells(pr as i32, pc as i32, cr as i32, cc as i32);
-        // Drop the destination cell (last entry) — the cursor occupies it.
-        path.pop();
-        if path.is_empty() {
+        if paired
+            && exact_deferred_fold.is_none()
+            && exact_reverse_fold.is_none()
+            && dr_abs <= 1
+            && raw_dist > 2
+            && (!self.ctx_alt || blink_fresh)
+        {
             return false;
         }
         // Keep at most `max_len` cells NEAREST the destination (the path's tail).
         let max_len = cfg.max_len.max(1);
-        if path.len() > max_len {
-            let drop = path.len() - max_len;
-            path.drain(0..drop);
+        self.spawn_path.clear();
+        if let Some((row, col)) = exact_deferred_fold.or(exact_reverse_fold) {
+            self.spawn_path.push((i32::from(row), i32::from(col)));
+        } else {
+            crate::trail_sweep::line_cells_tail(
+                &mut self.spawn_path,
+                (i32::from(pr), i32::from(pc)),
+                (i32::from(cr), i32::from(cc)),
+                max_len,
+                false,
+            );
+        }
+        if self.spawn_path.is_empty() {
+            return false;
         }
         // IGNITION: the typing-cadence intensity (baked at spawn) scales the head +
         // tail coverage between their gentle and ignited endpoints, and stretches
@@ -1193,9 +1623,9 @@ impl CursorTrail {
         let life_ms = (base_dur
             * (1.0 + CHAIN_LIFE_MULT * cfg.warmth.clamp(0.0, 1.0) + (IGNITED_LIFE_MULT - 1.0) * q))
             .max(1.0) as u64;
-        let n = path.len() as u32;
+        let n = self.spawn_path.len() as u32;
         // index 0 = farthest from the cursor (faintest), n-1 = nearest (brightest).
-        for (i, (r, c)) in path.into_iter().enumerate() {
+        for (i, (r, c)) in self.spawn_path.iter().copied().enumerate() {
             if r < 0 || c < 0 {
                 continue;
             }
@@ -1437,6 +1867,7 @@ pub fn ignite(cfg: &mut TrailConfig, intensity: f32, warmth: f32) {
 
 /// Integer cell-line (Bresenham) from `(r0,c0)` to `(r1,c1)` INCLUSIVE of both
 /// endpoints — the cells a straight cursor move sweeps through. Pure + total.
+#[cfg(test)]
 fn line_cells(r0: i32, c0: i32, r1: i32, c1: i32) -> Vec<(i32, i32)> {
     let (dr, dc) = ((r1 - r0).abs(), (c1 - c0).abs());
     let (sr, sc) = (if r0 < r1 { 1 } else { -1 }, if c0 < c1 { 1 } else { -1 });
@@ -1485,6 +1916,198 @@ mod tests {
         assert_eq!(t.tick(Some((0, 0)), now, &cfg(true), &mut out), 0);
         assert!(out.is_empty());
         assert!(!t.is_active());
+    }
+
+    #[test]
+    fn pending_content_echo_straddle_requires_exact_twin_endpoints_and_generation() {
+        let mut trail = CursorTrail::default();
+        let now = Instant::now();
+        let origin = (4, 9);
+        let target = (4, 10);
+        let mut out = Vec::new();
+        trail.tick(Some(origin), now, &cfg(true), &mut out);
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        trail.note_typed_expected(now, expected, target, origin);
+        let observed = ContentGeneration {
+            process_sequence: 17,
+            terminal_id: 41,
+            alternate_screen: false,
+        };
+        let committed = ContentGeneration {
+            process_sequence: 18,
+            ..observed
+        };
+        trail.observe_content_generation(observed, GenerationOwnership::Steady, None);
+
+        assert!(trail.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        for (name, observed_generation, observed_cursor, committed_generation, committed_cursor) in [
+            (
+                "same cursor",
+                observed,
+                Some(origin),
+                committed,
+                Some(origin),
+            ),
+            (
+                "wrong origin",
+                observed,
+                Some((4, 8)),
+                committed,
+                Some(target),
+            ),
+            (
+                "wrong target",
+                observed,
+                Some(origin),
+                committed,
+                Some((4, 11)),
+            ),
+            ("hidden observed", observed, None, committed, Some(target)),
+            ("hidden committed", observed, Some(origin), committed, None),
+            (
+                "same generation",
+                observed,
+                Some(origin),
+                observed,
+                Some(target),
+            ),
+            (
+                "intervening generation",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    process_sequence: 19,
+                    ..observed
+                },
+                Some(target),
+            ),
+            (
+                "terminal changed",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    terminal_id: 42,
+                    ..committed
+                },
+                Some(target),
+            ),
+            (
+                "screen changed",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    alternate_screen: true,
+                    ..committed
+                },
+                Some(target),
+            ),
+        ] {
+            assert!(
+                !trail.pending_content_echo_straddles(
+                    observed_generation,
+                    observed_cursor,
+                    committed_generation,
+                    committed_cursor,
+                ),
+                "{name} must fail closed"
+            );
+        }
+
+        trail.confirm_content_candidate(now, origin, target);
+        assert!(
+            !trail.pending_content_echo_straddles(observed, Some(origin), committed, Some(target),),
+            "an already-confirmed candidate is not a pending torn echo"
+        );
+    }
+
+    #[test]
+    fn pending_content_echo_straddle_excludes_scroll_fold_candidates() {
+        let mut trail = CursorTrail::default();
+        let now = Instant::now();
+        let origin = (23, 79);
+        let target = (23, 1);
+        let mut out = Vec::new();
+        trail.tick(Some(origin), now, &cfg(true), &mut out);
+        trail.note_bottom_scroll_typed_expected(
+            now,
+            ExpectedCellSpan::from_cells(['x']).unwrap(),
+            target,
+            (23, 0),
+        );
+        let observed = ContentGeneration {
+            process_sequence: u32::MAX,
+            terminal_id: 7,
+            alternate_screen: false,
+        };
+        let committed = ContentGeneration {
+            process_sequence: 0,
+            ..observed
+        };
+        assert!(
+            !trail.pending_content_echo_straddles(observed, Some(origin), committed, Some(target),),
+            "scroll-created folds stay on their translated-scroll protocol"
+        );
+    }
+
+    /// The glow twin can project `TranslatedScroll` only on the sole next
+    /// parser generation. A same-generation claim is therefore an authority
+    /// mismatch even when this twin holds an otherwise exact translated
+    /// candidate: it must not preserve resident wake or leave that candidate
+    /// available to mint light on a later cursor delta.
+    #[test]
+    fn same_generation_translated_scroll_claim_fails_closed() {
+        let mut trail = CursorTrail::default();
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let c = cfg(true);
+        let generation = ContentGeneration {
+            process_sequence: 7,
+            terminal_id: 41,
+            alternate_screen: false,
+        };
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        trail.tick(Some((5, 35)), now, &c, &mut out);
+        trail.note_synthetic_move(now + Duration::from_millis(1));
+        trail.tick(Some((5, 39)), now + Duration::from_millis(2), &c, &mut out);
+        assert!(
+            trail.is_active(),
+            "the mismatch has resident wake to retire"
+        );
+        trail.observe_content_generation(generation, GenerationOwnership::Steady, None);
+        trail.note_bottom_scroll_typed_expected(
+            now + Duration::from_millis(3),
+            expected,
+            (5, 1),
+            (5, 0),
+        );
+        trail.note_scroll(1);
+        assert!(
+            trail.move_candidate.is_some_and(|candidate| {
+                candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+            }),
+            "precondition: the local translated candidate itself is valid"
+        );
+        assert!(
+            trail.is_active(),
+            "translated wake survived the scroll signal"
+        );
+
+        trail.observe_content_generation(generation, GenerationOwnership::TranslatedScroll, None);
+        assert!(!trail.is_active(), "same-generation authority retires wake");
+        assert!(
+            !trail.move_candidate_pending(),
+            "same-generation authority retires the candidate"
+        );
+        assert!(
+            trail.type_hint.is_none() && trail.nav_hint.is_none() && trail.move_hint.is_none(),
+            "same-generation authority retires classifier hints"
+        );
     }
 
     /// PTY scrolls carry the classic terminal-cell trail just like the glow
@@ -1966,12 +2589,7 @@ mod tests {
             "the supersession latch must converge after a cold observation"
         );
         trail.confirm_content_candidate(second, (0, 1), (0, 2));
-        let fp = trail.tick(
-            Some((0, 2)),
-            t0 + Duration::from_millis(4),
-            &c,
-            &mut out,
-        );
+        let fp = trail.tick(Some((0, 2)), t0 + Duration::from_millis(4), &c, &mut out);
         assert_ne!(fp, 0, "the later exact candidate admits its own move");
         assert!(!out.is_empty());
     }
@@ -2164,6 +2782,75 @@ mod tests {
         assert!(!out.is_empty());
     }
 
+    #[test]
+    fn exact_deferred_wrap_lays_only_the_material_cell() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        let mut exact = CursorTrail::default();
+        exact.tick(Some((4, 79)), t0, &c, &mut out);
+        let typed = t0 + Duration::from_millis(1);
+        exact.note_typed_expected(typed, expected, (5, 1), (5, 0));
+        exact.confirm_content_candidate(typed, (4, 79), (5, 1));
+        let fp = exact.tick(Some((5, 1)), t0 + Duration::from_millis(2), &c, &mut out);
+        assert_ne!(fp, 0);
+        assert_eq!(
+            out.iter()
+                .map(|cell| (cell.row, cell.col))
+                .collect::<Vec<_>>(),
+            vec![(5, 0)],
+            "the fold lights the glyph cell, never a diagonal across the row"
+        );
+
+        let mut forged = CursorTrail::default();
+        forged.tick(Some((4, 79)), t0, &c, &mut out);
+        forged.note_typed_expected(typed, expected, (5, 1), (4, 79));
+        forged.confirm_content_candidate(typed, (4, 79), (5, 1));
+        assert_eq!(
+            forged.tick(Some((5, 1)), t0 + Duration::from_millis(2), &c, &mut out,),
+            0,
+            "a generic one-row teleport without next-row material remains a re-anchor"
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn exact_reverse_wrap_lays_only_the_departure_cell() {
+        let c = cfg(true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let origin = (5, 0);
+        let target = (4, 79);
+
+        let mut exact = CursorTrail::default();
+        exact.tick(Some(origin), t0, &c, &mut out);
+        let at = t0 + Duration::from_millis(1);
+        exact.note_reverse_delete_expected(at, target);
+        exact.confirm_content_candidate(at, origin, target);
+        let fp = exact.tick(Some(target), t0 + Duration::from_millis(2), &c, &mut out);
+        assert_ne!(fp, 0);
+        assert_eq!(
+            out.iter()
+                .map(|cell| (cell.row, cell.col))
+                .collect::<Vec<_>>(),
+            vec![(usize::from(origin.0), usize::from(origin.1))],
+            "the inverse fold leaves one seam cell, never a diagonal through the row"
+        );
+
+        let mut forged = CursorTrail::default();
+        forged.tick(Some(origin), t0, &c, &mut out);
+        forged.note_delete_expected(at, (4, 20));
+        forged.confirm_content_candidate(at, origin, (4, 20));
+        assert_eq!(
+            forged.tick(Some((4, 20)), t0 + Duration::from_millis(2), &c, &mut out,),
+            0,
+            "an arbitrary cross-row deletion target stays a re-anchor"
+        );
+        assert!(out.is_empty());
+    }
+
     /// THE KITTY→BLINK SWAP (trail twin of the glow law): on the ALT screen a
     /// typed classifier alone no longer re-anchors — for a candidate-backed
     /// typed move without a fresh REPAINT BLINK (vim never hides inside
@@ -2224,6 +2911,63 @@ mod tests {
         let diag = line_cells(0, 0, 2, 2);
         assert_eq!(diag.first(), Some(&(0, 0)));
         assert_eq!(diag.last(), Some(&(2, 2)));
+    }
+
+    #[test]
+    fn bounded_tail_matches_the_legacy_full_sweep() {
+        for (origin, destination) in [
+            ((0, 0), (0, 40)),
+            ((0, 40), (0, 0)),
+            ((1, 2), (37, 9)),
+            ((37, 9), (1, 2)),
+            ((3, 4), (31, 45)),
+            ((31, 45), (3, 4)),
+        ] {
+            for limit in 1..=12 {
+                let mut legacy = line_cells(origin.0, origin.1, destination.0, destination.1);
+                legacy.pop();
+                if legacy.len() > limit {
+                    legacy.drain(..legacy.len() - limit);
+                }
+                let mut bounded = Vec::new();
+                crate::trail_sweep::line_cells_tail(
+                    &mut bounded,
+                    origin,
+                    destination,
+                    limit,
+                    false,
+                );
+                assert_eq!(bounded, legacy, "{origin:?}->{destination:?}, {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn full_u16_jump_reuses_bounded_spawn_scratch() {
+        let now = Instant::now();
+        let c = cfg(true);
+        let mut trail = CursorTrail::default();
+        let mut out = Vec::new();
+        trail.tick(Some((0, 0)), now, &c, &mut out);
+        trail.note_synthetic_move(now);
+        trail.tick(
+            Some((0, u16::MAX)),
+            now + Duration::from_millis(1),
+            &c,
+            &mut out,
+        );
+        assert_eq!(trail.spawn_path.len(), c.max_len);
+        let (ptr, capacity) = (trail.spawn_path.as_ptr(), trail.spawn_path.capacity());
+
+        trail.note_synthetic_move(now + Duration::from_millis(2));
+        trail.tick(Some((0, 0)), now + Duration::from_millis(3), &c, &mut out);
+        assert_eq!(trail.spawn_path.len(), c.max_len);
+        assert_eq!(trail.spawn_path.capacity(), capacity);
+        assert_eq!(
+            trail.spawn_path.as_ptr(),
+            ptr,
+            "warm move does not allocate"
+        );
     }
 
     // ---- typing-cadence ignition -----------------------------------------

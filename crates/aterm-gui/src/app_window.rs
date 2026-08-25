@@ -1299,6 +1299,18 @@ impl App {
         // (Preedit/Commit) for CJK/dead-key/Option composition. Never enabled
         // before, so composition input was impossible.
         window.set_ime_allowed(true);
+        // …and tell the input method WHAT KIND of field it is driving. winit
+        // defaults to `ImePurpose::Normal`, which on Wayland goes out as
+        // `zwp_text_input_v3.set_content_type(hint=none, purpose=normal)` — a
+        // plain prose field. A terminal is not one: the protocol has a dedicated
+        // `content_purpose.terminal`, and IMs/on-screen keyboards read it to drop
+        // the prose affordances that corrupt shell input (autocapitalisation,
+        // word prediction, smart punctuation) and to surface the keys a terminal
+        // actually needs. Stored on the window here, so EVERY later
+        // `text_input.enter` re-announces it — which matters because `enable`
+        // resets the compositor's copy. A cross-platform no-op everywhere else
+        // (X11/macOS/Windows implement it as an empty body).
+        window.set_ime_purpose(winit::window::ImePurpose::Terminal);
         // OS color-scheme source: seed every session of this window with the REAL
         // desktop light/dark appearance (winit's `Window::theme()`, cross-platform).
         // The engine REPORTS the scheme to apps (DEC 2031 + DSR ?996n); this is what
@@ -2060,12 +2072,65 @@ impl App {
         // and `window_frame_px` reads the backend's current cell metrics.
         self.apply_window_scale(wid);
         let intended = self.window_frame_px(settle.rows, settle.cols);
-        if size == intended {
+        // THE SETTLE'S SUBJECT IS THE GRID, NOT THE PIXEL COUNT. Asking for
+        // `size == intended` is the same question only while the frame law's
+        // output is representable on the wire, and at a FRACTIONAL scale it is
+        // not: winit hands Wayland a LOGICAL size, which must be a whole number,
+        // so a physical frame that is not a multiple of the scale's denominator
+        // is rounded up on the round trip and can never come back. Measured in a
+        // nested GNOME 50 (mutter 50.1) session at scale 1.5, 24×80: the frame
+        // law wants 1156×720, `1156/1.5 = 770.67` rounds to 771 logical, and the
+        // compositor returns 1157×720 — one px the request can never win. The
+        // grid is nevertheless exactly the 24×80 that was asked for, because
+        // `pad_split` absorbs the stray px into the right-edge band (`dims`
+        // reports `band_right=1`, `crop_*=0`), which is precisely what the
+        // per-edge bands exist for.
+        //
+        // Pixel equality therefore burned the whole correction budget every
+        // fractional-scale launch — three synchronous `request_inner_size` +
+        // resync + redraw round trips, at the most latency-sensitive moment a
+        // window has, fighting for a size the compositor cannot express — and
+        // then parked the arm until the deadline instead of disarming. Comparing
+        // the GRID asks the question the settle actually cares about: 1.25/1.5
+        // now settle on the first configure like 1× and 2× always did, while the
+        // real defect this mechanism exists for (GNOME subtracting the 35 px CSD
+        // header, which costs three whole ROWS) still differs in the grid and is
+        // still corrected.
+        let grid_now = self.grid_dims_for(wid, size);
+        if grid_now == (settle.rows, settle.cols) {
+            if size != intended {
+                aterm_log::debug!(
+                    "initial-frame settle: {}x{} carries the intended {}x{} grid \
+                     (frame law wanted {}x{}; the {}px residue is band-absorbed, \
+                     unrepresentable at this scale) — settled",
+                    size.width,
+                    size.height,
+                    settle.cols,
+                    settle.rows,
+                    intended.width,
+                    intended.height,
+                    (size.width as i64 - intended.width as i64).abs()
+                        + (size.height as i64 - intended.height as i64).abs()
+                );
+            }
             if settle.corrected && let Some(ws) = self.windows.get_mut(&wid) {
                 ws.initial_frame_settle = None;
             }
             return;
         }
+        aterm_log::debug!(
+            "initial-frame settle: {}x{} grids {}x{}, attach asked for {}x{} — \
+             re-requesting {}x{} ({} correction(s) left)",
+            size.width,
+            size.height,
+            grid_now.1,
+            grid_now.0,
+            settle.cols,
+            settle.rows,
+            intended.width,
+            intended.height,
+            settle.corrections.saturating_sub(1)
+        );
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -4266,6 +4331,57 @@ mod tests {
         assert!(
             settle_state(&app).is_none(),
             "intended size after a correction = settled: disarm"
+        );
+    }
+
+    /// FRACTIONAL SCALE (125% / 150% — the everyday Linux HiDPI settings): the
+    /// compositor cannot always hand back the exact physical frame the law asks
+    /// for, because winit's Wayland size round-trips through a WHOLE-NUMBER
+    /// logical size. Measured in a nested GNOME 50 session at scale 1.5, 24×80:
+    /// the law wants 1156×720 and the surface comes back 1157×720 — forever.
+    /// That residue is band-absorbed and the GRID is exactly the 24×80 asked
+    /// for, so the settle must call it settled instead of spending its whole
+    /// budget on a size that does not exist. A residue of a WHOLE CELL is a real
+    /// grid change and must still be corrected.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn initial_frame_settle_accepts_a_band_absorbed_fractional_scale_residue() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let intended = arm_settle(&mut app, 24, 80, 3);
+        let (cell_w, _) = app.win_cell_size(wid);
+
+        // +1 px of width: unrepresentable-frame residue, absorbed by the band.
+        let residue = PhysicalSize::new(intended.width + 1, intended.height);
+        assert_eq!(
+            app.grid_dims_for(wid, residue),
+            (24, 80),
+            "negative control: a 1 px residue must NOT move the grid"
+        );
+        app.settle_initial_frame(wid, residue);
+        let s = settle_state(&app).expect("still armed — the lossy echo may yet arrive");
+        assert_eq!(
+            s.corrections, 3,
+            "a band-absorbed residue must spend NO correction (pre-fix: spent one, \
+             then two more, on every fractional-scale launch)"
+        );
+        assert!(!s.corrected);
+
+        // A WHOLE cell of width is a genuine column loss: still corrected.
+        let short = PhysicalSize::new(
+            intended.width - u32::try_from(cell_w).expect("cell width fits u32"),
+            intended.height,
+        );
+        assert_ne!(
+            app.grid_dims_for(wid, short),
+            (24, 80),
+            "negative control: a whole cell must move the grid"
+        );
+        app.settle_initial_frame(wid, short);
+        assert_eq!(
+            settle_state(&app).expect("armed").corrections,
+            2,
+            "a real grid change still spends exactly one correction"
         );
     }
 

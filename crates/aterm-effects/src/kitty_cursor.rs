@@ -93,6 +93,11 @@ const REVIVE_GATE: f32 = 0.35;
 /// Fade-in / fade-out durations (seconds).
 const FADE_IN: f32 = 0.35;
 const FADE_OUT: f32 = 0.75;
+/// Total wall-clock time of the classic cursor kitty's off-glass line-fold
+/// seam. Fourteen to eighteen 60 Hz samples are enough to read both the leave
+/// and arrive beats, while a sparse frame past the bound lands immediately
+/// instead of replaying stale travel after an occlusion.
+pub const CURSOR_FOLD_DURATION: Duration = Duration::from_millis(280);
 /// Scintillation rate of the exit StarWink, in radians across the whole fade-out.
 ///
 /// INVARIANT: keep `EXIT_STAR_SCINT / FADE_OUT / TAU <= 3.2` Hz — the same bound
@@ -280,6 +285,43 @@ pub struct CatPose {
     pub lead: f32,
     /// Baked blink/squint frame for this present.
     pub eyes: EyesFrame,
+}
+
+/// Direction of a positively authenticated classic cursor-kitty line fold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CatFoldDirection {
+    Forward,
+    Reverse,
+}
+
+/// The wall-clock fold sample handed to the pixel placement layer. CursorCat
+/// owns the behavioral clock; it deliberately does not know cell metrics,
+/// custom sprite dimensions, pane offsets, or any renderer coordinate.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CatFoldFrame {
+    pub started: Instant,
+    pub direction: CatFoldDirection,
+    /// Linear whole-seam progress, `0..1`. The placement layer splits it into
+    /// the leaving and arriving half-beats and applies their easing.
+    pub progress: f32,
+}
+
+/// CursorCat's complete placement-side verdict for one rendered frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CursorCatPlacementFrame {
+    /// The same injected frame clock used to sample the lifecycle. Placement
+    /// uses it to reject stale geometry after a sparse/occluded frame gap.
+    pub sampled_at: Instant,
+    pub fold: Option<CatFoldFrame>,
+    /// Persistent facing outside a fold. An active fold's direction outranks
+    /// this value so a new forward key cannot mirror a reverse body mid-seam.
+    pub facing_left: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CatFold {
+    started: Instant,
+    direction: CatFoldDirection,
 }
 
 impl CatPose {
@@ -566,6 +608,13 @@ pub struct CursorCat {
     /// The shared dance-beat phase in beats (fractional), from the same
     /// host sync. Meaningful only while `sing > 0`.
     sing_beat: f32,
+    /// Authenticated line-fold choreography. The classifier and clock live in
+    /// CursorGlow; CursorCat owns only the bounded behavioral episode, while
+    /// WordDecorations resolves it into pixels for the current sprite/geometry.
+    fold: Option<CatFold>,
+    /// Resting direction after a reverse fold. An active fold's own direction
+    /// wins in [`Self::placement_frame`].
+    facing_left: bool,
     rng: u32,
 }
 
@@ -607,6 +656,8 @@ impl Default for CursorCat {
             delight_chain: 0,
             sing: 0.0,
             sing_beat: 0.0,
+            fold: None,
+            facing_left: false,
             rng: 0x2545_F491,
         }
     }
@@ -640,15 +691,111 @@ impl CursorCat {
         self.discovery_until = None;
         self.collection_paused_at = None;
         self.colors = None;
+        self.fold = None;
+        self.facing_left = false;
         if let Some(pending) = self.pending_look.take() {
             self.look = pending;
         }
         self.reset_spine();
     }
 
+    /// Consume the lossless classifier verdict produced by CursorGlow.
+    ///
+    /// Forward pulses replace the host's historical `on_key(at, true)` call,
+    /// preserving the one canonical momentum law. Reverse folds do NOT call
+    /// `on_key(false)`: the input seam already delivered that physical
+    /// Backspace, and repeating it here would double-drain momentum and
+    /// double-kick the oops reaction.
+    pub fn on_motion_pulse(&mut self, pulse: crate::cursor_glow::CursorCatMotionPulse) {
+        self.on_motion_pulse_with_owner(pulse, true);
+    }
+
+    /// Build the authenticated tenure used by pet mode's singing face without
+    /// starting an ordinary flying episode. The resident pet owns idle glass,
+    /// but the held-key song still owes the same real cursor-travel floor as
+    /// classic mode; starving this feed makes that authored handoff unreachable.
+    pub fn on_pet_mode_motion_pulse(
+        &mut self,
+        pulse: crate::cursor_glow::CursorCatMotionPulse,
+    ) {
+        self.on_motion_pulse_with_owner(pulse, false);
+    }
+
+    fn on_motion_pulse_with_owner(
+        &mut self,
+        pulse: crate::cursor_glow::CursorCatMotionPulse,
+        ordinary_flight_owned: bool,
+    ) {
+        use crate::cursor_glow::CursorCatMotionKind;
+
+        match pulse.kind {
+            CursorCatMotionKind::Advance => {
+                self.on_key_with_owner(pulse.at, true, ordinary_flight_owned);
+                self.facing_left = false;
+            }
+            CursorCatMotionKind::FoldForward => {
+                self.on_key_with_owner(pulse.at, true, ordinary_flight_owned);
+                self.facing_left = false;
+                if self.is_active() && (ordinary_flight_owned || self.sing > 0.0) {
+                    self.fold = Some(CatFold {
+                        started: pulse.at,
+                        direction: CatFoldDirection::Forward,
+                    });
+                }
+            }
+            CursorCatMotionKind::FoldReverse => {
+                self.facing_left = true;
+                if self.is_active() && (ordinary_flight_owned || self.sing > 0.0) {
+                    self.fold = Some(CatFold {
+                        started: pulse.at,
+                        direction: CatFoldDirection::Reverse,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Sample the cat's bounded, geometry-free placement state. A sparse frame
+    /// after the duration returns settled immediately; it never replays stale
+    /// travel after an occlusion. The stale private stamp may remain until the
+    /// next pulse/reset because this accessor is read-only, but it can no
+    /// longer produce a fold once its wall-time bound elapsed.
+    #[must_use]
+    pub fn placement_frame(&self, now: Instant) -> CursorCatPlacementFrame {
+        let fold = self.fold.and_then(|fold| {
+            let progress = now.saturating_duration_since(fold.started).as_secs_f32()
+                / CURSOR_FOLD_DURATION.as_secs_f32();
+            (progress < 1.0).then_some(CatFoldFrame {
+                started: fold.started,
+                direction: fold.direction,
+                progress: progress.clamp(0.0, 1.0),
+            })
+        });
+        CursorCatPlacementFrame {
+            sampled_at: now,
+            fold,
+            facing_left: fold.map_or(self.facing_left, |active| {
+                matches!(active.direction, CatFoldDirection::Reverse)
+            }),
+        }
+    }
+
+    /// Retire only renderer-coordinate continuity. A LOCK A/B cursor/style/
+    /// scroll divergence may not carry an in-flight edge fold into the next
+    /// coordinate space, but a collection hello or singing appearance remains
+    /// a presentation promise and must continue settled at the live caret.
+    pub fn rebase_placement(&mut self) {
+        self.fold = None;
+        self.facing_left = false;
+    }
+
     /// Stamp one committed text keystroke: `forward` for a normal char / space /
     /// newline (the cursor advances), `!forward` for a backspace. Only text keys.
     pub fn on_key(&mut self, now: Instant, forward: bool) {
+        self.on_key_with_owner(now, forward, true);
+    }
+
+    fn on_key_with_owner(&mut self, now: Instant, forward: bool, ordinary_flight_owned: bool) {
         let dt = self
             .last
             .map(|l| now.saturating_duration_since(l).as_secs_f32())
@@ -693,6 +840,7 @@ impl CursorCat {
             // over after.
             if let State::FadeOut(t0) = self.state
                 && !self.collection_hello
+                && (ordinary_flight_owned || self.sing > 0.0)
                 && self.momentum.value(now) >= REVIVE_GATE
             {
                 let faded = (now.saturating_duration_since(t0).as_secs_f32() / FADE_OUT).min(1.0);
@@ -715,7 +863,8 @@ impl CursorCat {
         // the canonical metric's current high-band run has at least
         // MIN_RUN_KEYS forward events. DETERMINISTIC: a fully earned run ALWAYS
         // summons; no rarity roll can discard it.
-        if matches!(self.state, State::Hidden)
+        if ordinary_flight_owned
+            && matches!(self.state, State::Hidden)
             && self.sustain >= CAT_DWELL
             && self.run_keys >= MIN_RUN_KEYS
         {
@@ -735,6 +884,8 @@ impl CursorCat {
         self.sustain = 0.0;
         self.run_keys = 0;
         self.colors = None;
+        self.fold = None;
+        self.facing_left = false;
         if let Some(pending) = self.pending_look.take() {
             self.look = pending;
         }
@@ -1390,6 +1541,10 @@ impl CursorCat {
     /// bounded hold, then disappears in one step. Ordinary earned flights are
     /// not rendered by this path.
     pub fn static_frame(&mut self, now: Instant) -> CatFrame {
+        // A reduced-motion sample is a settled placement verdict, not a paused
+        // off-glass seam that may resume halfway through when policy changes.
+        self.fold = None;
+        self.facing_left = false;
         let now = self.collection_sample_time(now);
         let look = self.look;
         if self.collection_hello && self.discovery_active(now) {
@@ -1435,10 +1590,14 @@ impl CursorCat {
         // held-key celebration presents as a fully opaque STILL — the
         // singing face without the dance loop (pose STILL, bob 0 — the same
         // structural stillness as the hello above), appearing while the
-        // drive is high and disappearing in one step below half drive (the
-        // hello's one-step law; a crossfade is motion this path refuses).
+        // drive holds the authored singing face and disappearing in one step
+        // below its 0.33 face-swap threshold (the hello's one-step law; a
+        // crossfade is motion this path refuses). Keeping the still through
+        // 0.33 is also the late-frame safety net: a render occluded through
+        // the first half of wind-down can sample 1.0 -> 0.49 directly while
+        // the caret-fed resident finishes readying behind the opaque still.
         // The riff is host policy and plays independently if sound is on.
-        if self.sing >= 0.5 {
+        if self.sing >= 0.33 {
             return CatFrame {
                 alpha: 255,
                 exit: CatExit::Plain,
@@ -1464,9 +1623,9 @@ impl CursorCat {
         // ordinary flight is not drawn under reduced motion anyway), so the
         // flight retires to Hidden, `is_active` clears, and the latch releases.
         //
-        // Gated to `sing == 0`: a winding-down celebration (`0 < sing < 0.5`)
+        // Gated to `sing == 0`: a winding-down celebration (`0 < sing < 0.33`)
         // keeps the hello's ONE-STEP disappearance in the fall-through below
-        // (it reads alpha 0 the instant the drive drops under half), and it
+        // (it reads alpha 0 the instant the drive drops below the face swap), and it
         // retires through this very lifecycle once the drive settles to 0.
         if self.sing == 0.0 && !matches!(self.state, State::Hidden) {
             let grounded = self.decayed(now) < LOW;
@@ -1654,6 +1813,8 @@ impl CursorCat {
                 if t >= 1.0 {
                     self.state = State::Hidden;
                     self.flight = None;
+                    self.fold = None;
+                    self.facing_left = false;
                     self.reaction = CatReaction::Cruise;
                     self.reaction_until = None;
                     self.discovery_until = None;
@@ -2056,6 +2217,78 @@ mod tests {
 
     const V056_MIN_RUN_KEYS: u32 = 10;
     const _: () = assert!(MIN_RUN_KEYS > V056_MIN_RUN_KEYS);
+
+    #[test]
+    fn authenticated_fold_is_bounded_by_wall_time_and_hidden_cats_ignore_it() {
+        use crate::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
+
+        let t0 = Instant::now();
+        let mut hidden = CursorCat::default();
+        hidden.on_motion_pulse(CursorCatMotionPulse {
+            at: t0,
+            kind: CursorCatMotionKind::FoldForward,
+        });
+        assert!(
+            hidden.placement_frame(t0).fold.is_none(),
+            "one fold pulse cannot materialize an unearned cat"
+        );
+
+        let mut cat = CursorCat {
+            state: State::Shown,
+            ..CursorCat::default()
+        };
+        cat.on_motion_pulse(CursorCatMotionPulse {
+            at: t0,
+            kind: CursorCatMotionKind::FoldForward,
+        });
+        let launch = cat.placement_frame(t0).fold.expect("live cat folds");
+        assert_eq!(launch.direction, CatFoldDirection::Forward);
+        assert_eq!(launch.progress, 0.0);
+
+        let middle = cat
+            .placement_frame(t0 + CURSOR_FOLD_DURATION / 2)
+            .fold
+            .expect("the midpoint is still a bounded seam");
+        assert!((middle.progress - 0.5).abs() < 1e-6);
+        assert!(
+            cat.placement_frame(t0 + CURSOR_FOLD_DURATION)
+                .fold
+                .is_none(),
+            "a sparse frame at the duration lands immediately"
+        );
+    }
+
+    #[test]
+    fn reverse_fold_changes_place_without_double_delivering_backspace() {
+        use crate::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
+
+        let t0 = Instant::now();
+        let mut cat = CursorCat {
+            state: State::Shown,
+            ..CursorCat::default()
+        };
+        cat.momentum.set_value(t0, 0.8);
+        let before = cat.momentum(t0);
+        cat.on_motion_pulse(CursorCatMotionPulse {
+            at: t0,
+            kind: CursorCatMotionKind::FoldReverse,
+        });
+        assert_eq!(
+            cat.momentum(t0),
+            before,
+            "the input seam already delivered the physical Backspace"
+        );
+        let placement = cat.placement_frame(t0);
+        assert!(placement.facing_left);
+        assert_eq!(
+            placement.fold.expect("reverse seam").direction,
+            CatFoldDirection::Reverse
+        );
+
+        let _ = cat.static_frame(t0 + Duration::from_millis(1));
+        let settled = cat.placement_frame(t0 + Duration::from_millis(1));
+        assert!(settled.fold.is_none() && !settled.facing_left);
+    }
 
     /// PHOTOSENSITIVITY, pinned. The cat's exit StarWink is a 255-coverage
     /// pure-white star carrying a 40% amplitude swing, and it was the FASTEST
@@ -3765,7 +3998,7 @@ mod tests {
 
     /// THE REDUCED-MOTION ARM: a static celebration — full opacity, the
     /// singing face, pose pinned STILL and `bob = 0` (no dance loop), with
-    /// the hello's one-step disappearance below half drive.
+    /// the hello's one-step disappearance below the authored 0.33 face swap.
     #[test]
     fn reduced_motion_celebration_is_a_static_singing_pose() {
         let mut c = CursorCat::default();
@@ -3777,7 +4010,16 @@ mod tests {
         assert_eq!(f.pose, CatPose::STILL, "no dance loop under reduced motion");
         assert_eq!(f.bob, 0.0, "no bob under reduced motion");
         assert_eq!(f.render_look().variant, CatGlyphId::S115);
-        // Below half drive: one-step off (the hello's disappearance law).
+        // A late/occluded render can jump directly past the old 0.50 cutoff.
+        // The static singer must retain custody until the authored face swap,
+        // so that first sampled wind-down frame cannot be a blank while the
+        // resident pet has not yet received an intermediate fade-in tick.
+        let late = armed_at + Duration::from_millis(600);
+        c.set_singing(late, sync(0.49, 6.3));
+        let retained = c.static_frame(late);
+        assert_eq!(retained.alpha, 255, "late wind-down keeps opaque custody");
+        assert_eq!(retained.render_look().variant, CatGlyphId::S115);
+        // Below the face swap: one-step off (the hello's disappearance law).
         let t1 = armed_at + Duration::from_millis(800);
         c.set_singing(t1, sync(0.3, 7.3));
         let off = c.static_frame(t1);

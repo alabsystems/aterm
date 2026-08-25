@@ -26,10 +26,13 @@ use aterm_spec::derive::{
     composite_accessibility_route_model, config_catalog_snapshot_model,
     config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
     ct_frac_bearing_model, cursor_cat_curse_wince_model, cursor_cat_earn_floor_model,
-    cursor_cat_model, cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_model,
-    cursor_move_candidate_model, cursor_scroll_signal_model, cursor_viewport_lifecycle_model,
+    cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
+    cursor_cutout_clip_model, cursor_echo_commit_retry_model, cursor_effect_scroll_model,
+    cursor_model, cursor_move_candidate_model, cursor_scroll_signal_model,
+    cursor_viewport_lifecycle_model,
     damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
     dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
+    effect_presentability_settle_model,
     emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
     exact_instance_retention_model, exact_profanity_completion_model, fallback_band_clip_model,
     fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
@@ -65,8 +68,9 @@ use aterm_spec::derive::{
     rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
     rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_jump_burst_lifecycle_model,
     rainbow_move_admission_model, rainbow_terminus_admission_model, read_image_seq_model,
-    recording_model, recovery_redraw_model, release_channel_floor_model,
-    release_channel_single_head_model, release_durable_post_intent_model,
+    recording_model, recovery_redraw_model, reduced_motion_companion_handoff_model,
+    release_channel_floor_model, release_channel_single_head_model,
+    release_durable_post_intent_model,
     release_historical_recovery_model, release_journal_prefix_model,
     release_key_epoch_transition_model, release_published_identity_model,
     release_publisher_fence_model, release_yank_successor_first_model,
@@ -7305,6 +7309,58 @@ fn derived_cursor_cat_proves_and_catches_hidden_expiry() {
     assert_proves_and_catches(&cursor_cat_model());
 }
 
+/// The classic flying kitty changes viewport edges only after a complete body
+/// rectangle was sampled wholly off glass. The same bounded machine covers
+/// forward (right→left) and reverse (left→right) folds. `Buggy=1` is the old
+/// pure-placement teleport: its first transition lands directly on the other
+/// on-glass edge, so the history invariant fails in both directions.
+#[test]
+fn derived_cursor_cat_fold_proves_and_catches_direct_edge_teleport() {
+    let healthy = cursor_cat_fold_model();
+    assert_proves_and_catches(&healthy);
+    assert_every_invariant_carries_a_mutant(&healthy, &["StateBounded"]);
+
+    for (start, origin, destination) in [("StartForward", 1, 0), ("StartReverse", 0, 1)] {
+        let mut st = healthy.init_state();
+        assert!(healthy.fire(start, &mut st));
+        assert_eq!(st[&"origin_side"], origin, "{start}");
+        assert_eq!(st[&"side"], origin, "{start}");
+        assert!(healthy.fire("LeaveOff", &mut st));
+        assert_eq!(st[&"phase"], 2, "{start}");
+        assert_eq!(st[&"off_glass"], 1, "{start}");
+        assert_eq!(st[&"off_samples"], 1, "{start}");
+        assert_eq!(st[&"side"], origin, "{start}");
+        assert!(healthy.fire("CrossSide", &mut st));
+        assert_eq!(st[&"phase"], 3, "{start}");
+        assert_eq!(st[&"off_glass"], 1, "{start}");
+        assert_eq!(st[&"side"], destination, "{start}");
+        assert!(healthy.check_invariant("OffGlassBeforeSideChange", &st));
+        assert!(healthy.fire("EnterGlass", &mut st));
+        assert_eq!(st[&"phase"], 4, "{start}");
+        assert_eq!(st[&"off_glass"], 0, "{start}");
+        assert_eq!(st[&"side"], destination, "{start}");
+        assert!(healthy.check_invariant("OffGlassBeforeSideChange", &st));
+
+        let mut buggy = cursor_cat_fold_model();
+        for cst in &mut buggy.consts {
+            if cst.0 == "Buggy" {
+                cst.1 = 1;
+            }
+        }
+        let mut teleported = buggy.init_state();
+        assert!(buggy.fire(start, &mut teleported));
+        assert!(buggy.fire("LeaveOff", &mut teleported));
+        assert_eq!(teleported[&"phase"], 4, "{start}");
+        assert_eq!(teleported[&"side"], destination, "{start}");
+        assert_eq!(teleported[&"off_glass"], 0, "{start}");
+        assert_eq!(teleported[&"off_samples"], 0, "{start}");
+        assert!(
+            !buggy.check_invariant("OffGlassBeforeSideChange", &teleported),
+            "{start}: direct on-glass side change must be caught"
+        );
+    }
+}
+
 /// The cursor-trail master owns only ordinary rainbow kitty momentum. With the master
 /// off, typing is a semantic no-op for the ordinary host arm; a collection
 /// still enters its promised visible hello. The mutant reproduces the former
@@ -7386,6 +7442,177 @@ fn derived_kitty_sing_detector_proves_and_catches_eight_press_arm() {
 #[test]
 fn derived_cursor_cat_earn_floor_proves_and_catches_v056_threshold() {
     assert_proves_and_catches(&cursor_cat_earn_floor_model());
+}
+
+/// Reduced motion keeps one opaque companion on glass throughout the singer's
+/// handoff to the resident pet. The ordinary sampled cadence and a direct late
+/// 1.0 -> 0.49 observation take different actions but converge on the same
+/// static-tail custody; direct 1.0 -> 0.30 and 1.0 -> 0.0 samples return the
+/// already-ready resident immediately. The mutant restores the historical
+/// all-transparent handoff hole on every late route.
+#[test]
+fn derived_reduced_motion_companion_handoff_proves_and_catches_blackout() {
+    let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
+        .into_iter()
+        .map(|candidate| candidate.name)
+        .collect();
+    for expected in [
+        "ReducedMotionCompanionHandoff",
+        "CursorCatMotionPulseRouting",
+    ] {
+        assert!(
+            registered.contains(expected),
+            "{expected} must participate in the global spec registry"
+        );
+    }
+
+    let model = reduced_motion_companion_handoff_model();
+    assert_proves_and_catches(&model);
+
+    let mut cadenced = model.init_state();
+    assert!(model.fire("StartReducedSong", &mut cadenced));
+    assert_eq!(cadenced[&"singer_visible"], 1);
+    assert_eq!(cadenced[&"pet_visible"], 0);
+    assert!(model.fire("SampleAtHalfCutoff", &mut cadenced));
+    assert_eq!(cadenced[&"pet_ready"], 1);
+    assert_eq!(cadenced[&"singer_visible"], 1);
+    assert!(model.fire("SampleCadencedBelowHalf", &mut cadenced));
+    assert_eq!(cadenced[&"phase"], 3);
+    assert_eq!(cadenced[&"singer_visible"] + cadenced[&"pet_visible"], 1);
+    assert!(model.check_invariant("LiveTailKeepsCompanionVisible", &cadenced));
+    assert!(model.fire("SampleBelowFaceSwap", &mut cadenced));
+    assert_eq!(cadenced[&"singer_visible"], 0);
+    assert_eq!(cadenced[&"pet_visible"], 1);
+    assert!(model.fire("DrainSongTail", &mut cadenced));
+    assert_eq!(cadenced[&"song_tail_live"], 0);
+    assert_eq!(cadenced[&"pet_visible"], 1);
+
+    let mut late = model.init_state();
+    assert!(model.fire("StartReducedSong", &mut late));
+    assert_eq!(late[&"pet_ready"], 1);
+    assert!(model.fire("SampleLateBelowHalf", &mut late));
+    assert_eq!(late[&"phase"], 3);
+    assert_eq!(late[&"pet_ready"], 1);
+    assert_eq!(late[&"singer_visible"], 1);
+    assert_eq!(late[&"pet_visible"], 0);
+    assert!(model.check_invariant("LiveTailKeepsCompanionVisible", &late));
+    assert!(model.fire("SampleBelowFaceSwap", &mut late));
+    assert_eq!(late[&"pet_visible"], 1);
+
+    let mut late_below_swap = model.init_state();
+    assert!(model.fire("StartReducedSong", &mut late_below_swap));
+    assert!(model.fire("SampleLateBelowFaceSwap", &mut late_below_swap));
+    assert_eq!(late_below_swap[&"phase"], 4);
+    assert_eq!(late_below_swap[&"song_tail_live"], 1);
+    assert_eq!(late_below_swap[&"singer_visible"], 0);
+    assert_eq!(late_below_swap[&"pet_ready"], 1);
+    assert_eq!(late_below_swap[&"pet_visible"], 1);
+    assert!(model.check_invariant("LiveTailKeepsCompanionVisible", &late_below_swap));
+
+    let mut late_drained = model.init_state();
+    assert!(model.fire("StartReducedSong", &mut late_drained));
+    assert!(model.fire("SampleLateDrained", &mut late_drained));
+    assert_eq!(late_drained[&"phase"], 5);
+    assert_eq!(late_drained[&"song_tail_live"], 0);
+    assert_eq!(late_drained[&"singer_visible"], 0);
+    assert_eq!(late_drained[&"pet_ready"], 1);
+    assert_eq!(late_drained[&"pet_visible"], 1);
+    assert!(model.check_invariant("GlassCustodyIsExclusive", &late_drained));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut at_half = buggy.init_state();
+    assert!(buggy.fire("StartReducedSong", &mut at_half));
+    assert!(buggy.fire("SampleAtHalfCutoff", &mut at_half));
+    assert_eq!(at_half[&"pet_ready"], 1);
+    assert_eq!(at_half[&"singer_visible"] + at_half[&"pet_visible"], 0);
+    assert!(!buggy.check_invariant("LiveTailKeepsCompanionVisible", &at_half));
+
+    let mut late_gap = buggy.init_state();
+    assert!(buggy.fire("StartReducedSong", &mut late_gap));
+    assert!(buggy.fire("SampleLateBelowHalf", &mut late_gap));
+    assert_eq!(late_gap[&"phase"], 3);
+    assert_eq!(late_gap[&"singer_visible"] + late_gap[&"pet_visible"], 0);
+    assert!(!buggy.check_invariant("LiveTailKeepsCompanionVisible", &late_gap));
+
+    let mut late_below_swap_gap = buggy.init_state();
+    assert!(buggy.fire("StartReducedSong", &mut late_below_swap_gap));
+    assert!(buggy.fire("SampleLateBelowFaceSwap", &mut late_below_swap_gap));
+    assert_eq!(late_below_swap_gap[&"pet_ready"], 1);
+    assert_eq!(
+        late_below_swap_gap[&"singer_visible"] + late_below_swap_gap[&"pet_visible"],
+        0
+    );
+    assert!(!buggy.check_invariant("LiveTailKeepsCompanionVisible", &late_below_swap_gap));
+
+    let mut late_drained_gap = buggy.init_state();
+    assert!(buggy.fire("StartReducedSong", &mut late_drained_gap));
+    assert!(buggy.fire("SampleLateDrained", &mut late_drained_gap));
+    assert_eq!(late_drained_gap[&"pet_ready"], 1);
+    assert_eq!(
+        late_drained_gap[&"singer_visible"] + late_drained_gap[&"pet_visible"],
+        0
+    );
+    assert!(!buggy.check_invariant("GlassCustodyIsExclusive", &late_drained_gap));
+}
+
+/// Both render routes take and forward the producer's authenticated cat pulse
+/// in the frame that creates it. After either route consumes it, changing
+/// routes cannot expose another delivery. The mutant strands the composed
+/// pulse, then demonstrates the stale delivery after switching to ordinary.
+#[test]
+fn derived_cursor_cat_motion_pulse_routing_proves_and_catches_composed_strand() {
+    let model = cursor_cat_motion_pulse_routing_model();
+    assert_proves_and_catches(&model);
+
+    let mut ordinary = model.init_state();
+    assert!(model.fire("AuthenticatePulse", &mut ordinary));
+    assert!(model.fire("SelectOrdinaryRoute", &mut ordinary));
+    assert!(model.fire("RenderOrdinaryRoute", &mut ordinary));
+    assert_eq!(ordinary[&"attempted_route"], 1);
+    assert_eq!(ordinary[&"pending"], 0);
+    assert_eq!(ordinary[&"consumes"], 1);
+    assert_eq!(ordinary[&"deliveries"], 1);
+    assert!(model.fire("SwitchToComposedExtractedRoute", &mut ordinary));
+    assert!(
+        !model.fire("RenderComposedExtractedRoute", &mut ordinary),
+        "the ordinary route already consumed the one-shot pulse"
+    );
+    assert_eq!(ordinary[&"deliveries"], 1);
+
+    let mut composed = model.init_state();
+    assert!(model.fire("AuthenticatePulse", &mut composed));
+    assert!(model.fire("SelectComposedExtractedRoute", &mut composed));
+    assert!(model.fire("RenderComposedExtractedRoute", &mut composed));
+    assert_eq!(composed[&"attempted_route"], 2);
+    assert_eq!(composed[&"pending"], 0);
+    assert_eq!(composed[&"consumes"], 1);
+    assert_eq!(composed[&"deliveries"], 1);
+    assert!(model.fire("SwitchToOrdinaryRoute", &mut composed));
+    assert!(
+        !model.fire("RenderOrdinaryRoute", &mut composed),
+        "the composed route already consumed the one-shot pulse"
+    );
+    assert_eq!(composed[&"deliveries"], 1);
+    assert!(model.check_invariant("RouteSwitchCannotReplay", &composed));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut stranded = buggy.init_state();
+    assert!(buggy.fire("AuthenticatePulse", &mut stranded));
+    assert!(buggy.fire("SelectComposedExtractedRoute", &mut stranded));
+    assert!(buggy.fire("RenderComposedExtractedRoute", &mut stranded));
+    assert_eq!(stranded[&"pending"], 1);
+    assert_eq!(stranded[&"consumes"], 0);
+    assert_eq!(stranded[&"deliveries"], 0);
+    assert_eq!(stranded[&"stranded"], 1);
+    assert!(!buggy.check_invariant("NoComposedRouteStrand", &stranded));
+    assert!(!buggy.check_invariant("AttemptConsumesAndDeliversExactlyOnce", &stranded));
+
+    assert!(buggy.fire("SwitchToOrdinaryRoute", &mut stranded));
+    assert!(buggy.fire("RenderOrdinaryRoute", &mut stranded));
+    assert_eq!(stranded[&"pending"], 0);
+    assert_eq!(stranded[&"deliveries"], 1);
+    assert_eq!(stranded[&"stale_replay"], 1);
+    assert!(!buggy.check_invariant("RouteSwitchCannotReplay", &stranded));
 }
 
 /// A cold, unwitnessed cursor delta stays dark in both cursor-effect engines;
@@ -7489,6 +7716,150 @@ fn derived_rainbow_move_admission_proves_and_catches_stray_light() {
     );
 }
 
+/// A same-generation LOCK-A await holds a cold or warm candidate until LOCK B
+/// either rejects it or schedules one exact-echo retry. Every scheduled retry
+/// has exactly one terminal disposition: settle, retire, or lifecycle cancel.
+/// The blackout mutant drops the candidate/resident during the await.
+#[test]
+fn derived_cursor_echo_commit_retry_holds_then_consumes_once() {
+    let model = cursor_echo_commit_retry_model();
+    assert_proves_and_catches(&model);
+
+    // LOCK A is allowed to be one publication early. The await holds both the
+    // proof candidate and the already-streaming resident, but cannot birth.
+    let mut awaited = model.init_state();
+    assert!(model.fire("ArmTypedCandidate", &mut awaited));
+    assert!(model.fire("LockASameGenerationAwait", &mut awaited));
+    assert_eq!(awaited["phase"], 2);
+    assert_eq!(awaited["candidate_pending"], 1);
+    assert_eq!(awaited["resident_present"], 1);
+    assert_eq!(awaited["current_projection"], 1);
+    assert_eq!(awaited["retry_pending"], 0);
+    assert_eq!(awaited["births"], 0);
+
+    // An exact LOCK-B echo schedules a retry only. The next coherent LOCK-A
+    // pass consumes it once and is the sole confirmation/admission/birth.
+    let mut scheduled = awaited.clone();
+    assert!(model.fire("FinalExtractEchoStraddle", &mut scheduled));
+    assert_eq!(scheduled["phase"], 3);
+    assert_eq!(scheduled["retry_pending"], 1);
+    assert_eq!(scheduled["resident_present"], 1);
+    assert_eq!(scheduled["current_projection"], 0);
+    assert_eq!(scheduled["births"], 0);
+
+    let mut consumed = scheduled.clone();
+    assert!(model.fire("NextEchoSettle", &mut consumed));
+    assert_eq!(consumed["phase"], 4);
+    assert_eq!(consumed["retry_pending"], 0);
+    assert_eq!(consumed["retry_consumes"], 1);
+    assert_eq!(consumed["confirmations"], 1);
+    assert_eq!(consumed["admissions"], 1);
+    assert_eq!(consumed["births"], 1);
+    assert_eq!(consumed["current_projection"], 1);
+    assert!(
+        !model.fire("NextEchoSettle", &mut consumed),
+        "an exact-echo retry credential is one-shot"
+    );
+
+    // Cold-start twin: no resident or projected pixels exist at arm/await,
+    // but the candidate survives the same straddle and exact settlement earns
+    // the first resident/projection. The GUI-facing action order is unchanged.
+    let mut cold_awaited = model.init_state();
+    assert!(model.fire("SelectColdResident", &mut cold_awaited));
+    assert_eq!(cold_awaited["resident_present"], 0);
+    assert_eq!(cold_awaited["current_projection"], 0);
+    assert!(model.fire("ArmTypedCandidate", &mut cold_awaited));
+    assert_eq!(cold_awaited["resident_at_arm"], 0);
+    assert!(model.fire("LockASameGenerationAwait", &mut cold_awaited));
+    assert_eq!(cold_awaited["candidate_pending"], 1);
+    assert_eq!(cold_awaited["resident_present"], 0);
+    assert_eq!(cold_awaited["current_projection"], 0);
+
+    let mut cold_scheduled = cold_awaited;
+    assert!(model.fire("FinalExtractEchoStraddle", &mut cold_scheduled));
+    assert_eq!(cold_scheduled["retry_pending"], 1);
+    assert_eq!(cold_scheduled["resident_present"], 0);
+    assert_eq!(cold_scheduled["current_projection"], 0);
+    assert!(model.fire("NextEchoSettle", &mut cold_scheduled));
+    assert_eq!(cold_scheduled["retry_consumes"], 1);
+    assert_eq!(cold_scheduled["births"], 1);
+    assert_eq!(cold_scheduled["resident_present"], 1);
+    assert_eq!(cold_scheduled["current_projection"], 1);
+
+    // Once LOCK B has scheduled the exact-echo retry, the next probe may
+    // instead refute it (row mismatch or a later generation), or a lifecycle
+    // boundary may cancel it. Each path accounts for the sole credential and
+    // is terminal/dark; none can subsequently settle or birth.
+    for (action, retirements, cancellations) in
+        [("NextEchoRetire", 1, 0), ("LifecycleCancel", 0, 1)]
+    {
+        let mut dark = scheduled.clone();
+        assert!(model.fire(action, &mut dark), "drive {action}");
+        assert_eq!(dark["phase"], 4, "terminal {action}");
+        assert_eq!(dark["candidate_pending"], 0, "retire {action}");
+        assert_eq!(dark["resident_present"], 0, "ground {action}");
+        assert_eq!(dark["current_projection"], 0, "suppress {action}");
+        assert_eq!(dark["retry_pending"], 0, "spend {action}");
+        assert_eq!(dark["retry_consumes"], 0, "do not confirm {action}");
+        assert_eq!(dark["retry_retirements"], retirements, "retire {action}");
+        assert_eq!(
+            dark["retry_cancellations"], cancellations,
+            "cancel {action}"
+        );
+        assert_eq!(dark["confirmations"], 0, "no confirmation for {action}");
+        assert_eq!(dark["births"], 0, "no birth for {action}");
+        assert_eq!(
+            dark["retry_pending"]
+                + dark["retry_consumes"]
+                + dark["retry_retirements"]
+                + dark["retry_cancellations"],
+            1,
+            "exactly one disposition for {action}"
+        );
+        assert!(
+            !model.fire("NextEchoSettle", &mut dark),
+            "{action} cannot later settle"
+        );
+    }
+
+    // Each non-exact LOCK-B observation is a separate negative control. None
+    // may be reclassified as the exact retry or leave stale resident light.
+    for (action, kind) in [
+        ("LockBInterveningUnownedGeneration", 2),
+        ("LockBWrongTarget", 3),
+        ("LockBScrollDivergence", 4),
+        ("LockBStyleDivergence", 5),
+    ] {
+        let mut rejected = awaited.clone();
+        assert!(model.fire(action, &mut rejected), "drive {action}");
+        assert_eq!(rejected["commit_kind"], kind, "classify {action}");
+        assert_eq!(rejected["candidate_pending"], 0, "retire {action}");
+        assert_eq!(rejected["resident_present"], 0, "ground {action}");
+        assert_eq!(rejected["current_projection"], 0, "suppress {action}");
+        assert_eq!(rejected["retry_pending"], 0, "no retry for {action}");
+        assert_eq!(rejected["retry_retirements"], 0, "no retry for {action}");
+        assert_eq!(rejected["retry_cancellations"], 0, "no retry for {action}");
+        assert_eq!(rejected["births"], 0, "no birth for {action}");
+        assert!(
+            !model.fire("NextEchoSettle", &mut rejected),
+            "{action} cannot spend an exact-echo retry"
+        );
+    }
+
+    // Concrete non-vacuity witness for the historical blackout mutant.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut blacked_out = buggy.init_state();
+    assert!(buggy.fire("ArmTypedCandidate", &mut blacked_out));
+    assert!(buggy.fire("LockASameGenerationAwait", &mut blacked_out));
+    assert_eq!(blacked_out["candidate_pending"], 0);
+    assert_eq!(blacked_out["resident_present"], 0);
+    assert_eq!(blacked_out["current_projection"], 0);
+    assert!(
+        !buggy.check_invariant("AwaitHoldsCandidateAndResident", &blacked_out),
+        "the await-blackout mutant must violate the hold obligation"
+    );
+}
+
 /// Every cursor-light style requires a consumed, origin/target-bound candidate;
 /// typed/delete candidates additionally require an exact coherent content diff.
 /// The mutant restores the fresh-timestamp-alone shortcut and must fail on the
@@ -7523,21 +7894,104 @@ fn derived_cursor_move_candidate_proves_and_catches_timestamp_only_admission() {
     assert!(buggy.fire("ChargeResident", &mut torn));
     assert!(buggy.fire("ArmSynthetic", &mut torn));
     assert!(buggy.fire("ObserveMove", &mut torn));
-    assert!(buggy.fire("FinalExtractDrift", &mut torn));
+    assert!(buggy.fire("FinalExtractProjectionKeyDrift", &mut torn));
     assert_eq!(torn["resident_projection"], 1);
     assert!(
-        !buggy.check_invariant("ResidentProjectionRequiresFinalGeneration", &torn),
-        "a final-extraction generation drift must suppress both projected and resident cursor light"
+        !buggy.check_invariant("ResidentProjectionRequiresFinalProjectionKey", &torn),
+        "a final-extraction coordinate drift must suppress both projected and resident cursor light"
     );
 
     let mut resident_only = buggy.init_state();
     assert!(buggy.fire("ChargeResident", &mut resident_only));
-    assert!(buggy.fire("FinalExtractDrift", &mut resident_only));
+    assert!(buggy.fire("FinalExtractProjectionKeyDrift", &mut resident_only));
     assert_eq!(resident_only["projection"], 0);
     assert_eq!(resident_only["resident_projection"], 1);
     assert!(
-        !buggy.check_invariant("ResidentProjectionRequiresFinalGeneration", &resident_only),
+        !buggy.check_invariant(
+            "ResidentProjectionRequiresFinalProjectionKey",
+            &resident_only
+        ),
         "resident kitty/pet/Robi geometry must be independently covered"
+    );
+
+    let mut scrolled_resident = buggy.init_state();
+    assert!(buggy.fire("ChargeResident", &mut scrolled_resident));
+    assert!(buggy.fire("FinalExtractScrollDrift", &mut scrolled_resident));
+    assert_eq!(scrolled_resident["final_projection_key_match"], 1);
+    assert_eq!(scrolled_resident["final_scroll_state_match"], 0);
+    assert_eq!(scrolled_resident["resident_projection"], 1);
+    assert!(
+        !buggy.check_invariant("ScrollDriftRetiresResident", &scrolled_resident),
+        "a same-cell LOCK A/B scroll must catch retained row-bound resident light"
+    );
+
+    let mut stable_resident = model.init_state();
+    assert!(model.fire("ChargeResident", &mut stable_resident));
+    assert!(model.fire("FinalExtractGenerationDrift", &mut stable_resident));
+    assert_eq!(stable_resident["resident_charged"], 1);
+    assert_eq!(stable_resident["resident_projection"], 1);
+    assert!(model.check_invariant(
+        "ResidentProjectionRequiresFinalProjectionKey",
+        &stable_resident
+    ));
+
+    let mut stable_birth = model.init_state();
+    assert!(model.fire("ArmSynthetic", &mut stable_birth));
+    assert!(model.fire("ObserveMove", &mut stable_birth));
+    assert!(model.fire("FinalExtractGenerationDrift", &mut stable_birth));
+    assert_eq!(stable_birth["projection"], 1);
+    assert!(model.fire("PromoteProjectedBirth", &mut stable_birth));
+    assert_eq!(stable_birth["resident_projection"], 1);
+
+    let mut divergent_birth = model.init_state();
+    assert!(model.fire("ArmSynthetic", &mut divergent_birth));
+    assert!(model.fire("ObserveMove", &mut divergent_birth));
+    assert!(model.fire(
+        "FinalExtractProjectionKeyDrift",
+        &mut divergent_birth
+    ));
+    assert_eq!(divergent_birth["admitted"], 0);
+    assert_eq!(divergent_birth["birth"], 0);
+    assert_eq!(divergent_birth["projection"], 0);
+    assert!(model.fire("BeginCandidateEpoch", &mut divergent_birth));
+    assert!(model.fire("ArmSynthetic", &mut divergent_birth));
+    assert!(model.fire("ObserveMove", &mut divergent_birth));
+    assert_eq!(
+        divergent_birth["admitted"], 1,
+        "a projection-key reset cannot wedge the next independent candidate"
+    );
+
+    let mut divergent_resident = model.init_state();
+    assert!(model.fire("ChargeResident", &mut divergent_resident));
+    assert!(model.fire(
+        "FinalExtractProjectionKeyDrift",
+        &mut divergent_resident
+    ));
+    assert_eq!(divergent_resident["resident_charged"], 0);
+    assert_eq!(divergent_resident["resident_projection"], 0);
+    assert!(model.fire("BeginCandidateEpoch", &mut divergent_resident));
+    assert!(model.fire("ChargeResident", &mut divergent_resident));
+    assert_eq!(
+        divergent_resident["resident_charged"], 1,
+        "retiring a divergent resident cannot wedge the next resident epoch"
+    );
+
+    let mut scrolled_resident = model.init_state();
+    assert!(model.fire("ChargeResident", &mut scrolled_resident));
+    assert!(model.fire("FinalExtractScrollDrift", &mut scrolled_resident));
+    assert_eq!(scrolled_resident["final_projection_key_match"], 1);
+    assert_eq!(scrolled_resident["final_scroll_state_match"], 0);
+    assert_eq!(scrolled_resident["resident_charged"], 0);
+    assert_eq!(scrolled_resident["resident_projection"], 0);
+    assert!(model.check_invariant(
+        "ScrollDriftRetiresResident",
+        &scrolled_resident
+    ));
+    assert!(model.fire("BeginCandidateEpoch", &mut scrolled_resident));
+    assert!(model.fire("ChargeResident", &mut scrolled_resident));
+    assert_eq!(
+        scrolled_resident["resident_charged"], 1,
+        "retiring a scrolled resident cannot wedge the next resident epoch"
     );
 
     let mut rewritten = buggy.init_state();
@@ -7695,6 +8149,381 @@ fn derived_cursor_move_candidate_proves_and_catches_timestamp_only_admission() {
         !buggy.check_invariant("UnownedContentRewriteRetiresResident", &fresh_buggy),
         "a freshly born segment is resident and must not survive the next unowned generation"
     );
+}
+
+/// One transient alt-screen save/status frame may hold the sole-next typed
+/// generation without creating light. Its unchanged-generation restore is
+/// still Exact, but can retain only wake covered by the rebased input/current
+/// row witness. Any second hold, later generation, or invalid restore drains
+/// both the candidate and resident pool.
+#[test]
+fn derived_cursor_deferred_probe_hold_restore_is_bounded_and_attested() {
+    let model = cursor_move_candidate_model();
+    let healthy = aterm_spec::interp::with_buggy(&model, 0);
+
+    let mut held = healthy.init_state();
+    for action in ["ChargeResident", "ArmTyped", "DeliverStable"] {
+        assert!(healthy.fire(action, &mut held), "hold setup: {action}");
+    }
+    let before_hold = held.clone();
+    assert!(healthy.fire("DeferredProbeHold", &mut held));
+    assert_eq!(held["deferred_probe"], 1);
+    assert_eq!(held["resident_charged"], 1);
+    assert_eq!(held["admitted"], 0);
+    assert_eq!(held["birth"], 0);
+    assert_eq!(held["evidence_exact"], 0);
+    assert!(healthy.check_invariant(
+        "DeferredProbeHoldPreservesResidentWithoutBirth",
+        &held,
+    ));
+    assert!(
+        !healthy.fire("DeferredProbeHold", &mut held),
+        "a held generation cannot mint a second hold"
+    );
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before_hold,
+        &held,
+        Some("DeferredProbeHold"),
+        "sole-next off-row probe holds resident without admission",
+    );
+    assert!(ok, "deferred hold transition rejected: {why}");
+
+    // No wake witness covers this resident pool, so the restored exact probe
+    // retires it before the fresh candidate is admitted.
+    let before_restore = held.clone();
+    assert!(healthy.fire("DeferredProbeRestore", &mut held));
+    assert_eq!(held["deferred_probe"], 2);
+    assert_eq!(held["phase"], 3);
+    assert_eq!(held["evidence_exact"], 1);
+    assert_eq!(held["resident_charged"], 0);
+    assert!(healthy.check_invariant(
+        "DeferredProbeRestoreKeepsOnlyAttestedWake",
+        &held,
+    ));
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before_restore,
+        &held,
+        Some("DeferredProbeRestore"),
+        "same-generation restore is exact and retires unattested wake",
+    );
+    assert!(ok, "deferred restore transition rejected: {why}");
+    assert!(healthy.fire("ObserveMove", &mut held));
+    assert_eq!(held["admitted"], 1);
+    assert_eq!(held["birth"], 1);
+
+    // A baseline/current witness may retain its covered resident subset while
+    // the restored exact candidate independently forges fresh geometry.
+    let mut attested = healthy.init_state();
+    for action in [
+        "ChargeResident",
+        "AttestResidentWake",
+        "ArmTyped",
+        "DeliverStable",
+        "DeferredProbeHold",
+        "DeferredProbeRestore",
+    ] {
+        assert!(
+            healthy.fire(action, &mut attested),
+            "attested restore trace: {action}"
+        );
+    }
+    assert_eq!(attested["resident_wake_attested"], 1);
+    assert_eq!(attested["resident_charged"], 1);
+    assert!(healthy.fire("ObserveMove", &mut attested));
+    assert_eq!(attested["birth"], 1);
+    assert_eq!(attested["resident_charged"], 1);
+    assert!(healthy.fire("FinalExtractSame", &mut attested));
+    assert_eq!(attested["projection"], 1);
+    assert_eq!(attested["resident_projection"], 1);
+    assert!(healthy.fire("PromoteProjectedBirth", &mut attested));
+    assert_eq!(attested["resident_charged"], 1);
+    assert_eq!(attested["evidence_exact"], 0);
+
+    for terminal_action in ["DeferredProbeAdvance", "DeferredProbeInvalid"] {
+        let mut retired = healthy.init_state();
+        for action in [
+            "ChargeResident",
+            "AttestResidentWake",
+            "ArmTyped",
+            "DeliverStable",
+            "DeferredProbeHold",
+        ] {
+            assert!(
+                healthy.fire(action, &mut retired),
+                "{terminal_action} setup: {action}"
+            );
+        }
+        let before_terminal = retired.clone();
+        assert!(healthy.fire(terminal_action, &mut retired));
+        assert_eq!(retired["deferred_probe"], 3);
+        assert_eq!(retired["phase"], 4);
+        assert_eq!(retired["resident_charged"], 0);
+        assert_eq!(retired["resident_projection"], 0);
+        assert_eq!(retired["admitted"], 0);
+        assert_eq!(retired["birth"], 0);
+        assert!(healthy.check_invariant(
+            "DeferredProbeFailureRetiresCandidateAndResident",
+            &retired,
+        ));
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before_terminal,
+            &retired,
+            Some(terminal_action),
+            "deferred probe terminal failure retires candidate and resident",
+        );
+        assert!(ok, "{terminal_action} transition rejected: {why}");
+    }
+
+    // Negative controls pin all three obligations: blackout on hold,
+    // un-attested survival on exact restore, and resident survival on N+2.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut blackout = buggy.init_state();
+    for action in [
+        "ChargeResident",
+        "ArmTyped",
+        "DeliverStable",
+        "DeferredProbeHold",
+    ] {
+        assert!(buggy.fire(action, &mut blackout), "blackout trace: {action}");
+    }
+    assert!(!buggy.check_invariant(
+        "DeferredProbeHoldPreservesResidentWithoutBirth",
+        &blackout,
+    ));
+
+    let mut overretained = blackout.clone();
+    assert!(buggy.fire("DeferredProbeRestore", &mut overretained));
+    assert_eq!(overretained["resident_wake_attested"], 0);
+    assert_eq!(overretained["resident_charged"], 1);
+    assert!(!buggy.check_invariant(
+        "DeferredProbeRestoreKeepsOnlyAttestedWake",
+        &overretained,
+    ));
+
+    let mut advanced = blackout;
+    assert!(buggy.fire("DeferredProbeAdvance", &mut advanced));
+    assert!(!buggy.check_invariant(
+        "DeferredProbeFailureRetiresCandidateAndResident",
+        &advanced,
+    ));
+}
+
+/// A held row that restores byte-identical is authored Motion, not Exact
+/// content. The ownership transition stays dark and keeps only rebased,
+/// row-attested wake; the separate relocation-shape observation is the sole
+/// place a jump can birth light, while a small/invalid move consumes dark.
+#[test]
+fn derived_cursor_deferred_probe_motion_is_attested_and_shape_gated() {
+    let model = cursor_move_candidate_model();
+    let healthy = aterm_spec::interp::with_buggy(&model, 0);
+    let setup = |attested: bool| {
+        let mut state = healthy.init_state();
+        assert!(healthy.fire("ChargeResident", &mut state));
+        if attested {
+            assert!(healthy.fire("AttestResidentWake", &mut state));
+        }
+        for action in ["ArmTyped", "DeliverStable", "DeferredProbeHold"] {
+            assert!(healthy.fire(action, &mut state), "motion setup: {action}");
+        }
+        state
+    };
+
+    let mut motion = setup(true);
+    let before_motion = motion.clone();
+    assert!(healthy.fire("DeferredProbeMotion", &mut motion));
+    assert_eq!(motion["deferred_probe"], 4);
+    assert_eq!(motion["authored_motion"], 1);
+    assert_eq!(motion["motion_shape"], 0);
+    assert_eq!(motion["resident_wake_attested"], 1);
+    assert_eq!(motion["resident_charged"], 1);
+    assert_eq!(motion["evidence_exact"], 0);
+    assert_eq!(motion["admitted"], 0);
+    assert_eq!(motion["birth"], 0);
+    assert!(healthy.check_invariant(
+        "DeferredProbeMotionKeepsOnlyAttestedWakeDark",
+        &motion,
+    ));
+    assert!(healthy.check_invariant("AuthoredMotionConsumesTypedProofDark", &motion));
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before_motion,
+        &motion,
+        Some("DeferredProbeMotion"),
+        "same-generation byte-steady restore downgrades dark to authored Motion",
+    );
+    assert!(ok, "deferred Motion transition rejected: {why}");
+
+    let motion_ownership = motion;
+    let mut small = motion_ownership.clone();
+    assert!(healthy.fire("ObserveAuthoredMotionSmall", &mut small));
+    assert_eq!(small["motion_shape"], 2);
+    assert_eq!(small["admitted"], 0);
+    assert_eq!(small["birth"], 0);
+    assert_eq!(small["resident_charged"], 1);
+    assert!(healthy.check_invariant("AuthoredMotionBirthRequiresJumpShape", &small));
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &motion_ownership,
+        &small,
+        Some("ObserveAuthoredMotionSmall"),
+        "small same-generation Motion consumes dark",
+    );
+    assert!(ok, "small authored Motion transition rejected: {why}");
+
+    let mut jump = motion_ownership.clone();
+    let before_jump = jump.clone();
+    assert!(healthy.fire("ObserveAuthoredMotionJump", &mut jump));
+    assert_eq!(jump["motion_shape"], 1);
+    assert_eq!(jump["admitted"], 1);
+    assert_eq!(jump["birth"], 1);
+    assert_eq!(jump["evidence_exact"], 0);
+    assert!(healthy.check_invariant("AuthoredMotionBirthRequiresJumpShape", &jump));
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before_jump,
+        &jump,
+        Some("ObserveAuthoredMotionJump"),
+        "jump-shaped same-generation Motion admits separately",
+    );
+    assert!(ok, "jump-shaped authored Motion transition rejected: {why}");
+    assert!(healthy.fire("FinalExtractSame", &mut jump));
+    assert!(healthy.fire("PromoteProjectedBirth", &mut jump));
+    assert_eq!(jump["resident_charged"], 1);
+
+    let mut unattested = setup(false);
+    assert!(healthy.fire("DeferredProbeMotion", &mut unattested));
+    assert_eq!(unattested["resident_wake_attested"], 0);
+    assert_eq!(unattested["resident_charged"], 0);
+    assert!(healthy.check_invariant(
+        "DeferredProbeMotionKeepsOnlyAttestedWakeDark",
+        &unattested,
+    ));
+
+    // Negative controls: the ownership mutant keeps un-attested resident;
+    // the shape mutant lets a denied one-cell relocation purchase new light.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut overretained = buggy.init_state();
+    for action in [
+        "ChargeResident",
+        "ArmTyped",
+        "DeliverStable",
+        "DeferredProbeHold",
+        "DeferredProbeMotion",
+    ] {
+        assert!(
+            buggy.fire(action, &mut overretained),
+            "over-retention trace: {action}"
+        );
+    }
+    assert_eq!(overretained["resident_wake_attested"], 0);
+    assert_eq!(overretained["resident_charged"], 1);
+    assert!(!buggy.check_invariant(
+        "DeferredProbeMotionKeepsOnlyAttestedWakeDark",
+        &overretained,
+    ));
+
+    let mut forged_small = buggy.init_state();
+    for action in [
+        "ChargeResident",
+        "AttestResidentWake",
+        "ArmTyped",
+        "DeliverStable",
+        "DeferredProbeHold",
+        "DeferredProbeMotion",
+        "ObserveAuthoredMotionSmall",
+    ] {
+        assert!(buggy.fire(action, &mut forged_small), "small mutant: {action}");
+    }
+    assert_eq!(forged_small["motion_shape"], 2);
+    assert_eq!(forged_small["birth"], 1);
+    assert!(!buggy.check_invariant(
+        "AuthoredMotionBirthRequiresJumpShape",
+        &forged_small,
+    ));
+    let mut forged_projection = motion_ownership.clone();
+    forged_projection.insert("motion_shape", 2);
+    forged_projection.insert("admitted", 1);
+    forged_projection.insert("birth", 1);
+    forged_projection.insert("candidate_rewrite", 0);
+    forged_projection.insert("observations", 1);
+    let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &motion_ownership,
+        &forged_projection,
+        Some("ObserveAuthoredMotionSmall"),
+        "forged small Motion birth",
+    );
+    assert!(!ok, "a small/invalid Motion cannot buy light at Tier 1");
+}
+
+/// The coalesced-alt ownership state is neither an exact typed admission nor
+/// cold output: it consumes the typed proof dark while retaining resident wake
+/// already attested byte-steady. The mutant is the live blackout — wholesale
+/// retirement at this boundary — and must supply a concrete counterexample.
+#[test]
+fn derived_cursor_authored_motion_batch_retains_resident_without_birth() {
+    let model = cursor_move_candidate_model();
+    let healthy = aterm_spec::interp::with_buggy(&model, 0);
+    let mut state = healthy.init_state();
+    for action in ["ChargeResident", "ArmTyped", "DeliverStable"] {
+        assert!(healthy.fire(action, &mut state), "healthy setup: {action}");
+    }
+    let before = state.clone();
+    assert!(healthy.fire("AuthoredMotionBatch", &mut state));
+    assert_eq!(state["authored_motion"], 1);
+    assert_eq!(state["authored_motion_had_resident"], 1);
+    assert_eq!(state["authored_motion_retained"], 1);
+    assert_eq!(state["resident_charged"], 1);
+    assert_eq!(state["phase"], 4);
+    assert_eq!(state["evidence_exact"], 0);
+    assert_eq!(state["admitted"], 0);
+    assert_eq!(state["birth"], 0);
+    assert!(healthy.check_invariant("AuthoredMotionRetainsAttestedResident", &state));
+    assert!(healthy.check_invariant("AuthoredMotionConsumesTypedProofDark", &state));
+    let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before,
+        &state,
+        Some("AuthoredMotionBatch"),
+        "coalesced alt key retains attested wake without typed birth",
+    );
+    assert!(ok, "authored-motion transition rejected: {why}");
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut blackout = buggy.init_state();
+    for action in ["ChargeResident", "ArmTyped", "DeliverStable"] {
+        assert!(buggy.fire(action, &mut blackout), "blackout setup: {action}");
+    }
+    assert!(buggy.fire("AuthoredMotionBatch", &mut blackout));
+    assert_eq!(blackout["resident_charged"], 0);
+    assert!(
+        !buggy.check_invariant("AuthoredMotionRetainsAttestedResident", &blackout),
+        "the historical wholesale-clear mutant must be caught"
+    );
+
+    let mut forged = state;
+    forged.insert("birth", 1);
+    forged.insert("admitted", 1);
+    let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+        &model,
+        &[],
+        &before,
+        &forged,
+        Some("AuthoredMotionBatch"),
+        "forged typed birth on a downgraded generation",
+    );
+    assert!(!ok, "AuthoredMotion cannot purchase fresh typed light");
 }
 
 /// LIVENESS for the movement-admission confirm seam — the rainbow-trail
@@ -8207,6 +9036,30 @@ fn derived_rainbow_exit_sampling_proves_and_catches_sparse_restart() {
 #[test]
 fn derived_effect_present_rebase_proves_and_catches_frame_doublets() {
     assert_proves_and_catches(&effect_present_rebase_model());
+}
+
+#[test]
+fn derived_effect_presentability_settle_proves_and_catches_stranded_pixels() {
+    let model = effect_presentability_settle_model();
+    assert_proves_and_catches(&model);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut stranded = buggy.init_state();
+    assert!(buggy.fire("ExpireWake", &mut stranded));
+    assert!(buggy.fire("UnrelatedPark", &mut stranded));
+    assert_eq!(stranded["pending"], 0);
+    assert!(
+        !buggy.check_invariant("LitPixelsHaveSettleRoute", &stranded),
+        "the edge-triggered park must supply the concrete stranded-raster counterexample"
+    );
+
+    let mut healthy = model.init_state();
+    assert!(model.fire("ExpireWake", &mut healthy));
+    assert!(model.fire("UnrelatedPark", &mut healthy));
+    assert_eq!(healthy["pending"], 1);
+    assert!(model.fire("PaintSettle", &mut healthy));
+    assert_eq!(healthy["pixels_lit"], 0);
+    assert_eq!(healthy["effect_active"], 0);
 }
 
 #[test]

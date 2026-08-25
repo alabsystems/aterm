@@ -860,6 +860,7 @@ impl Model {
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
 mod models_core;
+mod models_cursor_input;
 mod models_effects;
 mod models_fx;
 mod models_glyphs;
@@ -874,6 +875,7 @@ mod models_title_summary;
 mod models_update;
 
 pub use models_core::*;
+pub use models_cursor_input::*;
 pub use models_effects::*;
 pub use models_fx::*;
 pub use models_glyphs::*;

@@ -1270,9 +1270,24 @@ pub fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathB
 #[cfg(not(target_os = "macos"))]
 pub fn notify(_title: &str, _body: &str) {}
 
-/// Non-macOS stub.
+/// Help, off macOS: the project page in the default browser, through the SAME
+/// helper a Ctrl-clicked link goes through (`open_url_external` —
+/// `ShellExecuteW` on Windows, `xdg-open` on Linux).
+///
+/// This was an empty body while the palette's Help row stayed enabled on both
+/// platforms, so the only command surface Windows has answered a row with
+/// nothing at all. There is no bundled `Help.html` to prefer here: the macOS arm
+/// reads it out of the `.app`'s `Contents/Resources`, which no other target has.
 #[cfg(not(target_os = "macos"))]
-pub fn open_help_url() {}
+pub fn open_help_url() {
+    crate::app_mouse::open_url_external(HELP_URL);
+}
+
+/// The project page — Help's destination when no bundled guide is reachable
+/// (every non-macOS target, and macOS outside the `.app`). One const so the two
+/// arms cannot drift, and `is_safe_url`-clean because `open_url_external` trusts
+/// its input.
+const HELP_URL: &str = "https://github.com/alabsystems/aterm";
 
 #[cfg(target_os = "macos")]
 mod macos {
@@ -2217,7 +2232,7 @@ mod macos {
         if let Some(help) = bundled_resource("Help.html") {
             open_in_workspace(&help, true);
         } else {
-            open_in_workspace("https://github.com/alabsystems/aterm", false);
+            open_in_workspace(super::HELP_URL, false);
         }
     }
 
@@ -2809,5 +2824,18 @@ mod tests {
         assert!(arbiter.is_current(second));
         assert!(arbiter.cancel_current());
         assert!(!arbiter.is_current(second));
+    }
+
+    /// Help's destination must survive the gate `open_url_external` trusts its
+    /// callers to have run: off macOS the row now actually opens a browser, and
+    /// the URL it hands the OS shell must be one `is_safe_url` accepts —
+    /// http(s)/mailto only, no control bytes, no `file://`.
+    #[test]
+    fn the_help_destination_passes_the_url_gate() {
+        assert!(
+            crate::is_safe_url(super::HELP_URL),
+            "{} must satisfy the same allowlist a clicked link does",
+            super::HELP_URL
+        );
     }
 }

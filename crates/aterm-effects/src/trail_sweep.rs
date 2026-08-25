@@ -27,7 +27,7 @@
 //! the wrap/coalesce cases it misses — reusable:
 //!
 //! * [`line_cells_tail`] — the canonical bounded Bresenham sweep (tail→head),
-//!   O(limit) whatever the jump distance.
+//!   forward-byte-identical and O(limit) whatever the jump distance.
 //! * [`row_sweep_cells`] — a same-row typed-coalesce sweep: the cells a
 //!   batched echo skipped between two observations.
 //! * [`wrap_fold_cells`] — the typewriter fold: a typing wrap finishes the old
@@ -38,8 +38,9 @@
 /// (in `out`) the up-to-`limit` cells NEAREST the destination, ordered
 /// tail→head (oldest first, destination-adjacent last). `include_destination`
 /// controls whether the destination cell itself is laid (a live cursor usually
-/// draws there). The walk runs BACKWARD from the destination so cost is
-/// O(limit), not O(distance) — a hostile cross-screen jump does bounded work.
+/// draws there). The start index is solved directly on the FORWARD Bresenham
+/// lattice, so cost is O(limit), not O(distance), without changing the legacy
+/// forward walk's asymmetric tie choices on shallow diagonals.
 pub fn line_cells_tail(
     out: &mut Vec<(i32, i32)>,
     origin: (i32, i32),
@@ -51,34 +52,37 @@ pub fn line_cells_tail(
     if limit == 0 {
         return;
     }
-    let ((r0, c0), (r1, c1)) = (destination, origin);
-    let (dr, dc) = ((r1 - r0).abs(), (c1 - c0).abs());
-    let (sr, sc) = (if r0 < r1 { 1 } else { -1 }, if c0 < c1 { 1 } else { -1 });
-    let mut err = dc - dr;
-    let (mut r, mut c) = (r0, c0);
-    let mut at_destination = true;
-    loop {
-        if (include_destination || !at_destination) && out.len() < limit {
-            out.push((r, c));
-        }
-        if r == r1 && c == c1 {
-            break;
-        }
-        if out.len() == limit {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 > -dr {
-            err -= dr;
-            c += sc;
-        }
-        if e2 < dc {
-            err += dc;
-            r += sr;
-        }
-        at_destination = false;
+    let dr = (i64::from(destination.0) - i64::from(origin.0)).abs();
+    let dc = (i64::from(destination.1) - i64::from(origin.1)).abs();
+    let major = dr.max(dc);
+    // Excluding the destination leaves indices 0..major; including it leaves
+    // 0..=major. Keep the nearest suffix without materialising its prefix.
+    let available = major + i64::from(include_destination);
+    let keep = available.min(i64::try_from(limit).unwrap_or(i64::MAX));
+    let start = available - keep;
+    let sr = if origin.0 < destination.0 { 1i128 } else { -1i128 };
+    let sc = if origin.1 < destination.1 { 1i128 } else { -1i128 };
+    let bias = i128::from(major.saturating_sub(1)) / 2;
+
+    for k in start..available {
+        let k = i128::from(k);
+        let (r_steps, c_steps) = if major == 0 {
+            (0, 0)
+        } else if dc >= dr {
+            (
+                (k * i128::from(dr) + bias) / i128::from(major),
+                k,
+            )
+        } else {
+            (
+                k,
+                (k * i128::from(dc) + bias) / i128::from(major),
+            )
+        };
+        let r = i128::from(origin.0) + sr * r_steps;
+        let c = i128::from(origin.1) + sc * c_steps;
+        out.push((r as i32, c as i32));
     }
-    out.reverse();
 }
 
 /// The SAME-ROW typed-coalesce sweep: the cells between two same-row
@@ -155,6 +159,70 @@ mod tests {
                     }
                     if !include {
                         assert!(!out.contains(&dest), "destination excluded");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bounded solver must be byte-identical to the historical FORWARD
+    /// Bresenham walk, including its direction-sensitive tie law. Reversing
+    /// Bresenham is not equivalent: `(0,0)→(1,2)` chooses `(0,1)`, while a
+    /// backward walk chooses `(1,1)`. Exhaust every small direction, limit and
+    /// destination policy so a visually shifted diagonal cannot hide behind a
+    /// handful of non-tie examples.
+    #[test]
+    fn bounded_tail_matches_forward_bresenham_exhaustively() {
+        fn reference(origin: (i32, i32), destination: (i32, i32)) -> Vec<(i32, i32)> {
+            let ((r0, c0), (r1, c1)) = (origin, destination);
+            let (dr, dc) = ((r1 - r0).abs(), (c1 - c0).abs());
+            let (sr, sc) = (if r0 < r1 { 1 } else { -1 }, if c0 < c1 { 1 } else { -1 });
+            let mut err = dc - dr;
+            let (mut r, mut c) = (r0, c0);
+            let mut cells = Vec::new();
+            loop {
+                cells.push((r, c));
+                if (r, c) == (r1, c1) {
+                    return cells;
+                }
+                let e2 = 2 * err;
+                if e2 > -dr {
+                    err -= dr;
+                    c += sc;
+                }
+                if e2 < dc {
+                    err += dc;
+                    r += sr;
+                }
+            }
+        }
+
+        let mut actual = Vec::new();
+        for r0 in -4..=3 {
+            for c0 in -4..=3 {
+                for r1 in -4..=3 {
+                    for c1 in -4..=3 {
+                        for include_destination in [false, true] {
+                            for limit in 0..=10 {
+                                let mut expected = reference((r0, c0), (r1, c1));
+                                if !include_destination {
+                                    expected.pop();
+                                }
+                                let keep_from = expected.len().saturating_sub(limit);
+                                expected.drain(..keep_from);
+                                line_cells_tail(
+                                    &mut actual,
+                                    (r0, c0),
+                                    (r1, c1),
+                                    limit,
+                                    include_destination,
+                                );
+                                assert_eq!(
+                                    actual, expected,
+                                    "({r0},{c0})→({r1},{c1}), limit={limit}, include={include_destination}"
+                                );
+                            }
+                        }
                     }
                 }
             }

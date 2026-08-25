@@ -95,7 +95,7 @@ fn round(
     let mut win_a = aterm_gpu::WindowGpu::new();
     gpu.video_begin_standin_for_test(&mut win_a, w, h, opts(half_res))
         .expect("standin tap");
-    gpu.reset_glow_ease_for_test();
+    gpu.reset_glow_ease_for_test(&mut win_a);
     for (i, (input, invert)) in seq.iter().enumerate() {
         gpu.present_swapchain_standin_for_test(&mut win_a, input, *invert, None, None, (w, h));
         gpu.video_after_present(&mut win_a, i as u64 + 1);
@@ -106,7 +106,7 @@ fn round(
     let mut win_b = aterm_gpu::WindowGpu::new();
     gpu.virtual_begin(&mut win_b, w, h, opts(half_res))
         .expect("virtual tap");
-    gpu.reset_glow_ease_for_test();
+    gpu.reset_glow_ease_for_test(&mut win_b);
     for (i, (input, invert)) in seq.iter().enumerate() {
         assert!(
             gpu.present_virtual(&mut win_b, input, *invert, None, None),

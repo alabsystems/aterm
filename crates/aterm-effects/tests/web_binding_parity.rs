@@ -52,7 +52,11 @@ const GPU_WEB_CRATE: &str = "aterm-gpu-web";
 /// the two are ~4400 vs ~3400 lines. Guarding them against each other would be
 /// asserting a falsehood, so the exclusion is the honest call — but note it is a
 /// CEILING, the only hand-typed one here, and every other shared name defaults
-/// to covered.
+/// to covered. It is NO LONGER a total blind spot: `lib.rs` stays line-excluded,
+/// but its JS binding SURFACE is guarded by
+/// [`wasm_lib_facade_surface_is_mirrored_by_gpu_web`] (audit-2 item 14 — the gap
+/// that let five wasm-only facade methods go unmirrored). Only line-level parity
+/// is waived here, not surface parity.
 const NOT_DUPLICATED: &[&str] = &["lib.rs"];
 
 /// A FLOOR on the derived set, never a ceiling: discovery may only add. Without
@@ -437,4 +441,127 @@ fn production_slice_drops_the_test_module() {
         vec!["impl X {}".to_owned()],
         "the split must keep the impl and drop the gate, blank line, and test module"
     );
+}
+
+// ---------------------------------------------------------------------------
+// lib.rs binding-SURFACE floor (audit-2 item 14). `lib.rs` stays in
+// NOT_DUPLICATED (two different pipelines, WebGPU vs CPU raster, cannot be
+// compared line-for-line) — but that made its JS binding surface a blind spot:
+// `process_str`, `last_command_output`, `row_range_json`, `search_summary` and
+// `search_index_release` were added to aterm-wasm and never mirrored into
+// aterm-gpu-web, uncaught. This restores a floor at the SURFACE level.
+// ---------------------------------------------------------------------------
+
+/// Does the contiguous `#[…]` attribute run immediately above `impl_idx` carry
+/// a wasm-bindgen export? Admits both styles in use: the `cfg_attr` form and a
+/// bare `#[wasm_bindgen]` paired with a separate `#[cfg(target_arch="wasm32")]`.
+fn preceding_attrs_export_to_wasm(lines: &[&str], impl_idx: usize) -> bool {
+    let mut k = impl_idx;
+    while k > 0 {
+        let t = lines[k - 1].trim();
+        if !t.starts_with("#[") {
+            return false;
+        }
+        if t == r#"#[cfg_attr(target_arch = "wasm32", wasm_bindgen)]"# || t == "#[wasm_bindgen]" {
+            return true;
+        }
+        k -= 1;
+    }
+    false
+}
+
+/// The JS-visible method surface of a crate's `Aterm(Gpu)Terminal` facade:
+/// every `pub fn` inside a wasm-bindgen-attributed `impl` of that facade type.
+/// Non-`wasm_bindgen` impls (native test helpers, private-method impls) are
+/// skipped, so an internal `pub fn` never enters the surface. Block extent is
+/// the rustfmt column-0 `}` closer — never brace depth, which the JSON string
+/// literals in the method bodies would corrupt.
+fn wasm_facade_surface(src: &str) -> BTreeSet<String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut out = BTreeSet::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let t = lines[i].trim();
+        let opener = t == "impl AtermTerminal {" || t == "impl AtermGpuTerminal {";
+        if opener && preceding_attrs_export_to_wasm(&lines, i) {
+            let mut j = i + 1;
+            while j < lines.len() && lines[j] != "}" {
+                let tt = lines[j].trim_start();
+                if let Some(rest) = tt.strip_prefix("pub fn ") {
+                    let name: String = rest
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_')
+                        .collect();
+                    if !name.is_empty() {
+                        out.insert(name);
+                    }
+                }
+                j += 1;
+            }
+            i = j + 1;
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+/// wasm-facade exports LEGITIMATELY absent from the gpu-web facade — each a
+/// CPU-raster export with no WebGPU counterpart. Shaped like the `#[test]`
+/// floors: a reason plus a still-resolves check below, so a carve-out cannot
+/// outlive its cause.
+const CPU_ONLY_FACADE_FNS: &[(&str, &str)] = &[(
+    "rgba_ptr",
+    "Byte offset of the CPU rasterizer's persistent `self.rgba` framebuffer in \
+     wasm linear memory, for a zero-copy `putImageData`. gpu-web renders through \
+     WebGPU to an offscreen target and exposes readback via `rgba()`/render_offscreen; \
+     it holds no persistent CPU `rgba` buffer to point into, so the zero-copy \
+     pointer variant is CPU-pipeline-only by construction.",
+)];
+
+/// Every method aterm-wasm exports on its `#[wasm_bindgen]` facade must also be
+/// exported by aterm-gpu-web's, save the reasoned CPU-only carve-outs.
+/// Deliberately ONE-directional — gpu-web adds GPU-only exports
+/// (`render_offscreen`/`adapter_info`/`gpu_ready`) wasm has no counterpart for,
+/// and those are not drift.
+#[test]
+fn wasm_lib_facade_surface_is_mirrored_by_gpu_web() {
+    let wasm = wasm_facade_surface(&read_module(WASM_CRATE, "lib.rs"));
+    let gpu = wasm_facade_surface(&read_module(GPU_WEB_CRATE, "lib.rs"));
+
+    // Non-vacuity: a scanner that yields nothing must FAIL, not pass silently.
+    assert!(
+        wasm.len() > 50 && gpu.len() > 50,
+        "facade-surface enumeration looks broken (wasm={}, gpu-web={}); the impl-opener \
+         or column-0 `}}` heuristic stopped matching",
+        wasm.len(),
+        gpu.len()
+    );
+
+    let allow: BTreeSet<&str> = CPU_ONLY_FACADE_FNS.iter().map(|(n, _)| *n).collect();
+    let missing: Vec<&String> = wasm
+        .iter()
+        .filter(|f| !gpu.contains(*f) && !allow.contains(f.as_str()))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "aterm-wasm exports these `#[wasm_bindgen]` facade methods that aterm-gpu-web does \
+         NOT: {missing:?}. Mirror each into gpu-web's facade impl, or — if it is a genuine \
+         CPU-only export with no WebGPU counterpart — add it to CPU_ONLY_FACADE_FNS with a reason."
+    );
+
+    // A carve-out that is no longer a divergence is a hole (mirrors the FOLDED
+    // still-resolves discipline): require each to STILL be wasm-only.
+    for (name, _why) in CPU_ONLY_FACADE_FNS {
+        assert!(
+            wasm.contains(*name),
+            "CPU_ONLY_FACADE_FNS lists `{name}` but aterm-wasm no longer exports it — \
+             stale carve-out, delete it"
+        );
+        assert!(
+            !gpu.contains(*name),
+            "CPU_ONLY_FACADE_FNS lists `{name}` as CPU-only but aterm-gpu-web now exports it \
+             too — the carve-out is obsolete, delete it"
+        );
+    }
 }

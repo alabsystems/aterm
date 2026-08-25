@@ -4188,18 +4188,35 @@ impl App {
                         })
                     })
                 });
-                if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.strip_press = tab.map(|tab| (now, tab));
-                    // A chip press is not part of a BAND double-click either.
-                    ws.strip_band_press = None;
-                }
-                // A click on a DIFFERENT chip is a click away and COMMITS, matching
-                // the macOS `Wake::SelectTab` arm and every other exit. A click on
-                // the chip already being edited is not leaving the field.
+                // A click on the chip already being edited is not leaving the
+                // field (read BEFORE the arm below, which needs it too).
                 let editing_this = self
                     .inline_rename_edit(wid)
                     .map(|edit| edit.tab)
                     .is_some_and(|edited| Some(edited) == tab);
+                if let Some(ws) = self.windows.get_mut(&wid) {
+                    ws.strip_press = tab.map(|tab| (now, tab));
+                    // A chip press is not part of a BAND double-click either.
+                    ws.strip_band_press = None;
+                    // DRAG-TO-REORDER arms HERE and travels with the pointer from
+                    // here ([`App::advance_strip_drag`]): the press still selects,
+                    // exactly as Explorer / Edge / Windows Terminal do, and only
+                    // motion reorders. NOT on the repeat press — that one opens
+                    // the inline rename editor, and a rename gesture must not also
+                    // be able to reshuffle the strip out from under the field —
+                    // and NOT while that editor is already OPEN on this chip: a
+                    // stale (past the double-click window) press there is "keep
+                    // editing", and the same reshuffle-under-the-field hazard.
+                    ws.strip_drag = match (repeat || editing_this, tab) {
+                        (false, Some(tab)) => Some(crate::app_mouse::StripDrag {
+                            tab,
+                            origin_col: col,
+                        }),
+                        _ => None,
+                    };
+                }
+                // A click on a DIFFERENT chip is a click away and COMMITS, matching
+                // the macOS `Wake::SelectTab` arm and every other exit.
                 if !editing_this {
                     self.settle_rename_edit(wid);
                 }
@@ -4274,10 +4291,17 @@ impl App {
     /// chip-then-band cannot read as a band double-click. The band arm in
     /// `handle_tab_strip_click` samples its streak BEFORE calling this and
     /// re-arms after.
+    ///
+    /// It also drops any in-flight DRAG-TO-REORDER, for the same reason: every
+    /// caller is a press that is not "grab this chip" — bare band, `✕`, `+`, `↻`,
+    /// a click away, or the right-press that pops the context menu — and a chip
+    /// left held across one of those must not keep stepping. (The ordinary end of
+    /// a drag is its RELEASE, in `on_mouse_input`.)
     pub(crate) fn clear_strip_press(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_press = None;
             ws.strip_band_press = None;
+            ws.strip_drag = None;
         }
     }
 

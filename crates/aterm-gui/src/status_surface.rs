@@ -16,6 +16,17 @@
 //! install, the updater, drive dials — is app-scoped, and every window's
 //! band shows the same truth.
 
+// STAGED LANDING. `ActivityKind`, `ActivityOutcome` and `ActivityKind::as_str` are
+// the producer-facing vocabulary this engine was built to accept — the `appstatus`
+// verb's `kind=` tokens — and the producers that will call them land next. Until
+// then they are `never used` and the workspace lint gate is `-D warnings`, so the
+// whole gate goes red for everyone rather than only for this file's author.
+//
+// Scoped to this module and explained rather than sprinkled per-item, so it is one
+// line to delete when the producers arrive. If they do NOT arrive, this comment is
+// the evidence that the vocabulary was speculative and should be removed instead.
+#![allow(dead_code)]
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -80,7 +91,7 @@ impl ActivityId {
 }
 
 #[derive(Clone, Debug)]
-struct Activity {
+pub struct Activity {
     id: ActivityId,
     kind: ActivityKind,
     /// The producer's standing title ("Installing ALab toolchain").
@@ -328,7 +339,7 @@ impl StatusFeed {
         }
         // Newest first, exactly as the design reads.
         let mut candidates: Vec<&Activity> = self.live.iter().collect();
-        candidates.sort_by(|a, b| b.began.cmp(&a.began));
+        candidates.sort_by_key(|a| std::cmp::Reverse(a.began));
         let slot = if candidates.len() > 1 {
             (self.elapsed_since_epoch(now).as_secs_f64()
                 / Self::LANE_ROTATE.as_secs_f64()) as usize
@@ -365,7 +376,6 @@ impl StatusFeed {
     }
 
     /// The completed ledger, oldest first.
-    #[must_use]
     pub fn ledger_rows(&self) -> impl Iterator<Item = &LedgerRow> {
         self.ledger.iter()
     }

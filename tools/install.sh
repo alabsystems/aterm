@@ -1562,8 +1562,13 @@ print_install_plan() {
 		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
 	elif [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 || "${CONTAINER_KIND:-}" == zip ]]; then
 		echo "install.sh: toolset: DEFERRED to first launch — aterm streams the ALab toolset from the signed network index (~4.4 GiB on disk when finished)"
-	else
+	elif [[ "${CONTAINER_KIND:-}" == dmg ]]; then
 		echo "install.sh: toolset: aterm pkg seed + pkg update — unpacks to ~4.4 GiB under your home directory (the app reclaims its ~1 GB sealed payload copy afterwards)"
+	else
+		# No container election ran (--no-app, or an already-current app): the
+		# app at the destination may or may not still carry a sealed payload,
+		# so the plan hedges exactly as install_toolchain's narration does.
+		echo "install.sh: toolset: aterm pkg seed + pkg update — from the app's sealed payload when it carries one, else the signed network index; unpacks to ~4.4 GiB under your home directory"
 	fi
 
 	if [[ "$TOKEN_WANTED" -eq 1 ]]; then
@@ -3029,8 +3034,14 @@ install_toolchain() {
 		return 0
 	fi
 
-	if [[ "$(uname -s)" == Darwin && "${CONTAINER_KIND:-dmg}" != zip ]]; then
+	if [[ "$(uname -s)" == Darwin && "${CONTAINER_KIND:-}" == dmg ]]; then
 		echo "install.sh: installing the ALab toolset from the payload inside the app (no download)"
+	elif [[ "$(uname -s)" == Darwin && -z "${CONTAINER_KIND:-}" ]]; then
+		# The repair lanes (--no-app, an already-current app) elected no
+		# container, so whether the app still carries a sealed payload is
+		# unknown here — \`pkg seed\` itself decides, so the narration hedges
+		# instead of promising "no download" for an app that may be lean.
+		echo "install.sh: installing the ALab toolset (aterm pkg seed — from the app's sealed payload when it carries one, else from the signed network index)"
 	else
 		# No sealed payload can exist here — the Linux store layout has no
 		# bundle, and the Intel Mac lean container ships without the seal — so

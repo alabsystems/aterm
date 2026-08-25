@@ -713,11 +713,27 @@ pub fn front_door_instance() -> Option<String> {
         env::var(SELF_SID_ENV).ok(),
     )
     .ok()?;
-    if CtlStream::connect(&path).is_ok() {
-        Some(path)
-    } else {
-        None
-    }
+    front_door_probe(&path)
+}
+
+/// The liveness probe behind [`front_door_instance`], and the alias step it
+/// cannot skip: the returned path is the RESOLVED one, so the caller forwards to
+/// exactly the instance that answered.
+///
+/// WINDOWS: the flagless `aterm.sock` is a pointer FILE, not a socket
+/// (`aterm_uds::latest`), so connecting to it directly ALWAYS fails — and since
+/// this probe is the whole input to `route_launch`'s `instance_reachable`, the
+/// entire `attach` lane was dead there: `aterm new-tab` opened a new window
+/// every time, no matter what `windowing_behavior` said, and the jump list's
+/// New Tab task (which is gated on `attach` being configured) with it. Every
+/// other client path in this crate already resolves the alias before dialing
+/// (`connect_stream`); this one did not. Unix is unaffected — the kernel
+/// resolves the symlink during `connect`, and `latest::resolve` is the identity
+/// there.
+#[must_use]
+fn front_door_probe(path: &str) -> Option<String> {
+    let resolved = aterm_uds::latest::resolve(path);
+    CtlStream::connect(&resolved).is_ok().then_some(resolved)
 }
 
 /// Hand one request line to the instance at `path` and return its FIRST reply
@@ -738,6 +754,7 @@ pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
     let stream = connect_stream(path)?;
     stream.set_read_timeout(Some(FORWARD_DEADLINE))?;
     stream.set_write_timeout(Some(FORWARD_DEADLINE))?;
+    allow_foreground_handoff(path);
     send_request(&stream, read_token_for(path).as_deref(), request)?;
     let mut reader = BufReader::new(&stream);
     let mut reply = String::new();
@@ -748,6 +765,54 @@ pub fn front_door_send(path: &str, request: &str) -> io::Result<String> {
         ));
     }
     Ok(reply.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// WINDOWS: hand our right to set the foreground window to the instance we are
+/// forwarding to, so its `SW_RESTORE` + `SetForegroundWindow` actually raises the
+/// window the new tab lands in instead of blinking the taskbar button.
+///
+/// The OS refuses `SetForegroundWindow` from a process that is not itself in the
+/// foreground; `AllowSetForegroundWindow(pid)` is the documented handoff, and the
+/// launching `aterm.exe` HAS that right (it was started by the foreground
+/// process — the shell the user typed in, or Explorer for the jump-list task).
+/// Best-effort in every direction: no pid (an explicit `$ATERM_CONTROL_SOCK`
+/// path names no instance), a stale alias, or a refusal all leave the receiver
+/// to fall back to the taskbar flash, which is Windows' own answer for "a
+/// background app wants your attention".
+///
+/// Called AFTER the connect (the instance is proven live) and BEFORE the request
+/// line, because the grant lasts only until the next input event — the receiver
+/// must be able to spend it the moment the spawn completes. Nothing about the
+/// forward's success depends on it: the reply framing, the deadlines and the
+/// caller's routing are all unchanged whether the grant lands or not.
+#[cfg(windows)]
+fn allow_foreground_handoff(path: &str) {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn AllowSetForegroundWindow(pid: u32) -> i32;
+    }
+    let Some(pid) = instance_pid_of(path) else {
+        return;
+    };
+    // SAFETY: a documented one-argument user32 call taking a plain pid, with no
+    // pointers and no preconditions; a refusal is reported as a `0` return,
+    // which is deliberately ignored (see the doc comment).
+    let _ = unsafe { AllowSetForegroundWindow(pid) };
+}
+
+#[cfg(not(windows))]
+fn allow_foreground_handoff(_path: &str) {}
+
+/// The pid of the instance a front-door socket path belongs to, parsed from the
+/// per-instance filename `aterm-<pid>.sock`, resolving the `latest` POINTER FILE
+/// first (on Windows the alias is a regular file naming the instance socket —
+/// see `aterm_uds::latest`). `None` when the path names no instance: an explicit
+/// `$ATERM_CONTROL_SOCK` override, or a dangling/foreign alias.
+#[cfg(windows)]
+fn instance_pid_of(path: &str) -> Option<u32> {
+    let resolved = aterm_uds::latest::resolve(path);
+    let name = std::path::Path::new(&resolved).file_name()?.to_str()?;
+    control_socket::instance_pid(name)
 }
 
 /// Environment variable consulted for the socket path when `--sock`/`--pid`
@@ -2583,6 +2648,14 @@ mod tests {
     /// pumps it back. Full cross-machine dial (a live TLS remote) is verified BY
     /// CONSTRUCTION: server prebuffer-forwards `<verb...>` (control.rs `try_net_dial`)
     /// and this client frames the reply by that forwarded verb.
+    ///
+    /// UNIX ONLY: the mock instance is a `std::os::unix::net::UnixListener`,
+    /// which does not exist on Windows — so without this gate the whole
+    /// `aterm-ctl` TEST TARGET failed to compile there (E0433, `cannot find
+    /// unix in os`) and not one of this module's tests could run on Windows.
+    /// The client half under test is platform-free; what is unix-only is the
+    /// listener standing in for a live instance.
+    #[cfg(unix)]
     #[test]
     fn dial_with_verb_reads_lines_reply_without_hanging() {
         use std::io::{BufRead, Read, Write};
@@ -3461,5 +3534,91 @@ mod tests {
         let inst = aterm_uds::latest::token_path_for_sock("/tmp/run/aterm-77.sock")
             .expect("instance socket resolves");
         assert_eq!(inst, Path::new("/tmp/run/aterm-77.token"));
+    }
+
+    /// The `attach` lane's foreground handoff must name the RECEIVING instance,
+    /// and all the forward path holds is a socket path. Both reachable shapes
+    /// resolve: a per-instance socket names its pid outright, and the flagless
+    /// `latest` alias is a pointer FILE whose contents name it. Anything that
+    /// names no instance stays `None` — a pid guessed out of an arbitrary
+    /// filename would hand the foreground right to an unrelated process.
+    #[cfg(windows)]
+    #[test]
+    fn the_forward_target_pid_comes_from_the_socket_name_or_its_alias() {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-fgpid-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let named = dir.join("aterm-77.sock");
+        assert_eq!(
+            instance_pid_of(named.to_str().expect("utf8 path")),
+            Some(77),
+            "a per-instance socket names its own pid"
+        );
+
+        let alias = dir.join(control_socket::LATEST_SOCK_FILE);
+        std::fs::write(&alias, "aterm-4242.sock\n").expect("write the latest pointer file");
+        assert_eq!(
+            instance_pid_of(alias.to_str().expect("utf8 path")),
+            Some(4242),
+            "the flagless alias resolves to the instance it points at"
+        );
+
+        // An explicit `$ATERM_CONTROL_SOCK` override names no instance.
+        assert_eq!(
+            instance_pid_of(dir.join("c.sock").to_str().expect("utf8")),
+            None
+        );
+        // A pointer file that does not name an instance socket resolves to
+        // nothing rather than to the alias's own (pid-less) name.
+        std::fs::write(&alias, "..\\..\\somewhere-else.sock").expect("rewrite the pointer file");
+        assert_eq!(instance_pid_of(alias.to_str().expect("utf8 path")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The front door's liveness probe must dial the instance the flagless
+    /// alias POINTS AT. On Windows that alias is a pointer file, so probing it
+    /// directly can never connect — and this probe is the entire input to
+    /// `route_launch`'s `instance_reachable`, so the whole `attach` lane
+    /// (`aterm new-tab` forwarding, and the jump list's New Tab task) silently
+    /// fell back to opening a new window. Measured with a real listener bound
+    /// at the instance path and a real pointer file beside it.
+    #[test]
+    fn the_front_door_probe_dials_through_the_latest_alias() {
+        let dir = std::env::temp_dir().join(format!("aterm-ctl-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("private probe dir");
+        let instance = dir.join(control_socket::instance_sock_name(std::process::id()));
+        let alias = dir.join(control_socket::LATEST_SOCK_FILE);
+        let alias_str = alias.to_str().expect("utf8 path").to_string();
+
+        // Nothing bound yet: the alias exists but the instance is a corpse.
+        aterm_uds::latest::publish(&alias, instance.to_str().expect("utf8 path"));
+        assert_eq!(
+            front_door_probe(&alias_str),
+            None,
+            "a dangling alias must not route a tab into a corpse"
+        );
+
+        // A live listener at the instance path — the probe must find it THROUGH
+        // the alias. What it answers with is PLATFORM LAW, not preference:
+        // on Windows the alias is a pointer file no connect can dial, so the
+        // probe must answer the RESOLVED instance path (the forward and the
+        // pid it grants foreground to must name the same instance); on unix
+        // the alias is a symlink the kernel follows during `connect` itself,
+        // `latest::resolve` is the documented identity, and the probe answers
+        // the alias back — resolving by hand there would be a second answer
+        // to a question the kernel already owns.
+        let listener = aterm_uds::CtlListener::bind(&instance).expect("bind the mock instance");
+        #[cfg(windows)]
+        let expected = instance.to_str().expect("utf8 path");
+        #[cfg(not(windows))]
+        let expected = alias_str.as_str();
+        assert_eq!(
+            front_door_probe(&alias_str).as_deref(),
+            Some(expected),
+            "the probe must dial the live instance through the alias"
+        );
+        drop(listener);
+        let _ = std::fs::remove_file(&instance);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

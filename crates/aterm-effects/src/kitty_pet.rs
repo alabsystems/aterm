@@ -97,6 +97,7 @@ use core::f32::consts::TAU;
 
 use web_time::Instant;
 
+use crate::cat_baker::CatColorKey;
 use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
 
 // ── the chase ───────────────────────────────────────────────────────────────
@@ -1617,6 +1618,13 @@ pub struct PetBrain {
     /// Whether the pet has been seen at all yet (drives the fade-in).
     alpha: f32,
 
+    /// Contrast palette frozen for this resident-pet appearance. The flying
+    /// cursor kitty has its own episode latch; sharing that latch made a hidden
+    /// flying cat donate stale colours to a pet that could remain on glass for
+    /// minutes. This one clears at zero alpha and on explicit host context
+    /// invalidation (session/theme/geometry/source changes).
+    colors: Option<CatColorKey>,
+
     /// The `(coat, iris)` this appearance is WEARING — the pet's copy of the
     /// flying kitty's per-appearance look latch (`kitty_cursor`'s two-path
     /// rule: one appearance wears one cat). `None` until the host first
@@ -1748,6 +1756,7 @@ impl Default for PetBrain {
             peek: false,
             gaze_dwell: 0.0,
             alpha: 0.0,
+            colors: None,
             worn: None,
             pending_worn: None,
             handoff_parked_clock: None,
@@ -2357,6 +2366,9 @@ impl PetBrain {
                 };
             }
             self.alpha = (self.alpha - dt / FADE_OUT).max(0.0);
+            if self.alpha == 0.0 {
+                self.colors = None;
+            }
             // The envelope has reached zero: a look sync parked mid-appearance
             // ([`Self::sync_look`]) lands now, so the NEXT appearance is the
             // one that wears the new cat.
@@ -2432,6 +2444,11 @@ impl PetBrain {
             self.enter_settled(dt);
             return self.emit(sense, width);
         };
+        if was_invisible {
+            // A new sighting samples the palette under its own prospective
+            // body. Never inherit a previous resident appearance.
+            self.colors = None;
+        }
         self.alpha = (self.alpha + dt / FADE_IN).min(1.0);
 
         // First sighting: materialise at the station rather than sliding in from
@@ -2485,7 +2502,12 @@ impl PetBrain {
         }
 
         if sense.reduced_motion {
-            // No chase, no gait, no arc: the pet simply IS at its station.
+            // No fade, chase, gait, or arc: the pet simply IS at its station.
+            // Reduced motion owns no frame-cadence lane in the host, so leaving
+            // the ordinary first-sighting fade at alpha 0 here strands the
+            // resident until unrelated redraws happen to advance it. Snap to
+            // the static final opacity on this very first live-caret sample.
+            self.alpha = 1.0;
             self.col = Self::station(cc, sense.cols, width);
             self.row = f32::from(cr);
             self.speed = 0.0;
@@ -3726,6 +3748,22 @@ impl PetBrain {
         }
 
         self.emit(sense, width)
+    }
+
+    /// Resolve an explicit windowless still capture. Such a capture has no
+    /// animation cadence after this call, so the ordinary first fade-in tick
+    /// (`dt == 0`, alpha 0) would produce an image with no resident pet and
+    /// leave `is_active()` false until somebody requested a second image.
+    /// Materialize that first sighting at full opacity after the normal tick
+    /// has seeded its lawful station and action; later captures use the normal
+    /// live state unchanged. Glass/video callers must continue using [`tick`].
+    pub fn tick_static_capture(&mut self, sense: PetSense) -> PetFrame {
+        let frame = self.tick(sense);
+        if sense.caret.is_some() && frame.alpha == 0 && self.needs_frames() {
+            self.alpha = 1.0;
+            return self.emit(sense, art_cols(sense.cell_w, sense.cell_h));
+        }
+        frame
     }
 
     /// React to an observed caret move of `(dr, dc)` cells, landing on
@@ -5099,6 +5137,26 @@ impl PetBrain {
         }
     }
 
+    /// Freeze the first prospective-footprint palette sample for the current
+    /// resident appearance. Later motion frames reuse it so walking never
+    /// thrashes between atlas tiles as the text beneath the body changes.
+    pub fn colors_for_appearance(&mut self, sampled: CatColorKey) -> CatColorKey {
+        *self.colors.get_or_insert(sampled)
+    }
+
+    /// Return the palette already frozen for this resident appearance.
+    #[must_use]
+    pub fn appearance_colors(&self) -> Option<CatColorKey> {
+        self.colors
+    }
+
+    /// Retire only the pet's contrast sample. Hosts call this when the pet's
+    /// coordinate or palette context changes while it remains visible; the
+    /// behaviour, position and breed handoff continue uninterrupted.
+    pub fn invalidate_colors(&mut self) {
+        self.colors = None;
+    }
+
     /// Whether the pet needs the host's 60 fps lane this frame — the
     /// **idle-to-zero** predicate.
     ///
@@ -5612,6 +5670,18 @@ mod tests {
     }
 
     #[test]
+    fn the_first_windowless_still_materializes_the_resident_pet() {
+        let mut pet = PetBrain::default();
+        let f = pet.tick_static_capture(sense(Instant::now(), Some((5, 10))));
+        assert_eq!(f.alpha, 255, "a requested still contains the resident pet");
+        assert!(pet.is_active(), "status agrees with the captured pixels");
+        assert!(
+            (f.col - PetBrain::station(10, 100, art_cols(10, 20))).abs() < 0.01,
+            "the static capture uses the normal first-sighting station"
+        );
+    }
+
+    #[test]
     fn a_fresh_pet_is_asleep_until_you_type() {
         let start = Instant::now();
         let mut pet = PetBrain::default();
@@ -5954,10 +6024,8 @@ mod tests {
                 assert_eq!(f.scale_y, 1.0);
                 assert!(matches!(f.action, PetAction::Sit | PetAction::Sleep));
                 assert!((f.col - PetBrain::station(col, 100, w)).abs() < 1e-3);
-                // The appear ramp is not "animation" — sample only once opaque.
-                if f.alpha == 255 {
-                    fps.insert(f.fp());
-                }
+                assert_eq!(f.alpha, 255, "a static pet appears in one sample");
+                fps.insert(f.fp());
             }
         }
         assert!(
@@ -5966,6 +6034,20 @@ mod tests {
              not animate: {} distinct frames",
             fps.len()
         );
+    }
+
+    #[test]
+    fn reduced_motion_first_live_caret_sample_is_an_opaque_static_pet() {
+        let now = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut input = sense(now, Some((4, 12)));
+        input.reduced_motion = true;
+        let frame = pet.tick(input);
+
+        assert_eq!(frame.alpha, 255, "the first requested still is already visible");
+        assert_eq!(frame.lift, 0.0);
+        assert_eq!((frame.scale_x, frame.scale_y), (1.0, 1.0));
+        assert!(matches!(frame.action, PetAction::Sit | PetAction::Sleep));
     }
 
     #[test]
@@ -6073,6 +6155,52 @@ mod tests {
             (9, 4),
             "the parked pair landed at zero alpha, so the new appearance wears it"
         );
+    }
+
+    #[test]
+    fn resident_palette_is_owned_by_one_pet_appearance() {
+        let dark = CatColorKey {
+            accent: 1,
+            background: 0,
+        };
+        let light = CatColorKey {
+            accent: 7,
+            background: 3,
+        };
+        let start = Instant::now();
+        let mut pet = PetBrain::default();
+        let mut t = awake(&mut pet, start, 5, 10);
+        assert_eq!(pet.appearance_colors(), None);
+        assert_eq!(pet.colors_for_appearance(dark), dark);
+        assert_eq!(
+            pet.colors_for_appearance(light),
+            dark,
+            "walking frames keep one stable atlas palette"
+        );
+
+        pet.invalidate_colors();
+        assert_eq!(
+            pet.colors_for_appearance(light),
+            light,
+            "a host context edge resamples without resetting the brain"
+        );
+        for _ in 0..120 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, None));
+        }
+        assert!(!pet.is_active(), "the fixture completes its fade-out");
+        assert_eq!(
+            pet.appearance_colors(),
+            None,
+            "zero alpha retires the old appearance palette"
+        );
+
+        for _ in 0..4 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((5, 10))));
+        }
+        assert!(pet.is_active());
+        assert_eq!(pet.colors_for_appearance(dark), dark);
     }
 
     /// The pet_stand pose shipped in the binary from day one and was never

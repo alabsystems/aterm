@@ -6,11 +6,15 @@
 //!
 //! # Why this exists
 //!
-//! The shipped `aterm` binary on aarch64-apple-darwin resolves 153 third-party
-//! packages carrying ~2.08M lines of Rust that aterm does not own, cannot edit,
-//! and does not verify — 85% more than that on Linux. `.cargo/config.toml`
+//! The shipped `aterm` binary on aarch64-apple-darwin resolves 148 third-party
+//! packages carrying ~2.05M lines of Rust that aterm does not own, cannot edit,
+//! and does not verify — 74% more than that on Linux. `.cargo/config.toml`
 //! disables in-compilation verification (`-Ztrust-verify=off`) for exactly that
 //! reason, as an explicitly temporary opt-out.
+//!
+//! Those two figures, and every other pinned count, are read from `measured`
+//! (`src/measured.rs`) — the single place the baseline lives, so an extraction
+//! that shrinks the surface costs ONE edit rather than fourteen red tests.
 //!
 //! Forge is the instrument for shrinking that surface on a measured, ratcheted,
 //! provenance-carrying basis: it SURVEYS the graph, ATTRIBUTES each package's
@@ -41,6 +45,7 @@
 //! | [`budget`] | `tools/forge-budget.tsv` — the lower-only ratchet |
 //! | [`attest`] | provenance, license and `[patch]`-liveness obligations |
 //! | [`check`] | the gate reporter: all of the above, no compilation |
+//! | `measured` | test-only: the pinned per-cell baseline, in ONE place |
 
 pub mod attest;
 pub mod blame;
@@ -48,6 +53,12 @@ pub mod budget;
 pub mod check;
 pub mod dominator;
 pub mod loc;
+/// THE pinned measurement baseline, read by every test that asserts a real
+/// number about this tree. Test-only on purpose: the shipped verbs MEASURE, and
+/// a verb that consulted a hard-coded count would be reporting the answer it
+/// was told instead of the one the graph has.
+#[cfg(test)]
+pub mod measured;
 pub mod model;
 pub mod policy;
 pub mod resolve;

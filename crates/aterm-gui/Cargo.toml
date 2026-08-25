@@ -31,16 +31,35 @@ required-features = ["control-conformance"]
 # into the inline-image placement/blit path). The production `cargo build
 # -p aterm-gui` therefore renders sixel; a consumer that wants the byte-identical
 # no-sixel engine can still build with `--no-default-features`.
-# `a11y-accesskit` is ON by default too: native tab apps (including Settings,
-# Manual, About, and Update) and the transient command palette expose the same
-# semantic model their renderer consumes, so a screen reader reads the same state
-# the pixels + `controls` verb do. The EXACT-pinned `accesskit_winit =0.33.1`
-# resolves against the vendored winit 0.30.13 through the workspace
-# `[patch.crates-io]` redirect (a SINGLE winit instance links), so shipping it on is
-# clean today. On macOS it is mutually exclusive with `a11y-appkit` (both claim the
-# content view's a11y tree) — build the AppKit publisher path with
+# `a11y-accesskit` WAS on by default and is NOT any more (2026-08-25, owner
+# decision, docs/THIRD_PARTY_SURFACE_PLAN.md). It was the single largest
+# dependency-surface item aterm could retire with one line, MEASURED by
+# `targo --unverified forge survey`:
+#
+#   * macOS  — 5 packages / 26,680 lines (accesskit, accesskit_consumer,
+#     accesskit_macos, accesskit_winit, and uuid, which is in the binary only
+#     because `accesskit::TreeId(pub Uuid)` exists and aterm's only constructor
+#     is the constant `TreeId::ROOT`).
+#   * Linux  — 57 packages / 241,084 lines, i.e. 22% of that target's whole
+#     third-party package count: accesskit_unix drags an entire D-Bus IPC
+#     runtime (zbus, zvariant, atspi) with its own async executor into a
+#     terminal.
+#   * And it removes the ONLY path by which an UNPATCHED `winnow 1.0.3` reached
+#     the shipped Linux graph. aterm forks winnow at 0.7.15 to fix an
+#     `offset_from` underflow; a 0.7 fork cannot satisfy `^1.0`, so the unfixed
+#     copy linked in through accesskit_unix -> zbus. `forge check`'s
+#     patch-liveness obligation was RED on exactly this.
+#
+# WHAT THIS COSTS, stated plainly: no cross-platform screen-reader tree. On
+# Linux and Windows that is the whole of it. On macOS the aterm-owned
+# `a11y-appkit` publisher below is a drop-in replacement carrying ZERO
+# third-party lines — it is still OFF by default because it adds a per-frame
+# publish cost, not because it is unavailable. Enable it with
 # `--no-default-features --features sixel,a11y-appkit`.
-default = ["sixel", "a11y-accesskit"]
+#
+# The feature itself is retained, not deleted: `--features a11y-accesskit`
+# restores the previous build exactly.
+default = ["sixel"]
 # Sixel graphics rendering in the shipped app (see `default` above). A thin
 # forward to aterm-core/sixel: aterm-gui carries no sixel code of its own, so
 # this only flips the engine feature on for this binary.

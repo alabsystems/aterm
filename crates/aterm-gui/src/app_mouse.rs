@@ -93,6 +93,21 @@ pub(crate) fn winit_mouse_button(b: WinitMouseButton) -> Option<aterm_types::mou
     }
 }
 
+/// An in-flight DRAG-TO-REORDER on the in-grid tab strip: which STABLE tab is
+/// held, and the strip column the gesture is anchored at. Stored per window in
+/// [`crate::WindowState::strip_drag`]; see [`App::advance_strip_drag`] for the
+/// rules.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StripDrag {
+    /// The tab the press grabbed. Identity, not index: a step relayouts the band,
+    /// so the index the press saw names a different tab immediately afterwards.
+    pub(crate) tab: crate::tab_model::TabId,
+    /// The strip column the drag is anchored at — the press column, re-anchored
+    /// to the pointer after every step it takes. A motion that has not left this
+    /// column takes no step, so a press that never moved cannot reorder.
+    pub(crate) origin_col: u16,
+}
+
 /// Whether the "open link" modifier is held: Cmd (Super) on macOS — its native
 /// convention — and Ctrl on every other platform, because Linux/X11 desktops grab
 /// the Super (Windows) key, so a Super-click would never reach aterm. Mirrors the
@@ -1334,6 +1349,12 @@ impl App {
         if !self.tab_strip_enabled() {
             return;
         }
+        // DRAG-TO-REORDER rides the same per-motion hook: the pointer has moved,
+        // and if a chip is held that motion may be a step. Runs BEFORE the hover
+        // below because the hover is change-gated and returns early — a reorder
+        // that left the pointer over the same INDEX must still repaint, which the
+        // step does for itself.
+        self.advance_strip_drag(wid, geom, x, y);
         let hovered = self.strip_col_at_with(wid, geom, x, y).and_then(|col| {
             let segs = self
                 .windows
@@ -1360,6 +1381,116 @@ impl App {
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
+    }
+
+    /// DRAG A TAB TO REORDER IT — the in-grid strip's second pointer gesture,
+    /// advanced from the same per-motion hook as the hover ([`Self::track_strip_hover`]).
+    ///
+    /// The gesture is armed by the press that SELECTS a chip (`handle_tab_strip_click`'s
+    /// [`crate::tab_bar::TabHit::Select`] arm, which still switches on the press —
+    /// Explorer, Edge and Windows Terminal all select first and reorder as the
+    /// pointer moves) and disarmed by the release, by any other strip press
+    /// ([`App::clear_strip_press`]) and by focus loss. Everything between is here.
+    ///
+    /// THE STEP RULE, and why it is a midpoint rather than a delta: the pointer
+    /// steps the held tab one slot whenever it passes the MIDPOINT of the
+    /// neighbouring segment, read out of the very `ws.tab_segments` the paint
+    /// recorded — the painter-records / hit-test-reads discipline the rest of the
+    /// strip already follows, so the chips can never swap somewhere the glass does
+    /// not show them. Two properties fall out of that and are worth naming:
+    ///
+    /// * A PRESS THAT NEVER MOVED CANNOT REORDER. The press column lies inside the
+    ///   held chip's own segment, and a neighbour's midpoint is strictly beyond
+    ///   that segment's far edge, so no crossing exists until the pointer actually
+    ///   travels. The `origin_col` guard states the same invariant explicitly
+    ///   rather than leaving it to be re-derived (and it is re-anchored after each
+    ///   step, so a settled pointer takes exactly one).
+    /// * The step is SELF-STABILISING. `move_tab` keeps the same tab selected, so
+    ///   after a step the pointer sits inside the moved chip's new share and the
+    ///   next crossing needs fresh travel — including under the pressure layout,
+    ///   where the active chip is the wide one and the geometry changes shape
+    ///   around the move.
+    ///
+    /// Off the band (below the strip rows) the drag stays ARMED but takes no step:
+    /// the chip neither tears out (explicitly out of scope — `detach_active_tab`
+    /// exists for a later lane) nor snaps home, so sweeping back onto the strip
+    /// resumes the same gesture.
+    ///
+    /// A single coalesced motion may cross more than one midpoint, so this steps
+    /// until the pointer is over the held chip again, bounded by the tab count.
+    fn advance_strip_drag(&mut self, wid: WindowId, geom: PointerGeometry, x: f64, y: f64) {
+        let Some(drag) = self.windows.get(&wid).and_then(|ws| ws.strip_drag) else {
+            return;
+        };
+        // A palette opened by KEYBOARD under a held button is still modal even
+        // though the pointer was never claimed: stepping the held chip under it
+        // would reorder the strip out of sight. Read-only on purpose —
+        // `palette_claims_pointer` (the motion seam's gate) owns the hover/press
+        // side effects, and the release still lands in `on_mouse_input`'s
+        // hoisted disarm, so the gesture simply ends when the button lifts.
+        if self.windows.get(&wid).is_some_and(|ws| ws.palette().is_some()) {
+            return;
+        }
+        let Some(col) = self.strip_col_at_with(wid, geom, x, y) else {
+            return;
+        };
+        if col == drag.origin_col {
+            return;
+        }
+        let mut stepped = false;
+        for _ in 0..self.windows.get(&wid).map_or(0, |ws| ws.tab_set.len()) {
+            let Some((from, to)) = self.strip_drag_step(wid, drag.tab, col) else {
+                break;
+            };
+            self.move_tab(wid, from, to);
+            stepped = true;
+        }
+        if !stepped {
+            return;
+        }
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.strip_drag = Some(StripDrag {
+                origin_col: col,
+                ..drag
+            });
+            if let Some(window) = &ws.os_window {
+                window.request_redraw();
+            }
+        }
+    }
+
+    /// One step of [`Self::advance_strip_drag`]: where the held `tab` currently
+    /// sits and where a pointer at strip column `col` wants it, or `None` when the
+    /// pointer has not passed a neighbour's midpoint (or the tab is gone, or it has
+    /// no neighbour on that side — a lone tab always lands here).
+    fn strip_drag_step(
+        &self,
+        wid: WindowId,
+        tab: crate::tab_model::TabId,
+        col: u16,
+    ) -> Option<(usize, usize)> {
+        let ws = self.windows.get(&wid)?;
+        let from = ws.tab_set.tabs().iter().position(|t| t.id == tab)?;
+        let segment = |index: usize| {
+            ws.tab_segments
+                .iter()
+                .find(|seg| seg.kind == crate::tab_bar::TabHit::Select(index))
+        };
+        // Midpoint of a half-open `[start, end)` column range.
+        let mid = |seg: &crate::tab_bar::TabSegment| {
+            seg.start_col + seg.end_col.saturating_sub(seg.start_col) / 2
+        };
+        if let Some(next) = segment(from + 1)
+            && col >= mid(next)
+        {
+            return Some((from, from + 1));
+        }
+        if let Some(prev) = from.checked_sub(1).and_then(segment)
+            && col < mid(prev)
+        {
+            return Some((from, from - 1));
+        }
+        None
     }
 
     /// A left click on the Cmd-F find panel. On the `Aa` (case) / `.*` (regex)
@@ -2904,6 +3035,18 @@ impl App {
         // FSM that yields the authoritative `click_count`. These stay in the
         // handler; the seam consumes `click_count`/`side` as DATA.
         let pressed = state == ElementState::Pressed;
+        // THE END OF A TAB DRAG. Lifting the button ends drag-to-reorder wherever
+        // the pointer is, so this sits ABOVE every gate below — a release the
+        // palette or the tab menu swallows must still disarm the chip, or the next
+        // bare hover across the strip would keep shuffling tabs. Nothing else is
+        // decided here: the tab is already where the drag left it (each step
+        // committed through `move_tab`), so there is no drop to settle.
+        if !pressed
+            && button == WinitMouseButton::Left
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            ws.strip_drag = None;
+        }
         // DRAG-TO-CONNECT (design §3.1–§3.3): a live winit-origin connector
         // gesture owns the left button — the RELEASE is its commit (§3.1:
         // in-place ⇒ menu, past the threshold ⇒ drop/cancel), checked before
@@ -3397,6 +3540,37 @@ impl App {
         // Cross-platform by config (macOS/Linux default `off` — their hands
         // expect a context menu / middle-click paste), so no cfg here: the
         // platform split lives in `RightClickGesture::PLATFORM_DEFAULT`.
+        //
+        // C5 COMPLETION (WINDOWS) — the bare-band right press below DECIDED
+        // the window's system menu but deliberately did not open it (see the
+        // `Chrome` arm: DefWindowProc refuses menu mode while winit still
+        // holds the press's mouse capture). The matching RELEASE completes
+        // it: by the time the posted SC_KEYMENU is pumped, winit's
+        // WM_RBUTTONUP handling has called `ReleaseCapture`, so the menu
+        // tracks for a real hand exactly as it does for Alt+Space. The
+        // release is CONSUMED with the popup — its press was chrome, never
+        // reported, so letting it fall through would at best die at the
+        // `was_reported` guard and at worst hand a tracking TUI half a pair.
+        // A right PRESS finding the latch still armed means the release was
+        // lost (focus steal mid-press, the `conn_drag` defensive rule):
+        // disarm and let the press decide afresh.
+        #[cfg(windows)]
+        if button == WinitMouseButton::Right
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.band_menu_release_pending)
+        {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.band_menu_release_pending = false;
+            }
+            if !pressed {
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    let _ = crate::platform_win::popup_system_menu(w);
+                }
+                return;
+            }
+        }
         if pressed && button == WinitMouseButton::Right {
             let (px, py) = self
                 .windows
@@ -3425,10 +3599,13 @@ impl App {
                     // CHIP, pop that tab's context menu — the first Windows
                     // reflex on a tab, and the only way the long-composed
                     // `session_chrome::compose_tab_menu` model reaches a human
-                    // off macOS. On the bare band, the `+` or the `↻` there is
-                    // nothing to pop, so the arm keeps its wave-3 behaviour: a
-                    // pure swallow, which is still the fix for the bogus-cell
-                    // fall-through this whole plan exists for.
+                    // off macOS. On the BARE band — which is caption, and
+                    // already drags the window and maximizes on a double-click —
+                    // the reflex is the WINDOW's system menu, the third and last
+                    // thing a right-press on a Windows caption does. It used to
+                    // be swallowed silently, so the one place aterm's caption
+                    // was not a caption was also the only place Move / Size /
+                    // Close could not be reached with the mouse.
                     //
                     // WINDOWS AND LINUX — the two platforms whose tab chrome IS
                     // the in-grid strip. macOS stays out: its chips carry a
@@ -3461,10 +3638,37 @@ impl App {
                             .get(&wid)
                             .map(|ws| ws.tab_segments.clone())
                             .unwrap_or_default();
-                        if let Some(crate::tab_bar::TabHit::Select(index) | crate::tab_bar::TabHit::Close(index)) =
-                            crate::tab_bar::hit_test(&segs, col)
-                        {
-                            self.open_tab_context_menu(wid, index, col, false);
+                        match crate::tab_bar::hit_test(&segs, col) {
+                            Some(
+                                crate::tab_bar::TabHit::Select(index)
+                                | crate::tab_bar::TabHit::Close(index),
+                            ) => {
+                                let _ = self.open_tab_context_menu(wid, index, col, false);
+                            }
+                            // The bare band (or the `+` / `↻`, which have no menu
+                            // of their own): on WINDOWS the caption's system menu — the
+                            // band IS caption there. Linux has no system menu to pop, so
+                            // the bare band keeps its wave-3 pure swallow (and this arm
+                            // must not name the cfg(windows) platform_win module).
+                            //
+                            // DECIDED here, OPENED on the release: the press only ARMS
+                            // `band_menu_release_pending`. Popping on the DOWN is a
+                            // proven dead end — winit's win32 backend holds `SetCapture`
+                            // for the whole press, `DefWindowProc` will not enter its
+                            // modal menu loop while the thread holds mouse capture, so
+                            // the posted SC_KEYMENU opened only for a machine-speed
+                            // click whose release was already queued; a HUMAN press
+                            // (release 50–150 ms later) opened nothing (GUI_INMENUMODE
+                            // polled at zero through a 2 s held press, and the same post
+                            // with no button down opened the menu instantly). The
+                            // matching release completes it below, after winit has
+                            // released capture — the bdf7cf40 custody rule.
+                            _ => {
+                                #[cfg(windows)]
+                                if let Some(ws) = self.windows.get_mut(&wid) {
+                                    ws.band_menu_release_pending = true;
+                                }
+                            }
                         }
                     }
                     return;
@@ -6517,6 +6721,105 @@ mod tests {
         assert_eq!(app.windows[&wid].reported_buttons, 0);
     }
 
+    /// C5, the BARE band — the system menu's press/release custody, the
+    /// ordering the fix lives or dies on: the right PRESS on the bare band
+    /// must NOT pop the menu (winit still holds that press's mouse capture,
+    /// and DefWindowProc discards a menu entered under capture — the
+    /// machine-click-only bug), only ARM `band_menu_release_pending`; the
+    /// matching RELEASE spends the latch, and the popup post sits behind that
+    /// spend (`on_mouse_input`'s completion block — headless windows have no
+    /// HWND, so the latch transition is the unit-observable half; the glass
+    /// probe photographs the #32768 menu itself). Windows-only like the latch:
+    /// Linux's bare band keeps its pure swallow.
+    #[cfg(windows)]
+    #[test]
+    fn the_bare_band_system_menu_arms_on_press_and_fires_on_release() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        app.splice_tab_strip_with(wid, 1);
+        // A strip column PAST every segment: `hit_test` answers None there —
+        // the bare band, the caption's naked stretch.
+        let bare = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .map(|seg| seg.end_col)
+            .max()
+            .expect("the strip laid out segments")
+            + 2;
+        let bare_pt = (
+            pad + f64::from(bare) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        assert!(
+            app.strip_col_at(wid, bare_pt.0, bare_pt.1).is_some(),
+            "fixture point must be ON the strip"
+        );
+        assert!(
+            crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, bare)
+                .is_none(),
+            "fixture point must be the BARE band, not a chip or control"
+        );
+
+        app.on_cursor_moved(wid, bare_pt.0, bare_pt.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Right);
+        assert!(
+            app.windows[&wid].band_menu_release_pending,
+            "the PRESS armed the latch instead of popping — a popup posted \
+             here is discarded under winit's mouse capture"
+        );
+        assert!(
+            app.windows[&wid].tab_menu.is_none(),
+            "the bare band pops the SYSTEM menu, never the tab card"
+        );
+        assert_eq!(
+            app.windows[&wid].reported_buttons, 0,
+            "a press on chrome is never reported to the terminal"
+        );
+
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Right);
+        assert!(
+            !app.windows[&wid].band_menu_release_pending,
+            "the RELEASE spent the latch — the popup post lives behind this \
+             spend, after winit's ReleaseCapture"
+        );
+        assert_eq!(
+            app.windows[&wid].reported_buttons, 0,
+            "…and the consumed release leaked nothing to the terminal"
+        );
+
+        // CONTRAST: a right press on a CHIP arms nothing — the chip owns the
+        // tab card, and the system menu must not shadow it.
+        let chip = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find_map(|seg| match seg.kind {
+                crate::tab_bar::TabHit::Select(0) => Some(seg.start_col + 1),
+                _ => None,
+            })
+            .expect("the lone tab has a chip");
+        let chip_pt = (
+            pad + f64::from(chip) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        app.on_cursor_moved(wid, chip_pt.0, chip_pt.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Right);
+        assert!(
+            !app.windows[&wid].band_menu_release_pending,
+            "a chip press must not arm the system menu"
+        );
+        assert!(
+            app.windows[&wid].tab_menu.is_some(),
+            "…because it pops the tab card"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Right);
+    }
+
     /// I10/I11: the hover cursor resolves BY LOCATION. Over plain grid cells the
     /// window advertises the I-BEAM state (`native_text_cursor`, the surface's
     /// primary gesture being text selection); while a VT mouse-tracking app owns
@@ -6601,6 +6904,471 @@ mod tests {
             );
             app.on_modifiers_changed(wid, winit::keyboard::ModifiersState::empty());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // DRAG A TAB TO REORDER IT — the strip's held-chip gesture, driven end to
+    // end through the real handlers (`on_mouse_input` press → `on_cursor_moved`
+    // motion → release), so these pin the mapping from PIXELS to a reorder and
+    // not merely the FSM. Everything here runs against the real laid-out
+    // `ws.tab_segments`.
+    //
+    // Three tabs on the harness's 80-column strip share ~25 cells each, which is
+    // comfortably above `PREFERRED_MIN_TAB_COLS`, so the layout is
+    // selection-independent (see `layout_segments`): a step moves the chips and
+    // nothing else, which is what lets these tests read the spans once.
+    // ------------------------------------------------------------------
+
+    /// The window's canonical tab order, by stable id.
+    fn tab_order(app: &crate::App, wid: crate::WindowId) -> Vec<crate::tab_model::TabId> {
+        app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|tab| tab.id)
+            .collect()
+    }
+
+    /// The half-open column span of chip `index` on the laid-out strip.
+    fn chip_span(app: &crate::App, wid: crate::WindowId, index: usize) -> (u16, u16) {
+        let seg = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .find(|seg| seg.kind == crate::tab_bar::TabHit::Select(index))
+            .expect("the tab has a laid-out chip");
+        (seg.start_col, seg.end_col)
+    }
+
+    /// The window pixel at the centre of strip column `col`.
+    fn strip_point(app: &crate::App, wid: crate::WindowId, col: u16) -> (f64, f64) {
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        let point = (
+            pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
+            top + ch as f64 * 0.5,
+        );
+        assert_eq!(
+            app.strip_col_at(wid, point.0, point.1),
+            Some(col),
+            "fixture point must land on strip column {col}"
+        );
+        point
+    }
+
+    /// A three-tab window with the one-row in-grid strip laid out.
+    fn app_with_three_chips() -> (crate::App, crate::WindowId, Vec<crate::tab_model::TabId>) {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.splice_tab_strip(wid);
+        let order = tab_order(&app, wid);
+        assert_eq!(order.len(), 3, "three chips to shuffle");
+        (app, wid, order)
+    }
+
+    /// THE GESTURE: press a chip, sweep past the next chip's midpoint, release —
+    /// the tabs swap, and the tab you dragged is still the one selected.
+    #[test]
+    fn dragging_a_chip_past_its_neighbour_reorders_the_strip() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "the press SELECTS and nothing more — reordering is the motion's job"
+        );
+        assert_eq!(app.windows[&wid].tabs.active, 0, "…and it selected chip 0");
+
+        // Past the neighbour's midpoint: the crossing that steps.
+        let (start, end) = chip_span(&app, wid, 1);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+
+        assert_eq!(
+            tab_order(&app, wid),
+            vec![before[1], before[0], before[2]],
+            "the dragged chip swapped with the one it crossed"
+        );
+        assert_eq!(
+            app.windows[&wid].tabs.active, 1,
+            "a reorder must not silently switch tabs: the dragged tab is still selected"
+        );
+        assert!(
+            app.windows[&wid].strip_drag.is_none(),
+            "the release disarmed the gesture"
+        );
+    }
+
+    /// The same gesture LEFTWARD, and across TWO chips in one sweep: a coalesced
+    /// motion that crosses two midpoints takes two steps, not one.
+    #[test]
+    fn a_sweep_across_two_chips_walks_the_tab_two_places() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 2).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+
+        // One motion event, landing on the FIRST chip's leading half.
+        let over = strip_point(&app, wid, chip_span(&app, wid, 0).0);
+        app.on_cursor_moved(wid, over.0, over.1);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+
+        assert_eq!(
+            tab_order(&app, wid),
+            vec![before[2], before[0], before[1]],
+            "the dragged chip walked all the way to the front"
+        );
+        assert_eq!(app.windows[&wid].tabs.active, 0);
+    }
+
+    /// A PRESS WITH NO MOTION MUST NOT REORDER — and neither does a sweep that
+    /// stays inside the held chip's own share. The midpoint rule is what makes
+    /// that structural: a neighbour's midpoint is strictly beyond the held
+    /// segment's far edge, so there is no crossing until the pointer travels.
+    #[test]
+    fn a_press_that_never_crosses_a_midpoint_never_reorders() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let (start, end) = chip_span(&app, wid, 0);
+        let grab = strip_point(&app, wid, start + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows[&wid].strip_drag.is_some(),
+            "the chip IS held — this test is about what a held chip does NOT do"
+        );
+
+        // A hand resting on the mouse: sub-cell jitter that never leaves the
+        // pressed column.
+        app.on_cursor_moved(wid, grab.0 + 0.25, grab.1 + 0.25);
+        assert_eq!(tab_order(&app, wid), before, "jitter is not a drag");
+
+        // And a full sweep to the far end of the chip's OWN share.
+        let inside = strip_point(&app, wid, end - 1);
+        app.on_cursor_moved(wid, inside.0, inside.1);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "travel within the chip's own share crosses nothing"
+        );
+    }
+
+    /// THE RELEASE ENDS IT. After the button is up, sweeping the pointer across
+    /// the whole strip is a bare hover — it reveals `✕`s and reorders nothing.
+    #[test]
+    fn a_bare_hover_after_the_release_never_reorders() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+
+        for index in [1usize, 2, 1, 0] {
+            let (start, end) = chip_span(&app, wid, index);
+            let point = strip_point(&app, wid, start + (end - start) / 2);
+            app.on_cursor_moved(wid, point.0, point.1);
+        }
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "hovering the strip with no button held moves nothing"
+        );
+    }
+
+    /// FOCUS LOSS DROPS IT TOO — an alt-tab mid-drag can leave the release
+    /// undelivered, and a wedged gesture would make every later hover shuffle.
+    #[test]
+    fn focus_loss_drops_a_held_chip() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        app.on_focus(wid, false);
+        assert!(app.windows[&wid].strip_drag.is_none());
+
+        let (start, end) = chip_span(&app, wid, 1);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        assert_eq!(tab_order(&app, wid), before);
+    }
+
+    /// THE BAND'S OWN PRESS-DRAG IS UNTOUCHED: a press on bare strip background
+    /// is the window-move / maximize gesture (W2), not a grab on a chip, so it
+    /// arms no reorder — and sweeping from there moves no tab.
+    #[test]
+    fn a_press_on_the_bare_band_arms_no_reorder() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        // Past the trailing `+`, short of the strip's right edge: genuinely bare.
+        let band = app.windows[&wid]
+            .tab_segments
+            .iter()
+            .map(|seg| seg.end_col)
+            .max()
+            .expect("a laid-out strip");
+        assert!(
+            crate::tab_bar::hit_test(&app.windows[&wid].tab_segments, band).is_none(),
+            "fixture column must be bare band"
+        );
+        let point = strip_point(&app, wid, band);
+        app.on_cursor_moved(wid, point.0, point.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows[&wid].strip_drag.is_none(),
+            "the band's press-drag is a WINDOW move, never a tab grab"
+        );
+
+        let (start, end) = chip_span(&app, wid, 0);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(tab_order(&app, wid), before);
+    }
+
+    /// ANY OTHER STRIP PRESS DROPS THE HELD CHIP. The one that can actually
+    /// arrive with the left button still down is the RIGHT press that pops the
+    /// tab's context menu (`open_tab_context_menu` → `clear_strip_press`): the
+    /// card owns the pointer from then on, and motion under it must not keep
+    /// shuffling the strip it is anchored to.
+    #[test]
+    fn opening_the_context_menu_drops_a_held_chip() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let (grab_start, _) = chip_span(&app, wid, 0);
+        let grab = strip_point(&app, wid, grab_start + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(app.windows[&wid].strip_drag.is_some(), "the chip is held");
+
+        assert!(
+            app.open_tab_context_menu(wid, 0, grab_start + 1, false),
+            "the chip has a composed menu"
+        );
+        assert!(
+            app.windows[&wid].strip_drag.is_none(),
+            "popping the card dropped the grab"
+        );
+
+        let (start, end) = chip_span(&app, wid, 1);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "motion under the open card reorders nothing"
+        );
+    }
+
+    /// A stale press (past the double-click window) on the chip whose inline
+    /// RENAME editor is open must not arm a drag: that press is "keep editing"
+    /// (the editor stays), and a drag would reshuffle the strip out from under
+    /// the live field. Only the repeat press was excluded before this pin.
+    #[test]
+    fn a_press_on_the_chip_being_renamed_arms_no_drag() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        assert!(
+            app.begin_session_rename(wid, before[0]),
+            "fixture guard: the editor opened on chip 0"
+        );
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(
+            app.windows[&wid].strip_drag.is_none(),
+            "a press on the edited chip keeps editing — it never arms a drag"
+        );
+        assert!(
+            app.inline_rename_edit(wid).is_some(),
+            "…and the editor is still open"
+        );
+        let (start, end) = chip_span(&app, wid, 1);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "a sweep past a midpoint moves nothing under the field"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+    }
+
+    /// A palette opened by KEYBOARD while a chip is held: the modal owns the
+    /// window even though it never claimed the pointer, so the held chip
+    /// freezes — and the release still disarms through the hoisted disarm.
+    #[test]
+    fn a_palette_opened_mid_drag_freezes_the_held_chip() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let (mut app, wid, before) = app_with_three_chips();
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert!(app.windows[&wid].strip_drag.is_some(), "the chip is held");
+
+        app.toggle_palette();
+        assert!(
+            app.windows[&wid].palette().is_some(),
+            "fixture guard: the palette really opened"
+        );
+        let (start, end) = chip_span(&app, wid, 1);
+        let over = strip_point(&app, wid, start + (end - start) / 2);
+        app.on_cursor_moved(wid, over.0, over.1);
+        assert_eq!(
+            tab_order(&app, wid),
+            before,
+            "motion under the open palette reorders nothing"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert!(
+            app.windows[&wid].strip_drag.is_none(),
+            "the release disarmed through the hoisted disarm"
+        );
+    }
+
+    /// A LONE CHIP HAS NOWHERE TO GO: one tab, dragged the length of its own
+    /// share, is a no-op rather than a panic or a phantom move.
+    #[test]
+    fn a_lone_chip_has_nowhere_to_go() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        app.splice_tab_strip(wid);
+        let before = tab_order(&app, wid);
+        assert_eq!(before.len(), 1);
+
+        let (start, end) = chip_span(&app, wid, 0);
+        let grab = strip_point(&app, wid, start);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        for col in start..end {
+            let point = strip_point(&app, wid, col);
+            app.on_cursor_moved(wid, point.0, point.1);
+        }
+        // The anchor is the witness: it is re-anchored by (and only by) a step,
+        // so a lone chip that never stepped still carries its press column. This
+        // catches a neighbour lookup that falls back to the held segment — where
+        // `move_tab`'s own range guard would silently absorb the bogus move.
+        assert_eq!(
+            app.windows[&wid].strip_drag.map(|drag| drag.origin_col),
+            Some(start),
+            "a lone chip has no neighbour to cross, so it never took a step"
+        );
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+        assert_eq!(tab_order(&app, wid), before);
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+    }
+
+    /// THE PRESSURE REGIME (share < `PREFERRED_MIN_TAB_COLS`): eight chips on the
+    /// 80-column harness strip share ~9 cells each, so `layout_segments` gives the
+    /// ACTIVE chip a wide share and compresses the rest around it — and every step
+    /// of a drag reshapes the band, because the dragged tab stays selected. The
+    /// march below models the real frame loop (`move_tab` requests a redraw; the
+    /// repaint re-records `ws.tab_segments`) by re-splicing after every motion,
+    /// and walks the wide chip from the front of the strip to the back one
+    /// neighbour at a time — the self-stabilisation `advance_strip_drag`'s doc
+    /// analyses, finally pinned by a test.
+    #[test]
+    fn under_pressure_the_wide_active_chip_marches_across_the_strip() {
+        use winit::event::{ElementState, MouseButton as WinitMouseButton};
+
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        for _ in 0..7 {
+            app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        }
+        app.splice_tab_strip(wid);
+        let before = tab_order(&app, wid);
+        assert_eq!(before.len(), 8, "eight chips to force the pressure layout");
+
+        // Grab the FIRST chip: the press selects it, so from the first repaint on
+        // the dragged chip is the WIDE one and the band reshapes around every step.
+        let grab = strip_point(&app, wid, chip_span(&app, wid, 0).0 + 1);
+        app.on_cursor_moved(wid, grab.0, grab.1);
+        app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
+        assert_eq!(
+            app.windows[&wid].tabs.active, 0,
+            "the press selected chip 0"
+        );
+        app.splice_tab_strip(wid); // the repaint the selection requested
+
+        // The PRESSURE SIGNATURE, on the freshly recorded segments: the active
+        // chip's share is wider than an inactive neighbour's — the
+        // selection-DEPENDENT geometry the equal-share tests above never see. If
+        // this fails, the harness is no longer testing the regime it names.
+        let width = |index: usize| {
+            let (start, end) = chip_span(&app, wid, index);
+            end - start
+        };
+        assert!(
+            width(0) > width(1),
+            "eight tabs on this strip must engage the pressure layout \
+             (active {} cols vs inactive {})",
+            width(0),
+            width(1)
+        );
+
+        // March the held chip one neighbour at a time to the far end, re-splicing
+        // after every step exactly as the runtime repaints after one.
+        for step in 0..before.len() - 1 {
+            let (start, end) = chip_span(&app, wid, step + 1);
+            let over = strip_point(&app, wid, start + (end - start) / 2);
+            app.on_cursor_moved(wid, over.0, over.1);
+            assert_eq!(
+                tab_order(&app, wid)[step + 1],
+                before[0],
+                "step {step}: the held chip advanced exactly one slot"
+            );
+            assert_eq!(
+                app.windows[&wid].tabs.active,
+                step + 1,
+                "step {step}: the dragged tab is still the selected one"
+            );
+            app.splice_tab_strip(wid);
+            // The SAME pointer, re-delivered over the reshaped band (the repaint
+            // moved the chips under a stationary hand): the held chip's new wide
+            // share contains the pointer, so a settled pointer takes no second
+            // step — the drag must not oscillate against its own relayout.
+            app.on_cursor_moved(wid, over.0, over.1);
+            assert_eq!(
+                tab_order(&app, wid)[step + 1],
+                before[0],
+                "step {step}: a settled pointer must not oscillate after the repaint"
+            );
+        }
+        app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Left);
+
+        let mut expect: Vec<_> = before[1..].to_vec();
+        expect.push(before[0]);
+        assert_eq!(
+            tab_order(&app, wid),
+            expect,
+            "the chip marched from the front of the strip to the back"
+        );
+        assert_eq!(app.windows[&wid].tabs.active, before.len() - 1);
+        assert!(app.windows[&wid].strip_drag.is_none());
     }
 
     /// SELECTION CUSTODY §3 row 24, on the REAL handler: a word/line drag must

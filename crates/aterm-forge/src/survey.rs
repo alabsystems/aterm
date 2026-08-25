@@ -778,6 +778,7 @@ fn jstr(o: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measured;
 
     fn repo_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -799,7 +800,7 @@ mod tests {
         assert_eq!(commas(0), "0");
         assert_eq!(commas(999), "999");
         assert_eq!(commas(1_000), "1,000");
-        assert_eq!(commas(2_081_414), "2,081,414");
+        assert_eq!(commas(1_234_567), "1,234,567");
         assert_eq!(commas(u64::MAX), "18,446,744,073,709,551,615");
     }
 
@@ -934,17 +935,18 @@ mod tests {
         assert!(json_wellformed(r#"{"a": "b}"#).is_err());
     }
 
-    /// THE ground-truth test. Measured on this checkout with an independent
-    /// `cargo tree` + walk: 206 packages, 53 workspace, 153 third-party,
-    /// 2,081,414 physical lines of Rust.
+    /// THE ground-truth test: the report's own assembly path reproduces the
+    /// baseline in `measured`, which was taken with an independent `cargo tree`
+    /// plus source walk.
     #[test]
     fn mac_arm_reproduces_the_measured_third_party_surface() {
         let root = repo_root();
+        let want = measured::MAC_ARM;
         let s = loc::survey_cell(&root, &cell("mac-arm")).expect("mac-arm resolves offline");
-        assert_eq!(s.graph.nodes.len(), 206, "total packages in the mac-arm shipped graph");
-        assert_eq!(s.third_party().count(), 153, "third-party packages");
-        assert_eq!(s.third_party_loc(), 2_081_414, "third-party physical LOC");
-        assert_eq!(s.duplicate_names().len(), 8, "names at two or more versions");
+        assert_eq!(s.graph.nodes.len(), want.resolved, "total packages in the shipped graph");
+        assert_eq!(s.third_party().count(), want.third_party, "third-party packages");
+        assert_eq!(s.third_party_loc(), want.third_party_loc, "third-party physical LOC");
+        assert_eq!(s.duplicate_names().len(), want.duplicate_names, "names at 2+ versions");
     }
 
     /// The invariant the report prints: non-nested dominator sets are disjoint
@@ -981,8 +983,13 @@ mod tests {
         let root = repo_root();
         let out = run(&root, &["mac-arm".to_string()], 12, None).expect("survey runs");
         assert!(out.ok, "a resolvable cell is not a failure:\n{}", out.log);
-        assert!(out.log.contains("2,081,414"), "third-party LOC is printed:\n{}", out.log);
-        assert!(out.log.contains("153"), "third-party count is printed");
+        let want = measured::MAC_ARM;
+        let loc_text = commas(want.third_party_loc);
+        assert!(out.log.contains(&loc_text), "third-party LOC is printed:\n{}", out.log);
+        assert!(
+            out.log.contains(&want.third_party.to_string()),
+            "third-party count is printed"
+        );
         assert!(out.log.contains("PARTITION CHECK OK"), "the check must hold:\n{}", out.log);
         assert!(out.log.contains("ZERO-COST LEAVES"));
         assert!(out.log.contains("DUPLICATE VERSIONS"));
@@ -1005,11 +1012,21 @@ mod tests {
         let body = std::fs::read_to_string(&path).expect("the JSON file was written");
         let _ = std::fs::remove_file(&path);
         json_wellformed(&body).unwrap_or_else(|e| panic!("hand-rolled JSON is malformed: {e}"));
-        assert!(body.contains("\"third_party\": 153"), "measured count in JSON");
-        assert!(body.contains("\"third_party_loc\": 2081414"), "measured LOC in JSON");
+        let want = measured::MAC_ARM;
+        assert!(
+            body.contains(&format!("\"third_party\": {}", want.third_party)),
+            "measured count in JSON"
+        );
+        assert!(
+            body.contains(&format!("\"third_party_loc\": {}", want.third_party_loc)),
+            "measured LOC in JSON"
+        );
         // `--top` is a DISPLAY bound; the machine-readable form keeps every row.
         let rows = body.matches("\"dom_pkgs\"").count();
-        assert_eq!(rows, 153, "every third-party row is in the JSON regardless of --top");
+        assert_eq!(
+            rows, want.third_party,
+            "every third-party row is in the JSON regardless of --top"
+        );
     }
 
     #[test]

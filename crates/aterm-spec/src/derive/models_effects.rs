@@ -1034,6 +1034,70 @@ pub fn cursor_cat_model() -> Model {
     }
 }
 
+/// The classic flying cursor kitty's forward/reverse wrap placement. A fold
+/// begins on the old edge, leaves that edge wholly off glass, changes sides
+/// while still wholly off glass, and only then re-enters on the new edge.
+/// `off_samples` is the history abstraction bound by Tier-1 to actual signed
+/// sprite rectangles; it cannot be minted by an on-glass sample.
+///
+/// `Buggy = 1` reproduces the retired direct placement law: the first fold
+/// sample jumps straight from the old on-glass edge to the new on-glass edge,
+/// with no wholly-off-glass witness. `OffGlassBeforeSideChange` catches that
+/// transition in either direction.
+///
+/// Tier-0: `derived_cursor_cat_fold_proves_and_catches_direct_edge_teleport`.
+/// Tier-1: `cursor_cat_fold_conformance_real_placement_and_teleport_mutant`
+/// drives `WordDecorations::resolve_kitty_cursor_placement` and projects the
+/// emitted signed sprite rectangle after every transition.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn cursor_cat_fold_model() -> Model {
+    crate::ty_model! {
+        CursorCatFold {
+            const Buggy = 0;
+            const MaxFolds = 2;
+            var phase = 0;       // 0 settled, 1 leave, 2 old-off, 3 new-off, 4 enter
+            var direction = 0;   // 0 none, 1 forward (right->left), 2 reverse
+            var origin_side = 1; // 0 left, 1 right
+            var side = 1;        // edge occupied by the sampled body
+            var off_glass = 0;   // the complete body rectangle misses the viewport
+            var off_samples = 0; // wholly-off samples observed in this fold
+            var folds = 0;
+
+            action StartForward when (phase == 0 && folds <= MaxFolds - 1) {
+                phase = 1; direction = 1; origin_side = 1; side = 1;
+                off_glass = 0; off_samples = 0; folds = folds + 1;
+            }
+            action StartReverse when (phase == 0 && folds <= MaxFolds - 1) {
+                phase = 1; direction = 2; origin_side = 0; side = 0;
+                off_glass = 0; off_samples = 0; folds = folds + 1;
+            }
+            action LeaveOff when (phase == 1) {
+                phase = if Buggy == 1 { 4 } else { 2 };
+                side = if Buggy == 1 { 1 - side } else { side };
+                off_glass = if Buggy == 1 { 0 } else { 1 };
+                off_samples = if Buggy == 1 { 0 } else { off_samples + 1 };
+            }
+            action CrossSide when (phase == 2) {
+                phase = 3; side = 1 - side; off_glass = 1;
+            }
+            action EnterGlass when (phase == 3) {
+                phase = 4; off_glass = 0;
+            }
+            action Finish when (phase == 4) {
+                phase = 0; direction = 0; origin_side = side;
+                off_glass = 0; off_samples = 0;
+            }
+
+            invariant OffGlassBeforeSideChange:
+                phase == 0 || side == origin_side || off_samples > 0;
+            invariant StateBounded:
+                phase <= 4 && direction <= 2 && origin_side <= 1 && side <= 1 &&
+                off_glass <= 1 && off_samples <= 1 && folds <= MaxFolds;
+        }
+    }
+}
+
 /// Cursor-cat reaction to complete profanity cues. Incomplete prefixes never
 /// reach the visual reaction; each accepted complete token re-kicks the wince
 /// and increases the bounded phrase chain through four distinct beats. A
@@ -1202,6 +1266,193 @@ pub fn cursor_cat_earn_floor_model() -> Model {
                 if active == 1 { singing == 1 } else { active == 0 };
             invariant RunBounded: run <= MinRun;
             invariant FlagsBounded: singing <= 1 && active <= 1;
+        }
+    }
+}
+
+/// Reduced-motion custody handoff from the static singing cursor cat back to
+/// the resident pet. The full song owns the glass first. Its first wind-down
+/// sample keeps the already-ready resident suppressed behind the still-opaque
+/// singer; the singer remains visible through the inclusive 0.50 down to 0.33
+/// static band, and the resident takes over below the 0.33 face-swap threshold.
+///
+/// `SampleCadencedBelowHalf` is the ordinary sequence through an observed 0.50
+/// sample. `SampleLateBelowHalf` is the equally valid direct 1.0 -> 0.49
+/// observation after an occluded/delayed callback. `SampleLateBelowFaceSwap`
+/// and `SampleLateDrained` cover stronger direct 1.0 -> 0.30 / 0.0 callbacks
+/// with no intermediate tick. Every route must preserve visible custody.
+/// `Buggy=1` restores the historical handoff blackout: the resident is ready
+/// but its draw gate has not opened, while the singer is already cut.
+/// `LiveTailKeepsCompanionVisible` catches the live-tail gap and exclusive
+/// custody catches the fully drained all-transparent sample.
+///
+/// Tier-0 lives in `derived_ring_ty.rs`. Tier-1 binds these sample actions to
+/// the real `flying_kitty_admitted` / `pet_companion_admitted` custody gates.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn reduced_motion_companion_handoff_model() -> Model {
+    crate::ty_model! {
+        ReducedMotionCompanionHandoff {
+            const Buggy = 0;
+            var phase = 0; // 0 resident, 1 full song, 2 at 0.50, 3 0.49..0.33,
+                           // 4 below 0.33, 5 drained
+            var started = 0;
+            var song_tail_live = 0;
+            var singer_visible = 0;
+            var pet_ready = 1;
+            var pet_visible = 1;
+
+            action StartReducedSong when (phase == 0 && started == 0) {
+                phase = 1;
+                started = 1;
+                song_tail_live = 1;
+                singer_visible = 1;
+                pet_ready = 1;
+                pet_visible = 0;
+            }
+            action SampleAtHalfCutoff when (phase == 1) {
+                phase = 2;
+                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                pet_ready = 1;
+                pet_visible = 0;
+            }
+            action SampleCadencedBelowHalf when (phase == 2) {
+                phase = 3;
+                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                pet_ready = 1;
+                pet_visible = 0;
+            }
+            action SampleLateBelowHalf when (phase == 1) {
+                phase = 3;
+                singer_visible = if Buggy == 1 { 0 } else { 1 };
+                pet_ready = 1;
+                pet_visible = 0;
+            }
+            action SampleLateBelowFaceSwap when (phase == 1) {
+                phase = 4;
+                singer_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
+            }
+            action SampleLateDrained when (phase == 1) {
+                phase = 5;
+                song_tail_live = 0;
+                singer_visible = 0;
+                pet_visible = if Buggy == 1 { 0 } else { 1 };
+            }
+            action SampleBelowFaceSwap when (phase == 3) {
+                phase = 4;
+                singer_visible = 0;
+                pet_visible = 1;
+            }
+            action DrainSongTail when (phase == 4) {
+                phase = 5;
+                song_tail_live = 0;
+                singer_visible = 0;
+                pet_visible = 1;
+            }
+
+            invariant LiveTailKeepsCompanionVisible:
+                if song_tail_live == 1 {
+                    singer_visible + pet_visible > 0
+                } else { song_tail_live == 0 };
+            invariant GlassCustodyIsExclusive:
+                singer_visible + pet_visible == 1;
+            invariant ResidentOwnsBelowSwap:
+                if phase > 3 {
+                    singer_visible == 0 && pet_ready == 1 && pet_visible == 1
+                } else { phase <= 3 };
+            invariant StateBounded:
+                phase <= 5 && started <= 1 && song_tail_live <= 1
+                    && singer_visible <= 1 && pet_ready <= 1 && pet_visible <= 1;
+        }
+    }
+}
+
+/// One-shot routing for the authenticated cursor-cat motion pulse shared by
+/// ordinary rendering and the extracted/composed render path. A render route
+/// that observes the pulse must take it from the glow producer and deliver it
+/// to the cat exactly once. Route changes after that frame see no pulse, so a
+/// style/layout transition cannot replay old typing into a new owner.
+///
+/// `Buggy=1` reproduces the composed-route omission: that route records an
+/// attempt but neither takes nor delivers the pulse, stranding it in the
+/// producer. Switching to the ordinary route can then consume that stale pulse;
+/// the model records this as `stale_replay`. Tier-0 proves the healthy
+/// conservation/one-shot laws and requires both the strand and replay witnesses.
+/// Tier-1 binds the route actions to `take_cursor_cat_motion_pulse` plus
+/// `forward_kitty_cursor_motion` at the ordinary and composed/extracted seams.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn cursor_cat_motion_pulse_routing_model() -> Model {
+    crate::ty_model! {
+        CursorCatMotionPulseRouting {
+            const Buggy = 0;
+            var authenticated = 0;
+            var pending = 0;
+            var route = 0;          // 0 unselected, 1 ordinary, 2 composed/extracted
+            var attempted_route = 0;
+            var consumes = 0;
+            var deliveries = 0;
+            var switched = 0;
+            var stranded = 0;
+            var stale_replay = 0;
+
+            action AuthenticatePulse when (authenticated == 0) {
+                authenticated = 1;
+                pending = 1;
+            }
+            action SelectOrdinaryRoute when (authenticated == 1 && route == 0) {
+                route = 1;
+            }
+            action SelectComposedExtractedRoute when (
+                authenticated == 1 && route == 0
+            ) {
+                route = 2;
+            }
+            action RenderOrdinaryRoute when (pending == 1 && route == 1) {
+                pending = 0;
+                attempted_route = if attempted_route == 0 { 1 } else { attempted_route };
+                consumes = consumes + 1;
+                deliveries = deliveries + 1;
+                stale_replay = if attempted_route > 0 { 1 } else { stale_replay };
+            }
+            action RenderComposedExtractedRoute when (
+                pending == 1 && route == 2 && attempted_route == 0
+            ) {
+                attempted_route = 2;
+                pending = if Buggy == 1 { 1 } else { 0 };
+                consumes = if Buggy == 1 { consumes } else { consumes + 1 };
+                deliveries = if Buggy == 1 { deliveries } else { deliveries + 1 };
+                stranded = if Buggy == 1 { 1 } else { 0 };
+            }
+            action SwitchToOrdinaryRoute when (
+                route == 2 && attempted_route == 2 && switched == 0
+            ) {
+                route = 1;
+                switched = 1;
+            }
+            action SwitchToComposedExtractedRoute when (
+                route == 1 && attempted_route == 1 && switched == 0
+            ) {
+                route = 2;
+                switched = 1;
+            }
+
+            invariant AttemptConsumesAndDeliversExactlyOnce:
+                if attempted_route > 0 {
+                    pending == 0 && consumes == 1 && deliveries == 1
+                } else {
+                    pending == authenticated && consumes == 0 && deliveries == 0
+                };
+            invariant NoComposedRouteStrand: stranded == 0;
+            invariant RouteSwitchCannotReplay: stale_replay == 0;
+            invariant DeliveryIsAuthenticatedAndAtMostOnce:
+                consumes <= authenticated && deliveries <= authenticated
+                    && deliveries == consumes;
+            invariant StateBounded:
+                authenticated <= 1 && pending <= 1 && route <= 2
+                    && attempted_route <= 2 && consumes <= 1 && deliveries <= 1
+                    && switched <= 1 && stranded <= 1 && stale_replay <= 1;
         }
     }
 }
@@ -1553,20 +1804,42 @@ pub fn rainbow_move_admission_model() -> Model {
 /// unobserved event, scroll, hidden/same-cell completion, expiry, or any source /
 /// target mismatch consumes the candidate dark.
 /// Resident light is independently charged/projected: a coherent next frame
-/// may retain it, final-extraction drift suppresses it, and an unowned parser
-/// generation retires it — even at an unmoved cursor — UNLESS the batch is
+/// retains it, as does a final process-sequence drift whose complete projection
+/// key (terminal/screen/caret/visibility/style) is stable. A final projection-
+/// key divergence suppresses it, and an unowned parser generation retires it —
+/// even at an unmoved cursor — UNLESS the batch is
 /// proven steady at the anchor (same terminal/screen identity, cursor anchor
 /// unmoved, probed anchor row content-identical), in which case the light
 /// survives while the candidate cohort still revokes fail-closed
-/// (`UnownedSteadyBatch`). An exact authored generation also retires every
-/// prior resident pool before its admitted move forges fresh geometry; its
-/// row proof cannot certify older light elsewhere.
+/// (`UnownedSteadyBatch`). Outside the explicitly rebased deferred-restore
+/// path below, an exact authored generation retires every prior resident pool
+/// before its admitted move forges fresh geometry; its row proof cannot
+/// certify older light elsewhere.
 ///
-/// `Buggy=1` is the historical timestamp-alone mutant: a fresh, geometrically
-/// matching typed candidate admits without content evidence. `EvidenceRequired`
-/// gives that exact defect a direct counterexample (`ArmTyped` -> `ObserveMove`),
-/// while the endpoint/freshness/one-shot invariants cover the rest of the real
-/// engine decision.
+/// A multi-batch alt-screen key is the narrow third verdict
+/// (`AuthoredMotionBatch`): exact typed evidence is unavailable, so it cannot
+/// admit or birth typed light, but the submitted-key boundary may downgrade
+/// to the independently shape-gated MOTION path. Already-resident wake that a
+/// row probe attests byte-steady survives; the historical blackout mutant
+/// clears that wake even though the batch did not rewrite it.
+///
+/// One sole-next alt-screen generation may also be held while a transient
+/// save/status cursor leaves the candidate's material row unprobeable
+/// (`DeferredProbeHold`). The hold preserves already-resident geometry but is
+/// neither admission nor birth. The same generation's restored exact probe
+/// (`DeferredProbeRestore`) rebases the wake witness to the input-time row and
+/// retains only resident wake attested by that baseline/current proof before
+/// the ordinary observation can admit and forge fresh geometry. A byte-steady
+/// restored row instead consumes the typed proof dark as authored MOTION
+/// (`DeferredProbeMotion`), retaining only the same attested wake; a separate
+/// jump-shape observation may buy new light, while a small/invalid relocation
+/// cannot. A later generation or any invalid restore retires both candidate
+/// and resident; no second hold exists.
+///
+/// `Buggy=1` combines the historical timestamp-alone admission and fail-open
+/// final-extraction mutants. `EvidenceRequired` catches the first directly
+/// (`ArmTyped` -> `ObserveMove`); the projection/scroll invariants catch stale
+/// row-bound light retained across either kind of LOCK A/B coordinate drift.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_move_candidate_model() -> Model {
@@ -1587,11 +1860,21 @@ pub fn cursor_move_candidate_model() -> Model {
             var unsupported = 0;
             var final_checked = 0;
             var final_generation_match = 0;
+            var final_projection_key_match = 0;
+            var final_scroll_state_match = 0;
             var projection = 0;
             var resident_charged = 0;
             var resident_projection = 0;
+            var resident_wake_attested = 0;
             var unowned_rewrite = 0;
             var candidate_rewrite = 0;
+            var authored_motion = 0;
+            var authored_motion_had_resident = 0;
+            var authored_motion_retained = 0;
+            var motion_shape = 0; // 0 unobserved, 1 admitted jump, 2 small/invalid
+            var deferred_probe = 0; // 0 none, 1 held, 2 exact, 3 retired, 4 motion
+            var deferred_had_resident = 0;
+            var deferred_hold_retained = 0;
             var hidden_boundary = 0;
             var style = 0;          // ten built-ins/custom selectors, 0..9
             var engine = 0;         // 0 Glow, 1 classic trail
@@ -1607,13 +1890,112 @@ pub fn cursor_move_candidate_model() -> Model {
                 phase == 0 && resident_charged == 0
                     && unowned_rewrite == 0 && evidence_exact == 0
             ) {
-                resident_charged = 1;
+                resident_charged = 1; resident_wake_attested = 0;
+            }
+            action AttestResidentWake when (
+                phase == 0 && resident_charged == 1
+                    && resident_wake_attested == 0
+            ) {
+                // The input-time row baseline covers the resident wake cells
+                // that an unchanged-generation restore may keep. This is a
+                // survival credential only, never an admission credential.
+                resident_wake_attested = 1;
             }
             action NextResidentFrame when (
                 final_checked == 1 && resident_charged == 1
             ) {
                 final_checked = 0; final_generation_match = 0;
+                final_projection_key_match = 0;
+                final_scroll_state_match = 0;
                 projection = 0; resident_projection = 0;
+            }
+            action DeferredProbeHold when (
+                phase == 2 && kind == 1 && fresh == 1
+                    && delivery_stable == 1 && deferred_probe == 0
+                    && admitted == 0 && birth == 0
+            ) {
+                // The sole N+1 batch is visible, but its transient save/status
+                // cursor put the material row outside the coherent probe.
+                // Preserve both the candidate and current resident pool for
+                // one emitted frame; this state purchases no new light.
+                deferred_probe = 1;
+                deferred_had_resident = resident_charged;
+                deferred_hold_retained = if Buggy == 1 {
+                    if resident_charged == 1 { 0 } else { 1 }
+                } else { 1 };
+                admitted = 0; birth = 0; evidence_exact = 0;
+            }
+            action DeferredProbeRestore when (
+                phase == 2 && kind == 1 && deferred_probe == 1
+            ) {
+                // The cursor and material-row probe returned in the SAME N+1
+                // generation. Rebase the wake witness to the input snapshot,
+                // classify this as Exact despite the steady parser sequence,
+                // and retain only the baseline/current-attested resident
+                // subset. ObserveMove may then forge one fresh birth.
+                deferred_probe = 2; phase = 3;
+                next_generation = 1; evidence_exact = 1;
+                resident_charged = if Buggy == 1 {
+                    resident_charged
+                } else { resident_wake_attested };
+                resident_projection = 0;
+                final_checked = 0; final_generation_match = 0;
+                final_projection_key_match = 0;
+                final_scroll_state_match = 0; projection = 0;
+            }
+            action DeferredProbeMotion when (
+                phase == 2 && kind == 1 && deferred_probe == 1
+            ) {
+                // The held N+1 row restored byte-identical: the typed CONTENT
+                // claim is consumed, but the submitted-key boundary may offer
+                // a separate MOTION candidate. At this ownership step it is
+                // still dark. Keep only wake covered by the rebased input-row
+                // witness; ObserveAuthoredMotionJump/Small owns shape later.
+                deferred_probe = 4; phase = 4; motion_shape = 0;
+                authored_motion = 1;
+                motion_shape = 0;
+                authored_motion_had_resident = resident_charged;
+                authored_motion_retained = if Buggy == 1 {
+                    if resident_charged == 1 && resident_wake_attested == 0 {
+                        0
+                    } else { 1 }
+                } else { 1 };
+                candidate_rewrite = 1;
+                next_generation = 0; evidence_exact = 0;
+                admitted = 0; birth = 0; projection = 0;
+                resident_charged = if Buggy == 1 {
+                    resident_charged
+                } else { resident_wake_attested };
+                resident_projection = 0;
+                final_checked = 0; final_generation_match = 0;
+                final_projection_key_match = 0;
+                final_scroll_state_match = 0;
+            }
+            action DeferredProbeAdvance when (
+                phase == 2 && kind == 1 && deferred_probe == 1
+            ) {
+                // N+2 (or later) cannot borrow N+1's held candidate.
+                deferred_probe = 3; phase = 4;
+                admitted = 0; birth = 0; evidence_exact = 0; projection = 0;
+                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
+                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
+            }
+            action DeferredProbeInvalid when (
+                phase == 2 && kind == 1 && deferred_probe == 1
+            ) {
+                // A second off-row hold, timeout, row mismatch, identity
+                // change, or invalid cursor restore is the same fail-closed
+                // terminal state: no candidate and no resident geometry.
+                deferred_probe = 3; phase = 4;
+                admitted = 0; birth = 0; evidence_exact = 0; projection = 0;
+                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
+                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
             }
             action UnownedSteadyBatch when (
                 resident_charged == 1 || (phase > 0 && phase <= 3)
@@ -1628,6 +2010,16 @@ pub fn cursor_move_candidate_model() -> Model {
                 candidate_rewrite = if phase > 0 && phase <= 3 { 1 } else { 0 };
                 phase = if phase > 0 && phase <= 3 { 4 } else { phase };
                 admitted = 0; birth = 0; projection = 0;
+                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
+                resident_charged = if deferred_probe == 1 {
+                    if Buggy == 1 { resident_charged } else { 0 }
+                } else { resident_charged };
+                resident_projection = if deferred_probe == 1 {
+                    if Buggy == 1 { resident_projection } else { 0 }
+                } else { resident_projection };
+                resident_wake_attested = if deferred_probe == 1 {
+                    if Buggy == 1 { resident_wake_attested } else { 0 }
+                } else { resident_wake_attested };
             }
             action UnownedContentRewrite when (
                 resident_charged == 1 || (phase > 0 && phase <= 3)
@@ -1643,6 +2035,57 @@ pub fn cursor_move_candidate_model() -> Model {
                 projection = if Buggy == 1 { projection } else { 0 };
                 resident_charged = if Buggy == 1 { 1 } else { 0 };
                 resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
+                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
+            }
+            action AuthoredMotionBatch when (
+                phase == 2 && kind == 1 && deferred_probe == 0
+            ) {
+                // The real key crossed a same-identity/same-alt-screen N+2
+                // redraw. Its CONTENT claim is consumed dark; only a separate
+                // jump-shaped Motion admission may later birth geometry. The
+                // already-attested resident wake survives this transition.
+                authored_motion = 1;
+                authored_motion_had_resident = resident_charged;
+                authored_motion_retained = if resident_charged == 1 {
+                    if Buggy == 1 { 0 } else { 1 }
+                } else { 1 };
+                candidate_rewrite = 1;
+                phase = 4; next_generation = 0; evidence_exact = 0;
+                admitted = 0; birth = 0; projection = 0;
+                resident_charged = if Buggy == 1 { 0 } else { resident_charged };
+                resident_projection = if Buggy == 1 { 0 } else { resident_projection };
+            }
+            action ObserveAuthoredMotionJump when (
+                phase == 4 && authored_motion == 1 && motion_shape == 0
+                    && observations == 0 && admitted == 0 && birth == 0
+                    && candidate_rewrite == 1 && unowned_rewrite == 0
+                    && hidden_boundary == 0 && final_checked == 0
+            ) {
+                // Admission belongs to the independently checked relocation
+                // shape, not to AuthoredMotion ownership itself.
+                motion_shape = 1; admitted = 1; birth = 1;
+                candidate_rewrite = 0;
+                birth_style = style; birth_engine = engine; birth_host = host;
+                observations = observations + 1;
+            }
+            action ObserveAuthoredMotionSmall when (
+                phase == 4 && authored_motion == 1 && motion_shape == 0
+                    && observations == 0 && admitted == 0 && birth == 0
+                    && candidate_rewrite == 1 && unowned_rewrite == 0
+                    && hidden_boundary == 0 && final_checked == 0
+            ) {
+                // A one-cell/small/invalid relocation consumes the candidate
+                // dark. The mutant restores the forbidden ownership-as-birth
+                // shortcut so the shape gate has a concrete counterexample.
+                motion_shape = 2;
+                admitted = if Buggy == 1 { 1 } else { 0 };
+                birth = if Buggy == 1 { 1 } else { 0 };
+                candidate_rewrite = 0;
+                birth_style = style; birth_engine = engine; birth_host = host;
+                observations = observations + 1;
             }
             action BeginResidentEpoch when (
                 unowned_rewrite == 1 && resident_charged == 0
@@ -1663,8 +2106,15 @@ pub fn cursor_move_candidate_model() -> Model {
                 next_generation = 0; evidence_exact = 0;
                 origin_match = 0; target_match = 0; observations = 0;
                 unsupported = 0; final_checked = 0;
-                final_generation_match = 0; unowned_rewrite = 0;
+                final_generation_match = 0; final_projection_key_match = 0;
+                final_scroll_state_match = 0;
+                unowned_rewrite = 0;
                 candidate_rewrite = 0; hidden_boundary = 0; birth_style = 0;
+                authored_motion = 0; authored_motion_had_resident = 0;
+                authored_motion_retained = 0;
+                motion_shape = 0;
+                deferred_probe = 0; deferred_had_resident = 0;
+                deferred_hold_retained = 0; resident_wake_attested = 0;
                 birth_engine = 0; birth_host = 0;
             }
             action ArmTyped when (
@@ -1695,32 +2145,55 @@ pub fn cursor_move_candidate_model() -> Model {
             action DeliverQueued when (phase == 1) {
                 phase = 4; delivery_stable = 0;
             }
-            action ConfirmTypedNext when (phase == 2 && kind == 1) {
+            action ConfirmTypedNext when (
+                phase == 2 && kind == 1 && deferred_probe == 0
+            ) {
                 phase = 3; next_generation = 1; evidence_exact = 1;
                 resident_charged = if Buggy == 1 { resident_charged } else { 0 };
                 resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
             }
-            action ConfirmBackspaceNext when (phase == 2 && kind == 2) {
+            action ConfirmBackspaceNext when (
+                phase == 2 && kind == 2 && deferred_probe == 0
+            ) {
                 phase = 3; next_generation = 1; evidence_exact = 1;
                 resident_charged = if Buggy == 1 { resident_charged } else { 0 };
                 resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
             }
-            action NextGenerationMismatch when (phase == 2 && kind <= 2) {
+            action NextGenerationMismatch when (
+                phase == 2 && kind <= 2 && deferred_probe == 0
+            ) {
                 phase = 4; next_generation = 1;
             }
-            action SkippedGeneration when (phase == 2 && kind <= 2) {
+            action SkippedGeneration when (
+                phase == 2 && kind <= 2 && deferred_probe == 0
+            ) {
                 phase = 4; next_generation = 0;
             }
-            action OriginMismatch when (phase > 0 && phase <= 3) {
+            action OriginMismatch when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; origin_match = 0;
             }
-            action TargetMismatch when (phase > 0 && phase <= 3) {
+            action TargetMismatch when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; target_match = 0;
             }
-            action Age when (phase > 0 && phase <= 3) {
+            action Age when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; fresh = 0;
             }
-            action ObserveMove when (phase == 2 || phase == 3) {
+            action ObserveMove when (
+                (phase == 2 || phase == 3)
+                    && (deferred_probe == 0 || deferred_probe == 2)
+            ) {
                 admitted = if kind == 3 {
                     if fresh == 1 && origin_match == 1 { 1 } else { 0 }
                 } else {
@@ -1765,37 +2238,99 @@ pub fn cursor_move_candidate_model() -> Model {
                     && final_checked == 0
             ) {
                 final_checked = 1; final_generation_match = 1;
+                final_projection_key_match = 1;
+                final_scroll_state_match = 1;
                 projection = admitted; resident_projection = resident_charged;
             }
-            action FinalExtractDrift when (
+            action FinalExtractGenerationDrift when (
                 ((phase == 4 && admitted == 1) || resident_charged == 1)
                     && final_checked == 0
             ) {
                 final_checked = 1; final_generation_match = 0;
+                final_projection_key_match = 1;
+                final_scroll_state_match = 1;
+                // A sequence-only drift changed terminal content, not the
+                // terminal/screen/caret/visibility/style key that places
+                // cursor-owned light. Retain this frame's earned projection;
+                // the next coherent engine observation still owns content-
+                // rewrite retirement.
+                projection = admitted; resident_projection = resident_charged;
+            }
+            action FinalExtractProjectionKeyDrift when (
+                ((phase == 4 && admitted == 1) || resident_charged == 1)
+                    && final_checked == 0
+            ) {
+                final_checked = 1; final_generation_match = 0;
+                final_projection_key_match = 0;
+                final_scroll_state_match = 1;
                 projection = if Buggy == 1 { admitted } else { 0 };
                 resident_projection = if Buggy == 1 { resident_charged } else { 0 };
+                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
+                admitted = if Buggy == 1 { admitted } else { 0 };
+                birth = if Buggy == 1 { birth } else { 0 };
+                evidence_exact = if Buggy == 1 { evidence_exact } else { 0 };
+                phase = if Buggy == 1 { phase } else { 4 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
+                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
+            }
+            action FinalExtractScrollDrift when (
+                ((phase == 4 && admitted == 1) || resident_charged == 1)
+                    && final_checked == 0
+            ) {
+                final_checked = 1; final_generation_match = 0;
+                final_projection_key_match = 1;
+                final_scroll_state_match = 0;
+                // A LOCK A/B scroll changes every row-bound coordinate even
+                // when the terminal restores the caret to the same cell. The
+                // host has not translated this scratch, so it must suppress
+                // and retire rather than retain the sequence-only projection.
+                projection = if Buggy == 1 { admitted } else { 0 };
+                resident_projection = if Buggy == 1 { resident_charged } else { 0 };
+                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
+                admitted = if Buggy == 1 { admitted } else { 0 };
+                birth = if Buggy == 1 { birth } else { 0 };
+                evidence_exact = if Buggy == 1 { evidence_exact } else { 0 };
+                phase = if Buggy == 1 { phase } else { 4 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
+                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
             }
             action PromoteProjectedBirth when (
                 phase == 4 && birth == 1 && projection == 1
-                    && final_checked == 1 && final_generation_match == 1
-                    && resident_charged == 0
+                    && final_checked == 1 && final_projection_key_match == 1
+                    && final_scroll_state_match == 1
+                    && (resident_charged == 0
+                        || ((deferred_probe == 2 || deferred_probe == 4)
+                            && resident_wake_attested == 1))
             ) {
                 // The freshly projected candidate geometry becomes the
                 // resident light a later terminal generation must fence. Its
                 // consumed evidence is no longer a licence for any new birth.
                 resident_charged = 1; resident_projection = 1;
+                resident_wake_attested = 0;
                 admitted = 0; projection = 0; evidence_exact = 0; birth = 0;
             }
-            action CompleteNoMove when (phase > 0 && phase <= 3) {
+            action CompleteNoMove when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; admitted = 0; birth = 0;
             }
-            action Supersede when (phase > 0 && phase <= 3) {
+            action Supersede when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; admitted = 0; birth = 0;
             }
-            action UnsupportedInput when (phase > 0 && phase <= 3) {
+            action UnsupportedInput when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; admitted = 0; birth = 0; unsupported = 1;
             }
-            action ScrollBoundary when (phase > 0 && phase <= 3) {
+            action ScrollBoundary when (
+                phase > 0 && phase <= 3 && deferred_probe == 0
+            ) {
                 phase = 4; admitted = 0; birth = 0;
             }
             action HiddenBoundary when (
@@ -1808,14 +2343,22 @@ pub fn cursor_move_candidate_model() -> Model {
                 projection = if Buggy == 1 { projection } else { 0 };
                 resident_charged = if Buggy == 1 { resident_charged } else { 0 };
                 resident_projection = if Buggy == 1 { resident_projection } else { 0 };
+                resident_wake_attested = if Buggy == 1 {
+                    resident_wake_attested
+                } else { 0 };
+                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
             }
 
             invariant EvidenceRequired:
-                if admitted == 1 && kind <= 2 { evidence_exact == 1 } else { admitted <= 1 };
+                if admitted == 1 && kind <= 2 && authored_motion == 0 {
+                    evidence_exact == 1
+                } else { admitted <= 1 };
             invariant StableDeliveryRequired:
                 if admitted == 1 && kind <= 2 { delivery_stable == 1 } else { admitted <= 1 };
             invariant NextGenerationRequired:
-                if admitted == 1 && kind <= 2 { next_generation == 1 } else { admitted <= 1 };
+                if admitted == 1 && kind <= 2 && authored_motion == 0 {
+                    next_generation == 1
+                } else { admitted <= 1 };
             invariant ExactEndpointRequired:
                 if admitted == 1 {
                     origin_match == 1 && (kind == 3 || target_match == 1)
@@ -1823,15 +2366,31 @@ pub fn cursor_move_candidate_model() -> Model {
             invariant FreshRequired:
                 if admitted == 1 { fresh == 1 } else { admitted == 0 };
             invariant BirthRequiresAdmission: birth <= admitted;
-            invariant ProjectionRequiresFinalGeneration:
+            invariant ProjectionRequiresFinalProjectionKey:
                 if projection == 1 {
-                    admitted == 1 && final_checked == 1 && final_generation_match == 1
+                    admitted == 1 && final_checked == 1
+                        && final_projection_key_match == 1
+                        && final_scroll_state_match == 1
                 } else { projection == 0 };
-            invariant ResidentProjectionRequiresFinalGeneration:
+            invariant ResidentProjectionRequiresFinalProjectionKey:
                 if resident_projection == 1 {
                     resident_charged == 1 && final_checked == 1
-                        && final_generation_match == 1
+                        && final_projection_key_match == 1
+                        && final_scroll_state_match == 1
                 } else { resident_projection == 0 };
+            invariant MatchingGenerationImpliesMatchingProjectionKey:
+                final_generation_match <= final_projection_key_match
+                    && final_generation_match <= final_scroll_state_match;
+            invariant DivergedProjectionKeyRetiresResident:
+                if final_checked == 1 && final_projection_key_match == 0 {
+                    projection == 0 && resident_charged == 0
+                        && resident_projection == 0
+                } else { final_checked <= 1 };
+            invariant ScrollDriftRetiresResident:
+                if final_checked == 1 && final_scroll_state_match == 0 {
+                    projection == 0 && resident_charged == 0
+                        && resident_projection == 0
+                } else { final_checked <= 1 };
             invariant UnownedContentRewriteRetiresResident:
                 if unowned_rewrite == 1 {
                     resident_charged == 0 && resident_projection == 0
@@ -1840,6 +2399,45 @@ pub fn cursor_move_candidate_model() -> Model {
                 if candidate_rewrite == 1 {
                     phase == 4 && admitted == 0 && birth == 0
                 } else { candidate_rewrite == 0 };
+            invariant AuthoredMotionRetainsAttestedResident:
+                if authored_motion == 1 {
+                    authored_motion_retained == 1
+                } else { authored_motion == 0 };
+            invariant AuthoredMotionConsumesTypedProofDark:
+                if authored_motion == 1 && motion_shape == 0 {
+                    phase == 4 && kind == 1 && evidence_exact == 0
+                        && admitted == 0 && birth == 0
+                } else { authored_motion <= 1 };
+            invariant AuthoredMotionBirthRequiresJumpShape:
+                if authored_motion == 1 && birth == 1 {
+                    motion_shape == 1
+                } else { birth <= 1 };
+            invariant DeferredProbeHoldPreservesResidentWithoutBirth:
+                if deferred_probe == 1 {
+                    phase == 2 && kind == 1 && admitted == 0 && birth == 0
+                        && evidence_exact == 0 && deferred_hold_retained == 1
+                        && resident_charged == deferred_had_resident
+                } else { deferred_probe <= 4 };
+            invariant DeferredProbeRestoreKeepsOnlyAttestedWake:
+                if deferred_probe == 2 && evidence_exact == 1 {
+                    next_generation == 1
+                        && resident_charged == resident_wake_attested
+                        && resident_projection <= resident_wake_attested
+                } else { deferred_probe <= 4 };
+            invariant DeferredProbeMotionKeepsOnlyAttestedWakeDark:
+                if deferred_probe == 4 && motion_shape == 0 {
+                    phase == 4 && authored_motion == 1
+                        && evidence_exact == 0 && admitted == 0 && birth == 0
+                        && resident_charged == resident_wake_attested
+                        && resident_projection <= resident_wake_attested
+                } else { deferred_probe <= 4 };
+            invariant DeferredProbeFailureRetiresCandidateAndResident:
+                if deferred_probe == 3 {
+                    phase == 4 && admitted == 0 && birth == 0
+                        && evidence_exact == 0 && projection == 0
+                        && resident_charged == 0 && resident_projection == 0
+                        && resident_wake_attested == 0
+                } else { deferred_probe <= 4 };
             invariant HiddenBoundaryDrainsCandidateAndResident:
                 if hidden_boundary == 1 {
                     phase == 4 && admitted == 0 && birth == 0
@@ -1847,8 +2445,15 @@ pub fn cursor_move_candidate_model() -> Model {
                 } else { hidden_boundary == 0 };
             invariant ExactContentChangeRetiresPriorResident:
                 if evidence_exact == 1 {
-                    resident_charged == 0 && resident_projection == 0
+                    if deferred_probe == 2 {
+                        resident_charged == resident_wake_attested
+                            && resident_projection <= resident_wake_attested
+                    } else {
+                        resident_charged == 0 && resident_projection == 0
+                    }
                 } else { evidence_exact == 0 };
+            invariant AttestedWakeRequiresResident:
+                resident_wake_attested <= resident_charged;
             invariant UnsupportedStaysDark:
                 if unsupported == 1 { admitted == 0 && birth == 0 } else { unsupported == 0 };
             invariant CandidateConsumedOnce: observations <= 1;
@@ -1861,17 +2466,252 @@ pub fn cursor_move_candidate_model() -> Model {
                 if birth == 1 {
                     kind == 3 || (delivery_stable == 1 && next_generation == 1
                         && evidence_exact == 1 && origin_match == 1 && target_match == 1)
+                        || (authored_motion == 1 && motion_shape == 1)
                 } else { birth == 0 };
             invariant CandidateBounds:
                 phase <= 4 && kind <= 3 && fresh <= 1 && delivery_stable <= 1
                     && next_generation <= 1 && evidence_exact <= 1
                     && origin_match <= 1 && target_match <= 1
                     && final_checked <= 1 && final_generation_match <= 1
+                    && final_projection_key_match <= 1
+                    && final_scroll_state_match <= 1
                     && candidate_rewrite <= 1
+                    && authored_motion <= 1 && authored_motion_had_resident <= 1
+                    && authored_motion_retained <= 1
+                    && motion_shape <= 2
+                    && deferred_probe <= 4 && deferred_had_resident <= 1
+                    && deferred_hold_retained <= 1
                     && projection <= 1 && resident_charged <= 1
-                    && resident_projection <= 1 && unowned_rewrite <= 1
+                    && resident_projection <= 1 && resident_wake_attested <= 1
+                    && unowned_rewrite <= 1
                     && hidden_boundary <= 1 && birth_style <= 9
                     && birth_engine <= 1 && birth_host <= 1;
+        }
+    }
+}
+
+/// CURSOR ECHO COMMIT-RETRY protocol at the split terminal-lock boundary.
+///
+/// LOCK A may inspect the candidate's baseline generation before the terminal
+/// has published its echo. That same-generation observation is an AWAIT, not a
+/// refutation: it preserves both the pending candidate and already-resident
+/// cursor light, and neither admits nor births anything. If LOCK B then sees
+/// the sole next generation with the exact target/projection, it suppresses
+/// only the current LOCK-A projection and creates one retry credential while
+/// retaining any resident engine state. The following coherent LOCK-A pass
+/// consumes that credential exactly once, restores a coherent projection, and
+/// performs the confirmation/admission/birth. Both a cold engine and an
+/// already-streaming resident are modeled.
+///
+/// Four negative commit classes are explicit environment observations rather
+/// than implementation guesses: an intervening unowned generation, a wrong
+/// target, content-scroll divergence, or cursor-style divergence. Each retires
+/// the candidate and resident and cannot manufacture a retry or birth. After
+/// an exact straddle, a mismatching/advanced next observation retires the
+/// credential via `NextEchoRetire`; a lifecycle boundary cancels it via
+/// `LifecycleCancel`. Consumption, retirement, and cancellation are mutually
+/// exclusive, exhaustive terminal dispositions of that one credential.
+///
+/// `Buggy=1` is the observed blackout: the same-generation LOCK-A await drops
+/// the candidate and resident before LOCK B can witness the exact echo.
+/// `AwaitHoldsCandidateAndResident` supplies the concrete counterexample. The
+/// healthy model also states retry conservation
+/// (`pending + consumed + retired + cancelled == 1`) so the credential cannot
+/// stick or replay after any terminal disposition.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn cursor_echo_commit_retry_model() -> Model {
+    crate::ty_model! {
+        CursorEchoCommitRetry {
+            const Buggy = 0;
+            var phase = 0;              // 0 idle, 1 armed, 2 await, 3 retry, 4 terminal
+            var candidate_pending = 0;
+            var resident_present = 1;   // engine-owned streaming trail survives suppression
+            var current_projection = 1;
+            var resident_at_arm = 0;
+            var await_observed = 0;
+            var commit_kind = 0;        // 1 exact; 2 unowned; 3 target; 4 scroll; 5 style
+            var retry_pending = 0;
+            var retry_consumes = 0;
+            var retry_retirements = 0;
+            var retry_cancellations = 0;
+            var confirmations = 0;
+            var admissions = 0;
+            var births = 0;
+
+            action SelectColdResident when (phase == 0 && resident_present == 1) {
+                resident_present = 0;
+                current_projection = 0;
+            }
+            action ArmTypedCandidate when (phase == 0) {
+                phase = 1;
+                candidate_pending = 1;
+                resident_at_arm = resident_present;
+            }
+            action LockASameGenerationAwait when (
+                phase == 1 && candidate_pending == 1
+            ) {
+                phase = 2;
+                await_observed = 1;
+                candidate_pending = if Buggy == 1 { 0 } else { 1 };
+                resident_present = if Buggy == 1 { 0 } else { resident_present };
+                current_projection = if Buggy == 1 { 0 } else { current_projection };
+            }
+            action FinalExtractEchoStraddle when (
+                phase == 2 && candidate_pending == 1
+            ) {
+                phase = 3;
+                commit_kind = 1;
+                retry_pending = 1;
+                current_projection = 0;
+            }
+            action NextEchoSettle when (
+                phase == 3 && candidate_pending == 1
+                    && retry_pending == 1 && retry_consumes == 0
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                retry_pending = 0;
+                retry_consumes = 1;
+                resident_present = 1;
+                confirmations = 1;
+                admissions = 1;
+                births = 1;
+                current_projection = 1;
+            }
+            action NextEchoRetire when (
+                phase == 3 && candidate_pending == 1
+                    && retry_pending == 1 && retry_retirements == 0
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                retry_pending = 0;
+                retry_retirements = 1;
+            }
+            action LifecycleCancel when (
+                phase == 3 && candidate_pending == 1
+                    && retry_pending == 1 && retry_cancellations == 0
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                retry_pending = 0;
+                retry_cancellations = 1;
+            }
+            action LockBInterveningUnownedGeneration when (
+                phase == 2 && candidate_pending == 1
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                commit_kind = 2;
+            }
+            action LockBWrongTarget when (
+                phase == 2 && candidate_pending == 1
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                commit_kind = 3;
+            }
+            action LockBScrollDivergence when (
+                phase == 2 && candidate_pending == 1
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                commit_kind = 4;
+            }
+            action LockBStyleDivergence when (
+                phase == 2 && candidate_pending == 1
+            ) {
+                phase = 4;
+                candidate_pending = 0;
+                resident_present = 0;
+                current_projection = 0;
+                commit_kind = 5;
+            }
+
+            invariant AwaitHoldsCandidateAndResident:
+                if phase == 2 {
+                    await_observed == 1 && candidate_pending == 1
+                        && resident_present == resident_at_arm
+                        && current_projection == resident_at_arm
+                        && retry_pending == 0
+                        && retry_consumes == 0 && retry_retirements == 0
+                        && retry_cancellations == 0
+                        && confirmations == 0 && admissions == 0 && births == 0
+                } else { phase <= 4 };
+            invariant ExactCommitSchedulesOnlyOneRetry:
+                if phase == 3 {
+                    commit_kind == 1 && candidate_pending == 1
+                        && resident_present == resident_at_arm
+                        && current_projection == 0
+                        && retry_pending == 1
+                        && retry_consumes == 0 && retry_retirements == 0
+                        && retry_cancellations == 0 && confirmations == 0
+                        && admissions == 0 && births == 0
+                } else { phase <= 4 };
+            invariant RetryCredentialConserved:
+                if commit_kind == 1 {
+                    retry_pending + retry_consumes + retry_retirements
+                        + retry_cancellations == 1
+                } else {
+                    retry_pending == 0 && retry_consumes == 0
+                        && retry_retirements == 0 && retry_cancellations == 0
+                };
+            invariant ExactRetryConfirmsAndBirthsOnce:
+                if retry_consumes == 1 {
+                    phase == 4 && commit_kind == 1
+                        && candidate_pending == 0 && resident_present == 1
+                        && current_projection == 1 && retry_pending == 0
+                        && retry_retirements == 0 && retry_cancellations == 0
+                        && confirmations == 1 && admissions == 1 && births == 1
+                } else { retry_consumes == 0 };
+            invariant RetiredRetryStaysDark:
+                if retry_retirements == 1 {
+                    phase == 4 && commit_kind == 1
+                        && candidate_pending == 0 && resident_present == 0
+                        && current_projection == 0 && retry_pending == 0
+                        && retry_consumes == 0 && retry_cancellations == 0
+                        && confirmations == 0 && admissions == 0 && births == 0
+                } else { retry_retirements == 0 };
+            invariant CancelledRetryStaysDark:
+                if retry_cancellations == 1 {
+                    phase == 4 && commit_kind == 1
+                        && candidate_pending == 0 && resident_present == 0
+                        && current_projection == 0 && retry_pending == 0
+                        && retry_consumes == 0 && retry_retirements == 0
+                        && confirmations == 0 && admissions == 0 && births == 0
+                } else { retry_cancellations == 0 };
+            invariant InvalidCommitConsumesDark:
+                if commit_kind > 1 {
+                    phase == 4 && candidate_pending == 0 && resident_present == 0
+                        && current_projection == 0 && retry_pending == 0
+                        && retry_consumes == 0 && retry_retirements == 0
+                        && retry_cancellations == 0
+                        && confirmations == 0 && admissions == 0 && births == 0
+                } else { commit_kind <= 1 };
+            invariant RetryRequiresPendingCandidate:
+                retry_pending <= candidate_pending;
+            invariant ProjectionRequiresResident:
+                current_projection <= resident_present;
+            invariant BirthRequiresExactConsumedRetry:
+                births <= admissions && admissions <= confirmations
+                    && confirmations <= retry_consumes;
+            invariant CommitRetryBounds:
+                phase <= 4 && candidate_pending <= 1 && resident_present <= 1
+                    && current_projection <= 1 && resident_at_arm <= 1
+                    && await_observed <= 1 && commit_kind <= 5
+                    && retry_pending <= 1 && retry_consumes <= 1
+                    && retry_retirements <= 1 && retry_cancellations <= 1
+                    && confirmations <= 1 && admissions <= 1 && births <= 1;
         }
     }
 }
@@ -1905,7 +2745,13 @@ pub fn cursor_move_candidate_model() -> Model {
 ///       exact predicted landing under the one attributable generation.
 ///   5 `KeySplitEcho` (E2) — the echo crosses TWO PTY read batches (baseline
 ///       + 2, not + 1). REGISTERED STANDING GAP: the strict next-generation
-///       law retires it today (`StandingGapSplitEchoRetiresE2`).
+///       law retires it today (`StandingGapSplitEchoRetiresE2`). The gap's
+///       WIPE half is CLOSED fence-side (v0.55 dev): the revoked-target
+///       tombstone (`CursorGlow::take_fresh_revoked_target_tombstone`,
+///       `echo-after-stream`) judges the split echo's landing an
+///       UnownedRewrite so earned light survives — but it never CONFIRMS,
+///       so this model's confirm-seam retire is untouched and the invariant
+///       still binds: fixing the RETIRE itself stays a loud model edit.
 ///   6 `KeyBurst` (E5) — several keys between rendered frames: the proof
 ///       anchor is stale (the row probe predates the keystroke), and proof
 ///       capture declines. REGISTERED STANDING GAP

@@ -133,12 +133,31 @@ impl Grid {
     /// allocation, like `row_text_into`. Reads through the display-offset-aware
     /// `visible_row_view`, exactly like the text path.
     pub fn row_cols_into(&self, row: u16, out: &mut Vec<char>) -> u16 {
+        self.row_cols_prefix_into(row, usize::MAX, out)
+    }
+
+    /// Fill `out` with at most the first `prefix_len` per-column characters of
+    /// visible row `row` and return the fill within that prefix.
+    ///
+    /// This is the bounded hot-path counterpart of
+    /// [`row_cols_into`](Self::row_cols_into): it uses the identical lead /
+    /// wide-continuation / blank projection, but neither scans nor reserves for
+    /// columns beyond the requested prefix. It does not synthesize the sparse
+    /// row's implicit blank tail; callers that require a fixed-width prefix may
+    /// resize the returned buffer to `prefix_len`.
+    pub fn row_cols_prefix_into(
+        &self,
+        row: u16,
+        prefix_len: usize,
+        out: &mut Vec<char>,
+    ) -> u16 {
         out.clear();
         if row >= self.rows() {
             return 0;
         }
         let view = self.visible_row_view(row);
-        let len = view.len();
+        let prefix_len = u16::try_from(prefix_len).unwrap_or(u16::MAX);
+        let len = view.len().min(prefix_len);
         out.reserve(len as usize);
         let mut fill = 0u16;
         for col in 0..len {
@@ -620,6 +639,15 @@ mod tests {
         let cap = cols.capacity();
         assert_eq!(grid.row_cols_into(0, &mut cols), 4);
         assert_eq!(cols.capacity(), cap, "refill reuses the buffer");
+
+        // The bounded sibling is byte-for-byte the corresponding prefix,
+        // including a continuation at the cutoff, and clears on a zero limit.
+        assert_eq!(grid.row_cols_prefix_into(0, 3, &mut cols), 3);
+        assert_eq!(cols, ['A', '\u{4E2D}', '\0']);
+        assert_eq!(grid.row_cols_prefix_into(0, 2, &mut cols), 2);
+        assert_eq!(cols, ['A', '\u{4E2D}']);
+        assert_eq!(grid.row_cols_prefix_into(0, 0, &mut cols), 0);
+        assert!(cols.is_empty());
     }
 
     // =========================================================================

@@ -3028,6 +3028,40 @@ pub(crate) fn range_of(key: &str) -> Option<Range> {
     }
 }
 
+/// Discovery aliases for the Shell row: the shells a user would SEARCH for on
+/// this platform. Keywords exist to find a row by intent, so they must name the
+/// shells that actually run here — a Windows first-run typing "powershell" found
+/// nothing, because the list was the Unix one ("bash", "zsh") on every target.
+/// The Windows entries are exactly the aliases the PTY already resolves by name
+/// (`aterm_pty::windows::shell::discover_shell`) plus the two PowerShell
+/// spellings its default probes.
+#[cfg(windows)]
+const SHELL_KEYWORDS: &[&str] = &[
+    "shell",
+    "powershell",
+    "pwsh",
+    "cmd",
+    "wsl",
+    "bash",
+    "git-bash",
+    "nu",
+    "nushell",
+    "command",
+    "login",
+    "argv",
+];
+#[cfg(not(windows))]
+const SHELL_KEYWORDS: &[&str] = &["shell", "bash", "zsh", "command", "login", "argv"];
+
+/// What the Shell field shows when nothing is configured. On Windows "platform
+/// default" alone left the by-name aliases (which need no path) undiscoverable;
+/// naming them is the whole prompt a user needs.
+#[cfg(windows)]
+const SHELL_PLACEHOLDER: &str =
+    "platform default — pwsh, powershell, cmd, bash, wsl, nu, or a path";
+#[cfg(not(windows))]
+const SHELL_PLACEHOLDER: &str = "platform default";
+
 /// Extra search keywords for a control so a fuzzy query finds it by INTENT, not only by
 /// its label (e.g. "dark mode" → `window_theme`, "history" → `scrollback_lines`). The
 /// label, key, and section name are always part of the search corpus; this augments
@@ -3116,7 +3150,7 @@ pub(crate) fn keywords_of(key: &str) -> &'static [&'static str] {
         EDIT_STREAM_FADE | EDIT_STREAM_FADE_MS => &["fade", "ink", "stream", "output", "motion"],
         EDIT_GPU => &["gpu", "renderer", "metal", "vulkan", "cpu", "restart"],
         EDIT_PALETTE => &["palette", "ansi", "colors", "colours", "indexed"],
-        EDIT_SHELL | EDIT_SHELL_ARGS => &["shell", "bash", "zsh", "command", "login", "argv"],
+        EDIT_SHELL | EDIT_SHELL_ARGS => SHELL_KEYWORDS,
         EDIT_WINDOW_COLORSPACE => &["colorspace", "srgb", "p3", "gamut", "color"],
         EDIT_RESTORE_SESSION => &["restore", "session", "reopen", "launch", "windows"],
         EDIT_FONT_FEATURES => &["opentype", "features", "ss01", "zero", "stylistic"],
@@ -4578,7 +4612,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
             kind: EditKind::Text,
             placeholder: shell
                 .clone()
-                .unwrap_or_else(|| "platform default".to_string()),
+                .unwrap_or_else(|| SHELL_PLACEHOLDER.to_string()),
             seed: shell,
         },
         EditField {
@@ -5652,6 +5686,41 @@ mod edit_tests {
             Some(24),
             "sibling kept"
         );
+    }
+
+    /// The Shell row must be findable by the shells THIS platform runs, and it
+    /// must say which names it accepts. On Windows the list was the Unix one, so
+    /// a first-run search for "powershell" — the single most likely query on the
+    /// platform — matched nothing, while `shell = "pwsh"|"cmd"|"wsl"|"bash"` are
+    /// all names the PTY resolves without a path.
+    #[test]
+    fn the_shell_row_is_findable_by_this_platform_s_shells() {
+        let keywords = keywords_of(super::EDIT_SHELL);
+        let expected: &[&str] = if cfg!(windows) {
+            &["powershell", "pwsh", "cmd", "wsl", "bash"]
+        } else {
+            &["bash", "zsh"]
+        };
+        for name in expected {
+            assert!(
+                keywords.contains(name),
+                "a search for {name:?} must reach the Shell row; have {keywords:?}"
+            );
+        }
+        // The empty-config placeholder is the row's only hint about what may be
+        // typed there, so on Windows it names the aliases.
+        let row = editable_fields(&Config::default())
+            .into_iter()
+            .find(|f| f.key == super::EDIT_SHELL)
+            .expect("the Shell row exists");
+        if cfg!(windows) {
+            assert!(
+                row.placeholder.contains("pwsh") && row.placeholder.contains("wsl"),
+                "the Windows placeholder must name the by-name aliases: {:?}",
+                row.placeholder
+            );
+        }
+        assert!(row.placeholder.starts_with("platform default"));
     }
 
     /// FAIL-CLOSED: a dotted write refuses when the top-level name is already

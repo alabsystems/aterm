@@ -2353,19 +2353,56 @@ impl RenderInput {
     /// `cjk` selects East-Asian-Ambiguous width, mirroring the write path's
     /// `char_width` so the composition occupies exactly the columns the
     /// committed text will.
+    ///
+    /// # The row is RAGGED
+    ///
+    /// A snapshot row carries only the row's WRITTEN PREFIX
+    /// (`render_row_into_impl` pushes `view.len()` cells, not `cols`), and at a
+    /// shell prompt the cursor sits EXACTLY at its end — `$ ` is a two-cell row
+    /// with the cursor at column 2. Writing through `cells[col]` there landed on
+    /// nothing at all: the composition painted zero glyphs and the caret still
+    /// jumped its width, so the dominant case — composing at a prompt, which is
+    /// where people type — showed the OS candidate window hovering over a grid
+    /// that never changed. So the overlay MATERIALIZES the cells it paints, the
+    /// way `paint_prediction_ghosts` does for speculative echo, padding any gap
+    /// with the frame's live implicit blank rather than a clone of the last
+    /// written cell (whose SGR background would smear across the sparse tail).
     pub fn overlay_ime_preedit(&mut self, preedit: &str, caret_byte: Option<usize>, cjk: bool) {
         if preedit.is_empty() || self.cursor_row >= self.rows {
             return;
         }
         let row = self.cursor_row;
         let cols = self.cols;
+        // Resolved BEFORE the row borrow: `default_bg_at` reads `self`.
+        let implicit = self.implicit_blank_at(row, self.cursor_col);
         let Some(cells) = self.cells.get_mut(row) else {
             return;
         };
         // The style seed: the cursor cell's resolved colors (theme-correct by
         // construction — they went through the same palette/DECSCNM resolution
-        // as every other cell this frame).
-        let seed = cells.get(self.cursor_col).copied().unwrap_or_default();
+        // as every other cell this frame). Past the written prefix there IS no
+        // cursor cell, and `unwrap_or_default()` handed back a BLACK-ON-BLACK
+        // placeholder — so even once the cells were materialized the
+        // composition would have been painted invisible. The live implicit
+        // blank is the honest answer (it is what the terminal paints at an
+        // unwritten column); the row's last real cell covers a producer that
+        // resolved no defaults at all (a pristine `Terminal::new`).
+        let seed = cells
+            .get(self.cursor_col)
+            .copied()
+            .or(implicit)
+            .or_else(|| cells.last().copied())
+            .unwrap_or_default();
+        // The pad for the gap between the row's end and the cursor: a blank in
+        // the seed's colors with every decoration DROPPED — those columns are
+        // not part of the composition and must not pick up its underline.
+        let pad = RenderCell {
+            ch: ' ',
+            fg: seed.fg,
+            bg: seed.bg,
+            ..RenderCell::default()
+        };
+        let start_col = self.cursor_col;
         let mut col = self.cursor_col;
         let mut caret_col: Option<usize> = None;
         let caret = caret_byte.unwrap_or(preedit.len());
@@ -2383,6 +2420,12 @@ impl RenderInput {
             }
             if col + width > cols {
                 break; // truncate: a wide char never straddles the edge
+            }
+            // Materialize the ragged tail up to (and including) the cells this
+            // character occupies — the gate above proves `col + width <= cols`,
+            // so the row never grows past the frame's width.
+            if cells.len() < col + width {
+                cells.resize(col + width, pad);
             }
             let lead = crate::terminal::RenderCell {
                 ch,
@@ -2413,7 +2456,51 @@ impl RenderInput {
             }
             col += width;
         }
+        // The overlay puts its scalar in `ch`, but a cell that previously held a
+        // MULTI-SCALAR grapheme also has that text in `clusters` (and its marks
+        // in `combining`), and both renderers prefer those over `ch` when they
+        // resolve the glyph. Left behind, composing over a flag or a ZWJ emoji
+        // would paint the OLD grapheme on top of the new composition. Free in
+        // the common case: a row with no complex graphemes has an empty list.
+        if col > start_col {
+            let covered = start_col..col;
+            if let Some(clusters) = self.clusters.get_mut(row) {
+                clusters.retain(|(c, _)| !covered.contains(c));
+            }
+            if let Some(combining) = self.combining.get_mut(row) {
+                combining.retain(|(c, _)| !covered.contains(c));
+            }
+        }
         self.cursor_col = caret_col.unwrap_or(col).min(cols.saturating_sub(1));
+    }
+
+    /// The frame's IMPLICIT BLANK at viewport cell (`row`, `col`): the cell the
+    /// terminal itself paints at a column no program has written yet — a space
+    /// in the LIVE default colours, which already carry OSC 10/11, their OSC
+    /// 110/111 resets, DECSCNM, and (on a composed split frame) the per-pane
+    /// [`default_bg_spans`](Self::default_bg_spans) refinement.
+    ///
+    /// `None` when the producer resolved no defaults ([`COLOR_UNSET`] — a
+    /// pristine `Terminal::new`, or a standalone renderer harness): the sentinel
+    /// is not a colour, and masking its high byte off would read as pure black.
+    /// Callers fall back to the row's own cells rather than invent one.
+    fn implicit_blank_at(&self, row: usize, col: usize) -> Option<RenderCell> {
+        let (fg, bg) = (self.default_fg, self.default_bg_at(row, col));
+        if fg == COLOR_UNSET || bg == COLOR_UNSET {
+            return None;
+        }
+        // `0x00RRGGBB` big-endian: the high byte is the (zero) tag, the rest
+        // are the channels — a byte split, so nothing can truncate.
+        let rgb = |c: u32| {
+            let [_, r, g, b] = c.to_be_bytes();
+            [r, g, b]
+        };
+        Some(RenderCell {
+            ch: ' ',
+            fg: rgb(fg),
+            bg: rgb(bg),
+            ..RenderCell::default()
+        })
     }
 }
 
@@ -2498,6 +2585,198 @@ mod ime_preedit_tests {
         f.overlay_ime_preedit("e\u{0301}", None, false);
         assert_eq!(f.cells[0][0].ch, 'e');
         assert_eq!(f.cursor_col, 1);
+    }
+}
+
+/// THE RAGGED ROW — the case every one of the fixtures above misses.
+///
+/// `frame()` hands the overlay a rectangular `cols`-wide grid, which no real
+/// snapshot is: `render_row_into_impl` materializes a row's WRITTEN PREFIX and
+/// stops. At a shell prompt the cursor sits exactly at that prefix's end, so
+/// `cells[cursor_col]` did not exist, `cells.get_mut(col)` swallowed every
+/// write, and the composition was invisible in the one place people compose.
+/// These drive the overlay from a REAL `Terminal` extraction so the raggedness
+/// is the engine's, not a fixture's opinion of it.
+#[cfg(test)]
+mod ime_preedit_ragged_row_tests {
+    use super::{COLOR_UNSET, RenderInput};
+    use crate::terminal::{RenderCell, Rgb, Terminal, UnderlineStyle};
+
+    /// A terminal at a prompt: `$ ` written, cursor parked after it. Colors are
+    /// host-configured, as every windowed frame's are, so the frame carries
+    /// resolved `default_fg` / `default_bg` rather than the `COLOR_UNSET` a
+    /// pristine `Terminal::new` reports.
+    fn prompt_frame(rows: u16, cols: u16) -> RenderInput {
+        let mut term = Terminal::new(rows, cols);
+        term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
+        term.set_default_background(Rgb::new(0x1B, 0x1D, 0x1E));
+        term.process(b"$ ");
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, rows.into(), cols.into());
+        f
+    }
+
+    /// The row really is short — if this ever fails the rest of the module is
+    /// testing a case that no longer exists, not a fix that still works.
+    #[test]
+    fn the_fixture_row_stops_at_the_written_prefix() {
+        let f = prompt_frame(4, 20);
+        assert_eq!(f.cells[0].len(), 2, "a snapshot row is the written prefix");
+        assert_eq!(
+            (f.cursor_row, f.cursor_col),
+            (0, 2),
+            "and the prompt's caret sits exactly at its end"
+        );
+        assert_ne!(f.default_bg, COLOR_UNSET, "a configured host resolves both");
+        assert_ne!(f.default_fg, COLOR_UNSET);
+    }
+
+    /// THE REGRESSION. Composing at a prompt painted NOTHING: the row ended at
+    /// the caret, every `cells.get_mut(col)` missed, and only the cursor moved.
+    #[test]
+    fn a_composition_at_the_prompt_caret_is_painted_not_swallowed() {
+        let mut f = prompt_frame(4, 20);
+        f.overlay_ime_preedit("日本", None, false);
+        let row: String = f.cells[0].iter().map(|c| c.ch).collect();
+        assert_eq!(row, "$ 日 本 ", "the composition lands right of the prompt");
+        assert_eq!(f.cells[0][2].ch, '日');
+        assert!(
+            f.cells[0][3].wide,
+            "the wide continuation is materialized too"
+        );
+        assert_eq!(f.cells[0][4].ch, '本');
+        assert!(f.cells[0][5].wide);
+        assert_eq!(f.cursor_col, 6, "and the caret trails the text it can see");
+    }
+
+    /// The caret must not run ahead of ink. Before the fix these two disagreed:
+    /// the cursor advanced by the composition's width over cells that stayed
+    /// unwritten, parking the block cursor in blank space four columns out.
+    #[test]
+    fn the_caret_never_advances_past_what_was_actually_drawn() {
+        let mut f = prompt_frame(4, 20);
+        f.overlay_ime_preedit("にほん", None, false);
+        assert_eq!(f.cursor_col, 8);
+        assert!(
+            f.cells[0].len() >= f.cursor_col,
+            "every column the caret crossed is materialized: len={} caret={}",
+            f.cells[0].len(),
+            f.cursor_col
+        );
+    }
+
+    /// Materializing is not enough on its own: `unwrap_or_default()` seeded the
+    /// style from a placeholder `RenderCell`, whose colors are BLACK ON BLACK.
+    /// Composed text drawn in it would be painted and still invisible, so the
+    /// seed falls back to the frame's live implicit blank.
+    #[test]
+    fn the_style_seed_falls_back_to_the_live_default_colors() {
+        let mut f = prompt_frame(4, 20);
+        f.overlay_ime_preedit("ab", None, false);
+        assert_eq!(
+            f.cells[0][2].fg,
+            [0xC0, 0xC5, 0xCE],
+            "live default foreground"
+        );
+        assert_eq!(
+            f.cells[0][2].bg,
+            [0x1B, 0x1D, 0x1E],
+            "live default background"
+        );
+        assert_ne!(
+            f.cells[0][2].fg, f.cells[0][2].bg,
+            "composing text must not be painted onto its own colour"
+        );
+        assert_eq!(f.cells[0][2].underline, UnderlineStyle::Single);
+    }
+
+    /// A producer that resolved NO defaults (a pristine `Terminal::new`, a
+    /// standalone renderer harness) still gets legible composition: the row's
+    /// own last cell seeds the colors rather than a black placeholder.
+    #[test]
+    fn an_unresolved_frame_seeds_from_the_rows_last_real_cell() {
+        let mut f = RenderInput {
+            rows: 2,
+            cols: 10,
+            cells: vec![
+                vec![RenderCell {
+                    ch: '$',
+                    fg: [11, 22, 33],
+                    bg: [44, 55, 66],
+                    ..Default::default()
+                }],
+                Vec::new(),
+            ],
+            cursor_row: 0,
+            cursor_col: 1,
+            ..Default::default()
+        };
+        assert_eq!(f.default_bg, COLOR_UNSET, "the unresolved producer case");
+        f.overlay_ime_preedit("x", None, false);
+        assert_eq!(f.cells[0][1].ch, 'x');
+        assert_eq!(f.cells[0][1].fg, [11, 22, 33]);
+        assert_eq!(f.cells[0][1].bg, [44, 55, 66]);
+    }
+
+    /// A cursor parked RIGHT of the row's end (a tab, or a program that moved
+    /// it there) leaves a gap. It is padded with the live implicit blank — no
+    /// glyph and, critically, no underline: those columns are not the
+    /// composition and must not be dressed as it.
+    #[test]
+    fn the_gap_before_the_caret_is_padded_with_undecorated_blanks() {
+        let mut f = prompt_frame(4, 20);
+        f.cursor_col = 5; // row is 2 cells long; columns 2..5 do not exist yet
+        f.overlay_ime_preedit("z", None, false);
+        assert_eq!(f.cells[0].len(), 6);
+        for col in 2..5 {
+            assert_eq!(f.cells[0][col].ch, ' ', "col {col} is a blank, not a glyph");
+            assert_eq!(
+                f.cells[0][col].underline,
+                UnderlineStyle::None,
+                "col {col} is padding, not composition"
+            );
+            assert_eq!(f.cells[0][col].bg, [0x1B, 0x1D, 0x1E], "in the live ground");
+        }
+        assert_eq!(f.cells[0][5].ch, 'z');
+        assert_eq!(f.cells[0][5].underline, UnderlineStyle::Single);
+    }
+
+    /// Truncation must not grow the row. A composition that does not fit stops
+    /// at the edge, and the cells it never reached stay unmaterialized.
+    #[test]
+    fn a_truncated_composition_materializes_only_what_it_drew() {
+        let mut f = prompt_frame(2, 5);
+        // Columns 2-3 hold '日'; '本' would need 4-5 and the row is 5 wide.
+        f.overlay_ime_preedit("日本", None, false);
+        assert_eq!(f.cells[0].len(), 4, "the straddling char extended nothing");
+        assert_eq!(f.cells[0][2].ch, '日');
+    }
+
+    /// Composing OVER a multi-scalar grapheme. The overlay sets `ch`, but both
+    /// renderers resolve such a cell's glyph from `clusters` — so a stale entry
+    /// paints the OLD grapheme on top of the composition.
+    #[test]
+    fn composing_over_a_grapheme_drops_its_stale_cluster() {
+        let mut term = Terminal::new(2, 10);
+        // Regional indicators J+P: one two-column flag cluster at column 0.
+        term.process("\u{1F1EF}\u{1F1F5}xy\r".as_bytes());
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, 2, 10);
+        assert_eq!(f.cluster_at(0, 0), Some("\u{1F1EF}\u{1F1F5}"));
+        assert_eq!(
+            (f.cursor_row, f.cursor_col),
+            (0, 0),
+            "CR parked at the flag"
+        );
+
+        f.overlay_ime_preedit("a", None, false);
+        assert_eq!(f.cells[0][0].ch, 'a');
+        assert_eq!(
+            f.cluster_at(0, 0),
+            None,
+            "the covered cell's grapheme goes with it"
+        );
+        assert_eq!(f.cluster_at(0, 2), None, "and nothing else is disturbed");
     }
 }
 

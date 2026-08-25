@@ -430,6 +430,82 @@ pub struct CatFootprint {
     pub h: u16,
 }
 
+/// One cursor-kitty placement resolved exactly once for palette sampling and
+/// sprite emission. `sample` is always the live logical target; the private
+/// leg may draw the body leaving/arriving off glass. Keeping both in one value
+/// prevents first-episode palette sampling from walking empty off-screen cells.
+#[derive(Clone, Copy, Debug)]
+pub struct KittyCursorPlacement {
+    pub sample: CatFootprint,
+    leg: KittyCursorPlacementLeg,
+    facing_left: bool,
+    sampled_at: Option<Instant>,
+}
+
+impl KittyCursorPlacement {
+    fn settled(sample: CatFootprint) -> Self {
+        Self {
+            sample,
+            leg: KittyCursorPlacementLeg::Settled,
+            facing_left: false,
+            sampled_at: None,
+        }
+    }
+
+    /// True for either visible half-beat (and the wholly off-stage seam
+    /// between them). Emitters use this to preserve signed X instead of
+    /// clamping the body or its notes back onto the opposite edge.
+    #[must_use]
+    pub fn in_motion(self) -> bool {
+        !matches!(self.leg, KittyCursorPlacementLeg::Settled)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KittyCursorPlacementLeg {
+    Settled,
+    Exit {
+        direction: crate::kitty_cursor::CatFoldDirection,
+        eased: f32,
+        from: CatFootprint,
+        from_sprite: Option<(i32, i32)>,
+    },
+    Enter {
+        direction: crate::kitty_cursor::CatFoldDirection,
+        eased: f32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KittyCursorPlacementKey {
+    scope: Option<u64>,
+    cell_w: u16,
+    cell_h: u16,
+    rows: u16,
+    cols: u16,
+    body_w: u16,
+    body_h: u16,
+    source: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KittyCursorActiveFold {
+    started: Instant,
+    direction: crate::kitty_cursor::CatFoldDirection,
+    from: CatFootprint,
+    from_sprite: Option<(i32, i32)>,
+}
+
+#[derive(Default)]
+struct KittyCursorPlacementState {
+    key: Option<KittyCursorPlacementKey>,
+    last_target: Option<CatFootprint>,
+    last_sprite: Option<(i32, i32)>,
+    last_emitted_at: Option<Instant>,
+    seen_fold: Option<(Instant, crate::kitty_cursor::CatFoldDirection)>,
+    active: Option<KittyCursorActiveFold>,
+}
+
 /// The fully-resolved per-frame decoration settings (host config → engine).
 #[derive(Clone, Debug)]
 pub struct DecoConfig {
@@ -2072,6 +2148,10 @@ pub struct WordDecorations {
     /// Bumped whenever the cursor sprite SOURCE changes (custom set/cleared), so
     /// the shared-atlas host key changes and the stale tile is re-baked.
     kitty_gen: u64,
+    /// Pixel-placement continuity for the classic flying cursor kitty. The cat
+    /// brain owns only authenticated fold time/direction; this renderer-owned
+    /// cache carries the last actual sprite origin across the off-glass seam.
+    kitty_cursor_placement: KittyCursorPlacementState,
     /// The sing-along's resident ♪/♫ note paints, one per
     /// [`crate::kitty_sing::NoteKind`]. Re-painted only when the host id (kind +
     /// cell-metric-derived size) changes.
@@ -2887,9 +2967,41 @@ impl WordDecorations {
         });
     }
 
+    /// Reset only state owned by Sparkle Words, preserving the cursor
+    /// companion's placement and resident sprite caches.
+    ///
+    /// The host uses this when the independent `[sparkle_words]` feed changes.
+    /// A word-language toggle must retire word episodes immediately, but it is
+    /// not authority to teleport an in-flight cursor kitty, evict the resident
+    /// pet's tiles, or make either companion rebake on the next frame.
+    pub fn hard_reset_words(&mut self) {
+        self.with_each_pane(|wd| {
+            wd.done_marks.clear();
+            wd.reset_word_transient_state();
+        });
+    }
+
     /// The shared body of [`reset`](Self::reset) / [`hard_reset`](Self::hard_reset):
     /// everything except the `done_marks` policy.
     fn reset_transient_state(&mut self) {
+        self.reset_word_transient_state();
+        self.kitty_cursor_placement = KittyCursorPlacementState::default();
+        // §5.5 invalidation: a full reset drops every shared bake cache.
+        self.cat_baker.clear();
+        self.pet_baker.clear();
+        self.animal_baker.clear();
+        self.pet_last_tile = None;
+        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
+        self.dog_baker.clear();
+        self.dog_last_tile = None;
+        self.robi_baker.clear();
+        self.robi_last_body = None;
+    }
+
+    /// Word-owned half of [`Self::reset_transient_state`]. Keep cursor
+    /// companion placement and the shared atlas/bakers out of this function:
+    /// Sparkle Words is a content effect, not their lifecycle owner.
+    fn reset_word_transient_state(&mut self) {
         self.occ.clear();
         self.have_scanned = false;
         self.last_epoch = 0;
@@ -2919,20 +3031,6 @@ impl WordDecorations {
         self.caret_word = None;
         self.frozen_at = None;
         self.settle_until = None;
-        // §5.5 invalidation: config reload / toggle drop the bake cache
-        // wholesale (version bump inside; a no-op when already empty).
-        self.cat_baker.clear();
-        // The pet's tiles are keyed on the same cell metrics and the same local
-        // palette, so they go stale for exactly the reasons the cat's do.
-        self.pet_baker.clear();
-        // …and the animal roster's, for the same reasons again.
-        self.animal_baker.clear();
-        self.pet_last_tile = None;
-        self.pet_depart_tiles = [None; crate::kitty_pet::PET_DEPARTURES_MAX];
-        self.dog_baker.clear();
-        self.dog_last_tile = None;
-        self.robi_baker.clear();
-        self.robi_last_body = None;
         // §F4.2: pending sightings die with the state.
         self.sightings.clear();
         self.unlogged.clear();
@@ -3219,6 +3317,133 @@ impl WordDecorations {
         Some(CatFootprint { x, y, w, h })
     }
 
+    /// Resolve the cursor kitty's logical target and authenticated line-fold
+    /// placement exactly once for this frame. The returned `sample` remains at
+    /// the live caret for palette selection; only the private draw leg leaves
+    /// and arrives off glass.
+    #[must_use]
+    pub fn resolve_kitty_cursor_placement(
+        &mut self,
+        layout: KittyCursorLayout,
+        motion: crate::kitty_cursor::CursorCatPlacementFrame,
+    ) -> Option<KittyCursorPlacement> {
+        let Some(target) = self.kitty_cursor_footprint(layout) else {
+            // A missing target is a coordinate-space break, not a paused
+            // half-beat. Retire every cached origin so re-enabling the kitty,
+            // restoring non-zero metrics, or widening a narrow pane starts at
+            // the live caret instead of replaying travel from old glass.
+            self.kitty_cursor_placement = KittyCursorPlacementState::default();
+            return None;
+        };
+        let key = KittyCursorPlacementKey {
+            scope: self.scan_scope(),
+            cell_w: layout.geom.cell_w,
+            cell_h: layout.geom.cell_h,
+            rows: layout.geom.rows,
+            cols: layout.geom.cols,
+            body_w: target.w,
+            body_h: target.h,
+            source: self.kitty_gen,
+        };
+        let stale = self
+            .kitty_cursor_placement
+            .last_emitted_at
+            .is_none_or(|at| {
+                motion.sampled_at.saturating_duration_since(at)
+                    >= crate::kitty_cursor::CURSOR_FOLD_DURATION
+            });
+        if self.kitty_cursor_placement.key != Some(key) || stale {
+            self.kitty_cursor_placement.key = Some(key);
+            self.kitty_cursor_placement.last_target = Some(target);
+            self.kitty_cursor_placement.last_sprite = None;
+            self.kitty_cursor_placement.active = None;
+            // A fold already under way belongs to the retired coordinate
+            // space / old frame train. Mark it seen so it cannot restart from
+            // the new target on the next sample.
+            self.kitty_cursor_placement.seen_fold =
+                motion.fold.map(|fold| (fold.started, fold.direction));
+            return Some(KittyCursorPlacement {
+                sample: target,
+                leg: KittyCursorPlacementLeg::Settled,
+                facing_left: motion.facing_left,
+                sampled_at: Some(motion.sampled_at),
+            });
+        }
+
+        let Some(fold) = motion.fold else {
+            self.kitty_cursor_placement.active = None;
+            self.kitty_cursor_placement.last_target = Some(target);
+            return Some(KittyCursorPlacement {
+                sample: target,
+                leg: KittyCursorPlacementLeg::Settled,
+                facing_left: motion.facing_left,
+                sampled_at: Some(motion.sampled_at),
+            });
+        };
+
+        let fold_id = (fold.started, fold.direction);
+        if self.kitty_cursor_placement.seen_fold != Some(fold_id) {
+            self.kitty_cursor_placement.seen_fold = Some(fold_id);
+            self.kitty_cursor_placement.active = Some(KittyCursorActiveFold {
+                started: fold.started,
+                direction: fold.direction,
+                from: self.kitty_cursor_placement.last_target.unwrap_or(target),
+                from_sprite: self.kitty_cursor_placement.last_sprite,
+            });
+        }
+        self.kitty_cursor_placement.last_target = Some(target);
+
+        let Some(active) = self
+            .kitty_cursor_placement
+            .active
+            .filter(|active| active.started == fold.started && active.direction == fold.direction)
+        else {
+            return Some(KittyCursorPlacement {
+                sample: target,
+                leg: KittyCursorPlacementLeg::Settled,
+                facing_left: motion.facing_left,
+                sampled_at: Some(motion.sampled_at),
+            });
+        };
+        let progress = if fold.progress.is_finite() {
+            fold.progress.clamp(0.0, 1.0)
+        } else {
+            self.kitty_cursor_placement.active = None;
+            return Some(KittyCursorPlacement {
+                sample: target,
+                leg: KittyCursorPlacementLeg::Settled,
+                facing_left: motion.facing_left,
+                sampled_at: Some(motion.sampled_at),
+            });
+        };
+        let leg = if progress < 0.5 {
+            KittyCursorPlacementLeg::Exit {
+                direction: fold.direction,
+                eased: smoothstep(progress * 2.0),
+                from: active.from,
+                from_sprite: active.from_sprite,
+            }
+        } else {
+            KittyCursorPlacementLeg::Enter {
+                direction: fold.direction,
+                eased: smoothstep((progress - 0.5) * 2.0),
+            }
+        };
+        Some(KittyCursorPlacement {
+            sample: target,
+            leg,
+            facing_left: motion.facing_left,
+            sampled_at: Some(motion.sampled_at),
+        })
+    }
+
+    /// Re-anchor the classic cursor kitty after the host detects a coordinate-
+    /// space tear between effect sampling and the frame it will present. Art
+    /// caches and lifecycle state remain valid; only old pixel continuity dies.
+    pub fn rebase_kitty_cursor_placement(&mut self) {
+        self.kitty_cursor_placement = KittyCursorPlacementState::default();
+    }
+
     /// The companion's body height in CELLS, before the age scale.
     ///
     /// Owner, 2026-08-09: "make it bigger … so I can see it more clearly."
@@ -3249,6 +3474,28 @@ impl WordDecorations {
         frame: KittyCursorFrame,
         free: &mut Vec<FreeSprite>,
     ) -> Option<u64> {
+        if frame.alpha == 0 || frame.geom.cell_w == 0 || frame.geom.cell_h == 0 {
+            return None;
+        }
+        let footprint = self.kitty_cursor_footprint(KittyCursorLayout {
+            geom: frame.geom,
+            cursor: frame.cursor,
+            look: frame.look,
+            bob: frame.bob,
+        })?;
+        self.kitty_cursor_at_placement(frame, KittyCursorPlacement::settled(footprint), free)
+    }
+
+    /// Emit one classic cursor kitty at the placement returned by
+    /// [`Self::resolve_kitty_cursor_placement`]. Hosts call the resolver once,
+    /// sample palette from `placement.sample`, then pass that same value here;
+    /// this avoids advancing placement twice in one frame.
+    pub fn kitty_cursor_at_placement(
+        &mut self,
+        frame: KittyCursorFrame,
+        placement: KittyCursorPlacement,
+        free: &mut Vec<FreeSprite>,
+    ) -> Option<u64> {
         let KittyCursorFrame {
             geom,
             cursor,
@@ -3263,12 +3510,17 @@ impl WordDecorations {
         if alpha == 0 || geom.cell_w == 0 || geom.cell_h == 0 {
             return None;
         }
-        let footprint = self.kitty_cursor_footprint(KittyCursorLayout {
-            geom,
-            cursor,
-            look,
-            bob,
-        })?;
+        let footprint = placement.sample;
+        debug_assert_eq!(
+            Some(footprint),
+            self.kitty_cursor_footprint(KittyCursorLayout {
+                geom,
+                cursor,
+                look,
+                bob,
+            }),
+            "cursor-kitty placement must match the frame it is emitted with"
+        );
         self.cat_baker.set_free_tiles(true);
         if !self.cat_baker_ready {
             self.cat_baker.begin_frame(geom.cell_w, geom.cell_h);
@@ -3353,13 +3605,66 @@ impl WordDecorations {
             .clamp(1, grid_w.max(1).min(i32::from(u16::MAX))) as u16;
         let dest_h =
             ((f32::from(nat_h) * pose.scale_y).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-        let lead_px = (pose.lead * f32::from(geom.cell_w)).round() as i32;
+        let flip_x = placement.facing_left;
+        let lead_px =
+            (pose.lead * f32::from(geom.cell_w)).round() as i32 * if flip_x { -1 } else { 1 };
         let cx = footprint.x + i32::from(nat_w) / 2;
         let cy = footprint.y + i32::from(nat_h) / 2;
-        let sprite_x = (cx - i32::from(dest_w) / 2 + lead_px).clamp(0, grid_w - i32::from(dest_w));
+        let target_x = (cx - i32::from(dest_w) / 2 + lead_px).clamp(0, grid_w - i32::from(dest_w));
+        let target_y = cy - i32::from(dest_h) / 2;
+        let clearance = i32::from(dest_w)
+            .max(i32::from(nat_w))
+            .saturating_add(i32::from(geom.cell_w).saturating_mul(2));
+        let lift = |q: f32| (0.18 * f32::from(geom.cell_h) * 4.0 * q * (1.0 - q)).round() as i32;
+        let lerp_px = |a: i32, b: i32, q: f32| {
+            (f64::from(a) + (f64::from(b) - f64::from(a)) * f64::from(q))
+                .round()
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32
+        };
+        let (sprite_x, sprite_y) = match placement.leg {
+            KittyCursorPlacementLeg::Settled => (target_x, target_y),
+            KittyCursorPlacementLeg::Exit {
+                direction,
+                eased,
+                from,
+                from_sprite,
+            } => {
+                let from_cx = from.x + i32::from(nat_w) / 2;
+                let from_x = (from_cx - i32::from(dest_w) / 2 + lead_px)
+                    .clamp(0, grid_w - i32::from(dest_w));
+                let from_y = from.y + i32::from(nat_h) / 2 - i32::from(dest_h) / 2;
+                let (start_x, start_y) = from_sprite.unwrap_or((from_x, from_y));
+                let end_x = match direction {
+                    crate::kitty_cursor::CatFoldDirection::Forward => {
+                        grid_w.saturating_add(clearance)
+                    }
+                    crate::kitty_cursor::CatFoldDirection::Reverse => {
+                        -i32::from(dest_w) - clearance
+                    }
+                };
+                (
+                    lerp_px(start_x, end_x, eased),
+                    lerp_px(start_y, from_y, eased).saturating_sub(lift(eased)),
+                )
+            }
+            KittyCursorPlacementLeg::Enter { direction, eased } => {
+                let start_x = match direction {
+                    crate::kitty_cursor::CatFoldDirection::Forward => {
+                        -i32::from(dest_w) - clearance
+                    }
+                    crate::kitty_cursor::CatFoldDirection::Reverse => {
+                        grid_w.saturating_add(clearance)
+                    }
+                };
+                (
+                    lerp_px(start_x, target_x, eased),
+                    target_y.saturating_sub(lift(eased)),
+                )
+            }
+        };
         let sprite = FreeSprite {
             x: sprite_x,
-            y: cy - i32::from(dest_h) / 2,
+            y: sprite_y,
             w: dest_w,
             h: dest_h,
             ax,
@@ -3368,7 +3673,7 @@ impl WordDecorations {
             ah: nat_h,
             tint: 0x00FF_FFFF,
             alpha,
-            flip_x: false,
+            flip_x,
             z: FreeZ::OverText,
             sampler: FreeSampler::Nearest,
         };
@@ -3387,8 +3692,13 @@ impl WordDecorations {
             [None; crate::kitty_sing::MAX_NOTES];
         if sing > 0.0 {
             let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
-            let mouth_x = sprite.x + i32::from(sprite.w);
-            let mouth_y = cy;
+            let mouth_x = if flip_x {
+                sprite.x
+            } else {
+                sprite.x + i32::from(sprite.w)
+            };
+            let mouth_y = sprite.y + i32::from(sprite.h) / 2;
+            let note_dir = if flip_x { -1.0 } else { 1.0 };
             for (slot, note) in note_sprites.iter_mut().zip(notes.iter().flatten()) {
                 let kind_idx = match note.kind {
                     crate::kitty_sing::NoteKind::Eighth => 0usize,
@@ -3417,17 +3727,23 @@ impl WordDecorations {
                 if a == 0 {
                     continue;
                 }
-                let nx =
-                    mouth_x + (note.dx * f32::from(geom.cell_w)).round() as i32 - i32::from(nw) / 2;
+                let nx = mouth_x + (note_dir * note.dx * f32::from(geom.cell_w)).round() as i32
+                    - i32::from(nw) / 2;
                 let ny =
                     mouth_y + (note.dy * f32::from(geom.cell_h)).round() as i32 - i32::from(nh) / 2;
                 if i32::from(nw) > grid_w {
                     continue; // a grid narrower than one note sings unadorned
                 }
                 *slot = Some(FreeSprite {
-                    // Notes ride fully on-grid horizontally (vertical clipping
-                    // is the renderer's).
-                    x: nx.clamp(0, grid_w - i32::from(nw)),
+                    // Settled notes ride fully on-grid. During a fold they
+                    // keep their signed mouth-relative coordinate; clamping
+                    // would pin them to the opposite edge while the body is
+                    // already off glass.
+                    x: if placement.in_motion() {
+                        nx
+                    } else {
+                        nx.clamp(0, grid_w - i32::from(nw))
+                    },
                     y: ny,
                     w: nw,
                     h: nh,
@@ -3448,6 +3764,10 @@ impl WordDecorations {
             free.push(*note);
         }
         free.push(sprite);
+        if let Some(at) = placement.sampled_at {
+            self.kitty_cursor_placement.last_sprite = Some((sprite.x, sprite.y));
+            self.kitty_cursor_placement.last_emitted_at = Some(at);
+        }
 
         // `tick` folds the atlas version before this post-tick cursor bake.
         // Return a complete cursor-art fingerprint so the host cannot swallow
@@ -4259,6 +4579,10 @@ impl WordDecorations {
     /// bytes.  The stable source fingerprint keys the shared-atlas tile; a
     /// target metric change still rebuilds only the bounded resample cache.
     pub fn set_kitty_sprite_source(&mut self, source: KittySpriteSource) {
+        // Even a same-size replacement names different pixels. A fold that
+        // began in the old source must not carry its cached body origin into
+        // the replacement's first frame.
+        self.kitty_cursor_placement = KittyCursorPlacementState::default();
         match source {
             KittySpriteSource::BuiltIn => {
                 self.kitty_custom = None;
@@ -21754,6 +22078,634 @@ mod tests {
             "shift, stretch, and pose lead must still clamp to the grid edge"
         );
         assert!(body.x >= 0, "body never crosses the left edge");
+    }
+
+    /// The classic kitty pays for a forward line fold with two edge-local
+    /// body beats. The only right→left discontinuity happens while both
+    /// samples are wholly off glass; the logical palette footprint stays at
+    /// the live new-row caret throughout.
+    #[test]
+    fn cursor_cat_fold_leaves_and_arrives_off_glass_without_edge_clamp() {
+        use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
+
+        let g = geom20();
+        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
+        let t0 = Instant::now();
+        let mut wd = WordDecorations::default();
+        let emit =
+            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
+                let layout = KittyCursorLayout {
+                    geom: g,
+                    cursor,
+                    look: KittyLook::default(),
+                    bob: 0.0,
+                };
+                let placement = wd
+                    .resolve_kitty_cursor_placement(layout, motion)
+                    .expect("placeable kitty");
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(
+                    KittyCursorFrame {
+                        geom: g,
+                        cursor,
+                        look: layout.look,
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::kitty_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    placement,
+                    &mut free,
+                )
+                .expect("kitty emitted");
+                (placement, *free.last().expect("body emits last"))
+            };
+
+        let old_cursor = (3, g.cols - 1);
+        let (_, old) = emit(
+            &mut wd,
+            old_cursor,
+            CursorCatPlacementFrame {
+                sampled_at: t0,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        assert_eq!(old.x + i32::from(old.w), grid_w, "seed at right edge");
+
+        let started = t0 + Duration::from_millis(16);
+        let motion = |progress: f32, sampled_at: Instant| CursorCatPlacementFrame {
+            sampled_at,
+            fold: Some(CatFoldFrame {
+                started,
+                direction: CatFoldDirection::Forward,
+                progress,
+            }),
+            facing_left: false,
+        };
+        let new_cursor = (4, 0);
+        let (launch_place, launch) = emit(&mut wd, new_cursor, motion(0.0, started));
+        assert_eq!(
+            (launch.x, launch.y),
+            (old.x, old.y),
+            "the first fold sample is C0-continuous with the body actually drawn"
+        );
+        assert_eq!(
+            launch_place.sample,
+            wd.kitty_cursor_footprint(KittyCursorLayout {
+                geom: g,
+                cursor: new_cursor,
+                look: KittyLook::default(),
+                bob: 0.0,
+            })
+            .expect("logical target"),
+            "palette sampling follows the live target, never the offstage body"
+        );
+
+        let (_, right_off) = emit(
+            &mut wd,
+            new_cursor,
+            motion(0.499, started + Duration::from_millis(139)),
+        );
+        assert!(
+            right_off.x >= grid_w,
+            "the leaving body is wholly right-offstage, not clamped back to {grid_w}: {right_off:?}"
+        );
+        let (_, left_off) = emit(
+            &mut wd,
+            new_cursor,
+            motion(0.5, started + Duration::from_millis(140)),
+        );
+        assert!(
+            left_off.x + i32::from(left_off.w) <= 0,
+            "the arriving body starts wholly left-offstage: {left_off:?}"
+        );
+
+        // The target remains live during entry. Advancing three cells changes
+        // the logical target now, and the settled endpoint is exactly the same
+        // bytes the historical direct emitter would draw there — no end snap.
+        let advanced = (4, 3);
+        let (entry_place, _) = emit(
+            &mut wd,
+            advanced,
+            motion(0.85, started + Duration::from_millis(238)),
+        );
+        assert_eq!(entry_place.sample.x, 4 * i32::from(g.cell_w) + 7);
+        let (_, landed) = emit(
+            &mut wd,
+            advanced,
+            CursorCatPlacementFrame {
+                sampled_at: started + crate::kitty_cursor::CURSOR_FOLD_DURATION,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        let mut direct = Vec::new();
+        wd.kitty_cursor(
+            KittyCursorFrame {
+                geom: g,
+                cursor: advanced,
+                look: KittyLook::default(),
+                colors: CatColorKey::default(),
+                bob: 0.0,
+                alpha: 255,
+                pose: crate::kitty_cursor::CatPose::STILL,
+                sing: 0.0,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            },
+            &mut direct,
+        );
+        assert_eq!(
+            landed, direct[0],
+            "the seam lands on the exact settled frame"
+        );
+    }
+
+    #[test]
+    fn reverse_fold_mirrors_reenters_and_rebaselines_on_coordinate_breaks() {
+        use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
+
+        let g = geom20();
+        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
+        let t0 = Instant::now();
+        let mut wd = WordDecorations::default();
+        let layout = |geom, cursor| KittyCursorLayout {
+            geom,
+            cursor,
+            look: KittyLook::default(),
+            bob: 0.0,
+        };
+        let emit = |wd: &mut WordDecorations,
+                    geom: EffectGeom,
+                    cursor: (u16, u16),
+                    motion: CursorCatPlacementFrame| {
+            let place = wd
+                .resolve_kitty_cursor_placement(layout(geom, cursor), motion)
+                .expect("placement");
+            let mut free = Vec::new();
+            wd.kitty_cursor_at_placement(
+                KittyCursorFrame {
+                    geom,
+                    cursor,
+                    look: KittyLook::default(),
+                    colors: CatColorKey::default(),
+                    bob: 0.0,
+                    alpha: 255,
+                    pose: crate::kitty_cursor::CatPose::STILL,
+                    sing: 0.0,
+                    notes: [None; crate::kitty_sing::MAX_NOTES],
+                },
+                place,
+                &mut free,
+            )
+            .expect("emission");
+            (place, free[0])
+        };
+        let _ = emit(
+            &mut wd,
+            g,
+            (3, 0),
+            CursorCatPlacementFrame {
+                sampled_at: t0,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        let started = t0 + Duration::from_millis(16);
+        let fold = |progress| CursorCatPlacementFrame {
+            sampled_at: started + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started,
+                direction: CatFoldDirection::Reverse,
+                progress,
+            }),
+            facing_left: true,
+        };
+        let (_, left_off) = emit(&mut wd, g, (2, g.cols - 1), fold(0.499));
+        assert!(left_off.flip_x);
+        assert!(left_off.x + i32::from(left_off.w) <= 0);
+        let (_, right_off) = emit(&mut wd, g, (2, g.cols - 1), fold(0.5));
+        assert!(right_off.flip_x);
+        assert!(right_off.x >= grid_w);
+
+        // A second authenticated fold may arrive before the first has landed
+        // (fast typing or Backspace correction). Its first pixel sample starts
+        // at the body actually emitted last frame, not at either logical caret.
+        let reentered_at = started + Duration::from_millis(150);
+        let reentered = |progress| CursorCatPlacementFrame {
+            sampled_at: reentered_at + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started: reentered_at,
+                direction: CatFoldDirection::Forward,
+                progress,
+            }),
+            facing_left: false,
+        };
+        let (_, restarted) = emit(&mut wd, g, (3, 0), reentered(0.0));
+        assert_eq!(
+            (restarted.x, restarted.y),
+            (right_off.x, right_off.y),
+            "a reentrant fold is C0-continuous with the last emitted body"
+        );
+
+        // A temporarily missing target retires the old coordinate space. The
+        // same still-live fold stamp cannot restart when valid metrics return.
+        let zero_width = EffectGeom { cell_w: 0, ..g };
+        assert!(
+            wd.resolve_kitty_cursor_placement(layout(zero_width, (3, 0)), reentered(0.1))
+                .is_none()
+        );
+        let (reappeared, body) = emit(&mut wd, g, (3, 0), reentered(0.2));
+        assert!(!reappeared.in_motion());
+        assert!(body.x >= 0 && body.x + i32::from(body.w) <= grid_w);
+
+        // Source replacement resets even when it resolves to the same built-in
+        // dimensions; cached pixels/origins never cross an asset identity seam.
+        wd.set_kitty_sprite_source(KittySpriteSource::BuiltIn);
+        let (replaced, _) = emit(&mut wd, g, (3, 0), reentered(0.3));
+        assert!(!replaced.in_motion());
+
+        let resized = EffectGeom {
+            cols: g.cols + 1,
+            ..g
+        };
+        let (place, body) = emit(&mut wd, resized, (3, 0), reentered(0.4));
+        assert!(
+            !place.in_motion(),
+            "geometry changes settle instead of interpolating incomparable spaces"
+        );
+        assert!(body.x >= 0 && body.x + i32::from(body.w) <= 210);
+
+        // A host-side LOCK A/B divergence has no new asset or geometry key to
+        // force a reset, so its explicit rebase seam must settle the still-live
+        // fold token rather than replaying it on the next coherent frame.
+        let torn_at = reentered_at + Duration::from_millis(160);
+        let torn_fold = |progress| CursorCatPlacementFrame {
+            sampled_at: torn_at + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started: torn_at,
+                direction: CatFoldDirection::Forward,
+                progress,
+            }),
+            facing_left: false,
+        };
+        let (moving, _) = emit(&mut wd, resized, (3, 0), torn_fold(0.1));
+        assert!(moving.in_motion());
+        wd.rebase_kitty_cursor_placement();
+        let (rebased, body) = emit(&mut wd, resized, (3, 0), torn_fold(0.2));
+        assert!(!rebased.in_motion());
+        assert!(body.x >= 0 && body.x + i32::from(body.w) <= 210);
+
+        // Session identity is part of the placement key. Even a quick tab/pane
+        // switch rebaselines instead of carrying signed pixels to another grid.
+        let session_fold_at = torn_at + Duration::from_millis(80);
+        let session_fold = |progress| CursorCatPlacementFrame {
+            sampled_at: session_fold_at + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started: session_fold_at,
+                direction: CatFoldDirection::Reverse,
+                progress,
+            }),
+            facing_left: true,
+        };
+        let (moving, _) = emit(&mut wd, resized, (2, g.cols), session_fold(0.1));
+        assert!(
+            moving.in_motion(),
+            "negative control: a fresh fold animates"
+        );
+        wd.set_scan_session(Some(0xCA7));
+        let (switched, _) = emit(&mut wd, resized, (2, g.cols), session_fold(0.2));
+        assert!(!switched.in_motion(), "a new session settles old travel");
+    }
+
+    #[test]
+    fn sparkle_word_reset_preserves_cursor_companion_placement_and_atlas() {
+        use crate::kitty_cursor::CursorCatPlacementFrame;
+
+        let g = geom20();
+        let now = Instant::now();
+        let mut wd = WordDecorations::default();
+        wd.begin_host_frame();
+        let layout = KittyCursorLayout {
+            geom: g,
+            cursor: (3, 7),
+            look: KittyLook::default(),
+            bob: 0.0,
+        };
+        let placement = wd
+            .resolve_kitty_cursor_placement(
+                layout,
+                CursorCatPlacementFrame {
+                    sampled_at: now,
+                    fold: None,
+                    facing_left: false,
+                },
+            )
+            .expect("placeable companion");
+        let mut free = Vec::new();
+        wd.kitty_cursor_at_placement(
+            KittyCursorFrame {
+                geom: g,
+                cursor: layout.cursor,
+                look: layout.look,
+                colors: CatColorKey::default(),
+                bob: 0.0,
+                alpha: 255,
+                pose: crate::kitty_cursor::CatPose::STILL,
+                sing: 0.0,
+                notes: [None; crate::kitty_sing::MAX_NOTES],
+            },
+            placement,
+            &mut free,
+        )
+        .expect("companion emits");
+        let atlas_before = wd.free_atlas().expect("companion baked an atlas");
+        let key_before = wd.kitty_cursor_placement.key;
+        let target_before = wd.kitty_cursor_placement.last_target;
+        wd.have_scanned = true;
+        wd.active_until = Some(now + Duration::from_secs(1));
+
+        wd.hard_reset_words();
+
+        assert!(!wd.have_scanned, "word scan state retires immediately");
+        assert!(wd.active_until.is_none(), "word cadence retires immediately");
+        assert_eq!(wd.kitty_cursor_placement.key, key_before);
+        assert_eq!(wd.kitty_cursor_placement.last_target, target_before);
+        let atlas_after = wd.free_atlas().expect("companion atlas stays resident");
+        assert!(
+            Arc::ptr_eq(&atlas_before, &atlas_after),
+            "a word-only toggle must not rebake the companion atlas"
+        );
+
+        wd.hard_reset();
+        assert!(
+            wd.kitty_cursor_placement.key.is_none(),
+            "negative control: a full lifecycle reset retires placement"
+        );
+        assert!(
+            wd.free_atlas().is_none(),
+            "negative control: a full reset evicts the shared atlas"
+        );
+    }
+
+    /// Tier-1 bind for `CursorCatFold`: project the REAL resolver/emitter onto
+    /// the model after every forward and reverse placement leg. The old pure
+    /// footprint emitter is retained as a deliberate mutant: it changes edges
+    /// with both frames on glass, is rejected by the healthy transition, and
+    /// is admitted exactly by `Buggy=1`.
+    #[test]
+    fn cursor_cat_fold_conformance_real_placement_and_teleport_mutant() {
+        use crate::kitty_cursor::{CatFoldDirection, CatFoldFrame, CursorCatPlacementFrame};
+
+        let model = aterm_spec::derive::cursor_cat_fold_model();
+        let g = geom20();
+        let grid_w = i32::from(g.cols) * i32::from(g.cell_w);
+        let t0 = Instant::now();
+
+        let emit =
+            |wd: &mut WordDecorations, cursor: (u16, u16), motion: CursorCatPlacementFrame| {
+                let layout = KittyCursorLayout {
+                    geom: g,
+                    cursor,
+                    look: KittyLook::default(),
+                    bob: 0.0,
+                };
+                let placement = wd
+                    .resolve_kitty_cursor_placement(layout, motion)
+                    .expect("placeable cursor kitty");
+                let mut free = Vec::new();
+                wd.kitty_cursor_at_placement(
+                    KittyCursorFrame {
+                        geom: g,
+                        cursor,
+                        look: layout.look,
+                        colors: CatColorKey::default(),
+                        bob: 0.0,
+                        alpha: 255,
+                        pose: crate::kitty_cursor::CatPose::STILL,
+                        sing: 0.0,
+                        notes: [None; crate::kitty_sing::MAX_NOTES],
+                    },
+                    placement,
+                    &mut free,
+                )
+                .expect("cursor kitty emitted");
+                (placement, *free.last().expect("body emits last"))
+            };
+
+        let sprite_place = |sprite: FreeSprite| {
+            let wholly_left = sprite.x + i32::from(sprite.w) <= 0;
+            let wholly_right = sprite.x >= grid_w;
+            let off = wholly_left || wholly_right;
+            let side = if wholly_left {
+                0
+            } else if wholly_right {
+                1
+            } else {
+                i64::from(sprite.x * 2 + i32::from(sprite.w) >= grid_w)
+            };
+            (side, i64::from(off))
+        };
+
+        let project = |placement: KittyCursorPlacement,
+                       sprite: FreeSprite,
+                       origin_side: i64,
+                       seen_off: bool,
+                       folds: i64| {
+            let (side, off_glass) = sprite_place(sprite);
+            let (phase, direction) = match placement.leg {
+                KittyCursorPlacementLeg::Settled => (0, 0),
+                KittyCursorPlacementLeg::Exit { direction, .. } => (
+                    if off_glass == 1 { 2 } else { 1 },
+                    match direction {
+                        CatFoldDirection::Forward => 1,
+                        CatFoldDirection::Reverse => 2,
+                    },
+                ),
+                KittyCursorPlacementLeg::Enter { direction, .. } => (
+                    if off_glass == 1 { 3 } else { 4 },
+                    match direction {
+                        CatFoldDirection::Forward => 1,
+                        CatFoldDirection::Reverse => 2,
+                    },
+                ),
+            };
+            let mut state = model.init_state();
+            state.insert("phase", phase);
+            state.insert("direction", direction);
+            state.insert("origin_side", origin_side);
+            state.insert("side", side);
+            state.insert("off_glass", off_glass);
+            state.insert("off_samples", i64::from(seen_off));
+            state.insert("folds", folds);
+            state
+        };
+
+        let assert_step = |before: &std::collections::BTreeMap<&'static str, i64>,
+                           after: &std::collections::BTreeMap<&'static str, i64>,
+                           action: &'static str,
+                           label: &str| {
+            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                &model,
+                &[],
+                before,
+                after,
+                Some(action),
+                label,
+            );
+            assert!(ok, "{label}: {why}");
+            let mut expected = before.clone();
+            assert!(model.fire(action, &mut expected), "{label}: action enabled");
+            assert_eq!(&expected, after, "{label}: real projection matches model");
+        };
+
+        let motion = |started: Instant, direction, progress: f32| CursorCatPlacementFrame {
+            sampled_at: started + Duration::from_secs_f32(progress * 0.28),
+            fold: Some(CatFoldFrame {
+                started,
+                direction,
+                progress,
+            }),
+            facing_left: matches!(direction, CatFoldDirection::Reverse),
+        };
+
+        let mut wd = WordDecorations::default();
+        let (seed_placement, seed) = emit(
+            &mut wd,
+            (3, g.cols - 1),
+            CursorCatPlacementFrame {
+                sampled_at: t0,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        let mut state = project(seed_placement, seed, 1, false, 0);
+        assert_eq!(state, model.init_state(), "right-edge seed is model Init");
+
+        let forward_at = t0 + Duration::from_millis(16);
+        for (progress, action, origin, seen_off, label) in [
+            (0.0, "StartForward", 1, false, "forward launch on old edge"),
+            (0.499, "LeaveOff", 1, true, "forward body wholly right-off"),
+            (0.5, "CrossSide", 1, true, "forward body wholly left-off"),
+            (0.9, "EnterGlass", 1, true, "forward arrival on new edge"),
+        ] {
+            let (placement, sprite) = emit(
+                &mut wd,
+                (4, 0),
+                motion(forward_at, CatFoldDirection::Forward, progress),
+            );
+            let next = project(placement, sprite, origin, seen_off, 1);
+            assert_step(&state, &next, action, label);
+            state = next;
+        }
+        let (placement, sprite) = emit(
+            &mut wd,
+            (4, 0),
+            CursorCatPlacementFrame {
+                sampled_at: forward_at + crate::kitty_cursor::CURSOR_FOLD_DURATION,
+                fold: None,
+                facing_left: false,
+            },
+        );
+        let next = project(placement, sprite, 0, false, 1);
+        assert_step(&state, &next, "Finish", "forward settles on left edge");
+        state = next;
+
+        let reverse_at =
+            forward_at + crate::kitty_cursor::CURSOR_FOLD_DURATION + Duration::from_millis(16);
+        for (progress, action, origin, seen_off, label) in [
+            (0.0, "StartReverse", 0, false, "reverse launch on old edge"),
+            (0.499, "LeaveOff", 0, true, "reverse body wholly left-off"),
+            (0.5, "CrossSide", 0, true, "reverse body wholly right-off"),
+            (0.9, "EnterGlass", 0, true, "reverse arrival on new edge"),
+        ] {
+            let (placement, sprite) = emit(
+                &mut wd,
+                (3, g.cols - 1),
+                motion(reverse_at, CatFoldDirection::Reverse, progress),
+            );
+            let next = project(placement, sprite, origin, seen_off, 2);
+            assert_step(&state, &next, action, label);
+            state = next;
+        }
+        let (placement, sprite) = emit(
+            &mut wd,
+            (3, g.cols - 1),
+            CursorCatPlacementFrame {
+                sampled_at: reverse_at + crate::kitty_cursor::CURSOR_FOLD_DURATION,
+                fold: None,
+                facing_left: true,
+            },
+        );
+        let next = project(placement, sprite, 1, false, 2);
+        assert_step(&state, &next, "Finish", "reverse settles on right edge");
+
+        // Negative control: the compatibility emitter is the pre-fix pure
+        // placement law. Both frames intersect the viewport, yet their sides
+        // differ with no off-glass history between them.
+        let mut mutant_wd = WordDecorations::default();
+        let mut free = Vec::new();
+        let frame = |cursor| KittyCursorFrame {
+            geom: g,
+            cursor,
+            look: KittyLook::default(),
+            colors: CatColorKey::default(),
+            bob: 0.0,
+            alpha: 255,
+            pose: crate::kitty_cursor::CatPose::STILL,
+            sing: 0.0,
+            notes: [None; crate::kitty_sing::MAX_NOTES],
+        };
+        mutant_wd
+            .kitty_cursor(frame((3, g.cols - 1)), &mut free)
+            .expect("old edge emits");
+        let old_edge = *free.last().expect("old body");
+        free.clear();
+        mutant_wd
+            .kitty_cursor(frame((4, 0)), &mut free)
+            .expect("new edge emits");
+        let new_edge = *free.last().expect("new body");
+        assert_eq!(sprite_place(old_edge), (1, 0));
+        assert_eq!(sprite_place(new_edge), (0, 0));
+
+        let mut before = model.init_state();
+        assert!(model.fire("StartForward", &mut before));
+        let mut teleported = before.clone();
+        teleported.insert("phase", 4);
+        teleported.insert("side", 0);
+        teleported.insert("off_glass", 0);
+        teleported.insert("off_samples", 0);
+        let (healthy_ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &model,
+            &[],
+            &before,
+            &teleported,
+            Some("LeaveOff"),
+            "direct edge teleport mutant",
+        );
+        assert!(
+            !healthy_ok,
+            "healthy model rejects the old direct placement"
+        );
+        assert!(!model.check_invariant("OffGlassBeforeSideChange", &teleported));
+
+        let mut buggy = aterm_spec::derive::cursor_cat_fold_model();
+        for cst in &mut buggy.consts {
+            if cst.0 == "Buggy" {
+                cst.1 = 1;
+            }
+        }
+        let (buggy_ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &buggy,
+            &[],
+            &before,
+            &teleported,
+            Some("LeaveOff"),
+            "Buggy=1 direct edge teleport",
+        );
+        assert!(buggy_ok, "Buggy=1 must reproduce the mutant: {why}");
     }
 
     /// OFFSET CONSTANT PROOF: the horizontal anchor is exactly the cursor

@@ -189,7 +189,47 @@ fn intern_discovered_font_bytes(bytes: &[u8]) -> std::sync::Arc<Vec<u8>> {
 /// interned SOURCE bytes alongside the parsed face (W8): the fallback pipeline
 /// needs both — fontdue for the portable raster, the raw bytes for ttf-parser
 /// cmap/metric duty and the macOS CoreText raster.
+///
+/// This entry point has only a SLICE, so a genuinely new face costs a copy of it.
+/// A caller that already holds the store's own handle type wants
+/// [`intern_parsed_font_owned`], which hands that handle over instead.
 fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
+    intern_parsed_font_keyed(bytes, || std::sync::Arc::new(bytes.to_vec()))
+}
+
+/// [`intern_parsed_font`] for a caller that ALREADY owns the source bytes in the
+/// store's handle type — the DISCOVERED fallback/symbol faces, whose bytes live
+/// in [`DISCOVERED_FONT_BYTES`] from the moment they are read
+/// ([`FallbackFace::from_path_bytes`]) and stay there for the life of the
+/// process.
+///
+/// WHY THIS EXISTS, in bytes. [`LazyFontdue::get`] materialises a deferred chain
+/// face by handing its bytes to the slice entry point, which copied them —
+/// so the moment the first CJK cell (or `⏸`) drew, the face's FILE was resident
+/// TWICE, permanently, and nothing ever read the second copy: `get` keeps its
+/// own handle and discards the one it is given. MEASURED on this Linux host at
+/// 4.03 MB (`DroidSansFallbackFull.ttf`, the broad tier) + 0.64 MB
+/// (`NotoSansSymbols2-Regular.ttf`, the symbol slot); on macOS the same two
+/// slots are `Hiragino Sans GB.ttc` (23.5 MB) and `Arial Unicode.ttf` (23.3 MB).
+/// Passing the handle over instead makes the entry's key the copy the caller was
+/// already holding — the exact bargain [`shared_parsed_face_owned`] strikes for
+/// the styled tier.
+///
+/// Returns the parse alone: the caller's own handle IS the store's, so handing
+/// the bytes back would only invite a second name for one allocation.
+fn intern_parsed_font_owned(
+    bytes: &std::sync::Arc<Vec<u8>>,
+) -> Result<std::sync::Arc<fontdue::Font>, String> {
+    intern_parsed_font_keyed(bytes, || bytes.clone()).map(|(_, font)| font)
+}
+
+/// The one parse + publish both entry points use. `key` supplies the store's byte
+/// handle ONLY when a genuinely new entry is being pushed — after the lookup AND
+/// after the under-lock re-check, so neither a hit nor a lost race pays for it.
+fn intern_parsed_font_keyed(
+    bytes: &[u8],
+    key: impl FnOnce() -> std::sync::Arc<Vec<u8>>,
+) -> Result<InternedFace, String> {
     if let Some(face) = interned_parsed_font_lookup(bytes) {
         return Ok(face);
     }
@@ -199,7 +239,6 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
     let parsed = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default())
         .map_err(|e| e.to_string())?;
     let font = std::sync::Arc::new(parsed);
-    let src = std::sync::Arc::new(bytes.to_vec());
     let mut store = PARSED_FONT_INTERN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -211,6 +250,7 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
     {
         return Ok((src.clone(), existing.clone()));
     }
+    let src = key();
     store.push((src.clone(), font.clone()));
     Ok((src, font))
 }
@@ -1833,6 +1873,12 @@ pub struct Renderer {
     rain_row_starts: Vec<u32>,
     rain_row_idx: Vec<u32>,
     rain_row_cursor: Vec<u32>,
+    /// Reused per-column NEAREST source-index table for scaled free sprites.
+    /// The common 1:1 pet/mote/note path bypasses this table entirely; a scaled
+    /// sprite grows it at most once and every later frame reuses the capacity.
+    /// Scratch is renderer-owned rather than window-owned because it carries no
+    /// frame identity or pixels — only indices rebuilt from the current sprite.
+    free_xmap_scratch: Vec<u32>,
     /// Memoized "is the current rain atlas pure-white RGB?" decision, keyed by
     /// atlas `(data ptr, version, len)`. Production rain uses the RainBaker atlas
     /// (RGB always 255) so the `WHITE_RGB` stamp fast path (tint hoisted, 3
@@ -3057,11 +3103,18 @@ impl LazyFontdue {
 
     /// The parsed face, materialising it from `bytes` on first call. `None` means
     /// fontdue rejected the bytes (cached: a second call does not re-parse).
-    fn get(&self, bytes: &[u8]) -> Option<&std::sync::Arc<fontdue::Font>> {
+    ///
+    /// Takes the caller's own byte HANDLE, not a slice, and hands it to the parsed
+    /// store as that entry's key ([`intern_parsed_font_owned`]): the bytes this
+    /// cell is materialising are already resident in [`DISCOVERED_FONT_BYTES`] for
+    /// the life of the process, so a slice here made the file resident twice —
+    /// measured at 4.67 MB on this Linux host's two chain slots, ~47 MB on macOS's.
+    /// [`Self::get_at`] strikes the same bargain against the other store.
+    fn get(&self, bytes: &std::sync::Arc<Vec<u8>>) -> Option<&std::sync::Arc<fontdue::Font>> {
         if self.0.get().is_none() {
             // Parse OUTSIDE the cell, then publish; a racer's duplicate result is
             // dropped by `set`. See the type docs on why this is not `get_or_init`.
-            let parsed = intern_parsed_font(bytes).ok().map(|(_, font)| font);
+            let parsed = intern_parsed_font_owned(bytes).ok();
             let _ = self.0.set(parsed);
         }
         self.0.get().and_then(Option::as_ref)
@@ -6153,6 +6206,7 @@ impl Renderer {
             rain_row_starts: Vec::new(),
             rain_row_idx: Vec::new(),
             rain_row_cursor: Vec::new(),
+            free_xmap_scratch: Vec::new(),
             rain_white_cache: None,
             alpha_memo: None,
         };
@@ -12611,7 +12665,7 @@ impl Renderer {
     /// stamping is byte-identical to a whole-rect stamp: the NEAREST source
     /// index is a pure function of the unclamped-origin dest offset.
     fn stamp_free_sprites<I>(
-        &self,
+        &mut self,
         pixels: &mut [u32],
         w: usize,
         h: usize,
@@ -12630,47 +12684,34 @@ impl Renderer {
         if !atlas_texels_valid(atlas) {
             return;
         }
-        // Per-column NEAREST source-index table for `stamp_free_sprite`, owned by
-        // THIS stack frame (not the `&self` renderer — the free-sprite phases hold
-        // `&self` alongside `&mut pixels`, so a resident field would force a
-        // `&mut self` / `RefCell` refactor of the composite borrow structure for no
-        // gain). One `Vec` per phase call — two per frame — refilled per stamp and
-        // amortized to zero reallocations after the first sprite.
-        let mut xmap: Vec<u32> = Vec::new();
+        // The phase runner already owns `&mut self`, so move the resident scratch
+        // out for the loop and restore it afterward. A scaled sprite may grow it;
+        // 1:1 sprites never touch its allocation. Keeping it across BOTH z phases
+        // and future frames removes the old one-Vec-per-active-phase churn.
+        let pad_x = self.pad;
+        let pad_y = self.grid_top();
+        let cell_h = self.cell_h;
+        let mut xmap = std::mem::take(&mut self.free_xmap_scratch);
         for r in rows {
             // Row `r`'s band, extended into the top/bottom pad strip at the grid
             // edges (mirroring the GPU scissor's edge extension, which Phase A's
             // strip reset re-established from bg).
-            let y_lo = if r == 0 {
-                0
-            } else {
-                self.grid_top() + r * self.cell_h
-            };
+            let y_lo = if r == 0 { 0 } else { pad_y + r * cell_h };
             let y_hi = if r + 1 >= input.rows {
                 h
             } else {
-                (self.grid_top() + (r + 1) * self.cell_h).min(h)
+                (pad_y + (r + 1) * cell_h).min(h)
             };
             if y_lo >= y_hi {
                 continue;
             }
             for s in &input.free_sprites {
                 if s.z == z {
-                    stamp_free_sprite(
-                        pixels,
-                        w,
-                        h,
-                        self.pad,
-                        self.grid_top(),
-                        atlas,
-                        s,
-                        y_lo,
-                        y_hi,
-                        &mut xmap,
-                    );
+                    stamp_free_sprite(pixels, w, h, pad_x, pad_y, atlas, s, y_lo, y_hi, &mut xmap);
                 }
             }
         }
+        self.free_xmap_scratch = xmap;
     }
 }
 
@@ -19633,10 +19674,10 @@ fn stamp_cat_quad<const WHITE_RGB: bool>(
 /// * v1 is NEAREST-only: `FreeSampler::Linear` is debug-asserted off and
 ///   ignored in release, mirroring the GPU instance build.
 ///
-/// `xmap` is a caller-owned scratch buffer for the per-COLUMN source-index table
-/// (cleared and refilled here): `sx` is a pure function of `dx`, so it is the
-/// same on every scanline of the stamp and is computed once per column instead of
-/// once per destination pixel.
+/// `xmap` is a caller-owned, cross-frame scratch buffer for the SCALED arm's
+/// per-column source-index table: `sx` is a pure function of `dx`, so it is the
+/// same on every scanline and is computed once per column. The common 1:1 arm
+/// indexes directly and neither fills nor allocates this table.
 #[allow(clippy::too_many_arguments)]
 fn stamp_free_sprite(
     pixels: &mut [u32],
@@ -19694,20 +19735,19 @@ fn stamp_free_sprite(
     // `stamp_cat_quad` does. The scaled arm keeps the exact divide, so a squashed
     // /stretched sprite samples the identical texel as before (and as the GPU).
     let one_to_one = aw == dw && ah == dh;
-    // Per-COLUMN source index, hoisted out of the scanline loop: `sx` depends only
-    // on `dx` (and the fixed `aw`/`dw`/`flip_x`), so it is identical on every row
-    // of this stamp — a pure memoization of a pure function, same texel per pixel.
-    // Divides drop from W·H_band to W_band per stamp (zero on the 1:1 arm).
-    xmap.clear();
-    xmap.extend((px0..xend).map(|px| {
-        let dx = (px as i32 - ox) as usize;
-        let sx0 = if one_to_one {
-            dx
-        } else {
-            (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1)
-        };
-        (if s.flip_x { aw - 1 - sx0 } else { sx0 }) as u32
-    }));
+    // Per-COLUMN source index for the scaled arm, hoisted out of the scanline
+    // loop. The 1:1 arm below derives `sx` directly, so a resident pet does not
+    // even grow the scratch on its first frame. Scaled sprites keep the exact
+    // pixel-center divide but pay it only W_band times, with capacity retained
+    // by the renderer across z phases and frames.
+    if !one_to_one {
+        xmap.clear();
+        xmap.extend((px0..xend).map(|px| {
+            let dx = (px as i32 - ox) as usize;
+            let sx0 = (((2 * dx + 1) * aw) / (2 * dw)).min(aw - 1);
+            (if s.flip_x { aw - 1 - sx0 } else { sx0 }) as u32
+        }));
+    }
     for py in py0..yend {
         // Dest offset against the UNCLAMPED origin (see the doc above).
         let dy = (py as i32 - oy) as usize;
@@ -19721,8 +19761,14 @@ fn stamp_free_sprite(
         let base = py * w;
         let arow = (s.ay as usize + sy) * atlas.width as usize;
         for px in px0..xend {
-            // `xmap` was filled over exactly `px0..xend`, so this index is in range.
-            let sx = xmap[px - px0] as usize;
+            let sx = if one_to_one {
+                let dx = (px as i32 - ox) as usize;
+                if s.flip_x { aw - 1 - dx } else { dx }
+            } else {
+                // The scaled arm filled `xmap` over exactly `px0..xend`, so this
+                // index is in range.
+                xmap[px - px0] as usize
+            };
             let i = (arow + s.ax as usize + sx) * 4;
             let a8 = mul8(atlas.rgba[i + 3] as u32, qa);
             if a8 == 0 {
@@ -21113,6 +21159,54 @@ mod tests {
         // And the entry does not wedge the cache: the next request re-parses.
         let (_, again) = shared_parsed_face(bytes, 0).expect("re-parse after release");
         assert!(again.horizontal_line_metrics(16.0).is_some());
+    }
+
+    /// MEMORY: materialising a DISCOVERED chain face must not put a SECOND copy
+    /// of the file in the process.
+    ///
+    /// A discovery-path face already holds its bytes in [`DISCOVERED_FONT_BYTES`]
+    /// from the moment they are read, and holds them there for the life of the
+    /// process. [`LazyFontdue::get`] used to hand a SLICE to the parsed store,
+    /// which copied it — so the first CJK cell (or `⏸`) made the file resident
+    /// twice, permanently, with nothing ever reading the second copy. MEASURED on
+    /// this Linux host as 3,907 kB on the broad chain face
+    /// (`DroidSansFallbackFull.ttf`) and 646 kB on the symbol slot
+    /// (`NotoSansSymbols2-Regular.ttf`), the mean of three alternating
+    /// before/after pairs (spread ≤ 40 kB).
+    ///
+    /// The observable is pointer identity: the parsed store's key for these bytes
+    /// IS the face's own handle, not an equal-content twin.
+    #[test]
+    fn a_materialising_chain_face_adopts_its_own_byte_handle() {
+        // A bundled DISPLAY face, deliberately not the primary and not the
+        // symbols backstop: nothing else in this test binary interns THESE bytes
+        // in `PARSED_FONT_INTERN` (the store is content-keyed, so a slice-path
+        // intern of the same face by another test would legitimately win the
+        // entry and the assertion would be about scheduling, not the change).
+        let bytes = display_face_bytes("pixel").expect("bundled display face");
+        let face = FallbackFace::from_path_bytes(bytes, None)
+            .expect("a bundled face is admissible on the discovery path");
+        assert!(
+            !face.font.is_materialised(),
+            "the discovery path defers the parse (that is what makes the byte \
+             handle reach the store before the parse does)"
+        );
+        let parsed = face
+            .font
+            .get(&face.bytes)
+            .expect("the bundled face parses")
+            .clone();
+        let (stored_bytes, stored_font) =
+            interned_parsed_font_lookup(&face.bytes).expect("the parse is published");
+        assert!(
+            std::sync::Arc::ptr_eq(&stored_font, &parsed),
+            "the published parse must be the one the cell latched"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&stored_bytes, &face.bytes),
+            "materialising must ADOPT the face's own byte handle — a second copy \
+             of the file is 3.9 MB on this host's broad chain face"
+        );
     }
 
     /// PERF/parity: the per-blit hoisted corrected-blend path ([`blend_text_pre`]

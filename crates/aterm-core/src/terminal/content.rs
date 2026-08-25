@@ -172,6 +172,27 @@ impl Terminal {
         self.grid.row_cols_into(row_u16(row), out)
     }
 
+    /// Fill `out` with at most the first `prefix_len` entries of visible row
+    /// `row` using the same per-column projection as [`Self::row_cols_into`].
+    ///
+    /// The grid scan and destination growth are both bounded by `prefix_len`;
+    /// a sparse row's implicit blank tail is left for the caller to pad when a
+    /// fixed-width prefix is required.
+    pub fn row_cols_prefix_into(
+        &self,
+        row: usize,
+        prefix_len: usize,
+        out: &mut Vec<char>,
+    ) -> u16 {
+        let rows = usize::from(self.grid.rows());
+        if row >= rows {
+            out.clear();
+            return 0;
+        }
+        self.grid
+            .row_cols_prefix_into(row_u16(row), prefix_len, out)
+    }
+
     /// Get the combining-aware grapheme text of a single VISIBLE cell.
     ///
     /// Returns the resolved base character plus any complex-cluster string and

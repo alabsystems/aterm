@@ -353,6 +353,7 @@ fn first_line(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measured;
 
     pub(crate) fn repo_root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -509,19 +510,20 @@ mod tests {
     }
 
     #[test]
-    fn mac_arm_resolves_to_the_measured_206_node_graph() {
+    fn mac_arm_resolves_to_the_baseline_node_graph() {
         let root = repo_root();
         let cells = default_cells();
+        let want = measured::MAC_ARM;
         let g = graph(&root, &cells[0]).expect("mac-arm must resolve offline");
         assert_eq!(g.root.name, "aterm", "the cell roots at the shipped binary");
-        assert_eq!(g.nodes.len(), 206, "measured 2026-08: 206 packages for aterm on mac-arm");
-        assert_eq!(g.reach(None).len(), 206, "every node is reachable from the root");
+        assert_eq!(g.nodes.len(), want.resolved, "packages for aterm on mac-arm");
+        assert_eq!(g.reach(None).len(), want.resolved, "every node is reachable from the root");
     }
 
     #[test]
-    fn linux_resolves_to_the_measured_301_node_graph() {
+    fn linux_resolves_to_the_baseline_node_graph() {
         let g = graph(&repo_root(), &default_cells()[1]).expect("linux must resolve offline");
-        assert_eq!(g.nodes.len(), 301);
+        assert_eq!(g.nodes.len(), measured::LINUX.resolved);
     }
 
     /// REGRESSION: a relative root used to be resolved TWICE — once as the

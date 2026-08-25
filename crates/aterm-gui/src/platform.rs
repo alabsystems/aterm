@@ -304,6 +304,19 @@ pub(crate) trait AppRt {
         false
     }
 
+    /// Un-minimize and raise OUR OWN `window` — the receiving half of a
+    /// `windowing_behavior = "attach"` forward, where `aterm new-tab` spawns a
+    /// tab in an instance the user may not be able to see.
+    ///
+    /// `false` by default (nothing raised). winit's own `focus_window()` is
+    /// deliberately NOT the seam: on Windows it early-returns for a MINIMIZED
+    /// window — the case that matters most here — and steals the foreground by
+    /// SendInput-ing a synthetic Alt keypress, which is not something a
+    /// background tab-spawn may inject into the user's input stream.
+    fn window_bring_to_front(&self, _window: &Window) -> bool {
+        false
+    }
+
     /// Install the per-window native toolbar (the full-width tab strip + "+"
     /// button) for logical window `wid`, returning the retained backing handle.
     /// `None` off macOS (no toolbar installed).

@@ -71,6 +71,7 @@ fn dom_against(s: &CellSurvey, base: &BTreeSet<PkgId>, target: &PkgId) -> DomCos
 mod tests {
     use super::*;
     use crate::loc::survey_cell;
+    use crate::measured::{self, Dom};
     use crate::model::{Cell, Graph, PkgFacts};
     use crate::resolve::default_cells;
     use std::collections::BTreeMap;
@@ -96,11 +97,13 @@ mod tests {
         hits.pop().expect("checked above").clone()
     }
 
-    fn assert_dom(s: &CellSurvey, name: &str, pkgs: usize, loc: u64) {
-        let id = find(s, name);
+    /// Check one anchor against its row in `measured`, plus the shape rules
+    /// every `DomCost` owes regardless of the numbers.
+    fn assert_dom(s: &CellSurvey, want: Dom) {
+        let id = find(s, want.name);
         let cost = dom(s, &id);
-        assert_eq!((cost.pkgs, cost.loc), (pkgs, loc), "dom({id})");
-        assert_eq!(cost.also.len(), pkgs - 1, "`also` excludes the target itself");
+        assert_eq!((cost.pkgs, cost.loc), (want.pkgs, want.loc), "dom({id})");
+        assert_eq!(cost.also.len(), want.pkgs - 1, "`also` excludes the target itself");
         assert!(!cost.also.contains(&id));
         assert!(cost.also.windows(2).all(|w| w[0] < w[1]), "`also` must be sorted");
     }
@@ -186,13 +189,11 @@ mod tests {
     // ---- the real repository: regression constants ------------------------
 
     #[test]
-    fn mac_arm_dominator_costs_hold() {
+    fn mac_arm_dominator_costs_match_the_baseline() {
         let s = survey(0);
-        assert_dom(&s, "wgpu", 29, 398_302);
-        assert_dom(&s, "naga", 8, 212_320);
-        assert_dom(&s, "regex", 4, 158_471);
-        assert_dom(&s, "libc", 1, 127_772);
-        assert_dom(&s, "tracing", 3, 84_483);
+        for want in measured::MAC_ARM_DOMINATORS {
+            assert_dom(&s, want);
+        }
     }
 
     #[test]
@@ -204,13 +205,14 @@ mod tests {
     }
 
     /// DISCREPANCY, recorded rather than smoothed over. The design note records
-    /// `dom(ureq@3.3.0) = 8 pkgs / 71,834 LOC`; this checkout measures 9 /
-    /// 72,528. The whole difference is `percent-encoding 2.3.2` (694 LOC),
-    /// whose ONLY parent in the mac-arm graph is ureq itself — so it must fall
-    /// with ureq. This test pins both halves of that claim so the next person
-    /// to re-measure sees the reason, not just a number that moved.
+    /// `dom(ureq@3.3.0)` one package smaller than this checkout measures. The
+    /// whole difference is `percent-encoding 2.3.2`, whose ONLY parent in the
+    /// mac-arm graph is ureq itself — so it must fall with ureq. This test pins
+    /// both halves of that claim (`measured::MAC_ARM_UREQ` and
+    /// `measured::UREQ_DESIGN_NOTE`) so the next person to re-measure sees the
+    /// reason, not just a number that moved.
     #[test]
-    fn ureq_costs_nine_packages_because_percent_encoding_has_no_other_parent() {
+    fn ureq_costs_the_design_note_figure_plus_percent_encoding() {
         let s = survey(0);
         let ureq = find(&s, "ureq");
         let pe = find(&s, "percent-encoding");
@@ -223,44 +225,53 @@ mod tests {
             .collect();
         assert_eq!(parents, vec![&ureq], "percent-encoding hangs off ureq alone");
 
+        assert_dom(&s, measured::MAC_ARM_UREQ);
         let cost = dom(&s, &ureq);
-        assert_eq!((cost.pkgs, cost.loc), (9, 72_528));
         assert!(cost.also.contains(&pe));
         // Subtracting the one contested package reproduces the recorded figure
         // exactly, which is what makes this a bookkeeping delta and not a
         // different graph.
-        assert_eq!(cost.pkgs - 1, 8);
-        assert_eq!(cost.loc - s.facts[&pe].loc, 71_834);
+        let note = measured::UREQ_DESIGN_NOTE;
+        assert_eq!(cost.pkgs - 1, note.pkgs);
+        assert_eq!(cost.loc - s.facts[&pe].loc, note.loc);
     }
 
+    /// The linux anchors. `accesskit_unix` and `accesskit_winit` used to be
+    /// pinned here too; dropping the `a11y-accesskit` default removed them from
+    /// the graph outright, so this asserts they are ABSENT rather than cheap —
+    /// a cost of zero would also be reported for a package forge failed to see.
     #[test]
-    fn linux_dominator_costs_hold() {
+    fn linux_dominator_costs_match_the_baseline() {
         let s = survey(1);
-        assert_dom(&s, "accesskit_unix", 57, 241_084);
-        assert_dom(&s, "sctk-adwaita", 7, 31_776);
-        assert_dom(&s, "accesskit_winit", 58, 242_598);
-        // accesskit_winit is accesskit_unix plus exactly one more package.
-        let unix = dom(&s, &find(&s, "accesskit_unix"));
-        let winit = dom(&s, &find(&s, "accesskit_winit"));
-        assert_eq!(winit.pkgs - unix.pkgs, 1);
+        for want in measured::LINUX_DOMINATORS {
+            assert_dom(&s, want);
+        }
+        for gone in ["accesskit", "accesskit_unix", "accesskit_winit"] {
+            assert!(
+                !s.graph.nodes.iter().any(|p| p.name == gone),
+                "`{gone}` is back in the linux graph — the a11y-accesskit default returned"
+            );
+        }
     }
 
+    /// `measured::MAC_ARM_DOMINATORS` is held in dominator-LOC order precisely
+    /// so it IS the head of the ranking — one list, two properties.
     #[test]
-    fn the_mac_arm_ranking_leads_with_wgpu_naga_regex_libc_tracing() {
+    fn the_mac_arm_ranking_leads_with_the_baseline_anchors() {
         let r = ranked(&survey(0));
-        let head: Vec<(&str, usize, u64)> =
-            r.iter().take(5).map(|(id, c)| (id.name.as_str(), c.pkgs, c.loc)).collect();
+        let head: Vec<(&str, usize, u64)> = r
+            .iter()
+            .take(measured::MAC_ARM_DOMINATORS.len())
+            .map(|(id, c)| (id.name.as_str(), c.pkgs, c.loc))
+            .collect();
+        let want: Vec<(&str, usize, u64)> =
+            measured::MAC_ARM_DOMINATORS.iter().map(|d| (d.name, d.pkgs, d.loc)).collect();
+        assert_eq!(head, want);
         assert_eq!(
-            head,
-            [
-                ("wgpu", 29, 398_302),
-                ("naga", 8, 212_320),
-                ("regex", 4, 158_471),
-                ("libc", 1, 127_772),
-                ("tracing", 3, 84_483),
-            ]
+            r.len(),
+            measured::MAC_ARM.third_party,
+            "every third-party package is ranked, none twice"
         );
-        assert_eq!(r.len(), 153, "every third-party package is ranked, none twice");
     }
 
     #[test]

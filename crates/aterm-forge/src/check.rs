@@ -18,15 +18,23 @@
 //! other gate in this repository keeps passing and the UNFIXED upstream code
 //! compiles into the product.
 //!
-//! MEASURED ON THIS TREE (2026-08-22, re-measured before this file was
-//! written): the `linux` cell resolves BOTH `winnow 0.7.15` — the fork at
+//! MEASURED ON THIS TREE, and since FIXED — the case this gate was built on.
+//! On 2026-08-22 the `linux` cell resolved BOTH `winnow 0.7.15` — the fork at
 //! `vendor/winnow`, which exists to fix an `offset_from` underflow — AND an
 //! unpatched `winnow 1.0.3` from the registry, reached by
 //! `accesskit_winit → accesskit_unix → zbus → zbus_macros (proc-macro) →
-//! proc-macro-crate → toml_edit 0.25 → winnow 1.0.3`. The forked fix is absent
-//! from the copy that runs inside the compiler on every Linux build, and no
-//! other cell resolves it. `[OB-12]` below is the only check in this repository
-//! that says so.
+//! proc-macro-crate → toml_edit 0.25 → winnow 1.0.3`. The forked fix was absent
+//! from the copy that ran inside the compiler on every Linux build, and
+//! `[OB-12]` below was the only check in this repository that said so.
+//!
+//! Dropping the `a11y-accesskit` default feature removed `accesskit_unix`, the
+//! only edge pulling zbus, and the sibling with it: as of 2026-08-25 no cell
+//! resolves an unpatched sibling of any fork. That is the CLEAN state, and it
+//! is what the tests below assert — a gate whose tests demanded the defect
+//! still be there would go red the day someone fixed it. `[OB-12]` stays armed
+//! because the next major bump or new dependency can reintroduce it silently,
+//! at cargo exit 0, and `tests/red_fixtures.rs` keeps a planted violation to
+//! prove the detector still bites.
 //!
 //! # The obligations
 //!
@@ -848,39 +856,65 @@ reason = \"no arch intrinsics reach the shipped build\"
         assert!(err.contains("mac-arm"), "the refusal must list the real cells: {err}");
     }
 
-    /// MEASURED 2026-08-22 on this checkout, reproduced twice: the linux cell
-    /// resolves an UNPATCHED `winnow 1.0.3` beside the fork, via
-    /// `accesskit_winit → accesskit_unix → zbus → zbus_macros (proc-macro) →
-    /// proc-macro-crate → toml_edit 0.25 → winnow 1.0.3`; the other three cells
-    /// resolve only the fork.
+    /// EVERY cell resolves ONLY the forked version of each vendored crate.
     ///
-    /// If this test starts reporting NO sibling for linux, the defect has been
-    /// FIXED — replace the expectation with an empty one and say so in the
-    /// commit message. It is not a test of forge; it is the standing evidence
-    /// that [OB-3] has something real to catch.
+    /// POLARITY, deliberately inverted 2026-08-25. This test used to assert
+    /// that the linux cell DID carry an unpatched `winnow 1.0.3` beside the
+    /// 0.7.15 fork, reached via `accesskit_winit → accesskit_unix → zbus →
+    /// zbus_macros (proc-macro) → proc-macro-crate → toml_edit 0.25`. That was
+    /// true when it was written; dropping the `a11y-accesskit` default feature
+    /// removed `accesskit_unix`, the only edge pulling zbus, and with it the
+    /// last unpatched sibling in any cell.
+    ///
+    /// A passing test must not require a defect to be PRESENT. Pinned that way,
+    /// fixing the defect turns the suite red and the fix looks like a
+    /// regression — precisely backwards. So this now asserts the CLEAN state,
+    /// which is the property worth defending: the graph carries no unpatched
+    /// sibling of any vendored fork, and if one reappears this reds.
+    ///
+    /// Nothing is lost on the detection side. The logic that FINDS a sibling is
+    /// proved by `tests/red_fixtures.rs::an_unpatched_sibling_version_reds_the
+    /// _forge_verb`, which plants a synthetic violation in a scratch tree and
+    /// requires `cargo forge check` to go RED on it — a fixture, so it keeps
+    /// working whatever the real graph does.
     #[test]
-    fn todays_measurement_only_the_linux_cell_carries_an_unpatched_sibling() {
+    fn no_cell_carries_an_unpatched_sibling_of_a_vendored_fork() {
         let root = repo_root();
         let (forks, _) = read_manifest_patches(&root).unwrap();
+        assert!(!forks.is_empty(), "there is nothing to check if nothing is vendored");
         for cell in resolve::default_cells() {
             let mut log = String::new();
             let (graph, paths) = resolve::graph_and_paths(&root, &cell, &mut log)
                 .unwrap_or_else(|e| panic!("cell `{}` must resolve offline: {e}", cell.name));
             let mut found: Vec<String> = Vec::new();
+            let mut live = 0usize;
             for f in &forks {
-                let (_, sibs) = classify(&graph, &paths, &f.name, &canon(&root.join(&f.path)));
+                let (is_live, sibs) =
+                    classify(&graph, &paths, &f.name, &canon(&root.join(&f.path)));
+                live += usize::from(is_live);
                 found.extend(sibs.iter().map(|s| s.0.spec()));
             }
             found.sort();
-            let want: &[&str] = if cell.name == "linux" { &["winnow@1.0.3"] } else { &[] };
-            assert_eq!(found, want, "unpatched siblings in cell `{}`", cell.name);
+            let empty: [&str; 0] = [];
+            assert_eq!(
+                found, empty,
+                "cell `{}` resolves an unpatched sibling beside a vendored fork — \
+                 `cargo forge blame <name>` names the edge that drags it in",
+                cell.name
+            );
+            assert!(live > 0, "cell `{}` reaches no fork at all — the patch table is dead \
+                 there, and a cell with no forks would pass this vacuously", cell.name);
         }
     }
 
-    /// The gate must NAME every sibling the graphs actually have — a report
-    /// that finds one and prints a summary without it is worse than no gate.
+    /// The gate must report every obligation, and NAME any sibling the graphs
+    /// actually carry — a report that finds one and prints a summary without it
+    /// is worse than no gate. The expectation is DERIVED from the live graphs,
+    /// so it neither requires a defect to exist (today none does, see
+    /// `no_cell_carries_an_unpatched_sibling_of_a_vendored_fork`) nor goes
+    /// quiet if one reappears.
     #[test]
-    fn the_gate_names_the_unpatched_siblings_the_real_graphs_have() {
+    fn the_gate_reports_every_obligation_and_names_any_unpatched_sibling() {
         let root = repo_root();
         let (forks, _) = read_manifest_patches(&root).unwrap();
         let cells = resolve::default_cells();

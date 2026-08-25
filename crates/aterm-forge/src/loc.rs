@@ -15,10 +15,11 @@
 //!
 //! One consequence is worth stating because it is the difference between two
 //! plausible totals: the walk descends into dot-directories, so
-//! `smol_str-0.2.2/.github/ci.rs` counts. That single file is 122 lines and is
-//! the entire gap between 2,081,292 and the recorded mac-arm figure of
-//! 2,081,414. It ships inside the `.crate` tarball, so vendoring smol_str means
-//! owning it, so it counts. This is the one place forge does NOT reuse
+//! `smol_str-0.2.2/.github/ci.rs` counts. That single file is 122 lines, and it
+//! is the ENTIRE gap between the mac-arm figure pinned in `src/measured.rs` and
+//! the total a dot-directory-skipping walk would report. It ships inside the
+//! `.crate` tarball, so vendoring smol_str means owning it, so it counts. This
+//! is the one place forge does NOT reuse
 //! [`aterm_census::collect_rs_files`] verbatim: that walker skips dot-
 //! directories on purpose, because inside the aterm checkout they hold
 //! `.claude/worktrees` clones that would multiply the census. Under a registry
@@ -283,6 +284,7 @@ fn manifest_facts(text: &str) -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::measured;
     use crate::resolve::default_cells;
 
     fn repo_root() -> PathBuf {
@@ -365,60 +367,61 @@ mod tests {
         assert_eq!(got.as_deref(), Some(hint.as_path()));
     }
 
-    #[test]
-    fn mac_arm_is_206_packages_53_workspace_153_third_party() {
-        let s = survey(0);
-        assert_eq!(s.graph.nodes.len(), 206, "total packages in the mac-arm shipped graph");
-        assert_eq!(s.third_party().count(), 153, "third-party packages");
-        assert_eq!(s.graph.nodes.len() - s.third_party().count(), 53, "workspace members");
+    /// Assert one cell against its row in [`measured::CELLS`]. Every count the
+    /// baseline carries is checked at once, so a cell needs exactly one test
+    /// and an extraction needs exactly one edit — in `measured.rs`, not here.
+    fn assert_matches_baseline(cell_index: usize) {
+        let want = measured::CELLS[cell_index];
+        let s = survey(cell_index);
+        assert_eq!(s.cell.name, want.cell, "baseline row is for another cell");
+        let third = s.third_party().count();
+        let got = measured::Baseline {
+            cell: want.cell,
+            resolved: s.graph.nodes.len(),
+            workspace: s.graph.nodes.len() - third,
+            third_party: third,
+            third_party_loc: s.third_party_loc(),
+            // Every build script is arbitrary code the compiler runs, and
+            // `targo trust` marks all of them `-Ztrust-verify=off`
+            // unconditionally — hence a pinned row of its own.
+            build_scripts: s.build_scripts(),
+            proc_macros: s.proc_macros(),
+            duplicate_names: s.duplicate_names().len(),
+        };
+        assert_eq!(got, want, "cell `{}` has moved off the measured baseline", want.cell);
     }
 
     #[test]
-    fn mac_arm_third_party_loc_is_the_ratcheted_2_081_414() {
-        assert_eq!(survey(0).third_party_loc(), 2_081_414);
+    fn mac_arm_matches_the_measured_baseline() {
+        assert_matches_baseline(0);
     }
 
     #[test]
-    fn mac_arm_carries_26_third_party_build_scripts_and_6_proc_macros() {
-        let s = survey(0);
-        // Every one of these is arbitrary code the compiler runs, and
-        // `targo trust` marks all of them `-Ztrust-verify=off` unconditionally.
-        assert_eq!(s.build_scripts(), 26);
-        assert_eq!(s.proc_macros(), 6);
+    fn mac_arm_third_party_loc_matches_the_baseline() {
+        assert_eq!(survey(0).third_party_loc(), measured::MAC_ARM.third_party_loc);
     }
 
     #[test]
-    fn mac_arm_has_exactly_eight_duplicated_names() {
+    fn mac_arm_duplicate_names_match_the_baseline() {
         let dups = survey(0).duplicate_names();
         let names: Vec<&str> = dups.keys().map(String::as_str).collect();
+        assert_eq!(names, measured::MAC_ARM_DUPLICATE_NAMES);
         assert_eq!(
-            names,
-            [
-                "bitflags",
-                "block2",
-                "core-foundation",
-                "foldhash",
-                "hashbrown",
-                "objc2",
-                "objc2-foundation",
-                "ttf-parser"
-            ]
+            dups["hashbrown"].len(),
+            measured::MAC_ARM_HASHBROWN_VERSIONS,
+            "hashbrown resolves three times over"
         );
-        assert_eq!(dups["hashbrown"].len(), 3, "hashbrown resolves three times over");
     }
 
     #[test]
-    fn linux_is_301_packages_and_248_third_party() {
-        let s = survey(1);
-        assert_eq!(s.graph.nodes.len(), 301);
-        assert_eq!(s.third_party().count(), 248);
-        assert_eq!(s.third_party_loc(), 3_844_574);
+    fn linux_matches_the_measured_baseline() {
+        assert_matches_baseline(1);
     }
 
     #[test]
-    fn windows_and_wasm_third_party_counts_hold() {
-        assert_eq!(survey(2).third_party().count(), 154);
-        assert_eq!(survey(3).third_party().count(), 139);
+    fn windows_and_wasm_match_the_measured_baseline() {
+        assert_matches_baseline(2);
+        assert_matches_baseline(3);
     }
 
     #[test]

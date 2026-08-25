@@ -413,15 +413,160 @@ pub fn build_key_input(
 /// `key_without_modifiers()` would encode the layout BASE key ('q') with no
 /// modifiers instead of the AltGr-composed glyph ('@' on de-DE) the app expects.
 /// The binding-LOOKUP path (`app_input::base_logical_key`) does use the
-/// extension on Windows; only PTY encoding keeps the composed `logical_key`.
+/// extension on Windows; only PTY encoding keeps the composed `logical_key` —
+/// except as the last-resort rescue for a Ctrl+Alt chord the layout composed
+/// into nothing, which [`windows_key_input`] documents.
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 #[must_use]
 pub fn build_key_input(
     ev: &KeyEvent,
     mods: Modifiers,
 ) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
-    let key = aterm_winit_keymap::map_logical_key(&ev.logical_key)?;
-    Some((key, mods, aterm_winit_keymap::base_layout_key_for(ev.physical_key)))
+    windows_key_input(
+        &ev.logical_key,
+        &key_without_modifiers(ev),
+        aterm_winit_keymap::base_layout_key_for(ev.physical_key),
+        mods,
+        layout_shift_state,
+    )
+}
+
+/// The layout-BASE key of a press, for the Ctrl+Alt rescue in
+/// [`windows_key_input`]. Windows implements `KeyEventExtModifierSupplement`
+/// (macOS and the Linux backends use it as their whole encode path); the
+/// remaining `not(macos/linux)` targets — web — do not, and there the rescue
+/// simply has no second key to try.
+#[cfg(windows)]
+fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
+    use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
+    ev.key_without_modifiers()
+}
+
+#[cfg(all(not(windows), not(any(target_os = "macos", target_os = "linux"))))]
+fn key_without_modifiers(ev: &KeyEvent) -> WinitKey {
+    ev.logical_key.clone()
+}
+
+/// `VkKeyScanExW`'s shift-state bits for "this character needs Ctrl AND Alt" —
+/// i.e. AltGr. (`winuser.h`: 1 = Shift, 2 = Ctrl, 4 = Alt.)
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const SHIFT_STATE_CTRL_ALT: u8 = 0b0000_0110;
+
+/// The Windows half of [`build_key_input`], as a PURE decision so the layout
+/// cases below are unit-testable without a window, an event loop, or a German
+/// keyboard. `logical_key` is the layout-COMPOSED key, `base_key` is
+/// `key_without_modifiers()`, `base_layout` the US-QWERTY identity of the
+/// physical key, and `layout_shift_state` answers `VkKeyScanExW`'s question
+/// "which modifiers does this character need on the CURRENT layout?".
+///
+/// Two Windows-only layout facts drive it, both flowing from ONE winit
+/// behaviour: `WindowsModifiers::remove_only_ctrl` keeps CONTROL in the layout
+/// lookup whenever ALT is also down, so a Ctrl+Alt press is resolved against
+/// the layout's AltGr table (`keyboard.rs:506`).
+///
+/// 1. ALTGR COMPOSED AS LEFTCTRL+LEFTALT ENCODES A CONTROL BYTE. winit clears
+///    Ctrl/Alt from `ModifiersState` only while the RIGHT Alt is physically down
+///    (`keyboard_layout.rs:277`), but Windows equally accepts LCtrl+LAlt as
+///    AltGr — that is in fact how winit DETECTS AltGr. So on de-DE, LCtrl+LAlt+8
+///    arrives as `Character('[')` with CTRL|ALT still set and the engine emits
+///    ESC ESC (`ctrl_character('[')` = 0x1B) instead of a `[`; LCtrl+LAlt+Q
+///    ('@') emits ESC NUL. Measured against the shipped layout DLLs with
+///    `ToUnicodeEx`: de-DE Ctrl+Alt+{7,8,Q} → `{ [ @`, US-QWERTY Ctrl+Alt+
+///    {7,8,A,Q} → nothing at all. So the strip below asks the LAYOUT (one
+///    `VkKeyScanExW`, no cache, no 256-key scan) whether the character the user
+///    actually got is one that needs Ctrl+Alt: on US-QWERTY no character ever
+///    answers yes, which is what makes US unreachable by this path. The RAlt
+///    path is untouched — winit already delivered it with no modifiers.
+///
+/// 2. A GENUINE Ctrl+Alt CHORD RESOLVES TO NOTHING. The same AltGr-first lookup
+///    means Ctrl+Alt+A is resolved against a shift state that no layout defines
+///    for letters (measured: `ToUnicodeEx` returns 0 on both US and de-DE), so
+///    winit reports `Key::Unidentified` and the chord encoded to ZERO bytes on
+///    Windows while macOS/Linux emit ESC ^A. When the composed key maps to
+///    nothing and both Ctrl and Alt are held, fall back to the base key — the
+///    same key macOS/Linux encode from — so the chord keeps its control
+///    sequence. Nothing else can reach this arm: without ALT, winit already
+///    drops CONTROL from the lookup and hands back the base key itself.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[must_use]
+fn windows_key_input(
+    logical_key: &WinitKey,
+    base_key: &WinitKey,
+    base_layout: Option<char>,
+    mods: Modifiers,
+    layout_shift_state: impl Fn(char) -> Option<u8>,
+) -> Option<(keyboard::Key, Modifiers, Option<char>)> {
+    let ctrl_alt = mods.contains(Modifiers::CTRL | Modifiers::ALT);
+    if ctrl_alt && altgr_composed(logical_key, base_layout, &layout_shift_state) {
+        let key = aterm_winit_keymap::map_logical_key(logical_key)?;
+        return Some((key, mods & !(Modifiers::CTRL | Modifiers::ALT), base_layout));
+    }
+    match aterm_winit_keymap::map_logical_key(logical_key) {
+        Some(key) => Some((key, mods, base_layout)),
+        None if ctrl_alt => Some((
+            aterm_winit_keymap::map_logical_key(base_key)?,
+            mods,
+            base_layout,
+        )),
+        None => None,
+    }
+}
+
+/// Whether `logical_key` is a character the CURRENT layout composes with AltGr —
+/// the proof that the live Ctrl+Alt bits are AltGr's spelling and not a chord.
+///
+/// Deliberately narrow: a single-codepoint, non-control character that is NOT
+/// merely the key's own base identity, and that `VkKeyScanExW` says is reachable
+/// only with Ctrl+Alt held on this layout. A control codepoint is exactly what a
+/// real chord would produce, so it can never launder itself through here.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn altgr_composed(
+    logical_key: &WinitKey,
+    base_layout: Option<char>,
+    layout_shift_state: impl Fn(char) -> Option<u8>,
+) -> bool {
+    let WinitKey::Character(s) = logical_key else {
+        return false;
+    };
+    let mut chars = s.chars();
+    let Some(c) = chars.next() else { return false };
+    if chars.next().is_some() || c.is_control() || Some(c) == base_layout {
+        return false;
+    }
+    layout_shift_state(c).is_some_and(|state| state & SHIFT_STATE_CTRL_ALT == SHIFT_STATE_CTRL_ALT)
+}
+
+/// `VkKeyScanExW`'s shift state for `c` on the CALLING THREAD's keyboard layout
+/// (`GetKeyboardLayout(0)`), or `None` when the layout cannot type it at all
+/// (the documented -1 return) — which is also the answer for every non-BMP
+/// character, since the API takes one UTF-16 unit.
+///
+/// Same tiny-FFI posture as [`lock_modifiers`] above: user32 is on the approved
+/// list, both calls are pure per-thread queries, and there is no std
+/// alternative. One call per Ctrl+Alt press, so no cache is warranted.
+#[cfg(windows)]
+fn layout_shift_state(c: char) -> Option<u8> {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetKeyboardLayout(idThread: u32) -> *mut core::ffi::c_void;
+        fn VkKeyScanExW(ch: u16, dwhkl: *mut core::ffi::c_void) -> i16;
+    }
+    let unit = u16::try_from(u32::from(c)).ok()?;
+    // SAFETY: both are pure keyboard-layout queries with no preconditions —
+    // `GetKeyboardLayout(0)` names the calling thread and returns a borrowed
+    // HKL (nothing to free), which `VkKeyScanExW` only reads. Called on the UI
+    // thread, whose layout is the one that composed the press.
+    let scan = unsafe { VkKeyScanExW(unit, GetKeyboardLayout(0)) };
+    if scan == -1 {
+        return None;
+    }
+    u8::try_from((scan >> 8) & 0xff).ok()
+}
+
+/// No layout to ask off Windows (web): nothing is AltGr-composed there.
+#[cfg(all(not(windows), not(any(target_os = "macos", target_os = "linux"))))]
+fn layout_shift_state(_c: char) -> Option<u8> {
+    None
 }
 
 #[cfg(test)]
@@ -580,6 +725,173 @@ mod tests {
         assert!(
             (Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK).contains(locks),
             "lock_modifiers must set nothing beyond CAPS_LOCK/NUM_LOCK, got {locks:?}"
+        );
+    }
+
+    /// The two layouts the Windows arm below is pinned against, as
+    /// `VkKeyScanExW` actually answers on the shipped layout DLLs (measured
+    /// 2026-08-22 against `00000407`/`00000409`; 1 = Shift, 2 = Ctrl, 4 = Alt,
+    /// `None` = the layout cannot type this character at all).
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn de_de_shift_state(c: char) -> Option<u8> {
+        match c {
+            // AltGr characters: 0x0637 '{', 0x0638 '[', 0x0651 '@', 0x0645 '€'.
+            '{' | '[' | '@' | '€' | '}' | ']' | '\\' | '|' | '~' => Some(0b0000_0110),
+            'a'..='z' | '0'..='9' => Some(0),
+            'A'..='Z' => Some(1),
+            _ => None,
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn us_qwerty_shift_state(c: char) -> Option<u8> {
+        match c {
+            // 0x01DB '{', 0x00DB '[', 0x0132 '@' — Shift or nothing, never 6.
+            '{' | '@' | 'A'..='Z' | '}' | '|' | '~' => Some(1),
+            '[' | 'a'..='z' | '0'..='9' | ']' | '\\' => Some(0),
+            // 0xFFFF: no US key types '€'.
+            _ => None,
+        }
+    }
+
+    /// AltGr spelled the way Windows equally accepts and compact/RDP keyboards
+    /// force — LEFT Ctrl + LEFT Alt — must type the composed character, not a
+    /// control byte. winit only clears Ctrl/Alt for the RIGHT Alt, so before the
+    /// strip de-DE AltGr+8 ('[') encoded ESC ESC and AltGr+Q ('@') encoded
+    /// ESC NUL: a German user typing a brace got a control code.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn de_de_altgr_as_left_ctrl_alt_types_the_character() {
+        for (composed, digit, base, want) in [
+            ("{", KeyCode::Digit7, '7', &b"{"[..]),
+            ("[", KeyCode::Digit8, '8', &b"["[..]),
+            ("@", KeyCode::KeyQ, 'q', &b"@"[..]),
+        ] {
+            let (key, mods, base_layout) = windows_key_input(
+                &ch(composed),
+                &ch(&base.to_string()),
+                Some(base),
+                Modifiers::CTRL | Modifiers::ALT,
+                de_de_shift_state,
+            )
+            .expect("an AltGr-composed character maps");
+            assert_eq!(
+                key,
+                keyboard::Key::Character(composed.chars().next().unwrap())
+            );
+            assert_eq!(
+                mods,
+                Modifiers::empty(),
+                "AltGr's Ctrl+Alt spelling must not survive into the encoding of {composed}"
+            );
+            assert_eq!(base_layout, Some(base));
+            let bytes = encode_key_event(
+                &ch(composed),
+                PhysicalKey::Code(digit),
+                mods,
+                KeyboardMode::empty(),
+            )
+            .expect("the composed character encodes");
+            assert_eq!(bytes, want, "de-DE AltGr must type {composed}");
+        }
+    }
+
+    /// The RIGHT-Alt spelling is winit's own path: it already cleared Ctrl/Alt
+    /// from `ModifiersState`, so the strip has nothing to do and must not
+    /// disturb the character.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn de_de_right_alt_altgr_is_unchanged() {
+        let (key, mods, _) = windows_key_input(
+            &ch("{"),
+            &ch("7"),
+            Some('7'),
+            Modifiers::empty(),
+            de_de_shift_state,
+        )
+        .expect("the RAlt-composed character maps");
+        assert_eq!(key, keyboard::Key::Character('{'));
+        assert_eq!(mods, Modifiers::empty());
+    }
+
+    /// The guard on the strip: a GENUINE Ctrl+Alt+letter chord keeps its
+    /// modifiers and still encodes as a control sequence (ESC ^A). Both shapes
+    /// are covered — the layout that composes nothing for the chord (measured:
+    /// `ToUnicodeEx` returns 0 for Ctrl+Alt+A on US AND de-DE, so winit reports
+    /// `Unidentified` and the chord used to encode NO bytes at all on Windows),
+    /// and a layout that hands back a plain letter, which `VkKeyScanExW` reports
+    /// as needing no modifiers and so can never look like AltGr.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn genuine_ctrl_alt_letter_still_encodes_a_control_sequence() {
+        let unidentified = WinitKey::Unidentified(winit::keyboard::NativeKey::Unidentified);
+        for logical in [&unidentified, &ch("a")] {
+            let (key, mods, _) = windows_key_input(
+                logical,
+                &ch("a"),
+                Some('a'),
+                Modifiers::CTRL | Modifiers::ALT,
+                de_de_shift_state,
+            )
+            .expect("a genuine Ctrl+Alt chord still resolves a key");
+            assert_eq!(key, keyboard::Key::Character('a'));
+            assert_eq!(
+                mods,
+                Modifiers::CTRL | Modifiers::ALT,
+                "a real chord must keep its modifiers"
+            );
+            let bytes = encode_key_event(
+                &ch("a"),
+                PhysicalKey::Code(KeyCode::KeyA),
+                mods,
+                KeyboardMode::empty(),
+            )
+            .expect("Ctrl+Alt+A encodes");
+            assert_eq!(bytes, b"\x1b\x01", "Ctrl+Alt+A must stay ESC ^A");
+        }
+    }
+
+    /// US-QWERTY is structurally out of reach of the strip: no character on it
+    /// needs Ctrl+Alt, so `VkKeyScanExW` never answers 6 and nothing is ever
+    /// stripped — including the '{' that US types with plain Shift.
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn us_qwerty_is_unaffected() {
+        // The same composed '{' a de-DE AltGr press produces, on a layout that
+        // reaches it with Shift: the modifiers must survive untouched.
+        let (_, mods, _) = windows_key_input(
+            &ch("{"),
+            &ch("["),
+            Some('['),
+            Modifiers::CTRL | Modifiers::ALT,
+            us_qwerty_shift_state,
+        )
+        .expect("the chord resolves");
+        assert_eq!(
+            mods,
+            Modifiers::CTRL | Modifiers::ALT,
+            "US-QWERTY has no AltGr; nothing may be stripped"
+        );
+        // And the ordinary shifted press stays exactly as it was.
+        let (key, mods, _) = windows_key_input(
+            &ch("{"),
+            &ch("["),
+            Some('['),
+            Modifiers::SHIFT,
+            us_qwerty_shift_state,
+        )
+        .expect("Shift+[ resolves");
+        assert_eq!(key, keyboard::Key::Character('{'));
+        assert_eq!(mods, Modifiers::SHIFT);
+        assert_eq!(
+            encode_key_event(
+                &ch("{"),
+                PhysicalKey::Code(KeyCode::BracketLeft),
+                mods,
+                KeyboardMode::empty(),
+            )
+            .expect("Shift+[ encodes"),
+            b"{"
         );
     }
 

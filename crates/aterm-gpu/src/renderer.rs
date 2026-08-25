@@ -2245,6 +2245,12 @@ pub struct WindowGpu {
     // diffed against window A's input on the SHARED `GpuRenderer`. See
     // `encode_frame` / `RepaintScope`.
     pub(crate) present_prev: Option<PresentPrev>,
+    /// ATTACK-SMOOTHED SDR crown level for THIS window. The renderer and its
+    /// pipelines are shared, but a glow-free present in window B must not reset
+    /// window A's in-flight rainbow bloom envelope.
+    sdr_glow_level: f32,
+    /// Timestamp of this window's last SDR crown smoothing step.
+    sdr_glow_level_at: Option<web_time::Instant>,
     // The PREVIOUS presented frame's input snapshot, kept RESIDENT across frames
     // (never reallocated in steady state): `encode_present_frame` updates it via
     // `clone_from` (Vec::clone_from reuses the destination's grid allocation when
@@ -2440,6 +2446,33 @@ impl WindowGpu {
     /// would leave them painted in the OLD theme until cell content changes.
     pub fn invalidate_present(&mut self) {
         self.present_prev = None;
+    }
+
+    /// Advance this window's SDR-crown attack envelope. Empty glow resets only
+    /// this window; another window sharing the renderer keeps its own bloom.
+    fn advance_sdr_glow_budget(
+        &mut self,
+        glow_present: bool,
+        target: f32,
+        now: web_time::Instant,
+    ) -> f32 {
+        if !glow_present {
+            self.sdr_glow_level = 0.0;
+            self.sdr_glow_level_at = None;
+            return 0.0;
+        }
+
+        let dt = self
+            .sdr_glow_level_at
+            .map_or(0.016, |t| now.saturating_duration_since(t).as_secs_f32());
+        self.sdr_glow_level_at = Some(now);
+        if target > self.sdr_glow_level {
+            let attack = 1.0 - (-dt / 0.045).exp();
+            self.sdr_glow_level += (target - self.sdr_glow_level) * attack;
+        } else {
+            self.sdr_glow_level = target;
+        }
+        self.sdr_glow_level
     }
 }
 
@@ -2703,17 +2736,6 @@ pub struct GpuRenderer {
     /// background's luma into the per-present budget by
     /// `aterm_render::hdr::sdr_glow_budget` (proven bounded ≤ 0.35).
     sdr_glow_boost: f32,
-    /// ATTACK-SMOOTHED SDR crown level: the budget actually applied this present,
-    /// eased toward the computed target with a ~45ms rise so the crown BLOOMS IN
-    /// over a few frames instead of strobing to full brightness on the first
-    /// keystroke frame (the "cursor flashes / character looks late" report — the
-    /// instant-onset wash also briefly masked the fresh glyph). Falls with the
-    /// quads' own fade; resets to 0 when the glow stream empties, so every fresh
-    /// burst re-blooms softly. Renderer-level (shared across windows — one
-    /// focused cursor animates at a time; a cross-window blend is imperceptible).
-    sdr_glow_level: f32,
-    /// Timestamp of the last smoothing step (`None` until the first glow present).
-    sdr_glow_level_at: Option<web_time::Instant>,
     /// Sparkle-word feline paw: textured coverage, ALPHA_BLENDING (== CPU `blend`).
     deco_over_pipeline: wgpu::RenderPipeline,
     /// Sparkle-word profanity sparkle: textured coverage, One/One premultiplied
@@ -4710,8 +4732,6 @@ impl GpuRenderer {
             glow_boost_bgl: None,
             sdr_glow_pipeline: None,
             sdr_glow_boost: 0.0,
-            sdr_glow_level: 0.0,
-            sdr_glow_level_at: None,
             deco_over_pipeline,
             deco_add_pipeline,
             deco_atlas: None,
@@ -8047,24 +8067,11 @@ impl GpuRenderer {
         // glow quads' own fade; an EMPTY stream resets the level so the next burst
         // re-blooms softly. The eased level can only ever be <= the proven-bounded
         // target, so the SDR_GLOW_BUDGET_BASE bound is preserved by construction.
-        let sdr_budget = if !glow_present {
-            self.sdr_glow_level = 0.0;
-            self.sdr_glow_level_at = None;
-            0.0
-        } else {
-            let now = web_time::Instant::now();
-            let dt = self
-                .sdr_glow_level_at
-                .map_or(0.016, |t| now.saturating_duration_since(t).as_secs_f32());
-            self.sdr_glow_level_at = Some(now);
-            if sdr_budget_target > self.sdr_glow_level {
-                let a = 1.0 - (-dt / 0.045).exp();
-                self.sdr_glow_level += (sdr_budget_target - self.sdr_glow_level) * a;
-            } else {
-                self.sdr_glow_level = sdr_budget_target;
-            }
-            self.sdr_glow_level
-        };
+        let sdr_budget = win.advance_sdr_glow_budget(
+            glow_present,
+            sdr_budget_target,
+            web_time::Instant::now(),
+        );
         let run_sdr_glow = crate::format_plan::sdr_boost_pass(
             format == wgpu::TextureFormat::Rgba16Float,
             glow_present,
@@ -9822,14 +9829,12 @@ impl GpuRenderer {
         Ok(())
     }
 
-    /// TEST HELPER: reset the SDR glow-boost ATTACK-ENVELOPE ease (renderer-
-    /// global, wall-clock driven) so two presents compared by a differential
-    /// test start from the identical eased budget — the one intentionally
-    /// time-dependent term in the present pass.
+    /// TEST HELPER: reset one window's SDR glow-boost attack envelope so two
+    /// presents compared by a differential test start from identical state.
     #[doc(hidden)]
-    pub fn reset_glow_ease_for_test(&mut self) {
-        self.sdr_glow_level = 0.0;
-        self.sdr_glow_level_at = None;
+    pub fn reset_glow_ease_for_test(&self, win: &mut WindowGpu) {
+        win.sdr_glow_level = 0.0;
+        win.sdr_glow_level_at = None;
     }
 
     /// TEST HELPER (on-glass blit coverage): run the REAL on-glass blit — the
@@ -14880,8 +14885,41 @@ mod tests {
     // for the wrong-colour regression a twin would hide.
     use super::{
         FRAME_GROUPS, G_BASE_BG, G_BASE_FG, G_CURSOR, G_FREE_OVER, G_GLOW, G_GLOW_UNDER,
-        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB,
+        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB, WindowGpu,
     };
+
+    #[test]
+    fn sdr_glow_attack_is_owned_per_window() {
+        let now = web_time::Instant::now();
+        let mut a = WindowGpu::new();
+        let mut b = WindowGpu::new();
+
+        let a_first = a.advance_sdr_glow_budget(true, 0.30, now);
+        let a_second = a.advance_sdr_glow_budget(
+            true,
+            0.30,
+            now + std::time::Duration::from_millis(16),
+        );
+        assert!(a_first > 0.0 && a_second > a_first);
+
+        assert_eq!(b.advance_sdr_glow_budget(false, 0.30, now), 0.0);
+        assert_eq!(
+            a.sdr_glow_level, a_second,
+            "an empty present in window B cannot reset window A's crown"
+        );
+        assert!(a.sdr_glow_level_at.is_some());
+
+        let b_first = b.advance_sdr_glow_budget(true, 0.30, now);
+        assert!(
+            (b_first - a_first).abs() < f32::EPSILON,
+            "window B begins its own attack instead of inheriting A's level"
+        );
+        assert_eq!(a.advance_sdr_glow_budget(false, 0.30, now), 0.0);
+        assert_eq!(
+            b.sdr_glow_level, b_first,
+            "resetting window A cannot disturb window B"
+        );
+    }
 
     /// The colour space each stream group composites in is a CORRECTNESS fact, and
     /// the coalescer is allowed to fuse exactly the neighbours that share one. Pin

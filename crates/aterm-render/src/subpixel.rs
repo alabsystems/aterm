@@ -165,7 +165,11 @@ pub(crate) fn subpixel_glyph_raster(
         return None;
     }
     // 1 px of filter padding each side: the FIR5 spread reaches 2 subpixels
-    // (2/3 px) past the ink box.
+    // (2/3 px) past the ink box. That pad also happens to be this path's
+    // [`crate::variation::RASTER_PAD`] — 3 subpixel samples of slack at 3×
+    // horizontal resolution — so the fitted outline can never sit ON the
+    // rasterizer's boundary and the accumulator-smear that ate the grayscale
+    // '2' at ppem 19 has no way in here. Do not narrow it back to the ink box.
     let x_min = pen.min_x.floor() - 1.0;
     let x_max = pen.max_x.ceil() + 1.0;
     let y_min = pen.min_y.floor();

@@ -218,6 +218,15 @@ pub(crate) struct DimsSnapshot {
     pub(crate) cell_w: u32,
     pub(crate) cell_h: u32,
     pub(crate) font_px: f32,
+    /// THE DPI SCALE the selected window's geometry was derived from
+    /// (`WindowState::scale`: its `scale_factor()`, or a `--scale` /
+    /// `$ATERM_FORCE_SCALE` pin). Every other field here is downstream of it —
+    /// `font_px` is `round(FONT_PX·scale)` under the auto-font, `pad`/`pad_top`
+    /// are `round(logical·scale)`, and `head` is the synthetic band's remainder
+    /// at that scale — so without it a reader can only INFER the DPI by dividing
+    /// back out of the font, which the explicit-font and clamped paths make
+    /// wrong. `1.0` when no window is selected (headless).
+    pub(crate) scale: f64,
     pub(crate) window: Option<u64>,
     pub(crate) window_rows: u32,
     pub(crate) window_cols: u32,

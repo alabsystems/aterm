@@ -2917,6 +2917,18 @@ enum ProvisionLane {
     SealedPayload,
 }
 
+impl ProvisionLane {
+    /// The R5 progress-file pass name this lane runs under — the ONE naming
+    /// authority, so the writer sites cannot drift from each other (the GUI
+    /// reads these strings back from the progress file).
+    fn pass_name(self) -> &'static str {
+        match self {
+            ProvisionLane::Network => "net",
+            ProvisionLane::SealedPayload => "seed",
+        }
+    }
+}
+
 /// The wire lane's announcement, if `lane` owes one — pure, so the
 /// phantom-network defect stays pinned by a test rather than an lsof session:
 /// the sealed-payload lane returns `None` for EVERY set, and only a non-empty
@@ -2950,7 +2962,7 @@ fn install_default_set(
     // run with NO pass, never under a fabricated "net" one. So the lane gates this
     // channel exactly as it gates the stdout announcement (`net_announcement`).
     let owned_pass = lane == ProvisionLane::Network
-        && progress_path().is_some_and(|p| crate::progress::begin_pass(p, "net"));
+        && progress_path().is_some_and(|p| crate::progress::begin_pass(p, lane.pass_name()));
     let out = install_default_set_inner(layout, fetcher, anchor, cfg, lane, now);
     if owned_pass {
         crate::progress::end_pass();
@@ -3894,8 +3906,8 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // same reason in the other channel: SealedPayload must never announce
     // `net-starting:`, which claimed a network install for a lane whose whole
     // consent argument is that it never touches one (see [`ProvisionLane`]).
-    let owned_pass =
-        progress_path().is_some_and(|p| crate::progress::begin_pass(p, "seed"));
+    let owned_pass = progress_path()
+        .is_some_and(|p| crate::progress::begin_pass(p, ProvisionLane::SealedPayload.pass_name()));
     let failures = install_default_set(
         &layout,
         &fetcher,

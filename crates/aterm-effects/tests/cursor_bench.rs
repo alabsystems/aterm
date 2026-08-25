@@ -62,9 +62,13 @@ fn saturated(style: GlowStyle) -> (CursorGlow, Instant, (u16, u16)) {
     glow.tick(Some(cursor), now, &config, geometry, &mut quads);
     // Same-instant alternating moves are the hostile pre-decay case: resident
     // spark/particle storage reaches its hard cap while every emission remains
-    // bounded. Normal human typing is far below this state.
+    // bounded. Normal human typing is far below this state. Authenticate each
+    // synthetic move exactly like the shipping host; raw program deltas are
+    // deliberately dark under the cursor-ownership gate and would make this
+    // saturation/performance assertion vacuous.
     for step in 0usize..1_200 {
         cursor.1 = if step.is_multiple_of(2) { 81 } else { 80 };
+        glow.note_synthetic_typed(now, 1);
         glow.tick(Some(cursor), now, &config, geometry, &mut quads);
     }
     (glow, now, cursor)

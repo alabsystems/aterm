@@ -400,6 +400,61 @@ pub fn effect_present_rebase_model() -> Model {
     }
 }
 
+/// Focus/typed-wake demotion must preserve the already-armed effect deadline
+/// until one settle present can erase the last animated raster. An unrelated
+/// event-loop turn may observe the wake as expired before that deadline fires;
+/// dropping the slot there strands lit pixels on an unfocused window.
+/// `Buggy=1` reproduces that edge-triggered park.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn effect_presentability_settle_model() -> Model {
+    crate::ty_model! {
+        EffectPresentabilitySettle {
+            const Buggy = 0;
+            const MaxSteps = 3;
+            var presentable = 1;
+            var effect_active = 1;
+            var pixels_lit = 1;
+            var pending = 1;
+            var settle_owed = 0;
+            var settles = 0;
+            var steps = 0;
+            action ExpireWake when (
+                presentable == 1 && effect_active == 1 && pixels_lit == 1
+                    && pending == 1 && steps <= MaxSteps - 1
+            ) {
+                presentable = 0; settle_owed = 1; steps = steps + 1;
+            }
+            action UnrelatedPark when (
+                presentable == 0 && settle_owed == 1 && pending == 1
+                    && steps <= MaxSteps - 1
+            ) {
+                pending = if Buggy == 1 { 0 } else { 1 };
+                steps = steps + 1;
+            }
+            action PaintSettle when (
+                presentable == 0 && settle_owed == 1 && pending == 1
+                    && steps <= MaxSteps - 1
+            ) {
+                pending = 0; effect_active = 0; pixels_lit = 0;
+                settle_owed = 0; settles = 1; steps = steps + 1;
+            }
+            invariant LitPixelsHaveSettleRoute:
+                if presentable == 0 && pixels_lit == 1 {
+                    pending == 1 && settle_owed == 1
+                } else { pending <= 1 };
+            invariant SettledPixelsAreClear:
+                if settles == 1 {
+                    pixels_lit == 0 && effect_active == 0 && settle_owed == 0
+                } else { settles == 0 };
+            invariant StateBounded:
+                presentable <= 1 && effect_active <= 1 && pixels_lit <= 1
+                    && pending <= 1 && settle_owed <= 1 && settles <= 1;
+            invariant StepsBounded: steps <= MaxSteps;
+        }
+    }
+}
+
 /// Phase-locked brisk effect cadence with a two-tick interval. Timer fire owns
 /// the cadence anchor; sub-interval wake/render cost must not slide the next
 /// deadline. Late delivery and arbitrarily overloaded rendering are reachable:

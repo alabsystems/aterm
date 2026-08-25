@@ -122,12 +122,21 @@ fn capability_list() -> Vec<(&'static str, bool)> {
 }
 
 /// The GPU renderer's backend name for the diagnostics label, per platform: wgpu
-/// negotiates Metal on macOS and Vulkan elsewhere (Vulkan on Linux/NVIDIA). The live
-/// `metrics` verb still reports the actually-negotiated backend at runtime.
+/// negotiates Metal on macOS, DX12 on Windows and Vulkan elsewhere (Vulkan on
+/// Linux/NVIDIA) — the same per-platform default `aterm_gpu::backends_from_env`
+/// asks for. The live `metrics` verb still reports the actually-negotiated
+/// backend at runtime, which is also where an `$ATERM_GPU_BACKEND` override shows
+/// up; this label is the compile-time default, not a probe.
 #[cfg(target_os = "macos")]
 const GPU_BACKEND_LABEL: &str = "gpu (metal)";
-/// See the macOS variant above — non-macOS uses Vulkan via wgpu.
-#[cfg(not(target_os = "macos"))]
+/// See the macOS variant above. Windows restricts wgpu to DX12 — the native
+/// Windows API and the only backend wired for the HDR/scRGB present — so a
+/// report that said "vulkan" here sent every Windows bug reporter's
+/// `--show-config` out with the wrong renderer named.
+#[cfg(windows)]
+const GPU_BACKEND_LABEL: &str = "gpu (dx12)";
+/// See the macOS variant above — everything else uses Vulkan via wgpu.
+#[cfg(not(any(target_os = "macos", windows)))]
 const GPU_BACKEND_LABEL: &str = "gpu (vulkan)";
 
 /// The renderer label for the reports: the platform GPU backend name when GPU is
@@ -3081,6 +3090,23 @@ ink = "rainbow"
             renderer_label(resolve_want_gpu_with(false, false, None)),
             GPU_BACKEND_LABEL
         );
+    }
+
+    /// The label must name the backend this platform actually negotiates. Every
+    /// other assertion above compares against the constant itself and so cannot
+    /// see it being WRONG: Windows restricts wgpu to DX12
+    /// (`aterm_gpu::backends_from_env`) while the report said "vulkan", which is
+    /// the one line a bug reporter is asked to paste.
+    #[test]
+    fn the_backend_label_names_this_platform_s_backend() {
+        let want = if cfg!(target_os = "macos") {
+            "gpu (metal)"
+        } else if cfg!(windows) {
+            "gpu (dx12)"
+        } else {
+            "gpu (vulkan)"
+        };
+        assert_eq!(renderer_label(true), want);
     }
 
     #[test]

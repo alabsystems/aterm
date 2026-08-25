@@ -5239,8 +5239,11 @@ impl TabBandHeight {
 /// bar the pixel band's card design is drawn against. A `cfg!` const so both
 /// arms stay type-checked everywhere; only the platform that reads the value
 /// through [`TabBandHeight::Standard`] ever feels it.
-pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 =
-    if cfg!(target_os = "linux") { 36.0 } else { 32.0 };
+pub(crate) const TAB_BAND_STANDARD_LOGICAL_PX: f32 = if cfg!(target_os = "linux") {
+    36.0
+} else {
+    32.0
+};
 
 /// Sanity cap on the SYNTHETIC head, in device px, as a multiple of the cell
 /// height: a pathological config (huge `tab_band_height` target against a tiny
@@ -7170,7 +7173,11 @@ impl App {
     /// rescales) — the same `cells` as the historical `max(usable/cell, 1)`, now the
     /// law the ty model + lattice tests pin. The tab strip is reserved out of the
     /// terminal grid while always leaving at least one terminal row.
-    fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
+    /// `pub(crate)` so the LINUX INITIAL-FRAME SETTLE
+    /// ([`Self::settle_initial_frame`], in `app_window`) can ask the ONE grid law
+    /// "does this surface already carry the grid the attach asked for?" instead of
+    /// re-deriving a private copy of it.
+    pub(crate) fn grid_dims_for(&self, wid: WindowId, size: PhysicalSize<u32>) -> (u16, u16) {
         let (cw, ch) = self.win_cell_size(wid);
         let pad = self.win_pad(wid);
         let cols = aterm_render::pad_split(size.width as usize, pad, cw).cells as u16;
@@ -7961,10 +7968,11 @@ impl App {
         let previous = std::mem::replace(&mut self.path_feed_fps, fresh);
         self.sparkle_dirty = true;
         if fresh.deco != previous.deco {
-            // v3 §1.1 reset table: a lexicon rebuild is a hard_reset, matching
-            // the changed-config path's `sparkle_feed_changed` arm.
+            // Retire only word-owned episodes. Cursor companions share this
+            // renderer's atlas, but a lexicon rebuild is not their lifecycle
+            // authority and must not teleport or rebake them.
             for ws in self.windows.values_mut() {
-                ws.word_decos.hard_reset();
+                ws.word_decos.hard_reset_words();
             }
         }
         for ws in self.windows.values() {
@@ -8390,10 +8398,8 @@ impl App {
         // have, and the config swap has already succeeded by this line, so
         // without the banner the Settings row would show ON over a protection
         // that is off.
-        let secure_input_refusal = crate::secure_input::set_desired(
-            self.config.secure_keyboard_entry_or_default(),
-        )
-        .err();
+        let secure_input_refusal =
+            crate::secure_input::set_desired(self.config.secure_keyboard_entry_or_default()).err();
         if let Some(voice) = audition_voice {
             // After the swap, so the preview plays at the NEW volume/master and
             // under the new look — the settings the user just wrote.
@@ -8464,15 +8470,18 @@ impl App {
         // re-publish (memory-only) so a flipped switch or a hand-edit shows on
         // the status card without waiting for the next worker pass.
         self.publish_native_packages_state();
-        // v3 §1.1 reset table: config reload / lexicon rebuild is a hard_reset
-        // (matches the web knob setters' parity arm) — but ONLY when the keys
-        // that actually feed the decorations changed (`sparkle_feed_changed`
-        // above). An unrelated edit (a cursor-trail style switch, a font tweak)
-        // must not wipe every window's live decorations mid-animation — the
-        // collateral half of the semantic-admission audit.
+        // Terminal/theme/config palette authority changed. A resident pet may
+        // remain visible across the reload, so explicitly retire only its
+        // appearance contrast sample; position, action and breed stay intact.
+        for ws in self.windows.values_mut() {
+            ws.cursor_pet.invalidate_colors();
+        }
+        // A Sparkle Words reload retires word episodes and done marks, but
+        // preserves the independent cursor companion's placement and sprite
+        // caches. Other config edits remain a complete no-op for this state.
         if sparkle_feed_changed {
             for ws in self.windows.values_mut() {
-                ws.word_decos.hard_reset();
+                ws.word_decos.hard_reset_words();
             }
         }
         // Keep any OPEN retired Settings test scaffold authoritative against the
@@ -12269,8 +12278,7 @@ mod tab_band_height_tests {
             .find(|l| l.starts_with("#[cfg") || l.starts_with("if cfg!"))
             .unwrap_or_default();
         assert_eq!(
-            gate,
-            "if cfg!(any(windows, target_os = \"linux\")) {",
+            gate, "if cfg!(any(windows, target_os = \"linux\")) {",
             "the on_resize C3 block must gate with a runtime `cfg!` (the form the macOS \
              band block above it uses), not a `#[cfg]` attribute — an attribute deletes \
              the only live call site on the excluded platforms and takes the whole chain \
@@ -13427,10 +13435,8 @@ mod whole_cell_min_size_tests {
         let min = app.whole_cell_min_size(wid);
         let (cw, ch) = app.win_cell_size(wid);
         let pad = app.win_pad(wid);
-        let base_h = app.win_head(wid)
-            + app.win_pad_top(wid)
-            + pad
-            + usize::from(app.tab_strip_rows) * ch;
+        let base_h =
+            app.win_head(wid) + app.win_pad_top(wid) + pad + usize::from(app.tab_strip_rows) * ch;
 
         // Congruence: every exact whole-cell frame `2·pad + C·cw` at or above
         // the min is a lattice point of `min + k·cw` — the property that keeps

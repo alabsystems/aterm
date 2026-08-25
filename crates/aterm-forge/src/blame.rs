@@ -867,7 +867,9 @@ mod tests {
             patch_state(&forks, &PkgId::new("winnow", v.clone())),
             PatchState::Fork { path: "vendor/winnow".into() }
         );
-        // Any OTHER version of a forked name is the defect this verb exists for.
+        // Any OTHER version of a forked name is the defect this verb exists
+        // for. Asserted on a SYNTHETIC id on purpose: the shipped graph carries
+        // no unpatched sibling today, and the detector must stay proved anyway.
         assert!(matches!(
             patch_state(&forks, &PkgId::new("winnow", "1.0.3")),
             PatchState::UnpatchedBesideFork { .. }
@@ -888,31 +890,60 @@ mod tests {
         assert!(out.contains("a-rather-long-package-name-11 0.47.0"));
     }
 
-    /// THE measured case: `winnow` is forked at 0.7.15 and ALSO resolves,
-    /// unpatched, at 1.0.3 in the linux cell — verified against this checkout
-    /// with `cargo tree` before it was encoded.
+    /// What blame owes for a crate that IS in the shipped graph: the version,
+    /// that it is FORKED, the fork's path, the cells it resolves in, its
+    /// dominator cost, and the first-party edges responsible.
+    ///
+    /// POLARITY, deliberately inverted 2026-08-25. This test used to require
+    /// that `winnow` resolved at TWO versions — the 0.7.15 fork plus an
+    /// unpatched 1.0.3 — and asserted `PATCH LIVENESS DEFECT` appeared. That
+    /// was the measured truth when it was written; dropping the
+    /// `a11y-accesskit` default removed `accesskit_unix → zbus`, the only edge
+    /// dragging the second major in, and winnow now resolves at exactly one
+    /// version in every cell. A test that requires a defect to be present turns
+    /// red when the defect is fixed, so it has to state a property instead.
+    ///
+    /// The liveness reporting itself is still proved, without depending on the
+    /// tree carrying a defect: `patch_state` is asserted to return
+    /// `UnpatchedBesideFork` for a synthetic off-fork version in
+    /// `the_workspace_patch_table_is_read_with_its_vendored_versions` above,
+    /// and `tests/red_fixtures.rs::an_unpatched_sibling_version_reds_the_forge
+    /// _verb` plants a real one in a scratch tree and requires the gate to go
+    /// RED on it.
     #[test]
-    fn blame_winnow_names_both_versions_and_flags_the_unpatched_one() {
+    fn blame_winnow_names_the_fork_its_path_and_its_cost_in_every_cell() {
         let root = repo_root();
-        let out = run(&root, "winnow", &["mac-arm".into(), "linux".into()]).expect("blame runs");
+        let cells = ["mac-arm".to_string(), "linux".to_string()];
+        let out = run(&root, "winnow", &cells).expect("blame runs");
         assert!(out.ok, "{}", out.log);
-        assert!(out.log.contains("winnow 0.7.15"), "the fork is named:\n{}", out.log);
-        assert!(out.log.contains("winnow 1.0.3"), "the unpatched copy is named:\n{}", out.log);
-        assert!(out.log.contains("PATCH LIVENESS DEFECT"), "the defect is surfaced:\n{}", out.log);
-        assert!(out.log.contains("vendor/winnow"), "the fork's path is named");
+        assert!(out.log.contains("winnow 0.7.15"), "the version is named:\n{}", out.log);
+        assert!(out.log.contains("FORKED"), "the fork is flagged as one:\n{}", out.log);
+        assert!(out.log.contains("vendor/winnow"), "the fork's path is named:\n{}", out.log);
+        for c in &cells {
+            assert!(out.log.contains(c.as_str()), "cell `{c}` is reported:\n{}", out.log);
+            assert!(
+                out.log.contains(&format!("cell {c}   dom ")),
+                "cell `{c}` gets a dominator cost:\n{}",
+                out.log
+            );
+        }
         assert!(
-            out.log.contains("Collapsing these 2"),
-            "two versions of one name carry a dedup prize:\n{}",
+            out.log.contains("first-party edges responsible:"),
+            "blame's whole job is naming the first-party edge:\n{}",
+            out.log
+        );
+        // One resolved version means no dedup prize and no liveness defect —
+        // the clean state, asserted as such rather than assumed.
+        assert!(
+            !out.log.contains("Collapsing these"),
+            "one version cannot carry a dedup prize:\n{}",
             out.log
         );
         assert!(
-            out.log.contains("proc macro") || out.log.contains("proc-macro"),
-            "the compiler-side reach is called out:\n{}",
+            !out.log.contains("PATCH LIVENESS DEFECT"),
+            "the fork covers every resolved version; a defect here is real news:\n{}",
             out.log
         );
-        // The unpatched copy is linux-only on this tree; the fork is in both.
-        let liveness = out.log.split("PATCH LIVENESS DEFECT").nth(1).unwrap_or_default();
-        assert!(liveness.contains("linux"), "the defect names the cell:\n{liveness}");
         for line in out.log.lines() {
             assert!(line.chars().count() <= 100, "{} cols: {line:?}", line.chars().count());
         }

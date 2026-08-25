@@ -1641,19 +1641,28 @@ const RAINBOW_WAKE_SEG: f32 = 0.25;
 /// [`RAINBOW_WAKE_EXTENT`] cells and usually far shorter, and at the rail's
 /// rate a resting 4.5-cell plume sits inside ONE band — reviewed as "a short
 /// wake can be entirely red or indigo", the exact monochrome failure the
-/// redesign exists to kill. At 0.15 a band is 1⁄(5 × 0.15) ≈ 1.33 columns, so
-/// any resting-length window shows at least three distinct anchors — the
-/// minimum-diversity invariant, pinned by
-/// `any_resting_wake_length_shows_at_least_three_bands`.
-const RAINBOW_WAKE_SWEEP_SPREAD: f32 = 0.15;
-/// Boundary CROSSFADE half-width, in fractions of one band bin. Nearest-anchor
-/// quantization alone would step hard at every bin edge — visible both as a
-/// spatial seam and, because the sweep rides the phase clock, as a temporal
-/// pop on a stationary column (~every 0.56 s at full momentum). Blending the
-/// outer 0.16 of each bin toward its neighbour makes the law continuous in
-/// BOTH column and phase while leaving the middle 68 % of every band flat —
-/// still six nameable colours, never a gradient.
-const RAINBOW_WAKE_BAND_BLEND: f32 = 0.16;
+/// redesign exists to kill. At 0.50 the continuous sequential-anchor sweep
+/// traverses 2.5 palette intervals per column: even a left-clipped one-cell
+/// wake carries visible hue separation instead of depending on a fortuitous
+/// band boundary. The reflected law still reverses at red and indigo — it
+/// never interpolates directly across the magenta-producing indigo↔red edge.
+/// Pinned across every sweep phase, representative cursor edge, and every
+/// millisecond of a human inter-key interval by
+/// `cold_single_key_wake_stays_visibly_rainbow_between_human_cadence_keys`.
+const RAINBOW_WAKE_SWEEP_SPREAD: f32 = 0.50;
+/// A short, smooth coverage SUPPORT under the spectral head. The exponential
+/// body and keystroke pulse can leave only one coloured raster sample above
+/// the perceptual floor between keys, even while dim rainbow geometry exists
+/// behind it. The support rises from exactly zero at the nozzle, reaches this
+/// floor after [`RAINBOW_WAKE_SUPPORT_ATTACK`], stays flat through
+/// [`RAINBOW_WAKE_SUPPORT_EASE_START`], and eases to zero at
+/// [`RAINBOW_WAKE_SUPPORT_WIDTH`]. `max(existing, support)` therefore preserves
+/// the nozzle, global peak, segment/work count, composite ceiling, and tail;
+/// it only keeps the first few already-emitted samples visibly spectral.
+const RAINBOW_WAKE_SUPPORT_FLOOR: f32 = 0.90;
+const RAINBOW_WAKE_SUPPORT_ATTACK: f32 = 0.25;
+const RAINBOW_WAKE_SUPPORT_EASE_START: f32 = 0.90;
+const RAINBOW_WAKE_SUPPORT_WIDTH: f32 = 1.50;
 /// PER-BAND COVERAGE COMPENSATION — equal scalar coverage is not equal
 /// perceived light: the six anchors' Rec.709 lumas span 0.21 (red) to 0.93
 /// (yellow), so an uncompensated plume reads as bright yellow-green patches
@@ -1849,11 +1858,11 @@ const RAINBOW_WAKE_SHOCK_GROW: f32 = 1.6;
 const RAINBOW_WAKE_SHOCK_RY: f32 = 1.6;
 const RAINBOW_WAKE_SHOCK_MAX: usize = 6;
 
-/// The wake's colour at a COLUMN: THE RAINBOW itself — the ribbon's own
-/// `bands`, nearest-anchor quantized along the family's reflected sweep at the
-/// wake's own spatial rate, with a narrow crossfade at the bin edges. Returns
-/// the colour and its per-band luma compensation (see
-/// [`RAINBOW_WAKE_LUMA_COMP`]), both blended across a boundary.
+/// The wake's colour at a COLUMN: THE RAINBOW itself — the ribbon's own six
+/// sequential `bands`, continuously interpolated along the family's reflected
+/// sweep at the wake's own spatial rate. Returns the colour and its per-band
+/// luma compensation (see [`RAINBOW_WAKE_LUMA_COMP`]), blended by the same
+/// coordinate.
 ///
 /// OWNER, 2026-08-15: "the color underline uses a magenta palette … that's not
 /// the correct color pallet. Redesign the underline." No magenta anchor exists
@@ -1870,46 +1879,30 @@ const RAINBOW_WAKE_SHOCK_MAX: usize = 6;
 /// The LINEAGE this law completes — both prior rulings still bind: 2026-07-29
 /// "it needs to match the nyan rainbow theme" retired the bespoke heat table
 /// for the ribbon's own anchors; 2026-08-11 "align the rainbow colour palettes
-/// between the underline and cursor trail" retired the continuous lerp for the
-/// six-anchor quantization and fed the momentum-rotated `bands` through both
-/// marks. This ruling retires the last divergence — the coordinate. The
-/// cooling READ never lived in the hue: brightness falloff is carried entirely
-/// by [`rainbow_wake_body`]'s `e^(−d/L)` coverage envelope, exactly as before.
+/// between the underline and cursor trail" fed the same momentum-rotated
+/// `bands` through both marks. The 2026-08-25 raster audit found the remaining
+/// nearest-anchor plateaus could leave a whole meaningful cold wake one hue;
+/// continuous interpolation removes that plateau without inventing colours or
+/// crossing the reflected sweep's indigo↔red edge. Cooling stays in coverage,
+/// never hue: [`rainbow_wake_body`] still owns the long exponential tail.
 ///
-/// Three review findings shaped the law (external design review, 2026-08-15):
-/// nearest-anchor `round(5t)` rather than `floor(6t)`, so the reflection's
-/// endpoint half-bins fold to interior width instead of doubling red/indigo
-/// at every fold; the wake gets its own spatial rate because at the rail's
-/// 0.045 a resting-length plume is monochrome ([`RAINBOW_WAKE_SWEEP_SPREAD`]);
-/// and the position argument is f32 — a left-clipped segment resolves a
-/// negative column through `rem_euclid`, never a `u16` cast.
+/// The wake keeps its own spatial rate because at the rail's 0.045 a
+/// resting-length plume is monochrome ([`RAINBOW_WAKE_SWEEP_SPREAD`]). The
+/// position argument stays f32: a left-clipped segment resolves a negative
+/// column through `rem_euclid`, never a `u16` cast.
 #[inline]
 fn rainbow_wake_band_at(bands: &[u32; 6], colx: f32, phase: f32) -> (u32, f32) {
-    let t =
-        rainbow_sweep_reflect(colx * RAINBOW_WAKE_SWEEP_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW);
+    let t = rainbow_sweep_reflect(
+        colx * RAINBOW_WAKE_SWEEP_SPREAD + phase * RAINBOW_LIGHT_RAIL_FLOW,
+    );
     let u = t * 5.0;
-    let i = u.round();
-    let frac = u - i; // signed distance to the nearest anchor centre, −0.5..0.5
-    let idx = (i as usize).min(5);
-    let c = bands[idx];
-    let comp = RAINBOW_WAKE_LUMA_COMP[idx];
-    let d = frac.abs();
-    let edge = 0.5 - RAINBOW_WAKE_BAND_BLEND;
-    if d <= edge {
-        return (c, comp);
-    }
-    let j = if frac > 0.0 {
-        (idx + 1).min(5)
-    } else {
-        idx.saturating_sub(1)
-    };
-    // 0 at the flat body's edge → 0.5 exactly ON the boundary, so the two
-    // sides of every boundary meet at the same mix: continuous in column and
-    // in phase.
-    let k = ((d - edge) / RAINBOW_WAKE_BAND_BLEND).clamp(0.0, 1.0) * 0.5;
+    let i = (u.floor() as usize).min(5);
+    let j = (i + 1).min(5);
+    let k = u - i as f32;
     (
-        lerp_rgb(c, bands[j], k),
-        comp + (RAINBOW_WAKE_LUMA_COMP[j] - comp) * k,
+        lerp_rgb(bands[i], bands[j], k),
+        RAINBOW_WAKE_LUMA_COMP[i]
+            + (RAINBOW_WAKE_LUMA_COMP[j] - RAINBOW_WAKE_LUMA_COMP[i]) * k,
     )
 }
 
@@ -1931,6 +1924,23 @@ fn rainbow_wake_body(d: f32, l: f32) -> f32 {
 fn rainbow_wake_pulse_space(d: f32) -> f32 {
     let g = d / RAINBOW_WAKE_PULSE_W;
     (-(g * g)).exp()
+}
+
+#[inline]
+fn rainbow_wake_spectral_head_support(d: f32, width: f32) -> f32 {
+    if d < 0.0 || width <= 0.0 || d >= width {
+        return 0.0;
+    }
+    let attack_end = (width * 0.20).min(RAINBOW_WAKE_SUPPORT_ATTACK);
+    let attack = smoothstep01(d / attack_end.max(f32::EPSILON));
+    let ease_start =
+        width * (RAINBOW_WAKE_SUPPORT_EASE_START / RAINBOW_WAKE_SUPPORT_WIDTH);
+    let release = if d <= ease_start {
+        1.0
+    } else {
+        1.0 - smoothstep01((d - ease_start) / (width - ease_start))
+    };
+    RAINBOW_WAKE_SUPPORT_FLOOR * attack * release
 }
 
 /// The TEMPORAL half: exponential decay on [`RAINBOW_WAKE_PULSE_TAU`] since the key
@@ -2858,17 +2868,18 @@ struct RainbowState {
     /// cursor cat ([`crate::kitty_cursor::CursorCat`]) runs the SAME law on the
     /// same keystream.
     momentum: TypingMomentum,
-    /// One-tick PULSE: the instant [`Self::momentum`] took a correlated
-    /// typed advance THIS tick (`None` otherwise). Cleared at the top of every
-    /// [`CursorGlow::tick`] and set only on the one gated advance in
-    /// [`CursorGlow::spawn`], so the host can drive the cursor cat's own metric
-    /// instance ([`crate::kitty_cursor::CursorCat`]) from the SAME
-    /// echo-correlated event the ribbon builds from — the two instances then
-    /// cannot diverge (a key-only, non-echoing keystream builds neither).
-    /// Read+cleared via [`CursorGlow::take_momentum_pulse`]. Transient
-    /// per-tick: never carried into a style-crossfade ghost, and cleared by the
-    /// tick head rather than by either family wipe.
-    momentum_pulse: Option<Instant>,
+    /// One-tick, AUTHENTICATED cursor-cat motion pulse. Ordinary advances keep
+    /// the historical momentum instant; a positively classified line fold also
+    /// preserves its direction instead of throwing that shape away at the host
+    /// seam. The fold bit is not inferred later from a large pixel delta: it is
+    /// minted here, beside `shape_wrap` / `re_anchor`, after the same typed or
+    /// delete candidate admission that licenses the ribbon itself.
+    ///
+    /// Cleared at the top of every [`CursorGlow::tick`], never carried through
+    /// a style ghost. [`CursorGlow::take_momentum_pulse`] remains as the
+    /// compatibility projection until hosts adopt the lossless
+    /// [`CursorGlow::take_cursor_cat_motion_pulse`] seam.
+    momentum_pulse: Option<CursorCatMotionPulse>,
     /// The rainbow ribbon's integrated SPECULAR PHASE (dimensionless sweeps):
     /// advanced by `dt · RAINBOW_PHASE_RATE · rainbow.disp` in the lazy-decay block, so
     /// the iridescent value-noise scrolls and the specular glint sweeps head→tail
@@ -2876,6 +2887,10 @@ struct RainbowState {
     /// cold — where the iridescence amplitude is zero anyway). Pure function of
     /// injected clocks; wrapped to a bounded ring so it never loses fp precision.
     phase: f32,
+    /// Test-only support-width override for the raster law's explicit failing
+    /// negative control. Production builds carry neither field nor branch.
+    #[cfg(test)]
+    wake_test_support_width: Option<f32>,
     /// WAKE FOLD CARRY (owner, 2026-08-15: "the rainbow streak … has some
     /// gaps"): `(folded_at, visible_len_cells)` stashed by a positively
     /// classified typed WRAP. The wake's throttle scan counts only nozzle-row
@@ -2906,16 +2921,24 @@ impl RainbowState {
     }
 
     /// The proportionate twin of [`Self::clear_visual_geometry`]: retire the
-    /// families a generation fence must always retire (jumps, bursts — landing
-    /// transients with no per-cell attestation), but let the TYPING WAKE's
-    /// cell-anchored memory survive where `keep(row, col)` attests the cell's
-    /// content is unchanged. The nozzle (`wake_head`) survives only on the
-    /// attested row itself — it is sub-cell, so its evidence is the row's.
-    /// The fold carry survives by its own law ("a scalar cannot paint stale
-    /// rows"); an in-flight retract keeps draining whatever sparks survive.
+    /// families a generation fence must always retire (jumps — relocation-
+    /// spanning streaks whose endpoints stale coordinates can strand), but let
+    /// the TYPING WAKE's cell-anchored memory survive where `keep(row, col)`
+    /// attests the cell's content is unchanged. The landing STARBURSTS survive
+    /// OUTRIGHT (v0.43.0 law, restored): a burst is a sub-second at-cursor
+    /// flash born only from an admitted move, and a byte-steady repaint
+    /// elsewhere cannot invalidate a flash already in flight — under a
+    /// streaming TUI's batch cadence the old per-batch clear killed every
+    /// burst within tens of ms of birth, which is the owner's "I don't see
+    /// the sparkles". A real relocation / identity change / reset takes the
+    /// wholesale [`Self::clear_visual_geometry`] path, which still retires
+    /// them: a relocation strands at-cursor light. The nozzle (`wake_head`)
+    /// survives only on the attested row itself — it is sub-cell, so its
+    /// evidence is the row's. The fold carry survives by its own law ("a
+    /// scalar cannot paint stale rows"); an in-flight retract keeps draining
+    /// whatever sparks survive.
     fn retire_keeping_validated_wake(&mut self, keep: &dyn Fn(u16, u16) -> bool, attested_row: u16) {
         self.jumps.clear();
-        self.bursts.clear();
         for slot in &mut self.tail {
             if slot.is_some_and(|(row, col)| !keep(row, col)) {
                 *slot = None;
@@ -3685,6 +3708,47 @@ pub struct CursorGlow {
     /// The timestamp hints above remain classifier inputs, never provenance by
     /// themselves.
     move_candidate: Option<GlowMoveCandidate>,
+    /// One-frame exception attached only to a validated alt-screen
+    /// typed-to-MOTION downgrade. If its relocation is too small for the
+    /// motion jump gate, consume it dark without wiping row-probe-attested
+    /// resident wake. A genuine jump still admits normally. Never a birth
+    /// licence.
+    preserve_wake_on_denied_motion: bool,
+    /// One-frame, endpoint-bound exception after an authenticated bottom
+    /// scroll's fresh-line material probe rejects. The candidate/new fold may
+    /// no longer birth light, but its previously translated cell wake remains
+    /// coordinate-valid. `(origin, target)`, consumed by the next tick only.
+    preserve_wake_on_rejected_bottom_scroll: Option<((u16, u16), (u16, u16))>,
+    /// One shipping tick may ignore a transient off-row cursor while the sole
+    /// next alt-screen generation awaits its restored material-row probe. The
+    /// candidate and old anchor stay intact; consumed by that tick so a
+    /// second frame cannot defer again.
+    deferred_probe_hold: bool,
+    /// Generation whose transient cursor-save frame was held and still owes
+    /// either one exact restored-row proof or a fail-closed retirement. This
+    /// outlives `deferred_probe_hold` by one frame: the hold is consumed by
+    /// the transient tick, while this marker makes a missing/mismatched
+    /// restore retire resident light on the following tick even though the
+    /// parser generation itself did not advance again.
+    deferred_probe_pending: Option<ContentGeneration>,
+    /// REVOKED-TARGET TOMBSTONE — the fence-side repair for the E2
+    /// SPLIT-BATCH ECHO collision (the `StandingGapSplitEchoRetiresE2`
+    /// registered gap's wipe half; live v0.54.0 evidence: `retired=10
+    /// last_retire_reason=unowned-batch`, ten wholesale ribbon wipes across
+    /// one Claude Code conversation). When the unowned fence revokes an
+    /// in-flight TYPED candidate ([`Self::revoke_unowned_hints`], the
+    /// `unowned-batch` retire), the candidate's identity is stashed here so
+    /// the key's echo — arriving one batch LATER with the cursor exactly on
+    /// the predicted target — can be judged a proportionate
+    /// [`GenerationOwnership::UnownedRewrite`] instead of a
+    /// relocation-with-wipe. RETENTION-ONLY: consuming it never confirms the
+    /// keystroke, mints light, or feeds momentum — it only stops the
+    /// wholesale wipe of light previous confirms already earned. One slot
+    /// (newest wins); cleared by consumption, expiry
+    /// ([`Self::TYPE_HINT_FRESH`] from the press), any wholesale transient
+    /// teardown (identity change / real relocation / reset / dark — all of
+    /// which run [`Self::clear_transient_state`]).
+    revoked_target_tombstone: Option<RevokedTargetTombstone>,
     /// Last coherent terminal content generation presented to this engine.
     /// Already-visible cell/pixel light may survive a generation change only
     /// when the host proves it was the exact candidate observed in this frame.
@@ -3700,12 +3764,17 @@ pub struct CursorGlow {
     /// key alone never poofs (a kill that erased nothing is silent), and a
     /// shrink alone never poofs (Ink repaints rewrite rows constantly).
     kill_hint: Option<Instant>,
-    /// A fresh PLAIN-BACKSPACE poof classifier/scheduler
-    /// ([`Self::note_backspace`]), kept SEPARATE from
-    /// [`Self::kill_hint`] so it never borrows the kill hint's nav/quench
-    /// escalation semantics. The timestamp alone never poofs: a plain Backspace
-    /// must also carry [`Self::confirmed_delete_span`], proven from its input-time
-    /// baseline and the exact next content generation. Cat-INDEPENDENT:
+    /// A fresh PLAIN-BACKSPACE poof license ([`Self::note_backspace`]), kept
+    /// SEPARATE from [`Self::kill_hint`] so it never borrows the kill hint's
+    /// nav/quench escalation semantics. `poof_scan` ORs it into the
+    /// `fresh_kill` gate, so a plain Backspace licenses the erase POOF on the
+    /// SAME Full-trust proof surface the kill chords use: the exact
+    /// [`Self::confirmed_delete_span`] still answers first with the precise
+    /// vanished cell when the admission proof delivers it, and otherwise the
+    /// shared full-trust span-shrink diff / witnessed caret fallback covers
+    /// the erase (a Backspace that provably erased nothing stays silent — see
+    /// `bs_only` in `poof_scan` — and a ContentOnly probe licenses no poof
+    /// branch at all, see [`ProbeTrust`]). Cat-INDEPENDENT:
     /// `poof_scan` never consults the
     /// cursor cat, so the delete burst fires whether or not the cat is flying
     /// (the cat's tongue-out "oops" layers on top when it happens to be present).
@@ -4085,6 +4154,15 @@ enum GlowMoveIntent {
     Motion,
 }
 
+/// Two-step credential for the sole typed shape whose target row is created
+/// by a terminal scroll. Input arms the first state; only the host's exact
+/// cumulative-scroll projection may advance it to the material-probe state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BottomScrollProof {
+    AwaitUniformUpOne,
+    AwaitMaterialProbe,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct GlowMoveCandidate {
     at: Instant,
@@ -4093,11 +4171,46 @@ struct GlowMoveCandidate {
     target: Option<(u16, u16)>,
     material: Option<(u16, u16)>,
     baseline_row: Option<ExpectedRowSnapshot>,
+    /// Previous-row baseline for an exact DECSET-45 col-zero Backspace. Its
+    /// presence distinguishes the non-erasing reverse fold from an ordinary
+    /// same-row EOL deletion.
+    reverse_target_baseline: Option<ExpectedRowSnapshot>,
+    /// Window-space column corresponding to the focused pane's local column
+    /// zero. Required with `reverse_target_baseline` so a mid-row jump cannot
+    /// forge the inverse-fold shape in a split pane.
+    reverse_left_col: Option<u16>,
     /// Terminal processing generation sampled under the same input-time lock
     /// as `baseline_row`. Content evidence is accepted only from the very next
     /// processed batch; any intervening output completes the candidate dark.
     baseline_generation: Option<ContentGeneration>,
+    /// Sole next generation already observed while its probe/cursor was on an
+    /// unrelated alt-screen save/restore row. Exactly one frame may hold this
+    /// candidate; the same generation can complete it after restore, while a
+    /// second hold, timeout, identity change, or later generation retires.
+    deferred_probe_generation: Option<ContentGeneration>,
     content_confirmed: bool,
+    bottom_scroll: Option<BottomScrollProof>,
+}
+
+/// What [`CursorGlow::revoked_target_tombstone`] remembers about a Typed
+/// candidate the unowned fence revoked before its echo was judged — the E2
+/// split-batch collision's first half. See the field doc for the law.
+#[derive(Clone, Copy, Debug)]
+struct RevokedTargetTombstone {
+    /// The revoked candidate's press instant ([`GlowMoveCandidate::at`]) —
+    /// the freshness anchor: the tombstone expires [`CursorGlow::TYPE_HINT_FRESH`]
+    /// after the PRESS, exactly the window the candidate itself lived under.
+    revoked_at: Instant,
+    /// The candidate's arming origin (the caret at press) — ring diagnostics
+    /// and the owned-span row/start for proportionate retention.
+    origin: (u16, u16),
+    /// The landing the input classifier predicted for the echo — the ONE cell
+    /// pair the consult accepts: a batch whose cursor sits anywhere else is a
+    /// real relocation and wipes exactly as before.
+    target: (u16, u16),
+    /// `process_sequence` of the candidate's input-time baseline, carried only
+    /// for the consumed case's admission-ring row.
+    baseline_generation: Option<u32>,
 }
 
 /// Host handoff from the coherent row proof to the classic trail twin.
@@ -4116,6 +4229,28 @@ pub enum ContentCandidateDecision {
     /// been downgraded in place; the host projects this onto the classic
     /// trail twin so both engines can admit the jump-shaped landing.
     Downgraded { at: Instant, origin: (u16, u16) },
+    /// The sole next alt-screen generation is present, but this frame caught
+    /// cursor-save/status/cursor-restore choreography on an unrelated row, so
+    /// the candidate's material row is outside the coherent probe. Hold the
+    /// old anchor and candidate for ONE tick; no light is admitted or born.
+    Deferred { at: Instant, origin: (u16, u16) },
+}
+
+/// Candidate evidence presented to the per-generation ownership fence.
+///
+/// `AuthoredMotion` is deliberately weaker than `Exact`: a real submitted
+/// alt-screen key crossed a multi-batch redraw, so its typed-content claim was
+/// refuted and downgraded to motion. It may preserve only already-resident,
+/// row-probe-attested wake; it grants no typed admission or fresh light.
+/// `DeferredProbe` is weaker still: the sole next generation was observed on
+/// a transient cursor-save row and earns exactly one decay/emission tick while
+/// the content-bound candidate waits for its original row to return.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContentGenerationEvidence {
+    None,
+    Exact,
+    AuthoredMotion,
+    DeferredProbe,
 }
 
 /// Which lifecycle event one [`AdmissionRecord`] captures.
@@ -4127,6 +4262,14 @@ pub enum AdmissionPhase {
     Confirmed,
     /// The confirm seam retired the candidate; `reason` names why.
     Retired,
+    /// The generation fence CONSUMED a revoked candidate's tombstone
+    /// (`echo-after-stream`): the key's split-batch echo landed on the
+    /// revoked target and earned proportionate retention instead of the
+    /// relocation wipe. Retention-only — the candidate's own verdict was
+    /// already recorded (its `unowned-batch` retire), so this row moves NO
+    /// tally counter: the scoreboard law
+    /// `armed == confirmed + retired + pending` must keep holding.
+    Tombstone,
 }
 
 impl AdmissionPhase {
@@ -4137,6 +4280,7 @@ impl AdmissionPhase {
             Self::Armed => "armed",
             Self::Confirmed => "confirmed",
             Self::Retired => "retired",
+            Self::Tombstone => "tombstone",
         }
     }
 }
@@ -4285,6 +4429,10 @@ impl AdmissionLog {
                 self.tally.retired += 1;
                 self.tally.last_retire_reason = Some(record.reason);
             }
+            // Ring-only: the candidate this tombstone stood for was already
+            // counted (its `unowned-batch` retire). Bumping any counter here
+            // would break `armed == confirmed + retired + pending`.
+            AdmissionPhase::Tombstone => {}
         }
         self.records[self.head] = Some(record);
         self.head = (self.head + 1) % ADMISSION_LOG_CAP;
@@ -4472,6 +4620,44 @@ impl GlowMoveCandidate {
     }
 }
 
+/// The exact cursor movement the authenticated typing classifier offers to the
+/// classic flying kitty. A fold is deliberately distinct from a large jump:
+/// it is one authored character of movement whose terminal projection crossed
+/// a line boundary (or re-anchored an input box), not permission to fly across
+/// every intervening cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorCatMotionKind {
+    /// An ordinary forward/coalesced typed advance. Builds kitty momentum but
+    /// starts no placement seam.
+    Advance,
+    /// A forward line fold: right edge to the following line's left edge, or
+    /// the same shape after bottom-row scrolling / bottom-anchored box growth.
+    FoldForward,
+    /// The exact Backspace-owned inverse: left edge back to the preceding
+    /// visual line's right edge (including a same-row reflow projection).
+    FoldReverse,
+}
+
+/// One per-tick cursor-cat motion verdict, carrying the classifier's injected
+/// clock so the cat's placement transition is wall-time deterministic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CursorCatMotionPulse {
+    pub at: Instant,
+    pub kind: CursorCatMotionKind,
+}
+
+impl CursorCatMotionPulse {
+    /// Whether this pulse is one of the forward advances that must be mirrored
+    /// into [`crate::kitty_cursor::CursorCat`]'s canonical momentum instance.
+    #[must_use]
+    pub fn advances_momentum(self) -> bool {
+        matches!(
+            self.kind,
+            CursorCatMotionKind::Advance | CursorCatMotionKind::FoldForward
+        )
+    }
+}
+
 /// One observed cursor move as [`CursorGlow::spawn`]'s classifier read it: the
 /// raw endpoints / clock / config / geometry plus the typing-vs-jump
 /// classification every later spawn phase keys on. Built once per move by
@@ -4490,12 +4676,26 @@ struct MoveCtx<'a> {
     dc_abs: i32,
     raw_dist: f32,
     /// The classifier verdicts — see the classifier comments in `classify_move`.
+    /// (`wrap` — `shape_wrap || re_anchor` — is a classifier-local now: its
+    /// last downstream reader was the momentum advance, which moved into
+    /// `classify_move` with the press-hint restoration; `dist`/`typing` below
+    /// already carry its collapse for every other phase.)
     shape_wrap: bool,
     typed_pair: bool,
     echo_run: bool,
     re_anchor: bool,
-    wrap: bool,
     rainbow_coalesce: bool,
+    /// `shape_wrap || re_anchor` — the classifier's one wrap verdict, kept on
+    /// the ctx because the momentum advance and the fold-shaped cat pulse
+    /// both key on it.
+    wrap: bool,
+    /// The press-hint half of typed pairing: a fresh key-time `typed_at`
+    /// stamp, REGARDLESS of candidate admission — the momentum spine's gate
+    /// (amplitude, not provenance; the 0.43 restoration law).
+    typed_hinted: bool,
+    /// The observed move paired with a fresh Backspace quench hint — a
+    /// backspace landing wearing a wrap shape; excluded from the advance.
+    bs_pair: bool,
     /// A scroll was reported between this move and the previous one — the
     /// screen moved under the light. See [`CursorGlow::scroll_seen`].
     scrolled: bool,
@@ -5587,9 +5787,12 @@ impl CursorGlow {
         // forward and momentum going backward are now measured identically.
         self.erase_mom.advance(now);
         self.quench_hint = Some(now);
-        // Schedule and classify a possible plain-Backspace poof. The timestamp
-        // is never the license: `confirmed_delete_span`, produced only by the
-        // exact next-generation candidate, supplies the vanished cell.
+        // Schedule the plain-Backspace poof: `poof_scan` ORs this into the
+        // `fresh_kill` gate. The exact confirmed span still answers first
+        // with the precise vanished cell when the admission proof delivers
+        // it; otherwise the shared FULL-trust span/fallback machinery covers
+        // the erase (a ContentOnly probe licenses nothing — see
+        // [`ProbeTrust`]).
         self.bs_poof_hint = Some(now);
         // Stamp the PRE-erase row fill while it is still the pre-erase row (see
         // [`Self::bs_baseline`]). `row_cur_meta` is the probe from this frame if
@@ -5618,6 +5821,35 @@ impl CursorGlow {
         if let Some(candidate) = self.move_candidate.as_mut() {
             candidate.target = Some(target);
             candidate.baseline_row = Some(baseline_row);
+            candidate.baseline_generation = Some(baseline_generation);
+        }
+        self.log_armed();
+    }
+
+    /// Upgrade the newest Backspace classifier with the exact non-erasing
+    /// DECSET-45 inverse-fold proof captured by the input host. Both adjacent
+    /// full rows must remain byte-stable through the sole next processing
+    /// generation; `left_col` binds pane-local column zero in window space.
+    pub fn note_reverse_delete_candidate(
+        &mut self,
+        now: Instant,
+        target: (u16, u16),
+        left_col: u16,
+        origin_baseline: ExpectedRowSnapshot,
+        target_baseline: ExpectedRowSnapshot,
+        baseline_generation: ContentGeneration,
+    ) {
+        if self.candidate_superseded {
+            self.candidate_superseded = false;
+            self.retire_move_candidate_at(now);
+            return;
+        }
+        self.arm_move_candidate(now, GlowMoveIntent::Delete);
+        if let Some(candidate) = self.move_candidate.as_mut() {
+            candidate.target = Some(target);
+            candidate.baseline_row = Some(origin_baseline);
+            candidate.reverse_target_baseline = Some(target_baseline);
+            candidate.reverse_left_col = Some(left_col);
             candidate.baseline_generation = Some(baseline_generation);
         }
         self.log_armed();
@@ -5729,6 +5961,36 @@ impl CursorGlow {
             candidate.baseline_generation = Some(baseline_generation);
         }
         self.log_armed();
+    }
+
+    /// Arm the one-cell DECAWM pending wrap whose landing row is created by a
+    /// full-screen upward scroll. The derived blank baseline remains inert
+    /// until [`Self::note_scroll`] authenticates exactly one row; the ordinary
+    /// next-generation/material/target proof still has to confirm afterward.
+    pub fn note_bottom_scroll_typed_expected(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        target: (u16, u16),
+        material: (u16, u16),
+        baseline_row: ExpectedRowSnapshot,
+        baseline_generation: ContentGeneration,
+    ) {
+        self.note_typed_expected(
+            now,
+            expected,
+            target,
+            material,
+            baseline_row,
+            baseline_generation,
+        );
+        if expected.as_slice().len() == 1
+            && let Some(candidate) = self.move_candidate.as_mut()
+            && candidate.at == now
+            && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+        {
+            candidate.bottom_scroll = Some(BottomScrollProof::AwaitUniformUpOne);
+        }
     }
 
     /// Record a main-screen ENTER classifier stamp. It never admits movement:
@@ -5953,6 +6215,46 @@ impl CursorGlow {
         self.move_candidate.is_some()
     }
 
+    /// Whether one authored content echo is still pending across the host's
+    /// coherent-observation/final-commit seam. This is a read-only retention
+    /// witness: it neither confirms the candidate nor admits fresh light.
+    /// The following coherent probe must still prove the expected material.
+    ///
+    /// Both endpoints, the candidate's input-time generation baseline, and
+    /// this engine's last observed generation must name the same sole-next
+    /// parser transition. Scroll-created folds and deferred save/restore
+    /// probes stay on their narrower protocols and cannot use this witness.
+    #[must_use]
+    pub fn pending_content_echo_straddles(
+        &self,
+        observed_generation: ContentGeneration,
+        observed_cursor: Option<(u16, u16)>,
+        committed_generation: ContentGeneration,
+        committed_cursor: Option<(u16, u16)>,
+    ) -> bool {
+        observed_generation.terminal_id == committed_generation.terminal_id
+            && observed_generation.alternate_screen == committed_generation.alternate_screen
+            && committed_generation.process_sequence
+                == observed_generation.process_sequence.wrapping_add(1)
+            && self.last_content_generation == Some(observed_generation)
+            && self.move_candidate.is_some_and(|candidate| {
+                let Some(target) = candidate.target else {
+                    return false;
+                };
+                !candidate.content_confirmed
+                    && matches!(
+                        candidate.intent,
+                        GlowMoveIntent::Typed(_) | GlowMoveIntent::Delete
+                    )
+                    && candidate.bottom_scroll.is_none()
+                    && candidate.deferred_probe_generation.is_none()
+                    && candidate.baseline_generation == Some(observed_generation)
+                    && Some(candidate.origin) == observed_cursor
+                    && Some(target) == committed_cursor
+                    && target != candidate.origin
+            })
+    }
+
     fn arm_move_candidate(&mut self, at: Instant, intent: GlowMoveIntent) {
         // A live candidate is never OVERWRITTEN into silence. Every production
         // caller reaches here with the slot already empty (the press path's
@@ -5968,8 +6270,12 @@ impl CursorGlow {
             target: None,
             material: None,
             baseline_row: None,
+            reverse_target_baseline: None,
+            reverse_left_col: None,
             baseline_generation: None,
+            deferred_probe_generation: None,
             content_confirmed: false,
+            bottom_scroll: None,
         });
     }
 
@@ -6001,6 +6307,26 @@ impl CursorGlow {
             self.bs_baseline = None;
             self.confirmed_delete_span = None;
         }
+    }
+
+    /// Retire the provisional bottom-scroll proof when its one candidate
+    /// window closes, even if no later visible cursor delta ever arrives.
+    /// Without this explicit clock boundary a hidden cursor could strand
+    /// `AwaitMaterialProbe` forever, and that state itself kept the GUI on its
+    /// phase-locked frame train indefinitely.
+    fn retire_expired_bottom_scroll_probe(&mut self, now: Instant) {
+        let Some(candidate) = self.move_candidate.filter(|candidate| {
+            candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && now.saturating_duration_since(candidate.at).as_secs_f32()
+                    > Self::TYPE_HINT_FRESH
+        }) else {
+            return;
+        };
+        if !candidate.content_confirmed {
+            self.discard_move_candidate("bottom-scroll-probe-expired");
+        }
+        self.retire_move_candidate_at(candidate.at);
+        self.owned_write_span = None;
     }
 
     /// DROP the pending content candidate and RECORD the drop, naming `reason`.
@@ -6178,6 +6504,19 @@ impl CursorGlow {
     /// vim vertical navigation) pulses on neither.
     #[must_use]
     pub fn take_momentum_pulse(&mut self) -> Option<Instant> {
+        self.rainbow
+            .momentum_pulse
+            .take()
+            .filter(|pulse| pulse.advances_momentum())
+            .map(|pulse| pulse.at)
+    }
+
+    /// Read and CLEAR the lossless cursor-cat motion pulse for this tick.
+    /// Unlike [`Self::take_momentum_pulse`], this preserves the authenticated
+    /// forward/reverse fold shape so the placement layer never has to infer a
+    /// wrap from an arbitrary large cursor relocation.
+    #[must_use]
+    pub fn take_cursor_cat_motion_pulse(&mut self) -> Option<CursorCatMotionPulse> {
         self.rainbow.momentum_pulse.take()
     }
 
@@ -6265,6 +6604,7 @@ impl CursorGlow {
         self.return_hint = None;
         self.reflow_hint = None;
         self.newline_hint = None;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
         self.discard_move_candidate("superseded");
         // The quench hint is dropped only once its OWN echo had a fair chance
         // to land (~2 frames): a fast backspace→Enter pair must not lose the
@@ -6335,13 +6675,91 @@ impl CursorGlow {
         current_cursor: Option<(u16, u16)>,
         exact_candidate_confirmed: bool,
     ) -> GenerationOwnership {
+        self.observe_content_generation_with_evidence(
+            generation,
+            current_cursor,
+            if exact_candidate_confirmed {
+                ContentGenerationEvidence::Exact
+            } else {
+                ContentGenerationEvidence::None
+            },
+        )
+    }
+
+    /// Evidence-rich form of [`Self::observe_content_generation`], used by
+    /// hosts that project a [`ContentCandidateDecision::Downgraded`] decision
+    /// through the same coherent generation fence.
+    pub fn observe_content_generation_with_evidence(
+        &mut self,
+        generation: ContentGeneration,
+        current_cursor: Option<(u16, u16)>,
+        evidence: ContentGenerationEvidence,
+    ) -> GenerationOwnership {
         let previous = self.last_content_generation;
         self.last_content_generation = Some(generation);
+        if previous == Some(generation)
+            && evidence == ContentGenerationEvidence::Exact
+            && self.deferred_probe_pending == Some(generation)
+            && self.move_candidate.is_some_and(|candidate| {
+                candidate.content_confirmed
+                    && candidate.deferred_probe_generation == Some(generation)
+                    && candidate.target == current_cursor
+            })
+        {
+            // ESC 7/status/ESC 8 can present the restored input row without a
+            // second parser batch. The candidate's input-time baseline was
+            // installed as the previous probe by the successful confirm, so
+            // run the ordinary exact retention law even though the numeric
+            // generation is steady. This consumes both the proven write span
+            // and the one-frame deferred authority; neither can leak into a
+            // later batch.
+            self.unsettle();
+            self.deferred_probe_hold = false;
+            self.deferred_probe_pending = None;
+            let owned_write = self.owned_write_span.take();
+            self.retire_geometry_keeping_validated_wake(owned_write);
+            return GenerationOwnership::Owned;
+        }
+        if previous == Some(generation) && self.deferred_probe_pending == Some(generation) {
+            if evidence == ContentGenerationEvidence::AuthoredMotion
+                && generation.alternate_screen
+                && matches!(
+                    self.move_candidate.map(|candidate| candidate.intent),
+                    Some(GlowMoveIntent::Motion)
+                )
+            {
+                // A restored row that stayed byte-identical proves the key
+                // was swallowed by the alt-screen app. This is the existing
+                // Motion downgrade, completed in the same parser generation
+                // as the held cursor-save frame. Apply its narrow attested-
+                // wake fence now; a small step will consume dark, while a
+                // genuine jump may use the still-bounded Motion candidate.
+                self.unsettle();
+                self.deferred_probe_hold = false;
+                self.deferred_probe_pending = None;
+                self.retire_denied_move_keeping_validated_wake();
+                self.preserve_wake_on_denied_motion = true;
+                return GenerationOwnership::AuthoredMotion;
+            }
+            // The transient frame spent its sole hold. Any other same-
+            // generation outcome means restore confirmation was missing,
+            // stale, mismatched, or otherwise desynchronized. Retire here so
+            // the host receives UnownedRelocation and grounds the companion;
+            // waiting for tick would leave that third consumer active.
+            self.clear_denied_move_visuals();
+            self.deferred_probe_hold = false;
+            self.deferred_probe_pending = None;
+            return GenerationOwnership::UnownedRelocation;
+        }
         let Some(previous) = previous.filter(|&previous| previous != generation) else {
             return GenerationOwnership::Steady;
         };
         self.unsettle();
-        if exact_candidate_confirmed {
+        self.preserve_wake_on_denied_motion = false;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
+        self.deferred_probe_hold = false;
+        self.deferred_probe_pending = None;
+        if evidence == ContentGenerationEvidence::Exact {
             // The exact proof may spawn fresh geometry below, but it does not
             // certify any already-resident spark/particle on another cell or
             // row in the same parser batch. Retire what the probe cannot
@@ -6357,6 +6775,78 @@ impl CursorGlow {
             let owned_write = self.owned_write_span.take();
             self.retire_geometry_keeping_validated_wake(owned_write);
             return GenerationOwnership::Owned;
+        }
+        if evidence == ContentGenerationEvidence::DeferredProbe {
+            let valid = previous.terminal_id == generation.terminal_id
+                && previous.alternate_screen == generation.alternate_screen
+                && generation.alternate_screen
+                && generation.process_sequence == previous.process_sequence.wrapping_add(1)
+                && self.move_candidate.is_some_and(|candidate| {
+                    matches!(candidate.intent, GlowMoveIntent::Typed(_))
+                        && candidate.baseline_generation == Some(previous)
+                        && candidate.deferred_probe_generation == Some(generation)
+                });
+            if valid {
+                // Hold, do not classify: the current off-row caret belongs to
+                // the transient save/status half-frame. Resident geometry,
+                // the content-bound candidate, admission credits, and the old
+                // anchor remain unchanged; the tick below merely decays and
+                // emits them. A second hold cannot be minted because the
+                // candidate now records this generation.
+                self.deferred_probe_hold = true;
+                self.deferred_probe_pending = Some(generation);
+                return GenerationOwnership::DeferredProbe;
+            }
+            self.clear_denied_move_visuals();
+            return GenerationOwnership::UnownedRelocation;
+        }
+        if evidence == ContentGenerationEvidence::AuthoredMotion {
+            // This verdict exists only at the same host seam that just
+            // received `ContentCandidateDecision::Downgraded`. Re-check the
+            // non-forgeable engine state here anyway: the candidate must have
+            // been downgraded in place to MOTION, terminal/screen identity
+            // must hold, and the screen must actually be alternate. A caller
+            // cannot mint this evidence around cold output; a torn or invalid
+            // handoff falls through to the old wholesale relocation fence.
+            let identity_held = previous.terminal_id == generation.terminal_id
+                && previous.alternate_screen == generation.alternate_screen;
+            let downgraded_motion = matches!(
+                self.move_candidate.map(|candidate| candidate.intent),
+                Some(GlowMoveIntent::Motion)
+            );
+            if identity_held && generation.alternate_screen && downgraded_motion {
+                // Multi-batch redraws often restore the cursor at the next
+                // cell before this frame is presented. Anchor relocation is
+                // therefore expected here, but it authenticates no new typed
+                // light. Keep only byte-steady pre-caret wake cells attested
+                // by the coherent row probe; revoke typed admissions/hints;
+                // preserve the MOTION candidate for its separate jump-shape
+                // test. This is the streamer blackout repair.
+                self.retire_denied_move_keeping_validated_wake();
+                self.preserve_wake_on_denied_motion = true;
+                return GenerationOwnership::AuthoredMotion;
+            }
+            self.clear_denied_move_visuals();
+            return GenerationOwnership::UnownedRelocation;
+        }
+        if self.move_candidate.is_some_and(|candidate| {
+            candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && candidate.baseline_generation == Some(previous)
+                && generation.terminal_id == previous.terminal_id
+                && generation.alternate_screen == previous.alternate_screen
+                && generation.process_sequence == previous.process_sequence.wrapping_add(1)
+                && candidate.target == current_cursor
+                && self.cursor_anchor() == Some(candidate.origin)
+        }) {
+            // `sync_cursor_effect_scroll` authenticated one exact uniform row,
+            // and the confirm seam authenticated the sole next generation and
+            // target above. The scroll frame intentionally has no row probe,
+            // so preserve the already-translated cell wake and this candidate
+            // as provisionally owned. The scheduled following frame must still
+            // prove the exact fresh-line material before either engine can
+            // spawn light.
+            self.retire_geometry_keeping_translated_wake();
+            return GenerationOwnership::TranslatedScroll;
         }
         let identity_held = previous.terminal_id == generation.terminal_id
             && previous.alternate_screen == generation.alternate_screen;
@@ -6380,11 +6870,83 @@ impl CursorGlow {
             // is the batch cadence Claude-Code-style TUIs emit continuously,
             // and the wholesale wipe here was the dominant pixel-killer.
             self.retire_denied_move_keeping_validated_wake();
-            GenerationOwnership::UnownedRewrite
-        } else {
-            self.clear_denied_move_visuals();
-            GenerationOwnership::UnownedRelocation
+            return GenerationOwnership::UnownedRewrite;
         }
+        // THE E2 SPLIT-BATCH ECHO (the `StandingGapSplitEchoRetiresE2` wipe
+        // half): identity held, anchor not — the shape a keystroke's echo
+        // takes when a stream batch beat it to the fence and revoked its
+        // candidate (`unowned-batch`). If THIS batch's cursor sits exactly on
+        // that revoked candidate's predicted target, within TYPE_HINT_FRESH
+        // of the press, the "relocation" is the key's own landing: judge it a
+        // proportionate rewrite (content-attested cells plus the candidate's
+        // own predicted write keep their light), re-anchor on the landing so
+        // the NEXT keystroke arms from the right origin, and record the
+        // consumption in the admission ring (`echo-after-stream`). The
+        // tombstone never confirms, mints light, or feeds momentum — and a
+        // cold PTY (no press) has no candidate, hence no tombstone, hence
+        // relocations wipe exactly as before (THE COLD-OUTPUT LAW).
+        if identity_held
+            && let Some(tombstone) = self.take_fresh_revoked_target_tombstone(current_cursor)
+        {
+            self.admission_log.push(AdmissionRecord {
+                seq: 0,
+                phase: AdmissionPhase::Tombstone,
+                reason: "echo-after-stream",
+                intent: "typed",
+                at: tombstone.revoked_at,
+                origin: tombstone.origin,
+                target: Some(tombstone.target),
+                baseline_generation: tombstone.baseline_generation,
+                // Unlike a drop row (`gen_cur=-`), the fence DID judge
+                // this batch: name the generation it consumed against.
+                decided_generation: Some(generation.process_sequence),
+                alternate_screen: generation.alternate_screen,
+            });
+            // The predicted write: origin column through target column on
+            // the origin row — the exact span the confirm proof would have
+            // checked. A wrapped landing (target on another row) exempts
+            // nothing and retention falls back to byte-steadiness alone.
+            let exempt_write = (tombstone.origin.0 == tombstone.target.0
+                && tombstone.origin.1 < tombstone.target.1)
+                .then_some((tombstone.origin.0, tombstone.origin.1, tombstone.target.1));
+            self.retire_denied_move_keeping_validated_wake_with(exempt_write);
+            // Re-anchor on the landing: the ledger retired above, so this
+            // arms nothing — it only keeps the next press's origin honest.
+            self.last = Some(tombstone.target);
+            return GenerationOwnership::UnownedRewrite;
+        }
+        self.clear_denied_move_visuals();
+        GenerationOwnership::UnownedRelocation
+    }
+
+    /// Consume [`Self::revoked_target_tombstone`] iff THIS batch's cursor sits
+    /// exactly on the tombstone's predicted target and the press is still
+    /// fresh ([`Self::TYPE_HINT_FRESH`]), judged against the newest row-probe
+    /// capture clock — the one honest `now` this seam has (the probe is
+    /// captured under the same terminal lock as the batch being judged; a
+    /// frame with no probe cannot attest retention anyway, so it cannot
+    /// consume either). One-shot: a fresh miss leaves the slot for the caller
+    /// to tear down with the relocation wipe; a stale slot dies here (and in
+    /// [`Self::tick`], which expires it against the real frame clock).
+    fn take_fresh_revoked_target_tombstone(
+        &mut self,
+        current_cursor: Option<(u16, u16)>,
+    ) -> Option<RevokedTargetTombstone> {
+        let tombstone = self.revoked_target_tombstone?;
+        let clock = self.row_cur_meta.map(|probe| probe.at)?;
+        if clock
+            .saturating_duration_since(tombstone.revoked_at)
+            .as_secs_f32()
+            > Self::TYPE_HINT_FRESH
+        {
+            self.revoked_target_tombstone = None;
+            return None;
+        }
+        if current_cursor != Some(tombstone.target) {
+            return None;
+        }
+        self.revoked_target_tombstone = None;
+        Some(tombstone)
     }
 
     /// The per-column attestation of the batch this fence just judged, for the
@@ -6529,7 +7091,7 @@ impl CursorGlow {
             matches!(
                 candidate.intent,
                 GlowMoveIntent::Typed(_) | GlowMoveIntent::Delete
-            )
+            ) && candidate.bottom_scroll != Some(BottomScrollProof::AwaitMaterialProbe)
         }) {
             self.retire_move_candidate_at(candidate.at);
         }
@@ -6601,10 +7163,24 @@ impl CursorGlow {
         self.last_visible = self
             .last_visible
             .and_then(|((row, col), at)| row.checked_sub(rows).map(|row| ((row, col), at)));
-        if let Some(candidate) = self.move_candidate.take() {
-            // Geometry can translate, but an input-time content proof cannot:
-            // the candidate crossed a content-generation boundary.
-            self.retire_move_candidate_at(candidate.at);
+        if let Some(mut candidate) = self.move_candidate.take() {
+            // The sole exception is the input seam's pending-wrap candidate:
+            // one exact uniform row is part of its proof, not an unrelated
+            // boundary. Translate only the departure anchor; its target and
+            // material remain on the freshly created bottom row.
+            if rows == 1
+                && candidate.bottom_scroll == Some(BottomScrollProof::AwaitUniformUpOne)
+                && let Some(origin_row) = candidate.origin.0.checked_sub(1)
+            {
+                candidate.origin.0 = origin_row;
+                candidate.bottom_scroll = Some(BottomScrollProof::AwaitMaterialProbe);
+                self.move_candidate = Some(candidate);
+            } else {
+                // Geometry can translate, but every other input-time content
+                // proof is stale at this generation boundary.
+                self.move_candidate = Some(candidate);
+                self.discard_move_candidate("scroll-boundary");
+            }
         }
         // STRAY RAINBOW (owner: "I still see stray pieces of rainbow"). The
         // anchors above were translated but the LIGHT was not. Every ribbon spark
@@ -6949,9 +7525,11 @@ impl CursorGlow {
     }
 
     /// Record one confirm-seam decision in the diagnosis ring, then emit the
-    /// env-gated stderr trace. `await-echo` is a NON-decision (the candidate
-    /// stays pending for a later frame) and is traced but not ringed, so a
-    /// slow echo cannot flood the ring off one keystroke.
+    /// env-gated stderr trace. `await-echo` and
+    /// `deferred-off-row-probe` are NON-decisions (the candidate stays
+    /// pending for a later frame) and are traced but not ringed, so a slow
+    /// echo or one transient cursor-save frame cannot double-count a single
+    /// candidate as both retired and later confirmed.
     fn log_confirm(
         &mut self,
         reason: &'static str,
@@ -6959,7 +7537,7 @@ impl CursorGlow {
         current: ContentGeneration,
         now: Instant,
     ) {
-        if reason != "await-echo" {
+        if !matches!(reason, "await-echo" | "deferred-off-row-probe") {
             let phase = if reason == "confirmed" {
                 AdmissionPhase::Confirmed
             } else {
@@ -7021,14 +7599,109 @@ impl CursorGlow {
         );
     }
 
+    /// Replace the transient status-row half of the probe pair with the
+    /// exact input-time baseline carried by a deferred typed candidate. The
+    /// restored current row was captured normally; pairing it with this
+    /// immutable baseline lets the ordinary per-column wake fence retain only
+    /// cells the completed proof actually attests. Neighbor rows deliberately
+    /// become unknown: the candidate captured no authority for them.
+    fn install_deferred_wake_baseline(
+        &mut self,
+        candidate: GlowMoveCandidate,
+        current_generation: ContentGeneration,
+    ) {
+        if candidate.deferred_probe_generation != Some(current_generation) {
+            return;
+        }
+        let (Some(material), Some(baseline), Some(current_meta)) = (
+            candidate.material,
+            candidate.baseline_row,
+            self.row_cur_meta,
+        ) else {
+            return;
+        };
+        if current_meta.row != material.0 {
+            return;
+        }
+        self.row_prev.clear();
+        self.row_prev.extend_from_slice(baseline.as_slice());
+        let fill = baseline
+            .as_slice()
+            .iter()
+            .rposition(|&cell| cell != ' ')
+            .map_or(0, |index| index + 1)
+            .min(usize::from(u16::MAX)) as u16;
+        self.row_prev_meta = Some(RowProbe {
+            row: material.0,
+            caret: material.1,
+            fill,
+            at: candidate.at,
+            above: NbrProbe::Unprobed,
+            below: NbrProbe::Unprobed,
+            trust: current_meta.trust,
+        });
+        self.row_above_prev.clear();
+        self.row_below_prev.clear();
+    }
+
+    /// Resolve the one typed-proof shape whose material row is temporarily
+    /// outside the coherent probe: an alt-screen frame captured between a
+    /// cursor save and restore. Exactly one sole-next-generation frame may be
+    /// deferred, and only while a visible off-target cursor demonstrates that
+    /// the probe is genuinely elsewhere. The candidate stays content-bound;
+    /// this grants no confirmation, motion downgrade, or fresh light.
+    fn defer_missing_typed_probe(
+        &mut self,
+        candidate: GlowMoveCandidate,
+        current_cursor: Option<(u16, u16)>,
+        current_generation: ContentGeneration,
+        now: Instant,
+    ) -> Option<ContentCandidateDecision> {
+        let can_defer = self.ctx_alt
+            && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+            && candidate.deferred_probe_generation.is_none()
+            && current_cursor.is_some()
+            && current_cursor != candidate.target;
+        if can_defer {
+            self.log_confirm("deferred-off-row-probe", &candidate, current_generation, now);
+            if let Some(live) = self
+                .move_candidate
+                .as_mut()
+                .filter(|live| live.at == candidate.at && live.origin == candidate.origin)
+            {
+                live.deferred_probe_generation = Some(current_generation);
+                return Some(ContentCandidateDecision::Deferred {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                });
+            }
+        }
+        self.log_confirm(
+            if candidate.deferred_probe_generation.is_some() {
+                "deferred-probe-exhausted"
+            } else {
+                "candidate-row-unprobed"
+            },
+            &candidate,
+            current_generation,
+            now,
+        );
+        self.retire_move_candidate_at(candidate.at);
+        Some(ContentCandidateDecision::Retired {
+            at: candidate.at,
+            origin: candidate.origin,
+        })
+    }
+
     /// Confirm the pending content-bound candidate against the input-time row
     /// snapshot supplied by the host and this coherent render snapshot. Typed
     /// input must materialize the exact committed cells at the caret while
     /// every cell BEFORE the caret stays identical — the row at/after the
     /// caret is the shell's presentation zone (autosuggest, highlight
-    /// extension) and carries no veto. A deletion must be one exact
-    /// end-of-line blank with every survivor identical. A timestamp or
-    /// matching landing alone is never evidence.
+    /// extension) and carries no veto. A same-row deletion must be one exact
+    /// end-of-line blank with every survivor identical. A DECSET-45 reverse
+    /// fold instead changes no cells, so both adjacent rows must remain exact.
+    /// A timestamp or matching landing alone is never evidence.
     ///
     /// Row equality is CONTENT equality under the implicit-blank lens
     /// ([`padded_probe_cell`]): the host's baseline is tail-filled to the grid
@@ -7081,6 +7754,19 @@ impl CursorGlow {
             // the press instant and origin — the two claims output cannot
             // fake — for the jump-shaped admission. Identity changes still
             // retire outright.
+            if candidate.deferred_probe_generation.is_some() {
+                self.log_confirm(
+                    "deferred-generation-advanced",
+                    &candidate,
+                    current_generation,
+                    now,
+                );
+                self.retire_move_candidate_at(candidate.at);
+                return Some(ContentCandidateDecision::Retired {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                });
+            }
             if self.ctx_alt
                 && matches!(candidate.intent, GlowMoveIntent::Typed(_))
                 && current_generation.terminal_id == baseline_generation.terminal_id
@@ -7094,8 +7780,12 @@ impl CursorGlow {
                     target: None,
                     material: None,
                     baseline_row: None,
+                    reverse_target_baseline: None,
+                    reverse_left_col: None,
                     baseline_generation: None,
+                    deferred_probe_generation: None,
                     content_confirmed: false,
+                    bottom_scroll: None,
                 });
                 // The press's typed hint retires with its content claim: a
                 // downgraded press must not fund a later ribbon coalesce.
@@ -7114,7 +7804,38 @@ impl CursorGlow {
                 origin: candidate.origin,
             });
         }
+        if candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+            && current_cursor != candidate.target
+        {
+            // One authenticated scroll owns one exact coordinate transform,
+            // never an arbitrary caret move after it.
+            self.log_confirm(
+                "bottom-scroll-target-mismatch",
+                &candidate,
+                current_generation,
+                now,
+            );
+            self.retire_move_candidate_at(candidate.at);
+            return Some(ContentCandidateDecision::Retired {
+                at: candidate.at,
+                origin: candidate.origin,
+            });
+        }
         let Some(current_meta) = self.row_cur_meta else {
+            if candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe) {
+                // The host deliberately skips every row probe on the frame
+                // that first observes a scroll. Keep this already scroll-,
+                // generation-, and target-authenticated candidate for the
+                // next ordinary frame; freshness above bounds a host that
+                // never supplies that material probe.
+                self.log_confirm(
+                    "await-bottom-scroll-probe",
+                    &candidate,
+                    current_generation,
+                    now,
+                );
+                return None;
+            }
             // This is already the sole next processing generation. A host
             // that cannot supply its coherent row cannot defer the proof to a
             // later frame and still attribute it to this input. (Hosts now
@@ -7144,13 +7865,20 @@ impl CursorGlow {
         let (confirmed, row_changed, write_span) = match candidate.intent {
             GlowMoveIntent::Typed(expected) => {
                 let material = candidate.material?;
-                let current = captured_probe_row(
+                let Some(current) = captured_probe_row(
                     current_meta,
                     &self.row_cur,
                     &self.row_above_cur,
                     &self.row_below_cur,
                     material.0,
-                )?;
+                ) else {
+                    return self.defer_missing_typed_probe(
+                        candidate,
+                        current_cursor,
+                        current_generation,
+                        now,
+                    );
+                };
                 let start = usize::from(material.1);
                 let expected = expected.as_slice();
                 let end = start.saturating_add(expected.len());
@@ -7306,36 +8034,77 @@ impl CursorGlow {
                 )
             }
             GlowMoveIntent::Delete => {
-                let current = captured_probe_row(
-                    current_meta,
-                    &self.row_cur,
-                    &self.row_above_cur,
-                    &self.row_below_cur,
-                    candidate.origin.0,
-                )?;
-                let target = candidate.target?;
-                let col = usize::from(target.1);
-                let baseline_row = candidate.baseline_row?;
-                let baseline = baseline_row.as_slice();
-                // Same sparse-storage law as the typed arm: an EOL erase is
-                // exactly where the stored row SHRINKS below the tail-filled
-                // baseline width, so the raw length equality retired every
-                // honest Backspace echo on a trimmed-row host. The erased
-                // cell must still go glyph -> blank and every survivor must
-                // be content-identical.
-                let width = baseline.len().max(current.len());
-                let changed = probe_rows_content_differ(baseline, current);
-                let exact = target.0 == candidate.origin.0
-                    && padded_probe_cell(baseline, col) != ' '
-                    && padded_probe_cell(current, col) == ' '
-                    && (0..width).all(|i| {
-                        i == col || padded_probe_cell(baseline, i) == padded_probe_cell(current, i)
-                    });
-                // An ERASE leaves a blank where a glyph was; the ribbon never
-                // lays on a deletion echo (it poofs instead), so there is no
-                // wake cell here whose survival the exemption would decide.
-                // Narrower is safer: no span.
-                (exact, changed, None)
+                if let (Some(target_baseline), Some(left_col)) =
+                    (candidate.reverse_target_baseline, candidate.reverse_left_col)
+                {
+                    let target = candidate.target?;
+                    let origin_current = captured_probe_row(
+                        current_meta,
+                        &self.row_cur,
+                        &self.row_above_cur,
+                        &self.row_below_cur,
+                        candidate.origin.0,
+                    )?;
+                    let target_current = captured_probe_row(
+                        current_meta,
+                        &self.row_cur,
+                        &self.row_above_cur,
+                        &self.row_below_cur,
+                        target.0,
+                    )?;
+                    let origin_baseline = candidate.baseline_row?;
+                    let origin_baseline = origin_baseline.as_slice();
+                    let target_baseline = target_baseline.as_slice();
+                    let origin_changed =
+                        probe_rows_content_differ(origin_baseline, origin_current);
+                    let target_changed =
+                        probe_rows_content_differ(target_baseline, target_current);
+                    let exact_shape = candidate.origin.1 == left_col
+                        && target.0.checked_add(1) == Some(candidate.origin.0)
+                        && usize::from(target.1).checked_add(1) == Some(target_baseline.len())
+                        && origin_baseline.len() == target_baseline.len();
+                    // BS itself changes no cells. Stability of BOTH adjacent
+                    // rows, the sole-next generation, and the exact right-edge
+                    // landing is the complete inverse-fold evidence.
+                    (
+                        exact_shape && !origin_changed && !target_changed,
+                        origin_changed || target_changed,
+                        None,
+                    )
+                } else {
+                    let current = captured_probe_row(
+                        current_meta,
+                        &self.row_cur,
+                        &self.row_above_cur,
+                        &self.row_below_cur,
+                        candidate.origin.0,
+                    )?;
+                    let target = candidate.target?;
+                    let col = usize::from(target.1);
+                    let baseline_row = candidate.baseline_row?;
+                    let baseline = baseline_row.as_slice();
+                    // Same sparse-storage law as the typed arm: an EOL erase is
+                    // exactly where the stored row SHRINKS below the tail-filled
+                    // baseline width, so the raw length equality retired every
+                    // honest Backspace echo on a trimmed-row host. The erased
+                    // cell must still go glyph -> blank and every survivor must
+                    // be content-identical.
+                    let width = baseline.len().max(current.len());
+                    let changed = probe_rows_content_differ(baseline, current);
+                    let exact = target.0 == candidate.origin.0
+                        && padded_probe_cell(baseline, col) != ' '
+                        && padded_probe_cell(current, col) == ' '
+                        && (0..width).all(|i| {
+                            i == col
+                                || padded_probe_cell(baseline, i)
+                                    == padded_probe_cell(current, i)
+                        });
+                    // An ERASE leaves a blank where a glyph was; the ribbon never
+                    // lays on a deletion echo (it poofs instead), so there is no
+                    // wake cell here whose survival the exemption would decide.
+                    // Narrower is safer: no span.
+                    (exact, changed, None)
+                }
             }
             _ => (false, false, None),
         };
@@ -7349,10 +8118,23 @@ impl CursorGlow {
             // as at the generation-skip seam. ROW-MISMATCH stays a retire —
             // content moved under the caret, and attributing a later jump to
             // this press would claim causality the mismatch just disproved.
+            if candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && let Some(target) = candidate.target
+            {
+                // The scroll/generation/landing were already authenticated by
+                // the hold. A failed material probe retires only the pending
+                // fold; the next tick must consume this known landing without
+                // letting the generic denied-move fence black out mature cells
+                // that were translated before this proof was attempted.
+                self.preserve_wake_on_rejected_bottom_scroll =
+                    Some((candidate.origin, target));
+            }
             if self.ctx_alt
                 && !row_changed
+                && candidate.bottom_scroll.is_none()
                 && matches!(candidate.intent, GlowMoveIntent::Typed(_))
             {
+                self.install_deferred_wake_baseline(candidate, current_generation);
                 self.log_confirm("motion-downgrade", &candidate, current_generation, now);
                 self.move_candidate = Some(GlowMoveCandidate {
                     at: candidate.at,
@@ -7361,8 +8143,12 @@ impl CursorGlow {
                     target: None,
                     material: None,
                     baseline_row: None,
+                    reverse_target_baseline: None,
+                    reverse_left_col: None,
                     baseline_generation: None,
+                    deferred_probe_generation: None,
                     content_confirmed: false,
+                    bottom_scroll: None,
                 });
                 if self.type_hint == Some(candidate.at) {
                     self.type_hint = None;
@@ -7402,7 +8188,9 @@ impl CursorGlow {
         if let Some(candidate) = self.move_candidate.as_mut() {
             candidate.content_confirmed = true;
         }
+        self.install_deferred_wake_baseline(candidate, current_generation);
         if matches!(candidate.intent, GlowMoveIntent::Delete)
+            && candidate.reverse_target_baseline.is_none()
             && let Some((row, col)) = candidate.target
         {
             self.confirmed_delete_span = Some((candidate.at, row, col));
@@ -7648,6 +8436,12 @@ impl CursorGlow {
             // drains — in practice the rainbow kitty sparks born beside every pop
             // outlive it, but the pop's cadence must not depend on that.
             || !self.rainbow.ink_pops.is_empty()
+            // A scroll frame deliberately carries no row probe. Schedule one
+            // bounded follow-up so an exact bottom-scroll candidate can prove
+            // material; ordinary candidates remain output-driven.
+            || self.move_candidate.is_some_and(|candidate| {
+                candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+            })
     }
 
     /// RESPONSIVENESS: when the NEXT visible change is due, so the host can pace
@@ -7707,11 +8501,20 @@ impl CursorGlow {
     /// `last_visible` / `last_move`), and `ctx_alt` stay with the callers —
     /// the three paths deliberately differ there.
     fn clear_transient_state(&mut self) {
+        self.preserve_wake_on_denied_motion = false;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
+        self.deferred_probe_hold = false;
+        self.deferred_probe_pending = None;
         self.clear_visual_geometry();
         self.rainbow.clear_admission();
         self.sound_cues.clear();
         self.clear_keyed_clicks();
         self.revoke_unowned_hints();
+        // The wholesale teardown outranks the tombstone `revoke_unowned_hints`
+        // may have just stashed: an identity change, a REAL relocation (cursor
+        // at neither anchor nor tombstone target), reset, and dark all come
+        // through here, and none of them may leave a rescue slot armed.
+        self.revoked_target_tombstone = None;
         self.last_poof = None;
         self.row_cur.clear();
         self.row_prev.clear();
@@ -7720,13 +8523,16 @@ impl CursorGlow {
         self.clear_neighbor_rows();
     }
 
-    /// Revoke the full input-classifier cohort: every one-shot hint, the
-    /// exact candidate, and the Backspace deletion proof. This is the
-    /// fail-closed half EVERY unowned generation change applies, whether or
-    /// not the resident light survives it (the proportionate-fence retained
-    /// path calls only this). Visual geometry, admission credits, audio
-    /// dedup, and the row probes are deliberately not touched here — the
-    /// wholesale teardowns layer those on top.
+    /// Revoke the input-classifier cohort: every one-shot hint, the
+    /// content-bound candidate, and the exact Backspace deletion proof. This
+    /// is the fail-closed half EVERY unowned generation change applies,
+    /// whether or not the resident light survives it (the
+    /// proportionate-fence retained path calls only this). One family is
+    /// EXEMPT — the Motion candidate: it carries no content claim an unowned
+    /// batch could stale, and its own freshness window still bounds it.
+    /// Visual geometry, admission credits, audio dedup, and the row probes
+    /// are deliberately not touched here — the wholesale teardowns layer
+    /// those on top.
     fn revoke_unowned_hints(&mut self) {
         self.quench_hint = None;
         self.nav_hint = None;
@@ -7748,6 +8554,30 @@ impl CursorGlow {
             self.move_candidate.map(|candidate| candidate.intent),
             Some(GlowMoveIntent::Motion)
         ) {
+            // THE REVOKED-TARGET TOMBSTONE (E2 split-batch echo): a TYPED
+            // candidate this fence revokes mid-flight — the stream batch beat
+            // the key's echo to the fence — leaves its identity behind, so the
+            // echo batch (cursor exactly on the predicted target, within
+            // TYPE_HINT_FRESH of the press) can be judged a proportionate
+            // rewrite instead of a relocation-with-wipe. Newest wins; the
+            // wholesale teardowns (`clear_transient_state`) clear it right
+            // after this call, so only the fence's own retained paths keep it.
+            // Typed only: it is the one intent whose echo is still owed a
+            // landing on a predicted target (Motion survives above, and the
+            // other intents predict no typed echo this repair is for).
+            if let Some(candidate) = self.move_candidate
+                && let (GlowMoveIntent::Typed(_), Some(target)) =
+                    (candidate.intent, candidate.target)
+            {
+                self.revoked_target_tombstone = Some(RevokedTargetTombstone {
+                    revoked_at: candidate.at,
+                    origin: candidate.origin,
+                    target,
+                    baseline_generation: candidate
+                        .baseline_generation
+                        .map(|generation| generation.process_sequence),
+                });
+            }
             self.discard_move_candidate("unowned-batch");
         }
         self.candidate_superseded = false;
@@ -7807,12 +8637,23 @@ impl CursorGlow {
     /// attesting pair, or a probe that changed rows: fail closed to the
     /// wholesale wipe, exactly as before.
     ///
-    /// Only the cell-anchored WAKE families are eligible (sparks; the rainbow
-    /// tail memory, ink pops and nozzle). The projectile/transient families
-    /// (particles, glide, meteors, vapor, bolts, ring, crown, style fades)
-    /// stay on the wholesale rule: they are sub-second at-cursor flashes whose
-    /// retirement was never the darkness, and a row probe cannot attest their
-    /// sub-cell positions anyway.
+    /// The cell-anchored WAKE families retain per attested cell (sparks; the
+    /// rainbow tail memory, ink pops and nozzle). The at-cursor TRANSIENT
+    /// families — `particles` (typing twinkles, shooting-star debris, poof
+    /// sparkles) here, and the rainbow landing `bursts` in the rainbow twin —
+    /// are EXEMPT from this proportionate fence outright (v0.43.0 law,
+    /// restored): they are sub-second flashes (0.26-1.4 s lifetimes) born
+    /// only from admitted moves or key-hint-licensed poofs, and a byte-steady
+    /// repaint elsewhere cannot invalidate a flash at the caret. Under a
+    /// streaming TUI's batch cadence the old per-batch clear killed them
+    /// within tens of ms of birth — structurally invisible twinkles, the
+    /// owner's "I don't see the sparkles" — so they now live their own
+    /// lifetimes here and die only of age or of a WHOLESALE teardown
+    /// ([`Self::clear_visual_geometry`] — relocations, identity changes,
+    /// resets — which still clears them: a real relocation strands at-cursor
+    /// light). The remaining projectile/positional families (glide, meteors,
+    /// vapor, bolts, ring, crown, style fades) stay on the per-batch rule: a
+    /// row probe cannot attest their sub-cell positions.
     ///
     /// `owned_write` is the ONE narrow exemption, and only the Owned path may
     /// pass it: the cells the candidate confirmed THIS batch materialized (see
@@ -7840,7 +8681,6 @@ impl CursorGlow {
         };
         self.fading.clear();
         self.ramp_in_at = None;
-        self.particles.clear();
         self.glide.clear();
         self.fire_meteors.clear();
         self.vapor.clear();
@@ -7872,6 +8712,32 @@ impl CursorGlow {
         self.row_cur = cur_cells;
     }
 
+    /// The no-probe twin of [`Self::retire_geometry_keeping_validated_wake`]
+    /// for one authenticated upward terminal scroll. [`Self::note_scroll`]
+    /// already translated every resident family into the new coordinate
+    /// space; only the CELL wake has enough ownership to survive the parser
+    /// generation boundary. Projectile/sub-cell transients and cached output
+    /// planes still retire exactly as they do at the ordinary content fence.
+    fn retire_geometry_keeping_translated_wake(&mut self) {
+        self.fading.clear();
+        self.ramp_in_at = None;
+        self.particles.clear();
+        self.rainbow.jumps.clear();
+        self.rainbow.bursts.clear();
+        self.glide.clear();
+        self.fire_meteors.clear();
+        self.vapor.clear();
+        self.last_smoke = None;
+        self.bolts.clear();
+        self.ring = None;
+        self.crown_until = None;
+        self.halo_out.clear();
+        self.patch_out.clear();
+        self.under_out.clear();
+        self.char_out.clear();
+        self.fire_halo_out.clear();
+    }
+
     /// Retire every visual trail family at a denied relocation while
     /// preserving independently earned, already-queued key-time audio. The
     /// echo-dedup ledger is one-shot correlation state: once the first observed
@@ -7892,12 +8758,29 @@ impl CursorGlow {
     /// evidence, which is what lets a wake live through a STREAM of unowned
     /// repaints instead of only the first one.
     fn retire_denied_move_keeping_validated_wake(&mut self) {
-        let sound_cues = std::mem::take(&mut self.sound_cues);
         // `None`: this batch is UNOWNED, so nothing in it is a proven write
         // and byte-steadiness is the only evidence on offer. (The span itself
         // is dropped by `revoke_unowned_hints` below, with the rest of the
         // fail-closed cohort.)
-        self.retire_geometry_keeping_validated_wake(None);
+        self.retire_denied_move_keeping_validated_wake_with(None);
+    }
+
+    /// [`Self::retire_denied_move_keeping_validated_wake`] with an explicit
+    /// exempt span. The ONE caller that passes `Some` is the consumed
+    /// revoked-target tombstone (`echo-after-stream`): the span is the revoked
+    /// candidate's own predicted write — origin column through target column on
+    /// the origin row — and the consult has just verified the cursor landed on
+    /// exactly that predicted target. Without it the split-batch echo's glyph
+    /// beheads the ribbon at the previous head's cell (the very cell the
+    /// keystroke was predicted to write), which is the v0.52 "sparkles
+    /// truncated" shape all over again. This exemption RETAINS resident light
+    /// on that span; it never mints any.
+    fn retire_denied_move_keeping_validated_wake_with(
+        &mut self,
+        exempt_write: Option<(u16, u16, u16)>,
+    ) {
+        let sound_cues = std::mem::take(&mut self.sound_cues);
+        self.retire_geometry_keeping_validated_wake(exempt_write);
         self.rainbow.clear_admission();
         self.clear_keyed_clicks();
         self.revoke_unowned_hints();
@@ -7966,6 +8849,10 @@ impl CursorGlow {
         self.ctx_alt = false;
         self.candidate_superseded = false;
         self.last_content_generation = None;
+        self.preserve_wake_on_denied_motion = false;
+        self.preserve_wake_on_rejected_bottom_scroll = None;
+        self.deferred_probe_hold = false;
+        self.deferred_probe_pending = None;
     }
 
     /// Advance one frame: observe the cursor at `cur` (`Some(row,col)` visible,
@@ -8025,9 +8912,22 @@ impl CursorGlow {
         // Any ENABLED tick may spawn light, bank heat, or arm hints: the next
         // dark frame must run one full teardown before it may latch again.
         self.dark_settled = false;
+        // The revoked-target tombstone expires TYPE_HINT_FRESH after its
+        // press, against the real frame clock: a split-batch echo lands a
+        // frame or two after the stream batch, and anything older is not that
+        // echo. (The consult seam re-checks against the probe clock; this is
+        // the belt that clears a slot no batch ever consults.)
+        if self.revoked_target_tombstone.is_some_and(|tombstone| {
+            now.saturating_duration_since(tombstone.revoked_at)
+                .as_secs_f32()
+                > Self::TYPE_HINT_FRESH
+        }) {
+            self.revoked_target_tombstone = None;
+        }
         if self.rng == 0 {
             self.rng = 0x9E37_79B9;
         }
+        self.retire_expired_bottom_scroll_probe(now);
 
         // STYLE SWITCH mid-animation: the still-in-flight sparks / particles /
         // bolts / meteors were forged under the OLD style's geometry, colours, and
@@ -8295,7 +9195,34 @@ impl CursorGlow {
         let completed_hidden_reappearance =
             self.last.is_none() && cur.is_some() && self.last_visible.is_some();
         let unseeded_visible = self.last.is_none() && self.last_visible.is_none() && cur.is_some();
-        if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
+        let awaiting_bottom_scroll_probe = self.move_candidate.is_some_and(|candidate| {
+            candidate.bottom_scroll == Some(BottomScrollProof::AwaitMaterialProbe)
+                && !candidate.content_confirmed
+                && now.saturating_duration_since(candidate.at).as_secs_f32()
+                    <= Self::TYPE_HINT_FRESH
+        });
+        let deferred_probe_hold = std::mem::take(&mut self.deferred_probe_hold);
+        if self.deferred_probe_pending.is_some() && !deferred_probe_hold {
+            // A deferred probe gets exactly the transient tick above. By this
+            // following tick the restore confirm must already have consumed
+            // `deferred_probe_pending` through a same-generation completion.
+            // If a direct/test host skipped the generation seam entirely,
+            // fail closed before any cursor classifier adopts the temporary
+            // coordinate.
+            self.clear_denied_move_visuals();
+            self.deferred_probe_pending = None;
+        }
+        if deferred_probe_hold {
+            // One transient cursor-save frame: keep the old anchor and exact
+            // candidate. No spawn/classification runs and no current-cursor
+            // state is adopted. Existing geometry still decays/emits below.
+        } else if awaiting_bottom_scroll_probe {
+            // The cursor has already landed, but the scroll frame deliberately
+            // carries no content probe. Hold the translated departure anchor
+            // for one scheduled frame; consuming the unconfirmed candidate or
+            // advancing `last` here would make the later exact material proof
+            // unreachable. No light is admitted on this hold.
+        } else if let (Some((pr, pc)), Some((cr, cc))) = (spawn_from, cur)
             && (pr != cr || pc != cc)
         {
             let dist = (cr.abs_diff(pr)).max(cc.abs_diff(pc));
@@ -8317,11 +9244,23 @@ impl CursorGlow {
             } else {
                 Self::CROWN_MS
             };
+            let preserve_denied_motion = self.preserve_wake_on_denied_motion;
+            let preserve_rejected_bottom_scroll = self
+                .preserve_wake_on_rejected_bottom_scroll
+                .is_some_and(|(origin, target)| origin == (pr, pc) && target == (cr, cc));
             let admitted = self.spawn(pr, pc, cr, cc, now, cfg, geom);
-            self.last_move = Some(now);
             if admitted {
+                self.last_move = Some(now);
                 self.crown_until = Some(now + Duration::from_millis(self.crown_window_ms));
             } else {
+                // A small AuthoredMotion relocation is a dark anchor advance,
+                // not movement provenance. Preserve the prior movement clock
+                // along with the attested wake; otherwise repeated coalesced
+                // redraws can keep a crown timer/glide cadence artificially
+                // warm even though they admitted no light.
+                if !preserve_denied_motion && !preserve_rejected_bottom_scroll {
+                    self.last_move = Some(now);
+                }
                 // The crown is cursor-relative, so carrying an older one across
                 // an unadmitted program warp would teleport legitimate light to
                 // the new cursor and turn the silent move back into a stray.
@@ -8341,16 +9280,36 @@ impl CursorGlow {
             // correlation that completed before first draw.
             self.retire_hidden_movement_provenance();
         }
-        self.last = cur;
-        if let Some(c) = cur {
-            self.last_visible = Some((c, now));
+        if !awaiting_bottom_scroll_probe && !deferred_probe_hold {
+            self.last = cur;
+            if let Some(c) = cur {
+                self.last_visible = Some((c, now));
+            }
         }
+        // A downgraded generation with no visible delta still spends the
+        // one-shot candidate and retention credit here; neither may escape to
+        // an unrelated later program move.
+        if self.preserve_wake_on_denied_motion {
+            self.preserve_wake_on_denied_motion = false;
+            self.move_candidate = None;
+        }
+        // The rejected-material exception belongs only to this presented
+        // landing. Hidden/stationary ticks spend it too, so it cannot be
+        // borrowed by a later unrelated cursor move.
+        self.preserve_wake_on_rejected_bottom_scroll = None;
         // The TYPING WAKE's sub-cell nozzle (rainbow kitty only — every other style's
         // state and emission stay byte-identical). Three float ops; the plume it
         // anchors is only ever emitted while the pop ring is non-empty, so a
         // window nobody is typing in pays for the ease and nothing else.
         if matches!(cfg.style, GlowStyle::RainbowKitty) {
-            self.advance_wake_head(cur, now);
+            self.advance_wake_head(
+                if deferred_probe_hold || awaiting_bottom_scroll_probe {
+                    self.cursor_anchor()
+                } else {
+                    cur
+                },
+                now,
+            );
         }
 
         // ERASE POOF detection: a fresh kill-key hint paired with a same-row NET
@@ -9102,32 +10061,74 @@ impl CursorGlow {
         // Consume the sole candidate on the first observed delta, matched or
         // not. A swallowed/ignored input can therefore never be retried against
         // a later program CUP within the freshness window.
-        let admitted_intent = self
-            .move_candidate
+        let preserve_denied_motion = std::mem::take(&mut self.preserve_wake_on_denied_motion);
+        let preserve_rejected_bottom_scroll = self
+            .preserve_wake_on_rejected_bottom_scroll
             .take()
+            .is_some_and(|(origin, target)| origin == (pr, pc) && target == (cr, cc));
+        let candidate = self.move_candidate.take();
+        // Normally the generation fence consumes this exact-batch witness
+        // before `spawn`. A deferred save/restore may complete in the SAME
+        // generation; if any direct/test host reaches spawn without the
+        // evidence-rich fence, the span still belongs to this consumed
+        // candidate and may not license retention in a future batch.
+        self.owned_write_span = None;
+        let authenticated_motion_origin = candidate.is_some_and(|candidate| {
+            candidate.intent == GlowMoveIntent::Motion && candidate.origin == (pr, pc)
+        });
+        let admitted_intent = candidate
             .filter(|candidate| {
                 candidate.admits((pr, pc), (cr, cc), now, Self::TYPE_HINT_FRESH)
             })
             .map(|candidate| candidate.intent);
+        if admitted_intent.is_none() && preserve_denied_motion && authenticated_motion_origin {
+            // The authenticated multi-batch key finished as a sub-jump caret
+            // step. Consume its downgraded candidate dark BEFORE
+            // `classify_move`: that classifier updates the glide EMA/run, so
+            // reaching it would let a deliberately denied move pump the next
+            // real animation even though no geometry was born. The generation
+            // fence has already reduced resident light to byte-attested wake.
+            return false;
+        }
+        if admitted_intent.is_none() && preserve_rejected_bottom_scroll {
+            // The candidate was retired by a same-generation material
+            // rejection. This exact landing is therefore dark but does not
+            // invalidate already-translated resident cells; return before the
+            // move classifier can warm glide/crown state or mint geometry.
+            return false;
+        }
         let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, admitted_intent);
         // Rainbow-kitty morphology is computed only after candidate admission:
         // row changes and large same-row skips can then select a linear ZOOM
         // streak instead of disconnected per-cell sparks.
         let rainbow_kitty = matches!(cfg.style, GlowStyle::RainbowKitty);
-        // Legacy classifier stamps are consumed on the first observed delta but
-        // cannot admit it. Exact or explicit synthetic candidates are the sole
-        // provenance for every style; these booleans remain false so Return and
-        // reflow timestamps cannot bypass the universal gate.
-        let _ = self
+        // Legacy classifier stamps are consumed on the first observed delta and
+        // can never ADMIT it — exact or explicit synthetic candidates stay the
+        // sole provenance for every style, and the universal gate below fails
+        // closed before any light. But a FRESH stamp is a LICENSE (v0.43.0 law,
+        // restored): once a move IS admitted, the resize/Enter gesture behind
+        // it earns the ZOOM/starburst arm even from a cold momentum spine (the
+        // `disp >= RAINBOW_JUMP_MIN_DISP || return_licensed || reflow_licensed`
+        // disjunction in `spawn_move_light`). Hard-wiring these false made a
+        // cold Enter land dark forever — the streak the owner had at v0.43.0.
+        // THE RESIZE LICENSE, consumed ONCE per spawn for EVERY style (owner,
+        // 2026-07-28: "all get"): `spawn` runs only on an observed move, and
+        // the first admitted move after a settled resize IS the relayout
+        // relocation, so this pairs with the right one. It also suppresses the
+        // landing payload — a resize gets the BEAM ONLY.
+        let reflow_licensed = self
             .reflow_hint
-            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH);
-        let reflow_licensed = false;
-        // Consume Return once even though it cannot admit; it must not survive
-        // as stale morphology for a later exact candidate.
-        let _ = self.return_hint.take_if(|t| {
-            now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
-        });
-        let return_licensed = false;
+            .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::REFLOW_HINT_FRESH)
+            .is_some();
+        // Consume Return once; a FRESH stamp is the bare-Enter license for the
+        // admitted jump arm ("a cold Enter throws the streak again"), and a
+        // stale one must not survive as morphology for a later exact candidate.
+        let return_licensed = self
+            .return_hint
+            .take_if(|t| {
+                now.saturating_duration_since(*t).as_secs_f32() <= Self::RETURN_HINT_FRESH
+            })
+            .is_some();
         // Consume Tab/paste once even though the timestamp cannot prove which
         // later PTY movement, if any, the child authored.
         let _ = self.user_gesture_hint.take();
@@ -9149,6 +10150,26 @@ impl CursorGlow {
         // cannot pollute heat, glide velocity, or a future landing anchor.
         let move_witnessed = admitted_intent.is_some();
         if !move_witnessed {
+            // THE 0.43 AMPLITUDE LAW survives the denial: a DENIED move whose
+            // shape is real typing under a fresh press hint still feeds the
+            // momentum spine (and mirrors the plain Advance pulse to the cat)
+            // — streaming collisions retire candidates constantly, and gating
+            // AMPLITUDE on admission is what parked the starfield at the cold
+            // floor forever. Provenance stays gated: a denied move mints no
+            // spark, no pop, no burst — only the number every earned-drama
+            // consumer reads. Cold output arms no key hint and credits
+            // nothing; backspace-paired wrap shapes are excluded.
+            if mv.typed_hinted
+                && (mv.forward || (mv.wrap && !mv.bs_pair) || mv.rainbow_coalesce)
+                && !mv.deletion
+                && !mv.navigation
+            {
+                self.rainbow.momentum.advance(mv.now);
+                self.rainbow.momentum_pulse = Some(CursorCatMotionPulse {
+                    at: mv.now,
+                    kind: CursorCatMotionKind::Advance,
+                });
+            }
             // A denied relocation changes the coordinate owner for EVERY
             // style, including Trail Packs. Retire the common transient state
             // in one exhaustive teardown: leaving even a non-typing spark,
@@ -9502,6 +10523,31 @@ impl CursorGlow {
         let navigation = (nav_hint_fresh
             && matches!(admitted_intent, Some(GlowMoveIntent::Delete)))
             || matches!(admitted_intent, Some(GlowMoveIntent::Motion));
+        // THE CANONICAL TYPING-MOMENTUM METRIC builds here and ONLY here, on
+        // the PRESS-HINT half (v0.43.0 law, restored): a non-delete printable
+        // typing advance — a forward glyph echo, a typing wrap/re-anchor, or a
+        // coalesced multi-glyph echo — paired with the fresh key-time hint
+        // (`typed_at`, armed by the host on a real printable key). Momentum is
+        // AMPLITUDE, never provenance: it mints no light by itself (every
+        // consumer still needs admitted sparks/jumps to exist), so it
+        // deliberately does NOT wait for candidate ADMISSION. Under streaming
+        // collisions — a busy TUI's batches revoking each keystroke's
+        // candidate before its echo lands — the admission-gated spelling
+        // starved the spine to zero at exactly the cadence the owner types
+        // against, so the starfield density and the ZOOM's warm-spine license
+        // never left the floor. The cold-output law holds untouched: program
+        // output arms no key-time hint, so a spinner's forward crawl still
+        // buys nothing (`program_output_alone_builds_no_momentum` pins it),
+        // and deletes/kills keep DRAINING at their key hints
+        // ([`Self::note_backspace`]/[`Self::note_kill`]). Rate normalization
+        // lives inside [`TypingMomentum::advance`], so a coalesced 3-glyph
+        // echo credits its one observed gap — key count never buys momentum.
+        // The one residual that CANNOT be resolved at the terminal layer: a
+        // printable key whose echo IS a forward move (vim `l`/`w` in normal
+        // mode) is byte-indistinguishable from typed text — noted, never
+        // mode-detected. The pulse mirrors this exact correlated advance onto
+        // the cursor cat so the two momentum instances read one value
+        // ([`Self::take_momentum_pulse`]).
         MoveCtx {
             pr,
             pc,
@@ -9517,8 +10563,10 @@ impl CursorGlow {
             typed_pair,
             echo_run,
             re_anchor,
-            wrap,
             rainbow_coalesce,
+            wrap,
+            typed_hinted: typed_at.is_some(),
+            bs_pair,
             // Consumed here, once per observed move: the classifier is the one
             // place that reads it, and leaving it armed would let one scroll
             // veto every later relocation.
@@ -9540,17 +10588,20 @@ impl CursorGlow {
         let &MoveCtx {
             pr,
             pc,
+            cc,
             now,
             cfg,
             geom,
             wrap,
+            re_anchor,
             rainbow_coalesce,
+            typed_hinted,
+            bs_pair,
             typing,
             fire,
             forward,
             deletion,
             navigation,
-            typed_pair,
             ..
         } = mv;
         // Typing cadence → HEAT: each keystroke earns credit by how quickly it
@@ -9615,9 +10666,37 @@ impl CursorGlow {
             // text — noted, never mode-detected. The pulse below mirrors this
             // exact correlated advance onto the cursor cat so the two momentum
             // instances read one value ([`Self::take_momentum_pulse`]).
-            if typed_pair && (forward || wrap || rainbow_coalesce) && !deletion && !navigation {
+            // THE 0.43 RESTORATION LAW (amplitude, not provenance): the spine
+            // advances on the PRESS-HINT half — a fresh key-time `typed_at`
+            // stamp with a typing shape — NOT on candidate admission, so
+            // streaming collisions that deny every candidate still let real
+            // typing earn its starfield. Cold output arms no key hint and
+            // builds nothing; a DENIED backspace landing wearing a wrap shape
+            // (`bs_pair`) is excluded, deletes DRAIN at their key hints, and
+            // one press credits at most one advance (the hint is consumed).
+            if typed_hinted
+                && (forward || (wrap && !bs_pair) || rainbow_coalesce)
+                && !deletion
+                && !navigation
+            {
                 self.rainbow.momentum.advance(now);
-                self.rainbow.momentum_pulse = Some(now);
+                self.rainbow.momentum_pulse = Some(CursorCatMotionPulse {
+                    at: now,
+                    kind: if wrap && cc < pc {
+                        CursorCatMotionKind::FoldForward
+                    } else {
+                        CursorCatMotionKind::Advance
+                    },
+                });
+            } else if deletion && re_anchor && cc > pc && !navigation {
+                // The input seam already delivered `CursorCat::on_key(false)`
+                // for this Backspace. This pulse carries only the authenticated
+                // PLACE change: duplicating the key here would drain momentum
+                // and re-kick the oops reaction twice.
+                self.rainbow.momentum_pulse = Some(CursorCatMotionPulse {
+                    at: now,
+                    kind: CursorCatMotionKind::FoldReverse,
+                });
             }
             self.last_type = Some(now);
             // QUENCH STEAM: a deletion echo flashes vapor off the doused cell
@@ -12256,10 +13335,18 @@ impl CursorGlow {
             self.bs_baseline = None;
             self.confirmed_delete_span = None;
         }
-        // Kill chords retain the legacy row-diff/fallback license. Plain
-        // Backspace reaches only the exact confirmed-span branch below; its
-        // timestamp cannot enter `fresh_kill`.
+        // A poof is licensed by EITHER a kill chord (`kill_hint`) OR a plain
+        // Backspace (`bs_poof_hint`) — v0.43.0 law, restored: EVERY Backspace
+        // licenses the erase POOF. Both mean "text is vanishing, puff the
+        // vacated span"; they share the whole downstream span/fallback
+        // machinery and the `POOF_MIN_GAP` rate gate, only their arming
+        // semantics differ. (The exact confirmed-span branch below still
+        // answers FIRST when the admission proof delivered the precise cell —
+        // this OR is what keeps a Backspace whose exact candidate was revoked
+        // by a streaming batch from losing its poof entirely.)
         let fresh_kill = self.kill_hint.is_some_and(|t| {
+            now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
+        }) || self.bs_poof_hint.is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::KILL_HINT_FRESH
         });
         let gap_ok = self
@@ -12332,7 +13419,13 @@ impl CursorGlow {
             // the unmoved prefix + the shifted suffix (overlap allowed — repeated
             // chars make p and s double-count, which only proves stability
             // harder). A scrolled/replaced row shares no such structure.
-            if p + s >= cur_fill {
+            //
+            // …but the test is VACUOUSLY true when the new row is BLANK
+            // (`cur_fill == 0` accounts for nothing), and a page-scroll can
+            // slide in a replacement row that shares an accidental prefix
+            // ('    })' → '    }'). Both are LINE REPLACEMENTS, not kills, so
+            // the arm additionally demands a NON-TRIVIAL SURVIVOR below.
+            if cur_fill > 0 && p + s >= cur_fill {
                 // The vanished span: prefix end .. old fill minus the survivors
                 // that shifted in from the right. `s_span` re-caps the suffix so
                 // repeated-char overlap can't push `c1` left of `c0`, and the
@@ -12343,25 +13436,46 @@ impl CursorGlow {
                 let s_span = s.min(cur_fill - p.min(cur_fill));
                 let c0 = p.min(prev.caret as usize).min(cur_fill) as u16;
                 let c1 = (prev_fill - s_span).max(c0 as usize + 1) as u16;
-                let n = (prev.fill - cur.fill).max(1);
-                self.spawn_poof(prev.row, c0, c1, n, now, cfg, geom, true);
-                // FRESH-INK KILL (span twin of the backspace retreat retain in
-                // `spawn`): a Ctrl-U/K/W span kill erased every glyph in
-                // `[c0..c1)` of `prev.row`, so any fresh-ink pop over those cells
-                // must die WITH its ink — instantly, like a backspace — rather
-                // than hang a warm highlight over the blank advertising a letter
-                // the kill just removed. Single retain over the live pops keeps
-                // it O(live pops); the `is_empty` gate keeps the idle path free.
-                if !self.rainbow.ink_pops.is_empty() {
-                    self.rainbow
-                        .ink_pops
-                        .retain(|p| p.row != prev.row || !(c0..c1).contains(&p.col));
+                // NON-TRIVIAL SURVIVOR: at least one NON-BLANK cell of the
+                // baseline's content must survive OUTSIDE the vanished span —
+                // the unmoved prefix left of `c0` holds ink, or a shifted
+                // suffix exists (its last cell is `cur_fill - 1`, non-blank by
+                // the fill definition). A real kill always leaves such a
+                // remnant abutting the span (prompt, prefix, or the shifted
+                // tail); a page-scroll REPLACEMENT whose caret sits inside the
+                // blank margin pulls `c0` left of every surviving glyph
+                // ('    })' → '    }' with the caret at the line start) and a
+                // blank scroll-in retains nothing at all — both refuse here
+                // and stay dark instead of minting a phantom full-row poof.
+                // A refusal simply falls through — the licences keep their
+                // freshness windows (a later batch may still carry the real
+                // shrink) and the Full-trust caret fallback below may answer.
+                let survivor_holds_ink = s_span > 0
+                    || self.row_cur[..(c0 as usize).min(self.row_cur.len())]
+                        .iter()
+                        .any(|&ch| ch != ' ');
+                if survivor_holds_ink {
+                    let n = (prev.fill - cur.fill).max(1);
+                    self.spawn_poof(prev.row, c0, c1, n, now, cfg, geom, true);
+                    // FRESH-INK KILL (span twin of the backspace retreat retain
+                    // in `spawn`): a Ctrl-U/K/W span kill erased every glyph in
+                    // `[c0..c1)` of `prev.row`, so any fresh-ink pop over those
+                    // cells must die WITH its ink — instantly, like a backspace
+                    // — rather than hang a warm highlight over the blank
+                    // advertising a letter the kill just removed. Single retain
+                    // over the live pops keeps it O(live pops); the `is_empty`
+                    // gate keeps the idle path free.
+                    if !self.rainbow.ink_pops.is_empty() {
+                        self.rainbow
+                            .ink_pops
+                            .retain(|p| p.row != prev.row || !(c0..c1).contains(&p.col));
+                    }
+                    self.last_poof = Some(now);
+                    self.kill_hint = None;
+                    self.bs_poof_hint = None;
+                    self.bs_baseline = None;
+                    poofed = true;
                 }
-                self.last_poof = Some(now);
-                self.kill_hint = None;
-                self.bs_poof_hint = None;
-                self.bs_baseline = None;
-                poofed = true;
             }
         }
         // CARET-ANCHORED FALLBACK: every kill keypress earns exactly one poof.
@@ -12381,17 +13495,32 @@ impl CursorGlow {
             (Some(a), Some(b)) => Some(a.max(b)),
             (a, b) => a.or(b),
         };
-        // This fallback is kill-chord-only: `fresh_kill` above excludes plain
-        // Backspace, whose exact confirmed span already had its sole branch.
-        // Keep the older Backspace-shaped predicates defensive if the outer gate
-        // is ever widened, but do not mistake them for present-day admission.
+        // A plain Backspace must PROVE it erased something before the caret
+        // fallback answers. The kill-CHORD fallback stays permissive — its hint
+        // is proof a kill KEY was pressed, and "a kill with nothing to kill
+        // still reads as honest feedback" (the reflowing-TUI case the fallback
+        // exists for). But an ordinary Backspace at column 0 / on an empty row
+        // erases NO cell, so when the ONLY licensing hint is `bs_poof_hint`
+        // (kill hint absent) we demand real-shrink evidence.
+        //
+        // TWO WITNESSES, because one of them is blind exactly when it matters.
+        // `erasure_proven` is the live frame-to-frame diff; it only exists while
+        // frames are flowing, and a lone correction after a pause is by
+        // definition the case where they are not (see [`Self::bs_baseline`]).
+        // `bs_erased` asks the same question against the row stamped AT THE KEY,
+        // which is the only observation that predates the erase in that case.
         let bs_only = self.kill_hint.is_none();
         let erasure_proven = self
             .row_prev_meta
             .zip(self.row_cur_meta)
             .is_some_and(|(prev, cur)| prev.row == cur.row && cur.fill < prev.fill);
-        // Legacy row witnesses remain part of that defensive inner predicate;
-        // they never replace `confirmed_delete_span` for a plain Backspace.
+        // …and the same question asked against the row as it stood AT THE KEY
+        // ([`Self::bs_baseline`]), which survives the frame gap the live diff
+        // cannot. With no baseline stamped the host simply was not composing,
+        // so "no shrink observed" proves nothing; fall back to the honest
+        // weaker witness — the caret is off column 0, so a Backspace here COULD
+        // have erased. A no-op Backspace at the left margin (and its autorepeat
+        // there) still stays silent, which is the case this gate exists for.
         let erase_on_glass = self.poof_erase_witnessed();
         let bs_erased = erase_on_glass
             || matches!(
@@ -17431,7 +18560,16 @@ impl CursorGlow {
                 }
                 beat = beat.max(rainbow_wake_pulse_space(d - pd) * decay);
             }
-            let w = RAINBOW_WAKE_BASE * rainbow_wake_body(d, len) + RAINBOW_WAKE_PULSE * beat;
+            let mut w =
+                RAINBOW_WAKE_BASE * rainbow_wake_body(d, len) + RAINBOW_WAKE_PULSE * beat;
+            #[cfg(test)]
+            let support_width = self
+                .rainbow
+                .wake_test_support_width
+                .unwrap_or(RAINBOW_WAKE_SUPPORT_WIDTH);
+            #[cfg(not(test))]
+            let support_width = RAINBOW_WAKE_SUPPORT_WIDTH;
+            w = w.max(rainbow_wake_spectral_head_support(d, support_width));
             if w <= 0.004 {
                 x -= seg;
                 segs += 1;
@@ -19646,6 +20784,165 @@ fn rainbow_slab_at(bands: &[u32; 6], t: f32) -> u32 {
 mod tests {
     use super::*;
     use crate::cursor_trail::{CursorTrail, GenerationOwnership, TrailConfig};
+
+    #[test]
+    fn pending_content_echo_straddle_requires_exact_candidate_and_generation_seam() {
+        let observed = ContentGeneration {
+            process_sequence: 17,
+            terminal_id: 41,
+            alternate_screen: false,
+        };
+        let committed = ContentGeneration {
+            process_sequence: 18,
+            ..observed
+        };
+        let origin = (4, 9);
+        let target = (4, 10);
+        let candidate = GlowMoveCandidate {
+            at: Instant::now(),
+            origin,
+            intent: GlowMoveIntent::Delete,
+            target: Some(target),
+            material: Some(target),
+            baseline_row: None,
+            reverse_target_baseline: None,
+            reverse_left_col: None,
+            baseline_generation: Some(observed),
+            deferred_probe_generation: None,
+            content_confirmed: false,
+            bottom_scroll: None,
+        };
+        let mut glow = CursorGlow {
+            move_candidate: Some(candidate),
+            last_content_generation: Some(observed),
+            ..Default::default()
+        };
+
+        assert!(glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        for (name, observed_generation, observed_cursor, committed_generation, committed_cursor) in [
+            ("same cursor", observed, Some(origin), committed, Some(origin)),
+            (
+                "wrong origin",
+                observed,
+                Some((4, 8)),
+                committed,
+                Some(target),
+            ),
+            (
+                "wrong target",
+                observed,
+                Some(origin),
+                committed,
+                Some((4, 11)),
+            ),
+            ("hidden observed", observed, None, committed, Some(target)),
+            ("hidden committed", observed, Some(origin), committed, None),
+            ("same generation", observed, Some(origin), observed, Some(target)),
+            (
+                "intervening generation",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    process_sequence: 19,
+                    ..observed
+                },
+                Some(target),
+            ),
+            (
+                "terminal changed",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    terminal_id: 42,
+                    ..committed
+                },
+                Some(target),
+            ),
+            (
+                "screen changed",
+                observed,
+                Some(origin),
+                ContentGeneration {
+                    alternate_screen: true,
+                    ..committed
+                },
+                Some(target),
+            ),
+        ] {
+            assert!(
+                !glow.pending_content_echo_straddles(
+                    observed_generation,
+                    observed_cursor,
+                    committed_generation,
+                    committed_cursor,
+                ),
+                "{name} must fail closed"
+            );
+        }
+
+        glow.last_content_generation = None;
+        assert!(
+            !glow.pending_content_echo_straddles(
+                observed,
+                Some(origin),
+                committed,
+                Some(target),
+            ),
+            "the engine itself must have observed the pre-commit generation"
+        );
+        glow.last_content_generation = Some(observed);
+        glow.move_candidate.as_mut().unwrap().content_confirmed = true;
+        assert!(!glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        glow.move_candidate.as_mut().unwrap().content_confirmed = false;
+        glow.move_candidate
+            .as_mut()
+            .unwrap()
+            .deferred_probe_generation = Some(committed);
+        assert!(!glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        glow.move_candidate
+            .as_mut()
+            .unwrap()
+            .deferred_probe_generation = None;
+        glow.move_candidate.as_mut().unwrap().bottom_scroll =
+            Some(BottomScrollProof::AwaitUniformUpOne);
+        assert!(!glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        glow.move_candidate.as_mut().unwrap().bottom_scroll = None;
+        glow.move_candidate.as_mut().unwrap().baseline_generation = Some(committed);
+        assert!(!glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+        glow.move_candidate.as_mut().unwrap().baseline_generation = Some(observed);
+        glow.move_candidate.as_mut().unwrap().intent = GlowMoveIntent::Motion;
+        assert!(!glow.pending_content_echo_straddles(
+            observed,
+            Some(origin),
+            committed,
+            Some(target),
+        ));
+    }
 
     #[test]
     fn swept_path_retains_only_the_bounded_landing_suffix() {
@@ -22369,6 +23666,120 @@ mod tests {
         switched.note_backspace(t0 + Duration::from_millis(10));
         switched.drop_row_probe();
         assert!(switched.bs_baseline.is_none() && switched.bs_poof_hint.is_none());
+    }
+
+    /// THE BLANK-ROW PHANTOM STAYS DARK (adversarial review, MEDIUM — the pin
+    /// OUTLIVES the withdrawn ContentOnly span widening): Ctrl-U in vi NORMAL
+    /// mode page-scrolls, and when the row that scrolls in under the caret is
+    /// BLANK the stable-survivor test is VACUOUSLY satisfied (`cur_fill == 0`
+    /// accounts for nothing — `p + s >= 0` always holds). Today the span arm
+    /// refuses the ContentOnly probe upstream, so this stays dark one gate
+    /// earlier; the `cur_fill > 0` guard remains as the Full-trust hardening
+    /// against the same vacuous shape, and this pin holds either way. Wired
+    /// order, ContentOnly probe: must stay dark.
+    #[test]
+    fn blank_scroll_in_after_kill_hint_stays_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 17,
+            alternate_screen: true,
+        };
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        glow.observe_row_with_trust(2, 3, &row("$ hello world"), t0, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(10), Some((2, 3)), false),
+            GenerationOwnership::Steady
+        );
+        glow.tick(Some((2, 3)), t0, &c, g, &mut out);
+        // The kill chord (vi normal-mode Ctrl-U — the host cannot see the
+        // mode, so the chord still arms the licence)…
+        glow.note_kill(t0 + Duration::from_millis(20), true);
+        // …and the program pages a BLANK row in at the same caret.
+        let t1 = t0 + Duration::from_millis(50);
+        glow.observe_row_with_trust(2, 3, &row(""), t1, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(11), Some((2, 3)), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        glow.tick(Some((2, 3)), t1, &c, g, &mut out);
+        assert!(
+            glow.last_poof.is_none(),
+            "a blank scroll-in accounts for nothing — no full-row phantom poof"
+        );
+        // Ride out the caret fallback's grace too: a ContentOnly probe cannot
+        // anchor the fallback either, so the licence expires unspent.
+        let t2 = t0 + Duration::from_millis(150);
+        glow.observe_row_with_trust(2, 3, &row(""), t2, ProbeTrust::ContentOnly);
+        glow.observe_content_generation(alt_gen(12), Some((2, 3)), false);
+        glow.tick(Some((2, 3)), t2, &c, g, &mut out);
+        assert!(
+            glow.last_poof.is_none() && glow.particles.is_empty() && glow.vapor.is_empty(),
+            "the phantom stays dark through the fallback grace as well"
+        );
+    }
+
+    /// THE PREFIX-SHRINK LINE REPLACEMENT STAYS DARK (adversarial review,
+    /// MEDIUM, second phantom shape — the pin OUTLIVES the withdrawn
+    /// ContentOnly span widening): a page-scroll can slide in a replacement
+    /// row sharing an accidental prefix with the baseline (`    })` → `    }`
+    /// — one closing brace replacing two). The survivors pass the stable
+    /// prefix+suffix test, but with the caret parked in the blank margin the
+    /// refined span swallows every surviving glyph. Today the span arm
+    /// refuses the ContentOnly probe upstream, so this stays dark one gate
+    /// earlier; the non-trivial-survivor guard remains as the Full-trust
+    /// hardening against the same shape, and this pin holds either way.
+    #[test]
+    fn prefix_shrink_line_replacement_stays_dark() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 17,
+            alternate_screen: true,
+        };
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        // vi normal mode: caret on the first non-blank (col 4 of "    })").
+        glow.observe_row_with_trust(2, 4, &row("    })"), t0, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(10), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        glow.note_kill(t0 + Duration::from_millis(20), true);
+        // The page replaces the line with a SHORTER one sharing its prefix.
+        let t1 = t0 + Duration::from_millis(50);
+        glow.observe_row_with_trust(2, 4, &row("    }"), t1, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(11), Some((2, 4)), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        glow.tick(Some((2, 4)), t1, &c, g, &mut out);
+        assert!(
+            glow.last_poof.is_none(),
+            "a prefix-shrink line replacement is not a kill — no poof over the survivors"
+        );
+        assert!(
+            glow.particles.is_empty() && glow.vapor.is_empty(),
+            "no sparkles or steam for a page-scroll replacement"
+        );
     }
 
     /// FALSE-POSITIVE FAMILY 1: repaints. An Ink repaint that rewrites the
@@ -25600,6 +27011,458 @@ mod tests {
         );
     }
 
+    /// What one run of the CLAUDE-STREAMING COLLISION driver observed at every
+    /// seam, so both its tests (and the dossier) read the same facts.
+    struct ClaudeStreamingCollision {
+        /// Ribbon segments after the three confirmed setup letters.
+        segments_before: usize,
+        /// The fence's verdict on the unowned stream batch (caret parked).
+        stream_ownership: GenerationOwnership,
+        /// The NEWEST admission-ring row right after that stream batch — the
+        /// `unowned-batch` retire of the in-flight candidate when one existed.
+        stream_retire: Option<AdmissionRecord>,
+        /// The confirm seam's answer at the echo batch (`None`: no candidate).
+        echo_decision: Option<ContentCandidateDecision>,
+        /// The fence's verdict on the echo batch itself.
+        echo_ownership: GenerationOwnership,
+        /// The NEWEST admission-ring row right after the echo batch's fence —
+        /// where the consumed tombstone's `echo-after-stream` row lands.
+        echo_ring: Option<AdmissionRecord>,
+        /// Ribbon segments after the echo batch's fence + tick.
+        segments_after: usize,
+        /// The per-seam trace, carried into every assert message.
+        observed: String,
+    }
+
+    /// Drive the CLAUDE-STREAMING COLLISION through the real seams (note →
+    /// probe → confirm → fence → tick, one rendered frame per key): three
+    /// letters of `abcd` confirm and build the ribbon, then the 4th letter's
+    /// press arms its Typed candidate (skipped by the cold control) — and its
+    /// echo comes back SPLIT ACROSS TWO PTY BATCHES. Batch 1 is the TUI's
+    /// token stream: content changed on a row far from the caret (the probed
+    /// caret row is byte-steady and the cursor is parked, so only the
+    /// generation moved). Batch 2 is the echo itself: the glyph materialized
+    /// and the cursor sits on the predicted target.
+    fn drive_claude_streaming_collision(press_fourth_key: bool) -> ClaudeStreamingCollision {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 4,
+            alternate_screen: true,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the fence baseline"
+        );
+
+        // ---- 'a' 'b' 'c': three confirmed keys, the pre-collision ribbon ----
+        let mut stored: Vec<char> = Vec::new();
+        for (i, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let col = i as u16;
+            let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
+            let seq = 10 + i as u32;
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(at, expected, (2, col + 1), (2, col), baseline, alt_gen(seq));
+            stored.push(ch);
+            glow.observe_row_with_trust(2, col + 1, &stored, at, ProbeTrust::ContentOnly);
+            let decision = glow.confirm_content_candidate(Some((2, col + 1)), at, alt_gen(seq + 1));
+            assert!(
+                matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+                "setup key {i} ({ch:?}) must confirm: {decision:?}"
+            );
+            assert_eq!(
+                glow.observe_content_generation(alt_gen(seq + 1), Some((2, col + 1)), true),
+                GenerationOwnership::Owned,
+                "setup key {i}: the confirmed echo owns its batch"
+            );
+            glow.tick(Some((2, col + 1)), at, &c, g, &mut scratch);
+        }
+        let segments_before = glow.ribbon_segments();
+        assert!(
+            segments_before >= 3,
+            "three confirmed keys must build the pre-collision ribbon, \
+             got {segments_before} segment(s)"
+        );
+
+        // ---- the 4th letter's PRESS (the cold control skips it) ----
+        let caret = (2u16, 3u16);
+        let press_at = t0 + Duration::from_millis(361);
+        if press_fourth_key {
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells(['d']).unwrap();
+            glow.note_typed_expected(press_at, expected, (2, 4), caret, baseline, alt_gen(13));
+            assert!(
+                glow.move_candidate_pending(),
+                "the 4th letter's press arms its Typed candidate"
+            );
+        }
+
+        // ---- BATCH 1: the unowned STREAM batch, before the echo. The token
+        // stream rewrote a row far from the caret, so the generation moved
+        // while the probed caret row stayed byte-steady and the cursor stayed
+        // parked at the caret. ----
+        let stream_at = press_at + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 3, &stored, stream_at, ProbeTrust::ContentOnly);
+        let stream_ownership = glow.observe_content_generation(alt_gen(14), Some(caret), false);
+        let stream_retire = glow.admission_log().last().copied();
+        glow.tick(Some(caret), stream_at, &c, g, &mut scratch);
+        let segments_between = glow.ribbon_segments();
+
+        // ---- BATCH 2: the ECHO batch — 'd' materialized at the caret and the
+        // cursor sits on the predicted target. ----
+        let echo_at = press_at + Duration::from_millis(16);
+        stored.push('d');
+        glow.observe_row_with_trust(2, 4, &stored, echo_at, ProbeTrust::ContentOnly);
+        let echo_decision = glow.confirm_content_candidate(Some((2, 4)), echo_at, alt_gen(15));
+        let echo_confirmed =
+            matches!(echo_decision, Some(ContentCandidateDecision::Confirmed { .. }));
+        let echo_ownership = glow.observe_content_generation(alt_gen(15), Some((2, 4)), echo_confirmed);
+        let echo_ring = glow.admission_log().last().copied();
+        glow.tick(Some((2, 4)), echo_at, &c, g, &mut scratch);
+        let segments_after = glow.ribbon_segments();
+
+        let _ = write!(
+            observed,
+            "press_fourth_key={press_fourth_key} segments_before={segments_before} \
+             stream_ownership={stream_ownership:?} \
+             stream_retire={:?} segments_between={segments_between} \
+             echo_decision={echo_decision:?} echo_ownership={echo_ownership:?} \
+             echo_ring={:?} segments_after={segments_after}",
+            stream_retire.map(|record| (record.phase, record.reason, record.decided_generation)),
+            echo_ring.map(|record| (record.phase, record.reason, record.decided_generation)),
+        );
+        ClaudeStreamingCollision {
+            segments_before,
+            stream_ownership,
+            stream_retire,
+            echo_decision,
+            echo_ownership,
+            echo_ring,
+            segments_after,
+            observed,
+        }
+    }
+
+    /// THE E2 SPLIT-BATCH ECHO, live-collision shape (v0.54.0 owner evidence:
+    /// `armed=361 candidates_confirmed=351 retired=10
+    /// last_retire_reason=unowned-batch` — ten collisions across one Claude
+    /// Code conversation = "the trail still vanishes sometimes on new words").
+    /// A keystroke lands WHILE the TUI streams output: the stream batch
+    /// reaches the fence BEFORE the key's echo, the unowned fence revokes the
+    /// in-flight Typed candidate (`retired reason=unowned-batch … gen_cur=-`),
+    /// and the echo batch then finds the cursor advanced with NO candidate —
+    /// `observe_content_generation` judges `anchor_held=false` →
+    /// [`GenerationOwnership::UnownedRelocation`] →
+    /// [`CursorGlow::clear_denied_move_visuals`] wholesale-wipes the ribbon,
+    /// ink pops and tail memory the previous confirms EARNED. This is the
+    /// fence-side face of the registered standing gap
+    /// `StandingGapSplitEchoRetiresE2` (aterm-spec `models_effects.rs`).
+    ///
+    /// Measured on this fixture BEFORE the tombstone (the collision this test
+    /// existed to fix): `stream_ownership=UnownedSteady`, ring `retired
+    /// reason=unowned-batch intent=typed gen_cur=-`, `echo_decision=None`,
+    /// `echo_ownership=UnownedRelocation`, ribbon `segments 3 → 3 → 0`.
+    ///
+    /// SHIPPED (the REVOKED-TARGET TOMBSTONE stage,
+    /// [`CursorGlow::take_fresh_revoked_target_tombstone`]): the echo batch
+    /// whose cursor sits exactly on the revoked candidate's predicted target,
+    /// within `TYPE_HINT_FRESH` of the press, is judged an
+    /// UnownedRewrite-class batch (proportionate retention — content-attested
+    /// cells plus the candidate's own predicted write survive), NOT a
+    /// relocation-with-wipe, and the ring records the consumption
+    /// (`phase=tombstone reason=echo-after-stream`, no tally movement). The
+    /// tombstone confirms nothing, mints no light, feeds no momentum — it
+    /// only stops the wipe of light already earned.
+    #[test]
+    fn claude_streaming_collision_ribbon_survives_the_split_batch_echo() {
+        let hot = drive_claude_streaming_collision(true);
+        assert!(
+            hot.segments_after >= hot.segments_before,
+            "the ribbon must survive the split-batch echo (>= its \
+             pre-collision {} segment(s), got {}). Observed: [{}]",
+            hot.segments_before,
+            hot.segments_after,
+            hot.observed
+        );
+        assert_ne!(
+            hot.echo_ownership,
+            GenerationOwnership::UnownedRelocation,
+            "the echo landing on the revoked candidate's predicted \
+             target must not be judged a relocation-with-wipe. Observed: [{}]",
+            hot.observed
+        );
+        assert_eq!(
+            hot.echo_ownership,
+            GenerationOwnership::UnownedRewrite,
+            "the consumed tombstone routes the echo batch through the \
+             PROPORTIONATE fence — the verdict the trail twin retains \
+             attested cells under. Observed: [{}]",
+            hot.observed
+        );
+        let ring = hot.echo_ring.unwrap_or_else(|| {
+            panic!(
+                "the consumed tombstone must leave its ring row. Observed: [{}]",
+                hot.observed
+            )
+        });
+        assert_eq!(
+            (ring.phase, ring.reason, ring.intent, ring.target),
+            (
+                AdmissionPhase::Tombstone,
+                "echo-after-stream",
+                "typed",
+                Some((2, 4))
+            ),
+            "the ring names the consumption distinctly for `ctl trail`. \
+             Observed: [{}]",
+            hot.observed
+        );
+        assert_eq!(
+            ring.decided_generation,
+            Some(15),
+            "unlike a drop row (`gen_cur=-`), the fence judged the echo \
+             batch's generation. Observed: [{}]",
+            hot.observed
+        );
+        assert_eq!(
+            hot.echo_decision, None,
+            "the tombstone never CONFIRMS: the echo batch still reaches the \
+             confirm seam with nothing to confirm. Observed: [{}]",
+            hot.observed
+        );
+    }
+
+    /// The two halves of the collision that hold TODAY and must keep holding
+    /// after the tombstone stage:
+    ///
+    /// 1. The collision really is the `unowned-batch` seam — the stream batch
+    ///    revokes the in-flight candidate through
+    ///    [`CursorGlow::revoke_unowned_hints`], the ring logs the retire with
+    ///    `gen_cur=-` (nothing was compared), and the echo batch reaches the
+    ///    confirm seam with nothing to confirm. The tombstone stage changes
+    ///    the echo batch's FENCE verdict only; this revocation stays.
+    /// 2. THE COLD-OUTPUT LAW (do not weaken; the paint matrix pins its
+    ///    zero-ink face in `aterm-conformance/tests/paint.rs`
+    ///    `alt_screen_cold_spinner_paints_zero_ink`): the SAME stream + cursor
+    ///    move WITHOUT any press has no candidate, hence no tombstone, hence
+    ///    the relocation wipes exactly as today.
+    #[test]
+    fn claude_streaming_collision_revokes_the_candidate_and_cold_output_still_wipes() {
+        // ---- the collision (hot): the stream batch revokes the candidate ----
+        let hot = drive_claude_streaming_collision(true);
+        assert_eq!(
+            hot.stream_ownership,
+            GenerationOwnership::UnownedSteady,
+            "the stream batch holds identity, anchor and the probed caret row \
+             — only the candidate cohort revokes. Observed: [{}]",
+            hot.observed
+        );
+        let retire = hot.stream_retire.unwrap_or_else(|| {
+            panic!(
+                "the stream batch must leave a ring row for the revoked \
+                 candidate. Observed: [{}]",
+                hot.observed
+            )
+        });
+        assert_eq!(retire.phase, AdmissionPhase::Retired, "Observed: [{}]", hot.observed);
+        assert_eq!(retire.reason, "unowned-batch", "Observed: [{}]", hot.observed);
+        assert_eq!(retire.intent, "typed", "Observed: [{}]", hot.observed);
+        assert_eq!(
+            retire.decided_generation, None,
+            "a drop row is `gen_cur=-`: the confirm seam never judged this \
+             candidate — the split. Observed: [{}]",
+            hot.observed
+        );
+        assert_eq!(
+            retire.target,
+            Some((2, 4)),
+            "the ring carries the revoked candidate's predicted target — the \
+             cell the tombstone will consult. Observed: [{}]",
+            hot.observed
+        );
+        assert_eq!(
+            hot.echo_decision, None,
+            "the revoked candidate never reaches the confirm seam: the echo \
+             batch has nothing to confirm (and the tombstone stage must keep \
+             it that way — the tombstone never confirms). Observed: [{}]",
+            hot.observed
+        );
+
+        // ---- THE COLD CONTROL: no press, no candidate, no tombstone ----
+        let cold = drive_claude_streaming_collision(false);
+        assert!(
+            cold.stream_retire
+                .is_none_or(|record| record.reason != "unowned-batch"),
+            "with no press there is no candidate for the stream batch to \
+             revoke. Observed: [{}]",
+            cold.observed
+        );
+        assert_eq!(
+            cold.echo_decision, None,
+            "cold output has no candidate to confirm. Observed: [{}]",
+            cold.observed
+        );
+        assert_eq!(
+            cold.echo_ownership,
+            GenerationOwnership::UnownedRelocation,
+            "COLD-OUTPUT LAW: a pressless cursor move is a relocation, today \
+             and after the tombstone stage. Observed: [{}]",
+            cold.observed
+        );
+        assert_eq!(
+            cold.segments_after, 0,
+            "COLD-OUTPUT LAW: the relocation wipes the resident ribbon \
+             exactly as today. Observed: [{}]",
+            cold.observed
+        );
+        assert!(
+            cold.echo_ring
+                .is_none_or(|record| record.reason != "echo-after-stream"),
+            "COLD-OUTPUT LAW: no press means no tombstone, so nothing may be \
+             consumed. Observed: [{}]",
+            cold.observed
+        );
+    }
+
+    /// The tombstone accepts exactly ONE landing: the revoked candidate's
+    /// predicted target. A batch whose cursor sits ANYWHERE else is a real
+    /// relocation — it wipes wholesale exactly as before the tombstone stage
+    /// AND tears the tombstone down with it
+    /// ([`CursorGlow::clear_transient_state`]), so a later batch that happens
+    /// to land on the old predicted target cannot be rescued either: the
+    /// second half of this test re-probes that exact cell WITHIN the
+    /// freshness window and must still see a relocation, proving the slot was
+    /// cleared by the miss rather than by expiry.
+    #[test]
+    fn claude_streaming_collision_mismatched_landing_still_relocates_and_clears_the_tombstone() {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 4,
+            alternate_screen: true,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+
+        // Same setup as the driver: three confirmed letters, then the 4th
+        // press whose candidate the stream batch revokes into the tombstone.
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the fence baseline"
+        );
+        let mut stored: Vec<char> = Vec::new();
+        for (i, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let col = i as u16;
+            let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
+            let seq = 10 + i as u32;
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(at, expected, (2, col + 1), (2, col), baseline, alt_gen(seq));
+            stored.push(ch);
+            glow.observe_row_with_trust(2, col + 1, &stored, at, ProbeTrust::ContentOnly);
+            let decision = glow.confirm_content_candidate(Some((2, col + 1)), at, alt_gen(seq + 1));
+            assert!(
+                matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+                "setup key {i} ({ch:?}) must confirm: {decision:?}"
+            );
+            assert_eq!(
+                glow.observe_content_generation(alt_gen(seq + 1), Some((2, col + 1)), true),
+                GenerationOwnership::Owned
+            );
+            glow.tick(Some((2, col + 1)), at, &c, g, &mut scratch);
+        }
+        let segments_before = glow.ribbon_segments();
+        assert!(segments_before >= 3, "setup ribbon, got {segments_before}");
+        let press_at = t0 + Duration::from_millis(361);
+        let mut before = [' '; 40];
+        before[..stored.len()].copy_from_slice(&stored);
+        let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['d']).unwrap();
+        glow.note_typed_expected(press_at, expected, (2, 4), (2, 3), baseline, alt_gen(13));
+        let stream_at = press_at + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 3, &stored, stream_at, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(14), Some((2, 3)), false),
+            GenerationOwnership::UnownedSteady,
+            "the stream batch revokes the candidate into the tombstone"
+        );
+        glow.tick(Some((2, 3)), stream_at, &c, g, &mut scratch);
+
+        // ---- the MISMATCHED landing: the cursor jumps to (5, 0), NOT the
+        // predicted (2, 4). A real relocation, tombstone or no tombstone. ----
+        let reloc_at = press_at + Duration::from_millis(16);
+        let blank: Vec<char> = vec![' '; 40];
+        glow.observe_row_with_trust(5, 0, &blank, reloc_at, ProbeTrust::ContentOnly);
+        let reloc_decision = glow.confirm_content_candidate(Some((5, 0)), reloc_at, alt_gen(15));
+        let reloc_ownership = glow.observe_content_generation(alt_gen(15), Some((5, 0)), false);
+        glow.tick(Some((5, 0)), reloc_at, &c, g, &mut scratch);
+        let _ = write!(
+            observed,
+            "segments_before={segments_before} reloc_decision={reloc_decision:?} \
+             reloc_ownership={reloc_ownership:?} segments_after_reloc={}; ",
+            glow.ribbon_segments()
+        );
+        assert_eq!(
+            reloc_ownership,
+            GenerationOwnership::UnownedRelocation,
+            "a landing off the predicted target is a real relocation. \
+             Observed: [{observed}]"
+        );
+        assert_eq!(
+            glow.ribbon_segments(),
+            0,
+            "the mismatched landing wipes wholesale, exactly as before the \
+             tombstone stage. Observed: [{observed}]"
+        );
+        assert!(
+            glow.admission_log().all(|record| record.reason != "echo-after-stream"),
+            "nothing was consumed. Observed: [{observed}]"
+        );
+
+        // ---- the tombstone is GONE: a batch touching the OLD predicted
+        // target, still inside TYPE_HINT_FRESH of the press, must relocate —
+        // the miss cleared the slot, not the clock. ----
+        let late_at = press_at + Duration::from_millis(24);
+        glow.observe_row_with_trust(2, 4, &stored, late_at, ProbeTrust::ContentOnly);
+        let late_ownership = glow.observe_content_generation(alt_gen(16), Some((2, 4)), false);
+        glow.tick(Some((2, 4)), late_at, &c, g, &mut scratch);
+        let _ = write!(observed, "late_ownership={late_ownership:?}");
+        assert_eq!(
+            late_ownership,
+            GenerationOwnership::UnownedRelocation,
+            "the relocation tore the tombstone down with the light: the old \
+             target buys no rescue afterwards. Observed: [{observed}]"
+        );
+        assert!(
+            glow.admission_log().all(|record| record.reason != "echo-after-stream"),
+            "still nothing consumed. Observed: [{observed}]"
+        );
+    }
+
     /// OWNER REGRESSION (v0.52), symptom 2 — *"the sparkles seem to be
     /// truncated"* — THE TRUNCATED HEAD, now pinned FIXED. The proportionate
     /// fence's retention predicate ([`CursorGlow::retire_geometry_keeping_validated_wake`],
@@ -26011,6 +27874,283 @@ mod tests {
         );
     }
 
+    /// PRODUCTION-ORDER regression for the live streamer blackout: a key's
+    /// echo and an ambient ESC-7/status/ESC-8 write can cross the render lock
+    /// as N+2 even though the final caret advanced by only one cell. The exact
+    /// content proof must downgrade (never forge typed light), while the same
+    /// authenticated generation preserves byte-steady resident wake through
+    /// BOTH engine ticks. Before `AuthoredMotion`, the generation fence called
+    /// this an unowned relocation; after the first fence repair, each tick's
+    /// denied one-cell Motion spawn wiped the retained wake a second time.
+    #[test]
+    fn coalesced_alt_generation_preserves_attested_wake_without_buying_light() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 61,
+            alternate_screen: true,
+        };
+        let blank = [' '; 16];
+        let blank_baseline = ExpectedRowSnapshot::from_slice(&blank).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['m']).unwrap();
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.note_context(true);
+        trail.note_context(true);
+        glow.observe_row_with_trust(2, 2, &blank, t0, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 2)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 2)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(37), Some((2, 2)), false),
+            GenerationOwnership::Steady
+        );
+        trail.observe_content_generation(generation(37), GenerationOwnership::Steady, None);
+
+        // Charge a real multi-cell RIBBON through three exact input-row
+        // proofs. A one-segment fixture is insufficient: the coalesced key
+        // legitimately rewrites the newest head cell, so the fence must drop
+        // that head while preserving the older byte-steady body.
+        let mut input_row = blank;
+        let mut caret = 2u16;
+        let mut seq = 37u32;
+        let mut charged_at = t0;
+        for (i, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            charged_at = t0 + Duration::from_millis((i as u64 + 1) * 10);
+            let row_before = ExpectedRowSnapshot::from_slice(&input_row).unwrap();
+            let cell = ExpectedCellSpan::from_cells([ch]).unwrap();
+            let target = (2, caret + 1);
+            glow.note_typed_expected(
+                charged_at,
+                cell,
+                target,
+                (2, caret),
+                row_before,
+                generation(seq),
+            );
+            trail.note_typed_expected(charged_at, cell, target, (2, caret));
+            input_row[usize::from(caret)] = ch;
+            glow.observe_row_with_trust(
+                2,
+                target.1,
+                &input_row,
+                charged_at,
+                ProbeTrust::ContentOnly,
+            );
+            seq += 1;
+            let decision =
+                glow.confirm_content_candidate(Some(target), charged_at, generation(seq));
+            let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+                panic!("ribbon seed key {ch:?} did not confirm: {decision:?}");
+            };
+            trail.confirm_content_candidate(at, origin, target);
+            let ownership = glow.observe_content_generation_with_evidence(
+                generation(seq),
+                Some(target),
+                ContentGenerationEvidence::Exact,
+            );
+            assert_eq!(ownership, GenerationOwnership::Owned);
+            let witness = glow.batch_wake_witness();
+            trail.observe_content_generation(generation(seq), ownership, witness.as_ref());
+            glow.tick(Some(target), charged_at, &c, g, &mut glow_out);
+            trail.tick(Some(target), charged_at, &trail_cfg, &mut trail_out);
+            caret = target.1;
+        }
+        assert_eq!(seq, 40);
+        assert_eq!(caret, 5);
+        assert!(glow.ribbon_segments() >= 3, "three exact keys charge a real ribbon");
+        assert!(frame_has_output(&glow_out, &glow));
+        assert!(!trail_out.is_empty());
+        let steady_ribbon_cells: Vec<(u16, u16)> = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing && spark.col < caret)
+            .map(|spark| (spark.row, spark.col))
+            .collect();
+        assert!(
+            steady_ribbon_cells.len() >= 2,
+            "the fixture must carry an older ribbon body, got {steady_ribbon_cells:?}"
+        );
+
+        // The submitted `m` is baselined at N, but the restored frame reports
+        // N+2 because the streamer's off-row batch coalesced with its echo.
+        let key_at = charged_at + Duration::from_millis(1);
+        glow.note_typed_expected(
+            key_at,
+            expected,
+            (2, 6),
+            (2, 5),
+            ExpectedRowSnapshot::from_slice(&input_row).unwrap(),
+            generation(40),
+        );
+        trail.note_typed_expected(key_at, expected, (2, 6), (2, 5));
+        let echo_at = key_at + Duration::from_millis(8);
+        let mut echoed = input_row;
+        echoed[5] = 'm';
+        glow.observe_row_with_trust(2, 6, &echoed, echo_at, ProbeTrust::ContentOnly);
+        let decision =
+            glow.confirm_content_candidate(Some((2, 6)), echo_at, generation(42));
+        let Some(ContentCandidateDecision::Downgraded { at, origin }) = decision else {
+            panic!("N+2 alt echo must downgrade to Motion: {decision:?}");
+        };
+        trail.arm_motion(at, origin);
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(42),
+            Some((2, 6)),
+            ContentGenerationEvidence::AuthoredMotion,
+        );
+        assert_eq!(ownership, GenerationOwnership::AuthoredMotion);
+        let witness = glow.batch_wake_witness();
+        trail.observe_content_generation(generation(42), ownership, witness.as_ref());
+
+        // Pin the no-purchase half at the shipping tick seam. The fence
+        // intentionally clears projectile glide state; this denied one-cell
+        // relocation may neither pump it back up nor update movement timing.
+        glow.heat_at = Some(echo_at);
+        let before_glide = (
+            glow.glide.vel.to_bits(),
+            glow.glide.dir,
+            glow.glide.run,
+            glow.glide.stars.len(),
+            glow.glide.last_fired,
+            glow.glide.head.map(|(x, y)| (x.to_bits(), y.to_bits())),
+            glow.glide.land_at,
+        );
+        let before_move = glow.last_move;
+        let before_spawns = glow.spawns();
+        let before_heat = (glow.heat.to_bits(), glow.coal.to_bits(), glow.flare.to_bits());
+        glow.tick(Some((2, 6)), echo_at, &c, g, &mut glow_out);
+        trail.tick(Some((2, 6)), echo_at, &trail_cfg, &mut trail_out);
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "the attested rainbow wake remains on glass after the glow tick"
+        );
+        assert!(
+            !trail_out.is_empty(),
+            "the attested classic comet remains on glass after its tick"
+        );
+        assert!(
+            glow.ribbon_segments() > 0,
+            "the coalesced frame must preserve the ribbon itself, not merely a pop/halo"
+        );
+        for cell in &steady_ribbon_cells {
+            assert!(
+                glow.sparks
+                    .iter()
+                    .any(|spark| spark.typing && (spark.row, spark.col) == *cell),
+                "byte-steady ribbon cell {cell:?} was lost"
+            );
+        }
+        assert_eq!(glow.cursor_anchor(), Some((2, 6)));
+        assert_eq!(trail.cursor_anchor(), Some((2, 6)));
+        assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
+        assert_eq!(glow.spawns(), before_spawns, "the denied step births no glow");
+        assert_eq!(glow.take_momentum_pulse(), None, "the denied step funds no cat pulse");
+        assert_eq!(
+            (
+                glow.glide.vel.to_bits(),
+                glow.glide.dir,
+                glow.glide.run,
+                glow.glide.stars.len(),
+                glow.glide.last_fired,
+                glow.glide.head.map(|(x, y)| (x.to_bits(), y.to_bits())),
+                glow.glide.land_at,
+            ),
+            before_glide,
+            "the denied step cannot pump the next genuine glide"
+        );
+        assert_eq!(glow.last_move, before_move);
+        assert_eq!(
+            (glow.heat.to_bits(), glow.coal.to_bits(), glow.flare.to_bits()),
+            before_heat,
+            "the denied step cannot purchase thermal momentum"
+        );
+
+        // COLD NEGATIVE: naming AuthoredMotion without the downgraded
+        // candidate cannot retain or create anything in either engine.
+        let mut cold_glow = CursorGlow::default();
+        let mut cold_trail = CursorTrail::default();
+        cold_glow.note_context(true);
+        cold_trail.note_context(true);
+        cold_glow.tick(Some((2, 2)), t0, &c, g, &mut glow_out);
+        cold_trail.tick(Some((2, 2)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            cold_glow.observe_content_generation(generation(50), Some((2, 2)), false),
+            GenerationOwnership::Steady
+        );
+        cold_trail.observe_content_generation(generation(50), GenerationOwnership::Steady, None);
+        let cold_ownership = cold_glow.observe_content_generation_with_evidence(
+            generation(52),
+            Some((2, 3)),
+            ContentGenerationEvidence::AuthoredMotion,
+        );
+        assert_eq!(cold_ownership, GenerationOwnership::UnownedRelocation);
+        cold_trail.observe_content_generation(generation(52), cold_ownership, None);
+        cold_glow.tick(Some((2, 3)), echo_at, &c, g, &mut glow_out);
+        cold_trail.tick(Some((2, 3)), echo_at, &trail_cfg, &mut trail_out);
+        assert!(!frame_has_output(&glow_out, &cold_glow) && trail_out.is_empty());
+
+        // NON-VACUITY: the same downgrade with a real jump-shaped landing
+        // still admits exactly once; AuthoredMotion narrows the denied case,
+        // it does not disable Vim-style motion streaks.
+        let jump_at = t0 + Duration::from_millis(30);
+        let mut jump_glow = CursorGlow::default();
+        let mut jump_trail = CursorTrail::default();
+        jump_glow.note_context(true);
+        jump_trail.note_context(true);
+        jump_glow.observe_row_with_trust(2, 3, &blank, t0, ProbeTrust::ContentOnly);
+        jump_glow.tick(Some((2, 3)), t0, &c, g, &mut glow_out);
+        jump_trail.tick(Some((2, 3)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            jump_glow.observe_content_generation(generation(60), Some((2, 3)), false),
+            GenerationOwnership::Steady
+        );
+        jump_trail.observe_content_generation(generation(60), GenerationOwnership::Steady, None);
+        jump_glow.note_typed_expected(
+            jump_at,
+            expected,
+            (2, 4),
+            (2, 3),
+            blank_baseline,
+            generation(60),
+        );
+        jump_trail.note_typed_expected(jump_at, expected, (2, 4), (2, 3));
+        let mut jump_row = blank;
+        jump_row[3] = 'm';
+        jump_glow.observe_row_with_trust(2, 12, &jump_row, jump_at, ProbeTrust::ContentOnly);
+        let decision =
+            jump_glow.confirm_content_candidate(Some((2, 12)), jump_at, generation(62));
+        let Some(ContentCandidateDecision::Downgraded { at, origin }) = decision else {
+            panic!("jump-shaped N+2 key must downgrade first: {decision:?}");
+        };
+        jump_trail.arm_motion(at, origin);
+        let ownership = jump_glow.observe_content_generation_with_evidence(
+            generation(62),
+            Some((2, 12)),
+            ContentGenerationEvidence::AuthoredMotion,
+        );
+        assert_eq!(ownership, GenerationOwnership::AuthoredMotion);
+        let witness = jump_glow.batch_wake_witness();
+        jump_trail.observe_content_generation(generation(62), ownership, witness.as_ref());
+        let before = jump_glow.spawns();
+        jump_glow.tick(Some((2, 12)), jump_at, &c, g, &mut glow_out);
+        jump_trail.tick(Some((2, 12)), jump_at, &trail_cfg, &mut trail_out);
+        assert_eq!(jump_glow.spawns(), before + 1);
+        assert!(frame_has_output(&glow_out, &jump_glow) && !trail_out.is_empty());
+        assert!(!jump_glow.move_candidate_pending() && !jump_trail.move_candidate_pending());
+    }
+
     /// A MID-SAVE FRAME DEFERS, IT DOES NOT RETIRE: if a presented frame
     /// catches the streamer between ESC 7 and ESC 8, the probe is on the
     /// STREAMER's row — the candidate's row proof simply isn't answerable
@@ -26022,6 +28162,14 @@ mod tests {
     fn esc7_mid_save_frame_defers_the_typed_proof_to_the_restore_frame() {
         let g = geom();
         let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
         let t0 = Instant::now();
         let generation = |process_sequence| ContentGeneration {
             process_sequence,
@@ -26040,32 +28188,446 @@ mod tests {
         let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
         let typed_x = ExpectedCellSpan::from_cells(['x']).unwrap();
         let mut out = Vec::new();
+        let mut trail_out = Vec::new();
         let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
         glow.note_context(true);
+        trail.note_context(true);
         glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        trail.tick(Some((2, 4)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(50), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        trail.observe_content_generation(generation(50), GenerationOwnership::Steady, None);
+
+        // Give the hold visible resident state to protect. This synthetic
+        // preview is independent of the typed candidate below and exists only
+        // so a wholesale-clear implementation cannot pass vacuously.
+        let resident_at = t0 + Duration::from_micros(1);
+        glow.note_synthetic_move(resident_at);
+        trail.note_synthetic_move(resident_at);
+        glow.tick(Some((2, 5)), resident_at, &c, g, &mut out);
+        trail.tick(Some((2, 5)), resident_at, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&out, &glow) && !trail_out.is_empty());
+
         let key = t0 + Duration::from_millis(1);
-        glow.note_typed_expected(key, typed_x, (2, 5), (2, 4), baseline, generation(50));
+        let mut keyed_baseline = baseline_cells;
+        keyed_baseline[4] = ' ';
+        let keyed_baseline = ExpectedRowSnapshot::from_slice(&keyed_baseline).unwrap();
+        glow.note_typed_expected(
+            key,
+            typed_x,
+            (2, 6),
+            (2, 5),
+            keyed_baseline,
+            generation(50),
+        );
+        trail.note_typed_expected(key, typed_x, (2, 6), (2, 5));
+        let armed_tally = glow.admission_tally();
         // Mid-save frame: the echo landed (generation 51) but the probe rode
         // the streamer's row 0 — not the candidate's row, not adjacent-known.
         let mid = key + Duration::from_millis(8);
         glow.observe_row_with_trust(0, 12, &row("[stream 001]"), mid, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((0, 12)), mid, generation(51));
+        let Some(ContentCandidateDecision::Deferred { .. }) = decision else {
+            panic!("the off-row sole-next probe must defer once: {decision:?}");
+        };
         assert_eq!(
-            glow.confirm_content_candidate(Some((0, 12)), mid, generation(51)),
-            None,
-            "a probe on the streamer's row defers the proof, it does not retire it"
+            glow.admission_tally(),
+            armed_tally,
+            "a non-terminal defer is trace-only, not a false retirement"
         );
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(51),
+            Some((0, 12)),
+            ContentGenerationEvidence::DeferredProbe,
+        );
+        assert_eq!(ownership, GenerationOwnership::DeferredProbe);
+        trail.observe_content_generation(generation(51), ownership, None);
+        // SHIPPING ORDER: both ticks really run on the mid-save cursor. The
+        // hold must keep the old input-row anchor/candidate and resident light.
+        glow.tick(Some((0, 12)), mid, &c, g, &mut out);
+        trail.tick(Some((0, 12)), mid, &trail_cfg, &mut trail_out);
         assert!(
-            glow.move_candidate_pending(),
-            "the one-shot candidate survives the mid-save frame"
+            glow.move_candidate_pending() && trail.move_candidate_pending(),
+            "both one-shot candidates survive the production mid-save frame"
         );
+        assert_eq!(glow.cursor_anchor(), Some((2, 5)));
+        assert_eq!(trail.cursor_anchor(), Some((2, 5)));
+        assert!(frame_has_output(&out, &glow) && !trail_out.is_empty());
         // Restore frame: same generation, probe back on the input row.
         let restored = mid + Duration::from_millis(8);
-        glow.observe_row_with_trust(2, 5, &row("> hix"), restored, ProbeTrust::ContentOnly);
-        let decision = glow.confirm_content_candidate(Some((2, 5)), restored, generation(51));
-        assert!(
-            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
-            "the restore frame's recaptured probe completes the proof: {decision:?}"
+        let mut restored_row = row("> hi x");
+        restored_row[5] = 'x';
+        glow.observe_row_with_trust(2, 6, &restored_row, restored, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 6)), restored, generation(51));
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("the restored probe must complete the proof: {decision:?}");
+        };
+        let confirmed_tally = glow.admission_tally();
+        assert_eq!(confirmed_tally.armed, armed_tally.armed);
+        assert_eq!(confirmed_tally.confirmed, armed_tally.confirmed + 1);
+        assert_eq!(confirmed_tally.retired, armed_tally.retired);
+        trail.confirm_content_candidate(at, origin, target);
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(51),
+            Some(target),
+            ContentGenerationEvidence::Exact,
         );
+        assert_eq!(ownership, GenerationOwnership::Owned);
+        assert!(
+            glow.owned_write_span.is_none(),
+            "same-generation restore consumes its exact-write witness"
+        );
+        let witness = glow.batch_wake_witness();
+        assert!(witness.is_some(), "restore is rebased onto the keyed row baseline");
+        trail.observe_content_generation(generation(51), ownership, witness.as_ref());
+        glow.tick(Some(target), restored, &c, g, &mut out);
+        trail.tick(Some(target), restored, &trail_cfg, &mut trail_out);
+        assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
+        assert_eq!(glow.cursor_anchor(), Some(target));
+        assert_eq!(trail.cursor_anchor(), Some(target));
+        assert!(frame_has_output(&out, &glow) && !trail_out.is_empty());
+
+        // EXTRA-GENERATION NEGATIVE: the one-frame hold cannot stretch over
+        // another parser batch or downgrade into a reusable Motion licence.
+        let mut expired = CursorGlow::default();
+        let mut expired_out = Vec::new();
+        expired.note_context(true);
+        expired.tick(Some((2, 4)), t0, &c, g, &mut expired_out);
+        assert_eq!(
+            expired.observe_content_generation(generation(70), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        expired.note_typed_expected(key, typed_x, (2, 5), (2, 4), baseline, generation(70));
+        expired.observe_row_with_trust(0, 12, &row("[stream 001]"), mid, ProbeTrust::ContentOnly);
+        assert!(matches!(
+            expired.confirm_content_candidate(Some((0, 12)), mid, generation(71)),
+            Some(ContentCandidateDecision::Deferred { .. })
+        ));
+        assert_eq!(
+            expired.observe_content_generation_with_evidence(
+                generation(71),
+                Some((0, 12)),
+                ContentGenerationEvidence::DeferredProbe,
+            ),
+            GenerationOwnership::DeferredProbe
+        );
+        expired.tick(Some((0, 12)), mid, &c, g, &mut expired_out);
+        let late = restored + Duration::from_millis(1);
+        assert!(matches!(
+            expired.confirm_content_candidate(Some((2, 5)), late, generation(72)),
+            Some(ContentCandidateDecision::Retired { .. })
+        ));
+        assert!(!expired.move_candidate_pending());
+    }
+
+    /// The deferred frame is a one-shot proof hold, not a grace period. Every
+    /// way the restored proof can fail on the following frame must retire both
+    /// engines immediately, including failures that happen in the SAME parser
+    /// generation (where the ordinary generation-change fence would not run).
+    #[test]
+    fn deferred_probe_rejections_retire_both_engines_without_a_second_hold() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let row = |s: &str| -> Vec<char> {
+            let mut cells: Vec<char> = s.chars().collect();
+            cells.resize(40, ' ');
+            cells
+        };
+        let make_deferred = || {
+            let mut glow = CursorGlow::default();
+            let mut trail = CursorTrail::default();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            glow.note_context(true);
+            trail.note_context(true);
+            glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+            trail.tick(Some((2, 4)), t0, &trail_cfg, &mut trail_out);
+            assert_eq!(
+                glow.observe_content_generation(generation(50), Some((2, 4)), false),
+                GenerationOwnership::Steady
+            );
+            trail.observe_content_generation(generation(50), GenerationOwnership::Steady, None);
+            let resident_at = t0 + Duration::from_micros(1);
+            glow.note_synthetic_move(resident_at);
+            trail.note_synthetic_move(resident_at);
+            glow.tick(Some((2, 5)), resident_at, &c, g, &mut glow_out);
+            trail.tick(Some((2, 5)), resident_at, &trail_cfg, &mut trail_out);
+            assert!(glow.live_sparks() > 0 && !trail_out.is_empty());
+            let mut baseline_cells = [' '; 40];
+            for (index, ch) in "> hi".chars().enumerate() {
+                baseline_cells[index] = ch;
+            }
+            let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+            let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+            let key = t0 + Duration::from_millis(1);
+            glow.note_typed_expected(
+                key,
+                expected,
+                (2, 6),
+                (2, 5),
+                baseline,
+                generation(50),
+            );
+            trail.note_typed_expected(key, expected, (2, 6), (2, 5));
+            let mid = key + Duration::from_millis(8);
+            glow.observe_row_with_trust(
+                0,
+                12,
+                &row("[stream 001]"),
+                mid,
+                ProbeTrust::ContentOnly,
+            );
+            assert!(matches!(
+                glow.confirm_content_candidate(Some((0, 12)), mid, generation(51)),
+                Some(ContentCandidateDecision::Deferred { .. })
+            ));
+            let ownership = glow.observe_content_generation_with_evidence(
+                generation(51),
+                Some((0, 12)),
+                ContentGenerationEvidence::DeferredProbe,
+            );
+            assert_eq!(ownership, GenerationOwnership::DeferredProbe);
+            trail.observe_content_generation(generation(51), ownership, None);
+            glow.tick(Some((0, 12)), mid, &c, g, &mut glow_out);
+            trail.tick(Some((0, 12)), mid, &trail_cfg, &mut trail_out);
+            assert!(glow.live_sparks() > 0 && !trail_out.is_empty());
+            (glow, trail, glow_out, trail_out, key, mid, baseline_cells)
+        };
+        let project_retired = |
+            glow: &mut CursorGlow,
+            trail: &mut CursorTrail,
+            decision: Option<ContentCandidateDecision>,
+            current: Option<(u16, u16)>,
+            current_generation: ContentGeneration,
+        | {
+            let Some(ContentCandidateDecision::Retired { at, origin }) = decision else {
+                panic!("expected a deferred retirement, got {decision:?}");
+            };
+            trail.retire_content_candidate(at, origin);
+            let ownership = glow.observe_content_generation_with_evidence(
+                current_generation,
+                current,
+                ContentGenerationEvidence::None,
+            );
+            assert_eq!(ownership, GenerationOwnership::UnownedRelocation);
+            let witness = glow.batch_wake_witness();
+            trail.observe_content_generation(current_generation, ownership, witness.as_ref());
+            assert_eq!(glow.live_sparks(), 0, "glow resident wake retired");
+            assert!(!trail.is_active(), "classic resident wake retired");
+            assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
+        };
+
+        // A literal second off-row frame cannot mint a second hold.
+        let (mut glow, mut trail, _, _, _, mid, _) = make_deferred();
+        let second = mid + Duration::from_millis(8);
+        glow.observe_row_with_trust(
+            0,
+            13,
+            &row("[stream 002]"),
+            second,
+            ProbeTrust::ContentOnly,
+        );
+        let decision = glow.confirm_content_candidate(Some((0, 13)), second, generation(51));
+        project_retired(
+            &mut glow,
+            &mut trail,
+            decision,
+            Some((0, 13)),
+            generation(51),
+        );
+
+        // The real freshness boundary is >250 ms, not merely N+2.
+        let (mut glow, mut trail, _, _, key, _, _) = make_deferred();
+        let stale = key + Duration::from_millis(251);
+        let decision = glow.confirm_content_candidate(Some((2, 6)), stale, generation(51));
+        project_retired(
+            &mut glow,
+            &mut trail,
+            decision,
+            Some((2, 6)),
+            generation(51),
+        );
+
+        // A valid restored row with the caret at an arbitrary cell does not
+        // become Exact ownership merely because the content proof succeeded.
+        let (mut glow, mut trail, _, _, _, mid, mut baseline_cells) = make_deferred();
+        baseline_cells[5] = 'x';
+        let restored = mid + Duration::from_millis(8);
+        glow.observe_row_with_trust(
+            2,
+            9,
+            &baseline_cells,
+            restored,
+            ProbeTrust::ContentOnly,
+        );
+        let decision = glow.confirm_content_candidate(Some((2, 9)), restored, generation(51));
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!("row proof should succeed before the target fence: {decision:?}");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(51),
+            Some((2, 9)),
+            ContentGenerationEvidence::Exact,
+        );
+        assert_eq!(ownership, GenerationOwnership::UnownedRelocation);
+        let witness = glow.batch_wake_witness();
+        trail.observe_content_generation(generation(51), ownership, witness.as_ref());
+        assert_eq!(glow.live_sparks(), 0);
+        assert!(!trail.is_active());
+
+        // Terminal identity, screen identity, and one additional parser batch
+        // all invalidate the sole deferred generation.
+        for invalid in [
+            ContentGeneration {
+                terminal_id: 8,
+                ..generation(51)
+            },
+            ContentGeneration {
+                alternate_screen: false,
+                ..generation(51)
+            },
+            generation(52),
+        ] {
+            let (mut glow, mut trail, _, _, _, mid, _) = make_deferred();
+            let decision = glow.confirm_content_candidate(Some((2, 6)), mid, invalid);
+            project_retired(
+                &mut glow,
+                &mut trail,
+                decision,
+                Some((2, 6)),
+                invalid,
+            );
+        }
+    }
+
+    /// A byte-unchanged restored row is the swallowed-key Motion shape. It
+    /// completes in the held generation too: keep attested resident wake, but
+    /// let a one-cell motion consume dark without adding light or erasing the
+    /// comet that was already on glass.
+    #[test]
+    fn deferred_probe_same_generation_motion_downgrade_keeps_attested_wake() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(400),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let mut baseline_cells = [' '; 40];
+        for (index, ch) in "> hi".chars().enumerate() {
+            baseline_cells[index] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let mut glow = CursorGlow::default();
+        let mut trail = CursorTrail::default();
+        let mut glow_out = Vec::new();
+        let mut trail_out = Vec::new();
+        glow.note_context(true);
+        trail.note_context(true);
+        glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+        trail.tick(Some((2, 4)), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(50), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        trail.observe_content_generation(generation(50), GenerationOwnership::Steady, None);
+        let resident_at = t0 + Duration::from_micros(1);
+        glow.note_synthetic_move(resident_at);
+        trail.note_synthetic_move(resident_at);
+        glow.tick(Some((2, 5)), resident_at, &c, g, &mut glow_out);
+        trail.tick(Some((2, 5)), resident_at, &trail_cfg, &mut trail_out);
+        let resident_sparks = glow.live_sparks();
+        assert!(resident_sparks > 0 && !trail_out.is_empty());
+
+        let key = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(
+            key,
+            expected,
+            (2, 6),
+            (2, 5),
+            baseline,
+            generation(50),
+        );
+        trail.note_typed_expected(key, expected, (2, 6), (2, 5));
+        let mid = key + Duration::from_millis(8);
+        let mut status: Vec<char> = "[stream 001]".chars().collect();
+        status.resize(40, ' ');
+        glow.observe_row_with_trust(0, 12, &status, mid, ProbeTrust::ContentOnly);
+        assert!(matches!(
+            glow.confirm_content_candidate(Some((0, 12)), mid, generation(51)),
+            Some(ContentCandidateDecision::Deferred { .. })
+        ));
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(51),
+            Some((0, 12)),
+            ContentGenerationEvidence::DeferredProbe,
+        );
+        trail.observe_content_generation(generation(51), ownership, None);
+        glow.tick(Some((0, 12)), mid, &c, g, &mut glow_out);
+        trail.tick(Some((0, 12)), mid, &trail_cfg, &mut trail_out);
+
+        let restored = mid + Duration::from_millis(8);
+        glow.observe_row_with_trust(
+            2,
+            6,
+            &baseline_cells,
+            restored,
+            ProbeTrust::ContentOnly,
+        );
+        let decision = glow.confirm_content_candidate(Some((2, 6)), restored, generation(51));
+        let Some(ContentCandidateDecision::Downgraded { at, origin }) = decision else {
+            panic!("byte-steady restored row must downgrade to Motion: {decision:?}");
+        };
+        trail.arm_motion(at, origin);
+        let ownership = glow.observe_content_generation_with_evidence(
+            generation(51),
+            Some((2, 6)),
+            ContentGenerationEvidence::AuthoredMotion,
+        );
+        assert_eq!(ownership, GenerationOwnership::AuthoredMotion);
+        let witness = glow.batch_wake_witness();
+        assert!(witness.is_some(), "downgrade is rebased onto the input row");
+        trail.observe_content_generation(generation(51), ownership, witness.as_ref());
+        assert!(
+            glow.live_sparks() > 0,
+            "same-generation Motion fence retains attested glow wake"
+        );
+        glow.tick(Some((2, 6)), restored, &c, g, &mut glow_out);
+        trail.tick(Some((2, 6)), restored, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            glow.live_sparks(), resident_sparks,
+            "denied one-cell Motion adds no glow geometry and preserves the old wake"
+        );
+        assert!(!trail_out.is_empty(), "classic attested wake survives too");
+        assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
     }
 
     /// THE PHANTOM-POOF FENCE HOLDS: a ContentOnly probe (plain alt screen)
@@ -26120,6 +28682,190 @@ mod tests {
         assert!(
             !glow.vapor.is_empty(),
             "the same shrink under Full trust still poofs — the fence, not the feature, moved"
+        );
+    }
+
+    /// THE FENCE LETS THE TRANSIENTS LIVE (v0.43.0 restoration): twinkle /
+    /// shooting-star particles and landing starbursts are sub-second at-cursor
+    /// flashes a byte-steady repaint elsewhere cannot invalidate, so both
+    /// PROPORTIONATE fence paths — the Owned confirm and the UnownedRewrite
+    /// retention — leave them to die of their own lifetimes. A real relocation
+    /// still takes the wholesale wipe: stranded at-cursor light retires.
+    #[test]
+    fn particles_and_bursts_survive_the_proportionate_fence_but_die_on_relocation() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 21,
+            alternate_screen: false,
+        };
+        let row = |s: &str| -> Vec<char> {
+            let mut v: Vec<char> = s.chars().collect();
+            v.resize(40, ' ');
+            v
+        };
+        let mut glow = CursorGlow::default();
+        glow.observe_row(2, 4, &row("> hi"), t0);
+        assert_eq!(
+            glow.observe_content_generation(generation(10), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        glow.tick(Some((2, 4)), t0, &c, g, &mut out);
+        // The at-cursor transients an admitted keystroke just threw.
+        glow.particles.push(Particle {
+            x0: 36.0,
+            y0: 40.0,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.3,
+            cov_scale: 1.0,
+            born: t0,
+        });
+        glow.rainbow.bursts.push(Starburst {
+            cx: 36.0,
+            cy: 40.0,
+            born: t0,
+            life: 5.0,
+            reach: 12.0,
+            seed: 0.25,
+            stars: 2,
+            sparkles: 2,
+            nova: false,
+        });
+        // OWNED batch (an exact confirm's own generation change): both live.
+        let t1 = t0 + Duration::from_millis(40);
+        glow.observe_row(2, 4, &row("> hi"), t1);
+        assert_eq!(
+            glow.observe_content_generation(generation(11), Some((2, 4)), true),
+            GenerationOwnership::Owned
+        );
+        assert!(
+            !glow.particles.is_empty() && !glow.rainbow.bursts.is_empty(),
+            "an Owned batch must not clear the at-cursor transients"
+        );
+        glow.tick(Some((2, 4)), t1, &c, g, &mut out);
+        // UNOWNED REWRITE (identity + anchor held, lit row rewritten): both
+        // live — the flash at the caret decorates the keystroke, not the row
+        // a streamer just repainted.
+        let t2 = t1 + Duration::from_millis(40);
+        glow.observe_row(2, 4, &row("!! zap"), t2);
+        assert_eq!(
+            glow.observe_content_generation(generation(12), Some((2, 4)), false),
+            GenerationOwnership::UnownedRewrite
+        );
+        assert!(
+            !glow.particles.is_empty() && !glow.rainbow.bursts.is_empty(),
+            "an unowned rewrite at a parked caret must not clear the at-cursor transients"
+        );
+        // REAL RELOCATION: the wholesale wipe still retires them.
+        assert_eq!(
+            glow.observe_content_generation(generation(13), Some((5, 0)), false),
+            GenerationOwnership::UnownedRelocation
+        );
+        assert!(
+            glow.particles.is_empty() && glow.rainbow.bursts.is_empty(),
+            "a relocation strands at-cursor light — the wholesale wipe holds"
+        );
+    }
+
+    /// MOMENTUM DECOUPLES FROM ADMISSION (v0.43.0 restoration): the spine
+    /// advances on the PRESS-HINT half of a typing-shaped echo, so a burst of
+    /// real keystrokes whose candidates ALL retire (each `note_typed`
+    /// supersedes the previous cohort and arms no exact candidate — the
+    /// streaming-collision cadence a busy TUI produces) still climbs the
+    /// canonical metric, and the starfield density consumer sees `disp` rise.
+    /// Amplitude, never provenance: every denied spawn is verified to mint no
+    /// light, and program output without presses stays pinned at zero
+    /// (`program_output_alone_builds_no_momentum`).
+    #[test]
+    fn momentum_climbs_through_streaming_collisions_that_retire_every_candidate() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut t = Instant::now();
+        glow.tick(Some((3, 0)), t, &c, g, &mut out);
+        for col in 1..=30u16 {
+            t += Duration::from_millis(40);
+            // The press arms the key-time hint; no exact candidate ever arms
+            // (the collision shape), so admission denies every echo.
+            glow.note_typed(t);
+            assert!(
+                glow.move_candidate.is_none(),
+                "the collision shape carries no admissible candidate"
+            );
+            glow.tick(Some((3, col)), t, &c, g, &mut out);
+            assert!(
+                glow.sparks.is_empty() && glow.rainbow.ink_pops.is_empty(),
+                "a denied echo mints no light (col {col})"
+            );
+        }
+        assert!(
+            glow.typing_momentum(t) > 0.5,
+            "momentum climbs across the collision burst: {}",
+            glow.typing_momentum(t)
+        );
+        assert!(
+            glow.rainbow.disp > 0.05,
+            "the starfield density consumer sees the eased spine rise: {}",
+            glow.rainbow.disp
+        );
+    }
+
+    /// THE ENTER AND REFLOW LICENSES RETURN (v0.43.0 restoration): an
+    /// ADMITTED jump from a COLD momentum spine (`disp == 0`) throws the ZOOM
+    /// streak when a fresh Return stamp licenses it — a cold Enter throws the
+    /// streak again — and the reflow stamp grants the same license with the
+    /// landing payload suppressed (a resize gets the BEAM ONLY). Without any
+    /// license the same admitted cold jump stays streakless, so the
+    /// anti-stray momentum gate is intact.
+    #[test]
+    fn a_fresh_return_or_reflow_stamp_licenses_the_cold_jump_arm() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let jump = t0 + Duration::from_millis(30);
+        let mut out = Vec::new();
+        // CONTROL: admitted synthetic jump, cold spine, no license — no ZOOM.
+        let mut cold = CursorGlow::default();
+        cold.tick(Some((1, 10)), t0, &c, g, &mut out);
+        cold.note_synthetic_move(jump);
+        cold.tick(Some((4, 2)), jump, &c, g, &mut out);
+        assert_eq!(cold.rainbow.disp, 0.0, "the fixture's spine is cold");
+        assert!(
+            cold.rainbow.jumps.is_empty(),
+            "cold and unlicensed: the anti-stray momentum gate still holds"
+        );
+        // ENTER: the same admitted cold jump with a fresh Return stamp zooms.
+        let mut entered = CursorGlow::default();
+        entered.tick(Some((1, 10)), t0, &c, g, &mut out);
+        entered.note_synthetic_move(jump);
+        entered.note_return(jump);
+        entered.tick(Some((4, 2)), jump, &c, g, &mut out);
+        assert!(
+            !entered.rainbow.jumps.is_empty(),
+            "a fresh Enter licenses the cold ZOOM streak"
+        );
+        // REFLOW: same license, beam only. (`note_reflow` and the synthetic
+        // arm each supersede the other's cohort, so stamp the classifier the
+        // way the settled-resize seam leaves it.)
+        let mut reflowed = CursorGlow::default();
+        reflowed.tick(Some((1, 10)), t0, &c, g, &mut out);
+        reflowed.note_synthetic_move(jump);
+        reflowed.reflow_hint = Some(jump);
+        reflowed.tick(Some((4, 2)), jump, &c, g, &mut out);
+        assert!(
+            !reflowed.rainbow.jumps.is_empty(),
+            "a settled resize licenses the cold ZOOM streak"
+        );
+        assert!(
+            reflowed.rainbow.bursts.is_empty(),
+            "a resize gets the BEAM ONLY — no landing starburst"
         );
     }
 
@@ -26518,6 +29264,679 @@ mod tests {
         );
         assert!(ok, "fresh resident retirement rejected: {why}");
         assert_eq!(retired["resident_charged"], 0);
+    }
+
+    /// The render host intentionally omits row probes on a scroll frame. An
+    /// exact bottom pending-wrap candidate must therefore hold its translated
+    /// departure anchor AND already-earned cell wake through that unprobed
+    /// tick, then admit only after the following frame proves fresh-line
+    /// material. Wrong scroll deltas retire at the signal edge.
+    #[test]
+    fn exact_bottom_scroll_fold_holds_one_tick_then_proves_material() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let trail_cfg = TrailConfig {
+            enabled: true,
+            duration: Duration::from_millis(300),
+            max_len: 24,
+            color: 0x0050_FA7B,
+            intensity: 0.5,
+            warmth: 0.0,
+        };
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 77,
+            alternate_screen: false,
+        };
+        let origin = (5, 39);
+        let translated_origin = (4, 39);
+        let target = (5, 1);
+        let material = (5, 0);
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let blank = ExpectedRowSnapshot::from_slice(&[' ']).unwrap();
+        let evidence_model = aterm_spec::derive::cursor_input_evidence_model();
+        // Build the production shape, not a cold cursor-only fixture: four
+        // exact, content-confirmed keys at the bottom row, each driven through
+        // the same row-proof -> generation-fence -> twin tick ordering as the
+        // render host. The scroll below must translate this mature wake rather
+        // than black it out while waiting for the new bottom-row probe.
+        let seed_bottom_wake = || {
+            let mut glow = CursorGlow::default();
+            let mut trail = CursorTrail::default();
+            let mut glow_out = Vec::new();
+            let mut trail_out = Vec::new();
+            let seed = (origin.0, origin.1 - 4);
+            let mut row = vec![' '; g.cols];
+            glow.observe_row(seed.0, seed.1, &row, t0);
+            assert_eq!(
+                glow.observe_content_generation(generation(6), Some(seed), false),
+                GenerationOwnership::Steady,
+            );
+            trail.observe_content_generation(generation(6), GenerationOwnership::Steady, None);
+            glow.tick(Some(seed), t0, &c, g, &mut glow_out);
+            trail.tick(Some(seed), t0, &trail_cfg, &mut trail_out);
+
+            for i in 0..4u32 {
+                let at = t0 + Duration::from_millis(u64::from(i) + 1);
+                let col = seed.1 + i as u16;
+                let baseline = ExpectedRowSnapshot::from_slice(&row).unwrap();
+                let landing = (seed.0, col + 1);
+                let material = (seed.0, col);
+                glow.note_typed_expected(
+                    at,
+                    expected,
+                    landing,
+                    material,
+                    baseline,
+                    generation(6 + i),
+                );
+                trail.note_typed_expected(at, expected, landing, material);
+                row[usize::from(col)] = 'x';
+                glow.observe_row(landing.0, landing.1, &row, at);
+                let Some(ContentCandidateDecision::Confirmed { at, origin, target }) =
+                    glow.confirm_content_candidate(Some(landing), at, generation(7 + i))
+                else {
+                    panic!("resident key {i} did not confirm");
+                };
+                trail.confirm_content_candidate(at, origin, target);
+                let ownership =
+                    glow.observe_content_generation(generation(7 + i), Some(landing), true);
+                assert_eq!(ownership, GenerationOwnership::Owned);
+                {
+                    let witness = glow.batch_wake_witness();
+                    trail.observe_content_generation(
+                        generation(7 + i),
+                        ownership,
+                        witness.as_ref(),
+                    );
+                }
+                glow.tick(Some(landing), at, &c, g, &mut glow_out);
+                trail.tick(Some(landing), at, &trail_cfg, &mut trail_out);
+            }
+            assert_eq!(glow.cursor_anchor(), Some(origin));
+            assert_eq!(trail.cursor_anchor(), Some(origin));
+            (glow, trail, glow_out, trail_out)
+        };
+
+        let (mut glow, mut trail, mut glow_out, mut trail_out) = seed_bottom_wake();
+        let mut resident_glow_cells = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing)
+            .map(|spark| (spark.row, spark.col))
+            .collect::<Vec<_>>();
+        resident_glow_cells.sort_unstable();
+        resident_glow_cells.dedup();
+        let mut resident_trail_cells = trail_out
+            .iter()
+            .map(|cell| (cell.row as u16, cell.col as u16))
+            .collect::<Vec<_>>();
+        resident_trail_cells.sort_unstable();
+        resident_trail_cells.dedup();
+        assert!(resident_glow_cells.len() >= 4, "mature rainbow wake");
+        assert!(resident_trail_cells.len() >= 4, "mature classic wake");
+        assert!(!glow.rainbow.ink_pops.is_empty(), "the plume has live fuel");
+
+        let typed_at = t0 + Duration::from_millis(10);
+        // Give the selective hold fence a real non-cell victim. This crown is
+        // deliberately long-lived, so disappearance at the hold cannot be
+        // mistaken for ordinary time decay.
+        let seeded_crown_until = t0 + Duration::from_secs(1);
+        glow.crown_until = Some(seeded_crown_until);
+        glow.note_bottom_scroll_typed_expected(
+            typed_at,
+            expected,
+            target,
+            material,
+            blank,
+            generation(10),
+        );
+        trail.note_bottom_scroll_typed_expected(typed_at, expected, target, material);
+        glow.note_scroll(1);
+        trail.note_scroll(1);
+        glow.drop_row_probe();
+        assert_eq!(glow.cursor_anchor(), Some(translated_origin));
+        assert_eq!(trail.cursor_anchor(), Some(translated_origin));
+        assert_eq!(
+            glow.crown_until,
+            Some(seeded_crown_until),
+            "precondition: the translated-cell seed also has a live non-cell transient"
+        );
+
+        // Tier 1, action 1: project the genuine exact scroll translation into
+        // the model's seed state. All three written bits come from live engine
+        // state, so neither candidate nor resident/transient precondition can
+        // silently disappear while this bind keeps passing.
+        let model_initial = evidence_model.init_state();
+        let mut model_seeded = model_initial.clone();
+        model_seeded.insert(
+            "translated_trail_resident",
+            i64::from(!glow.sparks.is_empty() && trail.is_active()),
+        );
+        model_seeded.insert(
+            "non_cell_transient",
+            i64::from(glow.crown_until == Some(seeded_crown_until)),
+        );
+        model_seeded.insert(
+            "bottom_candidate_pending",
+            i64::from(glow.move_candidate_pending() && trail.move_candidate_pending()),
+        );
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_initial,
+            &model_seeded,
+            Some("SeedTranslatedBottomScrollTrail"),
+            "effects exact bottom-scroll translated-wake seed",
+        );
+        assert!(ok, "real translated-wake seed rejected: {why}");
+        let spawns_before_hold = glow.spawns;
+
+        let scroll_frame = t0 + Duration::from_millis(11);
+        assert_eq!(
+            glow.confirm_content_candidate(Some(target), scroll_frame, generation(11)),
+            None,
+            "the signal frame waits for the deliberately fenced row probe"
+        );
+        let ownership = glow.observe_content_generation(generation(11), Some(target), false);
+        assert_eq!(ownership, GenerationOwnership::TranslatedScroll);
+        trail.observe_content_generation(generation(11), ownership, None);
+        assert!(
+            glow.needs_frame_cadence(),
+            "the material-probe frame is scheduled"
+        );
+
+        for &(row, col) in &resident_glow_cells {
+            assert!(
+                glow.sparks
+                    .iter()
+                    .any(|spark| { spark.typing && (spark.row, spark.col) == (row - 1, col) }),
+                "translated rainbow cell ({row},{col}) survives ownership"
+            );
+        }
+        glow.tick(Some(target), scroll_frame, &c, g, &mut glow_out);
+        trail.tick(Some(target), scroll_frame, &trail_cfg, &mut trail_out);
+        assert!(glow.move_candidate_pending() && trail.move_candidate_pending());
+        assert_eq!(glow.cursor_anchor(), Some(translated_origin));
+        assert_eq!(trail.cursor_anchor(), Some(translated_origin));
+        let hold_pulse = glow.take_cursor_cat_motion_pulse();
+        assert!(hold_pulse.is_none());
+        assert_eq!(
+            glow.spawns, spawns_before_hold,
+            "the unprobed hold admits no fresh movement birth"
+        );
+        assert!(
+            glow.crown_until.is_none(),
+            "the hold selectively clears the real non-cell crown"
+        );
+        assert!(
+            frame_has_output(&glow_out, &glow),
+            "the rainbow hold never blacks out"
+        );
+        assert!(!trail_out.is_empty(), "the classic hold never blacks out");
+        let hold_trail_cells = trail_out
+            .iter()
+            .map(|cell| (cell.row as u16, cell.col as u16))
+            .collect::<Vec<_>>();
+        for &(row, col) in &resident_trail_cells {
+            assert!(
+                hold_trail_cells.contains(&(row - 1, col)),
+                "translated classic cell ({row},{col}) survives the hold"
+            );
+        }
+        assert_eq!(
+            glow.rainbow.wake_head.map(|(row, _)| row),
+            Some(translated_origin.0),
+            "the plume nozzle stays with the translated wake until proof"
+        );
+
+        // Tier 1, action 2: the shipping hold keeps the two mature cell beds,
+        // keeps only the pending material credential, clears the real crown,
+        // and produces neither a spawn nor a cat fold pulse.
+        let translated_glow_held = resident_glow_cells.iter().all(|&(row, col)| {
+            glow.sparks
+                .iter()
+                .any(|spark| spark.typing && (spark.row, spark.col) == (row - 1, col))
+        });
+        let translated_trail_held = resident_trail_cells
+            .iter()
+            .all(|&(row, col)| hold_trail_cells.contains(&(row - 1, col)));
+        let mut model_held = model_seeded.clone();
+        model_held.insert("phase", 1);
+        model_held.insert(
+            "bottom_candidate_pending",
+            i64::from(glow.move_candidate_pending() && trail.move_candidate_pending()),
+        );
+        model_held.insert("bottom_material_hold", 1);
+        model_held.insert("bottom_material_exact", 0);
+        model_held.insert("armed", i64::from(glow.spawns > spawns_before_hold));
+        model_held.insert("bottom_scroll_fold", i64::from(hold_pulse.is_some()));
+        model_held.insert("trail_lit", i64::from(glow.spawns > spawns_before_hold));
+        model_held.insert(
+            "translated_trail_resident",
+            i64::from(translated_glow_held && translated_trail_held),
+        );
+        model_held.insert(
+            "non_cell_transient",
+            i64::from(glow.crown_until == Some(seeded_crown_until)),
+        );
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_seeded,
+            &model_held,
+            Some("HoldBottomScrollMaterialProbe"),
+            "effects exact bottom-scroll material hold",
+        );
+        assert!(ok, "real bottom-scroll material hold rejected: {why}");
+
+        let mut forged_blackout = model_held.clone();
+        forged_blackout.insert("translated_trail_resident", 0);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_seeded,
+            &forged_blackout,
+            Some("HoldBottomScrollMaterialProbe"),
+            "effects bottom-scroll hold blackout negative control",
+        );
+        assert!(
+            !ok,
+            "the model accepted a forged blackout at the authenticated hold"
+        );
+
+        let proof_frame = t0 + Duration::from_millis(12);
+        let spawns_before_proof = glow.spawns;
+        glow.observe_row(target.0, target.1, &['x'], proof_frame);
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) =
+            glow.confirm_content_candidate(Some(target), proof_frame, generation(11))
+        else {
+            panic!("fresh-line material did not confirm");
+        };
+        trail.confirm_content_candidate(at, origin, target);
+        glow.tick(Some(target), proof_frame, &c, g, &mut glow_out);
+        trail.tick(Some(target), proof_frame, &trail_cfg, &mut trail_out);
+        assert!(frame_has_output(&glow_out, &glow));
+        let newborn_trail_cells = trail_out
+            .iter()
+            .map(|cell| (cell.row as u16, cell.col as u16))
+            .filter(|cell| !hold_trail_cells.contains(cell))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            newborn_trail_cells,
+            [material],
+            "the classic trail births only the new-bottom material cell"
+        );
+        for &(row, col) in &resident_trail_cells {
+            assert!(
+                trail_out
+                    .iter()
+                    .any(|cell| (cell.row as u16, cell.col as u16) == (row - 1, col)),
+                "the proof does not replace translated classic cell ({row},{col})"
+            );
+        }
+        let proof_pulse = glow.take_cursor_cat_motion_pulse();
+        assert_eq!(
+            proof_pulse,
+            Some(CursorCatMotionPulse {
+                at: proof_frame,
+                kind: CursorCatMotionKind::FoldForward,
+            })
+        );
+
+        // Tier 1, action 3: the exact material proof consumes the provisional
+        // candidate, births exactly its material cell, preserves every older
+        // translated cell, and emits the authenticated forward-fold pulse.
+        let confirmed_glow_resident = resident_glow_cells.iter().all(|&(row, col)| {
+            glow.sparks
+                .iter()
+                .any(|spark| spark.typing && (spark.row, spark.col) == (row - 1, col))
+        });
+        let confirmed_trail_resident = resident_trail_cells.iter().all(|&(row, col)| {
+            trail_out
+                .iter()
+                .any(|cell| (cell.row as u16, cell.col as u16) == (row - 1, col))
+        });
+        let exact_fold_born = glow.spawns == spawns_before_proof + 1
+            && newborn_trail_cells == [material]
+            && proof_pulse.is_some();
+        let mut model_confirmed = model_held.clone();
+        model_confirmed.insert("phase", 2);
+        model_confirmed.insert(
+            "bottom_candidate_pending",
+            i64::from(glow.move_candidate_pending() || trail.move_candidate_pending()),
+        );
+        model_confirmed.insert("bottom_material_hold", 0);
+        model_confirmed.insert("bottom_material_exact", 1);
+        model_confirmed.insert("armed", i64::from(exact_fold_born));
+        model_confirmed.insert("bottom_scroll_fold", i64::from(proof_pulse.is_some()));
+        model_confirmed.insert("trail_lit", i64::from(exact_fold_born));
+        model_confirmed.insert(
+            "translated_trail_resident",
+            i64::from(confirmed_glow_resident && confirmed_trail_resident),
+        );
+        // This variable tracks the seeded transient retired by the hold, not
+        // a new crown legitimately born with the now-confirmed fold.
+        model_confirmed.insert("non_cell_transient", 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_held,
+            &model_confirmed,
+            Some("ConfirmHeldBottomScrollMaterial"),
+            "effects exact held bottom-scroll material confirmation",
+        );
+        assert!(ok, "real held-material confirmation rejected: {why}");
+
+        // A valid signal/generation hold followed by WRONG fresh-line material
+        // is not the wrong-scroll case below: the already-translated rows are
+        // still coordinate-valid. Production retires the pending candidate,
+        // projects the same-generation Steady fence, then observes the held
+        // landing. That observation must add nothing without blacking out the
+        // mature wake that preceded this failed proof.
+        let (
+            mut rejected_glow,
+            mut rejected_trail,
+            mut rejected_glow_out,
+            mut rejected_trail_out,
+        ) = seed_bottom_wake();
+        rejected_glow.note_bottom_scroll_typed_expected(
+            typed_at,
+            expected,
+            target,
+            material,
+            blank,
+            generation(10),
+        );
+        rejected_trail.note_bottom_scroll_typed_expected(
+            typed_at, expected, target, material,
+        );
+        rejected_glow.note_scroll(1);
+        rejected_trail.note_scroll(1);
+        rejected_glow.drop_row_probe();
+        assert_eq!(
+            rejected_glow.confirm_content_candidate(
+                Some(target),
+                scroll_frame,
+                generation(11),
+            ),
+            None,
+        );
+        let rejected_hold_ownership = rejected_glow.observe_content_generation(
+            generation(11),
+            Some(target),
+            false,
+        );
+        assert_eq!(
+            rejected_hold_ownership,
+            GenerationOwnership::TranslatedScroll
+        );
+        rejected_trail.observe_content_generation(
+            generation(11),
+            rejected_hold_ownership,
+            None,
+        );
+        rejected_glow.tick(
+            Some(target),
+            scroll_frame,
+            &c,
+            g,
+            &mut rejected_glow_out,
+        );
+        rejected_trail.tick(
+            Some(target),
+            scroll_frame,
+            &trail_cfg,
+            &mut rejected_trail_out,
+        );
+        let rejected_hold_trail_cells = rejected_trail_out
+            .iter()
+            .map(|cell| (cell.row as u16, cell.col as u16))
+            .collect::<Vec<_>>();
+        assert!(rejected_hold_trail_cells.len() >= 4, "rejection has mature wake");
+        let rejected_spawns_before = rejected_glow.spawns;
+
+        let rejected_at = proof_frame;
+        rejected_glow.observe_row(target.0, target.1, &['y'], rejected_at);
+        let Some(ContentCandidateDecision::Retired { at, origin }) =
+            rejected_glow.confirm_content_candidate(
+                Some(target),
+                rejected_at,
+                generation(11),
+            )
+        else {
+            panic!("wrong fresh-line material did not retire the held candidate");
+        };
+        rejected_trail.retire_content_candidate(at, origin);
+        let rejected_ownership = rejected_glow.observe_content_generation(
+            generation(11),
+            Some(target),
+            false,
+        );
+        assert_eq!(
+            rejected_ownership,
+            GenerationOwnership::Steady,
+            "the proof result belongs to the already-held parser generation"
+        );
+        rejected_trail.observe_content_generation(
+            generation(11),
+            rejected_ownership,
+            None,
+        );
+        rejected_glow.tick(
+            Some(target),
+            rejected_at,
+            &c,
+            g,
+            &mut rejected_glow_out,
+        );
+        rejected_trail.tick(
+            Some(target),
+            rejected_at,
+            &trail_cfg,
+            &mut rejected_trail_out,
+        );
+        assert!(!rejected_glow.move_candidate_pending());
+        assert!(!rejected_trail.move_candidate_pending());
+        assert_eq!(
+            rejected_glow.spawns, rejected_spawns_before,
+            "wrong material cannot birth a fold"
+        );
+        let rejected_pulse = rejected_glow.take_cursor_cat_motion_pulse();
+        assert!(rejected_pulse.is_none(), "wrong material cannot launch the cat");
+        assert!(
+            rejected_glow.crown_until.is_none(),
+            "wrong material cannot replace the crown cleared at the hold"
+        );
+        let rejected_final_trail_cells = rejected_trail_out
+            .iter()
+            .map(|cell| (cell.row as u16, cell.col as u16))
+            .collect::<Vec<_>>();
+        for cell in &rejected_hold_trail_cells {
+            assert!(
+                rejected_final_trail_cells.contains(cell),
+                "material rejection preserves translated classic cell {cell:?}"
+            );
+        }
+        assert!(
+            !rejected_final_trail_cells.contains(&material),
+            "wrong material births no classic material cell"
+        );
+        let rejected_glow_resident = resident_glow_cells.iter().all(|&(row, col)| {
+            rejected_glow
+                .sparks
+                .iter()
+                .any(|spark| spark.typing && (spark.row, spark.col) == (row - 1, col))
+        });
+        assert!(rejected_glow_resident, "material rejection preserves rainbow wake");
+        assert!(frame_has_output(&rejected_glow_out, &rejected_glow));
+
+        // Tier 1, action 4: reject only the held material credential. The
+        // translated resident bit is derived from both live engines and stays
+        // set; admission/fold/newborn bits all derive from the dark result.
+        let rejected_trail_resident = rejected_hold_trail_cells
+            .iter()
+            .all(|cell| rejected_final_trail_cells.contains(cell));
+        let rejected_born = rejected_glow.spawns > rejected_spawns_before
+            || rejected_final_trail_cells.contains(&material)
+            || rejected_pulse.is_some();
+        let mut model_rejected = model_held.clone();
+        model_rejected.insert("phase", 2);
+        model_rejected.insert(
+            "bottom_candidate_pending",
+            i64::from(
+                rejected_glow.move_candidate_pending()
+                    || rejected_trail.move_candidate_pending(),
+            ),
+        );
+        model_rejected.insert("bottom_material_hold", 0);
+        model_rejected.insert("bottom_material_exact", 0);
+        model_rejected.insert("armed", i64::from(rejected_born));
+        model_rejected.insert("bottom_scroll_fold", i64::from(rejected_pulse.is_some()));
+        model_rejected.insert("trail_lit", i64::from(rejected_born));
+        model_rejected.insert(
+            "translated_trail_resident",
+            i64::from(rejected_glow_resident && rejected_trail_resident),
+        );
+        model_rejected.insert("non_cell_transient", 0);
+        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_held,
+            &model_rejected,
+            Some("RejectHeldBottomScrollMaterial"),
+            "effects held bottom-scroll wrong-material rejection",
+        );
+        assert!(ok, "real held-material rejection rejected: {why}");
+
+        let mut forged_rejection_blackout = model_rejected.clone();
+        forged_rejection_blackout.insert("translated_trail_resident", 0);
+        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
+            &evidence_model,
+            &[],
+            &model_held,
+            &forged_rejection_blackout,
+            Some("RejectHeldBottomScrollMaterial"),
+            "effects material-rejection blackout negative control",
+        );
+        assert!(
+            !ok,
+            "the model accepted a forged blackout after material rejection"
+        );
+
+        let unrelated_at = rejected_at + Duration::from_millis(1);
+        rejected_glow.tick(
+            Some((target.0, target.1 + 2)),
+            unrelated_at,
+            &c,
+            g,
+            &mut rejected_glow_out,
+        );
+        rejected_trail.tick(
+            Some((target.0, target.1 + 2)),
+            unrelated_at,
+            &trail_cfg,
+            &mut rejected_trail_out,
+        );
+        assert_eq!(
+            rejected_glow.live_sparks(),
+            0,
+            "the rejection exception cannot preserve a later unrelated glow move"
+        );
+        assert!(
+            !rejected_trail.is_active(),
+            "the rejection exception cannot preserve a later unrelated classic move"
+        );
+
+        let (mut wrong_glow, mut wrong_trail, _, _) = seed_bottom_wake();
+        wrong_glow.note_bottom_scroll_typed_expected(
+            typed_at,
+            expected,
+            target,
+            material,
+            blank,
+            generation(10),
+        );
+        wrong_trail.note_bottom_scroll_typed_expected(typed_at, expected, target, material);
+        wrong_glow.note_scroll(2);
+        wrong_trail.note_scroll(2);
+        wrong_glow.drop_row_probe();
+        assert!(!wrong_glow.move_candidate_pending() && !wrong_trail.move_candidate_pending());
+        assert_eq!(
+            wrong_glow.confirm_content_candidate(Some(target), scroll_frame, generation(11)),
+            None,
+        );
+        let wrong_ownership =
+            wrong_glow.observe_content_generation(generation(11), Some(target), false);
+        assert_eq!(wrong_ownership, GenerationOwnership::UnownedRelocation);
+        wrong_trail.observe_content_generation(generation(11), wrong_ownership, None);
+        assert_eq!(
+            wrong_glow.live_sparks(),
+            0,
+            "wrong delta keeps no rainbow wake"
+        );
+        assert!(
+            !wrong_trail.is_active(),
+            "wrong delta keeps no classic wake"
+        );
+
+        // ORPHANED FOLLOW-UP NEGATIVE: if the cursor disappears before the
+        // material probe ever arrives, the provisional proof expires by its
+        // own clock. It may not pin `needs_frame_cadence` (and therefore the
+        // whole window) at 60 fps forever waiting for a delta that never comes.
+        let lumen = cfg(GlowStyle::Lumen, true);
+        let mut orphan_glow = CursorGlow::default();
+        let mut orphan_trail = CursorTrail::default();
+        orphan_glow.tick(Some(origin), t0, &lumen, g, &mut glow_out);
+        orphan_trail.tick(Some(origin), t0, &trail_cfg, &mut trail_out);
+        assert_eq!(
+            orphan_glow.observe_content_generation(generation(20), Some(origin), false),
+            GenerationOwnership::Steady,
+        );
+        orphan_trail.observe_content_generation(generation(20), GenerationOwnership::Steady, None);
+        orphan_glow.note_bottom_scroll_typed_expected(
+            typed_at,
+            expected,
+            target,
+            material,
+            blank,
+            generation(20),
+        );
+        orphan_trail.note_bottom_scroll_typed_expected(typed_at, expected, target, material);
+        orphan_glow.note_scroll(1);
+        orphan_trail.note_scroll(1);
+        orphan_glow.drop_row_probe();
+        assert_eq!(
+            orphan_glow.confirm_content_candidate(Some(target), scroll_frame, generation(21)),
+            None,
+        );
+        let ownership = orphan_glow.observe_content_generation(generation(21), Some(target), false);
+        assert_eq!(ownership, GenerationOwnership::TranslatedScroll);
+        orphan_trail.observe_content_generation(generation(21), ownership, None);
+        orphan_glow.tick(Some(target), scroll_frame, &lumen, g, &mut glow_out);
+        orphan_trail.tick(Some(target), scroll_frame, &trail_cfg, &mut trail_out);
+        assert!(orphan_glow.move_candidate_pending());
+        assert!(orphan_trail.move_candidate_pending());
+        assert!(orphan_glow.needs_frame_cadence());
+
+        let expired_at = typed_at + Duration::from_millis(251);
+        orphan_glow.tick(None, expired_at, &lumen, g, &mut glow_out);
+        orphan_trail.tick(None, expired_at, &trail_cfg, &mut trail_out);
+        assert!(!orphan_glow.move_candidate_pending());
+        assert!(!orphan_trail.move_candidate_pending());
+        assert!(!orphan_glow.is_active());
+        assert!(!orphan_trail.is_active());
+        assert!(!orphan_glow.needs_frame_cadence());
+        assert_eq!(
+            orphan_glow.next_change_deadline(expired_at, Duration::from_millis(16)),
+            None,
+            "the orphaned proof returns the window to true idle"
+        );
+        assert_eq!(
+            orphan_glow.admission_tally().last_retire_reason,
+            Some("bottom-scroll-probe-expired"),
+        );
     }
 
     /// STYLE SWITCH mid-animation CROSSFADES the foreign light instead of hard-
@@ -32512,10 +35931,13 @@ mod tests {
 
     /// EARNED BY REAL TYPING ONLY (M1): a program printing one glyph per frame
     /// walks the caret forward +1 col every tick — the exact `forward` shape —
-    /// yet arms NO exact/synthetic candidate, so the correlated advance never fires:
+    /// yet arms NO key-time press hint, so the correlated advance never fires:
     /// the metric stays flat at zero and no momentum pulse is ever offered to
-    /// the cat. The same forward moves WITH a synthetic typed candidate build normally, so
-    /// this is the correlation gate, not a dead advance.
+    /// the cat. The same forward moves WITH a real press behind them build
+    /// normally, so this is the correlation gate, not a dead advance. (The
+    /// advance keys on the PRESS-HINT half — v0.43.0 law — not on candidate
+    /// admission; see `classify_move`'s momentum comment and
+    /// `momentum_climbs_through_streaming_collisions_that_retire_every_candidate`.)
     #[test]
     fn program_output_alone_builds_no_momentum() {
         let g = geom();
@@ -32557,6 +35979,96 @@ mod tests {
             typed.typing_momentum(t2) > 0.5,
             "real typing of the same cells earns momentum: {}",
             typed.typing_momentum(t2)
+        );
+    }
+
+    /// Appendix-A seam: the classifier already knows whether an authenticated
+    /// cursor move is a fold. The cursor-cat channel must preserve that verdict
+    /// for the ordinary next-row shape, an explicit preview-only same-row
+    /// reflow projection, and the exact Backspace inverse — while a
+    /// navigation-shaped relocation mints nothing. Shipping bottom-scroll
+    /// reachability is bound by the real-App ContentScrollState test in
+    /// `app_input`; this synthetic classifier test makes no such claim.
+    #[test]
+    fn cursor_cat_motion_pulse_preserves_authenticated_fold_shape() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let mut out = Vec::new();
+
+        let mut ordinary = CursorGlow::default();
+        ordinary.tick(Some((2, 5)), t0, &c, g, &mut out);
+        let at = t0 + Duration::from_millis(20);
+        ordinary.note_synthetic_typed(at, 1);
+        ordinary.tick(Some((2, 6)), at, &c, g, &mut out);
+        assert_eq!(
+            ordinary.take_cursor_cat_motion_pulse(),
+            Some(CursorCatMotionPulse {
+                at,
+                kind: CursorCatMotionKind::Advance,
+            })
+        );
+
+        let mut next_row = CursorGlow::default();
+        next_row.tick(Some((2, 38)), t0, &c, g, &mut out);
+        next_row.note_synthetic_typed(at, 1);
+        next_row.tick(Some((3, 0)), at, &c, g, &mut out);
+        assert_eq!(
+            next_row.take_cursor_cat_motion_pulse(),
+            Some(CursorCatMotionPulse {
+                at,
+                kind: CursorCatMotionKind::FoldForward,
+            })
+        );
+
+        let mut same_row_preview = CursorGlow::default();
+        same_row_preview.tick(Some((5, 38)), t0, &c, g, &mut out);
+        same_row_preview.note_synthetic_typed(at, 1);
+        same_row_preview.tick(Some((5, 0)), at, &c, g, &mut out);
+        assert_eq!(
+            same_row_preview.take_cursor_cat_motion_pulse(),
+            Some(CursorCatMotionPulse {
+                at,
+                kind: CursorCatMotionKind::FoldForward,
+            }),
+            "the explicit same-row reflow preview preserves the fold classifier"
+        );
+
+        let mut reverse = CursorGlow::default();
+        let reverse_origin = (3, 0);
+        let reverse_target = (2, 38);
+        reverse.tick(Some(reverse_origin), t0, &c, g, &mut out);
+        reverse.note_backspace(at);
+        reverse.move_candidate = Some(GlowMoveCandidate {
+            at,
+            origin: reverse_origin,
+            intent: GlowMoveIntent::Delete,
+            target: Some(reverse_target),
+            material: None,
+            baseline_row: None,
+            reverse_target_baseline: None,
+            reverse_left_col: None,
+            baseline_generation: None,
+            deferred_probe_generation: None,
+            content_confirmed: true,
+            bottom_scroll: None,
+        });
+        reverse.tick(Some(reverse_target), at, &c, g, &mut out);
+        assert_eq!(
+            reverse.take_cursor_cat_motion_pulse(),
+            Some(CursorCatMotionPulse {
+                at,
+                kind: CursorCatMotionKind::FoldReverse,
+            })
+        );
+
+        let mut nav = CursorGlow::default();
+        nav.tick(Some((2, 38)), t0, &c, g, &mut out);
+        nav.note_synthetic_move(at);
+        nav.tick(Some((3, 0)), at, &c, g, &mut out);
+        assert!(
+            nav.take_cursor_cat_motion_pulse().is_none(),
+            "a jump-shaped/navigation candidate is not a typed fold"
         );
     }
 
@@ -38577,6 +42089,218 @@ halo = "add"
         (out, halos)
     }
 
+    #[derive(Clone, Copy, Debug)]
+    struct WakeHueRaster {
+        max_row_span: f32,
+        visible_pixels: usize,
+    }
+
+    /// The paint conformance scanner's meaningful-colour gate and continuous
+    /// HSV hue coordinate. A pair 59°/61° is 2° apart; 45°/75° is 30° apart.
+    fn paint_visible_hue(rgb: u32) -> Option<f32> {
+        let (r, gg, b) = (
+            ((rgb >> 16) & 0xff) as i32,
+            ((rgb >> 8) & 0xff) as i32,
+            (rgb & 0xff) as i32,
+        );
+        let hi = r.max(gg).max(b);
+        let lo = r.min(gg).min(b);
+        let d = hi - lo;
+        if hi < 110 || d < 60 {
+            return None;
+        }
+        let sector = if hi == r {
+            (gg - b) as f32 / d as f32
+        } else if hi == gg {
+            2.0 + (b - r) as f32 / d as f32
+        } else {
+            4.0 + (r - gg) as f32 / d as f32
+        };
+        Some(sector.rem_euclid(6.0) * 60.0)
+    }
+
+    /// Raster the wake exactly as the dark CPU renderer does: additive core
+    /// rectangles and additive radial halos over the shipped `0x111318` ground.
+    /// Return the widest circular hue separation carried by any one raster row,
+    /// which is the release paint oracle's streaming-rainbow predicate.
+    fn rasterized_wake_hue(quads: &[GlowQuad], halos: &[RainHalo]) -> WakeHueRaster {
+        if quads.is_empty() && halos.is_empty() {
+            return WakeHueRaster {
+                max_row_span: 0.0,
+                visible_pixels: 0,
+            };
+        }
+        assert!(halos.iter().all(|halo| halo.mode == HaloMode::Add));
+        let x0 = quads
+            .iter()
+            .map(|quad| i32::from(quad.x))
+            .chain(halos.iter().map(|halo| i32::from(halo.x)))
+            .min()
+            .unwrap();
+        let x1 = quads
+            .iter()
+            .map(|quad| i32::from(quad.x) + i32::from(quad.w))
+            .chain(
+                halos
+                    .iter()
+                    .map(|halo| i32::from(halo.x) + i32::from(halo.w)),
+            )
+            .max()
+            .unwrap();
+        let y0 = quads
+            .iter()
+            .map(|quad| i32::from(quad.y))
+            .chain(halos.iter().map(|halo| i32::from(halo.y)))
+            .min()
+            .unwrap();
+        let y1 = quads
+            .iter()
+            .map(|quad| i32::from(quad.y) + i32::from(quad.h))
+            .chain(
+                halos
+                    .iter()
+                    .map(|halo| i32::from(halo.y) + i32::from(halo.h)),
+            )
+            .max()
+            .unwrap();
+
+        let mut raster = WakeHueRaster {
+            max_row_span: 0.0,
+            visible_pixels: 0,
+        };
+        for py in y0..y1 {
+            let mut hues = Vec::new();
+            for px in x0..x1 {
+                let mut rgb = 0x0011_1318;
+                for quad in quads {
+                    let (qx, qy) = (i32::from(quad.x), i32::from(quad.y));
+                    if (qx..qx + i32::from(quad.w)).contains(&px)
+                        && (qy..qy + i32::from(quad.h)).contains(&py)
+                    {
+                        rgb = aterm_render::add_sat(rgb, quad.color);
+                    }
+                }
+                for halo in halos {
+                    let (hx, hy) = (i32::from(halo.x), i32::from(halo.y));
+                    if !((hx..hx + i32::from(halo.w)).contains(&px)
+                        && (hy..hy + i32::from(halo.h)).contains(&py))
+                    {
+                        continue;
+                    }
+                    let rx2 = i32::from(halo.rx) * i32::from(halo.rx);
+                    let ry2 = i32::from(halo.ry) * i32::from(halo.ry);
+                    let ny = aterm_render::halo_row_ny(py - i32::from(halo.cy), ry2);
+                    if ny >= 256 {
+                        continue;
+                    }
+                    let wt = aterm_render::halo_weight(px - i32::from(halo.cx), ny, rx2);
+                    if wt > 0 {
+                        rgb = aterm_render::add_sat(
+                            rgb,
+                            premul_rgb(halo.color, wt.min(255) as u8),
+                        );
+                    }
+                }
+                if let Some(hue) = paint_visible_hue(rgb) {
+                    raster.visible_pixels += 1;
+                    hues.push(hue);
+                }
+            }
+            let mut row_span = 0.0f32;
+            for (index, &a) in hues.iter().enumerate() {
+                for &b in &hues[index + 1..] {
+                    let direct = (a - b).abs();
+                    row_span = row_span.max(direct.min(360.0 - direct));
+                }
+            }
+            raster.max_row_span = raster.max_row_span.max(row_span);
+        }
+        raster
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct ColdWakeMinimum {
+        span: f32,
+        visible_pixels: usize,
+        at_ms: u64,
+        sweep_offset: f32,
+        cursor_col: u16,
+    }
+
+    /// One cold admitted key at a chosen absolute spectrum offset and cursor
+    /// column, sampled at every millisecond of a 120 ms human inter-key gap.
+    fn cold_wake_minimum(
+        sweep_offset: f32,
+        cursor_col: u16,
+        test_support_width: Option<f32>,
+        c: &GlowConfig,
+        g: Geom,
+    ) -> ColdWakeMinimum {
+        assert!((1..g.cols as u16).contains(&cursor_col));
+        let t0 = Instant::now();
+        let mut glow = CursorGlow {
+            rainbow: RainbowState {
+                // The wake consumes `phase * FLOW`; accepting the folded-law
+                // offset directly makes a complete 0..2 sweep unambiguous.
+                phase: sweep_offset / RAINBOW_LIGHT_RAIL_FLOW,
+                wake_test_support_width: test_support_width,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut scratch = Vec::new();
+        glow.tick(Some((2, cursor_col - 1)), t0, c, g, &mut scratch);
+        glow.note_synthetic_typed(t0, 1);
+        glow.tick(Some((2, cursor_col)), t0, c, g, &mut scratch);
+
+        let mut minimum = ColdWakeMinimum {
+            span: f32::INFINITY,
+            visible_pixels: 0,
+            at_ms: 0,
+            sweep_offset,
+            cursor_col,
+        };
+        for ms in 0..=120u64 {
+            let now = t0 + Duration::from_millis(ms);
+            glow.tick(Some((2, cursor_col)), now, c, g, &mut scratch);
+            let (quads, halos) = wake_of(&glow, now, c, g);
+            assert!(!quads.is_empty(), "wake vanished at +{ms} ms");
+            let raster = rasterized_wake_hue(&quads, &halos);
+            if raster.max_row_span < minimum.span {
+                minimum.span = raster.max_row_span;
+                minimum.visible_pixels = raster.visible_pixels;
+                minimum.at_ms = ms;
+            }
+        }
+        minimum
+    }
+
+    fn cold_wake_matrix_minimum(
+        test_support_width: Option<f32>,
+        c: &GlowConfig,
+        g: Geom,
+    ) -> ColdWakeMinimum {
+        let cursor_cols = [1u16, 2, 3, 4, 17, 42, 79];
+        let mut minimum = ColdWakeMinimum {
+            span: f32::INFINITY,
+            visible_pixels: 0,
+            at_ms: 0,
+            sweep_offset: 0.0,
+            cursor_col: 0,
+        };
+        for phase_step in 0..32u16 {
+            let sweep_offset = f32::from(phase_step) * (2.0 / 32.0);
+            for cursor_col in cursor_cols {
+                let sample =
+                    cold_wake_minimum(sweep_offset, cursor_col, test_support_width, c, g);
+                if sample.span < minimum.span {
+                    minimum = sample;
+                }
+            }
+        }
+        minimum
+    }
+
     /// One typed run: where the caret starts, how far it walks, and how fast.
     /// They travel as one value because no caller ever varies one of them
     /// without meaning a different run.
@@ -38800,13 +42524,58 @@ halo = "add"
         assert!(rainbow_wake_body(4.0, 6.0) > rainbow_wake_body(4.0, 2.0));
     }
 
+    #[test]
+    fn rainbow_wake_spectral_head_support_preserves_nozzle_peak_and_eases_out() {
+        assert_eq!(
+            rainbow_wake_spectral_head_support(0.0, RAINBOW_WAKE_SUPPORT_WIDTH),
+            0.0,
+            "the support adds no light at the nozzle"
+        );
+        assert_eq!(
+            rainbow_wake_spectral_head_support(
+                RAINBOW_WAKE_SUPPORT_ATTACK,
+                RAINBOW_WAKE_SUPPORT_WIDTH,
+            ),
+            RAINBOW_WAKE_SUPPORT_FLOOR,
+        );
+        assert_eq!(
+            rainbow_wake_spectral_head_support(
+                RAINBOW_WAKE_SUPPORT_EASE_START,
+                RAINBOW_WAKE_SUPPORT_WIDTH,
+            ),
+            RAINBOW_WAKE_SUPPORT_FLOOR,
+        );
+        assert_eq!(
+            rainbow_wake_spectral_head_support(
+                RAINBOW_WAKE_SUPPORT_WIDTH,
+                RAINBOW_WAKE_SUPPORT_WIDTH,
+            ),
+            0.0,
+        );
+        let mut previous = RAINBOW_WAKE_SUPPORT_FLOOR;
+        for step in 0..=100 {
+            let d = RAINBOW_WAKE_SUPPORT_EASE_START
+                + (RAINBOW_WAKE_SUPPORT_WIDTH - RAINBOW_WAKE_SUPPORT_EASE_START)
+                    * step as f32
+                    / 100.0;
+            let support = rainbow_wake_spectral_head_support(d, RAINBOW_WAKE_SUPPORT_WIDTH);
+            assert!(
+                (0.0..=RAINBOW_WAKE_SUPPORT_FLOOR).contains(&support),
+                "support escaped its peak bound at d={d}: {support}"
+            );
+            assert!(support <= previous, "release rose at d={d}");
+            previous = support;
+        }
+    }
+
     /// The wake IS the ribbon's rainbow, resolved per COLUMN (owner,
     /// 2026-08-15: "the color underline uses a magenta palette … Redesign the
     /// underline"; lineage 2026-08-11 "align the rainbow colour palettes
     /// between the underline and cursor trail"). The law under pin:
     ///
-    /// - the FLAT BODY of every band is an anchor EXACTLY — the plume is drawn
-    ///   out of the trail's six colours, not a lookalike gradient;
+    /// - every anchor is reached EXACTLY and adjacent anchors are interpolated
+    ///   sequentially — the plume uses the trail's palette, never a lookalike
+    ///   gradient or an indigo↔red shortcut;
     /// - all six anchors appear across a line — no band is unreachable;
     /// - MINIMUM DIVERSITY: no resting-length window of glass is monochrome —
     ///   the review's "a short wake can be entirely red or indigo" failure is
@@ -38822,19 +42591,21 @@ halo = "add"
     #[test]
     fn rainbow_wake_ramp_is_the_ribbon_rainbow() {
         let anchors: std::collections::BTreeSet<u32> = RAINBOW_BANDS.iter().copied().collect();
-        // FLAT-BODY EXACTNESS + full coverage across one line at a few phases.
+        // ANCHOR EXACTNESS at every phase: choose the ascending reflected arm's
+        // exact coordinate for each of the six palette stops.
         for phase in [0.0f32, 1.7, 4.5, 7.25] {
             let mut seen = std::collections::BTreeSet::new();
-            for c in 0..240 {
-                let colx = c as f32 * 0.5;
+            for (anchor, &want_anchor) in RAINBOW_BANDS.iter().enumerate() {
+                let t = anchor as f32 / 5.0;
+                let colx =
+                    (t - phase * RAINBOW_LIGHT_RAIL_FLOW) / RAINBOW_WAKE_SWEEP_SPREAD;
                 let (rgb, comp) = rainbow_wake_band_at(&RAINBOW_BANDS, colx, phase);
                 assert!(
                     (0.75..=1.26).contains(&comp),
                     "comp out of range at col {colx}: {comp}"
                 );
-                if anchors.contains(&rgb) {
-                    seen.insert(rgb);
-                }
+                assert_eq!(rgb, want_anchor);
+                seen.insert(rgb);
             }
             assert_eq!(
                 seen, anchors,
@@ -38861,11 +42632,10 @@ halo = "add"
                 );
             }
         }
-        // CONTINUITY: fine column steps never step the colour hard. The widest
-        // adjacent-anchor channel gap (red→orange green channel, 153) across
-        // the crossfade's ≈0.43-column width bounds a 0.05-column step at ~18
-        // counts; 40 is the generous ceiling that still forbids the old
-        // floor-quantizer's 153-count cliff.
+        // CONTINUITY: fine column steps never step the colour hard. At spread
+        // 0.50 the widest adjacent-anchor channel gap (153 counts) changes by
+        // ~19 counts per 0.05-column sample; 40 is a generous ceiling that
+        // still forbids the retired floor-quantizer's 153-count cliff.
         for p in 0..8 {
             let phase = p as f32 * 0.9;
             let mut prev = rainbow_wake_band_at(&RAINBOW_BANDS, 0.0, phase).0;
@@ -38938,8 +42708,8 @@ halo = "add"
         }
         // …and the WAKE reads these same rotated bands — the binding the old
         // version of this test lacked (review finding: it compared the helper
-        // with itself). Every flat-body sample at a hot spine is literally a
-        // member of the rotated set the ribbon cell above resolves.
+        // with itself). Every sample is the exact sequential interpolation of
+        // the rotated set the ribbon cell above resolves.
         for c in 0..80 {
             let colx = c as f32 * 0.4;
             let b = rainbow_momentum_bands(colx.floor(), 3.0, 4.5, 1.0);
@@ -38947,13 +42717,14 @@ halo = "add"
                 colx * RAINBOW_WAKE_SWEEP_SPREAD + 4.5 * RAINBOW_LIGHT_RAIL_FLOW,
             );
             let u = t * 5.0;
-            if (u - u.round()).abs() <= 0.5 - RAINBOW_WAKE_BAND_BLEND {
-                let (rgb, _) = rainbow_wake_band_at(&b, colx, 4.5);
-                assert!(
-                    b.contains(&rgb),
-                    "flat-body wake colour must be a rotated ribbon anchor (col {colx})"
-                );
-            }
+            let i = (u.floor() as usize).min(5);
+            let j = (i + 1).min(5);
+            let want = lerp_rgb(b[i], b[j], u - i as f32);
+            let (rgb, _) = rainbow_wake_band_at(&b, colx, 4.5);
+            assert_eq!(
+                rgb, want,
+                "wake colour must interpolate the rotated ribbon anchors (col {colx})"
+            );
         }
     }
 
@@ -39830,7 +43601,16 @@ halo = "add"
             wake_of(glow, now, &c, g)
                 .0
                 .iter()
-                .map(|q| (q.color >> 16) & 0xff)
+                .map(|q| {
+                    // `q.color` is premultiplied source light; acknowledgement
+                    // is a property of the displayed pixel over the shipped
+                    // dark ground, not of one palette channel in isolation.
+                    let shown = aterm_render::add_sat(0x0011_1318, q.color);
+                    let r = (shown >> 16) & 0xff;
+                    let gg = (shown >> 8) & 0xff;
+                    let b = shown & 0xff;
+                    r.max(gg).max(b)
+                })
                 .max()
                 .unwrap_or(0)
         };
@@ -39840,7 +43620,7 @@ halo = "add"
         cold.tick(Some((2, 2)), t, &c, g, &mut out);
         cold.note_synthetic_typed(t, 1);
         cold.tick(Some((2, 3)), t, &c, g, &mut out);
-        let cold_r = peak(&cold, t);
+        let cold_peak = peak(&cold, t);
         let mut hot = CursorGlow {
             rainbow: RainbowState {
                 disp: 1.0,
@@ -39851,14 +43631,69 @@ halo = "add"
         hot.tick(Some((2, 2)), t, &c, g, &mut out);
         hot.note_synthetic_typed(t, 1);
         hot.tick(Some((2, 3)), t, &c, g, &mut out);
-        let hot_r = peak(&hot, t);
+        let hot_peak = peak(&hot, t);
         assert!(
-            cold_r >= 110,
-            "a cold lone keystroke lights up (r={cold_r})"
+            cold_peak >= 110,
+            "a cold lone keystroke lights up (peak={cold_peak})"
         );
         assert!(
-            (cold_r as f32) >= 0.85 * hot_r as f32,
-            "cold tracks hot within 15% (cold {cold_r} vs hot {hot_r})"
+            (cold_peak as f32) >= 0.85 * hot_peak as f32,
+            "cold tracks hot within 15% (cold {cold_peak} vs hot {hot_peak})"
+        );
+    }
+
+    /// THE QUIET-WAKE COLOUR GAP, at the exact one-key cadence and geometry
+    /// the real paint lane exposed. A resting wake can emit several colours in
+    /// its dim tail and still LOOK monochrome: only the short, bright part near
+    /// the nozzle clears the raster's saturation floor. The old diversity test
+    /// counted every geometric sample equally, so it stayed green while three
+    /// consecutive presented frames carried only yellow above that floor.
+    ///
+    /// Raster the additive core + radial bloom with the renderers' own integer
+    /// compositors over the shipped dark ground, then apply the paint scanner's
+    /// exact visibility and continuous circular hue-separation law. One cold
+    /// keystroke must keep visible colours at least 25° apart throughout a
+    /// 120 ms human inter-key interval — not merely on its birth frame and not
+    /// merely somewhere in its dim tail.
+    #[test]
+    fn cold_single_key_wake_stays_visibly_rainbow_between_human_cadence_keys() {
+        let g = Geom {
+            cw: 7,
+            ch: 14,
+            rows: 20,
+            cols: 80,
+            origin_x: 12,
+            origin_y: 6,
+            win_w: 584,
+            win_h: 350,
+            head: 0,
+        };
+        let c = rainbow_pop_cfg();
+        assert_eq!(c.intensity.to_bits(), 0.7f32.to_bits());
+        // 32 offsets span the reflected law's complete 0..2 period. Cursor
+        // columns cover the clipped left edge, ordinary prompt positions, and
+        // the far edge; the 0.50 column term deliberately shifts each phase
+        // lattice too, including the retained orange/yellow collapse axis.
+        let too_short = cold_wake_matrix_minimum(Some(1.20), &c, g);
+        assert!(
+            too_short.span < 25.0,
+            "negative control unexpectedly met the perceptual law: {:.2}° at \
+             +{} ms, sweep offset {:.4}, cursor col {}",
+            too_short.span,
+            too_short.at_ms,
+            too_short.sweep_offset,
+            too_short.cursor_col,
+        );
+        let minimum = cold_wake_matrix_minimum(None, &c, g);
+        assert!(
+            minimum.span >= 25.0,
+            "wake's minimum visible hue span collapsed to {:.2}° at +{} ms, \
+             sweep offset {:.4}, cursor col {}, {} meaningful pixels",
+            minimum.span,
+            minimum.at_ms,
+            minimum.sweep_offset,
+            minimum.cursor_col,
+            minimum.visible_pixels,
         );
     }
 

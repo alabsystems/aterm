@@ -1295,6 +1295,125 @@ fn capture_ticks_cursor_fx(has_os_window: bool, recording_this_window: bool) -> 
     !has_os_window && !recording_this_window
 }
 
+/// Advance the visual half of the sing-along only when the explicit capture
+/// owns this window's cursor-effect clock. Application-present performs this
+/// same detector → cat sync on both live render paths; a glass-less still has
+/// to do it itself, while a windowed or recording-owned capture must retain
+/// the already-presented state. Deliberately no audio handle enters this seam.
+struct CaptureCompanionSongSync<'a> {
+    style: crate::cursor_glow::GlowStyle,
+    cursor_trail_enabled: bool,
+    cursor_companions_allowed: bool,
+    pet_mode: bool,
+    now: Instant,
+    detector: &'a mut aterm_effects::kitty_sing::KittySing,
+    cat: &'a mut crate::kitty_cursor::CursorCat,
+    glow: &'a mut crate::cursor_glow::CursorGlow,
+    riff_bar: &'a mut Option<u64>,
+}
+
+fn sync_capture_companion_song(sync: CaptureCompanionSongSync<'_>) -> f32 {
+    let CaptureCompanionSongSync {
+        style,
+        cursor_trail_enabled,
+        cursor_companions_allowed,
+        pet_mode,
+        now,
+        detector,
+        cat,
+        glow,
+        riff_bar,
+    } = sync;
+    if !cursor_companions_allowed {
+        // Input bookkeeping is intentionally source-agnostic and may have
+        // re-armed the detector after Serious Mode's transition drain. A
+        // capture can run before the event loop's next scheduler drain, so it
+        // must hard-retire that state here instead of sampling a graceful tail.
+        *detector = aterm_effects::kitty_sing::KittySing::default();
+        *riff_bar = None;
+    }
+    let drive = if cursor_companions_allowed
+        && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
+    {
+        detector.drive(now)
+    } else {
+        0.0
+    };
+    if drive > 0.0 {
+        glow.celebrate(now, drive);
+        // Keep the visual bar latch current without emitting a sound event. If
+        // this logical window later acquires glass, application-present resumes
+        // on the current bar instead of replaying one the still already showed.
+        if let Some(bar) = detector.bar(now) {
+            *riff_bar = Some(bar);
+        }
+    } else {
+        detector.settle(now);
+        *riff_bar = None;
+    }
+    cat.set_singing(
+        now,
+        crate::kitty_cursor::SingSync {
+            drive,
+            beat: detector.beat(now).unwrap_or(0.0),
+        },
+    );
+    crate::app_render::retire_kitty_cursor_without_owner(
+        cursor_trail_enabled && cursor_companions_allowed,
+        pet_mode,
+        style,
+        drive,
+        cat,
+    );
+    drive
+}
+
+/// The flying companion's exact capture-side presentation predicate. This is
+/// the application-present law from BOTH live paths: surface presentability,
+/// the sparkle sprite owner, and either ordinary/hello admission OR the
+/// reduced-motion static singing frame.
+fn capture_flying_companion_enabled(
+    cursor_companion_presentable: bool,
+    animate_cat: bool,
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+    collection_hello: bool,
+    sing: f32,
+) -> bool {
+    cursor_companion_presentable
+        && (crate::app_render::cursor_cat_presentation_enabled(
+            animate_cat,
+            cursor_trail_enabled,
+            style,
+            collection_hello,
+        ) || sing > 0.0)
+}
+
+/// Resolve the ONE cursor companion for an introspection frame through the
+/// same custody law as application-present. The middle verdict is the pet
+/// brain's caret feed (0.33 full-motion swap; always fed but hidden under the
+/// reduced-motion singer); the last is the resident pet's actual draw
+/// admission (held until the singing kitty releases pixel custody).
+fn capture_companion_custody(
+    pet_mode: bool,
+    kitty_enabled: bool,
+    cat_alpha: u8,
+    sing: f32,
+    caret_sing: f32,
+    pet_visible: bool,
+    reduced_motion: bool,
+) -> (u8, bool, bool) {
+    let kitty_alpha = if kitty_enabled && crate::app_render::flying_kitty_admitted(pet_mode, sing) {
+        cat_alpha
+    } else {
+        0
+    };
+    let pet_caret_live =
+        crate::app_render::pet_caret_admitted(pet_visible, caret_sing, reduced_motion);
+    let pet_on_glass = crate::app_render::pet_companion_admitted(pet_visible, sing);
+    (kitty_alpha, pet_caret_live, pet_on_glass)
+}
+
 /// Present-time placement of one frame axis inside one raw surface axis.
 /// Positive remainder becomes leading/trailing background bands; negative
 /// remainder becomes leading/trailing crop. The HORIZONTAL axis uses exactly
@@ -1523,10 +1642,7 @@ impl App {
     /// `Err` when there is no focused window — an honest refusal, never a
     /// fabricated empty ring. An idle ring answers `OK 0`, which is itself a
     /// finding (no candidate ever armed: the input seam never saw a key).
-    pub(crate) fn trail_admissions(
-        &self,
-        count: Option<usize>,
-    ) -> Result<Vec<String>, String> {
+    pub(crate) fn trail_admissions(&self, count: Option<usize>) -> Result<Vec<String>, String> {
         let Some(ws) = self.frontmost_window.and_then(|wid| self.windows.get(&wid)) else {
             return Err("no focused window".to_string());
         };
@@ -1588,6 +1704,12 @@ impl App {
             .frontmost_window
             .filter(|wid| windows.contains(wid))
             .or_else(|| windows.first().copied());
+        // The DPI scale the rest of this snapshot is derived from. Read from the
+        // per-window record (the W12 source of truth `attach_os_window` seeds and
+        // `on_scale_factor_changed` keeps current), NOT from the live shared
+        // backend — the backend is re-tuned to whichever window last drew, so on a
+        // mixed-DPI desktop it would report the wrong window's DPI.
+        let scale = selected.map_or(1.0, |wid| self.windows[&wid].scale);
 
         let (
             cell_w,
@@ -1749,6 +1871,7 @@ impl App {
             cell_w,
             cell_h,
             font_px,
+            scale,
             window,
             window_rows,
             window_cols,
@@ -1817,21 +1940,30 @@ impl App {
         // `cursor_fx_focus`, not bare `motion_focus`: the present seams fold
         // the TYPED WAKE into the focus input, and a capture must resolve the
         // same policy the glass painted (gauntlet F3 parity).
-        let motion = self.motion_policy(self.cursor_fx_focus(wid, raw_focused, now));
+        let capture_focused = self.cursor_fx_focus(wid, raw_focused, now);
+        let motion = self.motion_policy(capture_focused);
         let animate_sparkles = motion.animate(crate::motion::MotionEffect::WordSparkles);
         let (cell_w, cell_h) = self.backend.cell_size();
         let glow_cfg = self.glow_config();
+        let cursor_companions_allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::CursorCat);
+        let load_shed = self.load_shed_active();
+        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
+            self.config.cursor_trail_style_raw(),
+        );
         // The ONE companion verdict (favourite > program with tenure > launch
         // kitty) — the same seam the composed PRESENT resolves through, so a
         // capture shows the breed the glass wears (gauntlet F3: a capture
         // must never resolve the companion through a different rule than the
         // present). Same window, same focused pane, same frame instant.
         let companion_look = self.companion_verdict(wid, focus, now);
-        let windowless = self.headless;
+        let windowless = self
+            .windows
+            .get(&wid)
+            .is_none_or(|window| window.os_window.is_none());
         // The focused pane's caret, in PANE-LOCAL cells: the companion's anchor.
-        let (focus_live_viewport, focus_cursor) = self.pool.get(focus).map_or(
-            (false, None),
-            |s| {
+        let (focus_live_viewport, focus_cursor) = self.pool.get(focus).map_or((false, None), |s| {
             let term = term_lock(&s.term);
             let live = term.grid().display_offset() == 0;
             let cursor = (term.cursor_visible() && live).then(|| {
@@ -1845,40 +1977,77 @@ impl App {
         };
         let (win_rows, win_cols) = (ws.rows, ws.cols);
         ws.cursor_cat.set_look(companion_look);
+        let cursor_companion_presentable =
+            cursor_companions_allowed && capture_focused && !load_shed && focus_live_viewport;
         // A capture is itself a presentation boundary (the single-pane arm's rule).
         ws.cursor_cat
-            .set_collection_presentable(now, focus_live_viewport);
-        let animate_cat = !windowless
-            && ws.os_window.is_some()
-            && ws.focused
-            && motion.animate(crate::motion::MotionEffect::CursorGlow);
+            .set_collection_presentable(now, cursor_companion_presentable);
+        if !cursor_companions_allowed {
+            ws.music_notes.clear();
+        }
+        let sing_drive = {
+            let (detector, cat, glow, riff_bar) = (
+                &mut ws.kitty_sing,
+                &mut ws.cursor_cat,
+                &mut ws.cursor_glow,
+                &mut ws.sing_riff_bar,
+            );
+            sync_capture_companion_song(CaptureCompanionSongSync {
+                style: glow_cfg.style,
+                cursor_trail_enabled: glow_cfg.enabled,
+                cursor_companions_allowed,
+                pet_mode,
+                now,
+                detector,
+                cat,
+                glow,
+                riff_bar,
+            })
+        };
+        // A capture is a renderer, not a reduced-motion verdict. Sample one
+        // live pose whenever the SAME policy as glass permits animation;
+        // headless captures must not erase an already-earned companion merely
+        // because they have no OS window.
+        let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
             ws.cursor_cat.frame(now)
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let kitty_enabled = focus_live_viewport
-            && crate::app_render::cursor_cat_presentation_enabled(
-                animate_cat,
-                glow_cfg.enabled,
-                glow_cfg.style,
-                cat_frame.collection_hello,
-            );
+        let kitty_enabled = capture_flying_companion_enabled(
+            cursor_companion_presentable,
+            animate_cat,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+            cat_frame.collection_hello,
+            cat_frame.sing,
+        );
         // The PET companion. A capture is a presentation boundary, so it
         // resolves the pet the same way the composed present does — otherwise
         // `aterm-ctl image` on a split window would be blind to the one
         // companion the user actually selected.
-        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
-            self.config.cursor_trail_style_raw(),
+        let pet_visible = crate::app_render::resident_pet_presentation_enabled(
+            pet_mode,
+            cursor_companion_presentable,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
         );
-        let pet_visible = pet_mode && kitty_enabled;
+        let (kitty_alpha, pet_caret_live, pet_on_glass) = capture_companion_custody(
+            pet_mode,
+            kitty_enabled,
+            cat_frame.alpha,
+            cat_frame.sing,
+            sing_drive,
+            pet_visible,
+            !animate_cat,
+        );
         let (pane_rows, pane_cols) = panes
             .iter()
             .find(|(r, _)| r.session == focus)
             .map_or((0, 0), |(r, _)| (r.rows, r.cols));
-        let pet = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+        let pet_sense = aterm_effects::kitty_pet::PetSense {
             now,
-            caret: if pet_visible { focus_cursor } else { None },
+            caret: if pet_caret_live { focus_cursor } else { None },
             rows: pane_rows,
             cols: pane_cols,
             cell_w: cell_w.min(usize::from(u16::MAX)) as u16,
@@ -1890,7 +2059,12 @@ impl App {
             // No live pointer either — a capture has no mouse.
             output_burst: false,
             pointer: None,
-        });
+        };
+        let pet = if windowless {
+            ws.cursor_pet.tick_static_capture(pet_sense)
+        } else {
+            ws.cursor_pet.tick(pet_sense)
+        };
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
@@ -1901,14 +2075,11 @@ impl App {
             focus_cursor,
             win_focused: raw_focused,
             animate_sparkles,
-            kitty_alpha: if kitty_enabled && !pet_mode {
-                cat_frame.alpha
-            } else {
-                0
-            },
+            animate_cat,
+            kitty_alpha,
             cat_frame,
             pet,
-            pet_visible,
+            pet_visible: pet_on_glass,
             accent: glow_cfg.accent,
             cursor_color: ws.input_scratch.cursor_color,
             now,
@@ -1937,9 +2108,32 @@ impl App {
     /// the application-present redraw (`redraw_window`), so `image`/`snapshot` use
     /// the same app-owned transient-effect state. Must run AFTER `cell_frame_into`
     /// and BEFORE the tab-strip splice (which shifts decorations with the grid).
-    /// No-op when the feature is off, or on the alt-screen with
-    /// `suppress_in_alt_screen` set.
+    /// Word-owned channels are omitted when the feature is off, or on the
+    /// alt-screen with `suppress_in_alt_screen` set. Cursor companions remain
+    /// independent and still follow their own presentation policy.
     pub(crate) fn splice_word_decorations(&mut self, wid: crate::WindowId, now: Instant) {
+        // ONE CLOCK OWNER, including the companion engines. A windowed capture
+        // reuses the application-present artifact; a concurrent still during a
+        // headless recording reuses the recording loop's artifact. Rebuilding
+        // either would advance KittySing, CursorCat, and PetBrain beyond the
+        // pixels that owner most recently presented. The retained accumulators
+        // are reinstalled because a composed grid refill clears host overlays.
+        let recording_this_window = self.video_rec.as_ref().is_some_and(|r| r.window == wid);
+        let has_os_window = self
+            .windows
+            .get(&wid)
+            .is_some_and(|window| window.os_window.is_some());
+        let capture_owns_cursor_fx = capture_ticks_cursor_fx(has_os_window, recording_this_window);
+        if !capture_owns_cursor_fx {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                // Rain remains intentionally excluded from introspection.
+                ws.input_scratch.rain_quads.clear();
+                ws.input_scratch.rain_atlas = None;
+                ws.input_scratch.rain_add.clear();
+                crate::app_render::splice_word_deco_channels(ws);
+            }
+            return;
+        }
         // Resolve the sparkle config if it hasn't been (headless never runs
         // `redraw_window`, which is the only other site that recomputes it), so the
         // capture reflects the configured decorations.
@@ -1999,13 +2193,10 @@ impl App {
             self.splice_composed_capture_decorations(wid, now);
             return;
         }
-        let Some((cfg, lexicon)) = self
+        let sparkle = self
             .sparkle
             .as_ref()
-            .map(|r| (r.cfg.clone(), r.lexicon.clone()))
-        else {
-            return;
-        };
+            .map(|r| (r.cfg.clone(), r.lexicon.clone()));
         // Resolve the same MOTION POLICY as application-present (W11), so a
         // reduced/unfocused window captures the same static app-owned decorations.
         // Folded into the effects engine's own `reduced_motion` seam below (it
@@ -2013,16 +2204,18 @@ impl App {
         // recording pin used by application-present, preserving phase parity —
         // and the same TYPED-WAKE fold (`cursor_fx_focus`), so a capture of a
         // typed-into unfocused window shows the decorations the glass painted.
-        let motion = self.motion_policy(
-            self.cursor_fx_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused), now),
+        let capture_focused = self.cursor_fx_focus(
+            wid,
+            self.windows.get(&wid).is_some_and(|ws| ws.focused),
+            now,
         );
-        let cfg = if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
-            let mut c = cfg;
-            c.reduced_motion = true;
-            c
-        } else {
-            cfg
-        };
+        let motion = self.motion_policy(capture_focused);
+        let sparkle = sparkle.map(|(mut cfg, lexicon)| {
+            if !motion.animate(crate::motion::MotionEffect::WordSparkles) {
+                cfg.reduced_motion = true;
+            }
+            (cfg, lexicon)
+        });
         // Cell metrics for the cat emitter (§5.2 geometry / §5.7 floors); read
         // before the `ws` borrow — like the Kitty Log recorder gate (§F4.7).
         let (cell_w, cell_h) = self.backend.cell_size();
@@ -2036,14 +2229,23 @@ impl App {
         let capture_front_session = self.focused_session_id(wid).unwrap_or(0);
         let companion_look = self.companion_verdict(wid, capture_front_session, now);
         let glow_cfg = self.glow_config();
+        let cursor_companions_allowed = self
+            .serious_mode_policy()
+            .allows(crate::motion::SeriousEffect::CursorCat);
+        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
+            self.config.cursor_trail_style_raw(),
+        );
         // The same alt-screen policy the live application-present resolves: only a
         // configured `suppress_in_alt_screen` blanks the capture's decorations.
-        let suppress_alt = self.config.sparkle_suppress_alt_screen();
+        let suppress_alt = sparkle.is_some() && self.config.sparkle_suppress_alt_screen();
         // The same effective load-shed gate the live present folds into
         // `deco_suspend` (app_render). The raw diagnostic latch does not
         // suppress a user-forced Full policy or an explicit adaptive opt-out.
         let load_shed = self.load_shed_active();
-        let windowless = self.headless;
+        let windowless = self
+            .windows
+            .get(&wid)
+            .is_none_or(|window| window.os_window.is_none());
         let Some(front_terminal) = self.front_terminal_mirror(wid) else {
             return;
         };
@@ -2071,10 +2273,16 @@ impl App {
         // installation above is Arc/scalar-only and cannot perform filesystem
         // or decode work.
         ws.cursor_cat.set_look(companion_look);
+        let cursor_companion_presentable =
+            cursor_companions_allowed && capture_focused && !load_shed && live_viewport;
         // The capture itself is a presentation boundary. This resumes a hello
         // that was discovered after the preceding capture had already resolved
         // its frame and was therefore paused unseen below.
-        ws.cursor_cat.set_collection_presentable(now, live_viewport);
+        ws.cursor_cat
+            .set_collection_presentable(now, cursor_companion_presentable);
+        if !cursor_companions_allowed {
+            ws.music_notes.clear();
+        }
         // A CAPTURE IS A RENDERER, so it declares its session exactly like the
         // unsplit glass path does (`app_render::redraw_window`). This arm binds
         // no pane — `input_scratch` holds the FRONT terminal's whole grid — and
@@ -2085,51 +2293,74 @@ impl App {
         // suspension fork below for the same reason the glass path declares
         // above its own: identity does not depend on whether this frame draws.
         ws.word_decos.set_scan_session(Some(front_terminal.session));
-        // Explicit captures have no animation timer. A focused/full-motion
-        // window samples its live lifecycle; reduced or windowless captures
-        // show a collection as one full-opacity still, never a synthetic idle
-        // animation. Ordinary earned rainbow kitty remains focus + full-motion gated.
-        let animate_cat = !windowless
-            && ws.os_window.is_some()
-            && ws.focused
-            && motion.animate(crate::motion::MotionEffect::CursorGlow);
+        let sing_drive = {
+            let (detector, cat, glow, riff_bar) = (
+                &mut ws.kitty_sing,
+                &mut ws.cursor_cat,
+                &mut ws.cursor_glow,
+                &mut ws.sing_riff_bar,
+            );
+            sync_capture_companion_song(CaptureCompanionSongSync {
+                style: glow_cfg.style,
+                cursor_trail_enabled: glow_cfg.enabled,
+                cursor_companions_allowed,
+                pet_mode,
+                now,
+                detector,
+                cat,
+                glow,
+                riff_bar,
+            })
+        };
+        // Explicit captures have no animation timer, but they are renderers:
+        // sample the live lifecycle once under the same motion policy as glass.
+        // Reduced motion still uses the static collection frame and never
+        // synthesizes an unearned ordinary flight.
+        let animate_cat = motion.animate(crate::motion::MotionEffect::CursorGlow);
         let cat_frame = if animate_cat {
             ws.cursor_cat.frame(now)
         } else {
             ws.cursor_cat.static_frame(now)
         };
-        let kitty_enabled = live_viewport
-            && crate::app_render::cursor_cat_presentation_enabled(
-                animate_cat,
-                glow_cfg.enabled,
-                glow_cfg.style,
-                cat_frame.collection_hello,
-            );
-        // The PET companion, resolved the same way the composed capture arm
-        // does: a capture is a presentation boundary. `!pet_mode` folds into
-        // `kitty_alpha` for the same reason the windowed present folds it —
-        // in pet mode the flying kitty is un-drawable, so it must not draw
-        // below, claim the caret cell from a word-cat, or veto anything.
-        let pet_mode = crate::cursor_glow::GlowStyle::style_names_any_pet(
-            self.config.cursor_trail_style_raw(),
+        let kitty_enabled = capture_flying_companion_enabled(
+            cursor_companion_presentable,
+            animate_cat,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+            cat_frame.collection_hello,
+            cat_frame.sing,
         );
-        let pet_visible = pet_mode && kitty_enabled;
-        let kitty_alpha = if kitty_enabled && !pet_mode {
-            cat_frame.alpha
-        } else {
-            0
-        };
+        // The PET companion, resolved the same way the composed capture arm
+        // does: a capture is a presentation boundary. The shared custody law
+        // admits the flying singing face during pet mode's authored handoff,
+        // then returns the caret and pixels to the resident pet.
+        let pet_visible = crate::app_render::resident_pet_presentation_enabled(
+            pet_mode,
+            cursor_companion_presentable,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+        );
+        let (kitty_alpha, pet_caret_live, pet_on_glass) = capture_companion_custody(
+            pet_mode,
+            kitty_enabled,
+            cat_frame.alpha,
+            cat_frame.sing,
+            sing_drive,
+            pet_visible,
+            !animate_cat,
+        );
         let effect_geom = crate::word_decorations::EffectGeom {
             cell_w: cell_w as u16,
             cell_h: cell_h as u16,
             rows: rows as u16,
             cols: cols as u16,
         };
-        if (term.is_alternate_screen() && suppress_alt) || load_shed {
-            // The capture cannot draw decorations after all. Undo the
-            // presentation opportunity sampled above at the same instant, so
-            // a one-shot collection hello cannot age out behind this cleared
-            // early return.
+        let words_suspended = term.is_alternate_screen() && suppress_alt;
+        if load_shed {
+            // Load shedding owns the complete decorative surface. Undo the
+            // companion presentation opportunity sampled above at the same
+            // instant, so a one-shot collection hello cannot age out behind
+            // this cleared early return.
             ws.cursor_cat.set_collection_presentable(now, false);
             // v3 §1.1 reset table: BOTH suspension causes are freeze/thaw, not
             // resets — mirrors app_render's `deco_suspend` arm exactly, so a
@@ -2148,6 +2379,69 @@ impl App {
             ws.input_scratch.nova_add.clear();
             return;
         }
+        if words_suspended || sparkle.is_none() {
+            // Sparkle Words and the cursor companion share bakers/atlas, not
+            // ownership. An explicit feature disable resets word episodes;
+            // alt-screen suppression freezes them exactly like live glass.
+            // Either way, keep building the independent pet or authenticated
+            // flying kitty into the same free-sprite channel.
+            if words_suspended {
+                ws.word_decos.freeze(now);
+            } else {
+                ws.word_decos.hard_reset_words();
+                ws.pending_deco_birth = None;
+            }
+            ws.deco_scratch.clear();
+            ws.ink_scratch.clear();
+            ws.free_scratch.clear();
+            ws.nova_scratch.clear();
+            ws.word_decos.begin_host_frame();
+
+            // This capture is still the surface's presentation boundary even
+            // when there is no word scanner to consume the damage epoch.
+            term.take_damage();
+            let cpos = term.cursor();
+            let cur = (live_viewport && term.cursor_visible()).then_some((cpos.row, cpos.col));
+            let pet_sense = aterm_effects::kitty_pet::PetSense {
+                now,
+                caret: if pet_caret_live { cur } else { None },
+                rows: effect_geom.rows,
+                cols: effect_geom.cols,
+                cell_w: effect_geom.cell_w,
+                cell_h: effect_geom.cell_h,
+                reduced_motion: !animate_cat,
+                output_burst: false,
+                pointer: None,
+            };
+            let pet = if windowless {
+                ws.cursor_pet.tick_static_capture(pet_sense)
+            } else {
+                ws.cursor_pet.tick(pet_sense)
+            };
+            let default_bg = ws.input_scratch.default_bg;
+            let cursor_color = ws.input_scratch.cursor_color;
+            let _ = crate::app_render::emit_single_cursor_companion(
+                ws,
+                effect_geom,
+                cur,
+                pet_on_glass && pet.alpha > 0,
+                pet,
+                cat_frame,
+                kitty_alpha,
+                now,
+                !animate_cat,
+                default_bg,
+                cursor_color,
+                glow_cfg.accent,
+            );
+            drop(term);
+            crate::app_render::splice_word_deco_channels(ws);
+            return;
+        }
+        let (cfg, lexicon) = sparkle
+            .as_ref()
+            .expect("enabled, unsuspended Sparkle Words was checked above");
+        let mut prime_at = None;
         // Resume from a freeze (perf_reduced cleared / alt-screen exit with
         // suppression) before the rescan/tick read the clock — a no-op when
         // not frozen. Mirrors app_render's thaw-before-rescan ordering.
@@ -2157,7 +2451,6 @@ impl App {
             let cursor = term.cursor();
             (cursor.row, cursor.col)
         });
-        let mut prime_at = None;
         if ws.word_decos.needs_rescan(epoch) {
             // A normal application-present consumes `pending_deco_birth`. If the
             // stamp is still here, capture is this episode's first observable
@@ -2171,8 +2464,8 @@ impl App {
                 &ws.input_scratch.line_sizes,
                 rows,
                 cols,
-                &lexicon,
-                &cfg,
+                lexicon,
+                cfg,
                 epoch,
                 birth,
                 effect_geom,
@@ -2205,9 +2498,9 @@ impl App {
         // ticked it), and the suppression below needs the animal's LIVE body,
         // not a guess. A pet that cannot be drawn is fed `caret: None`, so it
         // fades out and releases honestly, exactly as the windowed paths do.
-        let pet = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
+        let pet_sense = aterm_effects::kitty_pet::PetSense {
             now,
-            caret: if pet_visible { cur } else { None },
+            caret: if pet_caret_live { cur } else { None },
             rows: effect_geom.rows,
             cols: effect_geom.cols,
             cell_w: effect_geom.cell_w,
@@ -2216,21 +2509,27 @@ impl App {
             // A capture is one isolated frame — see the windowed capture arm.
             output_burst: false,
             pointer: None,
-        });
+        };
+        let pet = if windowless {
+            ws.cursor_pet.tick_static_capture(pet_sense)
+        } else {
+            ws.cursor_pet.tick(pet_sense)
+        };
+        let pet_on_glass = pet_on_glass && pet.alpha > 0;
         // ONE CAT PER CARET: exactly the predicate the companion emission below
         // draws under. Told which cell the companion occupies, the engine drops
         // the ambient peek for the word beneath it — a capture must show the
         // same single cat the glass does, not the pre-fix pair. The pet counts
         // as the companion too (the windowed present's rule), and hands in its
         // live drawn body as the pixel-yield box.
-        let companion_at = cur
-            .filter(|_| kitty_alpha > 0 || (pet_visible && pet.alpha > 0))
-            .map(|cell| crate::word_decorations::CompanionOnGlass {
+        let companion_at = cur.filter(|_| kitty_alpha > 0 || pet_on_glass).map(|cell| {
+            crate::word_decorations::CompanionOnGlass {
                 cell,
-                body_px: (pet_visible && pet.alpha > 0)
+                body_px: pet_on_glass
                     .then(|| pet.body_px(effect_geom.cell_w, effect_geom.cell_h, effect_geom.cols))
                     .flatten(),
-            });
+            }
+        });
         // The same selection view the animated tick sees (§6.4 nova ignition
         // deferral / per-quad attenuation) — a capture must not ignite a nova
         // the window itself would defer.
@@ -2248,7 +2547,7 @@ impl App {
             // damage-driven present would have performed at output time.
             ws.word_decos.tick(
                 birth,
-                &cfg,
+                cfg,
                 effect_geom,
                 companion_at,
                 Some(sel_view),
@@ -2277,7 +2576,7 @@ impl App {
         ws.word_decos.begin_host_frame();
         ws.word_decos.tick(
             now,
-            &cfg,
+            cfg,
             effect_geom,
             companion_at,
             Some(sel_view),
@@ -2299,7 +2598,7 @@ impl App {
         self.kitty_log.observe_ambient(
             front_terminal.session,
             ws.word_decos.drain_kitty_sightings(),
-            &lexicon,
+            lexicon,
             now,
             kitty_log_on,
         );
@@ -2321,53 +2620,25 @@ impl App {
             now,
             primed_wince_hits.saturating_add(curse_drain.wince_hits),
         );
-        // `kitty_alpha` (not raw `kitty_enabled`): in pet mode the flying
-        // kitty is un-drawable on the windowed present, so a capture drawing
-        // it showed a companion the glass never has.
-        if kitty_alpha > 0
-            && let Some(cell) = cur
-        {
-            let layout = aterm_effects::word_decorations::KittyCursorLayout {
-                geom: effect_geom,
-                cursor: cell,
-                look: cat_frame.render_look(),
-                bob: cat_frame.bob,
-            };
-            if let Some(footprint) = ws.word_decos.kitty_cursor_footprint(layout) {
-                let colors = ws.cursor_cat.episode_colors().unwrap_or_else(|| {
-                    let sampled = crate::app_render::cursor_cat_color_key(
-                        &ws.input_scratch.cells,
-                        effect_geom,
-                        footprint,
-                        ws.input_scratch.default_bg,
-                        ws.input_scratch.cursor_color,
-                        glow_cfg.accent,
-                    );
-                    ws.cursor_cat.colors_for_episode(sampled)
-                });
-                let _ = ws.word_decos.kitty_cursor(
-                    aterm_effects::word_decorations::KittyCursorFrame {
-                        geom: effect_geom,
-                        cursor: cell,
-                        look: layout.look,
-                        colors,
-                        bob: cat_frame.bob,
-                        alpha: cat_frame.alpha,
-                        // Windowless capture is the reduced-motion still path, so
-                        // this is always the neutral pose; thread it through so
-                        // introspection and application-present share one emission contract.
-                        pose: cat_frame.pose,
-                        // The still capture carries the singing FACE (`sing`
-                        // reaches `render_look` upstream via `cat_frame`) but
-                        // no note stream: notes are an animation channel, and
-                        // the windowless path draws none.
-                        sing: cat_frame.sing,
-                        notes: [None; aterm_effects::kitty_sing::MAX_NOTES],
-                    },
-                    &mut ws.free_scratch,
-                );
-            }
-        }
+        // The shared config-free emitter owns BOTH animals. Sparkle Words may
+        // contribute ambient sprites to `free_scratch`, but it neither chooses
+        // the companion nor supplies its palette/lifecycle.
+        let default_bg = ws.input_scratch.default_bg;
+        let cursor_color = ws.input_scratch.cursor_color;
+        let _ = crate::app_render::emit_single_cursor_companion(
+            ws,
+            effect_geom,
+            cur,
+            pet_on_glass,
+            pet,
+            cat_frame,
+            kitty_alpha,
+            now,
+            !animate_cat,
+            default_bg,
+            cursor_color,
+            glow_cfg.accent,
+        );
         drop(term);
         ws.input_scratch
             .word_decorations
@@ -2921,16 +3192,20 @@ impl App {
                     // its semantics: it consumes no damage, reconciles no predictions,
                     // and stamps no present. Only the cursor-effect clock advances —
                     // a glass-less window has no present to advance it.
-                    let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
+                    let capture_now = Instant::now();
+                    let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
                     let Some(capture_grid) =
                         self.prepare_terminal_capture_grid_with_cursor_fx(front, clock)
                     else {
                         return;
                     };
                     if !capture_grid.composed {
-                        self.splice_cursor_fx(front, Instant::now());
-                        self.splice_word_decorations(front, Instant::now());
+                        self.splice_cursor_fx(front, capture_now);
                     }
+                    // Both one-pane and composed captures need the companion
+                    // splice. The helper dispatches the split path itself and
+                    // retains (rather than advances) under a recording owner.
+                    self.splice_word_decorations(front, capture_now);
                     self.splice_tab_strip(front);
                     self.splice_find_bar(front);
                     self.splice_settings_panel(front);
@@ -3885,7 +4160,8 @@ impl App {
             // A window without an OS presentation target has no prior
             // application-present artifact. Its explicit image is the one
             // present-real tick, built from current terminals.
-            let clock = self.composed_capture_cursor_fx_clock(front, Instant::now());
+            let capture_now = Instant::now();
+            let clock = self.composed_capture_cursor_fx_clock(front, capture_now);
             let Some(capture_grid) =
                 self.prepare_terminal_capture_grid_with_cursor_fx(front, clock)
             else {
@@ -3893,9 +4169,12 @@ impl App {
                 return;
             };
             if !capture_grid.composed {
-                self.splice_cursor_fx(front, Instant::now());
-                self.splice_word_decorations(front, Instant::now());
+                self.splice_cursor_fx(front, capture_now);
             }
+            // Unlike the cursor light extractor, the decoration splice already
+            // dispatches on one-pane versus composed geometry. It also owns the
+            // capture/recording clock boundary, so this is safe in both modes.
+            self.splice_word_decorations(front, capture_now);
             self.splice_tab_strip(front);
             self.splice_find_bar(front);
             self.splice_settings_panel(front);
@@ -5042,7 +5321,13 @@ impl App {
     ///
     /// Every supported target lives in the front aterm frame, so this delegates to the
     /// ordinary capture path and preserves its confinement and encoding behavior.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Windows takes the same arm: Settings renders INSIDE the frame there too,
+    /// and `capture_window` is fully implemented (`PrintWindow` + the presented
+    /// client stitch). It used to answer "only available on macOS" — refusing a
+    /// photograph it was already able to take, which left `window prefs` (the
+    /// route an AI uses to SEE the Settings surface) unreachable on Windows.
+    #[cfg(any(target_os = "macos", windows))]
     pub(crate) fn capture_aux_window(
         &mut self,
         target: AuxTarget,
@@ -5054,10 +5339,11 @@ impl App {
         self.capture_window(confined, cancel, reply);
     }
 
-    /// Off macOS there is no CoreGraphics window server to photograph, so the aux-window
-    /// capture reports that plainly (kept on every target so the
-    /// [`crate::Wake::CaptureAuxWindow`] handler is platform-independent).
-    #[cfg(not(target_os = "macos"))]
+    /// Off macOS/Windows there is no window server / `PrintWindow` to photograph, so
+    /// the aux-window capture reports that plainly (kept on every target so the
+    /// [`crate::Wake::CaptureAuxWindow`] handler is platform-independent) — the
+    /// same platform split, and the same wording, as `capture_window` itself.
+    #[cfg(not(any(target_os = "macos", windows)))]
     pub(crate) fn capture_aux_window(
         &mut self,
         _target: AuxTarget,
@@ -5066,7 +5352,7 @@ impl App {
         reply: std::sync::mpsc::Sender<crate::control::WindowReply>,
     ) {
         let _ = reply.send(Err(
-            "auxiliary window capture is only available on macOS".to_string()
+            "auxiliary window capture is only available on macOS and Windows".to_string(),
         ));
     }
 
@@ -6217,6 +6503,27 @@ mod split_capture_tests {
 
     use crate::{App, WindowId, term_lock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn first_headless_split_capture_keeps_the_pet_without_sparkle_words() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.split_active_stub_tab(wid);
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
+
+        app.splice_word_decorations(wid, Instant::now());
+        let ws = app.windows.get(&wid).expect("window");
+        assert!(
+            ws.cursor_pet.is_active(),
+            "the split pet is presentation-live"
+        );
+        assert!(
+            !ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_some(),
+            "the composed capture carries the focused pane's resident pet and atlas"
+        );
+    }
 
     /// T7 — a composed (split) capture splices the sparkle channels. The gate
     /// this replaces returned early on ANY multi-pane tab, so a split capture
@@ -7433,6 +7740,12 @@ mod terminal_split_capture_tests {
     #[test]
     fn image_capture_reports_split_composite_and_splices_chrome_once() {
         let (mut app, wid, right) = split_fixture();
+        app.recompute_sparkle();
+        // Cursor companions share the sprite atlas with Sparkle Words, but do
+        // not belong to that feature. Exercise the actual composed-image route
+        // with the word scanner structurally absent.
+        app.sparkle = None;
+        app.windows.get_mut(&wid).expect("window").focused = true;
         app.tab_strip_rows = 1;
         let base_rows = usize::from(app.windows[&wid].rows);
         let cols = usize::from(app.windows[&wid].cols);
@@ -7492,6 +7805,19 @@ mod terminal_split_capture_tests {
         let text = terminal_capture_text(&ws.input_scratch, 1, cols);
         assert!(text.lines().next().unwrap().contains("LEFT"));
         assert!(text.lines().next().unwrap().contains("RIGHT"));
+        assert!(
+            ws.cursor_pet.is_active(),
+            "the production composed-image route advances the default resident pet"
+        );
+        assert_eq!(
+            ws.input_scratch.free_sprites.len(),
+            1,
+            "the split capture carries exactly one resident companion, never zero or a pet+kitty pair"
+        );
+        assert!(
+            ws.input_scratch.free_atlas.is_some(),
+            "the retained split companion carries its atlas"
+        );
         assert_eq!(
             text.lines().count(),
             base_rows,
@@ -7519,6 +7845,11 @@ mod capture_overlay_reset_tests {
     fn disabled_word_decorations_cannot_leak_prior_capture_layers() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
+        // Isolate word-owned residue from the independent cursor companion.
+        // Other capture tests prove the shipped pet remains present when only
+        // Sparkle Words is disabled; this stale-layer test deliberately turns
+        // the cursor-trail owner off so any surviving free sprite is a leak.
+        app.config.cursor_trail = Some(false);
         app.prepare_terminal_capture_grid(wid).unwrap();
         app.sparkle_dirty = false;
         app.sparkle = None;
@@ -9215,6 +9546,11 @@ mod encode_worker_tests {
     fn headless_capture_emits_and_collects_an_eligible_cat() {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
+        // This test isolates AMBIENT word-cat provenance. The resident cursor
+        // companion is independently covered above and legitimately uses the
+        // over-text free-sprite tier, so disable its owner here rather than
+        // confusing it with a forbidden discovery hello.
+        app.config.cursor_trail = Some(false);
         let t0 = Instant::now();
         {
             let terminal = app
@@ -9920,9 +10256,396 @@ mod window_render_context_capture_tests {
 
 #[cfg(test)]
 mod headless_cursor_fx_tests {
-    use super::capture_ticks_cursor_fx;
-    use crate::{App, WindowId, term_lock};
+    use super::{
+        CaptureCompanionSongSync, capture_companion_custody, capture_flying_companion_enabled,
+        capture_ticks_cursor_fx, sync_capture_companion_song,
+    };
+    use crate::{App, WindowId, control_auth, term_lock};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn capture_companion_custody_matches_live_pet_song_handoff() {
+        assert_eq!(
+            capture_companion_custody(true, true, 211, 0.0, 0.0, true, false),
+            (0, true, true),
+            "the resting resident pet exclusively owns pet mode"
+        );
+        assert_eq!(
+            capture_companion_custody(true, true, 211, 1.0, 1.0, true, true),
+            (211, true, false),
+            "the reduced-motion singer exclusively owns pixels while the hidden pet keeps its caret"
+        );
+        assert_eq!(
+            capture_companion_custody(false, true, 211, 0.0, 0.0, false, false),
+            (211, false, false),
+            "classic mode admits its earned flying kitty"
+        );
+        assert_eq!(
+            capture_companion_custody(true, true, 211, 0.49, 0.49, true, true),
+            (211, true, false),
+            "a late 1.0→0.49 reduced sample retains the opaque singer while preloading the pet"
+        );
+        assert_eq!(
+            capture_companion_custody(true, false, 211, 0.0, 0.329, true, true),
+            (0, true, true),
+            "below the static face swap, capture returns both caret and pixel custody to the resident pet"
+        );
+    }
+
+    #[test]
+    fn capture_flying_gate_includes_the_live_static_song_exception() {
+        use crate::cursor_glow::GlowStyle;
+
+        assert!(capture_flying_companion_enabled(
+            true,
+            false,
+            true,
+            GlowStyle::RainbowKitty,
+            false,
+            1.0,
+        ));
+        assert!(!capture_flying_companion_enabled(
+            true,
+            false,
+            true,
+            GlowStyle::RainbowKitty,
+            false,
+            0.0,
+        ));
+        assert!(!capture_flying_companion_enabled(
+            false,
+            false,
+            true,
+            GlowStyle::RainbowKitty,
+            false,
+            1.0,
+        ));
+        assert!(capture_flying_companion_enabled(
+            true,
+            true,
+            true,
+            GlowStyle::RainbowKitty,
+            false,
+            0.0,
+        ));
+    }
+
+    #[test]
+    fn capture_owned_clock_syncs_and_retires_the_visual_singer_without_audio() {
+        use aterm_effects::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
+        use aterm_effects::kitty_sing::SING_ARM_REPEATS;
+
+        let now = Instant::now();
+        let start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
+        let mut detector = aterm_effects::kitty_sing::KittySing::default();
+        for i in 0..SING_ARM_REPEATS {
+            detector.note_char(start + Duration::from_millis(u64::from(i) * 10), 0, 'a');
+        }
+        let mut cat = crate::kitty_cursor::CursorCat::default();
+        let tenure_start = now - Duration::from_secs(7);
+        for i in 0..160u64 {
+            cat.on_pet_mode_motion_pulse(CursorCatMotionPulse {
+                at: tenure_start + Duration::from_millis(i * 40),
+                kind: CursorCatMotionKind::Advance,
+            });
+        }
+        assert!(!cat.is_active(), "pet tenure stays hidden before the song");
+        let mut glow = crate::cursor_glow::CursorGlow::default();
+        let mut riff_bar = None;
+        assert_eq!(
+            sync_capture_companion_song(CaptureCompanionSongSync {
+                style: crate::cursor_glow::GlowStyle::RainbowKitty,
+                cursor_trail_enabled: true,
+                cursor_companions_allowed: true,
+                pet_mode: true,
+                now,
+                detector: &mut detector,
+                cat: &mut cat,
+                glow: &mut glow,
+                riff_bar: &mut riff_bar,
+            }),
+            1.0
+        );
+        assert!(
+            cat.is_active(),
+            "the capture-owned song spends hidden tenure"
+        );
+        assert_eq!(cat.static_frame(now).sing, 1.0);
+        assert!(riff_bar.is_some(), "the silent visual bar still advances");
+
+        let drained = now + Duration::from_secs(2);
+        assert_eq!(
+            sync_capture_companion_song(CaptureCompanionSongSync {
+                style: crate::cursor_glow::GlowStyle::RainbowKitty,
+                cursor_trail_enabled: true,
+                cursor_companions_allowed: true,
+                pet_mode: true,
+                now: drained,
+                detector: &mut detector,
+                cat: &mut cat,
+                glow: &mut glow,
+                riff_bar: &mut riff_bar,
+            }),
+            0.0
+        );
+        assert!(
+            !cat.is_active(),
+            "capture-owned pet mode grounds a fully drained singer"
+        );
+        assert_eq!(riff_bar, None);
+    }
+
+    #[test]
+    fn production_headless_image_shows_one_reduced_motion_singing_companion() {
+        use aterm_effects::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
+        use aterm_effects::kitty_sing::SING_ARM_REPEATS;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config.motion = Some("reduced".into());
+        app.recompute_sparkle();
+        app.sparkle = None;
+        let now = Instant::now();
+        {
+            let ws = app.windows.get_mut(&wid).expect("headless window 0");
+            ws.focused = true;
+            let tenure_start = now - Duration::from_secs(7);
+            for i in 0..160u64 {
+                ws.cursor_cat
+                    .on_pet_mode_motion_pulse(CursorCatMotionPulse {
+                        at: tenure_start + Duration::from_millis(i * 40),
+                        kind: CursorCatMotionKind::Advance,
+                    });
+            }
+            let sing_start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
+            for i in 0..SING_ARM_REPEATS {
+                ws.kitty_sing.note_char(
+                    sing_start + Duration::from_millis(u64::from(i) * 10),
+                    0,
+                    'a',
+                );
+            }
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-headless-singing-companion-{}",
+            std::process::id()
+        ));
+        control_auth::ensure_private_dir(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.render_image(crate::control::ImageReq {
+            target: control_auth::ConfinedImage::for_test(&dir, "singer.png"),
+            clean: false,
+            session: None,
+            want_bytes: false,
+            want_metadata: false,
+            frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: tx,
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("image worker reply")
+            .expect("headless singer image succeeds");
+
+        let ws = app.windows.get_mut(&wid).expect("headless window 0");
+        assert!(
+            ws.cursor_cat.is_active(),
+            "the capture-owned detector sync spends the authenticated hidden tenure"
+        );
+        assert!(
+            ws.cursor_pet.is_active(),
+            "reduced motion keeps the resident pet caret-fed behind the opaque singer"
+        );
+        assert_eq!(
+            ws.input_scratch.free_sprites.len(),
+            1,
+            "the production still contains one singing kitty, never a missing or doubled companion"
+        );
+        assert!(ws.input_scratch.free_atlas.is_some());
+        assert_eq!(ws.cursor_cat.static_frame(Instant::now()).sing, 1.0);
+        assert!(
+            ws.input_scratch.word_decorations.is_empty()
+                && ws.input_scratch.ink.is_empty()
+                && ws.input_scratch.nova_add.is_empty(),
+            "the disabled word feed stays byte-empty while its independent singing companion draws"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn production_headless_image_keeps_classic_kitty_without_sparkle_words() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.config.motion = Some("full".into());
+        app.recompute_sparkle();
+        app.sparkle = None;
+        let now = Instant::now();
+        {
+            let ws = app.windows.get_mut(&wid).expect("headless window 0");
+            ws.focused = true;
+            let start = now - Duration::from_millis(95 * 40);
+            for i in 0..96u64 {
+                ws.cursor_cat
+                    .on_key(start + Duration::from_millis(i * 40), true);
+            }
+            assert!(
+                ws.cursor_cat.is_active(),
+                "the fixture earns the real classic cursor-cat lifecycle"
+            );
+        }
+
+        let dir = std::env::temp_dir().join(format!(
+            "aterm-headless-classic-companion-{}",
+            std::process::id()
+        ));
+        control_auth::ensure_private_dir(&dir).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        app.render_image(crate::control::ImageReq {
+            target: control_auth::ConfinedImage::for_test(&dir, "classic.png"),
+            clean: false,
+            session: None,
+            want_bytes: false,
+            want_metadata: false,
+            frame_metadata: std::sync::Arc::new(std::sync::OnceLock::new()),
+            cancel: crate::control::CaptureCancellation::new(),
+            reply: tx,
+        });
+        rx.recv_timeout(Duration::from_secs(10))
+            .expect("image worker reply")
+            .expect("classic kitty image succeeds");
+
+        let ws = app.windows.get(&wid).expect("headless window 0");
+        assert!(ws.cursor_cat.is_active());
+        assert!(!ws.cursor_pet.is_active());
+        assert_eq!(
+            ws.input_scratch.free_sprites.len(),
+            1,
+            "the config-free capture carries exactly the one earned classic kitty"
+        );
+        assert!(ws.input_scratch.free_atlas.is_some());
+        assert!(
+            ws.input_scratch.word_decorations.is_empty()
+                && ws.input_scratch.ink.is_empty()
+                && ws.input_scratch.nova_add.is_empty(),
+            "no word-owned channel is synthesized to host the independent kitty"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_headless_capture_keeps_the_default_pet_without_sparkle_words() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert_eq!(
+            app.config.cursor_trail_style_raw(),
+            crate::prefs::DEFAULT_CURSOR_TRAIL_STYLE,
+            "the fixture exercises the shipped default, not a forced style"
+        );
+        app.recompute_sparkle();
+        app.sparkle = None;
+        app.splice_word_decorations(wid, Instant::now());
+
+        let ws = app.windows.get(&wid).expect("headless window 0");
+        assert!(
+            ws.cursor_pet.is_active(),
+            "the first requested still and trail status agree that the pet is visible"
+        );
+        assert_eq!(
+            ws.input_scratch.free_sprites.len(),
+            1,
+            "the first requested still carries exactly one default pet body"
+        );
+        assert!(
+            ws.input_scratch.free_atlas.is_some(),
+            "the pet body carries the atlas it addresses"
+        );
+        assert!(
+            ws.input_scratch.word_decorations.is_empty()
+                && ws.input_scratch.ink.is_empty()
+                && ws.input_scratch.nova_add.is_empty(),
+            "disabling Sparkle Words keeps every word-owned channel empty"
+        );
+    }
+
+    #[test]
+    fn serious_mode_capture_hard_retires_a_song_rearmed_after_transition() {
+        use aterm_effects::kitty_sing::SING_ARM_REPEATS;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.recompute_sparkle();
+        app.sparkle = None;
+        assert!(app.set_serious_mode(true));
+
+        // Model the adversarial event ordering: cosmetic input bookkeeping is
+        // source-agnostic and can run after the transition drain but before an
+        // explicit capture. The old capture path consumed this live drive and
+        // resurrected the singing face through its presentation exception.
+        let now = Instant::now();
+        let start = now - Duration::from_millis(u64::from(SING_ARM_REPEATS - 1) * 10);
+        {
+            let ws = app.windows.get_mut(&wid).expect("headless window 0");
+            for i in 0..SING_ARM_REPEATS {
+                ws.kitty_sing
+                    .note_char(start + Duration::from_millis(u64::from(i) * 10), 0, 'a');
+            }
+            assert_eq!(
+                ws.kitty_sing.drive(now),
+                1.0,
+                "negative control: the post-transition input really re-armed the singer"
+            );
+        }
+
+        app.splice_word_decorations(wid, now);
+        let ws = app.windows.get(&wid).expect("headless window 0");
+        assert_eq!(ws.kitty_sing.drive(now), 0.0);
+        assert!(!ws.cursor_cat.is_active());
+        assert!(!ws.cursor_pet.is_active());
+        assert!(!ws.music_notes.is_active());
+        assert!(
+            ws.input_scratch.free_sprites.is_empty() && ws.input_scratch.free_atlas.is_none(),
+            "Serious Mode capture must publish no companion pixels"
+        );
+    }
+
+    #[test]
+    fn alt_screen_word_suppression_keeps_the_independent_capture_pet() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
+            enabled: Some(true),
+            suppress_in_alt_screen: Some(true),
+            ..Default::default()
+        });
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.sparkle_dirty = true;
+        app.recompute_sparkle();
+        assert!(
+            app.sparkle.is_some(),
+            "negative control: word sparkles resolved on"
+        );
+        let terminal = app.front_terminal(wid).expect("front terminal");
+        term_lock(&terminal.term).process(b"\x1b[?1049h");
+
+        app.splice_word_decorations(wid, Instant::now());
+        let ws = app.windows.get(&wid).expect("headless window 0");
+        assert_eq!(
+            ws.input_scratch.free_sprites.len(),
+            1,
+            "the word-only alt-screen switch cannot blank the resident cursor pet"
+        );
+        assert!(ws.input_scratch.free_atlas.is_some());
+        assert!(
+            ws.input_scratch.word_decorations.is_empty()
+                && ws.input_scratch.ink.is_empty()
+                && ws.input_scratch.nova_add.is_empty(),
+            "the suppressed word-owned channels remain empty"
+        );
+    }
 
     /// PHASE-1 law ("Headless Present-Real"): a HEADLESS `image` capture ticks
     /// the fire LIVE — a cursor move puts hot quads into the capture's

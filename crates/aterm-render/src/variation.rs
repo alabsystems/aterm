@@ -427,12 +427,18 @@ pub fn varied_glyph_raster_with_face(
         return None;
     }
     let (w, h) = (w as usize, h as usize);
-    let mut ras = ab_glyph_rasterizer::Rasterizer::new(w, h);
+    // Fill into a grid with RASTER_PAD px of slack on every side, the outline
+    // translated into its interior, then crop: the outline must never sit ON
+    // the grid boundary (see RASTER_PAD). A design-space `x_min` of 0 — which
+    // most glyphs of most fonts have — scales to an exactly-0 left edge, which
+    // is precisely the case that detonates.
+    let pad = RASTER_PAD as f32;
+    let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * RASTER_PAD, h + 2 * RASTER_PAD);
     let mut b = OutlineToRaster {
         ras: &mut ras,
         scale,
-        ox: x_min,
-        oy: y_max,
+        ox: x_min - pad,
+        oy: y_max + pad,
         last: ab_glyph_rasterizer::point(0.0, 0.0),
         start: ab_glyph_rasterizer::point(0.0, 0.0),
     };
@@ -440,13 +446,68 @@ pub fn varied_glyph_raster_with_face(
     // bbox check, but stay defensive (fall back rather than emit an all-zero raster).
     face.outline_glyph(g, &mut b)?;
     b.close_contour();
+    let cov = crop_padded_coverage(&ras, w, h);
+    Some((w, h, x_min as i32, y_min as i32, advance, cov))
+}
+
+/// Slack, in px, between the ink box and the coverage grid every
+/// `ab_glyph_rasterizer` fill in this crate actually rasterizes into. The
+/// outline is translated by this much so it can NEVER touch the grid's
+/// boundary; [`crop_padded_coverage`] reads the ink box back out, so the
+/// returned mask and its `(width, height, xmin, ymin)` metrics are unchanged.
+///
+/// WHY (the ppem-19 broken-digit bug): `ab_glyph_rasterizer` marches a
+/// segment's `x` INCREMENTALLY down its scanlines (`x += dxdy * dy`), so `x`
+/// at the last scanline drifts a fraction of an ULP off the segment's true
+/// endpoint. That is harmless in the grid's interior — but a segment sitting
+/// EXACTLY on `x = 0` drifts to `-1.19e-7`, whose `floor()` is `-1`, and the
+/// rasterizer has no clamp: `linestart + x0i < 0` makes it `continue`, DROPPING
+/// that whole scanline's area (or, on a row past the first, crediting it to the
+/// PREVIOUS row). Because `for_each_pixel` carries ONE running accumulator
+/// across the entire flat buffer — each row's contributions are trusted to sum
+/// to zero so the accumulator resets at the row boundary — the lost area never
+/// comes back: every texel after it is offset by a constant, and a glyph paints
+/// as a broken filled block.
+///
+/// A segment exactly on `x = 0` is not exotic; GRID FITTING MAKES IT THE
+/// COMMON CASE, because the autohinter snaps stem edges to whole pixels and the
+/// ink box's left edge is `floor(min_x)` — i.e. that very integer. Measured over
+/// 62 304 (face, hint mode, ppem 6..=64, glyph) combinations across DejaVu Sans
+/// Mono Regular/Bold, Noto Sans CJK and Symbols Nerd Font, it detonated on
+/// exactly two: the DEFAULT face's `'?'` at ppem 17 and `'2'` at ppem 19 — and
+/// ppem 19 is `round(15 * 1.25)`, the Linux auto-scale law at the most common
+/// fractional desktop scale, so every 125% user saw broken digits by default.
+/// The same reasoning applies at the right edge (`x1i == width` writes into the
+/// next row) and is fixed by the same slack.
+///
+/// [`crate::subpixel`] needs no change: its ink box is already widened by 1 px
+/// per side for the FIR5 filter spread, which is 3 subpixel samples of slack at
+/// its 3× horizontal resolution.
+pub(crate) const RASTER_PAD: usize = 1;
+
+/// Read the `w`×`h` ink box back out of a coverage grid that was filled with
+/// [`RASTER_PAD`] px of slack on every side (i.e. a `(w + 2*PAD)`×`(h + 2*PAD)`
+/// rasterizer whose outline was translated by `+PAD` in both axes). The padding
+/// ring is discarded: by construction it can only hold antialiasing spill from
+/// an edge that is already inside the box.
+pub(crate) fn crop_padded_coverage(
+    ras: &ab_glyph_rasterizer::Rasterizer,
+    w: usize,
+    h: usize,
+) -> Vec<u8> {
+    let pad = RASTER_PAD;
+    let gw = w + 2 * pad;
     let mut cov = vec![0u8; w * h];
     ras.for_each_pixel(|i, a| {
-        if let Some(slot) = cov.get_mut(i) {
-            *slot = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        let (gx, gy) = (i % gw, i / gw);
+        let (Some(x), Some(y)) = (gx.checked_sub(pad), gy.checked_sub(pad)) else {
+            return;
+        };
+        if x < w && y < h {
+            cov[y * w + x] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     });
-    Some((w, h, x_min as i32, y_min as i32, advance, cov))
+    cov
 }
 
 /// Feeds a ttf-parser glyph outline (design units, y-UP) into an `ab_glyph_rasterizer`
@@ -584,6 +645,141 @@ mod tests {
         assert!(
             ink(&l.5) > 0 && ink(&h.5) > 0,
             "both instances must lay down ink"
+        );
+    }
+
+    /// [`RASTER_PAD`] EXISTS, demonstrated on the exact geometry that ate the
+    /// hinted `'2'` at ppem 19 — no font, no hinter, just the rasterizer.
+    ///
+    /// `ab_glyph_rasterizer` marches a segment's x incrementally
+    /// (`xnext = x + dxdy * dy`), and for the segment
+    /// `(1.828125, 0.21875) → (0.0, 0.875)` that arithmetic overshoots to
+    /// `-1.19e-7`: `floor()` is `-1`, `linestart + x0i` is negative, and the
+    /// scanline's whole area is `continue`d away. `for_each_pixel` carries one
+    /// running accumulator across the flat buffer, so the loss offsets every
+    /// texel after it. Filled flush against the grid's left edge this triangle
+    /// loses 46% of its ink and smears the rest; given ONE pixel of slack it is
+    /// exact, and more slack changes nothing.
+    #[test]
+    fn a_boundary_hugging_outline_needs_the_raster_pad() {
+        // Area by the shoelace formula: exactly what a correct fill deposits.
+        let tri = [(0.0f32, 0.875f32), (1.828125, 0.21875), (1.828125, 3.0)];
+        let area = 0.5
+            * (0..3)
+                .map(|i| {
+                    let (a, b) = (tri[i], tri[(i + 1) % 3]);
+                    a.0 * b.1 - b.0 * a.1
+                })
+                .sum::<f32>()
+                .abs();
+        let ink_at = |pad: usize| {
+            let (w, h) = (2usize, 3usize);
+            let (gw, gh) = (w + 2 * pad, h + 2 * pad);
+            let mut ras = ab_glyph_rasterizer::Rasterizer::new(gw, gh);
+            let m = |p: &(f32, f32)| ab_glyph_rasterizer::point(p.0 + pad as f32, p.1 + pad as f32);
+            for i in 0..3 {
+                ras.draw_line(m(&tri[i]), m(&tri[(i + 1) % 3]));
+            }
+            let mut sum = 0.0f32;
+            ras.for_each_pixel(|_, a| sum += a);
+            sum
+        };
+        let flush = ink_at(0);
+        let padded = ink_at(RASTER_PAD);
+        let generous = ink_at(4 * RASTER_PAD);
+        assert!(
+            (padded - area).abs() < 0.01,
+            "with RASTER_PAD the fill must deposit the outline's area: {padded} vs {area}"
+        );
+        assert!(
+            (generous - padded).abs() < 0.01,
+            "more slack must change nothing: {generous} vs {padded}"
+        );
+        assert!(
+            (flush - area).abs() > 0.5,
+            "PRECONDITION: flush against the grid edge this outline must lose ink \
+             ({flush} vs {area}) — if it no longer does, the rasterizer changed and \
+             this test has stopped proving why RASTER_PAD is there"
+        );
+    }
+
+    /// The PORTABLE raster's half of the [`RASTER_PAD`] law: coverage may not
+    /// depend on how much empty grid surrounds the outline. The trap is the
+    /// same one the hinted seam fell into — a design-space `x_min` whose scaled
+    /// value is a whole pixel (a `bbox.x_min` of 0, which most glyphs of most
+    /// fonts have, always is) puts the outline flush against the grid's left
+    /// edge. Held to a 4×-slack refill over every printable ASCII code point
+    /// and the box-drawing run, at every desktop ppem, on the bundled face.
+    #[test]
+    #[cfg(feature = "embedded-font")]
+    fn varied_raster_is_invariant_to_grid_slack() {
+        const SLACK: usize = 4;
+        let bytes = crate::embedded_font();
+        let face = ttf_parser::Face::parse(bytes, 0).expect("the bundled face parses");
+        let upem = f32::from(face.units_per_em());
+        let mut checked = 0usize;
+        for pxi in 12..=40u32 {
+            let px = pxi as f32;
+            let scale = px / upem;
+            let mut chars: Vec<char> = (' '..='~').collect();
+            chars.extend("─│┌┐└┘├┤┬┴┼━┃█▀▄▌▐░▒▓".chars());
+            for ch in chars {
+                let Some(g) = face.glyph_index(ch) else { continue };
+                let Some((w, h, _, _, _, cov)) = varied_glyph_raster_with_face(&face, g.0, px)
+                else {
+                    continue;
+                };
+                if cov.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                // The same outline, same mapping, into a grid with four times
+                // the production slack.
+                let bbox = face.glyph_bounding_box(g).expect("an inked glyph has a bbox");
+                let x_min = (f32::from(bbox.x_min) * scale).floor();
+                let y_max = (f32::from(bbox.y_max) * scale).ceil();
+                let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
+                let mut b = OutlineToRaster {
+                    ras: &mut ras,
+                    scale,
+                    ox: x_min - SLACK as f32,
+                    oy: y_max + SLACK as f32,
+                    last: ab_glyph_rasterizer::point(0.0, 0.0),
+                    start: ab_glyph_rasterizer::point(0.0, 0.0),
+                };
+                face.outline_glyph(g, &mut b)
+                    .expect("the glyph we just drew still draws");
+                b.close_contour();
+                let gw = w + 2 * SLACK;
+                let mut reference = vec![0u8; w * h];
+                ras.for_each_pixel(|i, a| {
+                    let (gx, gy) = (i % gw, i / gw);
+                    let (Some(x), Some(y)) = (gx.checked_sub(SLACK), gy.checked_sub(SLACK))
+                    else {
+                        return;
+                    };
+                    if x < w && y < h {
+                        reference[y * w + x] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+                    }
+                });
+                let worst = cov
+                    .iter()
+                    .zip(&reference)
+                    .map(|(a, b)| i32::from(*a) - i32::from(*b))
+                    .map(i32::abs)
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    worst <= 1,
+                    "{ch:?} at {pxi}px: coverage moved by {worst}/255 when the fill grid \
+                     gained slack — the outline is sitting on the grid boundary and the \
+                     rasterizer is losing a scanline"
+                );
+            }
+        }
+        assert!(
+            checked > 2_000,
+            "the sweep must rasterize thousands of glyphs, got {checked}"
         );
     }
 

@@ -68,7 +68,7 @@ fn harvest(
     let mut win = WindowGpu::new();
     gpu.virtual_begin(&mut win, w, h, opts())
         .expect("virtual tap");
-    gpu.reset_glow_ease_for_test();
+    gpu.reset_glow_ease_for_test(&mut win);
     for (i, (input, tray)) in seq.iter().enumerate() {
         assert!(
             gpu.present_virtual(&mut win, input, false, None, *tray),

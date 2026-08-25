@@ -309,14 +309,23 @@ pub(crate) fn hinted_glyph_raster(
         return None;
     }
     let (w, h) = (w as usize, h as usize);
-    let mut ras = ab_glyph_rasterizer::Rasterizer::new(w, h);
-    pen.fill(&mut ras, x_min, y_max, 1.0);
-    let mut cov = vec![0u8; w * h];
-    ras.for_each_pixel(|i, a| {
-        if let Some(slot) = cov.get_mut(i) {
-            *slot = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-        }
-    });
+    // Fill into a grid with `RASTER_PAD` px of slack on every side and crop the
+    // ink box back out. Grid fitting is exactly what makes the unpadded fill
+    // unsafe: the autohinter snaps stem edges to whole pixels, so the fitted
+    // outline routinely sits EXACTLY on `x = floor(min_x)` — the grid's left
+    // edge — where the rasterizer's incremental x march drifts sub-ULP negative
+    // and drops a whole scanline's area, smearing the rest of the glyph into a
+    // filled block. See `variation::RASTER_PAD` for the full mechanism and the
+    // measured damage map ('?' at ppem 17, '2' at ppem 19 on the default face).
+    let pad = crate::variation::RASTER_PAD as f32;
+    let mut ras = ab_glyph_rasterizer::Rasterizer::new(
+        w + 2 * crate::variation::RASTER_PAD,
+        h + 2 * crate::variation::RASTER_PAD,
+    );
+    // `fill` translates by `x_min` and flips y about `y_max`, so shifting those
+    // origins by the pad IS the +PAD translate into the grid's interior.
+    pen.fill(&mut ras, x_min - pad, y_max + pad, 1.0);
+    let cov = crate::variation::crop_padded_coverage(&ras, w, h);
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
 
@@ -578,6 +587,221 @@ mod tests {
         assert!(
             bank.instance(key, bytes, 0, 12.0, HintMode::Full, &[], 0)
                 .is_some()
+        );
+    }
+
+    /// Re-fill the SAME recorded outline into a grid with a GENEROUS slack ring
+    /// (4 px, four times what production uses) and crop the ink box back out.
+    /// The coverage of a correct fill cannot depend on how much empty grid
+    /// surrounds it — so this is the reference the production raster is held to.
+    fn generous_slack_raster(pen: &PathPen, w: usize, h: usize) -> Vec<u8> {
+        const SLACK: usize = 4;
+        let (x_min, y_max) = (pen.min_x.floor(), pen.max_y.ceil());
+        let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
+        pen.fill(&mut ras, x_min - SLACK as f32, y_max + SLACK as f32, 1.0);
+        let gw = w + 2 * SLACK;
+        let mut cov = vec![0u8; w * h];
+        ras.for_each_pixel(|i, a| {
+            let (gx, gy) = (i % gw, i / gw);
+            let (Some(x), Some(y)) = (gx.checked_sub(SLACK), gy.checked_sub(SLACK)) else {
+                return;
+            };
+            if x < w && y < h {
+                cov[y * w + x] = (a * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            }
+        });
+        cov
+    }
+
+    /// `(area, perimeter)` of the fitted outline in px / px², by the shoelace
+    /// formula over a fine flattening. The area is the ink a correct nonzero
+    /// fill MUST deposit; the perimeter bounds how far antialiasing (and the
+    /// rasterizer's own coarser curve flattening) can move it, since both are
+    /// boundary effects.
+    fn area_and_perimeter(pen: &PathPen) -> (f32, f32) {
+        const SUB: usize = 32;
+        let (mut area, mut perim) = (0.0f32, 0.0f32);
+        let mut poly: Vec<(f32, f32)> = Vec::new();
+        let (mut start, mut last) = ((0.0f32, 0.0f32), (0.0f32, 0.0f32));
+        let close = |poly: &mut Vec<(f32, f32)>, area: &mut f32, perim: &mut f32| {
+            for i in 0..poly.len() {
+                let ((x0, y0), (x1, y1)) = (poly[i], poly[(i + 1) % poly.len()]);
+                *area += x0 * y1 - x1 * y0;
+                *perim += ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
+            }
+            poly.clear();
+        };
+        for c in &pen.cmds {
+            match *c {
+                Cmd::Move(x, y) => {
+                    close(&mut poly, &mut area, &mut perim);
+                    start = (x, y);
+                    last = start;
+                    poly.push(start);
+                }
+                Cmd::Line(x, y) => {
+                    last = (x, y);
+                    poly.push(last);
+                }
+                Cmd::Quad(cx, cy, x, y) => {
+                    for i in 1..=SUB {
+                        let t = i as f32 / SUB as f32;
+                        let m = 1.0 - t;
+                        poly.push((
+                            m * m * last.0 + 2.0 * m * t * cx + t * t * x,
+                            m * m * last.1 + 2.0 * m * t * cy + t * t * y,
+                        ));
+                    }
+                    last = (x, y);
+                }
+                Cmd::Curve(ax, ay, bx, by, x, y) => {
+                    for i in 1..=SUB {
+                        let t = i as f32 / SUB as f32;
+                        let m = 1.0 - t;
+                        let (m2, t2) = (m * m, t * t);
+                        poly.push((
+                            m2 * m * last.0 + 3.0 * m2 * t * ax + 3.0 * m * t2 * bx + t2 * t * x,
+                            m2 * m * last.1 + 3.0 * m2 * t * ay + 3.0 * m * t2 * by + t2 * t * y,
+                        ));
+                    }
+                    last = (x, y);
+                }
+                Cmd::Close => {
+                    close(&mut poly, &mut area, &mut perim);
+                    last = start;
+                    poly.push(start);
+                }
+            }
+        }
+        close(&mut poly, &mut area, &mut perim);
+        ((area * 0.5).abs(), perim)
+    }
+
+    /// The glyph set the ppem sweep covers: every printable ASCII code point
+    /// (the digits the bug ate live here), the box-drawing / block run a
+    /// terminal draws frames and progress bars out of, a Nerd-Font PUA sample
+    /// (the bundled symbols face carries nothing else, and its icon outlines
+    /// look nothing like Latin text), and a CJK sample for any face that
+    /// carries one.
+    fn sweep_chars() -> Vec<char> {
+        let mut v: Vec<char> = (' '..='~').collect();
+        v.extend("─│┌┐└┘├┤┬┴┼━┃█▀▄▌▐░▒▓".chars());
+        v.extend("\u{e0b0}\u{e0b2}\u{e5ff}\u{e62b}\u{e706}\u{e7a8}".chars());
+        v.extend("\u{f005}\u{f00c}\u{f00d}\u{f011}\u{f015}\u{f09b}".chars());
+        v.extend("\u{f120}\u{f121}\u{f0c9}\u{f1d3}\u{f269}\u{f4a0}".chars());
+        v.extend("一二日本語漢字".chars());
+        v
+    }
+
+    /// THE ppem-19 BROKEN-DIGIT REGRESSION (see `variation::RASTER_PAD`).
+    ///
+    /// Grid fitting snaps stem edges to whole pixels, so a fitted outline
+    /// routinely sits EXACTLY on `x = floor(min_x)` — the coverage grid's left
+    /// edge. `ab_glyph_rasterizer` marches x incrementally down a segment's
+    /// scanlines, drifts a sub-ULP past that edge, floors to `-1`, and drops the
+    /// whole scanline's area; `for_each_pixel`'s single running accumulator then
+    /// carries the loss through every remaining texel and the glyph paints as a
+    /// filled block. On the shipped default face that ate `'2'` at ppem 19 —
+    /// which is `round(15 * 1.25)`, i.e. what the Linux auto-scale law hands
+    /// every 125%-scale desktop — and `'?'` at ppem 17.
+    ///
+    /// TWO independent nets over the whole ppem range, both modes-wide:
+    ///
+    /// 1. SLACK INVARIANCE (sharp). Coverage cannot depend on how much empty
+    ///    grid surrounds the outline, so the production raster must match a
+    ///    4-px-slack fill of the same outline to within one 8-bit step.
+    ///    Pre-fix, the two broken glyphs differ from it on EVERY texel, by up
+    ///    to 180/255.
+    /// 2. INK PLAUSIBILITY (the "implausibly high ink for its shape" net).
+    ///    Rasterized ink must equal the fitted outline's geometric area; the
+    ///    slack is proportional to the outline's PERIMETER because antialiasing
+    ///    and the rasterizer's own curve flattening are boundary effects.
+    ///    Measured over the 11 571 (mode, ppem, glyph) combinations this sweep
+    ///    covers, the honest residual peaks at 0.029·perimeter; the pre-fix
+    ///    `'2'` at ppem 19 sat at 0.097·perimeter and `'?'` at ppem 17 at
+    ///    0.491·perimeter, so 0.06·perimeter separates them with margin on
+    ///    both sides.
+    #[test]
+    fn ppem_sweep_no_glyph_rasterizes_as_a_filled_block() {
+        // Both bundled faces: the text default the bug bit, and the Nerd icon
+        // face, whose outlines are shaped nothing like Latin text.
+        #[allow(unused_mut)]
+        let mut faces: Vec<(&str, &[u8])> = vec![("DejaVuSansMono (embedded)", dejavu())];
+        #[cfg(feature = "embedded-symbols")]
+        faces.push(("SymbolsNerdFontMono (embedded)", crate::embedded_symbols_font()));
+        let chars = sweep_chars();
+        let modes = [HintMode::Full, HintMode::Light, HintMode::Native];
+        let mut checked = 0usize;
+        for (name, bytes) in faces {
+            let font = FontRef::new(bytes).expect("bundled face parses");
+            for mode in modes {
+                for px in 12..=40 {
+                    let opts = mode.options().expect("the three hinting modes carry options");
+                    let px = px as f32;
+                    let hint = HintingInstance::new(
+                        &font.outline_glyphs(),
+                        Size::new(px),
+                        &location_of(&font, &[]),
+                        opts,
+                    )
+                    .expect("a hinting instance at every desktop ppem");
+                    for &ch in &chars {
+                        let Some(gid) = unicode_gid(bytes, 0, ch) else {
+                            continue;
+                        };
+                        let (w, h, _, _, _, cov) =
+                            hinted_glyph_raster(bytes, 0, gid, px, &hint, &[])
+                                .expect("the hinted raster never fails on a bundled face");
+                        if cov.is_empty() {
+                            continue; // blank glyph (space): advance only
+                        }
+                        checked += 1;
+                        // Re-draw the same outline to measure it against.
+                        let outline = font
+                            .outline_glyphs()
+                            .get(skrifa::GlyphId::from(gid))
+                            .expect("the gid we just rasterized still resolves");
+                        let mut pen = PathPen::default();
+                        outline
+                            .draw(DrawSettings::hinted(&hint, false), &mut pen)
+                            .expect("the outline we just drew still draws");
+
+                        // 1. slack invariance
+                        let reference = generous_slack_raster(&pen, w, h);
+                        let worst = cov
+                            .iter()
+                            .zip(&reference)
+                            .map(|(a, b)| i32::from(*a) - i32::from(*b))
+                            .map(i32::abs)
+                            .max()
+                            .unwrap_or(0);
+                        assert!(
+                            worst <= 1,
+                            "{name} {mode:?} {px}px {ch:?} (U+{:04X}): coverage moved by \
+                             {worst}/255 when the fill grid gained slack — the outline is \
+                             sitting on the grid boundary and the rasterizer lost a scanline",
+                            ch as u32
+                        );
+
+                        // 2. ink plausibility
+                        let ink = cov.iter().map(|&v| f32::from(v)).sum::<f32>() / 255.0;
+                        let (area, perim) = area_and_perimeter(&pen);
+                        let slack = 0.06 * perim + 0.75;
+                        assert!(
+                            (ink - area).abs() <= slack,
+                            "{name} {mode:?} {px}px {ch:?} (U+{:04X}): {w}x{h} raster carries \
+                             {ink:.2}px² of ink for an outline enclosing {area:.2}px² \
+                             (perimeter {perim:.1}px, allowed drift {slack:.2}px²)",
+                            ch as u32
+                        );
+                    }
+                }
+            }
+        }
+        // A sweep that quietly checked nothing would pass forever.
+        assert!(
+            checked > 5_000,
+            "the ppem sweep must actually rasterize thousands of glyphs, got {checked}"
         );
     }
 

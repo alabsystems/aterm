@@ -5563,6 +5563,16 @@ mod tests {
         let outline_rect = LogicalRect::new(16.0, 40.0, 220.0 - 32.0, 32.0);
         let outline_slot = outline_rect.width - 22.0;
         let heading = "Getting started with aterm";
+        // MEASURE AT THE SIZE THE PAINTER USES. The premise below used the ambient
+        // `px`, which the chip section above had shadowed to
+        // `native_type_px(TypeStep::Secondary)` — 13.0 — while every
+        // `paint_compiled_node` call in this test runs at 14.0. So the premise
+        // described a type size the painter never uses: it measured the heading at
+        // 149.0 regular / 154.3 semibold against the 166.0 slot and concluded that
+        // semibold FITS, when at the painted size it measures 160.4 / 166.2 and
+        // overflows by 0.2pt — which is the whole case this test exists to pin.
+        // Named so the two cannot drift apart again.
+        let outline_px = 14.0;
         let outline_painted = |selected: bool| {
             let mut control = Control::new(
                 ButtonSpec::new(heading),
@@ -5577,7 +5587,7 @@ mod tests {
                 content: UiContent::Button(control),
             };
             let mut prims = Vec::new();
-            paint_compiled_node(&mut prims, &node, roles, theme, 14.0);
+            paint_compiled_node(&mut prims, &node, roles, theme, outline_px);
             let painted = prims.iter().find_map(|p| match p {
                 DrawPrim::Text { s, .. } => Some(s.clone()),
                 _ => None,
@@ -5593,8 +5603,8 @@ mod tests {
         };
         // The premise: it FITS at rest, and it does not fit in semibold. Without
         // both halves the assertion below is vacuous.
-        let regular = crate::tray_raster::ui_text_width_for(TextFace::Ui, heading, px);
-        let bold = crate::tray_raster::ui_text_width_for(TextFace::UiBold, heading, px);
+        let regular = crate::tray_raster::ui_text_width_for(TextFace::Ui, heading, outline_px);
+        let bold = crate::tray_raster::ui_text_width_for(TextFace::UiBold, heading, outline_px);
         assert!(
             regular <= outline_slot && bold > outline_slot,
             "the premise moved: {heading:?} measures {regular:.1}pt regular / {bold:.1}pt \

@@ -38,7 +38,7 @@ mod scrollback_tiers_api;
 use aterm_core::grid::{PendingScrollbackReflow, ReflowStep};
 use aterm_core::selection::SmartSelection;
 use aterm_core::selection::{SelectionSide, SelectionType};
-use aterm_core::terminal::{ClipboardAccess, CursorStyle, MouseMode, Rgb, Terminal};
+use aterm_core::terminal::{BlockText, ClipboardAccess, CursorStyle, MouseMode, Rgb, Terminal};
 use aterm_effects::pipeline::EffectsPipeline;
 use aterm_render::{RenderInput, Renderer, SpillBand, Theme};
 
@@ -650,6 +650,15 @@ impl AtermGpuTerminal {
     /// Feed raw PTY output bytes into the engine.
     pub fn process(&mut self, bytes: &[u8]) {
         self.term.process(bytes);
+        self.pump_reflow_on_output();
+    }
+
+    /// Feed PTY output as a JS string. wasm-bindgen encodes it (UTF-8, via
+    /// `encodeInto`) straight into wasm memory, so the host avoids a separate
+    /// JS-side `TextEncoder.encode` allocation + copy on the hot output path.
+    /// Byte-identical to `process(new TextEncoder().encode(s))`.
+    pub fn process_str(&mut self, s: &str) {
+        self.term.process(s.as_bytes());
         self.pump_reflow_on_output();
     }
 
@@ -1690,6 +1699,38 @@ impl AtermGpuTerminal {
         out
     }
 
+    /// The last completed OSC-133 block's output as JSON, following the
+    /// `take_osc_events` JSON-drain convention (CM-A3, "Copy Last Command
+    /// Output") — mirrors the CPU binding:
+    ///   `{"status":"ok","text":"…","exitCode":0}` — output read in full
+    ///     (`exitCode` is `null` when the block was finalized without OSC 133 D,
+    ///     e.g. an interrupted command whose next prompt closed it);
+    ///   `{"status":"evicted"}` — the block's rows scrolled past the scrollback
+    ///     cap (DL-1: an honest marker, never silently-shifted/empty text);
+    ///   `undefined` — nothing to copy: no shell integration, no finished block
+    ///     yet (incl. a snapshot-rehydrated pane — blocks are excluded from
+    ///     checkpoints), or the block never reached its output phase.
+    ///
+    /// `&self` — the read rides `Terminal::last_completed_block`, which was added
+    /// alongside this binding precisely so the facade does not need the `&mut`
+    /// `output_blocks()` (`make_contiguous`) path.
+    pub fn last_command_output(&self) -> Option<String> {
+        let block = self.term.last_completed_block()?;
+        match self.term.block_output_text(block) {
+            BlockText::Text(text) => {
+                let exit = block
+                    .exit_code
+                    .map_or_else(|| "null".to_owned(), |c| c.to_string());
+                Some(format!(
+                    "{{\"status\":\"ok\",\"text\":{},\"exitCode\":{exit}}}",
+                    json_string(&text)
+                ))
+            }
+            BlockText::Evicted => Some("{\"status\":\"evicted\"}".to_owned()),
+            BlockText::NotAvailable => None,
+        }
+    }
+
     /// The window title (OSC 0/2), or `None` when unset (mirrors the CPU binding).
     pub fn title(&self) -> Option<String> {
         let title = self.term.title();
@@ -2037,6 +2078,87 @@ impl AtermGpuTerminal {
         self.term.display_row_text(row as usize)
     }
 
+    /// Batch row-range export for the P7 grid mirror (E9): the text/wrap/len
+    /// (+ per-column wide map) of `count` DISPLAY rows starting at `first_row`
+    /// (display_offset-aware, same coords as [`AtermGpuTerminal::row_text`]) in
+    /// ONE wasm-boundary crossing, replacing the per-row `row_text` +
+    /// `row_is_wrapped` + `row_len` + per-cell `cell_is_wide` walk. Returns a
+    /// JSON array of exactly `count` records
+    /// `{text, wrapped, len, widths?}` in row order; `widths` is a per-column
+    /// digit string (`'2'` wide lead / `'1'` otherwise, length == cols) OMITTED
+    /// for all-narrow rows so the host reuses its cached all-`'1'` string.
+    /// `undefined` when the range is unavailable (a row is out of the live grid,
+    /// e.g. resize skew) — the host falls back to the per-row path that frame.
+    pub fn row_range_json(&self, first_row: u32, count: u32) -> Option<String> {
+        let rows = u32::try_from(self.rows).unwrap_or(u32::MAX);
+        let cols = self.cols;
+        let end = first_row.checked_add(count)?;
+        // Any row past the live grid ⇒ range unavailable this frame.
+        if end > rows {
+            return None;
+        }
+        let mut out = String::from("[");
+        for y in first_row..end {
+            if y != first_row {
+                out.push(',');
+            }
+            let row_u16 = u16::try_from(y).ok()?;
+            // Text matches the per-row `row_text` fallback exactly
+            // (display_row_text), so a path switch never spuriously re-dirties.
+            let text = self.term.display_row_text(y as usize).unwrap_or_default();
+            let wrapped = self.term.grid().row_is_wrapped(row_u16).unwrap_or(false);
+            let len = self
+                .term
+                .grid()
+                .row_len(row_u16)
+                .map_or(self.cols, usize::from);
+            // Per-column wide map from the same source `cell_is_wide` reads; the
+            // continuation spacer of a wide cell reports narrow, matching the
+            // host's `cell_is_wide(y,x) ? '2' : '1'` per-cell walk.
+            //
+            // Read straight off ONE row view rather than through
+            // `display_row_grapheme_cells`: that accessor builds a
+            // `Vec<(String, bool)>` with a heap `String` per column carrying the
+            // resolved cluster text — text this loop never touches (the row's
+            // text came from `display_row_text` above), so a 200-col mirror
+            // refresh allocated and freed up to 200 Strings + a Vec PER ROW
+            // purely to read one bit each. `view.cell(col).is_wide()` is exactly
+            // the predicate that accessor computes for its `.1`, so the digit
+            // string is unchanged; an out-of-grid row yields `Empty`, whose
+            // `cell()` is `None` ⇒ the all-`'1'`/omitted shape the old `None`
+            // arm produced. It also materializes a scrolled-in history row once
+            // per record instead of twice.
+            let view = self.term.grid().visible_row_view(row_u16);
+            let mut widths = String::with_capacity(cols);
+            let mut any_wide = false;
+            for col in 0..cols {
+                let wide = u16::try_from(col)
+                    .ok()
+                    .and_then(|c| view.cell(c))
+                    .is_some_and(|c| c.is_wide());
+                if wide {
+                    widths.push('2');
+                    any_wide = true;
+                } else {
+                    widths.push('1');
+                }
+            }
+            out.push_str("{\"text\":");
+            out.push_str(&json_string(&text));
+            out.push_str(",\"wrapped\":");
+            out.push_str(if wrapped { "true" } else { "false" });
+            out.push_str(",\"len\":");
+            out.push_str(&len.to_string());
+            if any_wide {
+                out.push_str(",\"widths\":");
+                out.push_str(&json_string(&widths));
+            }
+            out.push('}');
+        }
+        out.push(']');
+        Some(out)
+    }
+
     /// Search the full retained buffer for `query`, returning matches as a flat
     /// `[abs_line, start_col, len]` triplet array. Empty query / regex error →
     /// empty array. `is_regex` compiles `query` as a regex (parity with aterm-wasm;
@@ -2089,6 +2211,79 @@ impl AtermGpuTerminal {
             incomplete: results.incomplete,
             match_count: u32::try_from(results.matches.len()).unwrap_or(u32::MAX),
         }
+    }
+
+    /// GPU-module parity with the aterm-wasm crate's `search_summary`: a
+    /// snippet-carrying superset of [`AtermGpuTerminal::search_meta`]. Returns
+    /// `{matches:[{absRow,col,len,snippet}], total, incomplete}` where `matches`
+    /// is capped to `max_matches` (0 = uncapped), `total` is the full match
+    /// count before the cap, `incomplete` is the engine's eviction/match-cap
+    /// truncation signal (which [`AtermGpuTerminal::search`] drops), and
+    /// `snippet` is the match line's text (absolute-row coordinate). Empty
+    /// query or invalid regex ⇒ `{matches:[],total:0,incomplete:false}`
+    /// (mirroring `search`'s silence).
+    ///
+    /// A bounded READ over an already-built full-content index — not a
+    /// from-scratch rebuild on the hot path ([`Terminal::search_summary_results`]):
+    /// after a [`AtermGpuTerminal::search_budgeted`] scan completes over the same
+    /// query + content snapshot, THAT retained index answers directly (zero
+    /// rebuild); otherwise the O(1)-reused one-shot index serves it, rebuilding
+    /// only on a content-key miss. Only the `≤max_matches` capped rows pay a
+    /// snippet read.
+    pub fn search_summary(
+        &mut self,
+        query: &str,
+        case_sensitive: bool,
+        is_regex: bool,
+        max_matches: u32,
+    ) -> Option<String> {
+        let empty = || Some("{\"matches\":[],\"total\":0,\"incomplete\":false}".to_owned());
+        if query.is_empty() {
+            return empty();
+        }
+        let (matches, total, incomplete) = {
+            let Ok(results) = self
+                .term
+                .search_summary_results(query, case_sensitive, is_regex)
+            else {
+                return empty();
+            };
+            let total = results.matches.len();
+            let cap = if max_matches == 0 {
+                total
+            } else {
+                (max_matches as usize).min(total)
+            };
+            // Copy the capped (line, start_col, len) triplets out so the &self
+            // index borrow ends before the &self snippet reads below.
+            let matches: Vec<(u64, usize, usize)> = results.matches[..cap]
+                .iter()
+                .map(|m| (m.line as u64, m.start_col, m.len()))
+                .collect();
+            (matches, total, results.incomplete)
+        };
+        let mut out = String::from("{\"matches\":[");
+        for (i, (abs, col, len)) in matches.iter().enumerate() {
+            if i != 0 {
+                out.push(',');
+            }
+            let snippet = self.term.abs_row_text(*abs).unwrap_or_default();
+            out.push_str("{\"absRow\":");
+            out.push_str(&abs.to_string());
+            out.push_str(",\"col\":");
+            out.push_str(&col.to_string());
+            out.push_str(",\"len\":");
+            out.push_str(&len.to_string());
+            out.push_str(",\"snippet\":");
+            out.push_str(&json_string(&snippet));
+            out.push('}');
+        }
+        out.push_str("],\"total\":");
+        out.push_str(&total.to_string());
+        out.push_str(",\"incomplete\":");
+        out.push_str(if incomplete { "true" } else { "false" });
+        out.push('}');
+        Some(out)
     }
 
     /// Absolute row of display row 0 at the live bottom. A match at absolute
@@ -2184,6 +2379,16 @@ impl AtermGpuTerminal {
     /// the partial index; outstanding cursors go stale and restart if resumed).
     pub fn search_budgeted_cancel(&mut self) {
         self.term.cancel_budgeted_search();
+    }
+
+    /// Release the search index's heap (fed E-1 `search_index_release`): drops
+    /// the cached full-content index AND any in-flight budgeted search so a
+    /// dormant/closed pane's index footprint returns to the allocator, making
+    /// federation idle-eviction REAL rather than a logical clear that retains
+    /// peak capacity. The next search rebuilds from the live buffer — one
+    /// rebuild paid, byte-identical results.
+    pub fn search_index_release(&mut self) {
+        self.term.release_search_index();
     }
 }
 

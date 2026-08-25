@@ -75,6 +75,94 @@ unsafe extern "system" {
     /// OS on a scheme change), not a round trip — cheap enough to re-read whole on
     /// every settings broadcast rather than caching it here.
     fn GetSysColor(index: i32) -> u32;
+    // The new-window cascade's work area (`window_work_area_pts`): HMONITOR is a
+    // pointer-sized handle, threaded as `isize` like every other handle here.
+    fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+    fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+    // The `attach` lane's raise (`window_bring_to_front`).
+    fn IsIconic(hwnd: isize) -> i32;
+    fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+    fn SetForegroundWindow(hwnd: isize) -> i32;
+    // The band's system menu (`popup_system_menu`).
+    fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+}
+
+/// `WM_SYSCOMMAND` / `SC_KEYMENU`: ask `DefWindowProc` to open the window menu
+/// — the exact Alt+Space path, anchored at the caption's top-left corner.
+///
+/// Chosen by MEASUREMENT, not taste (Windows 11, 2026-08, this repo's glass
+/// probes): a posted `WM_POPUPSYSTEMMENU` (0x0313), `WM_NCRBUTTONUP`+HTCAPTION
+/// and `WM_CONTEXTMENU` each opened NOTHING — modern DefWindowProc validates
+/// those against real non-client input — while a posted SC_KEYMENU+' '
+/// provably opens the real menu (Restore / Move / Size / Minimize / Maximize /
+/// Close), photographed in the same probe run that saw the other three fail.
+const WM_SYSCOMMAND: u32 = 0x0112;
+const SC_KEYMENU: usize = 0xF100;
+
+/// Post the window's own system menu (Restore / Move / Size / Minimize /
+/// Maximize / Close), as a caption right-press does everywhere else on
+/// Windows — the band IS this window's caption. `false` when there is no HWND.
+///
+/// POSTED, not sent: `DefWindowProc` tracks the menu in a MODAL loop, and
+/// entering that from inside the winit callback we are called from would re-enter
+/// the event loop with `App` already borrowed. Posting hands it to the message
+/// pump, so the menu opens exactly as Alt+Space's does — after this turn.
+///
+/// CALL THIS ON A RELEASE, NEVER A PRESS: winit's win32 backend holds
+/// `SetCapture` from button-down to button-up, and `DefWindowProc` refuses to
+/// enter the menu's modal loop while the thread holds mouse capture — a post
+/// made on the DOWN is silently discarded unless the release is ALREADY in the
+/// queue when it is pumped. Measured (2026-08, this repo's glass probes): with
+/// the button held, `GUI_INMENUMODE` stayed zero for a full two seconds after
+/// this post; the identical post with no button down opened the menu
+/// instantly. That is why only a machine-speed click ever saw the old
+/// press-time popup work. `App::on_mouse_input`'s `band_menu_release_pending`
+/// latch is the shape a caller takes.
+pub(crate) fn popup_system_menu(window: &Window) -> bool {
+    let Some(hwnd) = hwnd_of(window) else {
+        return false;
+    };
+    // SAFETY: `PostMessageW` queues one message on a live HWND owned by this
+    // process; no pointers are carried.
+    unsafe { PostMessageW(hwnd, WM_SYSCOMMAND, SC_KEYMENU, isize::from(b' ')) != 0 }
+}
+
+/// `MONITORINFO`. `size` MUST be pre-set to the struct's size — that is how
+/// `GetMonitorInfoW` tells this from the longer `MONITORINFOEXW`.
+#[repr(C)]
+struct MonitorInfo {
+    size: u32,
+    monitor: Rect,
+    work: Rect,
+    flags: u32,
+}
+
+/// `MONITOR_DEFAULTTONEAREST`: answer with the closest monitor rather than null
+/// for a window that is (partly) off every display.
+const MONITOR_DEFAULTTONEAREST: u32 = 0x0000_0002;
+/// `SW_RESTORE`: un-minimize to the size and position it had before.
+const SW_RESTORE: i32 = 9;
+
+/// `rcWork` (physical screen px) → the cascade's logical-point rectangle, or
+/// `None` for geometry the cascade cannot use: a non-finite or non-positive
+/// scale, or an empty/inverted work area (both of which would otherwise wrap
+/// every new window onto the same spot). Pure, so the conversion is pinned by a
+/// unit test rather than by a monitor.
+fn work_area_pts_from_rect(work: &Rect, scale: f64) -> Option<crate::app_window::WorkAreaPts> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let w = f64::from(work.right.checked_sub(work.left)?) / scale;
+    let h = f64::from(work.bottom.checked_sub(work.top)?) / scale;
+    if !(w > 0.0 && h > 0.0) {
+        return None;
+    }
+    Some(crate::app_window::WorkAreaPts {
+        x: f64::from(work.left) / scale,
+        y: f64::from(work.top) / scale,
+        w,
+        h,
+    })
 }
 
 // `RegGetValueW` — the one-call registry read (open + query + close + type check).
@@ -140,7 +228,7 @@ unsafe extern "system" {
 
 /// `RECT`.
 #[repr(C)]
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 struct Rect {
     left: i32,
     top: i32,
@@ -2059,6 +2147,60 @@ impl AppRt for AppRtWindows {
         resync_chrome_appearance(window);
     }
 
+    /// The work area of the monitor `window` sits on — `GetMonitorInfoW`'s
+    /// `rcWork`, i.e. the display rectangle MINUS the taskbar and any other
+    /// appbar — converted to logical points by the WINDOW's scale factor, which
+    /// is the same divisor winit applies to `outer_position()`, so the cascade
+    /// compares like with like.
+    ///
+    /// Without this the trait default (`None`) sent the new-window cascade to
+    /// the winit MONITOR bounds, which include the taskbar: a cascaded window
+    /// wrapped to a position partly underneath it. `MONITOR_DEFAULTTONEAREST`
+    /// keeps a window dragged half off-screen answering with the monitor it is
+    /// mostly on rather than failing.
+    fn window_work_area_pts(&self, window: &Window) -> Option<crate::app_window::WorkAreaPts> {
+        let hwnd = hwnd_of(window)?;
+        let mut info = MonitorInfo {
+            size: u32::try_from(std::mem::size_of::<MonitorInfo>()).ok()?,
+            monitor: Rect::default(),
+            work: Rect::default(),
+            flags: 0,
+        };
+        // SAFETY: `MonitorFromWindow` is a lookup on a live HWND that returns a
+        // borrowed HMONITOR (nothing to free) and a null handle only if the
+        // window is gone; `GetMonitorInfoW` fills the stack local whose `size`
+        // was pre-set as it documents. No pointer outlives the call.
+        let ok = unsafe {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            monitor != 0 && GetMonitorInfoW(monitor, &raw mut info) != 0
+        };
+        if !ok {
+            return None;
+        }
+        work_area_pts_from_rect(&info.work, window.scale_factor())
+    }
+
+    /// Un-minimize and raise this window for an `attach` forward. `SW_RESTORE`
+    /// first (a minimized window cannot take the foreground), then
+    /// `SetForegroundWindow`, whose cross-process refusal the FORWARDING
+    /// `aterm.exe` has already lifted with `AllowSetForegroundWindow(our pid)`.
+    /// Without that grant this degrades to the OS's taskbar flash rather than
+    /// stealing focus from whatever the user is typing into — which is exactly
+    /// the behaviour Windows wants, so no fallback hack belongs here.
+    fn window_bring_to_front(&self, window: &Window) -> bool {
+        let Some(hwnd) = hwnd_of(window) else {
+            return false;
+        };
+        // SAFETY: three documented one-shot calls on a live HWND owned by this
+        // process's UI thread, which is the thread we are on.
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd) != 0
+        }
+    }
+
     /// The panel's EDR headroom for `window`'s monitor when Windows HDR is on
     /// (`MaxLuminance / SDR-white`), or `1.0` (no headroom → the aurora pass is
     /// provably inert) when HDR is off or any query fails. See [`crate::hdr_win`].
@@ -2361,6 +2503,7 @@ pub(crate) fn capture_window_rgba(window: &Window) -> Result<(Vec<u8>, u32, u32)
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use super::Rect;
     use super::{
         AppRtWindows, CHROME_BG_UNKNOWN, ChromeApplyGuard, ClientBackdropDecline,
         DEFAULT_WHEEL_SCROLL_LINES, DWMSBT_MAINWINDOW, DWMSBT_NONE, DWMSBT_TABBEDWINDOW,
@@ -2370,12 +2513,79 @@ mod tests {
         caption_tint, chrome_policy_code, chrome_policy_from_code, chrome_reassert_needed,
         claim_os_settings_wake, colorref_swap, effective_backdrop, high_contrast_active,
         is_os_settings_message, os_text_scale, resolve_chrome_theme, resolve_forced_chrome,
-        transparency_effects_enabled, validate_window_capture_transfer,
-        watch_os_settings_message, wheel_notch_from_raw, wheel_notch_scroll,
+        transparency_effects_enabled, validate_window_capture_transfer, watch_os_settings_message,
+        wheel_notch_from_raw, wheel_notch_scroll, work_area_pts_from_rect,
     };
     use crate::app_config::{BackgroundMaterial, WindowTheme};
     use crate::native_appearance::AppearancePreferences;
     use crate::platform::AppRt;
+
+    /// The work area the cascade wraps against EXCLUDES the taskbar and is
+    /// denominated in the same logical points winit reports window positions in.
+    /// A 1920x1080 display with a 48 px taskbar at the bottom, at 150%: the
+    /// rectangle is 1280x688 points, not 1280x720 — the 32 points of difference
+    /// are exactly the strip a cascaded window used to wrap underneath.
+    #[test]
+    fn the_work_area_drops_the_taskbar_and_lands_in_logical_points() {
+        let taskbar_at_the_bottom = Rect {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1032,
+        };
+        let area = work_area_pts_from_rect(&taskbar_at_the_bottom, 1.5).expect("a usable area");
+        assert_eq!((area.x, area.y), (0.0, 0.0));
+        assert_eq!(area.w, 1280.0);
+        assert_eq!(area.h, 688.0);
+        // A taskbar docked LEFT moves the origin too, and a second monitor's
+        // rectangle is offset in the virtual desktop.
+        let docked_left_on_a_second_display = Rect {
+            left: 1920 + 72,
+            top: 0,
+            right: 1920 + 1280,
+            bottom: 1024,
+        };
+        let area = work_area_pts_from_rect(&docked_left_on_a_second_display, 2.0).expect("usable");
+        assert_eq!((area.x, area.y), (996.0, 0.0));
+        assert_eq!((area.w, area.h), (604.0, 512.0));
+        // Degenerate geometry is refused, so the caller falls back to the winit
+        // monitor bounds instead of cascading onto a zero-sized rectangle.
+        for (rect, scale) in [
+            (Rect::default(), 1.0),
+            (
+                Rect {
+                    left: 100,
+                    top: 100,
+                    right: 0,
+                    bottom: 0,
+                },
+                1.0,
+            ),
+            (
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 800,
+                    bottom: 600,
+                },
+                0.0,
+            ),
+            (
+                Rect {
+                    left: 0,
+                    top: 0,
+                    right: 800,
+                    bottom: 600,
+                },
+                f64::NAN,
+            ),
+        ] {
+            assert!(
+                work_area_pts_from_rect(&rect, scale).is_none(),
+                "degenerate work area {rect:?}@{scale} must not be cascaded against"
+            );
+        }
+    }
 
     /// The §3.2 settings hook watches exactly the four messages that can carry an OS
     /// appearance or accessibility change, and NOTHING else — the wndproc is on the

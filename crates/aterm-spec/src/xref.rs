@@ -322,8 +322,11 @@ pub fn model_registry() -> Vec<Model> {
         kitty_sing_detector_model(),
         cursor_cat_earn_floor_model(),
         cursor_cat_curse_wince_model(),
+        reduced_motion_companion_handoff_model(),
+        cursor_cat_motion_pulse_routing_model(),
         rainbow_move_admission_model(),
         cursor_move_candidate_model(),
+        cursor_echo_commit_retry_model(),
         // The blackout's liveness twin: an environment adversary produces the
         // audited real-shell echo shapes (plain/E1..E5/cold/swallowed/
         // deviating, plus shape 10's unblinked-alt echo — the probe-starved
