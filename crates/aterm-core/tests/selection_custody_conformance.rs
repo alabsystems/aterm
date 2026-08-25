@@ -645,6 +645,29 @@ fn char_edits_on_another_line_spare_the_highlight() {
     }
 }
 
+/// …and the POSITIVE half, the bug itself: ECH/ICH/DCH on the row the highlight
+/// sits on rewrite it (program output, no keypress — the GUI's typing-deselect
+/// never fires), so the stale highlight MUST be cleared or a copy returns text
+/// the user never selected. The spare test above only proves the scoping is not
+/// a blanket clear; without this direction, a regression that recorded NO
+/// selection damage on these ops would pass it. Uses the cursor's own row
+/// (1;1H) so the edit overlaps the selection on row 0.
+#[test]
+fn char_edits_on_the_selected_line_clear_the_stale_highlight() {
+    for op in [&b"\x1b[40X"[..], &b"\x1b[3P"[..], &b"\x1b[3@"[..]] {
+        let mut term = with_live_row_zero_selection();
+
+        // Cursor to row 0 (1-based 1;1), directly over the highlight.
+        term.process(b"\x1b[1;1H");
+        term.process(op);
+
+        assert!(
+            !term.text_selection().has_selection(),
+            "a char edit ON the selected row must clear the stale highlight: {op:?}"
+        );
+    }
+}
+
 /// The canonical progress bar WITHOUT an erase: `\r` plus a plain overwrite. The
 /// design used exactly this example, and only the `\r\e[K` spelling was closed —
 /// ordinary character output recorded nothing, so the highlight stayed painted over

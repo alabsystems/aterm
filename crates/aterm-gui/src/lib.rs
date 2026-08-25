@@ -153,6 +153,9 @@ pub use control::control_redraw_conformance::run_redraw_conformance;
 mod control_auth;
 #[cfg(test)]
 mod control_connection_conformance;
+// TRUST_NATIVE_TLA Tier-1: the `SelectionCustody` binding (real App gesture/press seams
+// + real `Terminal` damage/scroll/eviction batches). Test-only, like its siblings.
+mod selection_custody_conformance;
 mod crash_signal;
 mod cwd_native;
 /// The DefTerm handoff broker: an STA thread with its own Win32 message pump,
@@ -31859,6 +31862,73 @@ mod spec_xref_gate {
         eprintln!(
             "spec_xref_closure: input_release_pairing is actively-bound AND its Tier-1 \
              two-window owner-map conformance was RUN by the gate."
+        );
+
+        // SELECTION CUSTODY. The `#[refines]` anchors on the real gesture/press seams
+        // (`App::finish_selection`, `app_input::apply_press_custody`) and the real engine
+        // seams (`Terminal::post_process`, `set_scrollback_line_limit`, `clear_scrollback`)
+        // make `SelectionCustody` an ACTIVE machine, so Ob.3 already demands ratio 1.0 for
+        // it above. Assert the shape here — all eleven actions bound, none waived — and
+        // then RUN the Tier-1 body, so the gate proves the binding rather than claiming it.
+        {
+            let custody = report
+                .coverage
+                .iter()
+                .find(|c| aterm_spec::xref::machine_matches("SelectionCustody", &c.machine))
+                .expect("SelectionCustody must be in the coverage ledger");
+            assert!(
+                custody.active,
+                "SelectionCustody must be ACTIVELY-BOUND (>= 1 refinement on the real \
+                 selection seams), not report-only"
+            );
+            assert_eq!(
+                custody.total_actions, 11,
+                "SelectionCustody action inventory drifted; update the anchors AND the \
+                 Tier-1 conformance, found {}",
+                custody.total_actions
+            );
+            assert_eq!(
+                custody.ratio(),
+                1.0,
+                "SelectionCustody must be fully bound-or-waived; uncovered = {:?}",
+                custody.uncovered
+            );
+            for action in [
+                "SelectLow",
+                "SelectOldest",
+                "SelectHigh",
+                "UserClear",
+                "TypingPress",
+                "InertPress",
+                "UniformScroll",
+                "RegionDamageLow",
+                "RegionDamageHigh",
+                "Evict",
+                "WholesaleInvalidate",
+            ] {
+                assert!(
+                    custody.bound.contains(action),
+                    "SelectionCustody action `{action}` must carry a #[refines] anchor on a \
+                     REAL seam (it is bound, not waived: every one of the eleven has a site)"
+                );
+            }
+            assert!(
+                custody.waived.is_empty(),
+                "SelectionCustody carries no waivers — every action has an observable \
+                 shipping site; found {:?}",
+                custody.waived
+            );
+        }
+        super::selection_custody_conformance::run_conformance();
+        eprintln!(
+            "spec_xref_closure: SelectionCustody is actively-bound (11/11 actions, zero \
+             waivers) AND its Tier-1 conformance (real drag/press gestures + real VT \
+             damage/scroll/eviction/ED-3/RIS batches) was RUN by the gate. The COVERAGE \
+             half of that sentence is a claim about anchor STRINGS — obligation 2 \
+             (`project` resolves to a live symbol) is not enforced here, so an anchor \
+             names a seam without anything checking it sits on the right one. The \
+             conformance is what carries real weight: it drives shipping code and is \
+             falsified by a regression in it."
         );
 
         // ---- Proof #3b (Phase 4): the UNIFIED VERIFIER LEDGER over ty + kani. ----

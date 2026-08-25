@@ -124,6 +124,20 @@ const CUSTOM_GRAPHIC_COLLECTIONS: &[&str] = &["cats"];
 /// `useNew`/`useExisting` also parse (`aterm_cli::WindowingBehavior::parse`) and
 /// are offered as aliases so a ported `settings.json` habit validates.
 const WINDOWING_BEHAVIORS: &[&str] = &["new_window", "attach"];
+/// The five DEFERRED_CONFIG_KEYS scalars an operator writes by hand (two are
+/// taught by `--help` and the `--write-config` starter). They follow the
+/// `windowing_behavior` precedent: off `prefs::editable_fields`, but Manual
+/// must complete them, hover them, and flag a misspelled VALUE — calling a
+/// live key "unknown to this aterm build" was a false diagnostic (audit-2
+/// item 9). Canonical spellings here; parser aliases below, accepted but
+/// never offered.
+const FONT_HINTINGS: &[&str] = &["full", "light", "native", "off"];
+const FONT_SUBPIXELS: &[&str] = &["off", "rgb", "bgr"];
+const RIGHT_CLICK_GESTURES: &[&str] = &["copy_paste", "off"];
+const RIGHT_CLICK_ALIASES: &[&str] = &["copy-paste"];
+const TAB_MENU_CHORDS: &[&str] = &["on", "menu_key", "off"];
+const TAB_MENU_CHORD_ALIASES: &[&str] = &["both", "menu-key", "menu"];
+const TAB_BAND_HEIGHTS: &[&str] = &["compact", "standard"];
 const WINDOWING_BEHAVIOR_ALIASES: &[&str] = &[
     "new-window",
     "newwindow",
@@ -620,6 +634,54 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
             options: WINDOWING_BEHAVIORS,
         }),
         &["launch", "attach", "instance", "window", "tab", "single"],
+        true,
+    ),
+    // The five hand-written scalars (see the consts' note): live Config
+    // fields with resolvers and env aliases, deliberately off the Settings
+    // pages, previously "unknown to this aterm build" in Manual.
+    manual(
+        "font_hinting",
+        "Linux glyph grid-fitting",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: FONT_HINTINGS,
+        }),
+        &["hint", "grid", "autohinter", "crisp", "linux", "stem"],
+        true,
+    ),
+    manual(
+        "font_subpixel",
+        "Linux subpixel-RGB text",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: FONT_SUBPIXELS,
+        }),
+        &["lcd", "cleartype", "rgb", "bgr", "linux", "antialias"],
+        true,
+    ),
+    manual(
+        "right_click",
+        "Right-click gesture",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: RIGHT_CLICK_GESTURES,
+        }),
+        &["mouse", "paste", "copy", "context", "button"],
+        true,
+    ),
+    manual(
+        "tab_menu_chord",
+        "Tab context-menu keyboard chord",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: TAB_MENU_CHORDS,
+        }),
+        &["menu", "shift", "f10", "keyboard", "windows", "tab"],
+        true,
+    ),
+    manual(
+        "tab_band_height",
+        "Tab band height",
+        ConfigSchemaKind::Scalar(EditKind::Enum {
+            options: TAB_BAND_HEIGHTS,
+        }),
+        &["strip", "band", "compact", "chrome", "tab"],
         true,
     ),
     manual(
@@ -1803,6 +1865,8 @@ fn enum_aliases(key: &str) -> &'static [&'static str] {
         // `aterm_cli::WindowingBehavior::parse` accepts. Accepted, never OFFERED
         // — completion suggests the two canonical names.
         "windowing_behavior" => WINDOWING_BEHAVIOR_ALIASES,
+        "right_click" => RIGHT_CLICK_ALIASES,
+        "tab_menu_chord" => TAB_MENU_CHORD_ALIASES,
         _ => &[],
     }
 }
@@ -4794,10 +4858,17 @@ home = "~/aterm"
             "window_colorspace",
             "window_theme",
             "window_title_format",
-            // Manual-only (off `prefs::editable_fields` — see its
-            // DEFERRED_CONFIG_KEYS rationale), but a real enum an operator types
-            // into aterm.toml, so it gets the same domain coverage as the rest.
+            // Manual-only (off `prefs::editable_fields` — see the
+            // DEFERRED_CONFIG_KEYS rationale), but real enums an operator types
+            // into aterm.toml, so they get the same domain coverage as the
+            // rest. Calling any of them "unknown to this aterm build" was the
+            // audit-2 item-9 false diagnostic.
             "windowing_behavior",
+            "font_hinting",
+            "font_subpixel",
+            "right_click",
+            "tab_menu_chord",
+            "tab_band_height",
         ]);
         assert_eq!(actual, expected, "new enum needs language-domain coverage");
 
@@ -4843,6 +4914,10 @@ home = "~/aterm"
             // accepts must LOAD without an error, or Manual would red-flag a
             // value the front door happily honours.
             ("windowing_behavior", WINDOWING_BEHAVIOR_ALIASES),
+            // The hand-written scalars' parser aliases (`RightClickGesture::
+            // parse`, `TabMenuChord::parse`): accepted, never offered.
+            ("right_click", RIGHT_CLICK_ALIASES),
+            ("tab_menu_chord", TAB_MENU_CHORD_ALIASES),
         ] {
             for alias in aliases {
                 let source = source_for(key, alias);

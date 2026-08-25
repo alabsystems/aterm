@@ -789,7 +789,7 @@ fn scrollback_chord(mods: ModifiersState, ev: &KeyEvent) -> Option<ScrollIntent>
 /// to a kitty-protocol client lives in `App::front_defers_tab_menu_chord`,
 /// which the callers `&&` in — a key the front application negotiated for is
 /// never claimed no matter what this returns.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn tab_menu_chord(
     policy: crate::app_config::TabMenuChord,
     mods: aterm_types::keyboard::Modifiers,
@@ -1617,7 +1617,39 @@ pub(crate) enum PressPhase {
 ///
 /// Takes `&mut Terminal` rather than the guard so the caller owns the lock
 /// scope — this must never acquire one of its own.
-fn apply_press_custody(t: &mut Terminal, disturbs: bool) -> (bool, bool) {
+///
+/// SELECTION CUSTODY — this ONE function is BOTH press arms of the
+/// `SelectionCustody` machine, selected by `disturbs`:
+///
+/// * `TypingPress` (`disturbs == true`) — the one handover. Typing means "take me
+///   to the prompt", so the viewport snaps and the selection goes.
+/// * `InertPress` (`disturbs == false`) — a bare modifier expresses no intent and
+///   may DESTROY NOTHING. The `&&` short-circuits before the reads, so an inert
+///   press does not even look at the selection; the spec states the law as "the
+///   event changed nothing", which is falsifiable, rather than "a selection still
+///   exists", which would be free.
+///
+/// Anchored HERE rather than on `TextSelection::clear`: the clear primitive is
+/// shared by every destroyer in the workspace and could not witness WHICH press
+/// class asked for it. Tier-1 drives both arms in
+/// [`crate::selection_custody_conformance`].
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "SelectionCustody",
+        action = "TypingPress",
+        project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "SelectionCustody",
+        action = "InertPress",
+        project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+    )
+)]
+pub(crate) fn apply_press_custody(t: &mut Terminal, disturbs: bool) -> (bool, bool) {
     let scrolled = disturbs && t.grid().display_offset() != 0 && {
         t.scroll_to_bottom();
         true
@@ -5473,7 +5505,8 @@ impl App {
         // argument is the escape hatch instead — a knob that can only surrender
         // keys, never re-point them.
         //
-        // WINDOWS ONLY. macOS chips carry a real `NSMenu` (⇧F10 is not a menu
+        // WINDOWS AND LINUX (the in-grid-strip platforms; audit-2 item 10
+        // widened it from Windows-only). macOS chips carry a real `NSMenu` (⇧F10 is not a menu
         // chord there); Linux has no ratified lane for a new modal surface —
         // see the note on the `RightPressPlan::Chrome` arm in `app_mouse`.
         //
@@ -5482,7 +5515,7 @@ impl App {
         // and `open_active_tab_context_menu` returns `false` for a window with
         // no strip / no terminal tab. Either way the key falls through here
         // UNTOUCHED and takes the ordinary encoder path.
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         if let Some(ekey) = aterm_winit_keymap::map_logical_key(&ev.logical_key)
             && tab_menu_chord(
                 self.config.tab_menu_chord_or_default(),
@@ -6888,7 +6921,7 @@ impl App {
     /// (`kitty_reports_functional_keys` / `kitty_report_all_keys`) under ONE
     /// lock. It never calls an encoder — the seam remains the sole caller of
     /// `encode_key_with_layout`.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn front_defers_tab_menu_chord(
         &self,
         wid: WindowId,
@@ -7024,11 +7057,11 @@ impl App {
             }
         }
 
-        // Closed: the chord may POP it. Windows only, and only for a genuine
-        // PRESS — a repeat of a held Menu key must not re-pop a card the first
-        // press already opened (and then closed, on the second press's own
-        // dismiss rule).
-        #[cfg(windows)]
+        // Closed: the chord may POP it. The in-grid-strip platforms (Windows
+        // and Linux), and only for a genuine PRESS — a repeat of a held Menu
+        // key must not re-pop a card the first press already opened (and then
+        // closed, on the second press's own dismiss rule).
+        #[cfg(any(windows, target_os = "linux"))]
         if let InputEvent::Key {
             key,
             mods,

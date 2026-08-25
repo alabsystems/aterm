@@ -519,6 +519,14 @@ impl ProgressSink {
             maybe_write(&mut s);
         }
     }
+
+    /// A content-free tick: nothing to report, but the writer is ALIVE — let the
+    /// rate-cap policy refresh `heartbeat_unix` if it is due. This is what the
+    /// pass heartbeat thread calls (see [`begin_pass`]); every other mutator
+    /// gets the same refresh for free through [`Self::with`].
+    pub fn heartbeat(&self) {
+        self.with(|_| {});
+    }
 }
 
 /// The write policy: on change AND ≥[`WRITE_MIN_INTERVAL_MS`] since the last write
@@ -588,7 +596,54 @@ fn write_now(s: &mut SinkState) {
 // (the terminal lanes, every existing test).
 // ---------------------------------------------------------------------------
 
-static GLOBAL_SINK: Mutex<Option<(ProgressSink, std::thread::ThreadId)>> = Mutex::new(None);
+/// The pass heartbeat: a thread that ticks the live sink every
+/// [`HEARTBEAT_TICK_MS`] for the pass's whole lifetime, INDEPENDENT of flow
+/// calls. The heartbeat promise used to rest on the `.part` download poller
+/// alone, which covers exactly one phase — so a multi-GB Verify (one sha256
+/// over the archive, zero sink calls), an Extract, and the seed pass's
+/// cross-filesystem copy (the DMG-mounted install; 700c0d21 silenced the
+/// seed pass's poller on purpose, taking its cadence with it) all let the
+/// file age past [`HEARTBEAT_STALE_SECS`] under a LIVE writer: minutes of
+/// red "stopped" telling the user to run a command the running pass would
+/// refuse (audit-2 item 8). Owned by the pass exactly like the sink: spawned
+/// in [`begin_pass`], stopped and joined in [`end_pass`].
+struct PassHeartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+/// How often the pass heartbeat ticks. Well under
+/// [`HEARTBEAT_MIN_INTERVAL_SECS`] (the write policy decides whether a tick
+/// actually lands; most are free no-ops) and far under the readers'
+/// [`HEARTBEAT_STALE_SECS`] window.
+const HEARTBEAT_TICK_MS: u64 = 500;
+
+impl PassHeartbeat {
+    fn spawn(sink: ProgressSink) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("atpkg-pass-heartbeat".into())
+            .spawn(move || {
+                while !stop2.load(Ordering::Acquire) {
+                    sink.heartbeat();
+                    std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS));
+                }
+            })
+            .ok();
+        Self { stop, handle }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+static GLOBAL_SINK: Mutex<Option<(ProgressSink, std::thread::ThreadId, PassHeartbeat)>> =
+    Mutex::new(None);
 
 /// TESTS ONLY: the global sink is process-wide state with a thread owner, so any
 /// two tests that `begin_pass` concurrently see each other's refusal. Every such
@@ -618,7 +673,10 @@ pub fn begin_pass(path: &Path, pass: &str) -> bool {
     let Some(sink) = ProgressSink::create(path, pass) else {
         return false;
     };
-    *g = Some((sink, std::thread::current().id()));
+    // The heartbeat carries its OWN clone, so it never comes back through
+    // `active()`'s owner check — it is not the pass thread and must not be.
+    let heartbeat = PassHeartbeat::spawn(sink.clone());
+    *g = Some((sink, std::thread::current().id(), heartbeat));
     GLOBAL_ENABLED.store(true, Ordering::Release);
     true
 }
@@ -631,10 +689,13 @@ pub fn end_pass() {
     };
     if g
         .as_ref()
-        .is_some_and(|(_, owner)| *owner == std::thread::current().id())
-        && let Some((sink, _)) = g.take()
+        .is_some_and(|(_, owner, _)| *owner == std::thread::current().id())
+        && let Some((sink, _, heartbeat)) = g.take()
     {
         GLOBAL_ENABLED.store(false, Ordering::Release);
+        // Stop the heartbeat FIRST: a tick landing after the terminal
+        // snapshot would restamp a live heartbeat onto a pid-cleared file.
+        heartbeat.stop();
         sink.finish();
     }
 }
@@ -647,7 +708,7 @@ pub fn active() -> Option<ProgressSink> {
         return None;
     }
     GLOBAL_SINK.lock().ok().and_then(|g| {
-        g.as_ref().and_then(|(sink, owner)| {
+        g.as_ref().and_then(|(sink, owner, _)| {
             (*owner == std::thread::current().id()).then(|| sink.clone())
         })
     })
@@ -1277,6 +1338,52 @@ mod writer_tests {
         assert!(watch.handle.is_some(), "the net pass keeps its live download watch");
         drop(watch);
         end_pass();
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The heartbeat promise, kept INDEPENDENTLY of flow calls (audit-2 item 8):
+    /// a pass that makes zero sink calls for longer than the writer's minimum
+    /// interval — a multi-GB Verify sha256, an Extract, the seed pass's
+    /// cross-filesystem copy — must still read as RUNNING, because the pass
+    /// heartbeat thread ticks the file on its own. Before it, the promise
+    /// rested on the download poller alone (one phase; silenced on the seed
+    /// pass by 700c0d21), so those phases went red "stopped" under a live
+    /// writer. Asserted on the heartbeat ADVANCING while the pass thread is
+    /// deliberately asleep — a flow call from this thread would defeat the
+    /// point of the test.
+    #[test]
+    fn a_silent_phase_keeps_the_pass_heartbeat_live() {
+        let _gate = PASS_TEST_GATE.lock().unwrap_or_else(|e| e.into_inner());
+        let l = layout("silent-heartbeat");
+        assert!(begin_pass(&l.progress_file(), "seed"));
+        let h0 = read_file(&l.progress_file()).heartbeat_unix;
+        // Longer than the writer's minimum interval, with NO sink call from
+        // the pass thread: only the heartbeat thread can move the stamp.
+        std::thread::sleep(Duration::from_millis(
+            HEARTBEAT_MIN_INTERVAL_SECS * 1000 + 700,
+        ));
+        let file = read_file(&l.progress_file());
+        assert!(
+            file.heartbeat_unix >= h0 + HEARTBEAT_MIN_INTERVAL_SECS,
+            "the pass heartbeat must advance with no flow calls ({h0} → {})",
+            file.heartbeat_unix
+        );
+        assert!(
+            snapshot_running(&file, unix_now()),
+            "a silent-but-live pass reads as running"
+        );
+        end_pass();
+        // The terminal snapshot is the LAST word: the heartbeat thread is
+        // stopped before it, so no tick can restamp a pid-cleared file live.
+        let ended = read_file(&l.progress_file());
+        assert_eq!(ended.pid, None);
+        std::thread::sleep(Duration::from_millis(HEARTBEAT_TICK_MS * 2 + 200));
+        let later = read_file(&l.progress_file());
+        assert_eq!(
+            later.heartbeat_unix, ended.heartbeat_unix,
+            "no heartbeat tick may land after end_pass"
+        );
+        assert!(!snapshot_running(&later, unix_now()));
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

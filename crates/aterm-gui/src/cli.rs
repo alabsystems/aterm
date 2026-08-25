@@ -184,8 +184,12 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-N             Open a new window (same process, same sessions).\n",
     "    Cmd-T             Open a new tab (new shell, same window).\n",
     "    Cmd-W             Close the active tab; closing the last tab quits.\n",
+    "    Cmd-Shift-T       Reopen the most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
-    "                      Tab state shows in the title as [active/total].\n\n",
+    "                      Tab state shows in the title as [active/total].\n",
+    "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
+    "    This is the common set; the menu bar lists them ALL (splits, pane focus,\n",
+    "    move-tab, and more) with their live chords.\n\n",
 );
 
 /// See [`KEYS_HELP`] (macOS) — the non-macOS KEYS section, GENERATED from
@@ -1055,6 +1059,30 @@ mod tests {
         assert!(
             keys.contains("ctrl+click"),
             "the pointer half of the keymap stays documented"
+        );
+    }
+
+    /// On macOS the KEYS section is hand-written (macOS ships an empty
+    /// `platform_defaults()`; the menu bar owns the chords), so it has no
+    /// generative source to be complete against. It documents the COMMON set
+    /// and must (audit-2 item 17) both cover the high-traffic chords the old
+    /// list omitted — the Command Palette and reopen-tab — and SIGNAL that it
+    /// is partial, pointing at the menu bar as the exhaustive reference, so a
+    /// user does not read the absence of splits/pane-focus as their absence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_keys_help_covers_the_common_chords_and_admits_it_is_partial() {
+        let keys = super::keys_help();
+        for chord in ["Cmd-T", "Cmd-W", "Cmd-N", "Cmd-F", "Cmd-Shift-T", "Cmd-Shift-P"] {
+            assert!(keys.contains(chord), "{chord} must be documented:\n{keys}");
+        }
+        assert!(
+            keys.contains("Command Palette"),
+            "the palette — the door to every action — must be named"
+        );
+        assert!(
+            keys.contains("menu bar lists them ALL"),
+            "the section must signal it is not exhaustive:\n{keys}"
         );
     }
 

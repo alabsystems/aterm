@@ -8100,6 +8100,16 @@ mod tests {
     /// the member it reads like; the ordinal's tail is the same cut of the same
     /// title, so it takes the same rule ([`furniture_survivor_recut`]) instead
     /// of spending the window twice: once on a number, once on `· Ready`.
+    ///
+    /// SCOPED off macOS: the ordinal chip-strip is a Windows/Linux surface —
+    /// macOS puts its tabs in the native toolbar and paints NO band there
+    /// ([`STRIP_IS_CHROME_BAND`] is false; the ordinal doc above records
+    /// "these ordinals never appear there"). Run on macOS this drives the cut
+    /// at the padless avail (15) rather than the chip-card avail (14) it pins,
+    /// over geometry no macOS user sees — so it joins the file's other
+    /// `#[cfg(not(target_os = "macos"))]` band tests. The furniture invariant
+    /// is still exercised on macOS by the cross-band `on_band` tests.
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn an_ordinal_tail_is_never_the_shared_furniture() {
         let titles = [

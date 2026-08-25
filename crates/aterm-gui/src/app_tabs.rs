@@ -4328,9 +4328,9 @@ impl App {
     /// would have done before.
     ///
     /// The RIGHT-PRESS and keyboard callers (the strip's right press,
-    /// Shift+F10 / the Menu key) are `#[cfg(windows)]` — macOS pops a real
-    /// `NSMenu` off the native strip instead, and the card is not offered on
-    /// Linux (see the `Chrome` arm in `app_mouse`). The CONNECTOR caller
+    /// Shift+F10 / the Menu key) are gated to the in-grid-strip platforms,
+    /// Windows and Linux — macOS pops a real `NSMenu` off the native strip
+    /// instead (see the `Chrome` arm in `app_mouse`). The CONNECTOR caller
     /// ([`Self::open_connector_menu`], design §3.1 [v5]) is cross-platform:
     /// the status-mark cell is a new hit target, not a changed gesture, and it
     /// opens the same card everywhere the in-grid strip is drawn.
@@ -4441,11 +4441,12 @@ impl App {
     /// Returns whether a menu opened, so the caller can let the chord fall
     /// through when it did not (a native app tab, no strip, no tabs).
     ///
-    /// Its real callers are the two `#[cfg(windows)]` chord arms — `on_key`'s
-    /// and the convergence seam's `tab_menu_input_event` — which is what makes
-    /// `aterm ctl key menu` exercise the same path the physical key does. ⇧F10
-    /// is not a menu chord on macOS, and Linux does not offer the card.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// Its real callers are the two in-grid-strip chord arms (Windows and
+    /// Linux) — `on_key`'s and the convergence seam's `tab_menu_input_event` —
+    /// which is what makes `aterm ctl key menu` exercise the same path the
+    /// physical key does. ⇧F10 is not a menu chord on macOS, whose chips pop a
+    /// native `NSMenu` instead.
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub(crate) fn open_active_tab_context_menu(&mut self, wid: WindowId) -> bool {
         let Some(index) = self
             .windows
@@ -6924,7 +6925,9 @@ mod session_chrome_app_tests {
     /// a tracking TUI as half a press pair, the same defect the consumed-press
     /// key sets exist to prevent. The dismissing button is latched so its
     /// release is swallowed with it; a button that was never eaten is not.
-    #[cfg(windows)]
+    /// Runs on both in-grid-strip platforms: the dismiss rule is the same
+    /// state machine on each.
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_controller_press_that_dismisses_the_card_swallows_its_own_release() {
         use crate::input::InputEvent;

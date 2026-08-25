@@ -1389,7 +1389,7 @@ fn print_gc_sweeps(verb: &str, report: &crate::gc::GcReport) {
     // NOTHING swept, while `gc` reported "nothing to reclaim".
     for (p, names) in &report.swept_staging {
         println!(
-            "atpkg {verb}: swept {p} interrupted download(s) {} — a killed transfer left              the compressed archive behind",
+            "atpkg {verb}: swept {p} interrupted download(s) {} — a killed transfer left the compressed archive behind",
             names.join(", ")
         );
     }

@@ -3158,12 +3158,12 @@ impl App {
                     // not take the wire's shape is a genuine blocker, and now it
                     // says which check refused instead of dying anonymously.
                     capture_failed = Some(format!(
-                        "a visible checkpoint could not be shaped for the wire even without                          carried scrollback ({refusal})"
+                        "a visible checkpoint could not be shaped for the wire even without carried scrollback ({refusal})"
                     ));
                     break;
                 }
                 aterm_log::warn!(
-                    "update apply: carrying no scrollback for the rest of this handoff — the                      carried shape was refused ({refusal}). Processes, the visible screen and                      queued output still survive the update."
+                    "update apply: carrying no scrollback for the rest of this handoff — the carried shape was refused ({refusal}). Processes, the visible screen and queued output still survive the update."
                 );
                 // Only the LATCH carries this decision forward. Unlike the budget
                 // arm — which lowers `history` before the carry that reads it —
@@ -3179,7 +3179,7 @@ impl App {
                     crate::seamless::checkpoint_shape_refusal(session.id, &visible_only)
                 {
                     capture_failed = Some(format!(
-                        "a visible checkpoint could not be shaped for the wire even without                          carried scrollback ({refusal})"
+                        "a visible checkpoint could not be shaped for the wire even without carried scrollback ({refusal})"
                     ));
                     break;
                 }

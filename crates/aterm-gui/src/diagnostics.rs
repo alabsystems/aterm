@@ -1283,7 +1283,7 @@ pub(crate) fn config_backend_capability_warnings(
     if config.secure_keyboard_entry.is_some() && platform != ConfigCapabilityPlatform::MacOs {
         warnings.push(ConfigSemanticWarning {
             key: crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY,
-            message: "secure_keyboard_entry is parsed and preserved but has no protective                       effect on this platform; Secure Keyboard Entry is a macOS mechanism                       (Carbon secure input)"
+            message: "secure_keyboard_entry is parsed and preserved but has no protective effect on this platform; Secure Keyboard Entry is a macOS mechanism                       (Carbon secure input)"
                 .to_string(),
         });
     }

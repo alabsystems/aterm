@@ -201,12 +201,20 @@ pub fn model_registry() -> Vec<Model> {
         recording_model(),
         coalesce_model(),
         window_routing_model(),
-        // SELECTION CUSTODY: who owns the reading position and the highlight. Both
-        // are report-only for coverage (no `#[refines]` handler yet — obligation 3's
-        // `ratio == 1.0` is scoped to actively-bound machines), but registration is
-        // what puts them under `ty check --strict-vacuity` and makes them resolvable
-        // as anchor targets. They were left out when they landed, which meant the
-        // one repo-wide gate that would catch a dead action never saw them.
+        // SELECTION CUSTODY: who owns the reading position and the highlight.
+        //
+        // `SelectionCustody` is ACTIVELY-BOUND — 11/11 actions anchored, Tier-1
+        // conformance driving real gestures and real `Terminal::process` batches
+        // (`aterm_gui::selection_custody_conformance`), run by the gate.
+        //
+        // `PressCustody` is deliberately REPORT-ONLY. Five of its eleven actions have
+        // no seam at which their state change is observable — the grid layer owns no
+        // selection, and `OutputAtLive` is an identity transition any function
+        // satisfies — so anchoring it would buy a green ledger line rather than a
+        // check. Its regressions are covered by mutation-checked unit tests instead.
+        //
+        // Registration alone (independent of anchoring) is what puts BOTH under
+        // `ty check --strict-vacuity` in the repo-wide gate.
         press_custody_model(),
         selection_custody_model(),
         // Introspection / recursive-stacking control plane (audit findings M1/M2/S1).

@@ -328,6 +328,64 @@ impl Terminal {
     /// `was_alt` is which screen the batch STARTED on, captured by the caller
     /// before the parser ran — the batch may have switched screens since, and this
     /// is the only place that can tell.
+    ///
+    /// SELECTION CUSTODY — this is the `SelectionCustody` machine's ENGINE half, and
+    /// it carries FOUR spec actions because it asks four different questions of the
+    /// one selection in one pass (the macro's `write_all` precedent: one method may
+    /// legitimately implement more than one spec action):
+    ///
+    /// * `UniformScroll` — the `(None, delta)` arm's `adjust_for_scroll`. The anchors
+    ///   ride the content, so in the ABSOLUTE space the interval does not move.
+    /// * `RegionDamageLow` / `RegionDamageHigh` — the damage test
+    ///   (`SelectionDamage::clears_selection` over `intersects_absolute_band`). The two
+    ///   model arms are the two halves of the lattice — damage that MISSED must spare
+    ///   the selection, damage that HIT must clear it — and one seam decides both.
+    /// * `WholesaleInvalidate` — the `SelectionDamage::All` arm of the SAME damage
+    ///   test. ED 3, RIS and a Kitty unscroll destroy the coordinate space the anchors
+    ///   are stated in, and this is where that reaches the selection.
+    ///
+    /// `Evict` is deliberately NOT anchored here. The tail's `truncate_to_floor` is an
+    /// unconditional RE-clamp against a floor something else raised, so it runs on every
+    /// batch and discriminates nothing; an anchor on it would name code no test could
+    /// falsify. `Evict`'s one anchor is [`Terminal::set_scrollback_line_limit`], the
+    /// entry point that actually raises the floor.
+    ///
+    /// This is the CONSUMER, deliberately: `Grid` records bands and deltas but owns no
+    /// `text_selection`, so a grid-layer anchor could not witness `alive` at all. Tier-1
+    /// drives these through real `Terminal::process` batches in
+    /// `aterm_gui::selection_custody_conformance`.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "UniformScroll",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "RegionDamageLow",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "RegionDamageHigh",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "WholesaleInvalidate",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
     #[allow(clippy::too_many_lines)] // the crate's per-function convention (lib.rs)
     fn post_process(&mut self, absolute_rows_before: u64, was_alt: bool) {
         // Top-anchored partial scrollback inserts logical rows immediately

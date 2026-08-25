@@ -3675,8 +3675,17 @@ mod tests {
 
         let started = Instant::now();
         runtime.shutdown_and_join();
+        // The property is BOUNDED-vs-HUNG, not a latency SLA: the observer stays
+        // wedged until `release_tx.send()` BELOW, so a broken fallback that waited
+        // behind it would not return until the test's own 2 s reached-window — it
+        // would hang, not merely run late. The bound only has to sit clearly below
+        // that hang while absorbing scheduler noise: 30 ms configured timeout, and
+        // the timeout thread itself can be starved for hundreds of ms under a
+        // loaded gate (observed: a full-core cold rebuild made a 500 ms bound
+        // flake). 1500 ms keeps the fallback provably finite without pinning a
+        // latency the scheduler does not guarantee.
         assert!(
-            started.elapsed() < Duration::from_millis(500),
+            started.elapsed() < Duration::from_millis(1500),
             "timeout fallback waited behind the wedged observer"
         );
         release_tx.send(()).unwrap();

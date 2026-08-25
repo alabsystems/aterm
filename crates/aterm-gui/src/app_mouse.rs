@@ -2653,6 +2653,55 @@ impl App {
     /// not exfiltrate on-screen text. A human gesture and an Owner-scoped controller
     /// gesture pass `false`, so their copy-on-select / PRIMARY behaviour is unchanged.
     /// The selection ITSELF is still completed regardless (it is not exfil).
+    /// SELECTION CUSTODY — the RELEASE is where a gesture becomes a selection (or
+    /// stops being one), so this one seam carries FOUR `SelectionCustody` actions:
+    ///
+    /// * `SelectLow`, `SelectOldest`, `SelectHigh` — the `complete_selection()` arm.
+    ///   The model splits the gesture by WHERE the interval landed (a scrollback pair,
+    ///   a single row on the oldest retained line, a live-screen pair) because that is
+    ///   what makes the eviction and damage branches reachable at all; the CODE has one
+    ///   arm, and the row interval is whatever the drag left in `text_selection`. Three
+    ///   anchors on one method is the macro's documented `write_all` shape.
+    /// * `UserClear` — the `clear()` arm: a press and release inside one cell is a
+    ///   deliberate deselect, and a deliberate deselect is always allowed.
+    ///
+    /// This is the CONSUMER of the gesture, not the recorder: `TextSelection` holds the
+    /// anchors but cannot tell a completed drag from an abandoned one — `ws.sel_dragged`
+    /// is read here and nowhere below. Tier-1 drives the real
+    /// `begin_selection` → `drag_selection` → `finish_selection` gesture in
+    /// [`crate::selection_custody_conformance`].
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "SelectLow",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "SelectOldest",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "SelectHigh",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "UserClear",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
     pub(crate) fn finish_selection(
         &mut self,
         wid: WindowId,
@@ -3289,27 +3338,31 @@ impl App {
                     // pure swallow, which is still the fix for the bogus-cell
                     // fall-through this whole plan exists for.
                     //
-                    // WINDOWS ONLY, and the narrowing is deliberate.
+                    // WINDOWS AND LINUX — the two platforms whose tab chrome IS
+                    // the in-grid strip. macOS stays out: its chips carry a
+                    // REAL `NSMenu` on the native strip (`toolbar.rs`), popped
+                    // by AppKit on the same model, and the in-grid strip is a
+                    // non-default fallback there — a second, differently-drawn
+                    // menu would be two answers to one gesture on one platform.
                     //
-                    // macOS: its chips carry a REAL `NSMenu` on the native strip
-                    // (`toolbar.rs`), popped by AppKit on the same model. The
-                    // in-grid strip is a non-default fallback there, and giving
-                    // it a second, differently-drawn menu would mean two answers
-                    // to one gesture on one platform.
-                    //
-                    // LINUX: this is a Windows-lane bundle, and on Linux it
-                    // would change three things at once that no Linux lane has
-                    // ratified — a chip right-press going from a pure swallow to
-                    // a popup (and note `RightClickGesture::PLATFORM_DEFAULT` is
-                    // `off` there, yet `right_press_plan` returns `Chrome` for
-                    // the strip regardless of the gesture setting, so it would
-                    // fire even for a user who turned the gesture off), Menu /
-                    // Shift+F10 becoming app-owned, and a new keyboard mode that
-                    // swallows every key while the card is up. The in-grid strip
-                    // IS Linux's tab chrome, so the card is a natural fit there
-                    // and this is a scope decision rather than a technical one:
-                    // it needs its own lane's review, not a Windows commit's.
-                    #[cfg(windows)]
+                    // Linux was held back as a scope decision, not a technical
+                    // one, pending a Linux lane's review (audit-2 item 10 is
+                    // that review). Its three named concerns each resolve in
+                    // the code below, not by fiat: (1) the chip right-press was
+                    // ALREADY app-owned here — `right_press_plan` returns
+                    // `Chrome` for the strip regardless of the gesture setting,
+                    // so `RightClickGesture::PLATFORM_DEFAULT = off` never
+                    // reached this arm and the "pure swallow" was a dead end,
+                    // not a preservation — Copy Session ID, Copy CWD and the
+                    // identity card were simply unreachable by mouse, keyboard
+                    // AND `aterm ctl` on the one platform whose chrome this is;
+                    // (2) Menu / Shift+F10 ride the SAME `TabMenuChord` policy,
+                    // whose one-key surrender (`tab_menu_chord = "off"`) hands
+                    // both keys back on any platform, and whose kitty-protocol
+                    // deference is unconditional; (3) the card's keyboard mode
+                    // is the same tested state machine (`tab_menu_input_event`)
+                    // Windows ships, with the same dismiss rules.
+                    #[cfg(any(windows, target_os = "linux"))]
                     if let Some(col) = self.strip_col_at(wid, px, py) {
                         let segs = self
                             .windows
@@ -6285,9 +6338,9 @@ mod tests {
     /// something behind it); and a left press AWAY from the card dismisses it
     /// without also acting on whatever was underneath.
     ///
-    /// WINDOWS ONLY, mirroring the opener's own gate: macOS chips carry a real
-    /// `NSMenu`, and the card is not offered on Linux (see the `Chrome` arm).
-    #[cfg(windows)]
+    /// The in-grid-strip platforms, mirroring the opener's own gate: macOS
+    /// chips carry a real `NSMenu` instead (see the `Chrome` arm).
+    #[cfg(any(windows, target_os = "linux"))]
     #[test]
     fn a_right_press_on_a_chip_pops_the_menu_and_never_reaches_the_grid() {
         use winit::event::{ElementState, MouseButton as WinitMouseButton};

@@ -1082,15 +1082,23 @@ impl Terminal {
         scratch.selections.clear();
 
         let cur = self.cursor();
-        scratch.cursor_row = cur.row as usize;
         scratch.cursor_col = cur.col as usize;
         let display_offset = self.grid().display_offset();
-        // The DEC cursor is anchored in the active grid. While the viewport is
-        // showing retained history, projecting that cell over a historical row
-        // draws a cursor on unrelated text. Host copy/vi modes deliberately
-        // override this snapshot after extraction with their own history-space
-        // cursor; the ordinary terminal cursor therefore fails closed here.
-        scratch.cursor_visible = self.cursor_visible() && display_offset == 0;
+        // The DEC cursor is anchored in the ACTIVE grid; the viewport row it
+        // occupies is its active-grid row pushed DOWN by the scrollback offset
+        // (older history scrolls in at the top, so live content — the cursor's
+        // row included — slides toward the bottom). Project it there and show
+        // it only while that projected row is still on screen — matching
+        // xterm/kitty, where a small scroll-back that leaves the cursor row
+        // visible keeps the cursor drawn. A larger scroll pushes the projected
+        // row off the bottom (`>= rows`) and it fails closed, exactly as the
+        // whole-history case did before (this replaces the blanket
+        // `display_offset == 0` hide). Host copy/vi modes still override this
+        // snapshot after extraction with their own history-space cursor; the
+        // effects-layer history blackout is independent of this projection.
+        let projected_cursor_row = (cur.row as usize).saturating_add(display_offset);
+        scratch.cursor_row = projected_cursor_row;
+        scratch.cursor_visible = self.cursor_visible() && projected_cursor_row < rows;
         scratch.cursor_style = self.cursor_style();
         scratch.display_offset = display_offset as i32;
         // Capture base_y (absolute row of the top visible line) under the SAME lock as
@@ -2064,19 +2072,22 @@ mod tests {
     /// a host copy/vi cursor may still deliberately override this field after
     /// extraction in its own history coordinate space.
     #[test]
-    fn cell_frame_hides_the_dec_cursor_over_history() {
+    fn cell_frame_projects_the_dec_cursor_while_its_row_stays_on_screen() {
         let mut term = Terminal::new(2, 8);
         term.process(b"L0\r\nL1\r\nL2\r\nL3");
         let live = term.cell_frame(2, 8);
         assert_eq!(live.display_offset, 0);
         assert!(live.cursor_visible, "live DECTCEM cursor is present");
+        let live_row = live.cursor_row;
 
+        // A scroll deep enough to push the cursor's row off the bottom hides it
+        // (the whole-history case — unchanged, fail-closed).
         term.scroll_display(1);
         let history = term.cell_frame(2, 8);
         assert!(history.display_offset > 0, "fixture entered history");
         assert!(
             !history.cursor_visible,
-            "active-grid DEC cursor must not be projected over history"
+            "a cursor row scrolled off the viewport bottom stays hidden"
         );
 
         term.scroll_to_bottom();
@@ -2084,6 +2095,33 @@ mod tests {
             term.cell_frame(2, 8).cursor_visible,
             "returning live restores the ordinary DEC cursor"
         );
+
+        // …but a SMALL scroll that leaves the cursor's row on screen keeps the
+        // cursor drawn, PROJECTED down by the offset (audit-2 item 16). A tall
+        // terminal with the cursor near the top makes this observable: at
+        // offset d the cursor sits at viewport row `cur.row + d`, still < rows.
+        let mut tall = Terminal::new(6, 8);
+        tall.process(b"top");
+        tall.process(b"\r\n\r\n\r\n\r\n\r\nmore\r\nmore\r\nmore");
+        // Put the cursor back near the top, then leave room to scroll a little.
+        tall.process(b"\x1b[1;1H");
+        let base = tall.cell_frame(6, 8);
+        assert_eq!(base.display_offset, 0);
+        assert!(base.cursor_visible);
+        assert_eq!(base.cursor_row, 0, "cursor sits on the top row at offset 0");
+        tall.scroll_display(2);
+        let scrolled = tall.cell_frame(6, 8);
+        assert!(scrolled.display_offset >= 2, "scrolled a little into history");
+        assert!(
+            scrolled.cursor_visible,
+            "the cursor's row is still on screen after a small scroll — it must show"
+        );
+        assert_eq!(
+            scrolled.cursor_row,
+            scrolled.display_offset as usize,
+            "and it is PROJECTED down by the offset from its active-grid row 0"
+        );
+        assert_eq!(live_row, 1, "sanity: the 2-row fixture's live cursor is on row 1");
     }
 
     /// The per-frame snapshot folds emoji-cluster + combining-mark extraction

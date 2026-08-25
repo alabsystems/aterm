@@ -519,7 +519,7 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 history_lines,
             } => write!(
                 formatter,
-                "session {local_id}: meta out of bounds at {rows}x{cols} with {history_lines}                  carried line(s)"
+                "session {local_id}: meta out of bounds at {rows}x{cols} with {history_lines} carried line(s)"
             ),
             Self::DimensionsRefused {
                 local_id,
@@ -537,7 +537,7 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 meta_cap,
             } => write!(
                 formatter,
-                "session {local_id}: admission priced the grid at {admitted} bytes but the meta                  caps it at {meta_cap}"
+                "session {local_id}: admission priced the grid at {admitted} bytes but the meta caps it at {meta_cap}"
             ),
             Self::ParserNotGround { local_id } => {
                 write!(formatter, "session {local_id}: parser was not in Ground state")
@@ -548,7 +548,7 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 has_cursor,
             } => write!(
                 formatter,
-                "session {local_id}: inactive grid/cursor disagree (grid={has_grid},                  cursor={has_cursor})"
+                "session {local_id}: inactive grid/cursor disagree (grid={has_grid}, cursor={has_cursor})"
             ),
             Self::GridNotCanonical {
                 local_id,
@@ -559,7 +559,7 @@ impl std::fmt::Display for ScreenDigestRefusal {
                 bytes,
             } => write!(
                 formatter,
-                "session {local_id}: {which} is not canonical — {bytes} byte(s) must decode as                  exactly {expected_records} record(s) at {rows}x{cols} and re-encode identically"
+                "session {local_id}: {which} is not canonical — {bytes} byte(s) must decode as exactly {expected_records} record(s) at {rows}x{cols} and re-encode identically"
             ),
             Self::GridOverCap {
                 local_id,

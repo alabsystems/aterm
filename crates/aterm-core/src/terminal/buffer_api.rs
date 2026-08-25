@@ -140,6 +140,22 @@ impl Terminal {
     /// [`Grid::set_scrollback_line_limit`]).
     ///
     /// [`Grid::set_scrollback_line_limit`]: crate::grid::Grid::set_scrollback_line_limit
+    ///
+    /// SELECTION CUSTODY — `SelectionCustody`'s `Evict`. Shrinking the limit drops the
+    /// oldest retained lines with NO content scroll and NO damage band, so nothing else
+    /// re-floors the selection: this is the entry point `adjust_for_scroll` cannot serve
+    /// (`Terminal::post_process` carries the same action for the batch-epilogue re-floor).
+    /// The spec law is that partial eviction CLAMPS the head and RECORDS the loss, and only
+    /// a selection whose whole interval fell off the back is destroyed — driven for real in
+    /// `aterm_gui::selection_custody_conformance`.
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "SelectionCustody",
+            action = "Evict",
+            project = "aterm_gui::selection_custody_conformance::project_selection_custody"
+        )
+    )]
     pub fn set_scrollback_line_limit(&mut self, limit: Option<usize>) {
         let primary = if self.modes.alternate_screen {
             self.alt_grid.as_mut()
@@ -232,6 +248,15 @@ impl Terminal {
     /// and all tiers (hot, warm, cold) of the tiered scrollback.
     /// Preserves live visible rows. Clears any active text selection
     /// since scrollback-anchored selection coordinates become dangling.
+    ///
+    /// SELECTION CUSTODY — this performs the same destruction as
+    /// `SelectionCustody`'s `WholesaleInvalidate`, but it is deliberately NOT the
+    /// anchor for it. Nothing inside the engine calls this: it is a host-facing API,
+    /// and the three producers the model actually names (ED 3, RIS, a Kitty unscroll)
+    /// all reach the selection through `post_process`'s `SelectionDamage::All` arm
+    /// instead. Anchoring here would bind the action to a seam no VT path can drive,
+    /// which reads like coverage and proves nothing. The anchor lives on
+    /// [`Terminal::post_process`]; Tier-1 drives it there with real ED 3 bytes.
     pub fn clear_scrollback(&mut self) {
         self.grid.erase_scrollback();
         if let Some(ref mut alt) = self.alt_grid {
