@@ -238,6 +238,12 @@ enum MoveIntent {
     Delete,
     Synthetic,
     SyntheticTyped,
+    /// A USER-INITIATED MOTION (the glow twin's `GlowMoveIntent::Motion`,
+    /// projected here by the host): a real key press whose landing is a jump,
+    /// not an echo — either a navigation-class press, or a Typed candidate
+    /// whose content proof was refuted for the swallowed-echo causes. Admits
+    /// by JUMP shape only; carries no content claim.
+    Motion,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -251,6 +257,11 @@ struct MoveCandidate {
 }
 
 impl MoveCandidate {
+    /// Column sweep at/above which a same-row motion is a JUMP rather than a
+    /// hop — the glow twin's `MOTION_MIN_SWEEP_COLS`, kept equal by the shared
+    /// admission law.
+    const MOTION_MIN_SWEEP_COLS: u16 = 8;
+
     fn admits(self, from: (u16, u16), to: (u16, u16), now: Instant, fresh_s: f32) -> bool {
         if self.origin != from || now.saturating_duration_since(self.at).as_secs_f32() > fresh_s {
             return false;
@@ -260,6 +271,14 @@ impl MoveCandidate {
                 self.content_confirmed && self.target == Some(to)
             }
             MoveIntent::Synthetic | MoveIntent::SyntheticTyped => true,
+            // Shape-gated, mirroring the glow twin: only a real jump — two or
+            // more rows, or a meteor-scale column sweep — admits; one-row
+            // steps and word-skim hops stay dark.
+            MoveIntent::Motion => {
+                let dr = i32::from(to.0).abs_diff(i32::from(from.0));
+                let dc = i32::from(to.1).abs_diff(i32::from(from.1));
+                dr >= 2 || dc >= u32::from(Self::MOTION_MIN_SWEEP_COLS)
+            }
         }
     }
 }
@@ -612,8 +631,7 @@ impl CursorTrail {
                 self.type_hint = None;
                 self.nav_hint = None;
                 self.move_hint = None;
-                self.move_candidate = None;
-                self.candidate_superseded = false;
+                self.revoke_non_motion_candidate();
             }
             GenerationOwnership::UnownedRewrite => {
                 // An identity-and-anchor-held rewrite (a streaming TUI
@@ -623,8 +641,7 @@ impl CursorTrail {
                 self.type_hint = None;
                 self.nav_hint = None;
                 self.move_hint = None;
-                self.move_candidate = None;
-                self.candidate_superseded = false;
+                self.revoke_non_motion_candidate();
             }
             // `Steady` while THIS engine observed a change is a
             // desynchronized authority — fail closed like a relocation.
@@ -633,10 +650,26 @@ impl CursorTrail {
                 self.type_hint = None;
                 self.nav_hint = None;
                 self.move_hint = None;
-                self.move_candidate = None;
-                self.candidate_superseded = false;
+                self.revoke_non_motion_candidate();
             }
         }
+    }
+
+    /// The fence's candidate revocation, minus the MOTION exemption the glow
+    /// twin applies in `revoke_unowned_hints`: a motion candidate carries no
+    /// content claim an unowned batch could stale (only the press instant and
+    /// origin), and the multi-batch redraw that answers a full-screen
+    /// program's jump IS the unowned traffic these arms see — including the
+    /// RELOCATION arm, because the jump itself moves the anchor. Freshness
+    /// and the jump-shaped admission still bound it.
+    fn revoke_non_motion_candidate(&mut self) {
+        if !matches!(
+            self.move_candidate.map(|candidate| candidate.intent),
+            Some(MoveIntent::Motion)
+        ) {
+            self.move_candidate = None;
+        }
+        self.candidate_superseded = false;
     }
 
     /// Arm the navigation veto — see `CursorGlow::note_navigation`.
@@ -734,6 +767,28 @@ impl CursorTrail {
 
     /// Consume a candidate that the coherent content probe completed without a
     /// drawable move (same-cell materialization or expiry).
+    /// The host's projection of the glow twin's MOTION verdicts: a
+    /// navigation-class press, or a `Downgraded` decision from the refuted-echo
+    /// seam. Rewrites/arms this engine's candidate in place at the same stamp
+    /// and origin so both engines admit (or refuse) the observed jump under
+    /// one law.
+    pub fn arm_motion(&mut self, at: Instant, origin: (u16, u16)) {
+        self.move_candidate = Some(MoveCandidate {
+            at,
+            origin,
+            intent: MoveIntent::Motion,
+            target: None,
+            material: None,
+            content_confirmed: false,
+        });
+        self.candidate_superseded = false;
+        // The press's typed hint retires with its content claim, exactly as
+        // the glow twin does at its downgrade seam.
+        if self.type_hint == Some(at) {
+            self.type_hint = None;
+        }
+    }
+
     pub fn retire_content_candidate(&mut self, at: Instant, origin: (u16, u16)) {
         if self
             .move_candidate
@@ -1079,12 +1134,20 @@ impl CursorTrail {
             now.saturating_duration_since(t).as_secs_f32() <= Self::NAV_HINT_FRESH
         });
         let nav_paired = false;
-        let move_paired = self.move_hint.take().is_some_and(|t| {
+        let move_hint_fresh = self.move_hint.take().is_some_and(|t| {
             now.saturating_duration_since(t).as_secs_f32() <= Self::MOVE_HINT_FRESH
-        }) && matches!(
-            admitted_intent,
-            Some(MoveIntent::Synthetic | MoveIntent::SyntheticTyped)
-        );
+        });
+        // An admitted MOTION candidate needs no separate move hint: the
+        // candidate IS the press's witness (armed by the host's navigation
+        // seam, or minted at the downgrade seam from a refuted echo whose
+        // press never armed one), and its jump-shaped admission already
+        // rejected everything a bare timestamp used to let through.
+        let move_paired = (move_hint_fresh
+            && matches!(
+                admitted_intent,
+                Some(MoveIntent::Synthetic | MoveIntent::SyntheticTyped)
+            ))
+            || matches!(admitted_intent, Some(MoveIntent::Motion));
         // NAVIGATION (Ctrl-A/E, Home/End, arrows, word/line motions): its bare
         // timestamp is never a landing candidate, so it stays dark just like
         // CursorGlow. Retain the classifier consumption here so no stale nav

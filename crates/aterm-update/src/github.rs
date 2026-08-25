@@ -869,8 +869,11 @@ fn authorize_by_roster(
     })?;
     if verified.master_index() != 0 {
         // Never a rejection: a hit on a non-head master is a rotation in flight. Saying so
-        // makes a STALLED rotation visible instead of silent until updates stop.
-        crate::warn(&format!(
+        // makes a STALLED rotation visible instead of silent until updates stop. At INFO,
+        // not WARN: the roster VERIFIED under a pinned master, so this is rotation
+        // visibility, not verification degradation — an unverifiable roster is the
+        // `Refused` right above.
+        crate::log(&format!(
             "the machine roster was signed by master key #{}, not the current one — a \
              master rotation is in progress or incomplete",
             verified.master_index()
@@ -999,9 +1002,12 @@ fn fetch_authoritative_release(
                 // Index 0 is the key this build would sign with. Any other member is an
                 // outgoing key inside its retirement window (or one pre-seeded ahead of a
                 // rotation): still authoritative, but worth saying out loud so a stalled
-                // rotation is visible in the log rather than silent until the key is dropped.
+                // rotation is visible in the log rather than silent until the key is
+                // dropped. At INFO, not WARN: the signature VERIFIED against a pinned
+                // key, so this is rotation visibility, not verification degradation —
+                // the `Err` arm below is what degradation looks like.
                 Ok(0) => {}
-                Ok(index) => crate::warn(&format!(
+                Ok(index) => crate::log(&format!(
                     "release manifest for {} was signed by channel key #{index}, not the current \
                      one — a key rotation is in progress or incomplete",
                     candidate.release.tag_name
@@ -1042,25 +1048,13 @@ fn fetch_authoritative_release(
         fetched.observed_roster_seq = observed_roster_seq;
         fetched.observed_revocations = observed_revocations;
         match authorized {
-            Ok(who) => {
-                // The compatibility NOTE, not a gate. A release signed by a machine
-                // outside this build's keyset is perfectly installable HERE — the roster
-                // said so — but no client that predates the roster can verify it, and
-                // those clients have no fallback. Saying so in the log is what makes a
-                // split fleet diagnosable from a user's machine instead of only from the
-                // publisher's.
-                if !pinned_update_pubkeys.is_empty()
-                    && !pinned_update_pubkeys.contains(&who.pubkey_b64.as_str())
-                {
-                    crate::warn(&format!(
-                        "authoritative {} was signed by machine {who}, whose key is not in \
-                         this build's channel keyset — the master-signed roster authorizes \
-                         it, but clients older than the roster cannot verify this release",
-                        candidate.release.tag_name
-                    ));
-                }
-                Some(who)
-            }
+            // Nothing is said about the signer HERE: the keyset comparison is only a
+            // compatibility note, and it rides the attribution line after the parse
+            // (one INFO line — see below). It used to be a separate WARN at this spot,
+            // which stated the same fact twice and made every check of a release signed
+            // after a routine key rotation open with a warning about a fully verified
+            // signature.
+            Ok(who) => Some(who),
             // FAIL CLOSED, and never back to the keyset. Falling back would make the
             // roster advisory: an attacker who could suppress the two roster assets
             // would downgrade every armed client to the tier the roster replaced, and a
@@ -1118,10 +1112,36 @@ fn fetch_authoritative_release(
                 // ATTRIBUTION, recorded where a human reads it. The owner asked to be able
                 // to track which computer does what; this is that answer for the client
                 // half, beside the release it applies to.
-                crate::log(&format!(
-                    "authoritative {} was signed by machine {who}",
-                    candidate.release.tag_name
-                ));
+                //
+                // The keyset comparison is a compatibility NOTE riding the same line — not
+                // a gate, and not a warning. A signer outside this build's compiled-in
+                // keyset is the ordinary state of every build installed after a key
+                // rotation: the master-signed roster authorized it and verification fully
+                // succeeded, and the note's one consequence (clients OLDER than the
+                // roster cannot verify this release, and have no fallback) is a fleet
+                // observation that keeps a split fleet diagnosable from a user's machine
+                // — not a defect on THIS machine. It used to be a separate WARN ahead of
+                // this line, so a pristine install's first check warned about its own
+                // verified signature and then restated the fact at INFO — training people
+                // to ignore exactly the warnings that matter. WARN on this path is
+                // reserved for actual verification degradation: the roster refuses the
+                // signer, a signature fails, or the roster itself cannot be verified
+                // (all handled above).
+                if !pinned_update_pubkeys.is_empty()
+                    && !pinned_update_pubkeys.contains(&who.pubkey_b64.as_str())
+                {
+                    crate::log(&format!(
+                        "authoritative {} was signed by machine {who}, whose key is not in \
+                         this build's channel keyset — the master-signed roster authorizes \
+                         it, but clients older than the roster cannot verify this release",
+                        candidate.release.tag_name
+                    ));
+                } else {
+                    crate::log(&format!(
+                        "authoritative {} was signed by machine {who}",
+                        candidate.release.tag_name
+                    ));
+                }
                 fetched.attribution = Some(who.clone());
             }
             match select_stage_artifact(&candidate.release, &manifest, &candidate.version) {
@@ -4926,6 +4946,7 @@ mod tests {
                 other => Err(format!("unexpected fetch {other}")),
             }
         };
+        let _ = crate::log_capture::take();
         let fetched = fetch_authoritative_release(
             Some(selected),
             &keyset,
@@ -4954,6 +4975,28 @@ mod tests {
             urls.contains(&"roster-url".to_string())
                 && urls.contains(&"roster-sig-url".to_string()),
             "the roster and its master signature must actually be fetched: {urls:?}"
+        );
+        // The LOG contract of the fully-in-keyset accept: one INFO attribution line,
+        // no rotation note (the signer's key IS compiled in), and nothing at WARN.
+        let lines = crate::log_capture::take();
+        assert!(
+            lines
+                .iter()
+                .all(|(level, _)| *level != aterm_log::Level::Warn),
+            "an accepted release must log nothing at WARN: {lines:?}"
+        );
+        let attributed: Vec<_> = lines
+            .iter()
+            .filter(|(_, msg)| msg.contains("was signed by machine"))
+            .collect();
+        assert_eq!(
+            attributed.len(),
+            1,
+            "attribution is stated exactly once: {lines:?}"
+        );
+        assert!(
+            !attributed[0].1.contains("channel keyset"),
+            "the signer is in the keyset, so no compatibility note applies: {lines:?}"
         );
     }
 
@@ -5009,6 +5052,7 @@ mod tests {
             "roster-sig-url" => Ok(f.roster_sig.clone()),
             other => Err(format!("unexpected fetch {other}")),
         };
+        let _ = crate::log_capture::take();
         let fetched = fetch_authoritative_release(
             Some(selected),
             &keyset,
@@ -5026,6 +5070,15 @@ mod tests {
         );
         assert!(fetched.manifest_rejected);
         assert!(fetched.attribution.is_none());
+        // The contrast that keeps the rotation note's INFO demotion honest: an actual
+        // refusal — the roster does NOT authorize the signer — still surfaces at WARN.
+        let lines = crate::log_capture::take();
+        assert!(
+            lines.iter().any(|(level, msg)| *level
+                == aterm_log::Level::Warn
+                && msg.contains("refusing authoritative")),
+            "a roster refusal is verification degradation and must WARN: {lines:?}"
+        );
     }
 
     /// A REPLAYED PRE-REVOCATION ROSTER is refused by the durable floor, and a STALE one
@@ -5314,6 +5367,61 @@ mod tests {
         assert!(
             urls.contains(&"roster-url".to_string()),
             "the roster must actually be fetched: {urls:?}"
+        );
+    }
+
+    /// THE ROTATION NOTE'S LOG CONTRACT, pinned by LEVEL. A signer outside the
+    /// compiled-in keyset that the master-signed roster authorizes is the ordinary state
+    /// of every pristine install made after a key rotation — the very first check such
+    /// an install runs lands exactly here. It must be told so ONCE, at INFO, on the
+    /// attribution line. It used to be told twice — first as a WARN, then the same fact
+    /// as INFO — which presented routine rotation as a security problem on a release the
+    /// user had just installed and verified, and trained people to ignore the signature
+    /// warnings that DO matter. WARN stays reserved for actual verification degradation
+    /// (see the revoked-machine test above, which pins that a refusal still warns).
+    #[test]
+    fn a_roster_authorized_rotation_is_one_info_note_and_never_a_warn() {
+        let c = chain(
+            &[("m3", M3_SEED_FIXTURE), ("m11", M11_SEED_FIXTURE)],
+            &[],
+            ("m11", M11_SEED_FIXTURE),
+            4,
+            &MASTER_SEED_FIXTURE,
+            4,
+        );
+        // The old world's keyset holds m3 alone, so m11 — the roster-authorized signer —
+        // is outside it and the compatibility note applies.
+        let m3_pub = pub_b64(&M3_SEED_FIXTURE);
+        let keyset = [m3_pub.as_str()];
+        let masters = [c.master_pub.as_str()];
+        let _ = crate::log_capture::take();
+        let (fetched, _) = run_chain(&c, &keyset, &masters, 0, ROSTER_NOW);
+        assert!(
+            fetched.selected.is_some(),
+            "precondition: the roster accepts this release, or the note under test never fires"
+        );
+
+        let lines = crate::log_capture::take();
+        assert!(
+            lines
+                .iter()
+                .all(|(level, _)| *level != aterm_log::Level::Warn),
+            "a roster-authorized rotation is not a warning: {lines:?}"
+        );
+        let noted: Vec<_> = lines
+            .iter()
+            .filter(|(_, msg)| msg.contains("was signed by machine"))
+            .collect();
+        assert_eq!(
+            noted.len(),
+            1,
+            "the fact is stated exactly once, not WARN-then-INFO: {lines:?}"
+        );
+        let (level, note) = noted[0];
+        assert_eq!(*level, aterm_log::Level::Info, "the note is INFO: {note}");
+        assert!(
+            note.contains("m11 (roster seq 4)") && note.contains("channel keyset"),
+            "one line carries both the attribution and the compatibility note: {note}"
         );
     }
 

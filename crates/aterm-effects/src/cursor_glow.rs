@@ -4016,6 +4016,20 @@ enum GlowMoveIntent {
     Delete,
     Synthetic,
     SyntheticTyped,
+    /// A USER-INITIATED MOTION: a real key press whose landing is a jump, not
+    /// an echo. Armed two ways, both anchored to hardware input — directly by
+    /// the host for the navigation key class (which armed NOTHING before), and
+    /// by DOWNGRADE when a Typed candidate's content proof is refuted for the
+    /// swallowed-echo causes on the alt screen (generation-skip / row-unchanged
+    /// with terminal identity held): a bare letter that provably did NOT echo
+    /// (vim's normal-mode `G`) was a motion command, and the refuted echo is
+    /// the only honest witness of that. Carries NO content claim — admission
+    /// is the press instant + origin + a JUMP-shaped landing ([`GlowMoveCandidate::admits`]),
+    /// so PTY output alone can never mint one, and small hops (a word skim,
+    /// a one-row step) stay dark by shape. Earns no heat, no momentum, no
+    /// ribbon cells — it routes only the jump choreography the owner mandated
+    /// for vim gg/G/{/}.
+    Motion,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -4042,6 +4056,13 @@ pub enum ContentCandidateDecision {
         target: (u16, u16),
     },
     Retired { at: Instant, origin: (u16, u16) },
+    /// The typed content proof was REFUTED for a swallowed-echo cause on the
+    /// alt screen (generation-skip / row-unchanged with terminal identity
+    /// held): the pressed letter provably did not echo, which is the one
+    /// honest witness that it was a MOTION command. The glow candidate has
+    /// been downgraded in place; the host projects this onto the classic
+    /// trail twin so both engines can admit the jump-shaped landing.
+    Downgraded { at: Instant, origin: (u16, u16) },
 }
 
 /// Which lifecycle event one [`AdmissionRecord`] captures.
@@ -4170,11 +4191,17 @@ impl GlowMoveIntent {
             Self::Delete => "delete",
             Self::Synthetic => "synthetic",
             Self::SyntheticTyped => "synthetic-typed",
+            Self::Motion => "motion",
         }
     }
 }
 
 impl GlowMoveCandidate {
+    /// Column sweep at/above which a same-row motion is a JUMP rather than a
+    /// hop — deliberately the meteor lane's own floor (METEOR_MIN_COLS), so
+    /// motion admission and jump choreography agree on what a jump is.
+    const MOTION_MIN_SWEEP_COLS: u16 = 8;
+
     fn admits(self, from: (u16, u16), to: (u16, u16), now: Instant, fresh_s: f32) -> bool {
         if self.origin != from || now.saturating_duration_since(self.at).as_secs_f32() > fresh_s {
             return false;
@@ -4184,6 +4211,16 @@ impl GlowMoveCandidate {
                 self.content_confirmed && self.target == Some(to)
             }
             GlowMoveIntent::Synthetic | GlowMoveIntent::SyntheticTyped => true,
+            // A motion admits by SHAPE, not content: only a real jump — two or
+            // more rows, or a meteor-scale column sweep. A one-row step or a
+            // word-skim hop is exactly the light the owner ruled stray
+            // ("one credit must never paint a ribbon over a word the user
+            // only skimmed"); those land dark, as before.
+            GlowMoveIntent::Motion => {
+                let dr = i32::from(to.0).abs_diff(i32::from(from.0));
+                let dc = i32::from(to.1).abs_diff(i32::from(from.1));
+                dr >= 2 || dc >= u32::from(Self::MOTION_MIN_SWEEP_COLS)
+            }
         }
     }
 }
@@ -5503,6 +5540,22 @@ impl CursorGlow {
         self.move_candidate = None;
     }
 
+    /// A USER MOTION press: the host saw a key whose whole purpose is to move
+    /// the cursor (the navigation key class, scroll chords like Ctrl-D) — a
+    /// class that armed NOTHING before, keeping arrow-key jumps dark. Arms a
+    /// [`GlowMoveIntent::Motion`] candidate at the engine's own honest anchor;
+    /// admission still requires a JUMP-shaped landing inside the freshness
+    /// window, so output alone can never mint light and small hops stay dark.
+    /// Distinct from [`Self::note_navigation`], which remains the veto that
+    /// keeps generic navigation timestamps from ever being admission.
+    pub fn note_motion(&mut self, now: Instant) {
+        self.clear_typed(now);
+        self.unsettle();
+        self.nav_hint = Some(now);
+        self.arm_move_candidate(now, GlowMoveIntent::Motion);
+        self.candidate_superseded = false;
+    }
+
     /// Explicit scripted preview/test provenance. Production hosts use a
     /// correlated content/target method instead.
     #[doc(hidden)]
@@ -6617,7 +6670,41 @@ impl CursorGlow {
                 != baseline_generation.process_sequence.wrapping_add(1)
         {
             // More than one batch crossed the input boundary. Even if the row
-            // now happens to match, causality is no longer attributable.
+            // now happens to match, causality is no longer attributable — the
+            // CONTENT proof is dead. But when the terminal identity held and
+            // this is an alt-screen app, the multi-batch redraw is itself the
+            // signature of a full-screen program answering a MOTION command
+            // (vim's normal-mode G repaints in several batches): the refuted
+            // echo downgrades the candidate to Motion in place, keeping only
+            // the press instant and origin — the two claims output cannot
+            // fake — for the jump-shaped admission. Identity changes still
+            // retire outright.
+            if self.ctx_alt
+                && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+                && current_generation.terminal_id == baseline_generation.terminal_id
+                && current_generation.alternate_screen == baseline_generation.alternate_screen
+            {
+                self.log_confirm("motion-downgrade", &candidate, current_generation, now);
+                self.move_candidate = Some(GlowMoveCandidate {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                    intent: GlowMoveIntent::Motion,
+                    target: None,
+                    material: None,
+                    baseline_row: None,
+                    baseline_generation: None,
+                    content_confirmed: false,
+                });
+                // The press's typed hint retires with its content claim: a
+                // downgraded press must not fund a later ribbon coalesce.
+                if self.type_hint == Some(candidate.at) {
+                    self.type_hint = None;
+                }
+                return Some(ContentCandidateDecision::Downgraded {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                });
+            }
             self.log_confirm("generation-skip", &candidate, current_generation, now);
             self.retire_move_candidate_at(candidate.at);
             return Some(ContentCandidateDecision::Retired {
@@ -6805,6 +6892,35 @@ impl CursorGlow {
             // The first post-input processing batch completed without the exact
             // owned diff. This is a mismatch even when another row/title was
             // the only visible mutation; a later batch may not borrow it.
+            // ROW-UNCHANGED on an alt-screen Typed press is the other
+            // swallowed-echo signature (the app consumed the letter without
+            // echoing — a motion or a shortcut): downgrade to Motion exactly
+            // as at the generation-skip seam. ROW-MISMATCH stays a retire —
+            // content moved under the caret, and attributing a later jump to
+            // this press would claim causality the mismatch just disproved.
+            if self.ctx_alt
+                && !row_changed
+                && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+            {
+                self.log_confirm("motion-downgrade", &candidate, current_generation, now);
+                self.move_candidate = Some(GlowMoveCandidate {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                    intent: GlowMoveIntent::Motion,
+                    target: None,
+                    material: None,
+                    baseline_row: None,
+                    baseline_generation: None,
+                    content_confirmed: false,
+                });
+                if self.type_hint == Some(candidate.at) {
+                    self.type_hint = None;
+                }
+                return Some(ContentCandidateDecision::Downgraded {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                });
+            }
             self.log_confirm(
                 if row_changed {
                     "row-mismatch"
@@ -7166,7 +7282,19 @@ impl CursorGlow {
         self.return_hint = None;
         self.user_gesture_hint = None;
         self.newline_hint = None;
-        self.move_candidate = None;
+        // A MOTION candidate survives the unowned fence: it carries no content
+        // claim an unowned batch could stale — its only claims are the press
+        // instant and origin, both immune to output — and the multi-batch
+        // redraw that follows a full-screen program's jump IS the unowned
+        // traffic this fence sees. Its freshness window (TYPE_HINT_FRESH) and
+        // jump-shaped admission still bound it. Every content-bound candidate
+        // fails closed exactly as before.
+        if !matches!(
+            self.move_candidate.map(|candidate| candidate.intent),
+            Some(GlowMoveIntent::Motion)
+        ) {
+            self.move_candidate = None;
+        }
         self.candidate_superseded = false;
         self.bs_poof_hint = None;
         self.bs_baseline = None;
@@ -8872,12 +9000,17 @@ impl CursorGlow {
         // timestamp itself is consumed here but cannot make `navigation` true;
         // only a separately admitted compatible intent could reach this legacy
         // classifier. Thus raw Ctrl-A/E, Home/End and arrow timestamps stay dark
-        // in every direction instead of heating or birthing light.
-        let navigation = self
+        // in every direction instead of heating or birthing light. An admitted
+        // MOTION candidate routes here too — with or without the hint, because
+        // the downgrade seam mints one from a refuted echo whose press never
+        // armed nav — and its jump-shaped admission is the causal license.
+        let nav_hint_fresh = self
             .nav_hint
             .take_if(|t| now.saturating_duration_since(*t).as_secs_f32() <= Self::NAV_HINT_FRESH)
-            .is_some()
-            && matches!(admitted_intent, Some(GlowMoveIntent::Delete));
+            .is_some();
+        let navigation = (nav_hint_fresh
+            && matches!(admitted_intent, Some(GlowMoveIntent::Delete)))
+            || matches!(admitted_intent, Some(GlowMoveIntent::Motion));
         MoveCtx {
             pr,
             pc,
@@ -24918,14 +25051,29 @@ mod tests {
         );
 
         // SWALLOWED twin: the generation crossed but the caret cell never
-        // materialized — the exact proof retires exactly as on the primary
-        // screen. Trust widens probe AVAILABILITY, never the proof.
+        // materialized — the CONTENT proof is refuted exactly as on the
+        // primary screen; trust widens probe AVAILABILITY, never the proof.
+        // Since the jump-comet work the refuted alt-screen echo DOWNGRADES to
+        // a Motion candidate rather than retiring dark — the swallowed letter
+        // is the honest witness of a motion command — and the anti-stray law
+        // moves to admission: the downgraded candidate refuses every landing
+        // that is not JUMP-shaped, so this press still cannot lay one cell of
+        // typed-looking light.
         let mut glow = arm(20);
         glow.observe_row_with_trust(5, 4, &row("/ab"), echo, ProbeTrust::ContentOnly);
         let decision = glow.confirm_content_candidate(Some((5, 4)), echo, generation(21));
         assert!(
-            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
-            "a swallowed less-shape echo must retire: {decision:?}"
+            matches!(decision, Some(ContentCandidateDecision::Downgraded { .. })),
+            "a swallowed alt-screen echo downgrades to Motion: {decision:?}"
+        );
+        let candidate = glow.move_candidate.expect("downgraded candidate stays armed");
+        assert!(
+            !candidate.admits((5, 3), (5, 4), echo, CursorGlow::TYPE_HINT_FRESH),
+            "the one-cell landing the echo would have owned is NOT jump-shaped"
+        );
+        assert!(
+            candidate.admits((5, 3), (0, 0), echo, CursorGlow::TYPE_HINT_FRESH),
+            "a real jump landing admits from the same press"
         );
 
         // COLD twin: program output with no keystroke has no candidate to

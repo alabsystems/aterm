@@ -201,6 +201,7 @@ fn journal() -> Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done: vec![],
     }
 }
@@ -406,6 +407,154 @@ fn unfinished_v6_journal_still_owes_cask_and_fails_closed() {
     assert!(
         v6.ensure_resumable().is_err(),
         "a below-current-format unfinished journal must fail closed"
+    );
+}
+
+/// A PRE-LITE current-format journal — written before the lean-DMG lane
+/// existed, so the `lite_dmg_sha256` key is absent — must keep resuming, and
+/// must keep meaning what it meant: past selfcheck, the cut stays pre-lite,
+/// and its mirrored asset set must not grow one name its published head never
+/// carried. This is the same in-place compatibility rule the stable twins
+/// established, one lane later.
+#[test]
+fn a_pre_lite_journal_resumes_and_its_mirror_set_stays_exactly_pre_lite() {
+    let dir = tmpdir("journal-pre-lite");
+    let path = dir.join("cut-state.toml");
+    // Past `flip`, which is the shape that matters: selfcheck is done, so
+    // nothing will ever record a lite digest for this cut.
+    std::fs::write(
+        &path,
+        format!(
+            "format = 7\nversion = \"0.49.0\"\nbuild_number = 1785698378\n\
+             commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
+             done = [\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \
+             \"preflip\", \"tag\", \"flip\"]\n",
+            "d".repeat(40)
+        ),
+    )
+    .unwrap();
+
+    let pre_lite = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(
+        pre_lite.lite_dmg_sha256, None,
+        "an absent key is the pre-lite shape, not an error"
+    );
+    pre_lite.ensure_resumable().unwrap();
+    assert_eq!(pre_lite.first_incomplete(), Some("archive"));
+
+    // The mirror set such a resume (or a recovery, which journals the same
+    // `None`) derives is byte-for-byte the pre-lite set...
+    let pre_lite_set = mirror::required_asset_names("0.49.0", false, false, false, false);
+    assert!(
+        !pre_lite_set
+            .iter()
+            .any(|n| n.contains("lite") || n.contains("offline")),
+        "{pre_lite_set:?}"
+    );
+    mirror::validate_mirror_asset_set(&pre_lite_set, "0.49.0", false, false, false, false)
+        .expect("the published pre-lite head still validates exactly");
+    // ...and judging that head as a lite cut is refused, not repaired: the
+    // names the flag adds are names this release never published.
+    assert!(
+        mirror::validate_mirror_asset_set(&pre_lite_set, "0.49.0", false, false, false, true)
+            .is_err()
+    );
+}
+
+/// The lite digest record round-trips the journal, and a corrupt record is
+/// refused at the save/load boundary — it is the sole byte authority for two
+/// published assets, so a torn value must never become one.
+#[test]
+fn the_lite_digest_round_trips_the_journal_and_rejects_corrupt_records() {
+    let dir = tmpdir("journal-lite-roundtrip");
+    let path = dir.join("cut-state.toml");
+    let mut with_lite = journal();
+    with_lite.lite_dmg_sha256 = Some("c6".repeat(32));
+    with_lite.save(&path).unwrap();
+    assert_eq!(Journal::load(&path).unwrap().unwrap(), with_lite);
+
+    for corrupt in [
+        "C6".repeat(32),                   // uppercase — not what this cutter writes
+        "c6".repeat(31),                   // short
+        format!("{}zz", "c6".repeat(31)),  // non-hex
+    ] {
+        let mut bad = journal();
+        bad.lite_dmg_sha256 = Some(corrupt.clone());
+        assert!(
+            bad.save(&path).is_err(),
+            "{corrupt:?} must not reach disk as a lite digest record"
+        );
+    }
+}
+
+/// The selfcheck rule for the lean DMG, exhaustively: prove a matching record,
+/// rebuild when the record is absent (the pre-lite upgrade) or the artifact is
+/// missing BEFORE its bytes ever crossed toward the channel, and refuse both
+/// divergent bytes and an irreproducible already-uploaded artifact.
+#[test]
+fn lite_dmg_selfcheck_plan_covers_every_record_bytes_intent_shape() {
+    use publish::{LiteDmgPlan, lite_dmg_selfcheck_plan};
+    let d = "c6".repeat(32);
+    let other = "a1".repeat(32);
+    let upper = d.to_uppercase();
+
+    // Record and bytes agree: proven, regardless of the intent fact.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), Some(&d), false),
+        LiteDmgPlan::Proven
+    );
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), Some(&d), true),
+        LiteDmgPlan::Proven
+    );
+    // Digest equality is case-insensitive, like every sha256 comparison in the
+    // pipeline.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), Some(&upper), false),
+        LiteDmgPlan::Proven
+    );
+
+    // Bytes that disagree with the cut's own record were written by something
+    // else: refused, never repaired — even when no upload happened yet.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), Some(&other), false),
+        LiteDmgPlan::RefuseDivergent
+    );
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), Some(&other), true),
+        LiteDmgPlan::RefuseDivergent
+    );
+
+    // A recorded artifact gone missing: rebuildable exactly while its bytes
+    // never crossed toward the public channel, refused after.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), None, false),
+        LiteDmgPlan::Rebuild
+    );
+    assert_eq!(
+        lite_dmg_selfcheck_plan(Some(&d), None, true),
+        LiteDmgPlan::RefuseIrreproducible
+    );
+
+    // No record at all: the pre-lite journal re-entering selfcheck — build and
+    // record, overwriting any unattested leftover bytes.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(None, None, false),
+        LiteDmgPlan::Rebuild
+    );
+    assert_eq!(
+        lite_dmg_selfcheck_plan(None, Some(&other), false),
+        LiteDmgPlan::Rebuild
+    );
+    // ...and an issued intent with no record is a state this cutter never
+    // writes: fail closed rather than guess which bytes the channel holds.
+    assert_eq!(
+        lite_dmg_selfcheck_plan(None, None, true),
+        LiteDmgPlan::RefuseIrreproducible
+    );
+    assert_eq!(
+        lite_dmg_selfcheck_plan(None, Some(&other), true),
+        LiteDmgPlan::RefuseIrreproducible
     );
 }
 

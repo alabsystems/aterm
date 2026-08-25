@@ -2145,6 +2145,14 @@ pub const NET_INSTALLED_MARKER: &str = "net-installed: ";
 /// already argued for it ("ANNOUNCE BEFORE ACTING, exactly as the local seed
 /// lane does") while the code announced nothing: gigabytes could stream with
 /// the first user-visible line being the completion.
+///
+/// Emitted ONLY by the wire lane ([`net_announcement`], gated on
+/// [`ProvisionLane`]). The sealed-payload seed once announced itself with this
+/// marker — "installing … over the network" during an lsof-verified
+/// zero-socket local extraction — and the GUI, which parses these markers
+/// byte-for-byte, repeated the fabricated network install on its progress
+/// card. The local lane's announcement is [`SEED_STARTING_MARKER`], printed by
+/// `cmd_seed` itself.
 pub const NET_STARTING_MARKER: &str = "net-starting: ";
 /// The network lane's failure TERMINAL: an announced provisioning that then
 /// installs nothing must retire its own held card with the truth — the seed
@@ -2711,6 +2719,7 @@ fn cmd_update_all() -> ExitCode {
             &*fetcher,
             &effective_anchor(&layout),
             cfg,
+            ProvisionLane::Network,
             now_unix(),
         );
         failures += net.failures;
@@ -2872,7 +2881,9 @@ fn cmd_update_all() -> ExitCode {
 /// What a default-set pass did, for the caller's marker bookkeeping: how many
 /// members failed, and whether the `net-starting:` announcement was printed
 /// (an announcement DEMANDS a terminal answer — `net-installed:` or
-/// `net-failed:` — so the caller must know one was opened).
+/// `net-failed:` — so the caller must know one was opened). On the
+/// sealed-payload lane `announced` is always false: that lane's announcement
+/// (and its terminal) belongs to `cmd_seed`, not to this pass.
 struct DefaultSetOutcome {
     failures: u32,
     announced: bool,
@@ -2883,22 +2894,64 @@ struct DefaultSetOutcome {
     resolved_assets: std::collections::BTreeMap<String, String>,
 }
 
+/// WHERE a default-set pass's bytes come from — named by the CALLER, which owns
+/// the fetcher, because the pass's announcement must describe the actual
+/// transport. `net-starting:` claims the wire; during the sealed-payload seed
+/// (a purely local, lsof-verified zero-socket extraction) that claim was a
+/// fabrication the GUI then repeated on its progress card, since the markers
+/// are parsed byte-for-byte (crates/aterm-gui, `parse_seed_line`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProvisionLane {
+    /// [`resolve_fetcher`]'s chain: the network is the index authority and
+    /// bytes can cross the wire (the chain decides per asset — a local
+    /// bootstrap leg may serve some), so `net-starting:` is the honest
+    /// announcement.
+    Network,
+    /// `cmd_seed`'s bare [`crate::DirFetcher`] over the in-DMG sealed
+    /// registry: LOCAL by construction — that is the lane's whole consent
+    /// argument (see `cmd_seed`), so no byte can cross a socket. This lane's
+    /// announcement is the caller's own `seed-starting:` marker, printed with
+    /// the signed size BEFORE the pass runs; the pass itself announces
+    /// nothing — a second card-opening marker would double-announce, and a
+    /// `net-starting:` one would lie.
+    SealedPayload,
+}
+
+/// The wire lane's announcement, if `lane` owes one — pure, so the
+/// phantom-network defect stays pinned by a test rather than an lsof session:
+/// the sealed-payload lane returns `None` for EVERY set, and only a non-empty
+/// network pass speaks (the ordinary every-6-hours no-op tick stays silent).
+fn net_announcement(lane: ProvisionLane, will_install: &[String]) -> Option<String> {
+    if lane == ProvisionLane::SealedPayload || will_install.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {}",
+        will_install.len(),
+        will_install.join(", ")
+    ))
+}
+
 fn install_default_set(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
+    lane: ProvisionLane,
     now: i64,
 ) -> DefaultSetOutcome {
     // Live-progress pass ownership (R5): when the GUI opted in via `--progress-file`
     // and no pass is live yet, this pass IS the "net" pass — begun here so its start
     // truncates the file, ended here so the terminal snapshot (pid cleared,
     // `ended_unix` stamped) is written on every exit path. The seed lane begins its
-    // own "seed" pass BEFORE calling in, in which case `begin_pass` declines and the
-    // seed lane keeps ownership.
-    let owned_pass =
-        progress_path().is_some_and(|p| crate::progress::begin_pass(p, "net"));
-    let out = install_default_set_inner(layout, fetcher, anchor, cfg, now);
+    // own "seed" pass BEFORE calling in, so `begin_pass` declines and the seed lane
+    // keeps ownership — but that decline is a LIVENESS accident, not a lane rule:
+    // a sealed seed whose own `begin_pass` failed (unwritable progress file) must
+    // run with NO pass, never under a fabricated "net" one. So the lane gates this
+    // channel exactly as it gates the stdout announcement (`net_announcement`).
+    let owned_pass = lane == ProvisionLane::Network
+        && progress_path().is_some_and(|p| crate::progress::begin_pass(p, "net"));
+    let out = install_default_set_inner(layout, fetcher, anchor, cfg, lane, now);
     if owned_pass {
         crate::progress::end_pass();
     }
@@ -2912,6 +2965,7 @@ fn install_default_set_inner(
     fetcher: &dyn crate::flow::Fetcher,
     anchor: &crate::Anchor,
     cfg: &crate::config::PackagesConfig,
+    lane: ProvisionLane,
     now: i64,
 ) -> DefaultSetOutcome {
     let floor = build_floor(layout);
@@ -3041,7 +3095,10 @@ fn install_default_set_inner(
     // announced). The set named is exactly what the loop below will attempt:
     // wanted ∧ absent, minus dev-linked groups (announcing a member the loop
     // then skips for a dev link would be a lie). Printed only when non-empty,
-    // so the ordinary every-6-hours no-op tick stays silent.
+    // so the ordinary every-6-hours no-op tick stays silent — and only on the
+    // NETWORK lane: the sealed-payload seed already announced itself with
+    // `seed-starting:` and moves no byte over any socket, so `net-starting:`
+    // there was a fabricated network claim (see [`ProvisionLane`]).
     let mut will_install: Vec<String> = Vec::new();
     for group in crate::plan_groups(&index, ch) {
         if group
@@ -3059,14 +3116,11 @@ fn install_default_set_inner(
                 .cloned(),
         );
     }
-    let announced = !will_install.is_empty();
-    if announced {
-        will_install.sort();
-        println!(
-            "atpkg: {NET_STARTING_MARKER}installing {} program(s) over the network: {}",
-            will_install.len(),
-            will_install.join(", ")
-        );
+    will_install.sort();
+    let announcement = net_announcement(lane, &will_install);
+    let announced = announcement.is_some();
+    if let Some(line) = &announcement {
+        println!("{line}");
     }
     // The pass's plan, in PLAN ORDER, with each group's freshly-installable members —
     // materialized once so the priority queue below can permute what remains between
@@ -3547,6 +3601,7 @@ fn cmd_install_default_set() -> ExitCode {
         &*fetcher,
         &effective_anchor(&layout),
         cfg,
+        ProvisionLane::Network,
         now_unix(),
     );
     let failures = failures_outcome.failures;
@@ -3794,16 +3849,23 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // nowhere. Asking for the total first turns that into one honest refusal that
     // names the number, and leaves the seal intact for a retry after the user frees
     // space.
-    if let Some(need) = seed_install_bytes(&fetcher, &index, cfg, &wanted) {
+    // THE size, derived ONCE from the sealed manifests at print time and reused by
+    // every line below (the disk gate, its status row, and the announcement).
+    // Three derivations rendered three ways is how one install came to quote three
+    // different figures for the same bytes (install.sh's "~4.2 GB" header, this
+    // lane's "~4.7 GB", 4.08 GB measured). Unit convention: rendered ONLY via
+    // [`crate::cost::human_bytes`] — see [`seed_announcement`].
+    let signed_bytes = seed_install_bytes(&fetcher, &index, cfg, &wanted);
+    if let Some(need) = signed_bytes {
         let have = crate::freespace::available_bytes(&layout.prefix);
         if !have.is_none_or(|a| crate::cost::disk_ok(need, a, crate::cost::FREE_FLOOR)) {
             println!(
-                "atpkg: {SEED_FAILED_MARKER}the ALab toolset needs {:.1} GB free (plus a \
-                 {:.0} GB reserve) and this disk has {:.1} GB — nothing was installed, and \
+                "atpkg: {SEED_FAILED_MARKER}the ALab toolset needs {} free (plus a \
+                 {} reserve) and this disk has {} — nothing was installed, and \
                  the bundled copy is kept for when space is available",
-                need as f64 / 1e9,
-                crate::cost::FREE_FLOOR as f64 / 1e9,
-                have.unwrap_or(0) as f64 / 1e9
+                crate::cost::human_bytes(need),
+                crate::cost::human_bytes(crate::cost::FREE_FLOOR),
+                crate::cost::human_bytes(have.unwrap_or(0))
             );
             record_status(
                 &layout,
@@ -3813,7 +3875,7 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
                     state: String::from("blocked: insufficient disk space"),
                     tree_root: String::new(),
                 },
-                format!("needs {:.1} GB free", need as f64 / 1e9),
+                format!("needs {} free", crate::cost::human_bytes(need)),
             );
             return ExitCode::SUCCESS;
         }
@@ -3823,22 +3885,26 @@ fn cmd_seed(rest: &[String]) -> ExitCode {
     // only honest description of a first launch was "the app silently starts
     // consuming disk". The GUI streams this child's stdout, so the notice lands
     // while it happens rather than after (crates/aterm-gui, `parse_seed_line`).
-    println!(
-        "atpkg: seed-starting: installing {} ALab program(s) from the bundled registry{}",
-        wanted.len(),
-        match seed_install_bytes(&fetcher, &index, cfg, &wanted) {
-            Some(b) => format!(" (~{:.1} GB on disk when finished)", b as f64 / 1e9),
-            None => String::new(),
-        }
-    );
+    println!("{}", seed_announcement(wanted.len(), signed_bytes));
     let before = crate::active_builds(&layout);
     // The SEED progress pass (R5): same writer, `pass: "seed"` — verify/extract/link
     // phases with no download rows (the fetcher is a local dir; the sealed-seed
     // lane's bytes are untouched). Owned here so `install_default_set` sees a live
-    // pass and does not begin its own "net" one.
+    // pass and does not begin its own "net" one. The lane rides alongside for the
+    // same reason in the other channel: SealedPayload must never announce
+    // `net-starting:`, which claimed a network install for a lane whose whole
+    // consent argument is that it never touches one (see [`ProvisionLane`]).
     let owned_pass =
         progress_path().is_some_and(|p| crate::progress::begin_pass(p, "seed"));
-    let failures = install_default_set(&layout, &fetcher, &anchor, cfg, now_unix()).failures;
+    let failures = install_default_set(
+        &layout,
+        &fetcher,
+        &anchor,
+        cfg,
+        ProvisionLane::SealedPayload,
+        now_unix(),
+    )
+    .failures;
     if owned_pass {
         crate::progress::end_pass();
     }
@@ -4039,6 +4105,36 @@ fn seed_install_bytes(
         total = total.saturating_add(art.cost.disk_installed);
     }
     (total > 0).then_some(total)
+}
+
+/// The seed lane's announcement line (`seed-starting:` — the marker that opens the
+/// GUI's "Installing…" card, crates/aterm-gui `parse_seed_line`), built PURE so
+/// both of its honesty properties are testable:
+///
+/// * the marker is the LOCAL lane's ([`SEED_STARTING_MARKER`]), never the wire
+///   lane's — the sealed payload moves zero bytes over any socket, and
+///   [`net_announcement`] is where the network lane speaks;
+/// * the size is ONE number in ONE unit: the signed sum [`seed_install_bytes`]
+///   derives from the sealed manifests at print time, rendered by
+///   [`crate::cost::human_bytes`] — the crate's single byte renderer (binary
+///   units, "GiB", one decimal), the same tiers flow's disk-preflight errors,
+///   `doctor`'s free-space report, and the release cut transcript print
+///   (`aterm-release::bundle::human_bytes` mirrors it deliberately). One install
+///   used to quote three different figures for the same bytes because every
+///   surface derived and rendered its own; install.sh's fixed header text is the
+///   remaining out-of-crate quote and must carry the same GiB figure.
+///
+/// `None` size prints no size at all: no number is more honest than a
+/// confidently wrong one (the [`seed_install_bytes`] contract).
+fn seed_announcement(count: usize, signed_bytes: Option<u64>) -> String {
+    let size = match signed_bytes {
+        Some(b) => format!(" (~{} on disk when finished)", crate::cost::human_bytes(b)),
+        None => String::new(),
+    };
+    format!(
+        "atpkg: {SEED_STARTING_MARKER}installing {count} ALab program(s) from the bundled \
+         registry{size}"
+    )
 }
 
 /// The seal cannot serve this machine: say so honestly, reclaim it, and DO NOT claim
@@ -6321,6 +6417,119 @@ mod tests {
         }
     }
 
+    /// A SEALED-PAYLOAD SEED IS NOT A NETWORK INSTALL. The in-DMG seed lane is
+    /// local by construction (`cmd_seed`'s bare `DirFetcher` — zero sockets,
+    /// lsof-verified in the 2026-08 audit), yet `install_default_set` announced it
+    /// with "net-starting: installing N program(s) over the network", and the GUI —
+    /// which parses these markers byte-for-byte — repeated the fabricated network
+    /// install on its progress card. The wire announcement is now lane-gated and
+    /// pure, so the lie stays pinned here instead of by an lsof session.
+    #[test]
+    fn a_seed_from_the_sealed_payload_never_prints_the_net_starting_marker() {
+        let two = vec!["ay".to_string(), "trust".to_string()];
+        // The network lane still announces before acting…
+        let line = net_announcement(ProvisionLane::Network, &two)
+            .expect("a non-empty network pass announces before acting");
+        assert!(
+            line.starts_with(&format!("atpkg: {NET_STARTING_MARKER}")),
+            "the GUI strips exactly this prefix: {line}"
+        );
+        assert!(line.contains("ay, trust"), "{line}");
+        // …stays silent on the ordinary no-op tick…
+        assert!(net_announcement(ProvisionLane::Network, &[]).is_none());
+        // …and the sealed-payload lane NEVER claims the wire, whatever the set:
+        // its announcement is `cmd_seed`'s own `seed-starting:` line.
+        assert!(net_announcement(ProvisionLane::SealedPayload, &two).is_none());
+        assert!(net_announcement(ProvisionLane::SealedPayload, &[]).is_none());
+        // The local lane's announcement carries the LOCAL marker, and never the
+        // wire's — the GUI opens the same card off either, so the marker is the
+        // only place the transport claim lives.
+        let seed = seed_announcement(10, None);
+        assert!(
+            seed.starts_with(&format!("atpkg: {SEED_STARTING_MARKER}")),
+            "{seed}"
+        );
+        assert!(!seed.contains(NET_STARTING_MARKER), "{seed}");
+
+        // NON-VACUITY, in two halves. (1) `cmd_seed` actually wires the sealed
+        // lane: its body names SealedPayload and never touches the wire marker.
+        // (2) The wire marker reaches stdout through `net_announcement` alone, so
+        // the `None`s above are the whole story, not one suppressed call site.
+        let src = include_str!("cli.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        let start = production.find("fn cmd_seed").expect("the seed verb");
+        let end = production[start..]
+            .find("\nfn ")
+            .map(|i| start + i)
+            .expect("a function after cmd_seed");
+        let seed_body = &production[start..end];
+        assert!(
+            seed_body.contains("ProvisionLane::SealedPayload"),
+            "cmd_seed must name the sealed-payload lane"
+        );
+        assert!(
+            !seed_body.contains("NET_STARTING"),
+            "the seed verb must never reach for the wire announcement"
+        );
+        assert_eq!(
+            production.matches("NET_STARTING_MARKER}").count(),
+            1,
+            "the wire announcement must have exactly ONE production emission site \
+             (inside net_announcement), or the lane gate can be walked around"
+        );
+    }
+
+    /// ONE INSTALL, ONE SIZE. A single first run used to quote three figures for
+    /// the same bytes — install.sh's fixed "~4.2 GB" header, this lane's
+    /// "~4.7 GB on disk when finished", 4.08 GB measured — because every surface
+    /// derived and rendered its own number. Within atpkg the size is now derived
+    /// ONCE per run (`seed_install_bytes`, the sealed manifests' signed
+    /// `disk_installed` sum, at print time) and rendered ONLY by
+    /// `cost::human_bytes` (binary units, "GiB", one decimal — the renderer flow's
+    /// disk errors, doctor's free-space report, and the release cut transcript
+    /// already share).
+    #[test]
+    fn the_seed_lane_quotes_one_size_in_one_unit() {
+        // The announcement renders the signed sum through the ONE renderer…
+        let line = seed_announcement(10, Some(4_380_000_000));
+        assert!(
+            line.starts_with(&format!("atpkg: {SEED_STARTING_MARKER}")),
+            "the GUI strips exactly this prefix: {line}"
+        );
+        assert!(
+            line.contains("(~4.1 GiB on disk when finished)"),
+            "the size must be cost::human_bytes of the signed sum: {line}"
+        );
+        assert_eq!(
+            line.matches("4.1 GiB").count(),
+            1,
+            "one figure, stated once: {line}"
+        );
+        // …and an unavailable sum prints NO size: no number is more honest than a
+        // confidently wrong one.
+        let bare = seed_announcement(2, None);
+        assert!(!bare.contains("GiB") && !bare.contains("GB"), "{bare}");
+
+        // NON-VACUITY: no production line in this file renders bytes on its own.
+        // The ad-hoc decimal spellings (`as f64 / 1e9` under a "GB" label) are
+        // exactly what let the figures drift apart across surfaces.
+        let src = include_str!("cli.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+        assert!(
+            !production.contains("1e9"),
+            "no ad-hoc byte rendering in the CLI — every size goes through \
+             cost::human_bytes"
+        );
+        assert!(
+            !production.contains("{:.1} GB") && !production.contains("{:.0} GB"),
+            "no decimal-GB format fragment may return"
+        );
+    }
+
     /// THE CONSENT POLICY, as a table. Every consent regression this branch shipped
     /// lived in this one boolean, and none of them had a test — reverting either
     /// round-3 fix left the whole suite green, which is precisely why they shipped.
@@ -6808,7 +7017,15 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(failures, 0, "skips are never failures");
         let active = crate::active_builds(&layout);
         assert_eq!(
@@ -6824,7 +7041,15 @@ mod tests {
             "the dev link survives untouched"
         );
         // Idempotence: a second pass finds ay installed and re-installs nothing.
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(failures, 0);
         assert_eq!(crate::active_builds(&layout).get("ay").copied(), Some(18));
         // The durable floor advanced to the trusted index (§8 gate 3).
@@ -6849,7 +7074,14 @@ mod tests {
         let layout = temp_layout("unserved");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let out = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0);
+        let out = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        );
         assert_eq!(out.failures, 0, "unserved is a correct state, not a failure");
         let active = crate::active_builds(&layout);
         assert!(!active.contains_key("ay"), "no artifact, no install");
@@ -6887,14 +7119,30 @@ mod tests {
         // channel is one loud pass-level failure, nothing installs.
         let layout = temp_layout("channel-default");
         let cfg = crate::config::PackagesConfig::default();
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert!(failures > 0, "a missing channel is loud, not silent");
         assert!(crate::active_builds(&layout).is_empty());
         let _ = std::fs::remove_dir_all(&layout.prefix);
         // channel = "nightly" threads through and installs.
         let layout = temp_layout("channel-nightly");
         let cfg = crate::config::parse_packages("[packages]\nchannel = \"nightly\"\n");
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(failures, 0);
         assert_eq!(
             crate::active_builds(&layout).get("ay").copied(),
@@ -6946,7 +7194,15 @@ mod tests {
         let layout = temp_layout("group-ok");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(failures, 0);
         let active = crate::active_builds(&layout);
         assert_eq!(active.get("ta").copied(), Some(4), "tuple member installed");
@@ -6968,7 +7224,15 @@ mod tests {
         let layout = temp_layout("group-abort");
         let cfg = crate::config::PackagesConfig::default();
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(failures, 1, "one failure for the aborted group");
         let active = crate::active_builds(&layout);
         assert!(
@@ -7005,7 +7269,15 @@ mod tests {
             ..Default::default()
         };
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(
             failures, 0,
             "a config-narrowed tuple is a diagnostic, not a failure"
@@ -7036,7 +7308,15 @@ mod tests {
         let cfg =
             crate::config::parse_packages("[packages.links]\nghost = \"alabsystems/ghost\"\n");
         let fetcher = crate::DirFetcher::new(dir.clone());
-        let failures = install_default_set(&layout, &fetcher, &test_anchor(), &cfg, 0).failures;
+        let failures = install_default_set(
+            &layout,
+            &fetcher,
+            &test_anchor(),
+            &cfg,
+            ProvisionLane::Network,
+            0,
+        )
+        .failures;
         assert_eq!(
             failures, 0,
             "the refusal is a loud diagnostic, not a loop failure"

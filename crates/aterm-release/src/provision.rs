@@ -1518,20 +1518,6 @@ fn verifiers_check(bin: &Path) -> Check {
     }
 }
 
-/// The doc-tool FARM LINK. `.cargo/config.toml` names the workspace's doc driver
-/// by BARE NAME (`[build] rustdoc = "trustdoc"`, resolved from PATH), so a plain
-/// `cargo test` on this machine runs its doctest lane only where `trustdoc`
-/// resolves — the verify gate binds `RUSTDOC` to the stage2's copy when the
-/// stage2 carries one (and diagnoses when nothing exists anywhere), but a
-/// direct cargo invocation has only PATH, and without the link it dies at exec
-/// with a raw OS error that names no remedy. The convention that config
-/// comment describes — `~/.local/bin/trustdoc` symlinked at the live stage2 —
-/// is a provisioned artifact, audited like the rustup link. UNLIKE that link the
-/// whole remedy is one mechanical symlink, so a full run REPAIRS it in place: a
-/// missing entry or a DANGLING symlink (a swept stage2, say) is linked to the
-/// stage2's trustdoc; anything else at that path is somebody's arrangement and
-/// is never replaced. `--check` reports the remedy without writing, like every
-/// other no-writes path.
 #[cfg(unix)]
 /// The remedy for "the driver is there, its directory is not on PATH", written once
 /// because both checks in [`doc_tool_check`] hand out the identical one.
@@ -1548,6 +1534,21 @@ fn path_persist_fix(dir: &Path) -> String {
     )
 }
 
+/// The doc-tool FARM LINK. `.cargo/config.toml` names the workspace's doc driver
+/// by BARE NAME (`[build] rustdoc = "trustdoc"`, resolved from PATH), so a plain
+/// `cargo test` on this machine runs its doctest lane only where `trustdoc`
+/// resolves — the verify gate binds `RUSTDOC` to the stage2's copy when the
+/// stage2 carries one (and diagnoses when nothing exists anywhere), but a
+/// direct cargo invocation has only PATH, and without the link it dies at exec
+/// with a raw OS error that names no remedy. The convention that config
+/// comment describes — `~/.local/bin/trustdoc` symlinked at the live stage2 —
+/// is a provisioned artifact, audited like the rustup link. UNLIKE that link the
+/// whole remedy is one mechanical symlink, so a full run REPAIRS it in place: a
+/// missing entry or a DANGLING symlink (a swept stage2, say) is linked to the
+/// stage2's trustdoc; anything else at that path is somebody's arrangement and
+/// is never replaced. `--check` reports the remedy without writing, like every
+/// other no-writes path.
+#[cfg(unix)]
 fn doc_tool_check(home: &str, check_only: bool) -> Check {
     let path_var = std::env::var_os("PATH").unwrap_or_default();
     if let Some(found) = resolve_on_path("trustdoc", &path_var) {

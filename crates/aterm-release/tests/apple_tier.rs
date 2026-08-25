@@ -335,6 +335,32 @@ impl publish::Packager for FakePackager {
             size_bytes: 1_000,
         })
     }
+    fn dmg_lite(
+        &self,
+        app: &Path,
+        _dist: &Path,
+        _version: &str,
+        notarized: bool,
+        _seeded: bool,
+    ) -> ledger::Result<dmg::Packaged> {
+        // Recorded WITH the notarization fact, exactly like the zip: the lean
+        // DMG's restage Gatekeeper gate is only decisive when the bundle it
+        // strips really was stapled, so the lane must be told so.
+        record(
+            &self.log,
+            if notarized {
+                "create_dmg_lite(notarized)"
+            } else {
+                "create_dmg_lite"
+            },
+            app,
+        );
+        Ok(dmg::Packaged {
+            path: lite_dmg(),
+            sha256: DMG_SHA_BEFORE.into(),
+            size_bytes: 500,
+        })
+    }
     fn sha256(&self, path: &Path) -> ledger::Result<String> {
         record(&self.log, "rehash", path);
         Ok(DMG_SHA_AFTER.into())
@@ -353,6 +379,9 @@ fn dmg() -> PathBuf {
 }
 fn x86_dmg() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture/aterm-x86_64.dmg")
+}
+fn lite_dmg() -> PathBuf {
+    PathBuf::from("/tmp/aterm-tier-fixture/aterm-lite.dmg")
 }
 fn dist() -> PathBuf {
     PathBuf::from("/tmp/aterm-tier-fixture")
@@ -924,14 +953,26 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
             // 4. re-read afterwards,
             "rehash:aterm.dmg",
             "resize:aterm.dmg",
-            // 5. and the zip archived from the ALREADY-STAPLED bundle last.
+            // 5. the LEAN drag-install DMG rides the same per-container
+            //    sequence — built from the stapled bundle (told so, which is
+            //    what makes its restage Gatekeeper gate decisive), hooked,
+            //    re-read — after the fleet-critical seeded image so its
+            //    notarization wait is only ever spent on a cut that already
+            //    cleared the one that matters,
+            "create_dmg_lite(notarized):aterm.app",
+            "sign_dmg:aterm-lite.dmg",
+            "preflight:aterm-lite.dmg",
+            "notarize:aterm-lite.dmg",
+            "rehash:aterm-lite.dmg",
+            "resize:aterm-lite.dmg",
+            // 6. and the zip archived from the ALREADY-STAPLED bundle last.
             //    `(notarized)` is the point, not noise: it proves the ACTIVE tier
             //    tells the zip builder the bundle really is signed and stapled,
             //    which is what makes the stripped-bundle Gatekeeper check FATAL
             //    rather than advisory (dmg::verify_stripped_bundle).
             "create_zip(notarized):aterm.app",
         ],
-        "the bundle must be stapled before either container is built"
+        "the bundle must be stapled before any container is built"
     );
     // The digest that reaches the manifest is the one read AFTER the hook. A
     // `dmg::create`-time digest here would abort the self-check at best and
@@ -939,6 +980,10 @@ fn the_active_build_notarizes_the_bundle_before_the_zip_that_carries_it() {
     assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
     assert_eq!(out.dmg_size, 2_000, "the size must be re-read too");
     assert_eq!(out.zip.sha256, ZIP_SHA);
+    // The lean DMG's digest goes on record (the journal) under the same rule:
+    // post-hook bytes or nothing.
+    assert_eq!(out.dmg_lite_sha256, DMG_SHA_AFTER);
+    assert_eq!(out.dmg_lite_size, 2_000);
 }
 
 #[test]
@@ -981,9 +1026,16 @@ fn the_split_cut_builds_the_arm64_canonical_first_then_the_intel_variant() {
             "notarize:aterm-x86_64.dmg",
             "rehash:aterm-x86_64.dmg",
             "resize:aterm-x86_64.dmg",
+            "create_dmg_lite(notarized):aterm.app",
+            "sign_dmg:aterm-lite.dmg",
+            "preflight:aterm-lite.dmg",
+            "notarize:aterm-lite.dmg",
+            "rehash:aterm-lite.dmg",
+            "resize:aterm-lite.dmg",
             "create_zip(notarized):aterm.app",
         ],
-        "canonical arm64 first, Intel variant second, zip last — each from the stapled bundle"
+        "canonical arm64 first, Intel variant second, lean image third, zip \
+         last — each from the stapled bundle"
     );
     // Both manifest digests are the POST-hook reads, never the mint-time ones.
     assert_eq!(out.dmg_sha256, DMG_SHA_AFTER);
@@ -1010,8 +1062,12 @@ fn the_split_cut_builds_the_arm64_canonical_first_then_the_intel_variant() {
     assert!(out.dmg_x86_64.is_none());
     assert_eq!(
         entries(&log2),
-        vec!["create_dmg:aterm.app", "create_zip:aterm.app"],
-        "no split, no arch lane: byte-for-byte the pipeline as it always ran"
+        vec![
+            "create_dmg:aterm.app",
+            "create_dmg_lite:aterm.app",
+            "create_zip:aterm.app"
+        ],
+        "no split, no arch lane: the single-DMG pipeline plus the lean image"
     );
 }
 
@@ -1037,7 +1093,11 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
     .expect("the inactive packaging path");
     assert_eq!(
         entries(&log),
-        vec!["create_dmg:aterm.app", "create_zip:aterm.app"],
+        vec![
+            "create_dmg:aterm.app",
+            "create_dmg_lite:aterm.app",
+            "create_zip:aterm.app"
+        ],
         "the inactive tier packages and does nothing else"
     );
     assert_eq!(
@@ -1045,6 +1105,11 @@ fn the_inactive_build_packages_exactly_as_it_always_did() {
         "nothing rewrote the DMG, so nothing may re-hash it"
     );
     assert_eq!(out.dmg_size, 1_000);
+    assert_eq!(
+        out.dmg_lite_sha256, DMG_SHA_BEFORE,
+        "same rule for the lean image: no hook, no re-hash"
+    );
+    assert_eq!(out.dmg_lite_size, 500);
 }
 
 #[test]
@@ -1107,6 +1172,49 @@ fn a_failed_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
     assert!(
         seen.contains(&"notarize:aterm.app".to_string()),
         "precondition: the bundle's own submission succeeded, {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|c| c.starts_with("create_zip")),
+        "the zip must never be built, got {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|c| c.starts_with("create_dmg_lite")),
+        "the lean image must never be built after the fleet-critical DMG's \
+         notarization failed, got {seen:?}"
+    );
+}
+
+#[test]
+fn a_failed_lite_dmg_notarization_stops_the_cut_before_the_zip_is_built() {
+    // The lean image is a browser-download alias, but its failure is NOT
+    // advisory: `aterm.dmg` will serve these bytes, so a cut that cannot
+    // notarize them must stop exactly as it does for the seeded image — before
+    // the zip exists to be uploaded under a team-claiming manifest.
+    let log = log();
+    let tools = FakeTools {
+        fail_on_target: Some("aterm-lite.dmg"),
+        ..FakeTools::failing(&log, "notarize")
+    };
+    let outcome = publish::notarize_and_package(
+        &app(),
+        &dist(),
+        "9.9.9",
+        &active_tier(),
+        &tools,
+        &FakePackager {
+            log: Rc::clone(&log),
+        },
+        false,
+        false,
+    );
+    assert!(
+        outcome.is_err(),
+        "a failed lean-DMG submission must abort the cut"
+    );
+    let seen = entries(&log);
+    assert!(
+        seen.contains(&"notarize:aterm.dmg".to_string()),
+        "precondition: the seeded DMG's own submission succeeded, {seen:?}"
     );
     assert!(
         !seen.iter().any(|c| c.starts_with("create_zip")),
@@ -1265,6 +1373,7 @@ fn journal_with(done: &[&str]) -> Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done: done.iter().map(|s| (*s).to_string()).collect(),
     }
 }

@@ -7458,6 +7458,19 @@ struct WindowState {
     /// between the old probe/extract locks from pairing A effects with B cells,
     /// without adding a steady-state allocation.
     composed_focus_scratch: RenderInput,
+    /// One PERSISTENT snapshot buffer per UNFOCUSED terminal pane, keyed by
+    /// session id. The compose pass-2 loop used to refill a single shared
+    /// `pane_scratch` for every background pane in turn, so a strip of panes
+    /// with DIFFERENT row/col counts shrank+grew that one buffer's `Vec`-of-
+    /// rows on every presented frame — `cell_frame_fill`'s `resize_with` drops
+    /// surplus inner row `Vec`s (capacity lost) and pushes fresh empty ones
+    /// (realloc on refill), ~tens of KB alloc+free per frame at typical split
+    /// sizes (audit-2 item 11). A per-session resident buffer keeps each pane's
+    /// capacity across frames (no churn) AND its `terminal_id`/`extract_gen`
+    /// continuity (so the damage-scoped refill's scoped arm can fire on splits,
+    /// which a cross-terminal shared buffer can never do). Pruned to the live
+    /// pane set after each compose, like `leaf_render_cache`.
+    unfocused_pane_scratch: std::collections::BTreeMap<u64, RenderInput>,
     /// One cache per stable canonical leaf. Entries are pruned against the
     /// visible plan after each heterogeneous compose, so closed views cannot
     /// retain textures or semantic trees.
@@ -8871,6 +8884,7 @@ impl WindowState {
             pred_row_scratch: Vec::new(),
             pane_scratch: RenderInput::empty(),
             composed_focus_scratch: RenderInput::empty(),
+            unfocused_pane_scratch: std::collections::BTreeMap::new(),
             leaf_render_cache: std::collections::BTreeMap::new(),
             tab_segments: Vec::new(),
             last_strip_fp: None,

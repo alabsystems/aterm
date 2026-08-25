@@ -525,6 +525,7 @@ fn recovery_requires_a_clean_tree_with_no_cask_era_exception() {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "verify")

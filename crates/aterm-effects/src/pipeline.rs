@@ -769,6 +769,12 @@ impl EffectsPipeline {
                     self.trail.retire_content_candidate(at, origin);
                     false
                 }
+                Some(ContentCandidateDecision::Downgraded { at, origin }) => {
+                    // The refuted echo proved the press was a MOTION command;
+                    // both engines now hold the same jump-shaped candidate.
+                    self.trail.arm_motion(at, origin);
+                    false
+                }
                 None => false,
             }
         } else {

@@ -1469,6 +1469,21 @@ pub struct Journal {
     /// Append-only, exactly like [`Journal::upload_intents`].
     #[serde(default)]
     pub mirror_upload_intents: Vec<String>,
+    /// The LEAN drag-install DMG's digest — post-container-hook, in-process —
+    /// which is the byte AUTHORITY for `aterm-<v>-lite.dmg` and its `aterm.dmg`
+    /// alias, because the signed manifest deliberately names no lite container
+    /// (no client elects one; see `mirror::dmg_lite_asset_name`). The `.sha256`
+    /// sidecars restate this value; they never originate it, exactly as the
+    /// manifest-bound sidecars never originate theirs.
+    ///
+    /// `None` is the PRE-LITE shape — a journal written before the lane
+    /// existed, or a recovery of a release published without one — and every
+    /// consumer must then keep that cut's asset set byte-for-byte what it
+    /// always was (`mirror::required_asset_names` takes it as the `lite_dmg`
+    /// flag). `step_selfcheck` upgrades a pre-lite journal it re-enters by
+    /// building the missing artifact and recording the digest here.
+    #[serde(default)]
+    pub lite_dmg_sha256: Option<String>,
     /// Completed steps, in completion order (a subset of [`STEPS`]).
     #[serde(default)]
     pub done: Vec<String>,
@@ -1675,6 +1690,19 @@ impl Journal {
                 &self.mirror_upload_intents,
             )?;
         }
+        // The lite digest is the sole byte authority for two published assets
+        // (the manifest names neither), so a corrupt record here is a corrupt
+        // channel object later — refuse the journal, not the mirror.
+        if let Some(sha) = self.lite_dmg_sha256.as_deref()
+            && (sha.len() != 64
+                || !sha
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')))
+        {
+            return Err(Error::new(
+                "release journal lite DMG digest is not exactly 64 lowercase hex digits",
+            ));
+        }
         Ok(())
     }
 
@@ -1844,6 +1872,69 @@ pub const fn draft_cleanup_decision(
         (Some(false), true, _) | (None, false, _) | (None, true, false) => {
             DraftCleanupDecision::RefuseUnknownOrInconsistent
         }
+    }
+}
+
+/// What `step_selfcheck` may do about the LEAN drag-install DMG.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiteDmgPlan {
+    /// The journaled digest and the bytes on disk agree — proven, proceed.
+    Proven,
+    /// Build (or rebuild) the artifact through the packaging lane and record
+    /// its digest as the cut's new lite authority. Legal in exactly two
+    /// shapes: a pre-lite journal re-entering selfcheck (no record exists —
+    /// this is how an old cut is upgraded in place), and a recorded artifact
+    /// that has gone missing from mutable dist/ BEFORE its bytes ever crossed
+    /// to the public channel (the record is then this cutter's own private
+    /// note, free to re-mint — a DMG rebuild is never byte-identical, so the
+    /// record must move with it).
+    Rebuild,
+    /// Bytes exist that disagree with the cut's own digest record. This cutter
+    /// only writes what it records, so something else wrote these — refuse,
+    /// never repair, exactly as for a divergent stable twin.
+    RefuseDivergent,
+    /// The recorded artifact is gone AND its bytes were already durably
+    /// uploaded toward the public channel. A rebuild cannot reproduce them
+    /// (DMG imaging + staple are not deterministic), so converging the mirror
+    /// against fresh bytes would be publishing different bytes than the ones
+    /// the intent covered — stop and let a human look.
+    RefuseIrreproducible,
+}
+
+/// Decide the lean-DMG selfcheck action from the three facts that matter:
+/// the cut's own digest record, what dist/ holds now, and whether a mirror
+/// upload intent for the lite asset was ever durably issued.
+///
+/// A pure sibling of [`durable_post_decision`] for the same reason: the rule
+/// is fleet-facing (it governs what `aterm.dmg` will serve) and the effectful
+/// caller needs a real build to run, so the rule would otherwise be exactly as
+/// untested as it is important.
+#[must_use]
+pub fn lite_dmg_selfcheck_plan(
+    journaled_sha256: Option<&str>,
+    observed_sha256: Option<&str>,
+    mirror_upload_issued: bool,
+) -> LiteDmgPlan {
+    match (journaled_sha256, observed_sha256) {
+        (Some(recorded), Some(observed)) => {
+            if recorded.eq_ignore_ascii_case(observed) {
+                LiteDmgPlan::Proven
+            } else {
+                LiteDmgPlan::RefuseDivergent
+            }
+        }
+        (Some(_), None) | (None, _) if mirror_upload_issued => {
+            // An issued intent with no matching record+bytes pair is a state
+            // this cutter never writes (the intent is only minted over a
+            // recorded artifact) — fail closed rather than guess which bytes
+            // the channel holds.
+            LiteDmgPlan::RefuseIrreproducible
+        }
+        (Some(_), None) => LiteDmgPlan::Rebuild,
+        // No record: a pre-lite journal. Bytes without a record (if any) are
+        // unattested leftovers; the rebuild overwrites them exactly as a
+        // re-entered `step_build` would.
+        (None, _) => LiteDmgPlan::Rebuild,
     }
 }
 
@@ -5728,6 +5819,11 @@ pub struct CutCtx {
     pub mirror_release_id: Option<u64>,
     pub mirror_create_issued: bool,
     pub mirror_upload_intents: Vec<String>,
+    /// The lean DMG's post-hook digest — mirror of [`Journal::lite_dmg_sha256`]
+    /// and carried here too because dry-run/rehearse cuts are deliberately
+    /// unjournaled. `None` = a pre-lite cut whose asset set must stay exactly
+    /// what it was (see the journal field's doc for the full contract).
+    pub lite_dmg_sha256: Option<String>,
     pub kind: CutKind,
     /// `--no-paint-smoke`, carried to `step_selfcheck`. Never journaled: a
     /// resume re-earns the paint proof (and the CLI refuses the flag there,
@@ -5783,6 +5879,59 @@ impl CutCtx {
             .join(mirror::sha256_sidecar_name(&mirror::zip_asset_name(
                 &self.version,
             )))
+    }
+    /// The stable download twins in dist/ — `aterm.dmg` / `aterm-mac.zip`,
+    /// byte copies of the canonical containers. Staged by `step_build` from
+    /// the FINAL packaged bytes; re-proved (and, on a pre-twin journal's
+    /// resume, regenerated) by `step_selfcheck`; served to the public channel
+    /// through `mirror_asset_paths`.
+    fn stable_dmg_path(&self) -> PathBuf {
+        self.dist.join(mirror::stable_dmg_asset_name())
+    }
+    fn stable_zip_path(&self) -> PathBuf {
+        self.dist.join(mirror::stable_zip_asset_name())
+    }
+    /// The twins' `.sha256` sidecars — the SAME digests the versioned sidecars
+    /// state, with the ALIAS filename embedded, because `shasum -a 256 -c`
+    /// matches on the embedded name and a `releases/latest/download/...` click
+    /// saves the alias name.
+    fn stable_dmg_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::stable_dmg_asset_name()))
+    }
+    fn stable_zip_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::stable_zip_asset_name()))
+    }
+    /// The LEAN drag-install DMG in dist/ (`aterm-<v>-lite.dmg`) and its
+    /// sidecar. Its byte authority is [`Self::lite_dmg_sha256`], never the
+    /// manifest — see `mirror::dmg_lite_asset_name` for the naming contract.
+    fn dmg_lite_path(&self) -> PathBuf {
+        self.dist.join(mirror::dmg_lite_asset_name(&self.version))
+    }
+    fn dmg_lite_sha256_path(&self) -> PathBuf {
+        self.dist
+            .join(mirror::sha256_sidecar_name(&mirror::dmg_lite_asset_name(
+                &self.version,
+            )))
+    }
+    /// The seeded image's evergreen alias in dist/ (`aterm-offline.dmg`) and
+    /// its sidecar — staged exactly when the cut carries a lite DMG, because
+    /// the two repoints travel together (`mirror::stable_offline_dmg_asset_name`).
+    fn stable_offline_dmg_path(&self) -> PathBuf {
+        self.dist.join(mirror::stable_offline_dmg_asset_name())
+    }
+    fn stable_offline_dmg_sha256_path(&self) -> PathBuf {
+        self.dist.join(mirror::sha256_sidecar_name(
+            &mirror::stable_offline_dmg_asset_name(),
+        ))
+    }
+    /// Whether THIS cut carries the lean DMG lane — keyed on the cut's own
+    /// digest record rather than probing the disk, for the same reason the x86
+    /// pair asks the staged manifest: dist/ is mutable and a set-membership
+    /// decision must come from an authority, never from what happens to exist.
+    fn carries_lite_dmg(&self) -> bool {
+        self.lite_dmg_sha256.is_some()
     }
     /// The Intel DMG variant in dist/ (`aterm-<v>-x86_64.dmg`) — exists only
     /// on a per-arch split cut; every consumer asks the STAGED MANIFEST first
@@ -6021,6 +6170,7 @@ impl CutCtx {
             self.signature_required,
             self.attaches_roster(),
             self.staged_manifest_dmg_x86_64().is_some(),
+            self.carries_lite_dmg(),
         )
         .into_iter()
         .map(|name| self.dist.join(name))
@@ -7346,9 +7496,12 @@ fn recover_published_cut(
         &manifest.sha256,
         &dist.join(&manifest.dmg),
     )?;
-    // Regenerate the stable download twin from the digest-verified canonical
-    // DMG: recovery must leave dist/ able to satisfy required_asset_names(),
-    // and the twin is by definition a byte copy of the canonical asset.
+    // Regenerate the stable download twins from the digest-verified canonical
+    // containers: recovery must leave dist/ able to satisfy
+    // required_asset_names(), and each twin is by definition a byte copy of
+    // its canonical asset. `aterm.dmg` gets the SEEDED image here on purpose:
+    // a recovered cut is pre-lite (see the journal below), and pre-lite is
+    // exactly the world where that alias serves the seeded bytes.
     fs::copy(
         dist.join(&manifest.dmg),
         dist.join(mirror::stable_dmg_asset_name()),
@@ -7362,6 +7515,11 @@ fn recover_published_cut(
         &recovered_zip_sha256,
         &dist.join(&recovered_zip),
     )?;
+    fs::copy(
+        dist.join(&recovered_zip),
+        dist.join(mirror::stable_zip_asset_name()),
+    )
+    .map_err(|error| Error::new(format!("reconstruct stable zip twin: {error}")))?;
     // The Intel DMG, whenever the manifest names one — same digest-verified
     // lane as the canonical DMG, so a recovered dist/ can satisfy
     // required_asset_names() on a per-arch release. A name without a digest is
@@ -7400,10 +7558,17 @@ fn recover_published_cut(
     // The `.sha256` sidecars are pure functions of the manifest digests just
     // proved against the downloaded bytes, so a recovery REGENERATES them
     // rather than downloading — the mirror step demands them from dist/ and a
-    // release published before sidecars existed can still be recovered.
+    // release published before sidecars existed can still be recovered. The
+    // twins' ALIAS sidecars are the same proved digests under the alias names,
+    // so the documented `shasum -a 256 -c` works on the files the evergreen
+    // `releases/latest/download` URLs actually save.
+    let stable_dmg_name = mirror::stable_dmg_asset_name();
+    let stable_zip_name = mirror::stable_zip_asset_name();
     let mut sidecar_records = vec![
         (manifest.dmg.as_str(), manifest.sha256.as_str()),
         (recovered_zip.as_str(), recovered_zip_sha256.as_str()),
+        (stable_dmg_name.as_str(), manifest.sha256.as_str()),
+        (stable_zip_name.as_str(), recovered_zip_sha256.as_str()),
     ];
     if let Some((name, sha)) = &recovered_x86 {
         sidecar_records.push((name.as_str(), sha.as_str()));
@@ -7466,6 +7631,18 @@ fn recover_published_cut(
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        // DELIBERATELY PRE-LITE. Recovery reconstructs only remotely validated
+        // bytes, and the lean DMG's digest lives in the dead publisher's
+        // journal, not in anything the private release carries (the signed
+        // manifest names no lite container) — so there is nothing truthful to
+        // recover it FROM. The recovered cut therefore mirrors the pre-lite
+        // asset set, which is exactly right for every release published before
+        // the lane existed. Recovering a cut whose mirror ALREADY carries the
+        // lean assets then refuses loudly at the mirror's exact-set gate
+        // ("unexpected aterm-<v>-lite.dmg") rather than converging `aterm.dmg`
+        // onto different bytes — a human inspects, which is the only honest
+        // move when the one byte authority died with the publisher.
+        lite_dmg_sha256: None,
         done: [
             "lock",
             "build",
@@ -7529,6 +7706,8 @@ fn recover_published_cut(
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        // Pre-lite, matching the journal above (its comment holds the why).
+        lite_dmg_sha256: None,
         kind: CutKind::Real,
         // Recovery re-runs no build/selfcheck step (all are journaled done),
         // so there is no smoke left to skip.
@@ -8109,6 +8288,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        // Recorded by `step_build` once the lean DMG's post-hook digest exists.
+        lite_dmg_sha256: None,
         kind,
         no_paint_smoke: opts.no_paint_smoke,
         lease: None,
@@ -8134,6 +8315,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             mirror_release_id: None,
             mirror_create_issued: false,
             mirror_upload_intents: Vec::new(),
+            lite_dmg_sha256: ctx.lite_dmg_sha256.clone(),
             done: vec![],
         };
         j.save(&journal_path)?;
@@ -8291,6 +8473,10 @@ fn resume_cut(
         mirror_release_id: journal.mirror_release_id,
         mirror_create_issued: journal.mirror_create_issued,
         mirror_upload_intents: journal.mirror_upload_intents.clone(),
+        // The lean DMG's digest record rides the journal like every other cut
+        // authority; `None` here is a pre-lite journal, and `step_selfcheck`
+        // upgrades it in place iff selfcheck still has to run.
+        lite_dmg_sha256: journal.lite_dmg_sha256.clone(),
         kind: CutKind::Real,
         // Never journaled: a resumed self-check re-earns the paint proof.
         no_paint_smoke: false,
@@ -8672,6 +8858,20 @@ pub trait Packager {
         triple: &str,
         notarized: bool,
     ) -> Result<dmg::Packaged>;
+    /// The LEAN drag-install DMG lane (`dmg::create_lite`): restage the ONE
+    /// signed+notarized app with its sealed seed STRIPPED (the same restage
+    /// proof chain the zip runs — `optional = true` `.lproj` seal, codesign +
+    /// Gatekeeper re-proof), then image it through the same hdiutil lane as the
+    /// seeded DMG. `notarized`/`seeded` carry exactly the meanings they carry
+    /// for [`Packager::zip`], guarding the same two failures.
+    fn dmg_lite(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        notarized: bool,
+        seeded: bool,
+    ) -> Result<dmg::Packaged>;
     fn sha256(&self, path: &Path) -> Result<String>;
     fn size(&self, path: &Path) -> Result<u64>;
 }
@@ -8703,6 +8903,16 @@ impl Packager for RealPackager {
     ) -> Result<dmg::Packaged> {
         dmg::create_arch_filtered(app, dist, version, triple, notarized).map_err(Error::new)
     }
+    fn dmg_lite(
+        &self,
+        app: &Path,
+        dist: &Path,
+        version: &str,
+        notarized: bool,
+        seeded: bool,
+    ) -> Result<dmg::Packaged> {
+        dmg::create_lite(app, dist, version, notarized, seeded).map_err(Error::new)
+    }
     fn sha256(&self, path: &Path) -> Result<String> {
         dmg::sha256_file(path).map_err(Error::new)
     }
@@ -8713,7 +8923,7 @@ impl Packager for RealPackager {
     }
 }
 
-/// Both containers, and the digests the manifest will publish for them.
+/// Every container, and the digests that go on record for them.
 pub struct PackagedCut {
     pub dmg: dmg::Packaged,
     /// The DMG digest AFTER the Tier APPLE hook, which rewrites the bytes.
@@ -8727,10 +8937,21 @@ pub struct PackagedCut {
     /// today's single-DMG behaviour byte-for-byte: a seedless or acknowledged
     /// arm64-only cut emits one DMG and no `dmg_x86_64` manifest keys.
     pub dmg_x86_64: Option<(dmg::Packaged, String, u64)>,
+    /// The LEAN drag-install DMG (`aterm-<v>-lite.dmg`) — unconditional, every
+    /// cut ships one. Its post-hook digest is NOT a manifest field (no client
+    /// elects this container); it becomes `Journal::lite_dmg_sha256`, the byte
+    /// authority for the artifact and its `aterm.dmg` download alias.
+    pub dmg_lite: dmg::Packaged,
+    /// The lite DMG digest AFTER its own container hook, exactly like
+    /// [`Self::dmg_sha256`].
+    pub dmg_lite_sha256: String,
+    /// The lite DMG size AFTER the hook, for the same reason.
+    pub dmg_lite_size: u64,
 }
 
-/// Notarize the bundle, build both containers around it, notarize the DMG, and
-/// return the digests that go in the manifest.
+/// Notarize the bundle, build every container around it (the DMG family, then
+/// the zip), notarize each DMG, and return the digests that go on record —
+/// the manifest's for the containers it names, the journal's for the lite DMG.
 ///
 /// # The order is the property
 ///
@@ -8852,6 +9073,22 @@ pub fn notarize_and_package(
     } else {
         None
     };
+    // THE LEAN DRAG-INSTALL DMG — the seed-stripped restage in the seeded
+    // DMG's image lane, then the SAME container hook and the SAME re-hash rule
+    // as every other DMG: the digest that goes on record (the journal, here —
+    // this container is deliberately not a manifest field) must cover the
+    // stapled bytes clients actually download. Last of the DMG family so a
+    // notarization failure on a fleet-critical image stops the cut before the
+    // browser-alias image spends a wait, and before the zip so `ditto` still
+    // runs at the very end.
+    let lite_out = pack.dmg_lite(app, dist, version, notarized_app, seeded)?;
+    let lite_notarized =
+        sign::sign_and_notarize_dmg(&lite_out.path, tier, tools).map_err(Error::new)?;
+    let (dmg_lite_sha256, dmg_lite_size) = if lite_notarized {
+        (pack.sha256(&lite_out.path)?, pack.size(&lite_out.path)?)
+    } else {
+        (lite_out.sha256.clone(), lite_out.size_bytes)
+    };
     // The updater container, from the SAME signed — and, on the active tier,
     // already stapled — .app. It is built from the bundle rather than from the
     // DMG because `ditto` must archive the bundle directly to preserve its seal,
@@ -8868,6 +9105,9 @@ pub fn notarize_and_package(
         dmg_size,
         zip,
         dmg_x86_64,
+        dmg_lite: lite_out,
+        dmg_lite_sha256,
+        dmg_lite_size,
     })
 }
 
@@ -9039,6 +9279,9 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         dmg_size,
         zip: zout,
         dmg_x86_64,
+        dmg_lite: lout,
+        dmg_lite_sha256: lite_sha,
+        dmg_lite_size: lite_size,
     } = notarize_and_package(
         &app,
         &ctx.dist,
@@ -9058,24 +9301,36 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     if let Some((_, _, x86_size)) = &dmg_x86_64 {
         validate_release_asset_download_size(*x86_size)?;
     }
-    // The stable download twin (`aterm.dmg`) is copied only HERE, after
-    // `notarize_and_package` has produced the FINAL DMG bytes (codesign/staple
-    // rewrites included), so the twin is byte-identical to the bytes dmg_sha
-    // covers. required_asset_names() lists it, so the mirror uploads it and
-    // refuses a channel head without it. On a per-arch cut the twin stays a
-    // byte copy of manifest.dmg — the CANONICAL (arm64, majority-arch) DMG —
-    // so the alab.systems Download button and every printed/bookmarked
-    // `releases/latest/download/aterm.dmg` link keep working unchanged; an
-    // Intel visitor is routed by install.sh (or the release notes), never by
-    // this URL.
-    let stable_dmg = ctx.dist.join(mirror::stable_dmg_asset_name());
-    fs::copy(&dout.path, &stable_dmg).map_err(|e| {
-        Error::new(format!(
-            "copy {} -> {}: {e}",
-            dout.path.display(),
-            stable_dmg.display()
-        ))
-    })?;
+    validate_release_asset_download_size(lite_size)?;
+    // The stable download twins are copied only HERE, after
+    // `notarize_and_package` has produced the FINAL container bytes
+    // (codesign/staple rewrites included), so each twin is byte-identical to
+    // the bytes its in-process digest covers. required_asset_names() lists
+    // every one of them, so the mirror uploads them and refuses a channel head
+    // without them. The zip twin is the PRIMARY download: the alab.systems
+    // homepage is a single evergreen button pointed at
+    // `releases/latest/download/aterm-mac.zip`, the lightweight app-only
+    // container (its seed is stripped by `dmg::create_zip`; the app installs
+    // its toolchain itself on first launch). The DMG twin `aterm.dmg` aliases
+    // the LEAN drag-install DMG for the same person-with-a-browser reason
+    // (approved repoint, 2026-08 — see `mirror::stable_dmg_asset_name`), and
+    // the seeded image's evergreen spelling moves to `aterm-offline.dmg`, a
+    // byte copy of manifest.dmg — the CANONICAL (arm64-seeded, on a per-arch
+    // cut majority-arch) DMG. An Intel visitor is routed by install.sh (or the
+    // release notes), never by these URLs.
+    for (source, twin) in [
+        (&lout.path, ctx.stable_dmg_path()),
+        (&zout.path, ctx.stable_zip_path()),
+        (&dout.path, ctx.stable_offline_dmg_path()),
+    ] {
+        fs::copy(source, &twin).map_err(|e| {
+            Error::new(format!(
+                "copy {} -> {}: {e}",
+                source.display(),
+                twin.display()
+            ))
+        })?;
+    }
     // Provenance AFTER signing: binary_sha256 must cover the SIGNED bytes.
     let provenance_path = bundle::write_provenance(&spec, &app, &signed_by)?;
     if ctx.signature_required {
@@ -9126,6 +9381,16 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         );
     }
     step(
+        "",
+        &format!(
+            "{} ({:.1} MB)  sha256 {}… — lean drag-install variant (seed \
+             stripped, same notarized app; served as `aterm.dmg`)",
+            lout.path.display(),
+            lite_size as f64 / 1_000_000.0,
+            &lite_sha[..12.min(lite_sha.len())]
+        ),
+    );
+    step(
         "zip",
         &format!(
             "{} ({:.1} MB)  sha256 {}… — the container the in-app updater stages from",
@@ -9134,11 +9399,17 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             &zout.sha256[..12.min(zout.sha256.len())]
         ),
     );
-    // `.sha256` sidecars for BOTH containers, from the SAME in-process digests
-    // that feed the manifest — `shasum -a 256 -c` records, exactly like the
-    // Linux tarball's. The DMG is the manual download and its digest otherwise
-    // lives only inside the appcast TOML no human opens; these two ~99-byte
-    // assets are what the release notes' verify instruction points at.
+    // `.sha256` sidecars for the containers AND their stable twins, from the
+    // SAME in-process digests that feed the manifest — `shasum -a 256 -c`
+    // records, exactly like the Linux tarball's. The containers are the manual
+    // downloads and their digests otherwise live only inside the appcast TOML
+    // no human opens; these ~99-byte assets are what the release notes' verify
+    // instruction points at. The twin sidecars restate the twin's digest under
+    // the ALIAS filename — never a rehash of a separate artifact, because each
+    // twin is a byte copy of the exact bytes its digest here covers — since a
+    // `shasum -c` record names the file it checks, and the versioned sidecar
+    // can never verify the file a `releases/latest/download/...` click
+    // actually saves.
     let mut sidecars = vec![
         (
             ctx.dmg_sha256_path(),
@@ -9149,6 +9420,30 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
             ctx.zip_sha256_path(),
             zout.sha256.as_str(),
             mirror::zip_asset_name(&ctx.version),
+        ),
+        (
+            ctx.dmg_lite_sha256_path(),
+            lite_sha.as_str(),
+            mirror::dmg_lite_asset_name(&ctx.version),
+        ),
+        // The alias sidecars restate their SOURCE artifact's digest under the
+        // alias filename: `aterm.dmg` now carries the lite digest and the
+        // seeded digest rides under `aterm-offline.dmg` — each twin above is a
+        // byte copy of exactly the artifact whose digest it restates.
+        (
+            ctx.stable_dmg_sha256_path(),
+            lite_sha.as_str(),
+            mirror::stable_dmg_asset_name(),
+        ),
+        (
+            ctx.stable_zip_sha256_path(),
+            zout.sha256.as_str(),
+            mirror::stable_zip_asset_name(),
+        ),
+        (
+            ctx.stable_offline_dmg_sha256_path(),
+            dmg_sha.as_str(),
+            mirror::stable_offline_dmg_asset_name(),
         ),
     ];
     if let Some((_, x86_sha, _)) = &dmg_x86_64 {
@@ -9162,7 +9457,17 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         fs::write(&path, mirror::sha256_sidecar_contents(sha, &name))
             .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     }
-    step("", "`.sha256` sidecars staged for both containers (shasum -a 256 -c)");
+    step(
+        "",
+        "`.sha256` sidecars staged for every container and every stable twin \
+         (shasum -a 256 -c)",
+    );
+    // The lite digest goes on RECORD here, beside the packaging that minted
+    // it: it is the byte authority for two published assets the manifest
+    // deliberately does not name (`aterm-<v>-lite.dmg` and its `aterm.dmg`
+    // alias — no client elects either), and `step_selfcheck`, the mirror set,
+    // and every resume read it back from exactly this field.
+    ctx.lite_dmg_sha256 = Some(lite_sha.clone());
 
     // ---- manifest + notes (the rolled body, verbatim, once — spec §3) -----
     let cl_text = fs::read_to_string(ctx.repo.join(changelog::CHANGELOG_FILE))
@@ -9173,7 +9478,15 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // address a machine that already runs aterm.
     fs::write(
         ctx.notes_path(),
-        changelog::release_notes_document(&ctx.version, &body, dmg_x86_64.is_some()),
+        // `carries_lite_dmg` is always true HERE (the digest went on record a
+        // few lines up) — passed through the accessor anyway so the guide is
+        // keyed on the same authority as the mirror set, not on code distance.
+        changelog::release_notes_document(
+            &ctx.version,
+            &body,
+            dmg_x86_64.is_some(),
+            ctx.carries_lite_dmg(),
+        ),
     )
     .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
 
@@ -9251,7 +9564,8 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     }
     if let Some(journal) = &mut ctx.journal {
         // `run_pipeline` marks `build` immediately after this returns; that
-        // same atomic save persists the signature fact before later steps.
+        // same atomic save persists the signature fact — and the lite DMG's
+        // digest record — before later steps.
         journal.manifest_signed = ctx.manifest_signed;
         journal.signature_required = ctx.signature_required;
         journal.signature_pubkey.clone_from(&ctx.signature_pubkey);
@@ -9259,6 +9573,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         journal
             .signature_machine_id
             .clone_from(&ctx.signature_machine_id);
+        journal.lite_dmg_sha256.clone_from(&ctx.lite_dmg_sha256);
     }
     Ok(())
 }
@@ -9723,6 +10038,197 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
         }
     };
 
+    // THE LEAN DRAG-INSTALL DMG. Its byte authority is the CUT'S OWN digest
+    // record (`lite_dmg_sha256` — the signed manifest deliberately names no
+    // lite container, since no client elects one), and dist/ is mutable while
+    // a resume skips `step_build`, so record and bytes are re-proved against
+    // each other here, under the pure rule `lite_dmg_selfcheck_plan` states.
+    // A cut with NO record at all is a PRE-LITE journal re-entering selfcheck:
+    // the artifact is built NOW, through the same packaging + container-hook
+    // lane `step_build` runs, and its digest recorded — upgrading the old
+    // journal in place instead of stranding it. (A pre-lite journal already
+    // PAST selfcheck deliberately stays pre-lite: its mirrored set must not
+    // grow names its published head never carried.)
+    let lite_name = mirror::dmg_lite_asset_name(&ctx.version);
+    let lite_path = ctx.dmg_lite_path();
+    let observed_lite = if lite_path.is_file() {
+        Some(dmg::sha256_file(&lite_path)?)
+    } else {
+        None
+    };
+    let lite_sha = match lite_dmg_selfcheck_plan(
+        ctx.lite_dmg_sha256.as_deref(),
+        observed_lite.as_deref(),
+        ctx.mirror_upload_intent_issued(&lite_name),
+    ) {
+        LiteDmgPlan::Proven => ctx
+            .lite_dmg_sha256
+            .clone()
+            .expect("Proven implies a recorded digest"),
+        LiteDmgPlan::RefuseDivergent => {
+            return Err(Error::new(format!(
+                "self-check failed: lean DMG {} sha256 {} != this cut's recorded {} — \
+                 this cutter only writes what it records, so something else wrote these \
+                 bytes; refusing to alias them as `aterm.dmg` for every browser download",
+                lite_path.display(),
+                observed_lite.as_deref().unwrap_or("<unhashable>"),
+                ctx.lite_dmg_sha256.as_deref().unwrap_or("<none>"),
+            )));
+        }
+        LiteDmgPlan::RefuseIrreproducible => {
+            return Err(Error::new(format!(
+                "self-check failed: lean DMG {} is missing from dist/ but its upload \
+                 toward the public channel was already durably issued — a rebuild cannot \
+                 reproduce those exact bytes (imaging and stapling are not deterministic), \
+                 so converging would publish different bytes than the issued intent \
+                 covers. Inspect the mirror release by hand",
+                lite_path.display(),
+            )));
+        }
+        LiteDmgPlan::Rebuild => {
+            // Quality must survive the rebuild: on a cut whose manifest claims
+            // a team, every DMG ships Dev-ID signed, notarized and stapled —
+            // and a resume past `build` deliberately resolves no signing tier
+            // (`resume_apple_tier`), so say what is missing rather than alias
+            // an unsigned image on a notarized release.
+            let team = manifest.team_id.clone().unwrap_or_default();
+            let notarized = !team.is_empty();
+            if notarized && ctx.apple.identity().is_none() {
+                return Err(Error::new(format!(
+                    "self-check must build the lean DMG {lite_name} (this cut predates \
+                     the lite lane or lost the artifact), but the manifest claims team \
+                     {team} and this session resolved no signing identity — finish this \
+                     cut with the cutter version that started it, or re-cut with the \
+                     Developer ID configuration available",
+                )));
+            }
+            // The cut's own claim about the seal, from the attested provenance
+            // record beside the artifacts (validated against this claim above)
+            // — the exact `seeded` fact `step_build` hands the packagers, so
+            // the strip's silent-no-op tripwire keeps firing on a rebuild.
+            let seeded = String::from_utf8_lossy(&provenance)
+                .lines()
+                .any(|line| line == "seed=yes");
+            let out =
+                dmg::create_lite(&app, &ctx.dist, &ctx.version, notarized, seeded)
+                    .map_err(Error::new)?;
+            let hooked = sign::sign_and_notarize_dmg(&out.path, &ctx.apple, &sign::RealAppleTools)
+                .map_err(Error::new)?;
+            let (sha, size) = if hooked {
+                (
+                    dmg::sha256_file(&out.path)?,
+                    fs::metadata(&out.path)
+                        .map_err(|e| Error::new(format!("stat {}: {e}", out.path.display())))?
+                        .len(),
+                )
+            } else {
+                (out.sha256.clone(), out.size_bytes)
+            };
+            validate_release_asset_download_size(size)?;
+            // Record FIRST, then refresh the derivatives, so a crash between
+            // the two leaves a recorded digest and stale copies the next
+            // selfcheck pass regenerates — never fresh bytes with no record.
+            ctx.lite_dmg_sha256 = Some(sha.clone());
+            if let Some(journal) = &mut ctx.journal {
+                journal.lite_dmg_sha256 = Some(sha.clone());
+                journal.save(&ctx.journal_path)?;
+            }
+            // The lite sidecar and the `aterm.dmg` alias + alias sidecar are
+            // pure derivatives of the bytes just built — refresh them outright
+            // (a pre-lite resume's `aterm.dmg` still aliases the SEEDED image
+            // here, and judging that stale copy would strand the very resume
+            // this arm exists to finish).
+            fs::write(
+                ctx.dmg_lite_sha256_path(),
+                mirror::sha256_sidecar_contents(&sha, &lite_name),
+            )
+            .map_err(|e| {
+                Error::new(format!("self-check: write {}: {e}", ctx.dmg_lite_sha256_path().display()))
+            })?;
+            fs::copy(&out.path, ctx.stable_dmg_path()).map_err(|e| {
+                Error::new(format!(
+                    "self-check: copy {} -> {}: {e}",
+                    out.path.display(),
+                    ctx.stable_dmg_path().display()
+                ))
+            })?;
+            fs::write(
+                ctx.stable_dmg_sha256_path(),
+                mirror::sha256_sidecar_contents(&sha, &mirror::stable_dmg_asset_name()),
+            )
+            .map_err(|e| {
+                Error::new(format!(
+                    "self-check: write {}: {e}",
+                    ctx.stable_dmg_sha256_path().display()
+                ))
+            })?;
+            step(
+                "",
+                &format!(
+                    "lean DMG {lite_name} built at self-check ({:.1} MB)  sha256 {}… — \
+                     digest recorded; `aterm.dmg` alias refreshed",
+                    size as f64 / 1_000_000.0,
+                    &sha[..12.min(sha.len())]
+                ),
+            );
+            sha
+        }
+    };
+
+    // The stable download twins are byte copies of containers already proved
+    // against their digest records — the manifest's for the zip and the
+    // seeded image, the cut's own for the lean image — and dist/ is mutable
+    // while a resume skips `step_build`, so the copies are re-proved too: the
+    // mirror later verifies the public channel's alias objects against dist/'s
+    // twins, never against the canonical containers, so a stale twin here
+    // would cross byte-verified against itself. The digest is the record's
+    // own — the twin is only ever a byte copy, so hashing it and comparing IS
+    // the identity proof, never an independent record. A twin MISSING outright
+    // is a pre-twin (or, for `aterm-offline.dmg`, pre-lite) journal's resume
+    // shape and is regenerated from the proven canonical bytes (same reasoning
+    // as the sidecars below); a twin PRESENT with different bytes is refused,
+    // not repaired — this cutter only writes byte copies, so something else
+    // wrote it.
+    for (twin, source, expected_sha, what) in [
+        (
+            ctx.stable_dmg_path(),
+            ctx.dmg_lite_path(),
+            lite_sha.as_str(),
+            "stable DMG twin (lean alias)",
+        ),
+        (
+            ctx.stable_zip_path(),
+            ctx.zip_path(),
+            zip_sha256.as_str(),
+            "stable zip twin",
+        ),
+        (
+            ctx.stable_offline_dmg_path(),
+            ctx.dmg_path(),
+            manifest.sha256.as_str(),
+            "stable offline DMG twin (seeded alias)",
+        ),
+    ] {
+        if !twin.exists() {
+            fs::copy(&source, &twin).map_err(|e| {
+                Error::new(format!(
+                    "self-check: copy {} -> {}: {e}",
+                    source.display(),
+                    twin.display()
+                ))
+            })?;
+        }
+        let sha = dmg::sha256_file(&twin)?;
+        if !sha.eq_ignore_ascii_case(expected_sha) {
+            return Err(Error::new(format!(
+                "self-check failed: {what} {} sha256 {sha} != manifest {expected_sha} — \
+                 the evergreen `releases/latest/download` alias would serve different \
+                 bytes than the release it fronts",
+                twin.display()
+            )));
+        }
+    }
+
     // The `.sha256` sidecars on disk must state EXACTLY the digests the manifest
     // does — dist/ is mutable and a resume skips `step_build`, so a stale sidecar
     // from an earlier attempt would ship a verification record that fails against
@@ -9733,7 +10239,13 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
     // by a pre-sidecar cutter, resumed by this one. Sidecars are pure functions
     // of digests the manifest already binds, so they are regenerated here the
     // same way `recover_published_cut` reconstructs them for old releases —
-    // refusing would strand every journal written before sidecars existed.
+    // refusing would strand every journal written before sidecars existed. The
+    // twins' ALIAS sidecars ride the same rule: same digests, alias filenames
+    // (`aterm.dmg.sha256` restates the LEAN digest, `aterm-offline.dmg.sha256`
+    // the seeded one — each names the exact bytes its evergreen URL saves).
+    let stable_dmg_name = mirror::stable_dmg_asset_name();
+    let stable_zip_name = mirror::stable_zip_asset_name();
+    let stable_offline_name = mirror::stable_offline_dmg_asset_name();
     let mut sidecar_checks = vec![
         (
             ctx.dmg_sha256_path(),
@@ -9741,6 +10253,26 @@ fn step_selfcheck(ctx: &mut CutCtx) -> Result<()> {
             manifest.dmg.as_str(),
         ),
         (ctx.zip_sha256_path(), zip_sha256.as_str(), zip_name.as_str()),
+        (
+            ctx.dmg_lite_sha256_path(),
+            lite_sha.as_str(),
+            lite_name.as_str(),
+        ),
+        (
+            ctx.stable_dmg_sha256_path(),
+            lite_sha.as_str(),
+            stable_dmg_name.as_str(),
+        ),
+        (
+            ctx.stable_zip_sha256_path(),
+            zip_sha256.as_str(),
+            stable_zip_name.as_str(),
+        ),
+        (
+            ctx.stable_offline_dmg_sha256_path(),
+            manifest.sha256.as_str(),
+            stable_offline_name.as_str(),
+        ),
     ];
     if let Some((name, sha)) = &x86_pair {
         sidecar_checks.push((ctx.dmg_x86_64_sha256_path(), sha.as_str(), name.as_str()));
@@ -11206,6 +11738,7 @@ fn prove_channel_is_anonymously_readable(ctx: &CutCtx, slug: &str) -> Result<()>
         ctx.signature_required,
         ctx.attaches_roster(),
         ctx.staged_manifest_dmg_x86_64().is_some(),
+        ctx.carries_lite_dmg(),
     ) {
         if !body.contains(&format!("\"name\":\"{name}\"")) {
             return Err(Error::new(format!(
@@ -11385,6 +11918,7 @@ fn prove_mirror_draft_assets(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         ctx.signature_required,
         ctx.attaches_roster(),
         ctx.staged_manifest_dmg_x86_64().is_some(),
+        ctx.carries_lite_dmg(),
     )?;
     for file in ctx.mirror_asset_paths() {
         let name = file
@@ -11424,6 +11958,7 @@ fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Resul
         ctx.signature_required,
         ctx.attaches_roster(),
         ctx.staged_manifest_dmg_x86_64().is_some(),
+        ctx.carries_lite_dmg(),
     )?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
@@ -11710,6 +12245,7 @@ mod roster_wiring_tests {
             mirror_release_id: None,
             mirror_create_issued: false,
             mirror_upload_intents: Vec::new(),
+            lite_dmg_sha256: None,
             kind: CutKind::Real,
             no_paint_smoke: false,
             lease: None,
@@ -11778,6 +12314,51 @@ mod roster_wiring_tests {
                 "an unattributed cut must publish no roster: {set:?}"
             );
         }
+    }
+
+    /// THE LEAN LANE'S SET MEMBERSHIP, from the cut's own record. A cut that
+    /// recorded a lite digest serves the lean DMG, its sidecar, and the
+    /// `aterm-offline.dmg` alias pair to the MIRROR — and to the mirror only:
+    /// the PRIVATE draft's exact-set gate binds DMG names to what the manifest
+    /// says about itself, and the manifest deliberately names no lite
+    /// container, so the upload and byte-proof sets must never grow these
+    /// names. A pre-lite cut (no record — a recovery, or an old journal past
+    /// selfcheck) keeps every set byte-for-byte what it always was.
+    #[test]
+    fn a_recorded_lite_digest_routes_the_lean_assets_to_the_mirror_set_only() {
+        let mut lite = ctx(None);
+        lite.lite_dmg_sha256 = Some("c6".repeat(32));
+        assert!(lite.carries_lite_dmg());
+        let mirror_set = names(&lite.mirror_asset_paths());
+        for name in [
+            "aterm-0.5.0-lite.dmg",
+            "aterm-0.5.0-lite.dmg.sha256",
+            "aterm-offline.dmg",
+            "aterm-offline.dmg.sha256",
+        ] {
+            assert!(
+                mirror_set.contains(&name.to_string()),
+                "{name} missing from the mirror set: {mirror_set:?}"
+            );
+        }
+        for (label, set) in [
+            ("upload", lite.upload_asset_paths()),
+            ("draft byte-proof", lite.proof_asset_paths()),
+        ] {
+            let set = names(&set);
+            assert!(
+                !set.iter().any(|n| n.contains("lite") || n.contains("offline")),
+                "the {label} set must never carry the mirror-only lean assets: {set:?}"
+            );
+        }
+
+        let pre_lite = ctx(None);
+        assert!(!pre_lite.carries_lite_dmg());
+        let set = names(&pre_lite.mirror_asset_paths());
+        assert!(
+            !set.iter().any(|n| n.contains("lite") || n.contains("offline")),
+            "a pre-lite cut's mirror set must not grow one name: {set:?}"
+        );
     }
 
     /// The verdict's three attribution fields reach the cut TOGETHER, or the release

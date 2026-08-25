@@ -3038,6 +3038,19 @@ impl App {
                             ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
                         }
+                        // ...except NAVIGATION, which since the jump-comet
+                        // work arms the MOTION candidate: a press whose whole
+                        // purpose is to move the cursor is the honest witness
+                        // of the jump that follows. Admission is shape-gated
+                        // engine-side (two or more rows, or a meteor-scale
+                        // sweep), so a small hop or an app that ignores the
+                        // key still lays nothing.
+                        if navigation_key {
+                            ws.cursor_glow.note_motion(input_now);
+                            if let Some(origin) = ws.cursor_glow.cursor_anchor() {
+                                ws.cursor_trail.arm_motion(input_now, origin);
+                            }
+                        }
                         // Establish KILL AFTER the generic disarm. Moving kills
                         // need `note_kill`'s fresh nav classifier; stationary
                         // kills retain only their row-shrink poof proof and arm

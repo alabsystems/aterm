@@ -145,6 +145,12 @@ fn confirm_cursor_move_candidate(
             window.cursor_trail.retire_content_candidate(at, origin);
             false
         }
+        Some(aterm_effects::cursor_glow::ContentCandidateDecision::Downgraded { at, origin }) => {
+            // The refuted echo proved the press was a MOTION command; both
+            // engines now hold the same jump-shaped candidate.
+            window.cursor_trail.arm_motion(at, origin);
+            false
+        }
         None => false,
     };
     // ONE ownership verdict per frame: the glow engine (owner of the row
@@ -20494,6 +20500,19 @@ impl App {
                         focus_ambiguous_cjk,
                     );
                 }
+            } else {
+                // Swap this UNFOCUSED pane's PERSISTENT buffer into `pane_scratch`
+                // for the extraction + blit below (audit-2 item 11), mirroring
+                // the focused pane's `composed_focus_scratch` swap above. Every
+                // `pane_scratch` read in this iteration then sees this pane's own
+                // resident buffer — capacity kept across frames (no shrink/grow
+                // churn), identity kept (the scoped refill can fire). Swapped
+                // back at the loop's end. `or_default()` mints an empty buffer
+                // the first frame a session appears; `focus` never lands here
+                // (this is the `else` of `r.session == focus`), so it can never
+                // collide with `composed_focus_scratch`.
+                let buf = ws.unfocused_pane_scratch.entry(r.session).or_default();
+                std::mem::swap(&mut ws.pane_scratch, buf);
             }
             // TERM-LOCK DIET (the ghostty #13227 shape): the per-pane hold covers
             // ONLY a background pane's grid extract + damage consume. The focused
@@ -20557,11 +20576,19 @@ impl App {
                 (focus_title_sample.clone(), pred_paint, focus_blank)
             } else {
                 let mut term = term_lock(term);
-                term.cell_frame_into(&mut ws.pane_scratch, sub_rows, sub_cols);
+                // DMG-1 scoped arm on the per-session buffer swapped into
+                // `pane_scratch` above: its terminal_id/extract_gen continuity
+                // now holds across frames, so an idle background pane refills
+                // only its damaged rows instead of the whole grid under the
+                // per-pane lock. The scoped fn consumes damage itself (no
+                // explicit `take_damage`), exactly like the single-pane and
+                // rescan sites; a continuity break falls back to the full arm.
+                let refill =
+                    term.cell_frame_damage_scoped_into(&mut ws.pane_scratch, sub_rows, sub_cols);
+                metrics::note_frame_refill(refill);
                 ws.capture_leaf_snapshot_seqs
                     .push(ws.pane_scratch.snapshot_seq);
                 let blank = terminal_blank_cell(&term);
-                term.take_damage();
                 (term.title_arc(), None, blank)
             };
             // ---- Pane guard dropped: host-state-only prediction work. The
@@ -20624,7 +20651,23 @@ impl App {
                     None => ws.input_scratch.cursor_visible = false,
                 }
                 std::mem::swap(&mut ws.pane_scratch, &mut ws.composed_focus_scratch);
+            } else {
+                // Return this pane's persistent buffer to the map, holding its
+                // fresh extraction for next frame and restoring `pane_scratch`'s
+                // shared identity for the next iteration — the mirror of the
+                // focused swap-back above. The entry exists (the swap-in minted
+                // it), so `get_mut` cannot miss.
+                if let Some(buf) = ws.unfocused_pane_scratch.get_mut(&r.session) {
+                    std::mem::swap(&mut ws.pane_scratch, buf);
+                }
             }
+        }
+        // Prune per-session buffers to the LIVE pane set (like leaf_render_cache
+        // above), so a closed pane's buffer cannot linger past its session.
+        {
+            let live: std::collections::BTreeSet<u64> =
+                panes.iter().map(|(r, _)| r.session).collect();
+            ws.unfocused_pane_scratch.retain(|sid, _| live.contains(sid));
         }
         // All pure/mixed and live/capture composed paths share this exact
         // projection.  The engine streams are window-absolute; the tab-strip

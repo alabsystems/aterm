@@ -78,6 +78,7 @@ fn journal(done: Vec<String>) -> publish::Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done,
     }
 }

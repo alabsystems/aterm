@@ -52,15 +52,18 @@ puts `aterm.app` in `/Applications` (or `~/Applications`), and links one
 token for the updater's private-repo lane (`--no-token` skips this; the public
 channel needs no token), and `--no-path` leaves your shell profile untouched.
 `--no-toolchain` keeps the packages off entirely
-(`aterm pkg install --default-set` later); run it again with `--uninstall` to
-reverse everything it installed.
+(`aterm pkg install --default-set` later); `--dry-run` prints the entire plan
+— elected release, asset + size, every destination, what it would edit —
+without installing anything; run it again with `--uninstall` to reverse
+everything it installed.
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel) — and, from v0.44.0, for Linux x86_64 as a tarball on the same
 releases — from the public release channel at
 [github.com/alabsystems/aterm/releases](https://github.com/alabsystems/aterm/releases).
-Every macOS release is the same app in three containers (the Intel DMG joins
-with the first cut after 2026-08-22; older releases carry the first two):
+Every macOS release is the same app in a few containers (the Intel DMG joins
+with the first cut after 2026-08-22, the lean DMG with the first cut after
+2026-08-24; older releases carry fewer):
 
 - **`aterm-X.Y.0-mac.zip` (~27 MB) — the recommended install.** The signed,
   notarized app alone; the toolchain streams in on first launch (or on
@@ -70,6 +73,12 @@ with the first cut after 2026-08-22; older releases carry the first two):
 - **`aterm-X.Y.0-x86_64.dmg` (~0.96 GB) — batteries included, Intel.** The
   identical signed, notarized universal app; the seed carries the x86_64
   builds of every ALab program instead.
+- **`aterm-X.Y.0-lite.dmg` (~28 MB) — the same app alone, as a drag-install
+  DMG** (from the first cut after 2026-08-24). From that same cut each release
+  also carries permanent `releases/latest/download/` names: `aterm.dmg` (the
+  lean DMG), `aterm-mac.zip` (the zip), and `aterm-offline.dmg` (the full
+  batteries-included DMG, for installs with no network). Every container has a
+  `.sha256` sidecar: `shasum -a 256 -c <asset>.sha256`.
 
 You can also download a container yourself and drag `aterm.app` into
 Applications.
@@ -89,7 +98,7 @@ or download the DMG for your CPU (the bare `aterm-X.Y.0.dmg` seals the
 Apple-silicon toolchain, `aterm-X.Y.0-x86_64.dmg` the Intel one) and drag
 `aterm.app` into Applications. The DMG is big for exactly one reason: about a
 gigabyte of it is that toolchain seed, riding inside the signed app; installed,
-the toolset unpacks to ~4.2 GB and the app reclaims the sealed copy. From the
+the toolset unpacks to ~4.4 GiB and the app reclaims the sealed copy. From the
 first cut after 2026-08-22 the seed is packed for THIS architecture only
 (~1.1 GB instead of the dual-arch 2.1 GB); a release from before that date is
 the single dual-arch DMG.

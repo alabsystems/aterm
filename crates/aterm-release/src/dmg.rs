@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bundle packaging (release spec §6 `dmg.rs`). Up to three containers carry
+//! Bundle packaging (release spec §6 `dmg.rs`). Up to four containers carry
 //! the SAME signed `aterm.app`:
 //!
 //! * the **DMG** — `hdiutil create` UDZO with the `/Applications` symlink (the
@@ -11,6 +11,10 @@
 //!   `aterm-<v>.dmg` with the arm64 seed slice, plus the additive
 //!   `aterm-<v>-x86_64.dmg` with the Intel slice — one signing, one
 //!   notarization, two restages of the `optional = true` `.lproj` seal.
+//! * the **lite DMG** ([`create_lite`]) — the SEED-STRIPPED (lean) app in the
+//!   same drag-install image: the ~28 MB browser download for a machine that
+//!   installs its toolchain from the network on first launch. Same restage
+//!   proof chain as the zip, same hdiutil lane and container hook as the DMG.
 //! * the **zip** — `ditto -c -k --sequesterRsrc --keepParent`. This is what the
 //!   in-app updater stages from, because `hdiutil attach` needs a live bootstrap
 //!   context (DiskImages registers with the `com.apple.hdiejectd` XPC service)
@@ -326,6 +330,112 @@ pub fn create_arch_filtered(
     Err("per-arch DMG creation requires macOS (hdiutil); build releases on a Mac".into())
 }
 
+/// Package the LEAN (seed-stripped) app into `<out_dir>/aterm-<short>-lite.dmg`
+/// — the drag-install browser download for a machine that installs its
+/// toolchain from the network on first launch: exactly the bundle the updater
+/// zip carries, offered in the DMG gesture the seeded image carries.
+///
+/// One lane, two proven halves. The strip half is [`create_zip`]'s, verbatim:
+/// restage, delete the `optional = true` `.lproj` seal, refuse a seeded cut
+/// whose strip was a silent no-op, and re-prove the stripped bundle through
+/// codesign + Gatekeeper ([`verify_restaged_bundle`], `SeedExpectation::Absent`)
+/// — nothing signed is altered, so the ONE app signing and ONE app notarization
+/// cover this container too. The image half is [`create`]'s, verbatim: the same
+/// versioned volume name, the same `/Applications` symlink stage, the same
+/// `hdiutil create` UDZO lane. The caller then hands this DMG to the SAME
+/// container hook the seeded DMG gets (`sign::sign_and_notarize_dmg` — Dev-ID
+/// signature, notarization, staple, identical identity pin) and re-hashes it,
+/// exactly as `notarize_and_package` sequences for every DMG.
+///
+/// The `-lite` name is ADDITIVE and elected by NO deployed client: install.sh's
+/// asset allowlist and the in-app updater bind only the manifest-named
+/// containers, and the signed manifest deliberately does not name this one
+/// (see `mirror::dmg_lite_asset_name` for the naming contract). The unversioned
+/// `aterm.dmg` download alias is a byte copy of THIS artifact.
+#[cfg(unix)]
+pub fn create_lite(
+    app: &Path,
+    out_dir: &Path,
+    short_version: &str,
+    notarized: bool,
+    seeded: bool,
+) -> Result<Packaged, String> {
+    if !app.is_dir() {
+        return Err(format!(
+            "{} not found — assemble the bundle first",
+            app.display()
+        ));
+    }
+    let dmg = out_dir.join(format!("aterm-{short_version}-lite.dmg"));
+    let staged = restage_with_seed_filter(
+        app,
+        out_dir,
+        SeedFilter::Remove {
+            stage: "lite-dmg-stage",
+        },
+    )?;
+    // Same refusal, same reason as create_zip: a seeded cut whose strip
+    // silently did nothing would ship a ~1 GB image under the name whose whole
+    // point is that it is small — and from in here "no seal" and "the seal was
+    // removed under us" look identical, so whoever knows must say.
+    if seeded && staged.is_none() {
+        return Err(format!(
+            "this cut seals a toolchain, but {} carries no {} — something removed it \
+             between bundle and package. Refusing to image a lite DMG whose strip was \
+             a silent no-op",
+            app.display(),
+            atpkg::SEED_DIR_NAME
+        ));
+    }
+    let source = staged.as_ref().map_or(app, |s| s.app.as_path());
+    // The proof the design rests on, per artifact as always: the stripped
+    // bundle still verifies (codesign) and still assesses (Gatekeeper, which is
+    // where the stapled ticket participates) — decisive on a notarized cut,
+    // advisory on an ad-hoc one, exactly as for the zip.
+    if staged.is_some() {
+        verify_restaged_bundle(source, notarized, SeedExpectation::Absent)?;
+    }
+
+    let volname = format!("aterm {short_version}");
+    let _ = std::fs::remove_file(&dmg);
+    let stage = out_dir.join(format!(".dmg-stage-lite-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&stage);
+    std::fs::create_dir_all(&stage).map_err(|e| format!("create {}: {e}", stage.display()))?;
+    let result = build_in_stage(source, &stage, &volname, &dmg);
+    let _ = std::fs::remove_dir_all(&stage); // cleanup on success AND failure
+    drop(staged); // remove the lean restage before hashing
+    result?;
+
+    let size_bytes = std::fs::metadata(&dmg)
+        .map_err(|e| format!("stat {}: {e}", dmg.display()))?
+        .len();
+    let sha256 = sha256_file(&dmg)?;
+    println!(
+        "==> done: {} ({:.1} MB, lean — seed stripped)",
+        dmg.display(),
+        size_bytes as f64 / 1_000_000.0
+    );
+    println!("    sha256: {sha256}");
+    Ok(Packaged {
+        path: dmg,
+        sha256,
+        size_bytes,
+    })
+}
+
+/// Lite-DMG assembly is macOS end-to-end (restage + hdiutil); refuse plainly
+/// elsewhere, exactly like [`create_arch_filtered`].
+#[cfg(not(unix))]
+pub fn create_lite(
+    _app: &Path,
+    _out_dir: &Path,
+    _short_version: &str,
+    _notarized: bool,
+    _seeded: bool,
+) -> Result<Packaged, String> {
+    Err("lite DMG creation requires macOS (hdiutil); build releases on a Mac".into())
+}
+
 /// A scratch copy of the signed bundle with the toolchain seed removed, deleted
 /// on drop. `None` when the bundle carries no seed (an `ATERM_SEEDLESS=1` cut),
 /// in which case the caller archives the original and copies nothing.
@@ -349,9 +459,12 @@ impl Drop for SeedlessStage {
 /// How a restage treats the sealed toolchain seed.
 #[cfg(unix)]
 enum SeedFilter<'a> {
-    /// Delete the whole `.lproj` (the lean updater zip — updates never carry
-    /// the seed).
-    Remove,
+    /// Delete the whole `.lproj` — the LEAN restage, shared by the updater zip
+    /// and the lite DMG (neither ever carries the seed). `stage` keeps the two
+    /// lanes' scratch dirs distinct, under the same rule as the per-filter dirs
+    /// below: two restages in one dist/ must never be able to package each
+    /// other's half-built stage.
+    Remove { stage: &'static str },
     /// Keep every signed manifest (`*.toml` + `*.toml.sig` — the registry's
     /// index/roster/pkg quads travel INTACT, their signatures untouched) and
     /// only the named artifact tarballs. The per-arch DMG lane: the keep-set
@@ -379,7 +492,7 @@ enum SeedExpectation {
 /// The lean-zip specialization of [`restage_with_seed_filter`].
 #[cfg(unix)]
 fn strip_seed_into_stage(app: &Path, out_dir: &Path) -> Result<Option<SeedlessStage>, String> {
-    restage_with_seed_filter(app, out_dir, SeedFilter::Remove)
+    restage_with_seed_filter(app, out_dir, SeedFilter::Remove { stage: "zip-stage" })
 }
 
 /// Copy `app` to a scratch stage and apply `filter` to its sealed toolchain
@@ -403,10 +516,11 @@ fn restage_with_seed_filter(
         return Ok(None); // seedless cut — nothing to filter
     }
     let dir = out_dir.join(match filter {
-        SeedFilter::Remove => "zip-stage".to_string(),
-        // Distinct per-filter stage dirs: the zip restage and two DMG restages
-        // run in the same dist/ during one cut, and sharing a path would let
-        // one lane archive another lane's half-built stage.
+        SeedFilter::Remove { stage } => stage.to_string(),
+        // Distinct per-filter stage dirs: the zip restage, the lite-DMG restage
+        // and two per-arch DMG restages run in the same dist/ during one cut,
+        // and sharing a path would let one lane archive another lane's
+        // half-built stage.
         SeedFilter::KeepAssets(_) => format!("dmg-arch-stage-{}", std::process::id()),
     });
     let _ = std::fs::remove_dir_all(&dir);
@@ -436,12 +550,12 @@ fn restage_with_seed_filter(
     }
     let seed = stage.app.join(&seed_rel);
     match filter {
-        SeedFilter::Remove => {
+        SeedFilter::Remove { .. } => {
             let bytes = dir_size(&seed);
             std::fs::remove_dir_all(&seed)
                 .map_err(|e| format!("strip {}: {e}", seed.display()))?;
             println!(
-                "    stripped {} from the updater zip ({:.1} MB — the DMG keeps it)",
+                "    stripped {} from the lean restage ({:.1} MB — the seeded DMG keeps it)",
                 atpkg::SEED_DIR_NAME,
                 bytes as f64 / 1_000_000.0
             );

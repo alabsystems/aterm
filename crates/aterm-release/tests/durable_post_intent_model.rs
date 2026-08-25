@@ -77,6 +77,7 @@ fn journal() -> Journal {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done: Vec::new(),
     }
 }
@@ -120,6 +121,7 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         kind: CutKind::Real,
         no_paint_smoke: false,
         lease: None,

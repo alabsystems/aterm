@@ -38,12 +38,15 @@
 //!
 //! Exactly the client-required set plus the human-required `.sha256` sidecars
 //! crosses over: the manifest, the DMG (the per-arch pair, when the manifest
-//! names an Intel DMG), the updater zip, every container's sidecar, and the
-//! detached signature when the cut is signed. The provenance
-//! text and the dSYM archive stay private — they are debugging aids for the owner,
-//! the client never reads them, and a public channel should carry the smallest
-//! surface that still satisfies the updater. Keeping the set exact also makes
-//! [`validate_mirror_asset_set`] a total check (no "and maybe some extras" hole).
+//! names an Intel DMG), the updater zip, the lite DMG and its `aterm-offline.dmg`
+//! companion alias (on a cut that produced one — see [`dmg_lite_asset_name`]),
+//! the stable download twins (`aterm.dmg`, `aterm-mac.zip`), every container's
+//! and twin's sidecar, and the detached signature when the cut is signed. The
+//! provenance text and the dSYM archive stay private — they are debugging aids
+//! for the owner, the client never reads them, and a public channel should carry
+//! the smallest surface that still satisfies the updater. Keeping the set exact
+//! also makes [`validate_mirror_asset_set`] a total check (no "and maybe some
+//! extras" hole).
 
 use crate::ledger::{Error, Result};
 use crate::manifest_out;
@@ -211,18 +214,87 @@ pub fn dmg_x86_64_asset_name(version: &str) -> String {
 }
 
 /// The stable, version-independent twin of the DMG every release also carries,
-/// so `releases/latest/download/aterm.dmg` is a permanent direct-download URL
-/// (the alab.systems Download button points at it). Byte-identical to the
-/// [`dmg_asset_name`] asset of the same cut — which, on a per-arch-DMG release,
-/// is the CANONICAL (arm64-seeded) DMG: the twin serves the majority-arch
-/// download so the site button and every printed/bookmarked
-/// `releases/latest/download/aterm.dmg` link keeps working unchanged. NO client
-/// elects this name: install.sh and the in-app updater bind to the manifest's
-/// version-bound `dmg` field, so the twin exists purely for the browser
-/// download lane.
+/// so `releases/latest/download/aterm.dmg` is a permanent direct-download URL.
+/// NO client elects this name: install.sh and the in-app updater bind to the
+/// manifest's version-bound `dmg` field, so the twin exists purely for the
+/// browser download lane.
+///
+/// WHICH bytes it aliases changed once, deliberately (2026-08, product-owner
+/// approved). On a cut that produces a lite DMG — every cut this cutter makes
+/// — the twin is byte-identical to the [`dmg_lite_asset_name`] artifact: the
+/// ~28 MB seed-stripped drag-install image, because a browser click on an
+/// evergreen link is a person who wants the app, not a ~1.07 GB offline
+/// toolchain payload their machine will fetch fresh anyway. The seeded image
+/// keeps its version-bound [`dmg_asset_name`] spelling UNCHANGED (that name is
+/// fleet-load-bearing) and gains its own explicit evergreen alias,
+/// [`stable_offline_dmg_asset_name`]. On a pre-lite cut (a recovered old
+/// release) the twin stays what it always was: a byte copy of the canonical
+/// seeded DMG.
 #[must_use]
 pub fn stable_dmg_asset_name() -> String {
     "aterm.dmg".to_string()
+}
+
+/// The stable, version-independent alias of the SEEDED (offline,
+/// batteries-included) DMG, carried exactly when the cut also carries a lite
+/// DMG — the two repoints travel together: the moment `aterm.dmg` starts
+/// serving the lean image, the offline image needs an evergreen spelling of
+/// its own (`releases/latest/download/aterm-offline.dmg`), or the ~1.07 GB
+/// no-network install lane loses its only unversioned URL. Byte-identical to
+/// the [`dmg_asset_name`] asset of the same cut, elected by NO client, sidecar
+/// under the alias name — the same rules as every other twin here.
+#[must_use]
+pub fn stable_offline_dmg_asset_name() -> String {
+    "aterm-offline.dmg".to_string()
+}
+
+/// The stable, version-independent twin of the updater zip — the PRIMARY
+/// download: the alab.systems homepage is a single evergreen button pointed at
+/// `releases/latest/download/aterm-mac.zip`, the lightweight app-only
+/// container (`dmg::create_zip` strips the toolchain seed; the app installs
+/// its toolchain itself on first launch). Byte-identical to the
+/// [`zip_asset_name`] asset of the same cut, exactly as the DMG twin is to its
+/// canonical DMG, and like it elected by NO client — the in-app updater stages
+/// from the manifest's version-bound `zip` field — so it exists purely for the
+/// browser download lane.
+///
+/// The LIGHTWEIGHT DMG ([`dmg_lite_asset_name`]) landed beside these two twins
+/// exactly as this doc once predicted — a name helper, membership in
+/// [`required_asset_names`], and the byte-copy + alias-sidecar staging
+/// `step_build`/`step_selfcheck` give the twins — with ONE deliberate
+/// deviation from the prediction: membership is keyed on the cut carrying a
+/// lite digest record rather than unconditional, because the signed manifest
+/// names no lite container and a recovered pre-lite release must keep its
+/// published byte set exactly (see [`required_asset_names`]).
+#[must_use]
+pub fn stable_zip_asset_name() -> String {
+    "aterm-mac.zip".to_string()
+}
+
+/// The LEAN drag-install DMG for a release version: the seed-stripped app —
+/// the very bundle the updater zip carries — imaged with the `/Applications`
+/// symlink, signed, notarized and stapled through the same lane as the seeded
+/// DMG (`dmg::create_lite`). ADDITIVE beside [`dmg_asset_name`] for the same
+/// reason the Intel variant is: the bare `aterm-<version>.dmg` spelling is
+/// fleet-load-bearing — the deployed updater's `authoritative_dmg_index` and
+/// install.sh's identity bind (`manifest dmg != aterm-$version.dmg` is a hard
+/// refusal, and its asset allowlist admits only the manifest-named container
+/// shapes) both elect the versioned name as the BATTERIES-INCLUDED container
+/// through the signed manifest. Flipping that name's meaning to "lean" would
+/// hand every toolchain-included install a seedless image while passing every
+/// digest check — so the seeded image keeps the bare name, and the lean image
+/// takes this suffix, which no deployed script's allowlist matches and no
+/// client ever looks up.
+///
+/// Deliberately NOT a manifest field: no client elects this container, and the
+/// shared `Manifest` type is compiled into every deployed client — its byte
+/// authority is instead the cut's own in-process post-hook digest, journaled
+/// (`Journal::lite_dmg_sha256`) and restated by the `.sha256` sidecars. That is
+/// also why its membership in [`required_asset_names`] is a parameter rather
+/// than unconditional.
+#[must_use]
+pub fn dmg_lite_asset_name(version: &str) -> String {
+    format!("aterm-{version}-lite.dmg")
 }
 
 /// The canonical updater-container (zip) asset name for a release version. Same
@@ -252,19 +324,24 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 
 /// The EXACT asset set a mirrored release must carry, sorted, as the deployed
 /// updater requires it: the appcast, the version-bound DMG, the version-bound
-/// updater zip, the stable `aterm.dmg` download twin, the two `.sha256`
-/// sidecars a human verifies those containers with, and — only when the cut is
-/// signed — the detached signature the pinned client demands.
+/// updater zip, the stable `aterm.dmg` + `aterm-mac.zip` download twins, the
+/// `.sha256` sidecars a human verifies every one of those containers with, and
+/// — only when the cut is signed — the detached signature the pinned client
+/// demands.
 ///
 /// The zip is unconditional because every manifest this cutter emits names one,
 /// and a manifest naming an asset the channel does not carry is exactly the
-/// live-but-unelectable state this module exists to prevent. The stable twin is
-/// unconditional for the inverse reason: the website's
-/// `releases/latest/download/aterm.dmg` button 404s on any release that drops
-/// it. The sidecars are unconditional for the humans, not the updater: the DMG
-/// is the manual download, its digest lives only inside the appcast TOML nobody
-/// opens, and a download nobody can check is a funnel that trains people not to
-/// check.
+/// live-but-unelectable state this module exists to prevent. The stable twins
+/// are unconditional for the inverse reason: the website's evergreen
+/// `releases/latest/download/aterm-mac.zip` button (the homepage's ONLY
+/// download) and every printed/bookmarked `.../aterm.dmg` link 404 on any
+/// release that drops them. The sidecars are unconditional for the humans, not
+/// the updater: the containers are the manual downloads, their digests
+/// otherwise live only inside the appcast TOML nobody opens, and a download
+/// nobody can check is a funnel that trains people not to check. The TWIN
+/// sidecars restate the same digests under the ALIAS filenames, because
+/// `shasum -a 256 -c` matches on the embedded name — a versioned sidecar can
+/// never verify the file a button-click actually saves.
 ///
 /// `rostered` adds the master-signed machine roster and its signature. It belongs in
 /// the CLIENT-REQUIRED set rather than the private-debugging set for a blunt reason:
@@ -283,19 +360,45 @@ pub fn sha256_sidecar_contents(sha256: &str, asset: &str) -> String {
 /// lacks it fails this exact-set check, and a channel carrying one the manifest
 /// never named fails it too (an asset no manifest names is an asset no install
 /// can verify a digest for).
+///
+/// `lite_dmg` adds the lean drag-install DMG, its `.sha256` sidecar, and the
+/// `aterm-offline.dmg` alias + sidecar for the seeded image (the four names
+/// travel together — see [`stable_offline_dmg_asset_name`] for why). A
+/// parameter like `x86_dmg`, but keyed on a different authority: the signed
+/// manifest deliberately names no lite container ([`dmg_lite_asset_name`]),
+/// so every caller derives the flag from the CUT's own lite digest record
+/// (`Journal::lite_dmg_sha256`). Every cut this cutter builds carries one;
+/// `false` is the pre-lite shape — an old journal resumed past selfcheck, or a
+/// recovery of a release published before the lane existed — whose mirrored
+/// byte set must not change by one name, exactly as for the x86 pair.
 #[must_use]
-pub fn required_asset_names(version: &str, signed: bool, rostered: bool, x86_dmg: bool) -> Vec<String> {
+pub fn required_asset_names(
+    version: &str,
+    signed: bool,
+    rostered: bool,
+    x86_dmg: bool,
+    lite_dmg: bool,
+) -> Vec<String> {
     let mut names = vec![
         manifest_out::MANIFEST_ASSET.to_string(),
         dmg_asset_name(version),
         zip_asset_name(version),
         stable_dmg_asset_name(),
+        stable_zip_asset_name(),
         sha256_sidecar_name(&dmg_asset_name(version)),
         sha256_sidecar_name(&zip_asset_name(version)),
+        sha256_sidecar_name(&stable_dmg_asset_name()),
+        sha256_sidecar_name(&stable_zip_asset_name()),
     ];
     if x86_dmg {
         names.push(dmg_x86_64_asset_name(version));
         names.push(sha256_sidecar_name(&dmg_x86_64_asset_name(version)));
+    }
+    if lite_dmg {
+        names.push(dmg_lite_asset_name(version));
+        names.push(sha256_sidecar_name(&dmg_lite_asset_name(version)));
+        names.push(stable_offline_dmg_asset_name());
+        names.push(sha256_sidecar_name(&stable_offline_dmg_asset_name()));
     }
     if signed {
         names.push(manifest_out::MANIFEST_SIG_ASSET.to_string());
@@ -321,8 +424,9 @@ pub fn validate_mirror_asset_set(
     signed: bool,
     rostered: bool,
     x86_dmg: bool,
+    lite_dmg: bool,
 ) -> Result<()> {
-    let required = required_asset_names(version, signed, rostered, x86_dmg);
+    let required = required_asset_names(version, signed, rostered, x86_dmg, lite_dmg);
     let mut observed: Vec<String> = names.to_vec();
     observed.sort();
     if observed == required {
@@ -400,11 +504,12 @@ mod tests {
         assert_eq!(dmg_asset_name("0.47.0"), "aterm-0.47.0.dmg");
         assert_eq!(dmg_x86_64_asset_name("0.47.0"), "aterm-0.47.0-x86_64.dmg");
         assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
+        assert_eq!(stable_zip_asset_name(), "aterm-mac.zip");
 
-        let without = required_asset_names("0.47.0", true, false, false);
+        let without = required_asset_names("0.47.0", true, false, false, false);
         assert!(!without.iter().any(|n| n.contains("x86_64")), "{without:?}");
 
-        let with = required_asset_names("0.47.0", true, false, true);
+        let with = required_asset_names("0.47.0", true, false, true, false);
         assert!(with.contains(&"aterm-0.47.0-x86_64.dmg".to_string()), "{with:?}");
         assert!(
             with.contains(&"aterm-0.47.0-x86_64.dmg.sha256".to_string()),
@@ -415,9 +520,74 @@ mod tests {
         assert_eq!(extra.len(), 2, "{extra:?}");
 
         // The exact-set check inherits the flag in both directions.
-        validate_mirror_asset_set(&with, "0.47.0", true, false, true).expect("exact set");
-        assert!(validate_mirror_asset_set(&with, "0.47.0", true, false, false).is_err());
-        assert!(validate_mirror_asset_set(&without, "0.47.0", true, false, true).is_err());
+        validate_mirror_asset_set(&with, "0.47.0", true, false, true, false).expect("exact set");
+        assert!(validate_mirror_asset_set(&with, "0.47.0", true, false, false, false).is_err());
+        assert!(validate_mirror_asset_set(&without, "0.47.0", true, false, true, false).is_err());
+    }
+
+    /// PINS THE LITE-DMG NAME SHAPES AND SET MEMBERSHIP. The bare versioned DMG
+    /// name is fleet-load-bearing AS the batteries-included container —
+    /// install.sh's identity bind and the deployed updater elect it through the
+    /// signed manifest — so the lean image is strictly ADDITIVE (`-lite`
+    /// suffix), and the only names that repoint are the unversioned browser
+    /// aliases: `aterm.dmg` serves the lean bytes and the new
+    /// `aterm-offline.dmg` serves the seeded bytes. Exactly four names join the
+    /// mirrored set with the flag, and none without it: a pre-lite cut's
+    /// mirrored byte set must not change by one name.
+    #[test]
+    fn lite_dmg_names_and_required_set_membership() {
+        assert_eq!(dmg_lite_asset_name("0.50.0"), "aterm-0.50.0-lite.dmg");
+        assert_eq!(stable_offline_dmg_asset_name(), "aterm-offline.dmg");
+        assert_eq!(
+            sha256_sidecar_name(&dmg_lite_asset_name("0.50.0")),
+            "aterm-0.50.0-lite.dmg.sha256"
+        );
+        assert_eq!(
+            sha256_sidecar_name(&stable_offline_dmg_asset_name()),
+            "aterm-offline.dmg.sha256"
+        );
+
+        let without = required_asset_names("0.50.0", true, false, false, false);
+        assert!(
+            !without.iter().any(|n| n.contains("lite") || n.contains("offline")),
+            "{without:?}"
+        );
+
+        let with = required_asset_names("0.50.0", true, false, false, true);
+        for name in [
+            "aterm-0.50.0-lite.dmg",
+            "aterm-0.50.0-lite.dmg.sha256",
+            "aterm-offline.dmg",
+            "aterm-offline.dmg.sha256",
+        ] {
+            assert!(with.contains(&name.to_string()), "{name} missing: {with:?}");
+        }
+        // Exactly the four, nothing else, join the set — and the versioned
+        // seeded DMG stays exactly where it was.
+        let extra: Vec<&String> = with.iter().filter(|n| !without.contains(n)).collect();
+        assert_eq!(extra.len(), 4, "{extra:?}");
+        assert!(with.contains(&"aterm-0.50.0.dmg".to_string()), "{with:?}");
+        assert!(with.contains(&"aterm.dmg".to_string()), "{with:?}");
+
+        // The exact-set check inherits the flag in both directions: a lite cut
+        // whose lean assets never crossed is refused, and a pre-lite release
+        // judged as a lite one is refused too.
+        validate_mirror_asset_set(&with, "0.50.0", true, false, false, true).expect("exact set");
+        let err = validate_mirror_asset_set(&without, "0.50.0", true, false, false, true)
+            .expect_err("a lite cut's channel head without the lean DMG is refused");
+        assert!(err.to_string().contains("aterm-0.50.0-lite.dmg"), "{err}");
+        let err = validate_mirror_asset_set(&with, "0.50.0", true, false, false, false)
+            .expect_err("lean assets on a pre-lite release are foreign objects");
+        assert!(err.to_string().contains("aterm-0.50.0-lite.dmg"), "{err}");
+
+        // Both flags compose: an x86-split lite cut carries all six additions.
+        let both = required_asset_names("0.50.0", true, false, true, true);
+        validate_mirror_asset_set(&both, "0.50.0", true, false, true, true).expect("exact set");
+        assert_eq!(
+            both.iter().filter(|n| !without.contains(n)).count(),
+            6,
+            "{both:?}"
+        );
     }
 
     /// The drift this gate exists to stop, in its exact observed form: the tag
@@ -609,23 +779,28 @@ update_channel = \"someone/else\"
     #[test]
     fn required_asset_set_is_exactly_what_the_updater_elects() {
         // Unsigned (Tier REPO, the default): appcast + version-bound DMG + the
-        // version-bound zip the in-app updater actually stages from + the
-        // stable download twin the website button points at + the two
-        // `.sha256` sidecars a human verifies those containers with.
+        // version-bound zip the in-app updater actually stages from + the two
+        // stable download twins the evergreen website URLs point at + the
+        // `.sha256` sidecars a human verifies every one of those with (the
+        // twin sidecars embed the ALIAS names, so `shasum -c` accepts them
+        // against what a button-click actually saves).
         assert_eq!(
-            required_asset_names("0.5.0", false, false, false),
+            required_asset_names("0.5.0", false, false, false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0-mac.zip.sha256".to_string(),
                 "aterm-0.5.0.dmg".to_string(),
                 "aterm-0.5.0.dmg.sha256".to_string(),
                 "aterm-appcast.toml".to_string(),
+                "aterm-mac.zip".to_string(),
+                "aterm-mac.zip.sha256".to_string(),
                 "aterm.dmg".to_string(),
+                "aterm.dmg.sha256".to_string(),
             ]
         );
         // Signed (Tier SIG): a pinned client REFUSES a head with no .sig.
         assert_eq!(
-            required_asset_names("0.5.0", true, false, false),
+            required_asset_names("0.5.0", true, false, false, false),
             vec![
                 "aterm-0.5.0-mac.zip".to_string(),
                 "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -633,7 +808,10 @@ update_channel = \"someone/else\"
                 "aterm-0.5.0.dmg.sha256".to_string(),
                 "aterm-appcast.toml".to_string(),
                 "aterm-appcast.toml.sig".to_string(),
+                "aterm-mac.zip".to_string(),
+                "aterm-mac.zip.sha256".to_string(),
                 "aterm.dmg".to_string(),
+                "aterm.dmg.sha256".to_string(),
             ]
         );
         // The names are the client's literals, not a lookalike.
@@ -646,6 +824,17 @@ update_channel = \"someone/else\"
             "aterm-1.2.3.dmg.sha256"
         );
         assert_eq!(stable_dmg_asset_name(), "aterm.dmg");
+        // The twin names are VERSION-FREE by construction — that is the whole
+        // evergreen-URL property — and their sidecars embed exactly them.
+        assert_eq!(stable_zip_asset_name(), "aterm-mac.zip");
+        assert_eq!(
+            sha256_sidecar_name(&stable_zip_asset_name()),
+            "aterm-mac.zip.sha256"
+        );
+        assert_eq!(
+            sha256_sidecar_name(&stable_dmg_asset_name()),
+            "aterm.dmg.sha256"
+        );
     }
 
     /// The sidecar is only worth publishing if `shasum -a 256 -c` accepts it:
@@ -668,18 +857,24 @@ update_channel = \"someone/else\"
             "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0-mac.zip.sha256".to_string(),
             "aterm.dmg".to_string(),
+            "aterm.dmg.sha256".to_string(),
+            "aterm-mac.zip".to_string(),
+            "aterm-mac.zip.sha256".to_string(),
         ];
-        validate_mirror_asset_set(&ok, "0.5.0", false, false, false).unwrap();
+        validate_mirror_asset_set(&ok, "0.5.0", false, false, false, false).unwrap();
         // Order is irrelevant — GitHub does not promise listing order.
         let reordered = vec![
             "aterm-0.5.0-mac.zip".to_string(),
+            "aterm-mac.zip.sha256".to_string(),
             "aterm-0.5.0-mac.zip.sha256".to_string(),
             "aterm-0.5.0.dmg.sha256".to_string(),
             "aterm.dmg".to_string(),
+            "aterm-mac.zip".to_string(),
             "aterm-0.5.0.dmg".to_string(),
+            "aterm.dmg.sha256".to_string(),
             "aterm-appcast.toml".to_string(),
         ];
-        validate_mirror_asset_set(&reordered, "0.5.0", false, false, false).unwrap();
+        validate_mirror_asset_set(&reordered, "0.5.0", false, false, false, false).unwrap();
 
         // Every way a plausible-looking mirror silently never updates:
         let cases: Vec<(Vec<&str>, &str, bool, &str)> = vec![
@@ -691,6 +886,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -706,6 +904,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -720,6 +921,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -731,16 +935,19 @@ update_channel = \"someone/else\"
                 vec![
                     "aterm-appcast.toml",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
                     "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
                 "aterm-0.5.0.dmg",
             ),
-            // the stable download twin never crossed -> the website's
-            // releases/latest/download/aterm.dmg button 404s on this head
+            // the stable download twin never crossed -> every printed/bookmarked
+            // releases/latest/download/aterm.dmg link 404s on this head
             (
                 vec![
                     "aterm-appcast.toml",
@@ -751,6 +958,41 @@ update_channel = \"someone/else\"
                 false,
                 "aterm.dmg",
             ),
+            // the PRIMARY evergreen download never crossed -> the alab.systems
+            // homepage's single releases/latest/download/aterm-mac.zip button
+            // 404s on this head
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
+                    "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip.sha256",
+                ],
+                "0.5.0",
+                false,
+                "aterm-mac.zip",
+            ),
+            // a twin without its ALIAS sidecar -> the documented shasum -c
+            // one-liner has no record naming the file the button actually saved
+            (
+                vec![
+                    "aterm-appcast.toml",
+                    "aterm-0.5.0.dmg",
+                    "aterm-0.5.0.dmg.sha256",
+                    "aterm-0.5.0-mac.zip",
+                    "aterm-0.5.0-mac.zip.sha256",
+                    "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                ],
+                "0.5.0",
+                false,
+                "aterm-mac.zip.sha256",
+            ),
             // the updater container never crossed -> the manifest names a zip the
             // channel does not carry, and every in-app stage 404s
             (
@@ -760,6 +1002,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0.dmg.sha256",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -774,6 +1019,9 @@ update_channel = \"someone/else\"
                     "aterm-0.61.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -788,6 +1036,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 false,
@@ -802,6 +1053,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                 ],
                 "0.5.0",
                 true,
@@ -816,6 +1070,9 @@ update_channel = \"someone/else\"
                     "aterm-0.5.0-mac.zip",
                     "aterm-0.5.0-mac.zip.sha256",
                     "aterm.dmg",
+                    "aterm.dmg.sha256",
+                    "aterm-mac.zip",
+                    "aterm-mac.zip.sha256",
                     "aterm-0.5.0-dSYM.zip",
                 ],
                 "0.5.0",
@@ -825,7 +1082,7 @@ update_channel = \"someone/else\"
         ];
         for (names, version, signed, needle) in cases {
             let names: Vec<String> = names.into_iter().map(str::to_string).collect();
-            let err = validate_mirror_asset_set(&names, version, signed, false, false)
+            let err = validate_mirror_asset_set(&names, version, signed, false, false, false)
                 .expect_err(&format!("{names:?} must be refused"));
             assert!(
                 err.to_string().contains(needle),

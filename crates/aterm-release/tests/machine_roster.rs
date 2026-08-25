@@ -535,7 +535,7 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
 #[test]
 fn an_unattributed_release_carries_no_roster_assets() {
     assert_eq!(
-        mirror::required_asset_names("0.5.0", true, false, false),
+        mirror::required_asset_names("0.5.0", true, false, false, false),
         vec![
             "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -543,10 +543,14 @@ fn an_unattributed_release_carries_no_roster_assets() {
             "aterm-0.5.0.dmg.sha256".to_string(),
             "aterm-appcast.toml".to_string(),
             "aterm-appcast.toml.sig".to_string(),
+            "aterm-mac.zip".to_string(),
+            "aterm-mac.zip.sha256".to_string(),
             "aterm.dmg".to_string(),
+            "aterm.dmg.sha256".to_string(),
         ],
         "the mirrored set must not grow while the master is unpinned \
-         (the stable download twin is version-independent, not roster growth)"
+         (the stable download twins and their alias sidecars are \
+          version-independent, not roster growth)"
     );
     let manifest = manifest_out::build(&inputs("0.5.0", 500));
     assert_eq!(manifest.machine_id, None, "precondition: unattributed");
@@ -1127,7 +1131,7 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
     );
 
     // The mirrored set the client elects grows by exactly those two names.
-    let names = mirror::required_asset_names("0.5.0", true, true, false);
+    let names = mirror::required_asset_names("0.5.0", true, true, false, false);
     assert!(
         names.contains(&"aterm-machines.toml".to_string()),
         "{names:?}"
@@ -1136,11 +1140,12 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         names.contains(&"aterm-machines.toml.sig".to_string()),
         "{names:?}"
     );
-    mirror::validate_mirror_asset_set(&names, "0.5.0", true, true, false).expect("the exact set");
+    mirror::validate_mirror_asset_set(&names, "0.5.0", true, true, false, false)
+        .expect("the exact set");
     // ...and a mirror that forgets the roster is refused rather than published: the
     // armed client refuses such a head structurally, before any artifact crypto.
-    let forgotten = mirror::required_asset_names("0.5.0", true, false, false);
-    let err = mirror::validate_mirror_asset_set(&forgotten, "0.5.0", true, true, false)
+    let forgotten = mirror::required_asset_names("0.5.0", true, false, false, false);
+    let err = mirror::validate_mirror_asset_set(&forgotten, "0.5.0", true, true, false, false)
         .expect_err("a rostered channel head without its roster is unelectable");
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
 

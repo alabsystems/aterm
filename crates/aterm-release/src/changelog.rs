@@ -277,7 +277,19 @@ pub fn rolled_body(text: &str, version: &str) -> Result<String> {
 /// `intel_dmg` — whether this release carries the per-arch `-x86_64` DMG
 /// variant (the cut knows; docs must not name an asset the release lacks, and
 /// an arm64-only or seedless cut still ships an honest asset guide).
-pub fn release_notes_document(version: &str, changelog_body: &str, intel_dmg: bool) -> String {
+///
+/// `lite_dmg` — whether this release also carries the lean drag-install DMG
+/// and, with it, the evergreen alias trio on the public mirror (`aterm.dmg` =
+/// the lean bytes, `aterm-offline.dmg` = the seeded ones — the 2026-08
+/// repoint, `mirror::stable_dmg_asset_name`). Keyed on the cut's own lite
+/// digest record for the same honesty rule as `intel_dmg`: a recovered
+/// pre-lite release must not advertise assets it does not carry.
+pub fn release_notes_document(
+    version: &str,
+    changelog_body: &str,
+    intel_dmg: bool,
+    lite_dmg: bool,
+) -> String {
     // Sizes are ballpark labels for a reader scanning the asset list, not
     // records (the `.sha256` sidecars are the records): measured on the first
     // per-arch pair built from the real v0.46.0 app — 1,161.6 MB arm64 /
@@ -292,6 +304,21 @@ pub fn release_notes_document(version: &str, changelog_body: &str, intel_dmg: bo
     } else {
         String::new()
     };
+    // The lean lines ride the SAME flag as the assets they describe: the lite
+    // DMG and the alias trio join the mirrored set together (the four names
+    // travel as one — `mirror::required_asset_names`), so a pre-lite release
+    // body names neither.
+    let lite_lines = if lite_dmg {
+        format!(
+            "- `aterm-{version}-lite.dmg` — that same app alone as a drag-install DMG \
+             (~28 MB), if you prefer a DMG to a zip.\n\
+             - `aterm.dmg` / `aterm-mac.zip` / `aterm-offline.dmg` — permanent \
+             `releases/latest/download/` names for the lean DMG, the zip, and the full \
+             batteries-included DMG (the offline pick for a machine with no network).\n"
+        )
+    } else {
+        String::new()
+    };
     format!(
         "**aterm** is the batteries-included terminal for AI. New here? What each file is:\n\
          \n\
@@ -301,6 +328,7 @@ pub fn release_notes_document(version: &str, changelog_body: &str, intel_dmg: bo
          {intel_line}\
          - `aterm-{version}-mac.zip` — the same signed, notarized app alone (~26 MB); the \
          toolchain installs on demand via `aterm pkg install --default-set`.\n\
+         {lite_lines}\
          - `.sha256` files verify a download: `shasum -a 256 -c <asset>.sha256`.\n\
          - `aterm-appcast.toml` / `aterm-machines.toml` (and their `.sig`) are consumed by \
          the in-app self-updater — not for humans.\n\
@@ -370,13 +398,18 @@ mod tests {
     #[test]
     fn the_release_body_is_preamble_then_the_changelog_verbatim() {
         let body = "### Fixed\n- a thing\n- another";
-        let doc = release_notes_document("0.44.0", body, true);
+        let doc = release_notes_document("0.44.0", body, true, true);
         // The preamble names THIS release's exact asset names, so a reader can
         // match the guide against the asset list one screen below it.
         assert!(doc.starts_with("**aterm** is the batteries-included terminal for AI."));
         assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
         assert!(doc.contains("`aterm-0.44.0-x86_64.dmg`"), "{doc}");
         assert!(doc.contains("`aterm-0.44.0-mac.zip`"), "{doc}");
+        // The lean lane's guide entries: the versioned lite DMG and the
+        // evergreen alias trio it travels with (aterm.dmg = lean bytes,
+        // aterm-offline.dmg = seeded — the 2026-08 repoint).
+        assert!(doc.contains("`aterm-0.44.0-lite.dmg`"), "{doc}");
+        assert!(doc.contains("`aterm-offline.dmg`"), "{doc}");
         assert!(doc.contains("shasum -a 256 -c"), "{doc}");
         assert!(doc.contains("atpkg-index-N"), "{doc}");
         // Changelog below the rule, byte-for-byte, newline-terminated.
@@ -384,8 +417,15 @@ mod tests {
 
         // A release WITHOUT the Intel variant (arm64-only ack, seedless, or any
         // pre-pair cut) must not advertise an asset it does not carry.
-        let doc = release_notes_document("0.44.0", body, false);
+        let doc = release_notes_document("0.44.0", body, false, true);
         assert!(!doc.contains("x86_64.dmg"), "{doc}");
+        assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
+
+        // A PRE-LITE release (recovered old cut) must not advertise the lean
+        // DMG or the alias trio it travels with.
+        let doc = release_notes_document("0.44.0", body, true, false);
+        assert!(!doc.contains("lite.dmg"), "{doc}");
+        assert!(!doc.contains("aterm-offline.dmg"), "{doc}");
         assert!(doc.contains("`aterm-0.44.0.dmg`"), "{doc}");
     }
 }

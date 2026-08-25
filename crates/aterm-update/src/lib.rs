@@ -1866,13 +1866,45 @@ pub fn check_now(current_build: u64, _source: &Source) -> UpdateStatus {
 /// `.app`, unlike stderr. A no-op if no logger is installed (e.g. a dev harness).
 #[cfg(target_os = "macos")]
 pub(crate) fn log(msg: &str) {
+    #[cfg(test)]
+    log_capture::record(aterm_log::Level::Info, msg);
     aterm_log::info!("aterm-update: {msg}");
 }
 
 /// Emit a non-fatal updater warning to the app log (see [`log`]).
 #[cfg(target_os = "macos")]
 pub(crate) fn warn(msg: &str) {
+    #[cfg(test)]
+    log_capture::record(aterm_log::Level::Warn, msg);
     aterm_log::warn!("aterm-update: {msg}");
+}
+
+/// Test-only capture of the updater's own log lines, WITH THEIR LEVEL.
+///
+/// Some of the updater's log contracts are a level, not just a wording — above all the
+/// roster-authorized rotation note, which must be INFO exactly once (a WARN there taught
+/// every pristine post-rotation install to distrust its own verified signature, see
+/// `github::fetch_authoritative_release`). `aterm_log`'s global logger cannot pin that
+/// per-test — it is process-wide, install-once, and shared by every parallel test thread
+/// — so [`log`]/[`warn`] feed a thread-local here under `cfg(test)`: each test observes
+/// exactly the lines its own thread emitted, race-free.
+#[cfg(all(test, target_os = "macos"))]
+pub(crate) mod log_capture {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LINES: RefCell<Vec<(aterm_log::Level, String)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record(level: aterm_log::Level, msg: &str) {
+        LINES.with(|lines| lines.borrow_mut().push((level, msg.to_string())));
+    }
+
+    /// Drain this thread's captured lines. Call once BEFORE the action under test to
+    /// clear residue from earlier code on the same thread, and again after to read.
+    pub(crate) fn take() -> Vec<(aterm_log::Level, String)> {
+        LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
+    }
 }
 
 #[cfg(test)]

@@ -407,6 +407,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         mirror_release_id: None,
         mirror_create_issued: false,
         mirror_upload_intents: Vec::new(),
+        lite_dmg_sha256: None,
         done: publish::STEPS
             .iter()
             .take_while(|step| **step != "archive")
