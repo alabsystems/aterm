@@ -2752,7 +2752,10 @@ install_toolchain() {
 	echo "  only out-of-date programs are downloaded; the rest are already current."
 	if ! "$aterm_bin" pkg update; then
 		echo "install.sh: NOTE: could not reach the index to check for newer builds." >&2
-		echo "  the sealed builds are installed and usable; retry later with: $aterm_bin pkg update" >&2
+		# "the sealed builds are installed and usable" was only true on the
+		# macOS DMG path — a lean/zip/Linux install has no seal, and a seed
+		# that installed nothing leaves nothing "usable" (audit-2 item 6).
+		echo "  anything already installed keeps working; retry later with: $aterm_bin pkg update" >&2
 	fi
 	# Deliberately does NOT set INSTALLED_ANY. This half runs on top of an app
 	# the other halves (or a previous run) placed, and on an already-seeded
