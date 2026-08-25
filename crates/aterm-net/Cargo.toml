@@ -27,9 +27,9 @@ aterm-session = { workspace = true }
 # UnixStream alias — zero behavioral change; Windows: AF_UNIX over winsock).
 aterm-uds = { workspace = true }
 # Real capability crypto: HMAC-SHA256 binds the edge token to the channel
-# exporter; constant-time verify via `Mac::verify_slice`.
-hmac = { workspace = true }
-sha2 = { workspace = true }
+# exporter; constant-time verify via `HmacSha256::verify_slice`. SHA-256 also
+# fingerprints the pinned server certificate (tls.rs).
+aterm-digest = { workspace = true }
 rustls = { workspace = true }
 
 [dev-dependencies]

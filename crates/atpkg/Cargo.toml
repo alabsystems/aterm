@@ -77,10 +77,10 @@ toml = { workspace = true }
 serde_json = { workspace = true }
 # In-process SHA-256 for the apply-time `tree_root` re-verify (§4.2/§8): hash every
 # extracted file's content + the sorted (relpath, mode, sha) list. Streamed, so a
-# multi-GB sysroot is never buffered whole. Already a workspace dependency (in the lock
-# via rustls); using it directly avoids spawning `shasum` per file across thousands of
-# files. NOT the signature root — that stays `ring` (§8); this is content-integrity only.
-sha2 = { workspace = true }
+# multi-GB sysroot is never buffered whole. First-party and dependency-free, so it
+# avoids spawning `shasum` per file across thousands of files without importing a
+# crypto stack. NOT the signature root — that stays `ring` (§8); content-integrity only.
+aterm-digest = { workspace = true }
 # The bundle extractor: read a `.tar.zst` and lay it down through the tar-slip-safe
 # `vet_entry` gate (§9/§15). `zstd` is already a workspace dependency (aterm-scrollback);
 # `tar` is the one genuinely-new external dep the design flags for supply-chain audit

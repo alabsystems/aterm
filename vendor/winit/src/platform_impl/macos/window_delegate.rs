@@ -1,3 +1,6 @@
+// Modified by the aterm project in 2026; see the repository NOTICE.
+// (Two marked hunks below emit a settled-size Resized after each fullscreen
+// transition completes; search this file for the aterm local-patch marker.)
 #![allow(clippy::unnecessary_cast)]
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;

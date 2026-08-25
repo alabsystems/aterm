@@ -28,8 +28,8 @@
 // All probes are best-effort: a missing `git`/`date` degrades to "unknown" rather
 // than failing the build (so a source tarball without a .git still compiles).
 
+use aterm_digest::Sha256;
 use base64::Engine as _;
-use sha2::{Digest, Sha256};
 use std::process::Command;
 
 /// Fixed 64-byte lowercase record used only by unpinned development builds.

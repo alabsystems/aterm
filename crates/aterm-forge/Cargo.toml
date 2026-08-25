@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-forge"
+version.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "aterm-forge — the third-party surface survey, provenance notary and carve ledger behind `cargo forge`"
+
+[[bin]]
+name = "aterm-forge"
+path = "src/main.rs"
+
+[lib]
+name = "aterm_forge"
+path = "src/lib.rs"
+
+[dependencies]
+# NET-NEW THIRD-PARTY PACKAGES: ZERO. Every dependency below is already resolved
+# in the shipped graph, so the tool that measures the surface does not enlarge it.
+# `toml_edit` (already at 0.22.27 via crates/aterm-gui) is the ONE parser here:
+# the policy file carries load-bearing comments, and a round-trip that eats them
+# would delete the reasons this program exists to record.
+toml_edit = { version = "0.22" }
+# The shared source-walk (`collect_rs_files`/`is_test_file`) every scan gate
+# uses, and `REVIEWED_VENDORED_CRATES` itself — read directly rather than
+# re-parsed, so the vendor registry has exactly one definition.
+aterm-census = { workspace = true }
+
+[lints]
+workspace = true

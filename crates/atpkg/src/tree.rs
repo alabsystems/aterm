@@ -19,7 +19,7 @@
 use std::io::{self, Read};
 use std::path::Path;
 
-use sha2::{Digest, Sha256};
+use aterm_digest::Sha256;
 
 /// Compute the [`tree_root`](self) over the directory at `root`.
 ///
@@ -296,6 +296,34 @@ mod tests {
         assert_eq!(
             file_sha256(&f).unwrap(),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The cross-version byte contract, PINNED to a literal.
+    ///
+    /// `tree_root_is_deterministic` and `tree_root_changes_on_any_mutation` only
+    /// prove the root is a function of the tree that moves when the tree moves —
+    /// both stay green if the digest primitive, the line framing or the sort
+    /// changes underneath, because they recompute both sides. Signed manifests
+    /// embed roots computed by earlier releases, so what actually has to hold is
+    /// equality with a specific number. This is that number, computed
+    /// independently of this code from the documented format:
+    /// `sort(<relpath> 0x00 <octal mode> 0x00 <hex sha256> 0x0A)`, concatenated,
+    /// SHA-256. Unix-only because the fixture pins real permission bits, which
+    /// Windows reports as 0.
+    #[cfg(unix)]
+    #[test]
+    fn tree_root_matches_the_pinned_cross_version_vector() {
+        let d = tmp("golden");
+        write(&d.join("bin/ay"), b"binary");
+        write(&d.join("data"), b"x");
+        std::fs::set_permissions(d.join("bin/ay"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(d.join("data"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            tree_root(&d).unwrap(),
+            "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0",
+            "tree_root moved: every signed manifest in the wild disagrees with this build"
         );
         let _ = std::fs::remove_dir_all(&d);
     }

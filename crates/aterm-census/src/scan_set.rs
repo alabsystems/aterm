@@ -1424,6 +1424,12 @@ mod tests {
             "crates/aterm-control/src",
             "crates/aterm-core/src",
             "crates/aterm-ctl/src",
+            // Entered the closure when the first-party SHA-256/HMAC-SHA256 crate
+            // replaced `sha2` + `hmac`: aterm-gui, aterm-net, aterm-agent, atpkg
+            // and aterm-update all hash through it now. A normal [dependencies]
+            // edge, so it is GUI process code — it holds no locks, but the census
+            // walks it for exactly that reason.
+            "crates/aterm-digest/src",
             "crates/aterm-effects/src",
             "crates/aterm-error/src",
             "crates/aterm-ffi-types/src",

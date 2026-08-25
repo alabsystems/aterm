@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
-use sha2::{Digest, Sha256};
+use aterm_digest::Sha256;
 
 use crate::native_editor::{
     EditorDiagnosticSpan, EditorSyntaxClass, EditorSyntaxSpan, EditorViewportProjection,

@@ -42,6 +42,15 @@ aterm-census = { workspace = true }
 # split brain one layer down, and it is what let the two copies drift into
 # disagreeing about whether a rustup-linked pin counts.
 aterm-verify = { workspace = true }
+# aterm-forge: the third-party surface policy (`gate forge`). A PATH dep, not a
+# `workspace = true` one — the root manifest's [workspace.dependencies] table has
+# no `aterm-forge` row and that file is not this crate's to edit; the path form
+# resolves the same member and adds no net-new third-party package (forge's own
+# deps — toml_edit, aterm-census — are already in this graph). Linked for
+# the SAME reason aterm-census is: ONE implementation with TWO consumers, so the
+# `gate forge` verb and the `cargo forge check` verb a human runs by hand read
+# the tree by the same rules and cannot drift apart.
+aterm-forge = { path = "../aterm-forge" }
 
 [lints]
 workspace = true

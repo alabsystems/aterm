@@ -32,7 +32,7 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 # DMG sha256 is computed in-process (dmg.rs) — never shelled out to `shasum`,
 # so the digest that lands in the manifest is the digest of the bytes we hashed.
-sha2 = { workspace = true }
+aterm-digest = { workspace = true }
 # Release-channel signatures are verified in the cutter itself.  The signer is
 # deliberately external/owner-only, but trusting its exit status would not bind
 # the bytes uploaded to the public key compiled into clients.

@@ -28,7 +28,7 @@ use aterm_agent::operator::{
     EventGeneration, EventId, EventSnapshot, FaultLatchOutcome, FinalActionPermit,
     FleetFaultReason, FleetGateStatus, NewEvent, OperatorError, QueueConfig, Resolution,
 };
-use sha2::{Digest as _, Sha256};
+use aterm_digest::Sha256;
 
 use crate::session_store::{SessionHandle, SessionState, Store};
 use crate::subscribe::{SubscriberSet, Subscribers, Subscription};
@@ -2369,7 +2369,7 @@ fn observe_handle(handle: &SessionHandle) -> ObservedSession {
     };
     let surface = guard.map(|terminal| {
         let screen_tail = terminal_evidence(&terminal);
-        let fingerprint: [u8; 32] = Sha256::digest(screen_tail.as_bytes()).into();
+        let fingerprint: [u8; 32] = Sha256::digest(screen_tail.as_bytes());
         Surface {
             generation: Generation {
                 lifecycle_epoch: 0,
@@ -2913,7 +2913,7 @@ mod tests {
                     lifecycle_epoch: 0,
                     alternate_screen,
                     content_seq: seq,
-                    fingerprint: Sha256::digest(screen.as_bytes()).into(),
+                    fingerprint: Sha256::digest(screen.as_bytes()),
                 },
                 screen_tail: screen.to_string(),
             }),
@@ -3022,7 +3022,7 @@ mod tests {
         let current = classifier.sessions.get("s-a").unwrap();
         assert!(current.generation.alternate_screen);
         assert_eq!(current.screen_tail, new_grid);
-        let expected_fingerprint: [u8; 32] = Sha256::digest(new_grid.as_bytes()).into();
+        let expected_fingerprint: [u8; 32] = Sha256::digest(new_grid.as_bytes());
         assert_eq!(current.generation.fingerprint, expected_fingerprint);
 
         // Once the new full snapshot settles, the actual candidate is built only
@@ -3975,7 +3975,7 @@ mod tests {
 
     fn enqueue_operator_test_event(queue: &DurableQueue, sid: &str, seq: u64) -> EventId {
         let evidence = format!("ready event {seq}");
-        let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+        let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes());
         let EnqueueOutcome::Enqueued(event_id) = queue
             .enqueue(NewEvent::new(
                 sid,
@@ -4119,7 +4119,7 @@ mod tests {
                 lifecycle_epoch: 0,
                 alternate_screen: false,
                 content_seq: 2,
-                fingerprint: Sha256::digest(b"second ready event").into(),
+                fingerprint: Sha256::digest(b"second ready event"),
             },
             kind: CandidateKind::BusyBecameAttention,
             screen_tail: "second ready event".to_string(),

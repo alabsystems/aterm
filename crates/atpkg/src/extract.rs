@@ -31,7 +31,7 @@
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use aterm_digest::Sha256;
 
 /// Why an archive entry was refused. Any variant aborts the entire staged group — a
 /// half-extracted bundle never activates (§7).

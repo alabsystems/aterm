@@ -45,7 +45,7 @@ base64 = "0.22.1"
 # Shipping introspection fingerprints the decoded compile-time update key. This
 # reports the key the verifier actually consumes, independent of optimizer/lipo
 # treatment of the source base64 literal.
-sha2 = { workspace = true }
+aterm-digest = { workspace = true }
 # The ONE audited entropy surface (`aterm_uds::rand`) for the re-exec nonce —
 # no hand-rolled `/dev/urandom` reads here (that pattern caused the 2026-07-04/05
 # kernel panics). aterm-uds has an empty deps section, so no cycle.

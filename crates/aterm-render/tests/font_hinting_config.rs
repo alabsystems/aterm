@@ -69,10 +69,42 @@ fn default_is_full_and_spellings_round_trip() {
 #[test]
 fn same_value_is_free_change_reports_true() {
     let mut r = renderer();
-    assert!(!r.set_font_hinting("full"), "same-value set is a free no-op");
+    assert!(
+        !r.set_font_hinting("full"),
+        "same-value set is a free no-op"
+    );
     let changed = r.set_font_hinting("light");
     assert_eq!(changed, HINT_SEAM, "a real change reports on the seam only");
     assert!(!r.set_font_hinting("light"), "and is then idempotent");
+}
+
+/// A live-set mode RIDES the font-generation handoffs: the semantic-surface
+/// fork (Settings specimens, Markdown) and the sealed rebuild must render with
+/// the parent's `font_hinting`, not resurrect the env-resolved default — a
+/// `font_hinting = "off"` user must not meet re-hinted text in Settings. On
+/// targets without the seam both getters answer `"off"` and the assertions are
+/// the honesty contract itself.
+#[test]
+fn live_mode_rides_semantic_forks_and_rebuilds() {
+    let mut r = renderer();
+    r.set_font_hinting("off");
+    let fork = r
+        .fork_semantic_surface(12.0, Theme::default())
+        .expect("unsealed fork builds");
+    assert_eq!(
+        fork.font_hinting(),
+        "off",
+        "the unsealed fork must carry the live mode"
+    );
+    let _ = r.seal_admitted_font_sources();
+    let rebuilt = r
+        .fork_semantic_surface(12.0, Theme::default())
+        .expect("sealed fork (rebuild_from_admitted) builds");
+    assert_eq!(
+        rebuilt.font_hinting(),
+        "off",
+        "the sealed rebuild must carry the live mode"
+    );
 }
 
 #[test]

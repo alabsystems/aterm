@@ -86,6 +86,7 @@ mod app_tabs;
 /// worker, the Commit-time admission facts and `finish_update_handoff`. Split
 /// out of `app_input` verbatim; still an inherent `impl App`.
 mod app_update_handoff;
+mod status_surface;
 mod app_update_screen;
 mod app_window;
 #[cfg(test)]

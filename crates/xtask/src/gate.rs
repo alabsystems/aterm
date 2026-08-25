@@ -57,6 +57,32 @@
 //!   code (`fault::triggered("name")`, M7 FAULT-INJECT) must be armed by some test,
 //!   and every armed name must have a real injection site. Keeps the deterministic
 //!   fault-injection harness honest — an untested fail-closed path rots silently.
+//! - `forge`: THIRD-PARTY SURFACE POLICY. The shipped `aterm` binary resolves 153
+//!   third-party packages / 2,081,414 lines of Rust on aarch64-apple-darwin and
+//!   248 / 3,844,574 on Linux — code this repository neither owns nor verifies,
+//!   and the reason `.cargo/config.toml` still carries `-Ztrust-verify=off`. This
+//!   verb re-derives that surface from `cargo tree --locked --offline` (never
+//!   `cargo metadata --filter-platform`, whose feature-unified resolve over-counts
+//!   the macOS root by 28%) and fails on any of five obligation families: the
+//!   provenance/license/NOTICE attestation (`[OB-1]`..`[OB-10]`), a
+//!   `[patch.crates-io]` path fork nobody reviewed (`[OB-11]`), a fork that is not
+//!   the package the graph actually resolves — an UNPATCHED sibling version
+//!   beside it, or a dead patch (`[OB-12]`), a path the carve ledger records as
+//!   deleted that EXISTS again (`[OB-13]`), and a measured surface over its
+//!   ratchet ceiling (`[OB-14]`).
+//!
+//!   IT IS RED TODAY, on purpose: `vendor/winit` ships without its provenance
+//!   files, its two `// LOCAL PATCH (aterm):` sites carry no Apache-2.0 §4(b)
+//!   header notice, and the Linux cell resolves an unpatched `winnow 1.0.3`
+//!   beside the fork that exists to fix an `offset_from` underflow. Every `✗`
+//!   line names its fix.
+//!
+//!   Implemented in `crates/aterm-forge` and shared VERBATIM with the
+//!   `cargo forge check` verb ([`aterm_forge::check::check_report`]) — the same
+//!   one-implementation-two-consumers shape the census gates use, so the gate and
+//!   the hand-run tool cannot diverge. Compiles nothing: it reads `Cargo.lock`,
+//!   the `vendor/` tree, `vendor/forge.toml`, `tools/forge-budget.tsv` and four
+//!   offline `cargo tree` resolutions.
 //! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` + `cargo fmt`
 //!   through the stage2 cargo — plus grep_guard + license headers. Stock
 //!   `cargo clippy` is wrong here and fails closed: the stage2 tree ships no
@@ -112,17 +138,22 @@
 //!   the zstd C-dep); else the pure-Rust engine. Skips gracefully if that rustup
 //!   target is absent. Matches M5's "uname-gated state probe".
 //! - `all`: the [`ALL_ROSTER`] gates — drift, dormant, mainloop, lockorder,
-//!   wasmloop, scope, fault, counts, perf, lint — i.e. every check above except
-//!   `linux` (needs the Linux target), `miri` (needs a nightly miri toolchain),
-//!   `web` and `certified`.
+//!   wasmloop, scope, fault, forge, counts, perf, lint — i.e. every check above
+//!   except `linux` (needs the Linux target), `miri` (needs a nightly miri
+//!   toolchain), `web` and `certified`.
 //!   MANUAL ONLY — nothing invokes `all` itself. This line used to read "what the
 //!   pre-push hook runs"; MEASURED 2026-07-31, that was false. `.githooks/pre-push`
 //!   now runs exactly TWO commands — the `tools/freeze-safety-gate` build (which
 //!   fuses the mainloop / lockorder / wasmloop / scope censuses) and
 //!   `gate lint --no-fmt` — and tools/verify.sh invokes only `drift`, `dormant`,
-//!   `mainloop` and `counts`. So `fault` and `perf` still have NO automated
-//!   caller: run them by hand, or wire them into verify.sh (`fault` is cheap and
-//!   toolchain-free; `perf` belongs behind `--full`).
+//!   `mainloop` and `counts`. So `fault`, `forge` and `perf` still have NO
+//!   automated caller: run them by hand, or wire them into verify.sh (`fault` is
+//!   cheap and toolchain-free; `forge` costs four offline `cargo tree` resolves
+//!   plus a source walk of the whole third-party surface — 12s MEASURED here —
+//!   but it is RED on this tree today, so wiring it into verify.sh would stop
+//!   every merge until the winit provenance files and the shadowed `winnow` are
+//!   dealt with: the owner's call, not a default; `perf` belongs behind
+//!   `--full`).
 //!
 //! THE NON-VACUITY OBLIGATION ([`NON_VACUITY_REGISTRY`]). Six times on
 //! 2026-07-31 a gate in this repo was found ASSERTING MORE THAN IT VERIFIED —
@@ -161,6 +192,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         Some("wasmloop") => gate_wasmloop(),
         Some("scope") => gate_scope(),
         Some("fault") => gate_fault(),
+        Some("forge") => gate_forge(),
         Some("linux") => gate_linux(),
         Some("web") => gate_web(),
         Some("certified") => gate_certified(),
@@ -203,7 +235,7 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
         }
         other => {
             eprintln!(
-                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|fault|linux|web|certified|lint|counts|miri|perf|nonvacuity>\n\
+                "usage: xtask gate <all|drift|dormant|mainloop|lockorder|wasmloop|scope|fault|forge|linux|web|certified|lint|counts|miri|perf|nonvacuity>\n\
                  (unknown check {other:?})"
             );
             false
@@ -235,6 +267,7 @@ const ALL_ROSTER: &[RosterEntry] = &[
     ("wasmloop", gate_wasmloop),
     ("scope", gate_scope),
     ("fault", gate_fault),
+    ("forge", gate_forge),
     ("counts", gate_counts),
     ("perf", gate_perf),
     ("lint", gate_lint),
@@ -381,6 +414,36 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
                      fault point no test arms (and the mirror direction: an armed \
                      name with no injection site)",
             calls: "fault_report",
+            verb_level: true,
+        },
+    },
+    RedFixture {
+        gate: "forge",
+        proof: RedProof::Fixture {
+            test: "a_reinstated_carved_module_reds_the_forge_verb",
+            file: "crates/aterm-forge/tests/red_fixtures.rs",
+            drives: "the VERB: check_report() — the exact symbol `gate_forge` calls — \
+                     over a miniature aterm workspace built in CARGO_TARGET_TMPDIR \
+                     around a REAL copy of vendor/winnow. GREEN first (a fixture that \
+                     is red for an unrelated reason proves nothing), then RED once the \
+                     module `vendor/forge.toml` records as CARVED is reinstated \
+                     ([OB-13], naming the path and quoting the ledger's reason), then \
+                     GREEN again when it is removed — so the verb is shown to move in \
+                     BOTH directions, not merely to be stuck red. Three sibling \
+                     fixtures in the same file drive the same verb through the other \
+                     obligation families: an_unreviewed_patch_entry_reds_the_forge_verb \
+                     ([OB-11], a flawless-in-every-other-respect fork with no \
+                     REVIEWED_VENDORED_CRATES row), \
+                     a_notice_that_omits_a_registered_fork_reds_the_forge_verb ([OB-6], \
+                     proving the DELEGATED attest half reaches the verdict rather than \
+                     being reported and dropped), and \
+                     an_unpatched_sibling_version_reds_the_forge_verb ([OB-12] — the \
+                     live winnow shape synthesized, which cargo itself reports as \
+                     nothing at all). NOT COVERED: [OB-14], the ratchet ceiling. Its \
+                     comparison is proven by aterm-forge's own budget unit tests, not \
+                     through this verb, so a wiring slip that computed the ratchet \
+                     verdict and dropped it would survive these four fixtures.",
+            calls: "check_report",
             verb_level: true,
         },
     },
@@ -1188,6 +1251,29 @@ fn gate_scope() -> bool {
     let outcome = aterm_census::run_scope_census(&workspace_root());
     eprint!("{}", outcome.log);
     outcome.ok
+}
+
+// ---------------------------------------------------------------------------
+// G-FORGE: THIRD-PARTY SURFACE POLICY (provenance, patch liveness, the ratchet)
+// ---------------------------------------------------------------------------
+//
+// The same ONE-IMPLEMENTATION-TWO-CONSUMERS shape as the four censuses above,
+// with `crates/aterm-forge` in the shared-library role:
+//
+//   * THIS verb (`cargo run -p xtask -- gate forge`, part of `gate all`), and
+//   * `cargo forge check` — the hand-run tool, which calls the SAME
+//     `check::check_report` and turns its bool into the exit code.
+//
+// So the gate cannot judge the tree by one rule while the tool a human runs
+// judges it by another. See the crate docs for the obligation list
+// (`[OB-1]`..`[OB-14]`) and the honest precision limits (a `cargo tree` resolve
+// plus lexical reads — no compilation, so a fork's SOURCE is never compared
+// against upstream, only its provenance metadata).
+
+fn gate_forge() -> bool {
+    let (ok, log) = aterm_forge::check::check_report(&workspace_root());
+    eprint!("{log}");
+    ok
 }
 
 // ---------------------------------------------------------------------------

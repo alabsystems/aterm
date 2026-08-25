@@ -24,8 +24,8 @@
 use crate::session_store::{ConnectionCarry, HandoffFds, ScreenCarry, SessionHandoff, WindowCarry};
 use crate::spawn::Adopted;
 use aterm_core::terminal::{CheckpointMeta, TerminalCheckpoint};
+use aterm_digest::Sha256;
 use aterm_session::{LaunchNonce, SessionId};
-use sha2::{Digest, Sha256};
 
 const ENV_MANIFEST: &str = "ATERM_SEAMLESS_MANIFEST";
 pub(crate) const ENV_FDS: &str = "ATERM_SEAMLESS_FDS";
@@ -344,7 +344,7 @@ pub(crate) fn adoption_proof(
     }
     Some(AdoptionProof {
         count,
-        digest: hasher.finalize().into(),
+        digest: hasher.finalize(),
     })
 }
 
@@ -403,7 +403,7 @@ pub(crate) fn layout_wire_digest(wire: &str) -> Option<[u8; 32]> {
     hasher.update(LAYOUT_PROOF_DOMAIN);
     hasher.update(u64::try_from(wire.len()).ok()?.to_be_bytes());
     hasher.update(wire.as_bytes());
-    Some(hasher.finalize().into())
+    Some(hasher.finalize())
 }
 
 /// Which of a checkpoint's two grid blobs a refusal is about.
@@ -839,7 +839,7 @@ fn screen_wire_digest(entries: &mut [ScreenWireEntry<'_>]) -> Option<[u8; 32]> {
             return None;
         }
     }
-    Some(hasher.finalize().into())
+    Some(hasher.finalize())
 }
 
 /// 16 CSPRNG bytes as 32 lowercase-hex chars, for the single-use handoff nonce — minted
@@ -5099,7 +5099,7 @@ mod f4_adoption_proof_asymmetry {
         hasher.update(LAYOUT_PROOF_DOMAIN);
         hasher.update(u64::try_from(wire.len()).unwrap().to_be_bytes());
         hasher.update(wire.as_bytes());
-        hasher.finalize().into()
+        hasher.finalize()
     }
 
     /// Exactly what the child USED TO do: re-derive the digest from the PARSED
@@ -5407,7 +5407,7 @@ mod f4_adoption_proof_asymmetry {
         let parent_digest = {
             let mut hasher = Sha256::new();
             hasher.update(newer_parent_meta.as_bytes());
-            let d: [u8; 32] = hasher.finalize().into();
+            let d: [u8; 32] = hasher.finalize();
             d
         };
         let carry = ScreenCarry {
@@ -5425,7 +5425,7 @@ mod f4_adoption_proof_asymmetry {
         let child_digest = {
             let mut hasher = Sha256::new();
             hasher.update(child_meta.as_bytes());
-            let d: [u8; 32] = hasher.finalize().into();
+            let d: [u8; 32] = hasher.finalize();
             d
         };
         assert_ne!(parent_digest, child_digest);

@@ -18,7 +18,7 @@
 //! that separate boundary.
 
 #[cfg(target_os = "macos")]
-use sha2::{Digest as _, Sha256};
+use aterm_digest::Sha256;
 #[cfg(target_os = "macos")]
 use std::collections::HashSet;
 #[cfg(target_os = "macos")]

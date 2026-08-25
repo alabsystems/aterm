@@ -185,7 +185,9 @@ serde = { workspace = true }
 # JSON string (TOML cannot represent its `None` fields). Same workspace version
 # aterm-update already uses.
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+# SHA-256 for the operator/seamless/config-completion proof digests and the
+# managed-model blob check. First-party; no third-party crypto in this binary.
+aterm-digest = { workspace = true }
 toml = { workspace = true }
 # Smart-title inference runs on one bounded worker, never the UI thread. ureq gives
 # both the local Ollama and opt-in OpenAI-compatible providers a native, portable
@@ -214,7 +216,7 @@ fontdue = "0.9"
 # so the embedded record cannot disagree with the key actually trusted.
 aterm-update-core = { workspace = true }
 base64 = "0.22.1"
-sha2 = { workspace = true }
+aterm-digest = { workspace = true }
 # Windows only: compile + link the application .ico (assets/aterm.rc → assets/
 # aterm.ico) into the exe so the shell shows the aterm icon (taskbar button,
 # Alt-Tab, titlebar, Explorer) instead of the generic exe glyph. build.rs gates

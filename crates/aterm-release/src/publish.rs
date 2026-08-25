@@ -23,10 +23,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aterm_digest::Sha256;
 use base64::Engine as _;
 use ring::signature::{ED25519, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest as _, Sha256};
 
 use aterm_update_core::Manifest;
 use aterm_update_core::roster;

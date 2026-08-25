@@ -8,8 +8,9 @@
 # download, aterm opens immediately, and the ALab toolchain installs itself on
 # first launch with live progress. Flags only EXCLUDE — except --token and
 # --batteries, the two opt-ins (--batteries selects the batteries-included DMG
-# pair: first launch installs the whole toolset with no network, the
-# offline / air-gapped lane).
+# pair: this script seeds the whole toolset from the sealed payload before it
+# exits — no download — the offline / air-gapped lane; only the follow-up
+# update check touches the network, and it fails soft without one).
 #
 # The DEFAULT download source is the PUBLIC release repo (alabsystems/aterm),
 # fetched anonymously — no GitHub credential required. An authenticated `gh`
@@ -124,8 +125,9 @@
 #                                                     # the ALab toolchain installs itself
 #                                                     # on first launch with live progress
 #   tools/install.sh --batteries                      # the batteries-included DMG pair —
-#                                                     # offline / air-gapped: first launch
-#                                                     # installs the toolset, no network
+#                                                     # offline / air-gapped: the toolset
+#                                                     # seeds NOW, from the payload — no
+#                                                     # download
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
 #   tools/install.sh --token                          # DO provision the update token
@@ -1650,7 +1652,8 @@ DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
 # §7): default = the LEAN zip on every CPU (aterm opens immediately; the
 # toolchain installs itself on first launch with live progress). --batteries
 # is the second opt-in flag (after --token): the sealed DMG pair, for
-# offline / air-gapped installs where first launch must need no network.
+# offline / air-gapped installs that must not depend on the network for the
+# toolset (the script seeds it synchronously from the payload).
 DO_BATTERIES=0
 # PATH wiring for the user's OWN shell. `shell.d` is generated correctly but is
 # auto-sourced only by an aterm session, so every other terminal (iTerm, VS
@@ -2109,8 +2112,10 @@ install_app() {
 				echo "install.sh:   Same signed, notarized universal app; the sealed toolchain carries"
 				echo "install.sh:   x86_64 builds of every ALab program."
 			fi
-			echo "install.sh:   First launch installs the whole ALab toolset with no network —"
-			echo "install.sh:   the offline / air-gapped lane."
+			echo "install.sh:   The toolset seeds from the sealed payload in THIS run — no download,"
+			echo "install.sh:   the offline / air-gapped lane. (Only the follow-up update check"
+			echo "install.sh:   touches the network, and it fails soft without one. A drag-installed"
+			echo "install.sh:   copy of the same DMG seeds itself on first launch instead.)"
 		else
 			echo "install.sh: this release predates the lean container (no zip in its manifest) —"
 			echo "install.sh:   using the batteries-included DMG ($ASSET_NAME), exactly as its own"

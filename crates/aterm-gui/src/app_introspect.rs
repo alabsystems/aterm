@@ -310,9 +310,7 @@ fn sidecar_name(file_name: &std::ffi::OsStr, suffix: &str) -> std::ffi::OsString
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::Digest as _;
-
-    let digest = sha2::Sha256::digest(bytes);
+    let digest = aterm_digest::Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
         use std::fmt::Write as _;

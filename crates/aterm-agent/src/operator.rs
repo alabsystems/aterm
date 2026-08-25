@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest as _, Sha256};
+use aterm_digest::Sha256;
 
 /// Default claim visibility window.
 pub const DEFAULT_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -299,7 +299,7 @@ impl NewEvent {
     fn validate(&self) -> Result<(), OperatorError> {
         validate_text("sid", &self.sid, MAX_SID_BYTES, false)?;
         validate_evidence("evidence", &self.evidence, MAX_EVIDENCE_BYTES, true)?;
-        let actual: [u8; 32] = Sha256::digest(self.evidence.as_bytes()).into();
+        let actual: [u8; 32] = Sha256::digest(self.evidence.as_bytes());
         if actual != self.generation.fingerprint {
             return Err(OperatorError::InvalidInput(
                 "event generation fingerprint does not match evidence SHA-256".into(),
@@ -5754,7 +5754,7 @@ mod tests {
             u64::from(value),
             value % 2 == 1,
             u64::from(value) * 10,
-            Sha256::digest(evidence.as_bytes()).into(),
+            Sha256::digest(evidence.as_bytes()),
         )
     }
 
@@ -5878,12 +5878,8 @@ mod tests {
         queue.manage_sid("a").unwrap();
         for value in 1..=512_u64 {
             let evidence = format!("resolved generation {value}");
-            let generation = EventGeneration::new(
-                value,
-                false,
-                value,
-                Sha256::digest(evidence.as_bytes()).into(),
-            );
+            let generation =
+                EventGeneration::new(value, false, value, Sha256::digest(evidence.as_bytes()));
             let id = enqueued_id(
                 queue
                     .enqueue(NewEvent::new(
@@ -6795,8 +6791,7 @@ mod tests {
         let queue = DurableQueue::open(&directory.0, 1, fast_config()).unwrap();
         queue.manage_sid("a").unwrap();
         let canary = "CANARY-RAW-SCREEN-SECRET-4d92f5c1";
-        let generation =
-            EventGeneration::new(1, false, 9, Sha256::digest(canary.as_bytes()).into());
+        let generation = EventGeneration::new(1, false, 9, Sha256::digest(canary.as_bytes()));
         let id = enqueued_id(
             queue
                 .enqueue(NewEvent::new(

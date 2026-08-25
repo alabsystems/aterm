@@ -143,7 +143,7 @@ impl StagedUpdate {
 /// already happened; the only remaining step is the handoff.
 #[must_use]
 pub(crate) fn installed_activation_digest(build: u64, commit: &str) -> String {
-    use sha2::{Digest as _, Sha256};
+    use aterm_digest::Sha256;
     let mut hasher = Sha256::new();
     hasher.update(b"aterm installed-bundle activation\0");
     hasher.update(build.to_string().as_bytes());

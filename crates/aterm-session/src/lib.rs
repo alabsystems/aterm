@@ -133,6 +133,23 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         // natively. Identical bytes, identical constant-time shape.
         diff |= *x ^ *y;
     }
+    // NO `std::hint::black_box` here, deliberately — this is the one of aterm's
+    // three constant-time comparators without one, and the asymmetry is a Trust
+    // constraint, not an oversight. `aterm_digest::ct_eq` and
+    // `aterm_core::terminal::shell_integration_auth::constant_time_eq_32` both
+    // end `black_box(diff) == 0`; neither crate is gated by
+    // `tools/trust-gate-ratchet.tsv`. This one is, at a 92-proved floor, and
+    // `black_box` is a Rust-ABI callee with no body in the verification bundle
+    // — the FATAL absent-callee class (docs/measurements/
+    // 2026-07-09-extern-c-absent-callee-totality.md: only non-unwinding
+    // C-family ABIs discharge; "a resolved-but-out-of-bundle Rust body ... →
+    // fatal"). Adding it here trades a proof for a barrier. The same fail-closed
+    // verifier is why the XOR below is spelled `*x ^ *y`.
+    //
+    // Measured 2026-08-25 at -O3 on the stage2 aarch64 toolchain: this loop is
+    // branch-free as written, exiting only on the index bound. If that ever
+    // stops holding, the fix is to take the barrier AND re-measure the crate's
+    // proved count, not to add one silently.
     diff == 0
 }
 

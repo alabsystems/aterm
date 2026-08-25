@@ -4687,18 +4687,19 @@ mod tests {
     #[test]
     fn scanned_set_covers_the_full_gui_process_closure() {
         // The scan set is DERIVED (scan_set::derive_gui_scan_set) — the full
-        // aterm-gui process surface, currently 49 crates (46 until the K-2
+        // aterm-gui process surface, currently 50 crates (46 until the K-2
         // winit→engine key map moved out of aterm-types into its own
         // `aterm-winit-keymap` crate, then +2 when the embedded operator put
         // `aterm-agent` — and through it `aterm-ctl` — on the GUI's own
-        // dependency edge). The exact member list is pinned by scan_set's
+        // dependency edge, then +1 when `aterm-digest` replaced the `sha2` +
+        // `hmac` third-party pair). The exact member list is pinned by scan_set's
         // derived_closure_matches_the_pinned_canary; this asserts the census
         // actually WALKS the derived set and reports its provenance +
         // exclusions in the transcript.
         let out = run_lock_order_census(&repo_root());
         assert!(
             out.log
-                .contains("across 49 workspace crate(s) + 5 vendored crate(s)"),
+                .contains("across 50 workspace crate(s) + 5 vendored crate(s)"),
             "the census must report the full derived closure + the scanned vendored \
              crates:\n{}",
             out.log

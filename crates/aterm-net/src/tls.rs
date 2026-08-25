@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use aterm_uds::CtlStream;
 
+use aterm_digest::Sha256;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
@@ -31,7 +32,6 @@ use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, ServerConfig, ServerConnection,
     SignatureScheme, StreamOwned,
 };
-use sha2::{Digest, Sha256};
 
 /// RFC 5705 exporter label — namespaces our keying material so it cannot collide
 /// with any other exporter use on the same connection.
@@ -62,7 +62,7 @@ pub fn fixed_server_name() -> ServerName<'static> {
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(cert_der);
-    h.finalize().into()
+    h.finalize()
 }
 
 fn io_err(e: impl std::fmt::Display) -> io::Error {

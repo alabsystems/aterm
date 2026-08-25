@@ -39,7 +39,7 @@ aterm-ctl = { path = "../aterm-ctl" }
 # The operator WAL uses the workspace's audited SHA-256 implementation for
 # independently checksummed frames. `libc` is Unix-only at the call sites and
 # supplies O_NOFOLLOW/O_DIRECTORY for private state and WAL admission.
-sha2 = { workspace = true }
+aterm-digest = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]

@@ -85,10 +85,13 @@ Applications.
 
 ### Offline / air-gapped install (batteries-included)
 
-For machines where first launch cannot (or must not) touch the network, the
-batteries-included DMG pair remains a first-class install: the app with the
-published ALab toolchain sealed inside it, so the first launch installs the
-compilers, solvers, and provers with no network at all.
+For machines that cannot (or must not) fetch the toolchain over the network,
+the batteries-included DMG pair remains a first-class install: the app with
+the published ALab toolchain sealed inside it. The installer seeds the
+compilers, solvers, and provers from that payload during the install itself —
+no download; only the follow-up update check touches the network, and it
+fails soft without one. A drag-installed copy of the same DMG seeds itself on
+first launch, entirely offline.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/alabsystems/aterm/HEAD/tools/install.sh | bash -s -- --batteries

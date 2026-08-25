@@ -7525,9 +7525,13 @@ impl Renderer {
         {
             rebuilt.rasterizer = self.rasterizer;
         }
-        // The Linux twin of the forced-backend handoff: a debug-forced fontdue
-        // parent must not resurrect env-resolved hinting in its rebuild.
-        #[cfg(target_os = "linux")]
+        // The native twin of the forced-backend handoff: a rebuild keeps the
+        // LIVE grid-fitting mode — a debug-forced fontdue parent must not
+        // resurrect env-resolved hinting, and a semantic surface rebuilt from
+        // a `font_hinting = "off"` parent must not re-hint its text. Same cfg
+        // as the field itself, so Windows (which shares the hint seam) rides
+        // the handoff exactly like Linux.
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             rebuilt.hint_mode = self.hint_mode;
         }
@@ -7644,10 +7648,16 @@ impl Renderer {
             fork.rasterizer = self.rasterizer;
         }
         // W13: a debug-forced fontdue parent (hinting Off) must fork
-        // faithfully — same portable bytes on both sides of the handoff.
-        #[cfg(all(unix, not(target_os = "macos")))]
+        // faithfully — same portable bytes on both sides of the handoff — and
+        // a live-set `font_hinting` rides into semantic surfaces on Windows
+        // too (same cfg as the field). Subpixel stays with ITS field's
+        // Linux-only cfg.
+        #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         {
             fork.hint_mode = self.hint_mode;
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
             fork.subpix_mode = self.subpix_mode;
         }
         Some(fork)

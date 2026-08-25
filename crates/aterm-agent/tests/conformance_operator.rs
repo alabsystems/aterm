@@ -21,12 +21,12 @@ use aterm_agent::operator::{
     FaultLatchOutcome, FleetFaultReason, FleetGateStatus, NewEvent, OperatorError, QueueConfig,
     Resolution,
 };
+use aterm_digest::Sha256;
 use aterm_spec::derive::{
     Model, operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
     operator_wal_actuator_model,
 };
 use aterm_spec::verify;
-use sha2::{Digest as _, Sha256};
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -114,7 +114,7 @@ fn event(value: u8) -> NewEvent {
             1,
             false,
             u64::from(value),
-            Sha256::digest(evidence.as_bytes()).into(),
+            Sha256::digest(evidence.as_bytes()),
         ),
         AttentionCondition::Ready,
         evidence,
@@ -554,7 +554,7 @@ fn operator_fleet_fault_real_gate_and_human_clear_match_model() {
     queue
         .enqueue_rebaseline(NewEvent::new(
             "sid-a",
-            EventGeneration::new(2, false, 1, Sha256::digest(evidence.as_bytes()).into()),
+            EventGeneration::new(2, false, 1, Sha256::digest(evidence.as_bytes())),
             AttentionCondition::Changed,
             evidence,
         ))

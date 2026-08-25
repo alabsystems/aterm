@@ -3336,19 +3336,21 @@ fn padded_probe_cell(cells: &[char], col: usize) -> char {
 /// so both engines apply one retention law from one probe capture.
 pub struct BatchWakeWitness<'probe> {
     row: u16,
-    caret: u16,
     prev: &'probe [char],
     cur: &'probe [char],
 }
 
 impl BatchWakeWitness<'_> {
     /// Whether the judged batch provably left `(row, col)` untouched: the
-    /// attested row, strictly before the captured caret (the presentation
-    /// zone), content byte-steady under the implicit-blank lens.
+    /// attested row, content byte-steady under the implicit-blank lens. The
+    /// safety claim is CONTENT-based, not zone-based — a rewritten cell still
+    /// dies wherever it sits, and a byte-steady cell is byte-steady on either
+    /// side of the caret. (An earlier `col < caret` clause here was pure
+    /// conservatism, and it beheaded the rainbow ribbon, whose head lives AT
+    /// the caret, under every unowned-but-steady batch.)
     #[must_use]
     pub fn steady(&self, row: u16, col: u16) -> bool {
         row == self.row
-            && col < self.caret
             && padded_probe_cell(self.prev, col as usize)
                 == padded_probe_cell(self.cur, col as usize)
     }
@@ -6395,7 +6397,6 @@ impl CursorGlow {
         match (self.row_prev_meta, self.row_cur_meta) {
             (Some(prev), Some(cur)) if prev.row == cur.row => Some(BatchWakeWitness {
                 row: cur.row,
-                caret: cur.caret,
                 prev: &self.row_prev,
                 cur: &self.row_cur,
             }),
@@ -7189,11 +7190,13 @@ impl CursorGlow {
                 // tail-filled baseline already reads `' '` at the caret, so
                 // the newly-materialize clause was unsatisfiable and every
                 // word boundary broke the trail chain in EVERY shell (trace:
-                // `expected=[' ']` -> `row-unchanged`). The witness for an
+                // `expected=[' ']` -> `row-unchanged`). One witness for an
                 // all-blank span is storage growth: the stored row now
                 // materially covers the owned span (`DIFF` showed
                 // `clen 21->22` on a live box), which a swallowed echo on a
-                // trimmed row cannot fake.
+                // trimmed row cannot fake. A grid that keeps rows trimmed
+                // never grows storage for that space at all — there the
+                // CARET-ADVANCE witness below carries the proof instead.
                 let width = baseline.len().max(current.len());
                 let changed = probe_rows_content_differ(baseline, current);
                 // OVERTYPE WITNESS: retyping a history command under a VISIBLE
@@ -7222,11 +7225,43 @@ impl CursorGlow {
                         .iter()
                         .enumerate()
                         .all(|(k, &cell)| padded_probe_cell(baseline, start + k) == cell);
+                // CARET-ADVANCE WITNESS FOR INVISIBLE BLANKS (the owner's
+                // "each new word kills the trail" regression, v0.52): the
+                // storage-growth clause above only fires when the stored row
+                // actually lengthens — but a grid that keeps rows TRIMMED
+                // never stores a space echoed over an implicit blank, so the
+                // span's materialization is INVISIBLE under the lens (every
+                // expected cell already equals the tail-filled baseline:
+                // space over implicit blank, multi-space, space over a
+                // stored blank alike) and every word boundary retired
+                // `row-unchanged` — on the alt screen it downgraded through
+                // the jump-comet seam, and either way the echo batch reached
+                // the generation fence unowned and the caret's one-column
+                // advance was judged UnownedRelocation, wholesale-wiping the
+                // accumulated ribbon. For such a span the caret advance IS
+                // the materialization witness: the same single attributable
+                // generation (enforced upstream), every cell before the span
+                // content-unchanged and the span itself reading exactly as
+                // predicted (both enforced by `exact` below — cells at/after
+                // the caret keep their presentation-zone exemption), and the
+                // observed cursor landing on the exact predicted target. A
+                // swallowed space cannot fake that landing (its cursor never
+                // moves), a bare program CUP has no armed candidate to
+                // borrow, and a NON-blank glyph still demands one of the
+                // real materialization witnesses above.
+                let caret_advance = expected.iter().all(|&cell| cell == ' ')
+                    && expected
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &cell)| padded_probe_cell(baseline, start + k) == cell)
+                    && candidate.target.is_some()
+                    && current_cursor == candidate.target;
                 let materialized = expected
                     .iter()
                     .enumerate()
                     .any(|(k, &cell)| padded_probe_cell(baseline, start + k) != cell)
                     || (expected.iter().all(|&cell| cell == ' ') && current.len() >= end)
+                    || caret_advance
                     || overtype;
                 let exact = expected
                     .iter()
@@ -7762,10 +7797,15 @@ impl CursorGlow {
     /// narrower than its old wipe: never leave light on a cell whose CONTENT
     /// the batch rewrote. The probe pair attests exactly that, per column,
     /// under the implicit-blank lens — so a wake spark survives iff it sits on
-    /// the attested row, STRICTLY BEFORE the captured caret (the presentation
-    /// zone where echoes may not rewrite silently), on a column whose probed
-    /// content is byte-steady. No attesting pair, or a probe that changed
-    /// rows: fail closed to the wholesale wipe, exactly as before.
+    /// the attested row, on a column whose probed content is byte-steady. The
+    /// claim is CONTENT-based, not zone-based: a rewritten cell dies wherever
+    /// it sits, and a byte-steady cell carries the same proof on either side
+    /// of the caret. (An earlier `col < caret` clause here was pure
+    /// conservatism — and because rainbow lays its ribbon head AT the caret,
+    /// it beheaded the ribbon and pruned the tail memory with it under every
+    /// unowned-but-steady batch: the v0.52 "sparkles truncated" symptom.) No
+    /// attesting pair, or a probe that changed rows: fail closed to the
+    /// wholesale wipe, exactly as before.
     ///
     /// Only the cell-anchored WAKE families are eligible (sparks; the rainbow
     /// tail memory, ink pops and nozzle). The projectile/transient families
@@ -7791,10 +7831,10 @@ impl CursorGlow {
     /// retiring byte-for-byte as before.
     fn retire_geometry_keeping_validated_wake(&mut self, owned_write: Option<(u16, u16, u16)>) {
         let attested = match (self.row_prev_meta, self.row_cur_meta) {
-            (Some(prev), Some(cur)) if prev.row == cur.row => Some((cur.row, cur.caret)),
+            (Some(prev), Some(cur)) if prev.row == cur.row => Some(cur.row),
             _ => None,
         };
-        let Some((row, caret)) = attested else {
+        let Some(row) = attested else {
             self.clear_visual_geometry();
             return;
         };
@@ -7817,12 +7857,11 @@ impl CursorGlow {
         let cur_cells = std::mem::take(&mut self.row_cur);
         let steady = |cell_row: u16, cell_col: u16| {
             cell_row == row
-                && cell_col < caret
                 && (padded_probe_cell(&prev_cells, cell_col as usize)
                     == padded_probe_cell(&cur_cells, cell_col as usize)
                     // …or this batch's own PROVEN write: the confirmed
                     // candidate's exact span, which the proof already checked
-                    // materialized here and nowhere else before the caret.
+                    // materialized here and nowhere else on the row.
                     || owned_write.is_some_and(|(write_row, start, end)| {
                         cell_row == write_row && (start..end).contains(&cell_col)
                     }))
@@ -25025,7 +25064,12 @@ mod tests {
         );
 
         // PROTECTION PIN (space): a swallowed space echo — the stored row
-        // never grew over the caret — is not materialization and retires.
+        // never grew over the caret AND the cursor never advanced onto the
+        // predicted target — is not materialization and retires. (A trimmed
+        // row whose cursor DOES land on the exact predicted target confirms
+        // on the caret-advance witness instead — the v0.52 word-boundary
+        // regression — so the missing advance is what marks this one
+        // swallowed.)
         let ungrown = ['$', ' ', 'g', 'i', 't'];
         let mut glow = CursorGlow::default();
         glow.tick(Some((2, 5)), t0, &c, g, &mut out);
@@ -25033,7 +25077,7 @@ mod tests {
         glow.note_typed_expected(at, space, (2, 6), (2, 5), space_baseline, generation(50));
         glow.observe_row(2, 6, &ungrown, at + Duration::from_millis(1));
         let decision = glow.confirm_content_candidate(
-            Some((2, 6)),
+            Some((2, 5)),
             at + Duration::from_millis(1),
             generation(51),
         );
@@ -25452,6 +25496,340 @@ mod tests {
         assert!(
             matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
             "a probe-less unblinked-alt frame stays fail-closed: {decision:?}"
+        );
+    }
+
+    /// OWNER REGRESSION (v0.52), symptom 1 — *"each new word causes the
+    /// trail to disappear"* — THE WORD BOUNDARY. Typing `ab cd` on the alt
+    /// screen through the real seams (note → probe → confirm → fence → tick,
+    /// one rendered frame per key). The SPACE's echo writes `' '` over an
+    /// IMPLICIT blank: on a trimmed-storage capture the stored row does not
+    /// grow, so under the implicit-blank content lens the row is PROVABLY
+    /// UNCHANGED and the space's Typed candidate could not materialize its
+    /// glyph. The !confirmed branch downgraded it to Motion
+    /// (`motion-downgrade`; the main-screen twin of this shape retires
+    /// `row-unchanged`), so the echo batch reached the generation fence with
+    /// `exact_candidate_confirmed=false` — and because the caret ADVANCED
+    /// one column, `anchor_held` was false and the batch was judged
+    /// [`GenerationOwnership::UnownedRelocation`]:
+    /// `clear_denied_move_visuals` wholesale-wiped the accumulated ribbon,
+    /// tail memory, ink pops and wake. Every word boundary executed this
+    /// wipe (the downgraded Motion candidate itself dies at the space's own
+    /// tick — a one-column landing is no jump — so the following letters
+    /// re-armed and confirmed into a ribbon rebuilt from zero). Measured on
+    /// this fixture before the fix: segments 2 → 0 at the space, and `ab cd`
+    /// ended at 2 segments instead of 5.
+    ///
+    /// FIXED by the CARET-ADVANCE WITNESS in the confirm proof's Typed arm:
+    /// an all-blank span already blank in the baseline confirms on the
+    /// cursor landing on its exact predicted target under the single
+    /// attributable generation, so the space's batch is OWNED, the fence
+    /// attests its span, and the ribbon accumulates across word boundaries.
+    /// The observation string in each assert message carries what actually
+    /// happened at every seam.
+    #[test]
+    fn rainbow_ribbon_survives_word_boundaries_and_keeps_its_head() {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 4,
+            alternate_screen: true,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+
+        // ---- LEG 1: "ab cd", per key, the host's exact seam order ----
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the fence baseline"
+        );
+        // The grid's STORED row (what the trimmed probe capture shows): a
+        // glyph echo stores its cell; a space echoed over an implicit blank
+        // leaves the trimmed capture unchanged — the owner's shape.
+        let mut stored: Vec<char> = Vec::new();
+        let mut segments_after_space = 0usize;
+        for (i, ch) in ['a', 'b', ' ', 'c', 'd'].into_iter().enumerate() {
+            let col = i as u16;
+            let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
+            let seq = 10 + i as u32;
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(at, expected, (2, col + 1), (2, col), baseline, alt_gen(seq));
+            if ch != ' ' {
+                while stored.len() < i {
+                    stored.push(' ');
+                }
+                stored.push(ch);
+            }
+            glow.observe_row_with_trust(2, col + 1, &stored, at, ProbeTrust::ContentOnly);
+            let decision = glow.confirm_content_candidate(Some((2, col + 1)), at, alt_gen(seq + 1));
+            let confirmed = matches!(decision, Some(ContentCandidateDecision::Confirmed { .. }));
+            let ring = glow.admission_log().last().map(|r| (r.phase, r.reason));
+            let ownership =
+                glow.observe_content_generation(alt_gen(seq + 1), Some((2, col + 1)), confirmed);
+            glow.tick(Some((2, col + 1)), at, &c, g, &mut scratch);
+            let _ = write!(
+                observed,
+                "key{i}({ch:?}): decision={decision:?} ring={ring:?} ownership={ownership:?} \
+                 segments={}; ",
+                glow.ribbon_segments()
+            );
+            if ch == ' ' {
+                segments_after_space = glow.ribbon_segments();
+            }
+        }
+        let segments_after_word = glow.ribbon_segments();
+        assert!(
+            segments_after_space >= 3,
+            "the ribbon must SURVIVE the word boundary — the heads of 'a' and 'b' plus \
+             the space's own — got {segments_after_space} segment(s). Observed: [{observed}]"
+        );
+        assert!(
+            segments_after_word >= 4,
+            "'ab cd' must leave a multi-word ribbon, got {segments_after_word} segment(s). \
+             Observed: [{observed}]"
+        );
+    }
+
+    /// OWNER REGRESSION (v0.52), symptom 2 — *"the sparkles seem to be
+    /// truncated"* — THE TRUNCATED HEAD, now pinned FIXED. The proportionate
+    /// fence's retention predicate ([`CursorGlow::retire_geometry_keeping_validated_wake`],
+    /// [`BatchWakeWitness::steady`], and the trail twin's `retain_attested`
+    /// consuming the same witness) used to demand `col < caret` — but rainbow
+    /// lays its ribbon head AT the caret (see [`CursorGlow::owned_write_span`]),
+    /// so an unowned batch whose only change was BEYOND the caret (the head's
+    /// own cell byte-steady under the lens) pruned the at-caret head, and the
+    /// tail memory with it. The caret clause was conservatism, not safety —
+    /// the safety claim is content-based, and the head's cell here is
+    /// provably untouched — so retention now keeps every attested-row cell
+    /// the probe attests content-steady regardless of caret position. A
+    /// rewrite BENEATH the wake still retires those cells (the negative
+    /// control in `alt_screen_light_survives_proven_steady_unowned_batches`).
+    #[test]
+    fn rainbow_ribbon_keeps_its_at_caret_head_under_a_beyond_caret_repaint() {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 4,
+            alternate_screen: true,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+
+        // A confirmed head AT the caret vs an unowned batch whose only
+        // change is beyond the caret (the head's cell byte-steady).
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(30), Some((2, 0)), false),
+            GenerationOwnership::Steady
+        );
+        let mut stored: Vec<char> = Vec::new();
+        for (i, ch) in ['c', 'd'].into_iter().enumerate() {
+            let col = i as u16;
+            let at = t0 + Duration::from_millis(i as u64 * 120 + 1);
+            let seq = 30 + i as u32;
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(at, expected, (2, col + 1), (2, col), baseline, alt_gen(seq));
+            stored.push(ch);
+            glow.observe_row_with_trust(2, col + 1, &stored, at, ProbeTrust::ContentOnly);
+            let decision = glow.confirm_content_candidate(Some((2, col + 1)), at, alt_gen(seq + 1));
+            assert!(
+                matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+                "leg 2 key {i}: the exact typed proof must confirm: {decision:?}"
+            );
+            let ownership =
+                glow.observe_content_generation(alt_gen(seq + 1), Some((2, col + 1)), true);
+            assert_eq!(
+                ownership,
+                GenerationOwnership::Owned,
+                "leg 2 key {i}: the confirmed echo owns its batch"
+            );
+            glow.tick(Some((2, col + 1)), at, &c, g, &mut scratch);
+        }
+        let heads: Vec<(u16, u16)> = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing)
+            .map(|spark| (spark.row, spark.col))
+            .collect();
+        assert!(
+            heads.contains(&(2, 2)),
+            "the confirmed echo lays its head AT the caret: {heads:?}"
+        );
+        // The streaming TUI paints a status glyph well past the caret; the
+        // cell under the at-caret head is provably untouched.
+        let at = t0 + Duration::from_millis(400);
+        let repaint = ['c', 'd', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', '#'];
+        glow.observe_row_with_trust(2, 2, &repaint, at, ProbeTrust::ContentOnly);
+        let leg2_ownership = glow.observe_content_generation(alt_gen(33), Some((2, 2)), false);
+        glow.tick(Some((2, 2)), at, &c, g, &mut scratch);
+        let survivors: Vec<(u16, u16)> = glow
+            .sparks
+            .iter()
+            .filter(|spark| spark.typing)
+            .map(|spark| (spark.row, spark.col))
+            .collect();
+        let _ = write!(
+            observed,
+            "leg2: unowned-batch ownership={leg2_ownership:?} heads_before={heads:?} \
+             survivors={survivors:?}"
+        );
+
+        assert!(
+            survivors.contains(&(2, 2)),
+            "an unowned batch that provably left the at-caret head cell untouched must \
+             not prune the head. Observed: [{observed}]"
+        );
+    }
+
+    /// THE CARET-ADVANCE WITNESS, pinned in isolation. A SPACE echoed over an
+    /// implicit blank on a trimmed-storage capture is content-invisible under
+    /// the implicit-blank lens (the tail-filled baseline already reads `' '`
+    /// at the caret and the stored row never grows), so the confirm proof's
+    /// Typed arm accepts the cursor landing on the exact predicted target
+    /// under the single attributable generation as the materialization
+    /// witness — and NOTHING wider: a swallowed space whose cursor never
+    /// advanced is refused, a bare program CUP+1 has no armed candidate to
+    /// confirm, and a NON-blank glyph still demands real materialization.
+    #[test]
+    fn a_space_echo_confirms_on_the_caret_advance_witness() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let alt_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 9,
+            alternate_screen: true,
+        };
+        // The grid's STORED row is TRIMMED: "ab", then implicit blanks; the
+        // caret sits at col 2 and the space's echo stores nothing.
+        let stored = ['a', 'b'];
+        let mut before = [' '; 40];
+        before[..2].copy_from_slice(&stored);
+        let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+        let space = ExpectedCellSpan::from_cells([' ']).unwrap();
+        let key = t0 + Duration::from_millis(1);
+        let echo = key + Duration::from_millis(8);
+        let arm = |seq: u32, expected: ExpectedCellSpan, target: (u16, u16)| {
+            let mut glow = CursorGlow::default();
+            glow.note_context(true);
+            let mut out = Vec::new();
+            glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+            // Establish the fence baseline so the echo batch below is the
+            // fence's ONE next generation, exactly as in the host loop.
+            assert_eq!(
+                glow.observe_content_generation(alt_gen(seq), Some((2, 2)), false),
+                GenerationOwnership::Steady
+            );
+            glow.note_typed_expected(key, expected, target, (2, 2), baseline, alt_gen(seq));
+            glow
+        };
+
+        // THE SPACE: the trimmed capture is content-unchanged and does not
+        // grow — the caret advance onto the exact predicted target carries
+        // the proof, the confirm hands the fence the owned one-cell span,
+        // and the echo batch is judged OWNED like any other confirm.
+        let mut glow = arm(10, space, (2, 3));
+        glow.observe_row_with_trust(2, 3, &stored, echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 3)), echo, alt_gen(11));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "a space over an implicit blank must confirm on the caret-advance witness: {decision:?}"
+        );
+        assert_eq!(
+            glow.owned_write_span,
+            Some((2, 2, 3)),
+            "the confirmed space owns exactly its one-cell span for the fence"
+        );
+        assert_eq!(
+            glow.observe_content_generation(alt_gen(11), Some((2, 3)), true),
+            GenerationOwnership::Owned,
+            "the confirmed space echo owns its batch"
+        );
+
+        // THE SWALLOWED TWIN: same armed space, same unchanged row, but the
+        // cursor NEVER landed on the predicted target — the witness is
+        // refused (on the alt screen the refuted echo downgrades to Motion;
+        // the main-screen twin of this shape retires `row-unchanged`).
+        let mut glow = arm(20, space, (2, 3));
+        glow.observe_row_with_trust(2, 3, &stored, echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 2)), echo, alt_gen(21));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Downgraded { .. })),
+            "a swallowed space (no caret advance) must not confirm: {decision:?}"
+        );
+
+        // COLD CUP+1: program output advances the cursor one column with NO
+        // armed candidate — there is nothing to confirm, and no light. The
+        // caret-advance witness buys cold output nothing.
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        let mut out = Vec::new();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        glow.observe_row_with_trust(2, 3, &stored, echo, ProbeTrust::ContentOnly);
+        assert_eq!(
+            glow.confirm_content_candidate(Some((2, 3)), echo, alt_gen(31)),
+            None,
+            "a bare CUP+1 has no candidate to confirm"
+        );
+
+        // NON-BLANK GLYPH: the same shape with 'x' expected must still
+        // demand materialization — a caret advance over a row that never
+        // grew the glyph is not an echo of it.
+        let typed_x = ExpectedCellSpan::from_cells(['x']).unwrap();
+        let mut glow = arm(40, typed_x, (2, 3));
+        glow.observe_row_with_trust(2, 3, &stored, echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 3)), echo, alt_gen(41));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Downgraded { .. })),
+            "a non-blank glyph must still materialize; the caret advance alone is refused: \
+             {decision:?}"
+        );
+
+        // MULTI-SPACE OVER A STORED BLANK, MAIN SCREEN: the witness is not
+        // alt-specific, and covers a span mixing a STORED blank (col 2) with
+        // an implicit one (col 3). The growth clause cannot fire (the stored
+        // row ends at col 2 inclusive, short of the span's end), so the
+        // caret advance onto the exact two-column target carries the proof.
+        let main_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 9,
+            alternate_screen: false,
+        };
+        let stored_blank = ['a', 'b', ' '];
+        let two_spaces = ExpectedCellSpan::from_cells([' ', ' ']).unwrap();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 2)), t0, &c, g, &mut out);
+        glow.note_typed_expected(key, two_spaces, (2, 4), (2, 2), baseline, main_gen(50));
+        glow.observe_row_with_trust(2, 4, &stored_blank, echo, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo, main_gen(51));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "a multi-space span over stored+implicit blanks confirms on the main screen too: \
+             {decision:?}"
+        );
+        assert_eq!(
+            glow.owned_write_span,
+            Some((2, 2, 4)),
+            "the confirmed double space owns exactly its two-cell span"
         );
     }
 

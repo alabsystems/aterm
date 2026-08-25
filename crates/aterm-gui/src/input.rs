@@ -260,11 +260,13 @@ pub enum ScrollIntent {
     /// Jump to the live bottom.
     Bottom,
     /// Jump the viewport to the previous (older) shell PROMPT — the nearest
-    /// OSC-133 command mark whose prompt row is above the current top visible
-    /// row. A no-op when shell integration recorded no older mark.
+    /// recorded OSC-133 prompt row above the current top visible row (see
+    /// [`jump_prompt_target`] for which rows count as prompts). A no-op when
+    /// shell integration recorded no older prompt.
     PrevPrompt,
-    /// Jump the viewport to the next (newer) shell prompt — the nearest command
-    /// mark below the current top visible row. A no-op when there is none.
+    /// Jump the viewport to the next (newer) shell prompt — the nearest
+    /// recorded prompt row below the current top visible row. A no-op when
+    /// there is none.
     NextPrompt,
 }
 

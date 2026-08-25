@@ -293,7 +293,7 @@ pub(crate) fn hinted_glyph_raster(
     outline
         .draw(DrawSettings::hinted(hint, false), &mut pen)
         .ok()?;
-    if pen.cmds.is_empty() || !pen.min_x.is_finite() {
+    if pen.is_blank() {
         // No outline at all (space and friends): blank raster, advance only —
         // the blank-glyph convention of the variation path.
         return Some((0, 0, 0, 0, advance, Vec::new()));

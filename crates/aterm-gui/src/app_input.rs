@@ -4358,13 +4358,14 @@ impl App {
                 ScrollIntent::By(n) => term.scroll_display(n),
                 ScrollIntent::Top => term.scroll_to_top(),
                 ScrollIntent::Bottom => term.scroll_to_bottom(),
-                // Jump-to-prompt: lift the nearest OSC-133 command mark above
-                // (Prev) or below (Next) the current top visible row to the top.
-                // The target is resolved under the immutable `command_marks()`
-                // borrow and copied out BEFORE the `&mut` scroll, so the borrows
-                // never overlap. No mark in the requested direction → no scroll
-                // (mirrors the wheel hitting an edge); a bare shell with no
-                // integration marks is inertly a no-op.
+                // Jump-to-prompt: lift the nearest recorded OSC-133 prompt row
+                // above (Prev) or below (Next) the current top visible row to
+                // the top — the union of command marks and blocks, see
+                // `jump_prompt_target`. The target is resolved under the
+                // immutable borrows and copied out BEFORE the `&mut` scroll, so
+                // the borrows never overlap. No prompt in the requested
+                // direction → no scroll (mirrors the wheel hitting an edge); a
+                // bare shell with no integration marks is inertly a no-op.
                 ScrollIntent::PrevPrompt | ScrollIntent::NextPrompt => {
                     if let Some(row) = crate::input::jump_prompt_target(
                         &term,

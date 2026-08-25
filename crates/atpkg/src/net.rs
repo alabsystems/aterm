@@ -303,8 +303,7 @@ fn index_pair_urls(releases: &[Release]) -> Vec<CandidateUrls<'_>> {
 /// states share one fingerprint. NUL separators keep the concatenation unambiguous —
 /// neither a git tag nor a URL can contain a NUL byte.
 fn candidate_identity(u: &CandidateUrls<'_>) -> String {
-    use sha2::Digest as _;
-    let mut h = sha2::Sha256::new();
+    let mut h = aterm_digest::Sha256::new();
     for part in [u.label, u.index, u.index_sig, u.roster, u.roster_sig] {
         h.update(part.as_bytes());
         h.update([0u8]);

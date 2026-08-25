@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+#
+# vendor/forge.toml — THE FORK LEDGER. One [[fork]] block per [patch.crates-io] entry in the
+# workspace root manifest: what aterm vendored, at which upstream version, under which
+# license, and how the lock-order census classifies it.
+#
+# THE COMMENTS ARE THE RECORD. A fork's reason to exist is not a key here — it is the
+# comment block above it. forge round-trips this file with toml_edit precisely so that no
+# future write can eat one. Unknown KEYS are refused by name (fail-closed, the way
+# aterm-census's vendored-crate registry is); unknown COMMENTS are kept verbatim.
+#
+# Every version below is cross-checked against Cargo.lock: a vendored version that drifts
+# from the requirement the graph asks for silently un-uses the patch, and the only trace is
+# one line in the lock.
+#
+# Regenerate this skeleton with aterm_forge::policy::seed_from_vendor and DIFF it against
+# the checked-in file. Never overwrite: the diff is the review.
+
+[forge]
+# The methods every number in a forge report was produced by, recorded so a report can be
+# re-derived years later and so a change of method lands as a diff instead of as a silent
+# shift in the ratchet.
+# loc_method "rs-physical-all-files-v1": physical lines over every *.rs under the package
+#   root, that package's own tests and examples included. It measures the source aterm would
+#   OWN on vendoring, not the code that reaches codegen.
+# graph_method "cargo-tree-normal-no-dedupe-locked-offline-v1": cargo tree -p <package> -e
+#   normal --target <triple> --prefix depth --no-dedupe --locked --offline. Deliberately NOT
+#   cargo metadata --filter-platform, whose resolve is feature-unified across every
+#   workspace member and over-counts the macOS root by 28%.
+loc_method = "rs-physical-all-files-v1"
+graph_method = "cargo-tree-normal-no-dedupe-locked-offline-v1"
+# The measurement matrix: resolution needs no toolchain, so every cell is mandatory and
+# offline. A cell that cannot resolve is named and skipped, never passed.
+cells = [
+    { name = "mac-arm", triple = "aarch64-apple-darwin", package = "aterm" },
+    { name = "linux", triple = "x86_64-unknown-linux-gnu", package = "aterm" },
+    { name = "win", triple = "x86_64-pc-windows-msvc", package = "aterm" },
+    { name = "wasm", triple = "wasm32-unknown-unknown", package = "aterm" },
+]
+
+# --- winit 0.30.13 ------------------------------------------------------------
+# census review: vendored upstream winit 0.30.13 (+ the Wayland DnD patch): runs ON the main
+#   thread of the GUI process; the macOS-compiled surface is graphed under the `winit::`
+#   namespace, the non-macOS backends are labeled platform slices (no shipped aterm GUI
+#   compiles them today; the wasm surface is a different process, outside this census's
+#   one-process deadlock domain — censused since 2026-07-14 by run_wasm_census, where
+#   lock-order is a documented vacuous posture and L0-FREEZE is the live obligation)
+# LICENSE: Apache-2.0 — no non-Apache option, so Apache-2.0 §4(b) binds: every file aterm
+#   modified must carry a prominent notice stating that it changed it. apache_notice = true
+#   is the assertion; `cargo forge attest` is what checks the notices are actually there.
+[[fork]]
+name = "winit"
+version = "0.30.13"
+path = "vendor/winit"
+license = "Apache-2.0"
+apache_notice = true
+census.mode = "scanned"
+census.namespace = "winit"
+
+# --- libm 0.2.16 --------------------------------------------------------------
+# census review: aterm-trust fork of upstream libm (overflow fixes): pure math — ZERO
+#   lock-vocabulary sites at registration; scanned so that claim is re-checked by the walker
+#   every run instead of by review
+# LICENSE: MIT — no Apache-2.0 term applies, so there is no §4(b) modification-notice
+#   obligation. The retained LICENSE file and the copyright notice still are obligations;
+#   `cargo forge attest` checks those.
+[[fork]]
+name = "libm"
+version = "0.2.16"
+path = "vendor/libm"
+license = "MIT"
+apache_notice = false
+census.mode = "scanned"
+census.namespace = "libm"
+
+# --- indexmap 2.14.0 ----------------------------------------------------------
+# census review: aterm-trust fork of upstream indexmap (index-panic fix): one zero-arg
+#   `.read()` (extract.rs) that is core::ptr::read, categorized by the propagated
+#   raw-pointer evidence; no locks
+# LICENSE: Apache-2.0 OR MIT — dual-licensed, so a copy distributed under the non-Apache
+#   option carries no §4(b) modification-notice obligation. Set apache_notice = true here
+#   the day that election changes.
+[[fork]]
+name = "indexmap"
+version = "2.14.0"
+path = "vendor/indexmap"
+license = "Apache-2.0 OR MIT"
+apache_notice = false
+census.mode = "scanned"
+census.namespace = "indexmap"
+
+# --- winnow 0.7.15 ------------------------------------------------------------
+# census review: aterm-trust fork of upstream winnow (offset_from fix): three
+#   `writer.lock()` stderr-stream sites (combinator/debug/internals.rs), all behind the
+#   `debug` feature no aterm build activates — graphed anyway as `winnow::writer`
+#   (over-approximation, fail-closed: statement-shaped holds that nest nothing)
+# LICENSE: MIT — no Apache-2.0 term applies, so there is no §4(b) modification-notice
+#   obligation. The retained LICENSE file and the copyright notice still are obligations;
+#   `cargo forge attest` checks those.
+# PATCH LIVENESS: the fork is live at 0.7.15, but the lock ALSO carries registry winnow
+#   1.0.3 — the fix is not everywhere the name is. Anything resolving that other major runs
+#   unpatched.
+[[fork]]
+name = "winnow"
+version = "0.7.15"
+path = "vendor/winnow"
+license = "MIT"
+apache_notice = false
+census.mode = "scanned"
+census.namespace = "winnow"
+
+# --- pkg-config 0.3.33 --------------------------------------------------------
+# census review: aterm-trust fork of upstream pkg-config: a build-script host helper.
+#   Verified 2026-07-13 via `cargo tree --edges all -i pkg-config`: reachable ONLY through
+#   the [build-dependencies] of zstd-sys — it never links into the shipped GUI process
+# LICENSE: MIT OR Apache-2.0 — dual-licensed, so a copy distributed under the non-Apache
+#   option carries no §4(b) modification-notice obligation. Set apache_notice = true here
+#   the day that election changes.
+[[fork]]
+name = "pkg-config"
+version = "0.3.33"
+path = "vendor/pkg-config"
+license = "MIT OR Apache-2.0"
+apache_notice = false
+census.mode = "build-dep-only"
+
+# --- smol_str 0.2.2 -----------------------------------------------------------
+# census review: aterm-trust fork of upstream smol_str (winit's key-text string type): ZERO
+#   lock-vocabulary sites at registration; scanned so the claim is re-checked every run
+# LICENSE: MIT OR Apache-2.0 — dual-licensed, so a copy distributed under the non-Apache
+#   option carries no §4(b) modification-notice obligation. Set apache_notice = true here
+#   the day that election changes.
+[[fork]]
+name = "smol_str"
+version = "0.2.2"
+path = "vendor/smol_str"
+license = "MIT OR Apache-2.0"
+apache_notice = false
+census.mode = "scanned"
+census.namespace = "smol_str"

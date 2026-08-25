@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.53.0"
+version = "0.54.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -88,12 +88,15 @@ libc = "0.2"     # aterm-scrollback mmap/disk tier
 toml = "0.8"
 regex = "1"
 memchr = "2"
-# aterm-net (L3 network drive): real capability crypto — HMAC-SHA256 channel
-# binding + HKDF, and TLS 1.3 (rustls, ring provider) with the RFC 5705
+# aterm-net (L3 network drive): TLS 1.3 (rustls, ring provider) with the RFC 5705
 # keying-material exporter. rustls uses the `ring` backend (no aws-lc C build).
-hmac = "0.12"
-sha2 = "0.10"
-hkdf = "0.12"
+# The channel-binding HMAC-SHA256 is first-party — `aterm-digest`.
+#
+# `hkdf` was declared here for a key schedule that was never written: no crate
+# depends on it, so it never resolved into Cargo.lock and never cost a package.
+# Removed with `sha2`/`hmac` because it was built on `hmac` — re-deriving it
+# would have re-imported the whole tower this change just deleted. When aterm
+# needs HKDF it belongs in `aterm-digest`: RFC 5869 is ~30 lines over HMAC.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Distributed-slice collection across crates: the #[refines]/#[spec_unmodeled]
 # anchor emitters submit RefinementEntry/Waiver records into an inventory slice
@@ -179,6 +182,15 @@ aterm-rle = { path = "crates/aterm-rle" }
 aterm-codec = { path = "crates/aterm-codec" }
 aterm-bits = { path = "crates/aterm-bits" }
 aterm-hash = { path = "crates/aterm-hash" }
+# Cryptographic digests: SHA-256 and HMAC-SHA256, first-party and dependency-free.
+# Replaces `sha2` + `hmac`, which dragged 8 packages / 49,474 lines of third-party
+# source into the shipped graph — `digest` and its const-generic tower dominate at
+# 45,734, of which `typenum` alone is 40,601 — to expose the four methods every call
+# site here actually uses. Measured with `cargo forge survey --cell mac-arm`:
+# 161 → 153 third-party packages. `subtle` is NOT among them; rustls depends on it
+# directly, so it stays and `aterm_digest::ct_eq` replaces our USE of it. Strictly
+# separate from `aterm-hash`, which is and stays NON-cryptographic.
+aterm-digest = { path = "crates/aterm-digest" }
 aterm-log = { path = "crates/aterm-log" }
 aterm-alloc = { path = "crates/aterm-alloc" }
 aterm-update = { path = "crates/aterm-update" }

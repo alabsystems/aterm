@@ -280,8 +280,8 @@ pub const PINNED_UPDATE_PUBKEYS: &[&str] = aterm_update_core::pins::UPDATE_CHANN
 /// consumed by signature verification) avoids brittle searches for a base64
 /// literal that an optimizer may transform or eliminate.
 pub fn update_pubkey_sha256(encoded: &str) -> Result<Option<String>, String> {
+    use aterm_digest::Sha256;
     use base64::Engine as _;
-    use sha2::{Digest, Sha256};
 
     if encoded.is_empty() {
         return Ok(None);

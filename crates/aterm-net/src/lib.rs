@@ -53,13 +53,11 @@
 
 use std::io::{self, Read, Write};
 
+// HMAC-SHA256 (first-party, `aterm-digest`): the channel-binding MAC. The edge
+// token is the key.
+use aterm_digest::HmacSha256;
 use aterm_session::{EdgeToken, hex_nibble};
 use aterm_uds::CtlStream;
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
-
-/// HMAC-SHA256: the channel-binding MAC. The edge token is the key.
-type HmacSha256 = Hmac<Sha256>;
 
 /// TLS 1.3 transport (rustls) with the RFC 5705 keying-material exporter that
 /// binds the capability to the channel.
@@ -154,15 +152,12 @@ pub fn channel_bind(token: &EdgeToken, exporter: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(token.as_bytes())
         .expect("HMAC-SHA256 accepts a key of any length");
     mac.update(exporter);
-    let tag = mac.finalize().into_bytes();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&tag);
-    out
+    mac.finalize()
 }
 
 /// Verify a `presented` secret against `token` on the CURRENT channel's
 /// `exporter`, in **constant time**. Recomputes the HMAC and compares with
-/// [`Mac::verify_slice`] (constant-time tag compare), so a token bound to a
+/// [`HmacSha256::verify_slice`] (constant-time tag compare), so a token bound to a
 /// different channel (a captured replay) fails — its `presented` was computed over
 /// a different exporter — and the comparison leaks no timing.
 #[must_use]

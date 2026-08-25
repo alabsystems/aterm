@@ -22,7 +22,7 @@
 //!   job has exited — every attach from there fails ENXIO. `ditto` speaks to no
 //!   XPC service, so it works from any process context.
 //!
-//! Both digests are computed in-process via `sha2`, so the digest written into
+//! Both digests are computed in-process via `aterm-digest`, so the digest written into
 //! the manifest is provably the digest of the file we just produced.
 //!
 //! Port of `apps/aterm-mac/make-dmg.sh`, hdiutil branch only. The signed .app
@@ -793,7 +793,7 @@ fn build_in_stage(_app: &Path, _stage: &Path, _volname: &str, _dmg: &Path) -> Re
 /// Streaming in-process SHA-256 → lowercase hex. Public: the publish
 /// self-check re-hashes assets through the same code path.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
+    use aterm_digest::Sha256;
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();

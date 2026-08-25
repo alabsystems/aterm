@@ -40,10 +40,10 @@ use aterm_uds::{CtlListener, CtlStream};
 
 use aterm_containment::log_denial;
 use aterm_core::terminal::{CursorStyle, Terminal};
+use aterm_digest::Sha256;
 use aterm_session::sink::InputEpoch;
 use aterm_session::{EdgeToken, Op, SessionId, decide_edge};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
 use winit::event_loop::EventLoopProxy;
 
 use crate::control_auth::{self, AuthOutcome};
@@ -5321,7 +5321,7 @@ fn operator_input_if_epoch(
     };
     let OperatorTerminalFence::Exact(expected_generation) = terminal_fence;
     let evidence = crate::operator_host::terminal_evidence(&terminal);
-    let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+    let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes());
     if terminal.is_alternate_screen() != expected_generation.alternate_screen
         || terminal.content_seq() != expected_generation.content_seq
         || fingerprint != expected_generation.fingerprint
@@ -7390,7 +7390,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
         queue.manage_sid("s-interjection").unwrap();
-        let fingerprint: [u8; 32] = Sha256::digest(b"ready").into();
+        let fingerprint: [u8; 32] = Sha256::digest(b"ready");
         queue
             .enqueue(NewEvent::new(
                 "s-interjection",
@@ -7409,7 +7409,7 @@ mod tests {
                 0,
                 terminal.is_alternate_screen(),
                 terminal.content_seq(),
-                Sha256::digest(evidence.as_bytes()).into(),
+                Sha256::digest(evidence.as_bytes()),
             )
         };
         let paste = |text: &str| {
@@ -7564,7 +7564,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let queue = DurableQueue::open(&directory, 1, QueueConfig::default()).unwrap();
         queue.manage_sid("s-post-wal").unwrap();
-        let fingerprint: [u8; 32] = Sha256::digest(b"ready").into();
+        let fingerprint: [u8; 32] = Sha256::digest(b"ready");
         queue
             .enqueue(NewEvent::new(
                 "s-post-wal",
@@ -7638,7 +7638,7 @@ mod tests {
                 0,
                 terminal.is_alternate_screen(),
                 terminal.content_seq(),
-                Sha256::digest(evidence.as_bytes()).into(),
+                Sha256::digest(evidence.as_bytes()),
             )
         };
         let initial_evidence = {
@@ -7717,7 +7717,7 @@ mod tests {
             }
             let terminal = term_lock(&target.term);
             let evidence = crate::operator_host::terminal_evidence(&terminal);
-            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes());
             if terminal.content_seq() != proposal.generation.content_seq
                 || fingerprint != proposal.generation.fingerprint
             {
@@ -7746,7 +7746,7 @@ mod tests {
                         proposal.generation.lifecycle_epoch,
                         terminal.is_alternate_screen(),
                         terminal.content_seq(),
-                        Sha256::digest(evidence.as_bytes()).into(),
+                        Sha256::digest(evidence.as_bytes()),
                     );
                     assert_ne!(
                         generation, proposal.generation,
@@ -7809,7 +7809,7 @@ mod tests {
                 0,
                 terminal.is_alternate_screen(),
                 terminal.content_seq(),
-                Sha256::digest(evidence.as_bytes()).into(),
+                Sha256::digest(evidence.as_bytes()),
             )
         };
 
@@ -7845,7 +7845,7 @@ mod tests {
             0,
             terminal_guard.is_alternate_screen(),
             terminal_guard.content_seq(),
-            Sha256::digest(evidence.as_bytes()).into(),
+            Sha256::digest(evidence.as_bytes()),
         );
 
         let started = std::time::Instant::now();
@@ -7922,7 +7922,7 @@ mod tests {
         queue.manage_sid("s-test").unwrap();
 
         let claim = |evidence: &str, seq: u64| {
-            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes()).into();
+            let fingerprint: [u8; 32] = Sha256::digest(evidence.as_bytes());
             queue
                 .enqueue(NewEvent::new(
                     "s-test",
@@ -8084,7 +8084,7 @@ mod tests {
         let crash_queue = DurableQueue::open(&crash_directory, 1, QueueConfig::default()).unwrap();
         crash_queue.manage_sid("s-test").unwrap();
         let crash_evidence = "ready crash";
-        let crash_fingerprint: [u8; 32] = Sha256::digest(crash_evidence.as_bytes()).into();
+        let crash_fingerprint: [u8; 32] = Sha256::digest(crash_evidence.as_bytes());
         crash_queue
             .enqueue(NewEvent::new(
                 "s-test",

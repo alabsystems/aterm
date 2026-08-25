@@ -519,7 +519,7 @@ fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {
 /// bytes, and codesign rewrites them.
 pub fn write_provenance(spec: &BundleSpec, app: &Path, signed_by: &str) -> Result<PathBuf, String> {
     let shipped = app.join("Contents/MacOS/aterm");
-    // In-process sha256 (sha2): the digest on record is provably the digest of
+    // In-process sha256 (aterm-digest): the digest on record is provably the digest of
     // the bytes on disk, not of whatever a shelled hasher happened to read.
     let binary_sha256 = sha256_hex(&shipped)?;
     // build-app.sh emits the BARE short commit here (its `commit=` line runs
@@ -614,7 +614,7 @@ pub fn epoch_to_rfc3339(epoch: u64) -> String {
 /// Streaming in-process SHA-256 of a file (shared shape with dmg.rs — kept
 /// module-local so each file stays self-contained for the #[path] test mounts).
 fn sha256_hex(path: &Path) -> Result<String, String> {
-    use sha2::{Digest, Sha256};
+    use aterm_digest::Sha256;
     use std::io::Read;
     let mut f = std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
