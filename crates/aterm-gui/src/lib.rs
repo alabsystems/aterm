@@ -2581,11 +2581,11 @@ enum Wake {
         reply: std::sync::mpsc::Sender<Result<String, String>>,
     },
     /// `trail [<n>]` (control socket): read the FOCUSED window's cursor-trail
-    /// ADMISSION DIAGNOSIS ring — the last N armed/confirmed/retired
-    /// content-candidate decisions with their reasons and generations
-    /// ([`App::trail_admissions`]). Pure read of diagnostic state; the
-    /// one-command replacement for the `ATERM_TRACE_SPAWN` stderr hunt that
-    /// diagnosed the rainbow-trail blackout.
+    /// ADMISSION DIAGNOSIS ring — the last N spawn-seam verdicts
+    /// (`licensed`/`declined`, with the declining reason and the move's
+    /// endpoints) ([`App::trail_admissions`]). Pure read of diagnostic state;
+    /// the one-command replacement for the `ATERM_TRACE_SPAWN` stderr hunt
+    /// that diagnosed the rainbow-trail blackout.
     TrailAdmissions {
         /// `Some(n)` = only the newest `n` records; `None` = the whole ring.
         count: Option<usize>,
@@ -2593,7 +2593,7 @@ enum Wake {
     },
     /// `trail status` (control socket): the FOCUSED window's cursor-trail
     /// engine truth as ONE `key=value` line — resolved style, every gate from
-    /// the config knob to the glass, the cumulative admission scoreboard, and
+    /// the config knob to the glass, the cumulative licence scoreboard, and
     /// the light alive right now ([`App::trail_status`]). The standing-state
     /// sibling of [`Self::TrailAdmissions`]' per-decision ring, and the answer
     /// to "I don't see the rainbow cursor trails" that used to need a video
@@ -2713,14 +2713,14 @@ enum Wake {
         /// the hidden-session path if the answer turned out to be no.
         session: Option<u64>,
     },
-    /// Reply-bearing, side-effect-free cursor-provenance fence for a control
+    /// Reply-bearing, side-effect-free cursor-LICENSE fence for a control
     /// operation (notably `signal`) that acts directly on a visible session and
     /// therefore has no [`InputEvent`] of its own. The main thread re-resolves
     /// the named session across every window that still presents it before
-    /// clearing only the two cursor-engine candidates (OS focus-in/out events
+    /// expiring only the two engines' key-hint stamps (OS focus-in/out events
     /// can overlap during a handoff);
     /// it does not impersonate a key, touch cadence/rain/latency, or write bytes.
-    CursorCandidateCancel {
+    CursorMoveLicenseClear {
         session: u64,
         reply: std::sync::mpsc::Sender<bool>,
     },
@@ -7221,17 +7221,6 @@ struct WindowState {
     /// pump disarms it every cycle it successfully drives, so it fires only when the
     /// pump chain breaks (see the `Wake::EffectFrame` doc).
     next_trail_tick: Option<Instant>,
-    /// One exact typed/delete echo landed between the cursor-effects LOCK A
-    /// observation and LOCK B final extraction. The torn frame suppresses its
-    /// stale cursor projection but preserves both pending engine proofs; this
-    /// level latch buys the one coherent follow-up those proofs need even when
-    /// a cold first key has no resident geometry to keep frame cadence alive.
-    ///
-    /// It is a LEVEL, not an edge: unrelated event-loop turns before the due
-    /// frame must not park the deadline. The next render that actually reaches
-    /// the coherent candidate-confirm seam consumes it; lifecycle/serious-mode
-    /// parking clears it fail-closed. It therefore schedules at most one frame.
-    cursor_echo_settle_pending: bool,
     /// The last trail cadence anchor: normally the deadline that FIRED this
     /// redraw cycle; when a successful content/input present samples the effects
     /// before that deadline, the frame start replaces it and consumes the stale
@@ -8327,10 +8316,10 @@ impl WindowState {
     /// 3. The reduced-motion cat's bounded one-shot erase.
     /// 4. PARK — drop every clock in this lane; the loop returns to pure `Wait`.
     ///
-    /// Arm 1 preempts arm 2, and that asymmetry is safe in the direction it goes:
-    /// arm 1 is the FRAME cadence, strictly finer than arm 2's bounded one-shot,
+    /// Arm 1 preempts arm 3, and that asymmetry is safe in the direction it goes:
+    /// arm 1 is the FRAME cadence, strictly finer than arm 3's bounded one-shot,
     /// so a pending reduced-motion erase can only land earlier, never later. Once
-    /// the decorations rest, arm 2 re-arms the one-shot exactly as before.
+    /// the decorations rest, arm 3 re-arms the one-shot exactly as before.
     fn plan_terminal_effect_lane(
         &mut self,
         now: Instant,
@@ -8353,12 +8342,6 @@ impl WindowState {
         // this decoration armed. See `deco_anim_until` for the freeze that taught
         // us the difference.
         let deco_wake = self.deco_anim_frame_active(now);
-        // A cold first-key echo can have no live geometry at all: the ordinary
-        // pending candidate is deliberately output-driven and does not make
-        // either engine active. LOCK B already consumed that sole output batch,
-        // so retain a one-frame LEVEL until the next coherent LOCK A consumes
-        // it. Unlike cursor animation this settle is not focus-gated.
-        let echo_settle_wake = self.cursor_echo_settle_pending && self.front_terminal().is_some();
         // LUMEN cursor aurora: while any light is alive on a focused window,
         // re-present so the comet/bloom/ring/sparks animate, then disarm (→ pure
         // `Wait`, 0% idle) the moment they decay to nothing. The cadence is the
@@ -8367,11 +8350,7 @@ impl WindowState {
         // 120 Hz ProMotion panel the same comet twice and lands every second
         // frame ~8.3 ms stale. Coarse-only effects still take their own deadlines
         // below, so the extra wakes are confined to light that is actually MOVING.
-        if has_glass
-            && (echo_settle_wake
-                || deco_wake
-                || self.terminal_effect_frame_active(now, cursor_cat_motion))
-        {
+        if has_glass && (deco_wake || self.terminal_effect_frame_active(now, cursor_cat_motion)) {
             let aurora_interval = effect_tick_interval(self.frame_interval);
             // RESPONSIVENESS: collapse the multi-second 60 fps forge-ember tail.
             // If the ONLY live cursor effect is the glow's slowly-cooling ember
@@ -8392,8 +8371,7 @@ impl WindowState {
             // deadline would win the `phase_locked_effect_deadline` selection
             // below and pace Robi's walk at ~11 fps — the exact drift the
             // `cursor_dependents` split was introduced to end.
-            let others_need_cadence =
-                fade_wake || cursor_dependents || deco_wake || echo_settle_wake;
+            let others_need_cadence = fade_wake || cursor_dependents || deco_wake;
             let glow_deadline = self.cursor_glow.next_change_deadline(now, aurora_interval);
             let needs_frame_cadence = others_need_cadence || self.cursor_glow.needs_frame_cadence();
             // PHASE-LOCKED re-arm: continue the previous deadline train (`fired +
@@ -8497,7 +8475,6 @@ impl WindowState {
         self.next_trail_tick = None;
         self.last_trail_fire = None;
         self.last_effect_pump_at = None;
-        self.cursor_echo_settle_pending = false;
         // The decoration latch rides the same lane, so it parks with it. Reaching
         // here means the lane's own predicate said no, which for the decorations
         // is one of two things: the latch already expired (this is a no-op), or
@@ -9002,7 +8979,6 @@ impl WindowState {
             rain_hidden_band: Vec::new(),
             next_rain_tick: None,
             next_trail_tick: None,
-            cursor_echo_settle_pending: false,
             last_trail_fire: None,
             last_effect_pump_at: None,
             deco_anim_until: None,
@@ -12068,7 +12044,6 @@ impl App {
             // bookkeeping and must not erase a live terminal animation.
             ws.cursor_glow.reset();
             ws.cursor_trail.reset();
-            ws.cursor_echo_settle_pending = false;
             ws.cursor_pet.invalidate_colors();
             // The SCROLL ANCHOR belongs to the old terminal for exactly the same
             // reason. Two panes carry independent histories, so diffing the new
@@ -13441,11 +13416,11 @@ impl App {
     )]
     fn on_modifiers_changed(&mut self, wid: WindowId, mods: ModifiersState) {
         // A modifier snapshot is a newer human-input boundary even though it
-        // writes no PTY bytes itself.  Retire any still-unobserved cursor-move
-        // proof before publishing the new chord state: otherwise a swallowed
-        // key followed by (say) Shift alone could leave its exact candidate
-        // available for an unrelated child cursor move to borrow.
-        self.cancel_cursor_move_candidate(wid);
+        // writes no PTY bytes itself.  Close the cursor-move LICENSE before
+        // publishing the new chord state: otherwise a swallowed key followed
+        // by (say) Shift alone would leave its stamp fresh for an unrelated
+        // child cursor move to borrow.
+        self.clear_move_license(wid);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.mods = mods;
         }
@@ -16867,7 +16842,7 @@ impl ApplicationHandler<Wake> for App {
             Wake::SelectTab { window, index } => {
                 // Native TabView consumes this mouse/VoiceOver gesture directly,
                 // so it never crosses winit/app_mouse's ingress fence.
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 // A click on a DIFFERENT chip is "a click away", and clicking away
                 // keeps what you typed. The macOS strip's `TabView` is a plain
                 // NSView that never takes first responder, so AppKit never ends
@@ -16885,7 +16860,7 @@ impl ApplicationHandler<Wake> for App {
             // take. If it was the window's LAST tab, flag + escalate (we have `el`
             // here) so the window tears down, exactly like a tab-strip close.
             Wake::CloseTab { window, index } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 // Settle FIRST, like every other spelling of "close". The native
                 // close ✕ posts this wake, while the in-grid ✕, ⌘W and the
                 // context menu all settle on their way in — without this, the
@@ -16910,7 +16885,7 @@ impl ApplicationHandler<Wake> for App {
                 tab,
                 action,
             } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 // The SAME divert the menu bar takes (`dispatch_menu_action` runs
                 // it first thing). Without it the two spellings of one command
                 // disagreed: Close Tab from the menu bar committed the edit, while
@@ -16926,7 +16901,7 @@ impl ApplicationHandler<Wake> for App {
                 self.dispatch_tab_menu_action(el, window, tab, action);
             }
             Wake::TabContextMenuOpening { window } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
             }
             // A per-peer connection row (Show / Configure… / Disconnect) of a
             // tab's context menu, resolved against the pop-time stable tab id
@@ -16948,7 +16923,7 @@ impl ApplicationHandler<Wake> for App {
             // A tab chip was double-clicked: open the inline pin editor over that
             // tab's FOCUSED pane's session, resolved from the stable id here.
             Wake::BeginSessionRename { window, tab } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 self.begin_session_rename(window, tab);
             }
             // The editor ended keeping what was typed (Return / Tab / click away).
@@ -16959,13 +16934,13 @@ impl ApplicationHandler<Wake> for App {
                 session,
                 text,
             } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 self.commit_session_rename(window, session, &text);
             }
             // Escape, or the strip discovering its edited tab is gone: tear the
             // editor down and write nothing.
             Wake::CancelSessionRename { window, session } => {
-                self.cancel_tab_surface_cursor_move_candidate(Some(window));
+                self.clear_tab_surface_move_license(Some(window));
                 self.cancel_session_rename(window, session);
             }
             // The control socket's `tab` verb (new/<N>/next/prev), driving the FRONT
@@ -16977,7 +16952,7 @@ impl ApplicationHandler<Wake> for App {
                 // Native TabView drag gestures and controller tab commands share
                 // this wake. A reorder that leaves the active tab unchanged is
                 // still a newer input/coordinate boundary.
-                self.cancel_tab_surface_cursor_move_candidate(None);
+                self.clear_tab_surface_move_license(None);
                 // A control-socket `tab close` is a DELIBERATE, non-interactive
                 // instruction — it must NOT pop the blocking native confirm dialog
                 // (that would wedge the UI thread inside `runModal` and hang the
@@ -17512,8 +17487,8 @@ impl ApplicationHandler<Wake> for App {
             // P2: an AccessKit adapter event (initial-tree request / OS action / deactivate).
             #[cfg(feature = "a11y-accesskit")]
             Wake::Accessibility(event) => self.on_accessibility_event(event),
-            Wake::CursorCandidateCancel { session, reply } => {
-                let canceled = self.cancel_cursor_move_candidate_for_session(session);
+            Wake::CursorMoveLicenseClear { session, reply } => {
+                let canceled = self.clear_move_license_for_session(session);
                 let _ = reply.send(canceled);
             }
             // Phase 0.5 (A.2.3): apply a controller-built batch on the main thread
@@ -17636,11 +17611,11 @@ impl ApplicationHandler<Wake> for App {
             // because Quit / the last-tab Close must exit the loop.
             Wake::MenuAction { action } => self.dispatch_menu_action(el, action),
             Wake::OperatorAction { action } => {
-                self.cancel_front_cursor_move_candidate();
+                self.clear_front_move_license();
                 self.dispatch_operator_action(el, action);
             }
             Wake::OperatorMenuOpening => {
-                self.cancel_front_cursor_move_candidate();
+                self.clear_front_move_license();
                 if let Some(proxy) = self.proxy.clone() {
                     fleet_watch::request_scan(proxy);
                 }
@@ -25083,33 +25058,36 @@ mod multi_window_tests {
             "an unseeded reflow landing cannot bridge old and new layouts"
         );
 
-        // Tier 1: the shipping same-cell completion projects onto the derived
-        // fail-closed revocation transition. `RevokeQueued` is the model's
-        // shared abstraction for an armed host class whose owned landing is
-        // proven not to occur; retaining the class is the negative control.
-        let model = aterm_spec::derive::rainbow_move_admission_model();
+        // Tier 1: the shipping same-cell completion projects onto the licence
+        // model's swallow disposition — an armed class whose owned landing is
+        // proven not to occur is cleared at the boundary, exactly like a key
+        // this window swallowed. Retaining the stamp is the negative control.
+        let model = aterm_spec::derive::cursor_hint_license_model();
         let mut armed = model.init_state();
-        armed.insert("strong_class", 1);
+        armed.insert("hint", 1);
+        armed.insert("arms", 1);
+        armed.insert("credit_arms", 1);
         let mut revoked = armed.clone();
-        revoked.insert("strong_class", 0);
-        revoked.insert("queued_revoked", 1);
+        revoked.insert("hint", 0);
+        revoked.insert("cleared", 1);
+        revoked.insert("swallowed", 1);
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &armed,
             &revoked,
-            Some("RevokeQueued"),
+            Some("SwallowedKeyClearsLicense"),
             "same-cell resize reflow revocation",
         );
         assert!(ok, "same-cell resize revocation rejected: {why}");
         let mut sticky = revoked;
-        sticky.insert("strong_class", 1);
+        sticky.insert("hint", 1);
         let (ok, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &armed,
             &sticky,
-            Some("RevokeQueued"),
+            Some("SwallowedKeyClearsLicense"),
             "same-cell resize sticky-hint negative control",
         );
         assert!(!ok, "same-cell resize may not retain a reflow licence");
@@ -28012,6 +27990,33 @@ mod early_out_tests {
         );
     }
 
+    /// WHAT BUYS THE FRAME AFTER A TORN CARET (docs/design/EFFECTS-LICENSE-
+    /// REDESIGN.md). The proof era's `cursor_echo_settle_pending` was a
+    /// one-shot LEVEL in the effects scheduler whose whole job was to schedule
+    /// one more present after an echo landed between LOCK A and LOCK B — the
+    /// cold-first-key case, where no engine owns an animation deadline. It was
+    /// never needed: the caret move that tore the frame is itself two terms of
+    /// the `RepaintKey`, so the very next redraw cannot take the content
+    /// early-out, and the PTY reader re-arms its output wake for a chunk that
+    /// lands inside a redraw (`Wake::Output` clears the coalescing latch before
+    /// any of its work). This pins the half that lives here.
+    #[test]
+    fn a_bare_caret_move_moves_the_repaint_key() {
+        let mut term = Terminal::new(4, 10);
+        let settled = frame_key(&mut term, true, false, None);
+        // CUP: relocate the caret, write nothing.
+        term.process(b"\x1b[3;7H");
+        let moved = frame_key(&mut term, true, false, None);
+        assert_eq!(
+            settled.damage_epoch, moved.damage_epoch,
+            "a pure caret move marks no grid damage — the premise of the latch"
+        );
+        assert!(
+            should_repaint(Some(settled), moved),
+            "the cursor terms carry the frame a torn caret owes, with no latch"
+        );
+    }
+
     /// Exercise the COMPLETE split compose call site, not only the pure gate:
     /// after one unchanged frame early-outs, the same key must compose when a
     /// recovery redraw is outstanding. Removing the recovery-aware predicate
@@ -28505,7 +28510,6 @@ mod tests {
         ws.pet_hit_rect = Some((0, 0, 8, 16));
 
         ws.next_trail_tick = Some(now);
-        ws.cursor_echo_settle_pending = true;
         ws.next_rain_tick = Some(now);
         ws.next_demo_tick = Some(now);
         ws.next_native_preview_tick = Some(now);
@@ -28561,7 +28565,6 @@ mod tests {
         assert!(ws.matrix_rain.is_none());
         assert!(!ws.stream_fade.is_active(now));
         assert!(ws.next_trail_tick.is_none());
-        assert!(!ws.cursor_echo_settle_pending);
         assert!(ws.next_rain_tick.is_none());
         assert!(ws.next_demo_tick.is_none());
         assert!(ws.next_native_preview_tick.is_none());
@@ -32030,7 +32033,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            145,
+            141,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(

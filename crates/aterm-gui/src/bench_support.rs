@@ -1158,8 +1158,13 @@ impl DigestBench {
     /// `targets` watched sessions, each with `blocks` shell blocks, `turns` turn
     /// records and `timeline` timeline events retained. Depths past the shipping
     /// ring caps saturate; [`Self::retained`] reports what was really reached.
+    /// NOT named `new`, for the same reason its inner `DigestFixture::build` is
+    /// not: the lock-order census resolves a held one-hop call by callee NAME, so
+    /// a `fn new` here would capture every `Vec::new()` made under a held `term`
+    /// guard and report an OB-7 re-entrancy suspect against a bench fixture's own
+    /// private engine.
     #[must_use]
-    pub fn new(targets: usize, blocks: usize, turns: usize, timeline: usize) -> Self {
+    pub fn build(targets: usize, blocks: usize, turns: usize, timeline: usize) -> Self {
         DigestBench {
             inner: crate::subscribe::bench_seam::DigestFixture::build(
                 targets, blocks, turns, timeline,

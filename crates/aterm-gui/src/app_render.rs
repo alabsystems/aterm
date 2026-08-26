@@ -129,10 +129,12 @@ enum CursorEffectScrollDecision {
     Invalidate,
 }
 
-/// The `ATERM_TRACE_SPAWN` diagnostic gate, shared by the per-present
-/// `SPAWNSRC` cursor trace below and the input path's `PRESS`/`ARM` traces
-/// (the content-proof capture and arming sensors in `app_input`; the engine's
-/// own `CONFIRM`/`DIFF` twins live behind the same env var in `cursor_glow`).
+/// The `ATERM_TRACE_SPAWN` diagnostic gate behind the per-present `SPAWNSRC`
+/// cursor trace below: every cursor position the effect engines SEE, frame by
+/// frame. The proof era's `PRESS`/`ARM`/`CONFIRM`/`DIFF` sensors rode the same
+/// env var and went with their subjects; the standing answer to "why is the
+/// ribbon dark" is now `aterm ctl trail` (the admission ring and its
+/// `trail status` line), which needs no rebuild.
 /// A static once-sampled bool — a mid-run env mutation is not a supported use
 /// — so every trace site pays one cached load when the trace is off.
 pub(crate) fn trace_spawn_enabled() -> bool {
@@ -140,110 +142,23 @@ pub(crate) fn trace_spawn_enabled() -> bool {
     *ON.get_or_init(|| std::env::var_os("ATERM_TRACE_SPAWN").is_some())
 }
 
-/// Project CursorGlow's coherent content proof onto the classic trail twin
-/// before either engine observes this frame's cursor delta.
-#[inline]
-fn cursor_candidate_generation_evidence(
-    decision: Option<aterm_effects::cursor_glow::ContentCandidateDecision>,
-) -> aterm_effects::cursor_glow::ContentGenerationEvidence {
-    use aterm_effects::cursor_glow::{ContentCandidateDecision, ContentGenerationEvidence};
-
-    match decision {
-        Some(ContentCandidateDecision::Confirmed { .. }) => ContentGenerationEvidence::Exact,
-        Some(ContentCandidateDecision::Downgraded { .. }) => {
-            ContentGenerationEvidence::AuthoredMotion
-        }
-        Some(ContentCandidateDecision::Deferred { .. }) => ContentGenerationEvidence::DeferredProbe,
-        Some(ContentCandidateDecision::Retired { .. }) | None => ContentGenerationEvidence::None,
-    }
-}
-
-fn confirm_cursor_move_candidate(
-    window: &mut WindowState,
-    cur: Option<(u16, u16)>,
-    now: Instant,
-    generation: aterm_effects::cursor_trail::ContentGeneration,
-) {
-    let decision = window
-        .cursor_glow
-        .confirm_content_candidate(cur, now, generation);
-    let generation_evidence = cursor_candidate_generation_evidence(decision);
-    match decision {
-        Some(aterm_effects::cursor_glow::ContentCandidateDecision::Confirmed {
-            at,
-            origin,
-            target,
-        }) => {
-            window
-                .cursor_trail
-                .confirm_content_candidate(at, origin, target);
-            // A `confirmed-prefix` split (partial echo of a mash-extended
-            // span) staged the unjudged tail inside the glow engine; project
-            // the SAME tail onto the classic twin so both engines re-arm it
-            // after this frame's spawn consumes the confirmed prefix.
-            if let Some(remainder) = window.cursor_glow.confirmed_prefix_remainder() {
-                window.cursor_trail.rearm_typed_remainder(
-                    remainder.at,
-                    remainder.expected,
-                    remainder.target,
-                    remainder.material,
-                );
-            }
-        }
-        Some(aterm_effects::cursor_glow::ContentCandidateDecision::Retired { at, origin }) => {
-            window.cursor_trail.retire_content_candidate(at, origin);
-        }
-        Some(aterm_effects::cursor_glow::ContentCandidateDecision::Downgraded { at, origin }) => {
-            // The refuted echo proved the press was a MOTION command; both
-            // engines now hold the same jump-shaped candidate.
-            window.cursor_trail.arm_motion(at, origin);
-        }
-        Some(aterm_effects::cursor_glow::ContentCandidateDecision::Deferred { .. }) | None => {}
-    }
-    // ONE ownership verdict per frame: the glow engine (owner of the row
-    // probe) triages the generation change, and that verdict is projected
-    // verbatim onto the classic trail and the cursor companion. Only an
-    // unowned RELOCATION (a program-owned cursor move or a terminal/screen
-    // identity change) grounds the companion — output-only spinner/stream
-    // batches at an untouched caret keep its earned momentum, matching
-    // `retire_unowned_cursor_motion`'s own contract.
-    let ownership = window.cursor_glow.observe_content_generation_with_evidence(
-        generation,
-        cur,
-        generation_evidence,
-    );
-    let witness = window.cursor_glow.batch_wake_witness();
-    window
-        .cursor_trail
-        .observe_content_generation(generation, ownership, witness.as_ref());
-    if matches!(
-        ownership,
-        aterm_effects::cursor_trail::GenerationOwnership::UnownedRelocation
-    ) {
-        window.cursor_cat.retire_unowned_cursor_motion();
-    }
-    // Reaching this point means a real render ran the coherent LOCK-A proof
-    // seam. It is the only event that can spend the bounded follow-up bought by
-    // a prior LOCK-A/LOCK-B echo straddle; unrelated event-loop turns leave the
-    // level latch untouched in the scheduler.
-    window.cursor_echo_settle_pending = false;
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CursorFxCommit {
     Same,
     StableProjectionDrift,
-    /// The caret's VISIBILITY flipped between LOCK A and LOCK B while every
-    /// coordinate-space key — terminal identity, screen, caret cell, DECSCUSR
-    /// style, scroll clock — held. A DECTCEM toggle is not a coordinate
-    /// divergence: nothing the engines hold moved, so nothing they hold is
-    /// stale. The presented cursor style must still be rebound (LOCK B owns
-    /// it), but the resident engines keep their light AND their thermals.
+    /// The caret moved between LOCK A and LOCK B while the coordinate space
+    /// itself held still. THIS FRAME's cursor scratch was emitted at the old
+    /// cell and must be suppressed — but the engines' RESIDENT light is
+    /// anchored to cells, and no cell moved, so none of it is stale.
+    CursorMoved,
+    /// The caret's VISIBILITY flipped between the locks while every
+    /// coordinate key held. LOCK B owns the presented cursor style and the
+    /// caret's visibility is part of that binding, so the style is rebound —
+    /// but no cell moved, so resident light and this frame's scratch are both
+    /// still exactly true. (Under the proof era a visibility flip was a full
+    /// divergence that reset both engines; a blinking caret alone could
+    /// therefore blank the ribbon.)
     VisibilityDrift,
-    /// One exact authored content echo landed between LOCK A and LOCK B. The
-    /// current projection is stale and must be suppressed, but both pending
-    /// engine proofs remain valid for one coherent settle frame.
-    EchoStraddle,
     Diverged,
 }
 
@@ -258,20 +173,26 @@ struct CursorFxProjection {
 
 /// Classify the LOCK A effect tick against the LOCK B frame that will actually
 /// be presented. A process-sequence change alone does not move a cursor-owned
-/// projection: the terminal/screen identity, caret, visibility, and cursor
-/// shape are its placement key, while the cumulative content-scroll state is
-/// the coordinate-space key for every row-bound point. Keeping a projection
-/// across ordinary output avoids a one-frame rainbow/kitty blackout, but a
-/// scroll between the two locks must fail closed even when it returns the
-/// caret to the same cell: LOCK A's scratch has not observed that transform.
-/// The only moving-caret exception is the twin-engine witness for the exact
-/// pending content candidate crossing its sole next generation. That commit
-/// suppresses stale scratch but preserves state for one coherent retry.
+/// projection: the terminal/screen identity, visibility, and cursor shape are
+/// its placement key, while the cumulative content-scroll state is the
+/// coordinate-space key for every row-bound point. Keeping a projection across
+/// ordinary output avoids a one-frame rainbow/kitty blackout, and a scroll
+/// between the two locks must fail closed even when it returns the caret to
+/// the same cell: LOCK A's scratch has not observed that transform.
+///
+/// A BARE CARET MOVE IS NOT A DIVERGENCE (docs/design/EFFECTS-LICENSE-
+/// REDESIGN.md). The caret is not part of the coordinate space — cells did not
+/// move, so resident light is exactly as true as it was a microsecond ago.
+/// Only THIS frame's scratch, emitted at the old cell, is stale. The proof era
+/// classified every such frame `Diverged` and reset both engines, then bought
+/// typing back out of its own fence with a twin-witness exception and a
+/// one-shot settle latch — an epicycle whose only job was to stop the fence
+/// from killing the ribbon on the user's own keystrokes. Both are gone: the
+/// arm is unconditional, and it destroys nothing.
 #[inline]
 fn classify_cursor_fx_commit(
     observed: CursorFxProjection,
     committed: CursorFxProjection,
-    pending_content_echo_straddles: bool,
 ) -> CursorFxCommit {
     if observed.generation.terminal_id != committed.generation.terminal_id
         || observed.generation.alternate_screen != committed.generation.alternate_screen
@@ -280,43 +201,8 @@ fn classify_cursor_fx_commit(
     {
         CursorFxCommit::Diverged
     } else if observed.cursor != committed.cursor {
-        // A caret that MOVED between the locks is still fenced exactly as
-        // before, hidden or not: the move is the coordinate divergence, and
-        // only the exact twin-owned sole-next echo witness retains it.
-        if observed.visible
-            && committed.visible
-            && pending_content_echo_straddles
-            && committed.generation.process_sequence
-                == observed.generation.process_sequence.wrapping_add(1)
-        {
-            CursorFxCommit::EchoStraddle
-        } else {
-            CursorFxCommit::Diverged
-        }
+        CursorFxCommit::CursorMoved
     } else if observed.visible != committed.visible {
-        // THE DECTCEM BRACKET, no longer a hard reset.
-        //
-        // Claude Code (and vim, and fzf) hide the caret INSIDE the per-keystroke
-        // DEC-2026 synchronized repaint and show it again at the end — the
-        // host's own LOCK-A comment documents that bracket. When the parser
-        // processed the hide between LOCK A and LOCK B, `visible` differed, this
-        // classified Diverged, and `retire_torn_cursor_fx` called
-        // `CursorGlow::reset()` — which is the ONLY per-frame path in the tree
-        // that also clears THERMALS, i.e. the rainbow kitty's momentum spine.
-        // On a TUI bracketing every keystroke that fires continuously, which
-        // parks the trail at the cold floor no matter how well the engine's own
-        // admission seams behave.
-        //
-        // It is also a straight contradiction of the engine's own law: "A hidden
-        // cursor is NOT relocation evidence — `None` frames are the alt screen's
-        // steady state" (`cursor_glow.rs`, the unowned generation fence). The
-        // host may not answer a question the engine has already decided.
-        //
-        // Nothing here weakens the fence. Every coordinate-space key held
-        // (checked above) and the caret did not move (checked above), so LOCK
-        // A's scratch is positionally exact; the only thing LOCK B owns that
-        // changed is whether the caret block itself paints, and that is
-        // precisely what the rebind below is for.
         CursorFxCommit::VisibilityDrift
     } else if observed.generation.process_sequence != committed.generation.process_sequence {
         CursorFxCommit::StableProjectionDrift
@@ -326,17 +212,19 @@ fn classify_cursor_fx_commit(
 }
 
 /// Retire every cursor-coordinate owner when a torn LOCK A/LOCK B frame
-/// actually DIVERGED the cursor's coordinate space (`classify_cursor_fx_commit`
-/// — identity/style change, unowned cursor move/visibility flip, or scroll).
+/// actually DIVERGED the cursor's COORDINATE SPACE (`classify_cursor_fx_commit`
+/// — a terminal/screen identity change, a DECSCUSR shape change, or a
+/// scroll; a bare visibility flip is `VisibilityDrift`, not a divergence).
+/// Resident light is anchored in that space, so when the
+/// space itself is replaced the light has no cell left to be true about.
 /// A merely newer generation with a stable projection key and scroll clock
-/// keeps both the engines and this frame's projection live. `free_scratch` is
-/// deliberately conservative: the cursor kitty, resident pet, and Robi share
-/// that untagged sprite plane, so keeping any of it would risk one frame at the
-/// old cursor.
+/// keeps both the engines and this frame's projection live, and so — since the
+/// license redesign — does a bare caret move. `free_scratch` is deliberately
+/// conservative: the cursor kitty, resident pet, and Robi share that untagged
+/// sprite plane, so keeping any of it would risk one frame at the old cursor.
 fn retire_torn_cursor_fx(window: &mut WindowState) {
     window.cursor_glow.reset();
     window.cursor_trail.reset();
-    window.cursor_echo_settle_pending = false;
     // Ground an ordinary earned flight, but preserve a collection/song promise;
     // either way its old edge-fold and renderer pixel origin are incomparable
     // with the committed coordinate space and must be re-anchored.
@@ -362,17 +250,20 @@ fn apply_cursor_fx_commit(window: &mut WindowState, commit: CursorFxCommit) -> b
             retire_torn_cursor_fx(window);
             true
         }
-        CursorFxCommit::EchoStraddle => {
-            // The retained engines/cat own their next coherent frame, not this
+        CursorFxCommit::CursorMoved => {
+            // The retained engines/cat own their next frame, not this
             // old-caret scratch plane. Clearing scratch does not mutate their
-            // resident state; the settle latch below buys the re-emission.
+            // resident state. Nothing needs to be latched to buy the
+            // re-emission: `RepaintKey` carries `cursor_row`/`cursor_col`, so
+            // the very move that tore this frame also forbids the next one's
+            // early-out, and the PTY reader re-arms its output wake for any
+            // chunk that lands inside a redraw.
             window.free_scratch.clear();
             window.pet_hit_rect = None;
             window.robi_hit_rect = None;
             window.robi_tip_request = None;
             window.robi_tip_posted = None;
             window.robi_bubble_anchor = None;
-            window.cursor_echo_settle_pending = true;
             true
         }
         CursorFxCommit::VisibilityDrift => {
@@ -436,9 +327,8 @@ fn rebind_cursor_override_after_torn(
 mod cursor_fx_generation_fence_tests {
     use super::{
         CursorFxCommit, CursorFxProjection, apply_cursor_fx_commit, classify_cursor_fx_commit,
-        confirm_cursor_move_candidate, cursor_candidate_generation_evidence,
         rebind_cursor_override_after_torn, retain_cursor_free_sprite_span, retire_torn_cursor_fx,
-        suppress_torn_cursor_projection, suppress_torn_robi_tip, take_due_trail_tick,
+        suppress_torn_cursor_projection, suppress_torn_robi_tip,
     };
     use crate::{App, Backend, WindowId};
     use aterm_core::render::{
@@ -446,52 +336,12 @@ mod cursor_fx_generation_fence_tests {
     };
     use aterm_core::terminal::{ContentScrollState, CursorStyle};
     use aterm_effects::cursor_glow::{
-        ContentCandidateDecision, ContentGenerationEvidence, CursorCatMotionKind,
-        CursorCatMotionPulse, Geom, GlowStyle, ProbeTrust,
+        CursorCatMotionKind, CursorCatMotionPulse, Geom, GlowStyle, ProbeTrust,
     };
-    use aterm_effects::cursor_trail::{
-        ContentGeneration, ExpectedCellSpan, ExpectedRowSnapshot, TrailConfig,
-    };
+    use aterm_effects::cursor_trail::{ContentGeneration, TrailConfig};
     use aterm_effects::kitty_registry::KittyLook;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
-
-    #[test]
-    fn production_host_maps_candidate_decisions_to_generation_evidence() {
-        let now = Instant::now();
-        let origin = (4, 9);
-        let cases = [
-            (
-                Some(ContentCandidateDecision::Confirmed {
-                    at: now,
-                    origin,
-                    target: (4, 10),
-                }),
-                ContentGenerationEvidence::Exact,
-            ),
-            (
-                Some(ContentCandidateDecision::Retired { at: now, origin }),
-                ContentGenerationEvidence::None,
-            ),
-            (
-                Some(ContentCandidateDecision::Downgraded { at: now, origin }),
-                ContentGenerationEvidence::AuthoredMotion,
-            ),
-            (
-                Some(ContentCandidateDecision::Deferred { at: now, origin }),
-                ContentGenerationEvidence::DeferredProbe,
-            ),
-            (None, ContentGenerationEvidence::None),
-        ];
-
-        for (decision, expected) in cases {
-            assert_eq!(
-                cursor_candidate_generation_evidence(decision),
-                expected,
-                "production host mapped {decision:?} to the wrong generation evidence"
-            );
-        }
-    }
 
     #[test]
     fn projection_key_divergence_retires_resident_cursor_and_companion_projection() {
@@ -520,7 +370,6 @@ mod cursor_fx_generation_fence_tests {
                     visible: true,
                     style: CursorStyle::SteadyBlock,
                 },
-                false,
             ),
             CursorFxCommit::StableProjectionDrift,
             "content churn at a stable caret keeps the current projection"
@@ -566,8 +415,8 @@ mod cursor_fx_generation_fence_tests {
             ws.cursor_glow.note_synthetic_move(now);
             ws.cursor_trail.note_synthetic_move(now);
             assert!(
-                ws.cursor_glow.move_candidate_pending() && ws.cursor_trail.move_candidate_pending(),
-                "the fence test starts with real pending engine provenance"
+                ws.cursor_glow.move_licensed(now) && ws.cursor_trail.move_licensed(now),
+                "the fence test starts with a real live license on both engines"
             );
             ws.glow_scratch.push(GlowQuad::default());
             ws.trail_scratch.push(TrailCell {
@@ -597,8 +446,10 @@ mod cursor_fx_generation_fence_tests {
             });
             assert!(ws.cursor_cat.placement_frame(fold_at).fold.is_some());
             retire_torn_cursor_fx(ws);
-            assert!(!ws.cursor_glow.move_candidate_pending());
-            assert!(!ws.cursor_trail.move_candidate_pending());
+            assert!(
+                !ws.cursor_glow.move_licensed(now) && !ws.cursor_trail.move_licensed(now),
+                "a genuinely torn coordinate space spends every license too"
+            );
             assert!(ws.glow_scratch.is_empty() && ws.trail_scratch.is_empty());
             assert!(ws.free_scratch.is_empty());
             assert!(ws.pet_hit_rect.is_none() && ws.robi_hit_rect.is_none());
@@ -685,133 +536,15 @@ mod cursor_fx_generation_fence_tests {
         };
         assert_eq!(renderer.cursor_style_override(), None);
 
-        // Tier-1: resident kitty/pet projection exists independently of a
-        // newly admitted move. A sequence-only drift retains it; a placement-
-        // key or content-scroll divergence suppresses and retires it.
-        let model = aterm_spec::derive::cursor_move_candidate_model();
-        let source = model.init_state();
-        let mut charged = source.clone();
-        assert!(model.fire("ChargeResident", &mut charged));
-        assert_eq!(charged["resident_charged"], 1);
-        assert_eq!(charged["resident_projection"], 0);
-        let mut coherent = charged.clone();
-        assert!(model.fire("FinalExtractSame", &mut coherent));
-        assert_eq!(coherent["resident_projection"], 1);
-        let mut next_frame = coherent.clone();
-        assert!(model.fire("NextResidentFrame", &mut next_frame));
-        let mut retained = next_frame.clone();
-        assert!(model.fire("FinalExtractGenerationDrift", &mut retained));
-        assert_eq!(retained["resident_projection"], 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &retained,
-            Some("FinalExtractGenerationDrift"),
-            "real stable LOCK A/B cursor projection drift",
-        );
-        assert!(ok, "stable resident retention rejected: {why}");
-        let mut blanked = retained.clone();
-        blanked.insert("resident_projection", 0);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &blanked,
-            Some("FinalExtractGenerationDrift"),
-            "forged one-frame companion blackout",
-        );
-        assert!(!ok, "a stable drift may not blank resident light");
-
-        let mut dropped = next_frame.clone();
-        assert!(model.fire("FinalExtractProjectionKeyDrift", &mut dropped));
-        assert_eq!(dropped["resident_projection"], 0);
-        assert_eq!(dropped["resident_charged"], 0);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &dropped,
-            Some("FinalExtractProjectionKeyDrift"),
-            "real divergent LOCK A/B cursor projection fence",
-        );
-        assert!(ok, "resident divergence suppression rejected: {why}");
-        let mut stranded = dropped;
-        stranded.insert("resident_charged", 1);
-        stranded.insert("resident_projection", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &stranded,
-            Some("FinalExtractProjectionKeyDrift"),
-            "forged retained companion after coordinate divergence",
-        );
-        assert!(
-            !ok,
-            "a resident companion may not survive coordinate divergence"
-        );
-
-        let scroll_commit = classify_cursor_fx_commit(
-            CursorFxProjection {
-                generation: observed,
-                scroll: ContentScrollState::default(),
-                cursor: (2, 2),
-                visible: true,
-                style: CursorStyle::SteadyBlock,
-            },
-            CursorFxProjection {
-                generation: committed,
-                scroll: ContentScrollState {
-                    uniform_up_rows: 1,
-                    ..ContentScrollState::default()
-                },
-                cursor: (2, 2),
-                visible: true,
-                style: CursorStyle::SteadyBlock,
-            },
-            false,
-        );
-        let scroll_action = match scroll_commit {
-            CursorFxCommit::Diverged => "FinalExtractScrollDrift",
-            other => panic!("same-cell scroll was not fenced: {other:?}"),
-        };
-        let mut scroll_dropped = next_frame.clone();
-        assert!(model.fire(scroll_action, &mut scroll_dropped));
-        assert_eq!(scroll_dropped["final_projection_key_match"], 1);
-        assert_eq!(scroll_dropped["final_scroll_state_match"], 0);
-        assert_eq!(scroll_dropped["resident_projection"], 0);
-        assert_eq!(scroll_dropped["resident_charged"], 0);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &scroll_dropped,
-            Some(scroll_action),
-            "real same-cell LOCK A/B scroll fence",
-        );
-        assert!(ok, "scroll divergence suppression rejected: {why}");
-        let mut scroll_stranded = scroll_dropped;
-        scroll_stranded.insert("resident_charged", 1);
-        scroll_stranded.insert("resident_projection", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &next_frame,
-            &scroll_stranded,
-            Some(scroll_action),
-            "forged retained companion after same-cell scroll",
-        );
-        assert!(
-            !ok,
-            "row-bound resident light may not survive an unobserved scroll"
-        );
     }
 
     /// TORN-FRAME PIN (v0.49.0): a PTY chunk landing between LOCK A and
     /// LOCK B is a standing, several-times-per-second event under a streaming
     /// TUI. Content churn with an identical projection key keeps the current
-    /// overlays; a coordinate/identity/style/scroll change suppresses and resets.
+    /// overlays; a COORDINATE-SPACE change (identity, screen, visibility,
+    /// DECSCUSR shape, scroll) suppresses and resets; a bare caret move
+    /// suppresses this frame's stale scratch and resets NOTHING, whoever moved
+    /// the caret and whether or not a key licensed it.
     #[test]
     fn torn_frame_projection_classifier_is_proportionate() {
         let observed = ContentGeneration {
@@ -831,7 +564,7 @@ mod cursor_fx_generation_fence_tests {
             visible: true,
             style: CursorStyle::SteadyBlock,
         };
-        let classify = |generation, cursor, visible, style, echo_straddle| {
+        let classify = |generation, cursor, visible, style| {
             classify_cursor_fx_commit(
                 observed_projection,
                 CursorFxProjection {
@@ -841,40 +574,32 @@ mod cursor_fx_generation_fence_tests {
                     visible,
                     style,
                 },
-                echo_straddle,
             )
         };
         assert_eq!(
-            classify(committed, (3, 9), true, CursorStyle::SteadyBlock, false,),
+            classify(committed, (3, 9), true, CursorStyle::SteadyBlock),
             CursorFxCommit::StableProjectionDrift,
             "an output-only mid-frame batch keeps this frame's resident light"
         );
         assert_eq!(
-            classify(committed, (4, 0), true, CursorStyle::SteadyBlock, false,),
-            CursorFxCommit::Diverged,
-            "a mid-frame cursor move owns a hard reset"
+            classify(committed, (4, 0), true, CursorStyle::SteadyBlock),
+            CursorFxCommit::CursorMoved,
+            "a mid-frame caret move suppresses stale scratch and resets nothing"
         );
         assert_eq!(
-            classify(committed, (4, 0), true, CursorStyle::SteadyBlock, true,),
-            CursorFxCommit::EchoStraddle,
-            "the exact twin-owned sole-next echo is the one retained cursor move"
+            classify(observed, (4, 0), true, CursorStyle::SteadyBlock),
+            CursorFxCommit::CursorMoved,
+            "no generation step is required: cells did not move, so light is not stale"
         );
         assert_eq!(
-            classify(observed, (4, 0), true, CursorStyle::SteadyBlock, true,),
-            CursorFxCommit::Diverged,
-            "a same-generation cursor move cannot borrow the echo witness"
-        );
-        assert_eq!(
-            classify(committed, (3, 9), false, CursorStyle::SteadyBlock, false,),
+            classify(committed, (3, 9), false, CursorStyle::SteadyBlock),
             CursorFxCommit::VisibilityDrift,
-            "a DECTCEM flip at a STATIONARY caret is not a coordinate divergence: \
-             it must not hard-reset the engines (that reset is the only per-frame \
-             path that also zeroes the rainbow kitty's momentum spine)"
-        );
-        assert_eq!(
-            classify(committed, (4, 0), false, CursorStyle::SteadyBlock, true,),
-            CursorFxCommit::Diverged,
-            "a hidden cursor cannot retain a target move even with a forged witness"
+            "a bare visibility flip rebinds the presented style and resets \
+             NOTHING — no cell moved, so resident light is still exactly true. \
+             The proof era called this a divergence, which meant a blinking \
+             caret could blank the ribbon; a repaint-blinking TUI (DECTCEM \
+             hide inside a synchronized update) flips this several times a \
+             second."
         );
         assert_eq!(
             classify(
@@ -885,7 +610,6 @@ mod cursor_fx_generation_fence_tests {
                 (3, 9),
                 true,
                 CursorStyle::SteadyBlock,
-                true,
             ),
             CursorFxCommit::Diverged,
             "a mid-frame screen swap owns a hard reset"
@@ -899,13 +623,12 @@ mod cursor_fx_generation_fence_tests {
                 (3, 9),
                 true,
                 CursorStyle::SteadyBlock,
-                true,
             ),
             CursorFxCommit::Diverged,
             "a mid-frame terminal identity change owns a hard reset"
         );
         assert_eq!(
-            classify(committed, (4, 0), true, CursorStyle::SteadyBar, true,),
+            classify(committed, (4, 0), true, CursorStyle::SteadyBar),
             CursorFxCommit::Diverged,
             "a mid-frame DECSCUSR change cannot retain a stale block override"
         );
@@ -922,243 +645,17 @@ mod cursor_fx_generation_fence_tests {
                     visible: true,
                     style: CursorStyle::SteadyBlock,
                 },
-                true,
             ),
             CursorFxCommit::Diverged,
             "a mid-frame scroll cannot retain LOCK A row-bound scratch even when the caret returns"
         );
         assert_eq!(
-            classify(observed, (3, 9), true, CursorStyle::SteadyBlock, false,),
+            classify(observed, (3, 9), true, CursorStyle::SteadyBlock),
             CursorFxCommit::Same,
             "an exact LOCK A/B observation is coherent"
         );
     }
 
-    #[test]
-    fn production_echo_straddle_preserves_twins_and_consumes_one_settle() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        let glow_cfg = app.glow_config();
-        let trail_cfg = TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(400),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.5,
-            warmth: 0.0,
-        };
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let generation = |process_sequence| ContentGeneration {
-            process_sequence,
-            terminal_id: 7,
-            alternate_screen: false,
-        };
-        let observed_generation = generation(6);
-        let committed_generation = generation(7);
-        let t0 = Instant::now();
-        let origin = (2, 2);
-        let target = (2, 3);
-        let ws = app.windows.get_mut(&wid).unwrap();
-
-        // Establish the content clock and genuine resident light before the
-        // key whose echo will straddle the lock split.
-        ws.cursor_glow
-            .tick(Some((2, 1)), t0, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some((2, 1)), t0, &trail_cfg, &mut ws.trail_scratch);
-        confirm_cursor_move_candidate(ws, Some((2, 1)), t0, observed_generation);
-        let resident_at = t0 + Duration::from_millis(1);
-        ws.cursor_glow.note_synthetic_move(resident_at);
-        ws.cursor_trail.note_synthetic_move(resident_at);
-        ws.cursor_glow.tick(
-            Some(origin),
-            resident_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail
-            .tick(Some(origin), resident_at, &trail_cfg, &mut ws.trail_scratch);
-        let resident_sparks = ws.cursor_glow.live_sparks();
-        assert!(resident_sparks > 0 && ws.cursor_trail.is_active());
-
-        let mut baseline_cells = [' '; 16];
-        baseline_cells[0] = '>';
-        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
-        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
-        let key_at = resident_at + Duration::from_millis(1);
-        ws.cursor_glow.note_typed_expected(
-            key_at,
-            expected,
-            target,
-            origin,
-            baseline,
-            observed_generation,
-        );
-        ws.cursor_trail
-            .note_typed_expected(key_at, expected, target, origin);
-
-        // Production order: LOCK A runs before the echo and explicitly awaits
-        // the unchanged generation. Neither engine may spend its proof here.
-        let await_at = key_at + Duration::from_millis(1);
-        ws.cursor_glow.observe_row_with_trust(
-            origin.0,
-            origin.1,
-            &baseline_cells,
-            await_at,
-            ProbeTrust::Full,
-        );
-        confirm_cursor_move_candidate(ws, Some(origin), await_at, observed_generation);
-        assert!(
-            ws.cursor_glow.move_candidate_pending() && ws.cursor_trail.move_candidate_pending(),
-            "same-generation LOCK A preserves both pending proofs"
-        );
-        assert_eq!(ws.cursor_glow.live_sparks(), resident_sparks);
-
-        let glow_straddles = ws.cursor_glow.pending_content_echo_straddles(
-            observed_generation,
-            Some(origin),
-            committed_generation,
-            Some(target),
-        );
-        let trail_straddles = ws.cursor_trail.pending_content_echo_straddles(
-            observed_generation,
-            Some(origin),
-            committed_generation,
-            Some(target),
-        );
-        assert!(glow_straddles && trail_straddles);
-        let observed_projection = CursorFxProjection {
-            generation: observed_generation,
-            scroll: ContentScrollState::default(),
-            cursor: origin,
-            visible: true,
-            style: CursorStyle::SteadyBlock,
-        };
-        let committed_projection = CursorFxProjection {
-            generation: committed_generation,
-            scroll: ContentScrollState::default(),
-            cursor: target,
-            visible: true,
-            style: CursorStyle::SteadyBlock,
-        };
-        let commit = classify_cursor_fx_commit(
-            observed_projection,
-            committed_projection,
-            glow_straddles && trail_straddles,
-        );
-        assert_eq!(commit, CursorFxCommit::EchoStraddle);
-        ws.free_scratch.push(FreeSprite::default());
-        ws.pet_hit_rect = Some((1, 2, 3, 4));
-        ws.robi_hit_rect = Some((5, 6, 7, 8));
-        ws.robi_tip_request = Some(0);
-        ws.robi_tip_posted = Some(0);
-        ws.robi_bubble_anchor = Some((9.0, 10.0));
-        assert!(apply_cursor_fx_commit(ws, commit));
-        assert!(
-            ws.free_scratch.is_empty(),
-            "stale LOCK-A scratch is dropped"
-        );
-        assert!(ws.pet_hit_rect.is_none() && ws.robi_hit_rect.is_none());
-        assert!(ws.robi_tip_request.is_none());
-        assert!(ws.robi_tip_posted.is_none());
-        assert!(ws.robi_bubble_anchor.is_none());
-        assert!(ws.cursor_echo_settle_pending);
-        assert!(
-            ws.cursor_glow.move_candidate_pending() && ws.cursor_trail.move_candidate_pending(),
-            "the final extraction does not reset either proof"
-        );
-        assert_eq!(ws.cursor_glow.live_sparks(), resident_sparks);
-        assert!(
-            ws.cursor_trail.is_active(),
-            "resident comet survives the retry"
-        );
-
-        // Tier-1 bind: drive the real host/engine order beside the derived
-        // commit-retry protocol and validate each production transition.
-        let model = aterm_spec::derive::cursor_echo_commit_retry_model();
-        let mut model_state = model.init_state();
-        for (action, label) in [
-            ("ArmTypedCandidate", "real twin candidate arm"),
-            (
-                "LockASameGenerationAwait",
-                "real LOCK-A same-generation await",
-            ),
-            (
-                "FinalExtractEchoStraddle",
-                "real LOCK-B exact echo straddle",
-            ),
-        ] {
-            let before = model_state.clone();
-            assert!(model.fire(action, &mut model_state));
-            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &before,
-                &model_state,
-                Some(action),
-                label,
-            );
-            assert!(ok, "{label} rejected: {why}");
-        }
-        assert_eq!(model_state["retry_pending"], 1);
-
-        // The one scheduled coherent frame sees generation 7 and exact row
-        // material, confirms both twins, emits the move, and spends the latch.
-        let settle_at = await_at + Duration::from_millis(1);
-        let mut current_cells = baseline_cells;
-        current_cells[usize::from(origin.1)] = 'x';
-        ws.cursor_glow.observe_row_with_trust(
-            target.0,
-            target.1,
-            &current_cells,
-            settle_at,
-            ProbeTrust::Full,
-        );
-        confirm_cursor_move_candidate(ws, Some(target), settle_at, committed_generation);
-        assert!(!ws.cursor_echo_settle_pending);
-        ws.cursor_glow.tick(
-            Some(target),
-            settle_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail
-            .tick(Some(target), settle_at, &trail_cfg, &mut ws.trail_scratch);
-        assert!(!ws.cursor_glow.move_candidate_pending());
-        assert!(!ws.cursor_trail.move_candidate_pending());
-        assert!(
-            !ws.trail_scratch.is_empty(),
-            "the exact echo births its trail"
-        );
-
-        let before = model_state.clone();
-        assert!(model.fire("NextEchoSettle", &mut model_state));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &model_state,
-            Some("NextEchoSettle"),
-            "real coherent echo settle",
-        );
-        assert!(ok, "real coherent echo settle rejected: {why}");
-        assert_eq!(model_state["retry_consumes"], 1);
-        assert_eq!(model_state["births"], 1);
-    }
 
     struct StraddledEchoFixture {
         app: App,
@@ -1199,10 +696,14 @@ mod cursor_fx_generation_fence_tests {
         }
     }
 
-    /// Drive the real candidate engines through the exact LOCK-A/LOCK-B echo
-    /// straddle. `resident=false` is the load-bearing cold-first-key case: no
-    /// engine owns an animation deadline, so only the host settle latch can
-    /// make the confirming frame happen.
+    /// Drive the real engines through a LOCK-A/LOCK-B caret straddle: the
+    /// tick runs at `origin`, then the frame commits at `target` because the
+    /// keystroke's echo landed between the two locks.
+    ///
+    /// `resident` picks the two cases that were ever load-bearing. `true` is
+    /// light already earned, which the commit may not destroy. `false` is the
+    /// cold first key, where no engine owns an animation deadline — the case
+    /// the retired settle latch existed to buy a frame for.
     fn straddled_echo_fixture(resident: bool) -> StraddledEchoFixture {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
@@ -1219,13 +720,13 @@ mod cursor_fx_generation_fence_tests {
         let ws = app.windows.get_mut(&wid).unwrap();
 
         // Baseline both engines and their content clock. Moving to `origin`
-        // without an input license stays dark; the resident arm uses the same
-        // real synthetic-move admission as the positive legacy control.
+        // without an input license stays dark; the resident arm licenses that
+        // move with a real synthetic note, exactly as the host's gesture seam
+        // does.
         ws.cursor_glow
             .tick(Some((2, 1)), t0, &glow_cfg, geom, &mut ws.glow_scratch);
         ws.cursor_trail
             .tick(Some((2, 1)), t0, &trail_cfg, &mut ws.trail_scratch);
-        confirm_cursor_move_candidate(ws, Some((2, 1)), t0, observed_generation);
         let origin_at = t0 + Duration::from_millis(1);
         if resident {
             ws.cursor_glow.note_synthetic_move(origin_at);
@@ -1249,22 +750,12 @@ mod cursor_fx_generation_fence_tests {
 
         let mut baseline_cells = [' '; 16];
         baseline_cells[0] = '>';
-        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
-        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
         let key_at = origin_at + Duration::from_millis(1);
-        ws.cursor_glow.note_typed_expected(
-            key_at,
-            expected,
-            target,
-            origin,
-            baseline,
-            observed_generation,
-        );
-        ws.cursor_trail
-            .note_typed_expected(key_at, expected, target, origin);
+        ws.cursor_glow.note_typed_cells(key_at, 1);
+        ws.cursor_trail.note_typed(key_at);
 
-        // Run the production LOCK-A seam, including the engine tick that
-        // follows confirmation, against the still-unchanged generation.
+        // Run the production LOCK-A seam against the still-unchanged
+        // generation: the row probe, then the engine tick at `origin`.
         let await_at = key_at + Duration::from_millis(1);
         ws.cursor_glow.observe_row_with_trust(
             origin.0,
@@ -1273,7 +764,6 @@ mod cursor_fx_generation_fence_tests {
             await_at,
             ProbeTrust::Full,
         );
-        confirm_cursor_move_candidate(ws, Some(origin), await_at, observed_generation);
         ws.cursor_glow.tick(
             Some(origin),
             await_at,
@@ -1287,28 +777,12 @@ mod cursor_fx_generation_fence_tests {
             &trail_cfg,
             &mut ws.trail_scratch,
         );
-        assert!(
-            ws.cursor_glow.move_candidate_pending() && ws.cursor_trail.move_candidate_pending(),
-            "same-generation LOCK A must retain both exact proofs"
-        );
-        if !resident {
-            assert_eq!(ws.cursor_glow.live_sparks(), 0);
-            assert!(!ws.cursor_trail.is_active());
-        }
 
-        let glow_straddles = ws.cursor_glow.pending_content_echo_straddles(
-            observed_generation,
-            Some(origin),
-            committed_generation,
-            Some(target),
-        );
-        let trail_straddles = ws.cursor_trail.pending_content_echo_straddles(
-            observed_generation,
-            Some(origin),
-            committed_generation,
-            Some(target),
-        );
-        assert!(glow_straddles && trail_straddles);
+        // The key that will explain this straddle is still fresh on both
+        // engines — but the commit below is not allowed to care, and is handed
+        // no witness to care with.
+        assert!(ws.cursor_glow.move_licensed(await_at));
+        assert!(ws.cursor_trail.move_licensed(await_at));
         let commit = classify_cursor_fx_commit(
             CursorFxProjection {
                 generation: observed_generation,
@@ -1324,11 +798,9 @@ mod cursor_fx_generation_fence_tests {
                 visible: true,
                 style: CursorStyle::SteadyBlock,
             },
-            glow_straddles && trail_straddles,
         );
-        assert_eq!(commit, CursorFxCommit::EchoStraddle);
+        assert_eq!(commit, CursorFxCommit::CursorMoved);
         assert!(apply_cursor_fx_commit(ws, commit));
-        assert!(ws.cursor_echo_settle_pending);
 
         StraddledEchoFixture {
             app,
@@ -1337,8 +809,45 @@ mod cursor_fx_generation_fence_tests {
         }
     }
 
+    /// THE RETENTION LAW AT THE TORN SEAM (docs/design/EFFECTS-LICENSE-
+    /// REDESIGN.md): a caret that moves between the two locks suppresses the
+    /// stale scratch plane and NOTHING ELSE. Before the redesign this frame
+    /// was `Diverged` unless a twin-engine license witness rescued it, and the
+    /// rescue was narrow enough (exactly one parser batch, cursor visible) that
+    /// an ordinary streaming collision reset both engines mid-ribbon.
     #[test]
-    fn cold_real_echo_straddle_schedules_and_births_on_exact_settle() {
+    fn a_mid_frame_caret_move_keeps_the_light_it_tore() {
+        let mut fixture = straddled_echo_fixture(true);
+        let ws = fixture.app.windows.get_mut(&WindowId(0)).unwrap();
+        assert!(
+            ws.cursor_glow.live_sparks() > 0,
+            "resident aurora survives a torn caret"
+        );
+        assert!(
+            ws.cursor_trail.is_active(),
+            "resident comet survives a torn caret"
+        );
+        assert!(
+            ws.cursor_glow.move_licensed(fixture.await_at)
+                && ws.cursor_trail.move_licensed(fixture.await_at),
+            "the commit spends no license either"
+        );
+        assert!(
+            ws.free_scratch.is_empty() && ws.pet_hit_rect.is_none(),
+            "the stale companion sprite plane IS dropped for this frame"
+        );
+    }
+
+    /// THE COLD FIRST KEY, WITHOUT A LATCH. No engine owns an animation
+    /// deadline here, so the retired `cursor_echo_settle_pending` one-shot used
+    /// to be the only thing scheduling the frame that could mint this echo.
+    /// It is not needed: the caret move that tore the frame is itself a
+    /// `RepaintKey` term (`cursor_row`/`cursor_col`), so the next redraw cannot
+    /// early-out — see `lib.rs`'s `a_bare_caret_move_moves_the_repaint_key`.
+    /// All this seam owes is to have destroyed nothing, so that the next LOCK A
+    /// at the new caret still finds a fresh license and mints the light.
+    #[test]
+    fn cold_licensed_echo_births_on_the_next_lock_a() {
         let mut fixture = straddled_echo_fixture(false);
         let wid = WindowId(0);
         let target = (2, 3);
@@ -1348,19 +857,15 @@ mod cursor_fx_generation_fence_tests {
         let ws = fixture.app.windows.get_mut(&wid).unwrap();
         assert!(
             !ws.cursor_fx_active(fixture.await_at, false),
-            "cold pending proofs do not forge an ordinary animation owner"
+            "negative control: a cold first key owns no resident cadence"
+        );
+        assert_eq!(
+            ws.plan_terminal_effect_lane(fixture.await_at, false, true),
+            None,
+            "and the effects lane manufactures no wake of its own for it"
         );
 
-        let due = ws
-            .plan_terminal_effect_lane(fixture.await_at, false, true)
-            .expect("the production echo straddle must buy one coherent settle frame");
-        assert!(due > fixture.await_at);
-        assert!(take_due_trail_tick(
-            &mut ws.next_trail_tick,
-            &mut ws.last_trail_fire,
-            due,
-        ));
-
+        let due = fixture.await_at + Duration::from_millis(8);
         let mut current_cells = fixture.baseline_cells;
         current_cells[2] = 'x';
         ws.cursor_glow.observe_row_with_trust(
@@ -1370,99 +875,17 @@ mod cursor_fx_generation_fence_tests {
             due,
             ProbeTrust::Full,
         );
-        confirm_cursor_move_candidate(ws, Some(target), due, echo_generation(7));
-        assert!(!ws.cursor_echo_settle_pending);
         ws.cursor_glow
             .tick(Some(target), due, &glow_cfg, geom, &mut ws.glow_scratch);
         ws.cursor_trail
             .tick(Some(target), due, &trail_cfg, &mut ws.trail_scratch);
-        assert!(!ws.cursor_glow.move_candidate_pending());
-        assert!(!ws.cursor_trail.move_candidate_pending());
-        assert!(ws.cursor_glow.live_sparks() > 0, "cold exact echo births light");
+        assert!(
+            ws.cursor_glow.live_sparks() > 0,
+            "cold licensed echo births light"
+        );
         assert!(
             !ws.trail_scratch.is_empty(),
             "cold exact echo births the classic trail"
-        );
-    }
-
-    fn assert_post_straddle_rejected(
-        mut fixture: StraddledEchoFixture,
-        current_cells: [char; 16],
-        committed_generation: ContentGeneration,
-        label: &str,
-    ) {
-        let wid = WindowId(0);
-        let target = (2, 3);
-        let glow_cfg = fixture.app.glow_config();
-        let trail_cfg = echo_trail_config();
-        let geom = echo_geom();
-        let settle_at = fixture.await_at + Duration::from_millis(1);
-        let ws = fixture.app.windows.get_mut(&wid).unwrap();
-        let spawns_before = ws.cursor_glow.spawns();
-        ws.cursor_glow.observe_row_with_trust(
-            target.0,
-            target.1,
-            &current_cells,
-            settle_at,
-            ProbeTrust::ContentOnly,
-        );
-        confirm_cursor_move_candidate(ws, Some(target), settle_at, committed_generation);
-        assert!(!ws.cursor_echo_settle_pending, "{label}: settle is consumed");
-        assert!(
-            !ws.cursor_glow.move_candidate_pending() && !ws.cursor_trail.move_candidate_pending(),
-            "{label}: both exact proofs retire"
-        );
-        ws.cursor_glow.tick(
-            Some(target),
-            settle_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail.tick(
-            Some(target),
-            settle_at,
-            &trail_cfg,
-            &mut ws.trail_scratch,
-        );
-        assert_eq!(
-            ws.cursor_glow.spawns(),
-            spawns_before,
-            "{label}: rejection cannot forge a cursor-move birth"
-        );
-        assert!(
-            ws.trail_scratch.is_empty(),
-            "{label}: rejection cannot emit a classic trail"
-        );
-        assert!(
-            !ws.cursor_trail.is_active(),
-            "{label}: old resident trail is grounded at the unowned relocation"
-        );
-    }
-
-    #[test]
-    fn post_straddle_row_mismatch_is_dark_and_consumes_settle() {
-        let fixture = straddled_echo_fixture(true);
-        let mut wrong_cells = fixture.baseline_cells;
-        wrong_cells[2] = 'y';
-        assert_post_straddle_rejected(
-            fixture,
-            wrong_cells,
-            echo_generation(7),
-            "row mismatch",
-        );
-    }
-
-    #[test]
-    fn post_straddle_generation_advance_is_dark_and_consumes_settle() {
-        let fixture = straddled_echo_fixture(true);
-        let mut exact_cells = fixture.baseline_cells;
-        exact_cells[2] = 'x';
-        assert_post_straddle_rejected(
-            fixture,
-            exact_cells,
-            echo_generation(8),
-            "generation advance",
         );
     }
 
@@ -1480,205 +903,6 @@ mod cursor_fx_generation_fence_tests {
         );
     }
 
-    #[test]
-    fn unowned_generation_grounds_the_cursor_cat_only_on_relocation() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let now = Instant::now();
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        let generation = ContentGeneration {
-            process_sequence: 20,
-            terminal_id: 7,
-            alternate_screen: false,
-        };
-        let glow_cfg = app.glow_config();
-        let trail_cfg = TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(300),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.5,
-            warmth: 0.0,
-        };
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let ws = app.windows.get_mut(&wid).unwrap();
-        ws.cursor_glow
-            .tick(Some((2, 2)), now, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some((2, 2)), now, &trail_cfg, &mut ws.trail_scratch);
-        confirm_cursor_move_candidate(ws, Some((2, 2)), now, generation);
-        for i in 0..96u64 {
-            ws.cursor_cat
-                .on_key(now + Duration::from_millis(i * 40), true);
-        }
-        assert!(
-            ws.cursor_cat.is_active(),
-            "fixture earns a real flying episode"
-        );
-
-        // An unowned OUTPUT-ONLY batch at the same cursor (a spinner /
-        // streaming chunk — Claude Code emits several per second) is not a
-        // relocation: the companion keeps its earned episode. This is the
-        // paint-side half of the v0.49.0 regression — the old fence grounded
-        // the cat on every such batch, so it could never stay visible on a
-        // busy alternate-screen TUI.
-        confirm_cursor_move_candidate(
-            ws,
-            Some((2, 2)),
-            now + Duration::from_secs(4),
-            ContentGeneration {
-                process_sequence: 21,
-                ..generation
-            },
-        );
-        assert!(
-            ws.cursor_cat.is_active(),
-            "an unowned output-only batch at an unmoved cursor keeps the earned flight"
-        );
-
-        // A program-owned RELOCATION (the cursor lands somewhere no candidate
-        // owns) still grounds it — `retire_unowned_cursor_motion`'s contract.
-        ws.cursor_glow.tick(
-            Some((2, 2)),
-            now + Duration::from_secs(4),
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        confirm_cursor_move_candidate(
-            ws,
-            Some((9, 40)),
-            now + Duration::from_secs(5),
-            ContentGeneration {
-                process_sequence: 22,
-                ..generation
-            },
-        );
-        assert!(
-            !ws.cursor_cat.is_active(),
-            "an unowned cursor relocation cannot carry the old flying episode"
-        );
-    }
-
-    #[test]
-    fn production_deferred_rejection_retires_both_trails_and_grounds_cursor_cat() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let t0 = Instant::now();
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        let generation = |process_sequence| ContentGeneration {
-            process_sequence,
-            terminal_id: 7,
-            alternate_screen: true,
-        };
-        let glow_cfg = app.glow_config();
-        let trail_cfg = TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(400),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.5,
-            warmth: 0.0,
-        };
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let ws = app.windows.get_mut(&wid).unwrap();
-        ws.cursor_glow.note_context(true);
-        ws.cursor_trail.note_context(true);
-        ws.cursor_glow
-            .tick(Some((2, 4)), t0, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some((2, 4)), t0, &trail_cfg, &mut ws.trail_scratch);
-        confirm_cursor_move_candidate(ws, Some((2, 4)), t0, generation(50));
-
-        for i in 0..96u64 {
-            ws.cursor_cat
-                .on_key(t0 + Duration::from_millis(i * 40), true);
-        }
-        assert!(
-            ws.cursor_cat.is_active(),
-            "fixture earns a real flying episode"
-        );
-        let resident_at = t0 + Duration::from_micros(1);
-        ws.cursor_glow.note_synthetic_move(resident_at);
-        ws.cursor_trail.note_synthetic_move(resident_at);
-        ws.cursor_glow.tick(
-            Some((2, 5)),
-            resident_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail
-            .tick(Some((2, 5)), resident_at, &trail_cfg, &mut ws.trail_scratch);
-        assert!(ws.cursor_glow.live_sparks() > 0 && !ws.trail_scratch.is_empty());
-
-        let mut baseline_cells = [' '; 40];
-        for (index, ch) in "> hi".chars().enumerate() {
-            baseline_cells[index] = ch;
-        }
-        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
-        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
-        let key = t0 + Duration::from_millis(1);
-        ws.cursor_glow
-            .note_typed_expected(key, expected, (2, 6), (2, 5), baseline, generation(50));
-        ws.cursor_trail
-            .note_typed_expected(key, expected, (2, 6), (2, 5));
-        let mid = key + Duration::from_millis(8);
-        let mut status: Vec<char> = "[stream 001]".chars().collect();
-        status.resize(40, ' ');
-        ws.cursor_glow
-            .observe_row_with_trust(0, 12, &status, mid, ProbeTrust::ContentOnly);
-        confirm_cursor_move_candidate(ws, Some((0, 12)), mid, generation(51));
-        assert!(
-            ws.cursor_glow.move_candidate_pending()
-                && ws.cursor_trail.move_candidate_pending()
-                && ws.cursor_cat.is_active(),
-            "the first transient frame holds all three cursor-effect owners"
-        );
-        ws.cursor_glow
-            .tick(Some((0, 12)), mid, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some((0, 12)), mid, &trail_cfg, &mut ws.trail_scratch);
-
-        // Same parser generation, second off-row frame: the content candidate
-        // retires, Glow returns UnownedRelocation through the real host seam,
-        // the classic twin clears, and the host grounds the companion.
-        let second = mid + Duration::from_millis(8);
-        status[8] = '2';
-        ws.cursor_glow
-            .observe_row_with_trust(0, 13, &status, second, ProbeTrust::ContentOnly);
-        confirm_cursor_move_candidate(ws, Some((0, 13)), second, generation(51));
-        assert!(!ws.cursor_glow.move_candidate_pending());
-        assert!(!ws.cursor_trail.move_candidate_pending());
-        assert_eq!(ws.cursor_glow.live_sparks(), 0);
-        assert!(!ws.cursor_trail.is_active());
-        assert!(
-            !ws.cursor_cat.is_active(),
-            "same-generation deferred rejection is a real relocation boundary"
-        );
-    }
 }
 
 /// Pure per-consumer projection of two cumulative snapshots. Kept separate
@@ -1745,11 +969,10 @@ pub(crate) fn sync_cursor_effect_scroll(
         }
         CursorEffectScrollDecision::Invalidate => {
             // Coordinates no longer share one uniform transform. Drop every
-            // live point and every row-bound proof before the current row is
-            // probed.
+            // live point and every row-bound probe identity before the current
+            // row is probed.
             window.cursor_glow.reset();
             window.cursor_trail.reset();
-            window.cursor_echo_settle_pending = false;
             CursorEffectScrollChange {
                 invalidated: true,
                 ..CursorEffectScrollChange::default()
@@ -2463,43 +1686,6 @@ mod canonical_layout_scheduler_tests {
         assert!(!app.windows[&wid].cursor_glow.is_active());
     }
 
-    #[test]
-    fn coordinate_space_change_retires_echo_settle_with_its_engine_proofs() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.windows.get_mut(&wid).unwrap().win_px =
-            Some(winit::dpi::PhysicalSize::new(640, 384));
-        let route = app.active_visible_content_route(wid).unwrap();
-        assert!(!app.prepare_layout_coordinate_space(wid, route));
-
-        let now = Instant::now();
-        {
-            let state = app.windows.get_mut(&wid).unwrap();
-            state.cursor_echo_settle_pending = true;
-            assert!(
-                state
-                    .plan_terminal_effect_lane(now, false, true)
-                    .is_some(),
-                "negative control: a cold exact-echo retry owns one scheduled frame"
-            );
-        }
-
-        let old_key = app.windows[&wid].last_layout_coordinate_space;
-        app.windows.get_mut(&wid).unwrap().scale = 2.0;
-        assert!(!app.prepare_layout_coordinate_space(wid, route));
-        let state = app.windows.get_mut(&wid).unwrap();
-        assert_ne!(state.last_layout_coordinate_space, old_key);
-        assert!(
-            !state.cursor_echo_settle_pending,
-            "the latch cannot outlive the candidate engines' coordinate space"
-        );
-        assert_eq!(
-            state.plan_terminal_effect_lane(now, false, true),
-            None,
-            "a retired proof cannot buy a frame in the replacement layout"
-        );
-        assert!(state.next_trail_tick.is_none());
-    }
 
     /// Tier-1 conformance for `layout_coordinate_reset_model`: drive the real
     /// shipping divider/key/reset seam and project each decision onto the
@@ -3635,65 +2821,6 @@ mod config_asset_publication_tests {
 mod trail_present_pacing_tests {
     use super::*;
     use std::collections::BTreeMap;
-
-    #[test]
-    fn cold_echo_straddle_settle_is_a_level_until_a_real_lock_a_consumes_it() {
-        let mut app = App::headless_for_test();
-        let ws = app
-            .windows
-            .get_mut(&WindowId(0))
-            .expect("the headless fixture owns window 0");
-        let now = Instant::now();
-        assert!(ws.front_terminal().is_some());
-        assert!(
-            !ws.cursor_fx_active(now, false),
-            "negative control: a cold first key has no resident cadence owner"
-        );
-        ws.cursor_echo_settle_pending = true;
-
-        let armed = ws
-            .plan_terminal_effect_lane(now, false, true)
-            .expect("the exact echo straddle buys one coherent follow-up");
-        assert!(armed > now);
-        assert_eq!(ws.next_trail_tick, Some(armed));
-        for step in 1..=5_u32 {
-            let unrelated = now + (armed - now) / 8 * step;
-            assert!(unrelated < armed);
-            assert_eq!(
-                ws.plan_terminal_effect_lane(unrelated, false, true),
-                Some(armed),
-                "an unrelated event-loop turn must preserve the level latch"
-            );
-            assert!(ws.cursor_echo_settle_pending);
-        }
-
-        // This helper is the shipping LOCK-A proof seam. Reaching it, rather
-        // than merely reaching an event-loop park, spends the one-shot.
-        confirm_cursor_move_candidate(
-            ws,
-            Some((0, 0)),
-            now,
-            aterm_effects::cursor_trail::ContentGeneration {
-                process_sequence: 1,
-                terminal_id: 7,
-                alternate_screen: false,
-            },
-        );
-        assert!(!ws.cursor_echo_settle_pending);
-        assert_eq!(
-            ws.plan_terminal_effect_lane(now, false, true),
-            None,
-            "the consumed cold settle cannot manufacture a frame train"
-        );
-        assert!(ws.next_trail_tick.is_none());
-
-        ws.cursor_echo_settle_pending = true;
-        assert_eq!(ws.plan_terminal_effect_lane(now, false, false), None);
-        assert!(
-            !ws.cursor_echo_settle_pending,
-            "a glass-less/native lifecycle boundary retires the settle"
-        );
-    }
 
     #[test]
     fn useful_present_consumes_near_pending_animation_tick() {
@@ -5439,16 +4566,16 @@ pub(crate) const BLINK_RECENT_MAX: Duration = Duration::from_secs(1);
 /// from every plain alt-screen app, protecting the kill/poof detector from
 /// phantom poofs (Ctrl-U/Ctrl-W page-scroll in vim/less, and region scrolls
 /// slide content through the cursor row). But withholding it also starved the
-/// typed-echo CONFIRM proof: on `less` /-search typing, `vi` insert mode, and
-/// a per-key-echo TUI whose concurrent streamer writes at another row via
-/// cursor save/restore (ESC 7/ESC 8), `row_cur_meta` was never available and
-/// EVERY honest keystroke's admission retired `reason=no-row-probe` — zero
-/// confirms, zero spawns, zero ink — while a repaint-BLINKING alt TUI (Claude
-/// Code's DEC-2026 bracket) confirmed fine. The probe now always flows and
-/// carries its trust class instead: `ContentOnly` feeds only the exact
-/// content proofs (typed/delete confirm, unowned-steady anchor), and every
-/// kill/poof branch refuses it inside the engine, so the phantom-poof fence
-/// holds exactly as before. All four capture seams (single-pane LOCK A, the
+/// content seam the proof era gated typing on: on `less` /-search typing,
+/// `vi` insert mode, and a per-key-echo TUI whose concurrent streamer writes
+/// at another row via cursor save/restore (ESC 7/ESC 8), `row_cur_meta` was
+/// never available and EVERY honest keystroke retired `reason=no-row-probe` —
+/// zero spawns, zero ink — while a repaint-BLINKING alt TUI (Claude Code's
+/// DEC-2026 bracket) was fine. That gate is gone (a fresh key hint licenses
+/// the move now), but the probe's TRUST CLASS is kept and is what the
+/// erase-poof lane still reads: every kill/poof branch refuses `ContentOnly`
+/// inside the engine, so the phantom-poof fence holds exactly as before.
+/// All four capture seams (single-pane LOCK A, the
 /// composed live/headless seam, the split-pane compose pass, and the headless
 /// `app_introspect` capture) resolve trust through this one function.
 pub(crate) fn row_probe_trust(
@@ -9656,11 +8783,12 @@ mod composed_cursor_effect_advance_tests {
         window.cursor_trail.note_synthetic_typed(now);
     }
 
-    /// Arm and materialize one exact printable echo through the same bounded
-    /// row/generation proof the input host supplies. Unlike the synthetic
-    /// preview helper above, the composed tick must confirm this candidate
-    /// against the real Terminal sample before it can mint a cat pulse.
-    fn arm_authenticated_typed_echo(
+    /// Type one printable character through the same seam the input host
+    /// uses: the press stamps the typed LICENSE, then the byte reaches the
+    /// terminal. The composed tick that follows observes the caret advance
+    /// and — because a human touched the keyboard inside the freshness
+    /// window — mints its cat pulse.
+    fn type_one_licensed_echo(
         app: &mut App,
         wid: WindowId,
         term: &std::sync::Arc<std::sync::Mutex<Terminal>>,
@@ -9675,81 +8803,55 @@ mod composed_cursor_effect_advance_tests {
             .expect("focused terminal leaf");
         let row_offset = leaf.rect.origin.y.round().max(0.0) as u16;
         let col_offset = leaf.rect.origin.x.round().max(0.0) as u16;
-        let (origin, target, material, baseline, generation) = {
+        let origin = {
             let terminal = term_lock(term);
             let cursor = terminal.cursor();
             assert!(
                 cursor.col + 1 < terminal.cols(),
                 "fixture needs one free cell"
             );
-            let mut row = Vec::new();
-            terminal.row_cols_into(usize::from(cursor.row), &mut row);
-            row.resize(usize::from(cursor.col) + 1, ' ');
-            if col_offset != 0 {
-                let len = row.len();
-                row.resize(len + usize::from(col_offset), ' ');
-                row.rotate_right(usize::from(col_offset));
-            }
             (
-                (
-                    cursor.row.saturating_add(row_offset),
-                    cursor.col.saturating_add(col_offset),
-                ),
-                (
-                    cursor.row.saturating_add(row_offset),
-                    cursor.col.saturating_add(col_offset).saturating_add(1),
-                ),
-                (
-                    cursor.row.saturating_add(row_offset),
-                    cursor.col.saturating_add(col_offset),
-                ),
-                aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(&row)
-                    .expect("bounded row proof"),
-                aterm_effects::cursor_trail::ContentGeneration {
-                    process_sequence: terminal.pipeline_timestamps().process_sequence,
-                    terminal_id: terminal.render_identity(),
-                    alternate_screen: terminal.is_alternate_screen(),
-                },
+                cursor.row.saturating_add(row_offset),
+                cursor.col.saturating_add(col_offset),
             )
         };
-        let expected = aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(['x'])
-            .expect("one-cell expected span");
         {
             let window = app.windows.get_mut(&wid).expect("test window");
             assert_eq!(window.cursor_glow.cursor_anchor(), Some(origin));
             assert_eq!(window.cursor_trail.cursor_anchor(), Some(origin));
-            window
-                .cursor_glow
-                .note_typed_expected(at, expected, target, material, baseline, generation);
-            window
-                .cursor_trail
-                .note_typed_expected(at, expected, target, material);
+            window.cursor_glow.note_typed_cells(at, 1);
+            window.cursor_trail.note_typed(at);
         }
         term_lock(term).process(b"x");
     }
 
     fn bind_extracted_cat_pulse_route(
         label: &str,
-        authenticated: bool,
+        classified: bool,
         pending_after_render: bool,
         delivered: bool,
         replay_changed_cat: bool,
     ) {
         let model = aterm_spec::derive::cursor_cat_motion_pulse_routing_model();
-        let authenticated_state =
-            model.successors("AuthenticatePulse", &model.init_state())[0].clone();
+        // PROVENANCE, classifier-fed: the pulse exists because a LICENSED spawn
+        // classified this move as a typed advance/fold. `licensed` is read off
+        // the engine's own admission ring, so a route bound here is bound to a
+        // pulse the licence seam let through.
+        let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
+        let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
         assert_eq!(
-            authenticated_state[&"authenticated"],
-            i64::from(authenticated),
-            "{label}: the exact Terminal proof must authenticate the pulse"
+            classified_state[&"classified"],
+            i64::from(classified),
+            "{label}: a licensed, classified move must mint the pulse"
         );
+        assert_eq!(classified_state[&"cold_pulse"], 0);
         let selected =
-            model.successors("SelectComposedExtractedRoute", &authenticated_state)[0].clone();
+            model.successors("SelectComposedExtractedRoute", &classified_state)[0].clone();
         let mut observed = model.successors("RenderComposedExtractedRoute", &selected)[0].clone();
         observed.insert("pending", i64::from(pending_after_render));
         observed.insert(
             "consumes",
-            i64::from(authenticated && !pending_after_render),
+            i64::from(classified && !pending_after_render),
         );
         observed.insert("deliveries", i64::from(delivered));
         let transition_label = format!("{label} composed pulse consume/delivery");
@@ -9805,20 +8907,22 @@ mod composed_cursor_effect_advance_tests {
     }
 
     fn bind_ordinary_cat_pulse_route(
-        authenticated: bool,
+        classified: bool,
         pending_after_render: bool,
         delivered: bool,
         replay_changed_cat: bool,
     ) {
         let model = aterm_spec::derive::cursor_cat_motion_pulse_routing_model();
-        let authenticated_state =
-            model.successors("AuthenticatePulse", &model.init_state())[0].clone();
+        // Same provenance chain as the extracted route: licence, then classify.
+        let licensed_state = model.successors("LicenseMove", &model.init_state())[0].clone();
+        let classified_state = model.successors("ClassifyPulse", &licensed_state)[0].clone();
         assert_eq!(
-            authenticated_state[&"authenticated"],
-            i64::from(authenticated),
-            "the ordinary exact-row proof must authenticate the pulse"
+            classified_state[&"classified"],
+            i64::from(classified),
+            "the ordinary licensed, classified move must mint the pulse"
         );
-        let selected = model.successors("SelectOrdinaryRoute", &authenticated_state)[0].clone();
+        assert_eq!(classified_state[&"cold_pulse"], 0);
+        let selected = model.successors("SelectOrdinaryRoute", &classified_state)[0].clone();
         assert!(
             !model
                 .successors("RenderOrdinaryRoute", &selected)
@@ -9829,7 +8933,7 @@ mod composed_cursor_effect_advance_tests {
         observed.insert("pending", i64::from(pending_after_render));
         observed.insert(
             "consumes",
-            i64::from(authenticated && !pending_after_render),
+            i64::from(classified && !pending_after_render),
         );
         observed.insert("deliveries", i64::from(delivered));
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
@@ -9874,7 +8978,7 @@ mod composed_cursor_effect_advance_tests {
     }
 
     #[test]
-    fn ordinary_single_pane_forwards_and_drains_authenticated_cat_pulse() {
+    fn ordinary_single_pane_forwards_and_drains_licensed_cat_pulse() {
         let mut app = App::headless_for_test();
         app.config.motion = Some("full".into());
         app.config.cursor_trail = Some(true);
@@ -9882,11 +8986,6 @@ mod composed_cursor_effect_advance_tests {
         app.config.trail_sounds = Some(false);
         let wid = WindowId(0);
         let t0 = Instant::now();
-        let generation = |process_sequence| aterm_effects::cursor_trail::ContentGeneration {
-            process_sequence,
-            terminal_id: 73,
-            alternate_screen: false,
-        };
 
         // Seed both the engine cursor and production generation fence on the
         // exact ordinary/single-pane host path.
@@ -9898,28 +8997,14 @@ mod composed_cursor_effect_advance_tests {
         let mut seed = CursorFxInputs::sample_for_test(t0);
         seed.cur = Some((2, 0));
         seed.row_probe = Some((2, 0, aterm_effects::cursor_glow::ProbeTrust::Full));
-        seed.content_generation = generation(10);
         app.tick_cursor_fx(wid, seed)
             .expect("seed ordinary cursor route");
 
         let typed = t0 + Duration::from_millis(1);
-        let baseline = aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(&[' '; 80])
-            .expect("bounded exact baseline");
-        let expected = aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(['x'])
-            .expect("one-cell exact echo");
         {
             let window = app.windows.get_mut(&wid).expect("ordinary window");
-            window.cursor_glow.note_typed_expected(
-                typed,
-                expected,
-                (2, 1),
-                (2, 0),
-                baseline,
-                generation(10),
-            );
-            window
-                .cursor_trail
-                .note_typed_expected(typed, expected, (2, 1), (2, 0));
+            window.cursor_glow.note_typed_cells(typed, 1);
+            window.cursor_trail.note_typed(typed);
             window.poof_row_buf[0] = 'x';
         }
 
@@ -9927,18 +9012,17 @@ mod composed_cursor_effect_advance_tests {
         let mut live = CursorFxInputs::sample_for_test(tick);
         live.cur = Some((2, 1));
         live.row_probe = Some((2, 1, aterm_effects::cursor_glow::ProbeTrust::Full));
-        live.content_generation = generation(11);
         app.tick_cursor_fx(wid, live)
             .expect("advance ordinary cursor route");
 
         let ordinary_route = {
             let window = app.windows.get_mut(&wid).expect("ordinary window");
-            let authenticated = window.cursor_glow.admission_tally().confirmed > 0;
+            let classified = window.cursor_glow.admission_tally().licensed > 0;
             let before_replay = window.cursor_cat.momentum(tick);
             let delivered = before_replay > 0.0;
             assert!(
                 delivered,
-                "the authenticated ordinary pulse reaches the cat in its own frame"
+                "the licensed ordinary pulse reaches the cat in its own frame"
             );
             let replay_pulse = window.cursor_glow.take_cursor_cat_motion_pulse();
             let pending = replay_pulse.is_some();
@@ -9955,7 +9039,7 @@ mod composed_cursor_effect_advance_tests {
                 !pending,
                 "the ordinary route leaves no pulse for composition"
             );
-            (authenticated, pending, delivered, replay_changed)
+            (classified, pending, delivered, replay_changed)
         };
         bind_ordinary_cat_pulse_route(
             ordinary_route.0,
@@ -10107,9 +9191,11 @@ mod composed_cursor_effect_advance_tests {
         assert!(
             app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t0))
         );
-        // This test exercises host propagation of the repaint-blink classifier,
-        // not movement admission. The terminal-programmed relocation remains
-        // dark with or without the classifier timestamp.
+        // A real press, so the relocation that follows is LICENSED. What the
+        // repaint blink then decides is the MORPHOLOGY: a Claude-Code-style
+        // hide-inside-sync redraw is a re-anchor (no comet across cells the
+        // caret never swept), while an unblinked alt move — vim's own one-row
+        // motions — keeps its comet, exactly as v0.43.0 had it.
         {
             let window = app.windows.get_mut(&wid).expect("test window");
             window.cursor_glow.note_typed(t0 + Duration::from_millis(1));
@@ -10144,8 +9230,9 @@ mod composed_cursor_effect_advance_tests {
 
         let (vim_like, blink_at) = run_alt_reanchor(false);
         assert!(
-            vim_like.is_empty(),
-            "a timestamp-only alt-screen program move stays dark even without a repaint blink"
+            !vim_like.is_empty(),
+            "without the blink the same licensed move keeps its comet — the blink IS \
+             the discriminator, which is what makes the arm above non-vacuous"
         );
         assert_eq!(blink_at, None);
     }
@@ -10195,10 +9282,9 @@ mod composed_cursor_effect_advance_tests {
             ComposedCursorFxClock::Advance(t0 + Duration::from_millis(16))
         ));
         let window = app.windows.get(&wid).expect("test window");
-        assert!(
-            window.trail_scratch.is_empty(),
-            "a Return timestamp alone cannot license the scrolling program relocation"
-        );
+        // The subject here is the SCROLL ANCHOR, not admission: the host must
+        // have advanced its cumulative scroll clock to the terminal's, so the
+        // next move classifies against where the caret now sits.
         assert_eq!(
             window.cursor_scroll_state,
             Some(term_lock(&term).content_scroll_state())
@@ -10302,7 +9388,7 @@ mod composed_cursor_effect_advance_tests {
     }
 
     #[test]
-    fn extracted_mixed_live_and_split_capture_forward_and_drain_authenticated_cat_pulses() {
+    fn extracted_mixed_live_and_split_capture_forward_and_drain_licensed_cat_pulses() {
         let t0 = Instant::now();
 
         // Heterogeneous composition is the extracted live route: native cells
@@ -10322,7 +9408,7 @@ mod composed_cursor_effect_advance_tests {
                 )
                 .is_some()
         );
-        arm_authenticated_typed_echo(
+        type_one_licensed_echo(
             &mut mixed,
             mixed_wid,
             &mixed_term,
@@ -10339,12 +9425,12 @@ mod composed_cursor_effect_advance_tests {
         );
         let mixed_route = {
             let window = mixed.windows.get_mut(&mixed_wid).expect("mixed window");
-            let authenticated = window.cursor_glow.admission_tally().confirmed > 0;
+            let classified = window.cursor_glow.admission_tally().licensed > 0;
             let before_replay = window.cursor_cat.momentum(mixed_tick);
             let delivered = before_replay > 0.0;
             assert!(
                 delivered,
-                "the authenticated mixed-live pulse reaches the cat in its own frame"
+                "the licensed mixed-live pulse reaches the cat in its own frame"
             );
             let replay_pulse = window.cursor_glow.take_cursor_cat_motion_pulse();
             let pending = replay_pulse.is_some();
@@ -10361,7 +9447,7 @@ mod composed_cursor_effect_advance_tests {
                 !pending,
                 "the mixed-live route leaves no pulse for a later route"
             );
-            (authenticated, pending, delivered, replay_changed)
+            (classified, pending, delivered, replay_changed)
         };
         bind_extracted_cat_pulse_route(
             "mixed live",
@@ -10382,7 +9468,7 @@ mod composed_cursor_effect_advance_tests {
                 )
                 .is_some()
         );
-        arm_authenticated_typed_echo(
+        type_one_licensed_echo(
             &mut split,
             split_wid,
             &split_term,
@@ -10399,12 +9485,12 @@ mod composed_cursor_effect_advance_tests {
         );
         let split_route = {
             let window = split.windows.get_mut(&split_wid).expect("split window");
-            let authenticated = window.cursor_glow.admission_tally().confirmed > 0;
+            let classified = window.cursor_glow.admission_tally().licensed > 0;
             let before_replay = window.cursor_cat.momentum(split_tick);
             let delivered = before_replay > 0.0;
             assert!(
                 delivered,
-                "the authenticated split-capture pulse reaches the cat in its own frame"
+                "the licensed split-capture pulse reaches the cat in its own frame"
             );
             let replay_pulse = window.cursor_glow.take_cursor_cat_motion_pulse();
             let pending = replay_pulse.is_some();
@@ -10421,7 +9507,7 @@ mod composed_cursor_effect_advance_tests {
                 !pending,
                 "the split-capture route leaves no pulse for a later route"
             );
-            (authenticated, pending, delivered, replay_changed)
+            (classified, pending, delivered, replay_changed)
         };
         bind_extracted_cat_pulse_route(
             "split capture",
@@ -10444,7 +9530,7 @@ mod composed_cursor_effect_advance_tests {
             )
             .is_some()
         );
-        arm_authenticated_typed_echo(&mut app, wid, &term, t0 + Duration::from_millis(1));
+        type_one_licensed_echo(&mut app, wid, &term, t0 + Duration::from_millis(1));
         let fire_tick = t0 + Duration::from_millis(16);
         assert!(
             app.prepare_heterogeneous_input_scratch_with_cursor_fx(
@@ -10455,11 +9541,11 @@ mod composed_cursor_effect_advance_tests {
         );
         {
             let window = app.windows.get_mut(&wid).expect("test window");
-            assert!(window.cursor_glow.admission_tally().confirmed > 0);
+            assert!(window.cursor_glow.admission_tally().licensed > 0);
             assert_eq!(
                 window.cursor_cat.momentum(fire_tick),
                 0.0,
-                "a non-kitty owner must not forward the authenticated pulse"
+                "a non-kitty owner must not forward the licensed pulse"
             );
             assert!(
                 window.cursor_glow.take_cursor_cat_motion_pulse().is_none(),
@@ -13144,8 +12230,6 @@ pub(crate) struct CursorFxInputs {
     /// while the kill/poof detector keeps refusing exactly what it always
     /// refused there.
     pub row_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)>,
-    /// Terminal parser generation coherent with `cur` and `row_probe`.
-    pub content_generation: aterm_effects::cursor_trail::ContentGeneration,
     /// The live default FOREGROUND (`0x00RRGGBB`), the twin of `default_bg`.
     /// The cursor-effect layer anchors its fresh-typed glyph tint on it, and
     /// the pair must come from ONE observation or a DECSCNM-swapped frame gets
@@ -13185,11 +12269,6 @@ impl CursorFxInputs {
             live_cursor_rgb: [255, 255, 255],
             default_bg: Theme::default().bg,
             row_probe: None,
-            content_generation: aterm_effects::cursor_trail::ContentGeneration {
-                process_sequence: 0,
-                terminal_id: 0,
-                alternate_screen: false,
-            },
             default_fg: Theme::default().fg,
         }
     }
@@ -13278,7 +12357,6 @@ struct FocusedComposedCursorFxSample {
     alt: bool,
     blink_epoch: u64,
     content_scroll_state: ContentScrollState,
-    content_generation: aterm_effects::cursor_trail::ContentGeneration,
     /// Exact per-column cursor-row probe from the same terminal observation.
     /// Capacity is moved from and restored to `WindowState::poof_row_buf`, so
     /// the successful steady-state mixed path remains allocation-free.
@@ -13309,11 +12387,6 @@ fn focused_composed_cursor_fx_sample(
         alt: terminal.is_alternate_screen(),
         blink_epoch: terminal.repaint_blink_epoch(),
         content_scroll_state: terminal.content_scroll_state(),
-        content_generation: aterm_effects::cursor_trail::ContentGeneration {
-            process_sequence: terminal.pipeline_timestamps().process_sequence,
-            terminal_id: terminal.render_identity(),
-            alternate_screen: terminal.is_alternate_screen(),
-        },
         row_probe,
     }
 }
@@ -14681,7 +13754,6 @@ impl App {
             default_bg,
             default_fg,
             row_probe,
-            content_generation,
         } = fx;
         // MOTION POLICY (W11): the one resolved gate for every decorative
         // animation this present composes — config `motion` × the live OS
@@ -14804,7 +13876,6 @@ impl App {
             // before this frame can project any cursor-owned channel.
             ws.cursor_glow.reset();
             ws.cursor_trail.reset();
-            ws.cursor_echo_settle_pending = false;
         }
         // Advance the LUMEN aurora off the cursor cell (terminal coords →
         // window-absolute pixels via the cell geometry + origin); the effect
@@ -14867,7 +13938,6 @@ impl App {
                 (usize::from(prow) + 1 < rows).then_some(ws.poof_row_below_buf.as_slice()),
             );
         }
-        confirm_cursor_move_candidate(ws, cur, frame_started, content_generation);
         let glow_fp = ws.cursor_glow.tick(
             cur,
             frame_started,
@@ -15376,7 +14446,6 @@ impl App {
         if let Some(window) = self.windows.get_mut(&wid) {
             window.cursor_glow.reset();
             window.cursor_trail.reset();
-            window.cursor_echo_settle_pending = false;
             window.glow_scratch.clear();
             window.trail_scratch.clear();
             window.composed_cursor_effect_valid = false;
@@ -15523,7 +14592,6 @@ impl App {
             alt,
             blink_epoch,
             content_scroll_state,
-            content_generation,
             row_probe: sampled_row_probe,
         } = sample;
         let row_probe = {
@@ -15542,7 +14610,6 @@ impl App {
                 // may then project only the newly committed empty frame.
                 window.cursor_glow.reset();
                 window.cursor_trail.reset();
-                window.cursor_echo_settle_pending = false;
             }
             if window.blink_reseed {
                 // A focus switch adopts the new terminal's repaint epoch without
@@ -15676,7 +14743,6 @@ impl App {
                 probe_trust,
             );
         }
-        confirm_cursor_move_candidate(window, effect_cursor, now, content_generation);
         window.cursor_glow.tick(
             effect_cursor,
             now,
@@ -15685,7 +14751,7 @@ impl App {
             &mut window.glow_scratch,
         );
         // CORRELATED FORWARD MOMENTUM: this extracted composed seam owns the
-        // same authenticated pulse as the ordinary and legacy-compose ticks.
+        // same licensed pulse as the ordinary and legacy-compose ticks.
         // Consume it in the frame that created it even when the active route
         // or style gates the cat off; otherwise a later route change can replay
         // stale typing into a companion that did not own the original frame.
@@ -17183,11 +16249,6 @@ impl App {
             // space as the aurora's. Carrying it across this boundary would
             // spawn a one-frame streak from a position the cursor never held.
             state.cursor_trail.reset();
-            // The retry is meaningful only while both exact candidate proofs
-            // still inhabit this coordinate space. A tab/focus/split/zoom/
-            // scale transition just retired them, so carrying the level into
-            // the replacement layout would buy an unauthenticated extra frame.
-            state.cursor_echo_settle_pending = false;
             state.predictor.reset();
             // Stream-fade mirrors one single-pane window-content view. The
             // next eligible frame re-baselines as settled ink.
@@ -18092,7 +17153,6 @@ impl App {
                     default_bg: default_bg_u32,
                     default_fg: default_fg_u32,
                     row_probe,
-                    content_generation,
                 },
             ) else {
                 return;
@@ -19552,26 +18612,10 @@ impl App {
                 (presented_default_bg_u32, _, presented_cursor_color_u32) =
                     terminal_frame_colors(&term);
                 drop(term);
-                let observed_effect_cursor = cur;
-                let committed_effect_cursor = (committed_cursor_visible && display_offset == 0)
-                    .then_some((committed_cursor.row, committed_cursor.col));
-                // The sole safe cursor-moving torn commit: LOCK A sampled the
-                // still-pending input boundary and LOCK B sampled exactly that
-                // candidate's sole-next echo. Both engines must independently
-                // retain the same exact endpoints. This witnesses retention
-                // only; the next coherent row probe still owns admission.
-                let pending_content_echo_straddles =
-                    ws.cursor_glow.pending_content_echo_straddles(
-                        content_generation,
-                        observed_effect_cursor,
-                        committed_generation,
-                        committed_effect_cursor,
-                    ) && ws.cursor_trail.pending_content_echo_straddles(
-                        content_generation,
-                        observed_effect_cursor,
-                        committed_generation,
-                        committed_effect_cursor,
-                    );
+                // A caret that moved between the two locks suppresses THIS
+                // frame's stale cursor scratch and nothing else — no engine
+                // state is touched, whoever moved it. Retention only: no light
+                // is minted here, and none is destroyed.
                 cursor_fx_commit = classify_cursor_fx_commit(
                     CursorFxProjection {
                         generation: content_generation,
@@ -19587,7 +18631,6 @@ impl App {
                         visible: committed_cursor_visible,
                         style: committed_cursor_style,
                     },
-                    pending_content_echo_straddles,
                 );
                 reset_cursor_override_after_torn = apply_cursor_fx_commit(ws, cursor_fx_commit);
                 // Freshness vs. decoration consistency: this is a NON-rescan frame, so
@@ -19609,7 +18652,7 @@ impl App {
                     ws.ink_scratch.clear();
                     if matches!(
                         cursor_fx_commit,
-                        CursorFxCommit::Diverged | CursorFxCommit::EchoStraddle
+                        CursorFxCommit::Diverged | CursorFxCommit::CursorMoved
                     ) {
                         ws.free_scratch.clear();
                     } else {
@@ -19822,7 +18865,7 @@ impl App {
             ws.input_scratch.cursor_trail_color = trail_color;
             if matches!(
                 cursor_fx_commit,
-                CursorFxCommit::Diverged | CursorFxCommit::EchoStraddle
+                CursorFxCommit::Diverged | CursorFxCommit::CursorMoved
             ) {
                 // LOCK B changed the cursor projection key after LOCK A's
                 // effect tick. Present the newest cells without stale cursor
@@ -22432,11 +21475,6 @@ impl App {
         // Scrolled into history? The effect engines then see NO cursor (the
         // single-pane law: active-grid coords over scrollback rows are lies).
         let mut focus_scrolled = false;
-        let mut focus_content_generation = aterm_effects::cursor_trail::ContentGeneration {
-            process_sequence: 0,
-            terminal_id: 0,
-            alternate_screen: false,
-        };
         let mut focus_no_echo = false;
         // The focused pane's effective cursor colour (OSC 12 when set, otherwise
         // OSC 10): recolours the wake/comet exactly like the single-pane
@@ -22570,11 +21608,6 @@ impl App {
                         term.is_alternate_screen() || term.kitty_suppresses_predictive_echo();
                     let content_scroll_state = term.content_scroll_state();
                     let pane_alt = term.is_alternate_screen();
-                    focus_content_generation = aterm_effects::cursor_trail::ContentGeneration {
-                        process_sequence: term.pipeline_timestamps().process_sequence,
-                        terminal_id: term.render_identity(),
-                        alternate_screen: pane_alt,
-                    };
                     // Coordinate invalidation clears engine context, so apply
                     // it before re-stating this pane's exact alt/blink inputs.
                     let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
@@ -22900,7 +21933,6 @@ impl App {
                 // never project them over a focused pane's history viewport.
                 ws.cursor_glow.reset();
                 ws.cursor_trail.reset();
-                ws.cursor_echo_settle_pending = false;
             }
             let glow_geom = crate::cursor_glow::Geom {
                 cw: glow_cw,
@@ -22953,7 +21985,6 @@ impl App {
                 // the displaced rainbow kitty stars take the safe IN-CELL fallback in
                 // split panes — never a guess over an adjacent row's glyphs.
             }
-            confirm_cursor_move_candidate(ws, win_cur, now, focus_content_generation);
             let glow_fp =
                 ws.cursor_glow
                     .tick(win_cur, now, &glow_cfg, glow_geom, &mut ws.glow_scratch);
@@ -25882,7 +24913,6 @@ impl App {
             // can tick between this commit and the next normal layout prepare.
             ws.cursor_glow.reset();
             ws.cursor_trail.reset();
-            ws.cursor_echo_settle_pending = false;
             ws.rows = rows;
             ws.cols = cols;
             // The grid dimensions (and thus the cursor coordinate space predictions are

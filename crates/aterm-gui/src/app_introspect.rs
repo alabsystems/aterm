@@ -1629,19 +1629,19 @@ fn native_settings_route_not_open_controls_lines(
 impl App {
     /// The `trail` control-socket verb ([`crate::Wake::TrailAdmissions`]): the
     /// FOCUSED window's cursor-trail ADMISSION DIAGNOSIS ring — the last
-    /// armed/confirmed/retired content-candidate decisions with the confirm
-    /// seam's reason tokens, generations, and endpoints, newest last
+    /// spawn-seam verdicts (`licensed` / `declined`, with the declining reason
+    /// token and the move's endpoints), newest last
     /// (`aterm_effects::cursor_glow::AdmissionRecord::line` rows).
     ///
     /// It exists because the rainbow-trail blackout (201449c2) was diagnosed
     /// by rebuilding with `ATERM_TRACE_SPAWN` and reading stderr archaeology;
     /// a user report should be ONE COMMAND. Read-only over state the engine
-    /// already records beside its decisions; typed TEXT is never reported —
-    /// records carry positions, generations and reason tokens only.
+    /// already records beside decisions it has already made; typed TEXT is
+    /// never reported — records carry positions and reason tokens only.
     ///
     /// `Err` when there is no focused window — an honest refusal, never a
     /// fabricated empty ring. An idle ring answers `OK 0`, which is itself a
-    /// finding (no candidate ever armed: the input seam never saw a key).
+    /// finding: the engine has judged no cursor move at all.
     pub(crate) fn trail_admissions(&self, count: Option<usize>) -> Result<Vec<String>, String> {
         let Some(ws) = self.frontmost_window.and_then(|wid| self.windows.get(&wid)) else {
             return Err("no focused window".to_string());
@@ -3032,11 +3032,6 @@ impl App {
                     crate::app_render::terminal_blank_cell(&term).fg,
                 ),
                 row_probe,
-                content_generation: aterm_effects::cursor_trail::ContentGeneration {
-                    process_sequence: term.pipeline_timestamps().process_sequence,
-                    terminal_id: term.render_identity(),
-                    alternate_screen: is_alt,
-                },
             }
         };
         let Some(fx) = self.tick_cursor_fx(wid, inputs) else {

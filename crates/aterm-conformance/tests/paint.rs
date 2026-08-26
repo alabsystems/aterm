@@ -30,6 +30,9 @@
 //!      frame, including frame zero, AND rainbow ink with no interior blackout
 //!   8. classic flying-kitty style, sustained typing → kitty is EARNED and its
 //!      whole-head bitmap survives into three isolated final stills
+//!   9. alt-screen COLD TOKEN STREAMER whose RESTING CARET ADVANCES every
+//!      batch (append-shaped, DECTCEM SHOWN, NOTHING typed)
+//!                                                    → ZERO ink in EVERY frame
 //!
 //! Rows 7 and 8 close a different false-green class. The first six rows pin
 //! `rainbow kitty` and accept generic dynamic rainbow pixels; they neither run
@@ -589,4 +592,64 @@ fn classic_style_sustained_typing_earns_and_paints_the_flying_kitty() {
         Capture::UnpinnedFocused,
         Some(Companion::Cat),
     );
+}
+
+/// Matrix row 9 — THE COLD ADVANCING CARET, the one shape only the freshness
+/// LICENCE can keep dark (docs/design/EFFECTS-LICENSE-REDESIGN.md).
+///
+/// Rows 3 and 6 are already cold controls, but neither of them ever presents a
+/// cold cursor DELTA: `cold-spinner` hides its caret inside every repaint and
+/// parks it on the input row, and row 4's `streamer` restores the caret with
+/// ESC 7 / ESC 8 so its resting position never moves (and is typed into
+/// anyway). Both are dark whatever the gating law is. This row is the gap: an
+/// append-shaped token stream, alt screen, caret SHOWN and never hidden, whose
+/// RESTING POSITION WALKS several cells per batch, several times a second —
+/// with NOTHING typed. That is exactly the light v0.43.0 could not refuse (its
+/// tick spawned on every presented cursor delta, which is why a bare revert
+/// re-opens `cat` sweeps and token streams), and exactly what a fresh-key-hint
+/// licence refuses: no press, no fresh hint, nothing minted.
+///
+/// `Expect::Dark` — total_ink == 0, the strict reading, not row 6's negated
+/// `quiet` — is affordable because the fixture desaturates the ONE known
+/// non-effect emitter: a caret that walks paints ~98 dynamic saturated px per
+/// moved cell in aterm's default `#50FA7B`, so the fixture sets it to the
+/// foreground grey over OSC 12 before its first byte. Every authored effect
+/// hue is untouched, which is what the red arm below measures.
+///
+/// NOT VACUOUS, and the probe refuses to guess: before it captures anything it
+/// reads `ctl cursor` twice, 0.6 s apart, and turns the row into COULD-NOT-RUN
+/// unless the caret is genuinely `visible=1` and genuinely at a different cell.
+/// A fixture that failed to launch or stopped streaming cannot report a dark
+/// green here.
+///
+/// PROVEN RED, 2026-08-25, red-first — BEFORE the licence seam exists. The
+/// broken arm is a scratch build of THIS tree with `CursorGlow::spawn`'s
+/// universal candidate gate neutered (`admitted_intent` becomes `Some(..)` for
+/// every presented delta, i.e. v0.43.0's own spawn behaviour, which had no
+/// candidate gate at all); the healthy arm is the same worktree restored and
+/// rebuilt, so the two binaries differ in that term and nothing else.
+///
+///   candidate gate NEUTERED  frames=282 total_ink=20 best_ink=4 hues=1  FAIL
+///   candidate gate NEUTERED  frames=283 total_ink=18 best_ink=4 hues=1  FAIL
+///   HEAD, restored           frames=144 total_ink=0  best_ink=0 hues=0  PASS
+///   HEAD, restored           frames=149 total_ink=0  best_ink=0 hues=0  PASS
+///
+/// The broken arm's ink is STRUCTURAL, not luck: a 2-4 px spark on every line
+/// FOLD, landing at frames 11 / 57 / 104 / 149 / 193 / 238 / 282 of one take —
+/// once per 0.72 s of stream, so any take long enough to fold carries it. The
+/// healthy arm is exactly zero across every frame of a take that folds just as
+/// often. That is the whole row: cold output walking the caret earns light
+/// without a gate, and none with one.
+///
+/// (A first draft of the fixture streamed "…the lazy dog…" and the HEALTHY
+/// build came back total_ink=84309 — `dog` is a Keyword-Kitty lexicon entry and
+/// aterm had decorated the screen with animal sprites that then scrolled. Word
+/// decoration is content-triggered and is not the light this row judges; the
+/// fixture's alphabet is now nonsense and the probe switches `[sparkle_words]`
+/// off for this shape. Recorded here because a future reader will otherwise
+/// re-derive it the same expensive way.)
+#[cfg(target_os = "macos")]
+#[test]
+fn alt_screen_cold_token_streamer_with_a_walking_caret_paints_zero_ink() {
+    probe("cold-streamer", "", Expect::Dark);
 }

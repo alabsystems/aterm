@@ -551,9 +551,9 @@ pub const VERBS: &[VerbSpec] = &[
          \"the model never ran\". The typed window's TEXT is never reported)",
     ),
     // Read-only observability for the cursor-trail engine: the last N
-    // armed/confirmed/retired decisions from the fixed-size admission diagnosis
-    // ring, and (`trail status`) the engine's standing state. The one-command
-    // face of what the rainbow-trail blackout hunt did with ATERM_TRACE_SPAWN
+    // licensed/declined verdicts from the fixed-size admission diagnosis ring,
+    // and (`trail status`) the engine's standing state. The one-command face
+    // of what the rainbow-trail blackout hunt did with ATERM_TRACE_SPAWN
     // stderr logs, and of what "I don't see the rainbow cursor trails" needed a
     // video recording for.
     v(
@@ -562,20 +562,22 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         App,
         "trail [<n>]: the focused window's last <n> (default all, ring cap 32) cursor-trail \
-         admission decisions, newest last — one `admission seq= phase=armed|confirmed|retired \
-         reason= intent= age_ms= origin= target= gen_base= gen_cur= alt=` row per decision, \
-         from the engine's fixed-size DIAGNOSTIC ring (reasons are the confirm seam's tokens — \
-         row-mismatch, generation-skip, stale, … — or, with `gen_cur=-`, a candidate the confirm \
-         seam never judged: `superseded` (the next press arrived before any frame observed this \
-         one's echo, so the keys are outrunning the RENDER, not failing a proof), input-cancelled, \
-         input-revoked, reflow, hidden-boundary, unowned-batch). The tally CONSERVES: \
-         armed = candidates_confirmed + retired + at most one still pending. `trail status`: one standing-state row \
-         instead — `trail style= resolved= config_enabled= effective= focused= motion= \
-         motion_stage= shed= intensity= armed= candidates_confirmed= retired= \
-         last_retire_reason= spawns= ribbon_active= ribbon_segments= ribbon_hue_bands= \
-         sparks= momentum= momentum_display= speed= glow_active= pet_active= cat_active=` \
-         (every gate from the config knob to the glass, in the order the frame path walks \
-         them, plus the cumulative tally the ring has forgotten). Read-only; typed text is \
+         spawn-seam verdicts, newest last — one `admission seq= phase=licensed|declined \
+         reason= age_ms= origin= target= alt=` row per judged cursor move, from the engine's \
+         fixed-size DIAGNOSTIC ring. A move paints only if a keypress LICENSED it, so a \
+         decline carries one of three reasons: `no-fresh-hint` (no key hint was fresh — the \
+         move was program output nobody's fingers asked for), `no-credits` (a multi-cell \
+         coalesce outran the press CREDIT budget), `off-shape` (licensed and classified, but \
+         the style's shape gates laid nothing). Every observed move is counted exactly once: \
+         licensed + declined is the number of cursor deltas the seam has judged. \
+         `trail status`: one standing-state row instead — `trail style= resolved= \
+         config_enabled= effective= focused= motion= motion_stage= shed= intensity= \
+         licensed= declined= last_decline_reason= spawns= ribbon_active= ribbon_look= \
+         ribbon_segments= ribbon_hue_bands= sparks= momentum= momentum_display= speed= \
+         glow_active= pet_active= cat_active=` (every gate from the config knob to the glass, \
+         in the order the frame path walks them, plus the cumulative tally the ring has \
+         forgotten — `licensed=0 declined>0` blames the licence and names why, `licensed>0` \
+         over a dark screen blames everything downstream of it). Read-only; typed text is \
          never reported",
     ),
     // Read-only observability for SELECTION/VIEWPORT CUSTODY: which of the eleven

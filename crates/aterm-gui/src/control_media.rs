@@ -2167,7 +2167,7 @@ pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// and a count must not be swallowed as an unknown keyword.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrailForm {
-    /// `trail [<n>]` — the per-decision admission ring.
+    /// `trail [<n>]` — the per-verdict admission ring.
     Admissions(Option<usize>),
     /// `trail status` — the standing engine-state line.
     Status,
@@ -2190,19 +2190,31 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
 /// `trail [status|<n>]` -> the FOCUSED window's cursor-trail diagnostics, in
 /// the two shapes a "the trail went dark" report needs.
 ///
-/// * `trail [<n>]` — the last `n` ADMISSION decisions (default: the whole
-///   diagnostic ring, cap 32), one `admission seq= phase= reason= …` row each,
-///   newest last ([`crate::App::trail_admissions`]). What the last few
-///   keystrokes DECIDED.
+/// * `trail [<n>]` — the last `n` SPAWN-SEAM VERDICTS (default: the whole
+///   diagnostic ring, cap 32), one
+///   `admission seq= phase= reason= age_ms= origin= target= alt=` row each,
+///   newest last ([`crate::App::trail_admissions`]). `phase` is `licensed` or
+///   `declined`; `reason` on a decline is `no-fresh-hint` (no key hint was
+///   fresh, so the move was program output nobody's fingers asked for),
+///   `no-credits` (a multi-cell coalesce outran the press CREDIT budget) or
+///   `off-shape` (licensed and classified, but the style's shape gates laid
+///   nothing). What the last few keystrokes DECIDED.
 /// * `trail status` — ONE `trail style= … ribbon_active= …` line of standing
 ///   engine state ([`crate::App::trail_status`]): the resolved style, every
-///   gate from the `cursor_trail` knob to the glass, the cumulative admission
-///   scoreboard, and the light alive right now. What is TRUE.
+///   gate from the `cursor_trail` knob to the glass, the cumulative
+///   `licensed=`/`declined=`/`last_decline_reason=` scoreboard, and the light
+///   alive right now. What is TRUE.
 ///
-/// The one-command face of the confirm-seam sensor: the rainbow-trail
-/// blackout was diagnosed with `ATERM_TRACE_SPAWN` stderr logs, and the
-/// standing owner report *"I don't see the rainbow cursor trails"* was
-/// investigated by recording video and scanning frames for hue diversity.
+/// READ THEM IN THAT ORDER. A zero `licensed` beside a nonzero `declined`
+/// means every move the engine saw was unlicensed — read
+/// `last_decline_reason`. A nonzero `licensed` over a dark screen means the
+/// licence is fine and the failure is downstream (morphology, tuning, the
+/// compositor), which the rest of the status row walks in frame order.
+///
+/// The one-command face of the sensor: the rainbow-trail blackout was
+/// diagnosed with `ATERM_TRACE_SPAWN` stderr logs, and the standing owner
+/// report *"I don't see the rainbow cursor trails"* was investigated by
+/// recording video and scanning frames for hue diversity.
 /// Both now read the engine's own truth, so a user report is ONE COMMAND.
 /// Read-only, main-thread hop like `tone` (the state lives in per-window App
 /// state); works headless. The ring form answers `OK <n>` + n rows and the

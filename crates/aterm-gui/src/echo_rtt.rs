@@ -92,17 +92,17 @@ pub const WINDOW: usize = 1024;
 /// better explanation.
 const ARM_TTL_US: u64 = 2_000_000;
 
-// TIER (ii), DESIGNED, NOT WIRED — key-arrival → typed-confirm-present.
+// TIER (ii), DESIGNED, NOT WIRED — key-arrival → typed-echo-present.
 //
-// The exact echo (this keystroke's GLYPH is proven on the cursor row) is
-// already computed by the cursor-glow content proof:
-// `aterm_effects::cursor_glow::ContentCandidateDecision::Confirmed { at, .. }`,
-// projected onto the trail in `app_render::confirm_cursor_move_candidate`.
-// Wiring is two lines — arm at the same place tier (i) arms, and in the
-// `Confirmed` branch record `at - arm`. It is NOT wired here because
-// `app_render.rs`'s cursor-fx seam is under an explicit change fence for this
-// release (it carries the landed trail-blackout fix) and is owned by another
-// work package this cycle. See the package report for the call site.
+// This once pointed at the cursor-glow content proof
+// (`ContentCandidateDecision::Confirmed { at, .. }`) as a ready-made source
+// for "this keystroke's GLYPH is proven on the cursor row". That whole seam is
+// gone (docs/design/EFFECTS-LICENSE-REDESIGN.md): the effects engines no
+// longer prove echoes, they ask whether a keypress licensed the move, and a
+// licence is not a measurement. Tier (ii) therefore needs its OWN observation
+// if it is ever wired — the cheapest honest one being the frame that first
+// presents a cell change on the armed keystroke's row, taken in the render
+// path, with no dependency on the effects engines at all.
 
 // ---------------------------------------------------------------------------
 // The single arm slot.

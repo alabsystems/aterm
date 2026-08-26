@@ -1822,8 +1822,8 @@ impl App {
         use crate::overlay::OverlayKind;
         // Screen-reader actions bypass keyboard/pointer ingress. Even an
         // ignored/stale request is a newer external-input boundary and must
-        // retire a swallowed cursor-move proof before any local early return.
-        self.cancel_cursor_move_candidate(wid);
+        // close the cursor-move licence before any local early return.
+        self.clear_move_license(wid);
         let kind = self
             .windows
             .get(&wid)

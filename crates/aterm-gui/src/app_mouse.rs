@@ -2142,10 +2142,10 @@ impl App {
     }
 
     pub(crate) fn on_cursor_moved(&mut self, wid: WindowId, x: f64, y: f64) {
-        // Pointer input has no causally provable terminal landing. It remains
-        // dark, but as a newer user boundary it must retire an older swallowed
-        // key candidate even when chrome/modal handling returns locally.
-        self.cancel_cursor_move_candidate(wid);
+        // Pointer motion is not typing. It stays dark, and as a newer user
+        // boundary it closes an older swallowed key's licence even when
+        // chrome/modal handling returns locally.
+        self.clear_move_license(wid);
         // Remember the raw pixel position so a follow-up button press can tell
         // whether it landed in the tab strip (intercepted before cell mapping).
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -3066,7 +3066,7 @@ impl App {
         state: ElementState,
         button: WinitMouseButton,
     ) {
-        self.cancel_cursor_move_candidate(wid);
+        self.clear_move_license(wid);
         // GUI-ONLY prefix (gesture-state owner = App; a controller can't trigger
         // these): Cmd-click link-open, shift-extend, and the MULTI_CLICK_MS streak
         // FSM that yields the authoritative `click_count`. These stay in the
@@ -4081,7 +4081,7 @@ impl App {
     /// the cell under the pointer; otherwise scroll the scrollback viewport (the
     /// everyday "scroll up to see history" gesture).
     pub(crate) fn on_mouse_wheel(&mut self, wid: WindowId, delta: MouseScrollDelta) {
-        self.cancel_cursor_move_candidate(wid);
+        self.clear_move_license(wid);
         // The modal claim is decided before normalization. Sub-line gestures still
         // return below without ever reaching native/terminal scroll consumers, and
         // so do HORIZONTAL ones over the palette / a native view — the terminal

@@ -3309,7 +3309,7 @@ fn serve_request_line(
         debug_assert_ne!(bin_verb, "operator-propose-bin");
         let mut dispatch_front_input =
             |event, session| post_input_reply_to(proxy, Op::WriteInput, vec![event], session);
-        let mut cancel_candidate = |session| front_routed_candidate_cancel(proxy, session);
+        let mut clear_license = |session| front_routed_license_clear(proxy, session);
         if !run_feed_bin_routed(
             &line,
             bin_verb,
@@ -3320,7 +3320,7 @@ fn serve_request_line(
                 scope,
             },
             &mut dispatch_front_input,
-            &mut cancel_candidate,
+            &mut clear_license,
             writer,
         ) {
             return Some(ServeDisposition::Close);
@@ -3516,7 +3516,7 @@ fn binary_frame_verb(line: &str) -> Option<&'static str> {
 /// Resolve only the target-bearing prefix of a binary input header.  This is
 /// deliberately independent of the length/trailing-argument parser: once an
 /// authenticated client has named a real write verb and target, even a malformed
-/// or over-cap attempt is a newer input boundary for that target's cursor proof.
+/// or over-cap attempt is a newer input boundary for that target's cursor licence.
 /// Unknown verbs return `None`, and authorization is still checked separately
 /// before the boundary is allowed to mutate visible state.
 fn binary_frame_attempt_selector(line: &str, verb: &str) -> Option<Option<Selector>> {
@@ -4303,7 +4303,7 @@ fn run_feed_bin<W: Write>(
         seam_egress(&term, &ctx.sink, &event, EgressMode::Backpressured);
         Ok(InputOutcome::Ok)
     };
-    let mut cancel_candidate = |_session| "OK\n".to_string();
+    let mut clear_license = |_session| "OK\n".to_string();
     run_feed_bin_routed(
         line,
         verb,
@@ -4314,7 +4314,7 @@ fn run_feed_bin<W: Write>(
             scope,
         },
         &mut dispatch,
-        &mut cancel_candidate,
+        &mut clear_license,
         writer,
     )
 }
@@ -4332,7 +4332,7 @@ fn run_feed_bin_routed<W: Write, F, C>(
     reader: &mut impl BufRead,
     route: FeedBinRoute<'_>,
     dispatch_front_input: &mut F,
-    cancel_candidate: &mut C,
+    clear_license: &mut C,
     writer: &mut W,
 ) -> bool
 where
@@ -4345,8 +4345,8 @@ where
     let paste = verb == "paste-bin";
     // Resolve and authorize the target from the header PREFIX before waiting for
     // its payload.  A client may legally trickle a bounded binary frame for much
-    // longer than the cursor-proof freshness window; leaving the old candidate
-    // armed until `read_exact` completed let unrelated child output borrow it.
+    // longer than the key-hint freshness window; leaving the old licence
+    // stamped until `read_exact` completed let unrelated child output borrow it.
     // Malformed and over-cap attempts use this same prefix rule: a resolvable,
     // authorized target is fenced; unknown/unauthorized targets never mutate UI
     // state.  Framing behavior below remains unchanged.
@@ -4363,10 +4363,10 @@ where
     if header_authorized
         && let Some((_, _, session, _)) = header_target.as_ref()
     {
-        let response = cancel_candidate(*session);
+        let response = clear_license(*session);
         if !response.starts_with("OK") {
             // Do not wait for a slow payload while the header target's old
-            // movement proof is still live. The main-thread fence failed, so
+            // movement licence is still live. The main-thread fence failed, so
             // this framed connection is no longer safe to continue.
             let _ = writer.write_all(response.as_bytes());
             let _ = writer.flush();
@@ -4494,12 +4494,13 @@ where
     }
 
     // The active/self selector can retarget while the payload is in flight, and
-    // a fresh local input can arm a new proof after the header fence. Fence the
-    // target selected by the post-payload snapshot as well, immediately before
-    // any direct egress. App-routed input repeats this boundary harmlessly.
-    let canceled = cancel_candidate(target_session);
-    if !canceled.starts_with("OK") {
-        let _ = writer.write_all(canceled.as_bytes());
+    // a fresh local input can stamp a new licence after the header fence. Fence
+    // the target selected by the post-payload snapshot as well, immediately
+    // before any direct egress. App-routed input repeats this boundary
+    // harmlessly.
+    let cleared = clear_license(target_session);
+    if !cleared.starts_with("OK") {
+        let _ = writer.write_all(cleared.as_bytes());
         let _ = writer.flush();
         return false;
     }
@@ -4544,8 +4545,8 @@ where
         let event = if paste {
             InputEvent::Paste(String::from_utf8_lossy(&payload).into_owned())
         } else {
-            // Raw front-session input is uncorrelatable movement. It still
-            // enters App::input so that seam retires any older candidate before
+            // Raw front-session input is not the user's fingers. It still
+            // enters App::input so that seam closes any older licence before
             // writing the exact bytes. The direct route below retains its
             // background egress but runs an explicit session-wide fence first,
             // because another window may still present that session.
@@ -5455,32 +5456,32 @@ fn front_routed_input(
     }
 }
 
-/// Close any pending exact cursor-move proof before a visible-front control
-/// operation that does not otherwise pass through `App::input`. The dedicated
-/// main-thread wake clears only cursor provenance: unlike an empty synthetic
-/// key it cannot heat cadence/rain, stamp input latency, or write a PTY frame.
-/// The round trip completes before the direct operation below, so a signal
-/// cannot synchronously trigger output that borrows the older proof.
-fn front_routed_candidate_cancel(proxy: &EventLoopProxy<Wake>, session: u64) -> String {
-    candidate_cancel_reply(control_media::call_main(proxy, |reply| {
-        Wake::CursorCandidateCancel {
+/// Close the cursor-move LICENCE before a visible-front control operation that
+/// does not otherwise pass through `App::input`. The dedicated main-thread wake
+/// expires only the two key-hint stamps: unlike an empty synthetic key it
+/// cannot heat cadence/rain, stamp input latency, or write a PTY frame. The
+/// round trip completes before the direct operation below, so a signal cannot
+/// synchronously trigger output that borrows the older licence.
+fn front_routed_license_clear(proxy: &EventLoopProxy<Wake>, session: u64) -> String {
+    license_clear_reply(control_media::call_main(proxy, |reply| {
+        Wake::CursorMoveLicenseClear {
             session,
             reply,
         }
     }))
 }
 
-fn candidate_cancel_reply(result: Result<bool, &'static str>) -> String {
+fn license_clear_reply(result: Result<bool, &'static str>) -> String {
     match result {
         // `false` is a safe tab-switch race: the named target is no longer
-        // visible and therefore owns no window candidate, but the authorized
+        // visible and therefore holds no licence, but the authorized
         // direct operation still proceeds against that session.
         Ok(_) => "OK\n".to_string(),
         Err(error) => format!("ERR input dispatch failed: {error}\n"),
     }
 }
 
-fn control_attempt_supersedes_cursor_candidate(verb: &str) -> bool {
+fn control_attempt_closes_cursor_license(verb: &str) -> bool {
     matches!(
         verb,
         "send"
@@ -6066,16 +6067,16 @@ fn handle(
     }
 
     // Every AUTHORIZED control attempt that can inject bytes, signal the
-    // child, or mutate its cursor coordinate space is a newer provenance
-    // boundary — even when its arguments are malformed and dispatch later
-    // returns an error. Fence before parsing so a swallowed candidate cannot
-    // survive an ignored attempt and be borrowed by subsequent PTY output.
+    // child, or mutate its cursor coordinate space is a newer input boundary —
+    // even when its arguments are malformed and dispatch later returns an
+    // error. Fence before parsing so a swallowed key's LICENCE cannot survive
+    // an ignored attempt and be borrowed by subsequent PTY output.
     // Authorization has already completed above; denied callers cannot mutate
     // visible-window effect state through this side channel.
-    if control_attempt_supersedes_cursor_candidate(verb) {
-        let canceled = front_routed_candidate_cancel(proxy, session);
-        if !canceled.starts_with("OK") {
-            return canceled;
+    if control_attempt_closes_cursor_license(verb) {
+        let cleared = front_routed_license_clear(proxy, session);
+        if !cleared.starts_with("OK") {
+            return cleared;
         }
     }
 
@@ -6419,14 +6420,14 @@ fn handle(
         // reads the peer's front window).
         "tone" => control_media::cmd_tone(proxy, rest),
         // `trail [status|<n>]`: the FOCUSED window's cursor-trail diagnostics.
-        // The `<n>` form prints the last n admission decisions from the
-        // engine's diagnostic ring — armed/confirmed/retired + reason +
-        // generation + origin/target; `status` prints ONE line of standing
-        // engine state (style, every gate to the glass, cumulative admission
-        // tally, live ribbon). Read-only and App-level like `tone` (`@peer
-        // trail` reads the peer's focused window); the one-command face of the
-        // ATERM_TRACE_SPAWN confirm-seam sensor and of "I don't see the
-        // rainbow cursor trails".
+        // The `<n>` form prints the last n spawn-seam verdicts from the
+        // engine's diagnostic ring — licensed/declined + reason
+        // (no-fresh-hint / no-credits / off-shape) + origin/target; `status`
+        // prints ONE line of standing engine state (style, every gate to the
+        // glass, the cumulative licensed/declined tally, live ribbon).
+        // Read-only and App-level like `tone` (`@peer trail` reads the peer's
+        // focused window); the one-command face of the ATERM_TRACE_SPAWN
+        // sensor and of "I don't see the rainbow cursor trails".
         "trail" => control_media::cmd_trail(proxy, rest),
         // `spawn`: mint ONE new tab session and reply `OK <sid>` — birth as a
         // socket primitive. The sid is immediately addressable (`@<sid> turn …`),
@@ -6679,7 +6680,7 @@ mod tests {
     #[test]
     fn an_explicit_selector_for_the_front_tab_is_routed_through_the_input_seam() {
         use super::{
-            TurnInputRoute, candidate_cancel_reply, control_attempt_supersedes_cursor_candidate,
+            TurnInputRoute, license_clear_reply, control_attempt_closes_cursor_license,
             front_routed, turn_input_route,
         };
         // Named the tab on screen -> the seam.
@@ -6707,9 +6708,9 @@ mod tests {
         // `false` main-thread result means the tab switched before the fence;
         // the target is now background and its otherwise valid signal must not
         // be dropped.
-        assert_eq!(candidate_cancel_reply(Ok(true)), "OK\n");
-        assert_eq!(candidate_cancel_reply(Ok(false)), "OK\n");
-        assert!(candidate_cancel_reply(Err("event loop gone")).starts_with("ERR "));
+        assert_eq!(license_clear_reply(Ok(true)), "OK\n");
+        assert_eq!(license_clear_reply(Ok(false)), "OK\n");
+        assert!(license_clear_reply(Err("event loop gone")).starts_with("ERR "));
 
         // Parsing happens only after this verb-level boundary, so malformed
         // front and cross forms cancel exactly like valid ones. Read-only and
@@ -6719,12 +6720,12 @@ mod tests {
             "resize", "scroll",
         ] {
             assert!(
-                control_attempt_supersedes_cursor_candidate(verb),
+                control_attempt_closes_cursor_license(verb),
                 "authorized {verb} attempt must fence before argument parsing"
             );
         }
         for verb in ["text", "screen", "cursor", "image", "metrics"] {
-            assert!(!control_attempt_supersedes_cursor_candidate(verb));
+            assert!(!control_attempt_closes_cursor_license(verb));
         }
     }
 
@@ -10573,8 +10574,8 @@ mod tests {
                 // `tone` OBSERVES the mood classifier; the knob it reports is
                 // rewritten through `settings` (ConfigWrite), never here.
                 "tone",
-                // `trail` OBSERVES the cursor-trail engine — the admission
-                // diagnosis ring and (`trail status`) its standing state. It
+                // `trail` OBSERVES the cursor-trail engine — the licence
+                // verdict ring and (`trail status`) its standing state. It
                 // has no write form at all (both are engine-written diagnostic
                 // state beside decisions already made; the knobs it reports are
                 // rewritten through `settings`, never here).
@@ -14189,7 +14190,7 @@ mod tests {
     }
 
     /// A bounded binary header is itself the authoritative input boundary.  The
-    /// candidate fence must complete before the server can block waiting for a
+    /// licence fence must complete before the server can block waiting for a
     /// slow payload; rejected/unauthorized headers may never mutate cursor state.
     #[test]
     #[cfg(unix)]
@@ -14257,7 +14258,7 @@ mod tests {
         assert!(drain_pipe(&front_rx).is_empty());
 
         // A rejected frame still consumes its bounded payload, but an
-        // unauthorized header cannot use the candidate fence as a UI side
+        // unauthorized header cannot use the licence fence as a UI side
         // channel.
         let cancel_count = std::cell::Cell::new(0usize);
         let mut cancel = |_session| {
@@ -14522,7 +14523,7 @@ mod tests {
             inner: std::io::Cursor::new(b"Z".to_vec()),
             action: Some(|| panic!("payload read despite a failed header fence")),
         };
-        let mut cancel = |_session| "ERR candidate fence unavailable\n".to_string();
+        let mut cancel = |_session| "ERR licence fence unavailable\n".to_string();
         let mut dispatch = |_event, _session| Ok(InputOutcome::Ok);
         let mut failed = Vec::new();
         assert!(!run_feed_bin_routed(
@@ -14540,7 +14541,7 @@ mod tests {
         ));
         assert_eq!(
             String::from_utf8_lossy(&failed),
-            "ERR candidate fence unavailable\n"
+            "ERR licence fence unavailable\n"
         );
     }
 
@@ -14659,7 +14660,7 @@ mod tests {
             routed = Some((event, session));
             Ok(InputOutcome::Ok)
         };
-        let mut cancel_candidate = |_session| "OK\n".to_string();
+        let mut clear_license = |_session| "OK\n".to_string();
         assert!(run_feed_bin_routed(
             &line,
             "paste-bin",
@@ -14670,7 +14671,7 @@ mod tests {
                 scope: Scope::Owner,
             },
             &mut dispatch,
-            &mut cancel_candidate,
+            &mut clear_license,
             &mut reply,
         ));
         assert_eq!(String::from_utf8_lossy(&reply), "OK 7 bytes\n");
@@ -14733,7 +14734,7 @@ mod tests {
         let mut out = Vec::new();
         let mut dispatch_front_input =
             |event, _session| Ok(app.input(wid, event, Source::Controller { op: Op::WriteInput }));
-        let mut cancel_candidate = |_session| "OK\n".to_string();
+        let mut clear_license = |_session| "OK\n".to_string();
         assert!(run_feed_bin_routed(
             &line,
             "paste-bin",
@@ -14744,7 +14745,7 @@ mod tests {
                 scope: Scope::Owner,
             },
             &mut dispatch_front_input,
-            &mut cancel_candidate,
+            &mut clear_license,
             &mut out,
         ));
         assert_eq!(String::from_utf8_lossy(&out), "OK 6 bytes\n");

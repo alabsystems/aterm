@@ -324,28 +324,7 @@ pub fn model_registry() -> Vec<Model> {
         cursor_cat_curse_wince_model(),
         reduced_motion_companion_handoff_model(),
         cursor_cat_motion_pulse_routing_model(),
-        rainbow_move_admission_model(),
-        cursor_move_candidate_model(),
-        cursor_echo_commit_retry_model(),
-        // The blackout's liveness twin: an environment adversary produces the
-        // audited real-shell echo shapes (plain/E1..E5/cold/swallowed/
-        // deviating, plus shape 10's unblinked-alt echo — the probe-starved
-        // less//vi//ESC 7-streamer class) and the settled decision must
-        // CONFIRM every handled shape — safety alone had proven a mute gate
-        // green. E2/E5 are registered standing gaps, stated as invariants and
-        // reprinted by the Tier-0 driver. Tier-1 binds the real
-        // confirm_content_candidate in aterm-effects/src/cursor_glow.rs.
-        typed_echo_liveness_model(),
-        // The ERASE twin of the shape above (R1, "backspace KILLS my cursor
-        // trail"): 20003ffd repaired the typed arm and left the delete arm on
-        // the 201449c2 laws — whole-row exactness + the vacated-cell-only
-        // witness — so a suggestion repaint, a space erase, or a trimmed-row
-        // EOL erase all retired, and the denied batch then reached the
-        // generation fence and WIPED the resident ribbon. Same prove-and-catch
-        // discipline: the mute delete arm is SAFE, and only the liveness
-        // family catches it. Tier-1 binds the real Delete arm of
-        // confirm_content_candidate in aterm-effects/src/cursor_glow.rs.
-        delete_echo_liveness_model(),
+        cursor_hint_license_model(),
         cursor_viewport_lifecycle_model(),
         cursor_effect_scroll_model(),
         cursor_scroll_signal_model(),

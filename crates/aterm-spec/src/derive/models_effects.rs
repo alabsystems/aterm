@@ -1368,26 +1368,38 @@ pub fn reduced_motion_companion_handoff_model() -> Model {
     }
 }
 
-/// One-shot routing for the authenticated cursor-cat motion pulse shared by
+/// One-shot routing for the CLASSIFIER-MINTED cursor-cat motion pulse shared by
 /// ordinary rendering and the extracted/composed render path. A render route
 /// that observes the pulse must take it from the glow producer and deliver it
 /// to the cat exactly once. Route changes after that frame see no pulse, so a
 /// style/layout transition cannot replay old typing into a new owner.
 ///
-/// `Buggy=1` reproduces the composed-route omission: that route records an
-/// attempt but neither takes nor delivers the pulse, stranding it in the
-/// producer. Switching to the ordinary route can then consume that stale pulse;
-/// the model records this as `stale_replay`. Tier-0 proves the healthy
-/// conservation/one-shot laws and requires both the strand and replay witnesses.
-/// Tier-1 binds the route actions to `take_cursor_cat_motion_pulse` plus
-/// `forward_kitty_cursor_motion` at the ordinary and composed/extracted seams.
+/// WHERE THE PULSE COMES FROM (`docs/design/EFFECTS-LICENSE-REDESIGN.md`): a
+/// spawn that cleared the LICENSE seam and was then positively classified as a
+/// typed advance or fold — `RainbowState::momentum_pulse`, minted beside
+/// `shape_wrap`/`re_anchor` inside `CursorGlow::spawn`. It is not "authenticated"
+/// by anything downstream: under the license law nothing is pending between the
+/// key hint and the verdict, so `LicenseMove` -> `ClassifyPulse` is the whole
+/// provenance chain and an unlicensed program move never reaches the classifier
+/// that mints one.
+///
+/// `Buggy=1` reproduces two independent defects: the composed-route omission —
+/// that route records an attempt but neither takes nor delivers the pulse,
+/// stranding it in the producer, after which switching to the ordinary route
+/// consumes the stale pulse (`stale_replay`) — and a pulse minted with no
+/// license behind it (`cold_pulse`), the shape a re-introduced cold spawn seam
+/// would have. Tier-0 proves the healthy conservation/one-shot/provenance laws
+/// and requires all three witnesses. Tier-1 binds the route actions to
+/// `take_cursor_cat_motion_pulse` plus `forward_kitty_cursor_motion` at the
+/// ordinary and composed/extracted seams.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn cursor_cat_motion_pulse_routing_model() -> Model {
     crate::ty_model! {
         CursorCatMotionPulseRouting {
             const Buggy = 0;
-            var authenticated = 0;
+            var licensed = 0;
+            var classified = 0;
             var pending = 0;
             var route = 0;          // 0 unselected, 1 ordinary, 2 composed/extracted
             var attempted_route = 0;
@@ -1396,16 +1408,25 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
             var switched = 0;
             var stranded = 0;
             var stale_replay = 0;
+            var cold_pulse = 0;
 
-            action AuthenticatePulse when (authenticated == 0) {
-                authenticated = 1;
-                pending = 1;
+            action LicenseMove when (licensed == 0) {
+                licensed = 1;
             }
-            action SelectOrdinaryRoute when (authenticated == 1 && route == 0) {
+            // The producer mints the pulse INSIDE a licensed spawn, from the
+            // classifier. `Buggy=1` lets it mint with no license behind it.
+            action ClassifyPulse when (
+                (licensed == 1 || Buggy == 1) && classified == 0
+            ) {
+                classified = 1;
+                pending = 1;
+                cold_pulse = if licensed == 0 { 1 } else { cold_pulse };
+            }
+            action SelectOrdinaryRoute when (classified == 1 && route == 0) {
                 route = 1;
             }
             action SelectComposedExtractedRoute when (
-                authenticated == 1 && route == 0
+                classified == 1 && route == 0
             ) {
                 route = 2;
             }
@@ -1442,1790 +1463,341 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
                 if attempted_route > 0 {
                     pending == 0 && consumes == 1 && deliveries == 1
                 } else {
-                    pending == authenticated && consumes == 0 && deliveries == 0
+                    pending == classified && consumes == 0 && deliveries == 0
                 };
             invariant NoComposedRouteStrand: stranded == 0;
             invariant RouteSwitchCannotReplay: stale_replay == 0;
-            invariant DeliveryIsAuthenticatedAndAtMostOnce:
-                consumes <= authenticated && deliveries <= authenticated
+            invariant NoPulseFromAnUnlicensedMove: cold_pulse == 0;
+            invariant DeliveryIsClassifiedAndAtMostOnce:
+                consumes <= classified && deliveries <= classified
                     && deliveries == consumes;
             invariant StateBounded:
-                authenticated <= 1 && pending <= 1 && route <= 2
+                licensed <= 1 && classified <= 1 && pending <= 1 && route <= 2
                     && attempted_route <= 2 && consumes <= 1 && deliveries <= 1
-                    && switched <= 1 && stranded <= 1 && stale_replay <= 1;
+                    && switched <= 1 && stranded <= 1 && stale_replay <= 1
+                    && cold_pulse <= 1;
         }
     }
 }
 
-/// Cursor classifier and typed-credit bookkeeping after causal movement
-/// admission. Movement birth itself belongs exclusively to
-/// [`cursor_move_candidate_model`]: typed/Return/reflow/navigation/Tab/paste
-/// timestamps here are morphology inputs only. `AdmitCandidate` represents an
-/// already-proven exact/synthetic decision before `WitnessedMove`; a cold move
-/// and fresh/stale gesture classes stay dark.
-/// `ArmGesture` also supersedes any swallowed typed/strong classifier so paste
-/// cannot inherit re-anchor, ZOOM, or navigation suppression semantics. An
-/// input with no possible cursor movement (empty/sanitized/zero-width paste or
-/// text, or a stationary kill) takes `IgnoreNoMoveInput`: bytes/protocol
-/// framing may egress, but no movement licence is armed for a later program
-/// delta. `RevokeQueued` withdraws a newly armed class when its key bytes joined
-/// an already-pending FIFO or its inline write fails, and retires the complete
-/// typed-credit high-water owned by that now-unwitnessed latest hint. `RevokeAsyncPaste`
-/// withdraws every paste's arrival-time class: even the first FIFO job is
-/// written on another thread, so enqueue is not delivery. `DeclineHidden` consumes every class whenever a
-/// hidden→visible completion reaches no `spawn` decision (a far relocation or
-/// a same-cell return). Historical
-/// warmth is amplitude only and remains `UnwitnessedMove`. `ArmTypedCredit` ->
-/// `ObserveTypedEcho` is the bounded committed-cell ledger: every observed
-/// non-coalesced boundary retires every earlier outstanding credit (the
-/// one-slot hint cannot correlate a partial remote echo to one of several
-/// in-flight presses), so already-rendered text cannot subsidize a later
-/// coalesced program move. `recent_typing_activity` is a separate bounded
-/// witness: spending admission cells does not erase the user's earned
-/// navigation burst/debris reward, and that activity bit is never summed into
-/// coalesce admission. `ArmNextTypedCredit` -> `ColdTwoCellMove` crosses into a
-/// second cohort and proves its one new credit cannot pool with any retired
-/// pre-boundary history. `SupersedeTypedCohort` is the Enter/Tab/navigation
-/// boundary: dropping a swallowed typed hint retires the same credit high-water
-/// even though no typed echo was observed. `ExpireTypedCohort` is the same
-/// high-water fence when a later key arrives after the prior one-shot expired;
-/// credits may outlive one hint only inside the still-correlatable batch window.
+/// THE LICENSE, modelled at the seam that asks it: *did a human touch the
+/// keyboard just now?* (`docs/design/EFFECTS-LICENSE-REDESIGN.md`).
 ///
-/// `Buggy=1` preserves the audited credit-retention mutants and restores the
-/// forbidden timestamp-only birth. Tier-1 drives the genuine credit ring;
-/// movement admission is bound separately by `cursor_move_candidate_model`.
+/// The predicate, enumerated term by term at the top of `CursorGlow::spawn` /
+/// `CursorTrail::spawn`, before `classify_move` and before one byte of state
+/// moves:
+///
+/// ```text
+/// licensed = fresh(type_hint) || fresh(quench_hint) || fresh(nav_hint)
+///         || fresh(return_hint) || fresh(newline_hint)
+///         || fresh(user_gesture_hint) || synthetic_note_pending
+/// ```
+///
+/// Six key-hint stamps under their own freshness constants (the 0.25 s class),
+/// plus the scripted-preview note, which needs no field of its own because
+/// `note_synthetic_move` / `note_synthetic_typed` stamp `user_gesture_hint` /
+/// `type_hint` at the same instant. The disjunction is CLASS-BLIND on purpose —
+/// which choreography fires stays `classify_move`'s job — so the model carries
+/// ONE three-valued licence term (`hint`: absent / fresh / stale) rather than
+/// six symmetric copies of the same disjunct.
+///
+/// WHAT THE MODEL CLAIMS, derived from that predicate rather than from the
+/// implementation (the enumerate-the-predicate discipline that ended the
+/// erase-poof lane), and each claim carrying its own `Buggy=1` counterexample:
+///
+/// * A move with NO stamp mints nothing (`cold_admitted`) — the cold token
+///   streamer, `cat`, a spinner two rows away. This is the one invariant the
+///   design names, and it is STRICTLY STRONGER than v0.43.0, whose tick spawned
+///   on every presented cursor delta and let a cold one-cell advance earn heat.
+/// * A move with a STALE stamp mints nothing (`stale_admitted`). Freshness is
+///   half the predicate; a model that only knew about absence would prove
+///   nothing about the window.
+/// * `reflow_hint` / `blink_hint` are NOT licence terms (`morphology_admitted`).
+///   A resize and a TUI's repaint blink are not keypresses; they stay morphology
+///   inputs, and the mutant is the maintainer who "helpfully" adds one to the
+///   disjunction.
+/// * A key this window SWALLOWED never licenses (`swallow_admitted`) — the ~15
+///   `clear_move_license` call sites (mouse, wheel, focus, paste, scroll, tab
+///   switch, IME, a11y, `signal`). A stamp that outlives its own boundary is
+///   not an answer to the licence question.
+/// * A DECLINED move destroys nothing (`wiped`). This is the second half of the
+///   law and the actual reported darkness: the proof era's denial paths refused
+///   to mint (fine) and then wiped the ribbon the user's own typing had earned.
+///   Retention is decay + `note_scroll` translation + reset, and nothing else.
+/// * Every armed press reaches EXACTLY ONE disposition — consumed by its one
+///   paired echo, expired by freshness, cleared at a swallow boundary, or
+///   superseded by a newer press over the one-slot stamp. Never two, never none;
+///   `admissions <= arms` is the same law counted from the other side (one hint,
+///   one echo).
+/// * The press CREDIT budget spends monotonically: spent cells never exceed the
+///   cells real presses banked, an admitted multi-cell coalesce PAYS for its
+///   ribbon, a starved one pays nothing and stays dark, and retiring a stale
+///   stamp never refunds cells to fund a second stray sweep (`credit_refunded`).
+/// * The slimmed diagnosis ring cannot lie to `ctl trail`: every spawn scores
+///   exactly one of `licensed`/`declined`, and a `licensed` row means light was
+///   actually minted.
+///
+/// Tier-1 (`cursor_glow.rs`) drives the REAL `CursorGlow` through press, echo,
+/// cold echo and expiry against these transitions.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn rainbow_move_admission_model() -> Model {
+pub fn cursor_hint_license_model() -> Model {
     crate::ty_model! {
-        RainbowMoveAdmission {
+        CursorHintLicense {
             const Buggy = 0;
-            const CreditCap = 3;
-            var witnessed = 0;
-            var admitted = 0;
-            var candidate_admitted = 0;
-            var gesture_hint = 0;       // 0 absent, 1 fresh, 2 stale
-            var gesture_arms = 0;
-            var gesture_admissions = 0;
-            var typed_class = 0;
-            var strong_class = 0;       // Return/reflow/navigation
-            var no_move_ignored = 0;
-            var queued_revoked = 0;
-            var async_paste_revoked = 0;
-            var hidden_declined = 0;
-            var credit_arms = 0;        // high-water before one observed boundary
-            var pending_credits = 0;
-            var spent_credits = 0;
-            var observed_credit_boundary = 0;
-            var recent_typing_activity = 0;
-            var next_generation_credit = 0;
-            var cold_two_cell_admitted = 0;
-            var credit_superseded = 0;
-            var credit_expired = 0;
+            const ArmCap = 2;
+            const CoalesceCells = 2;
+            const MoveCap = 2;
 
-            action UnwitnessedMove when (
-                gesture_hint == 0 && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                witnessed = 0;
-                admitted = if Buggy == 1 { 1 } else { 0 };
-            }
-            action AdmitCandidate when (
-                candidate_admitted == 0 && queued_revoked == 0
-                    && async_paste_revoked == 0 && hidden_declined == 0
-            ) {
-                candidate_admitted = 1;
-            }
-            action WitnessedMove when (
-                candidate_admitted == 1 && queued_revoked == 0
-                    && async_paste_revoked == 0 && hidden_declined == 0
-            ) {
-                witnessed = 1;
-                admitted = 1;
-                candidate_admitted = 0;
-                gesture_hint = 0;
-            }
-            action ArmTyped when (
-                queued_revoked == 0 && async_paste_revoked == 0 && hidden_declined == 0
-            ) {
-                typed_class = 1;
-                strong_class = 0;
-                gesture_hint = 0;
-            }
-            action ArmStrong when (
-                queued_revoked == 0 && async_paste_revoked == 0 && hidden_declined == 0
-            ) {
-                strong_class = 1;
-                typed_class = 0;
-                gesture_hint = 0;
-            }
-            action IgnoreNoMoveInput when (
-                gesture_hint == 0 && gesture_arms == 0 && no_move_ignored == 0
-                    && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                no_move_ignored = 1;
-                gesture_hint = if Buggy == 1 { 1 } else { 0 };
-                gesture_arms = if Buggy == 1 { 1 } else { 0 };
-            }
-            action ArmGesture when (
-                gesture_hint == 0 && gesture_arms == 0 && no_move_ignored == 0
-                    && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                gesture_hint = 1;
-                gesture_arms = 1;
-                typed_class = if Buggy == 1 { typed_class } else { 0 };
-                strong_class = if Buggy == 1 { strong_class } else { 0 };
-            }
-            action AgeGesture when (
-                gesture_hint == 1 && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                gesture_hint = 2;
-            }
-            action GestureMove when (
-                gesture_hint == 1 && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                witnessed = 0;
-                admitted = if Buggy == 1 { 1 } else { 0 };
-                gesture_hint = if Buggy == 1 { 1 } else { 0 };
-                gesture_admissions = gesture_admissions + 1;
-            }
-            action StaleGestureMove when (
-                gesture_hint == 2 && queued_revoked == 0 && async_paste_revoked == 0
-                    && hidden_declined == 0
-            ) {
-                witnessed = 0;
-                admitted = if Buggy == 1 { 1 } else { 0 };
-                gesture_hint = 0;
-                gesture_admissions = if Buggy == 1 {
-                    gesture_admissions + 1
-                } else {
-                    gesture_admissions
-                };
-            }
-            action RevokeQueued when (
-                queued_revoked == 0 && async_paste_revoked == 0 && hidden_declined == 0
-                    && (gesture_hint > 0 || typed_class > 0 || strong_class > 0)
-            ) {
-                gesture_hint = if Buggy == 1 { gesture_hint } else { 0 };
-                typed_class = if Buggy == 1 { typed_class } else { 0 };
-                strong_class = if Buggy == 1 { strong_class } else { 0 };
-                pending_credits = if Buggy == 1 { pending_credits } else { 0 };
-                spent_credits = if pending_credits > 0 {
-                    if Buggy == 1 { spent_credits } else { credit_arms }
-                } else {
-                    spent_credits
-                };
-                observed_credit_boundary = if pending_credits > 0 {
-                    1
-                } else {
-                    observed_credit_boundary
-                };
-                witnessed = 0;
-                admitted = 0;
-                queued_revoked = 1;
-            }
-            action RevokeAsyncPaste when (
-                async_paste_revoked == 0 && queued_revoked == 0 && hidden_declined == 0
-                    && (gesture_hint > 0 || typed_class > 0 || strong_class > 0)
-            ) {
-                gesture_hint = if Buggy == 1 { gesture_hint } else { 0 };
-                typed_class = if Buggy == 1 { typed_class } else { 0 };
-                strong_class = if Buggy == 1 { strong_class } else { 0 };
-                witnessed = 0;
-                admitted = 0;
-                async_paste_revoked = 1;
-            }
-            action DeclineHidden when (
-                hidden_declined == 0 && queued_revoked == 0 && async_paste_revoked == 0
-                    && (gesture_hint > 0 || typed_class > 0 || strong_class > 0)
-            ) {
-                gesture_hint = if Buggy == 1 { gesture_hint } else { 0 };
-                typed_class = if Buggy == 1 { typed_class } else { 0 };
-                strong_class = if Buggy == 1 { strong_class } else { 0 };
-                witnessed = 0;
-                admitted = 0;
-                hidden_declined = 1;
-            }
-            action ArmTypedCredit when (
-                credit_arms <= CreditCap - 1 && observed_credit_boundary == 0
-                    && queued_revoked == 0 && async_paste_revoked == 0
-            ) {
-                credit_arms = credit_arms + 1;
-                pending_credits = pending_credits + 1;
-                recent_typing_activity = 1;
-            }
-            action ObserveTypedEcho when (
-                pending_credits > 0 && observed_credit_boundary == 0
-            ) {
-                pending_credits = if Buggy == 1 {
-                    pending_credits
-                } else {
-                    0
-                };
-                spent_credits = credit_arms;
-                observed_credit_boundary = 1;
-                recent_typing_activity = if Buggy == 1 { 0 } else { 1 };
-            }
-            action SupersedeTypedCohort when (
-                pending_credits > 0 && observed_credit_boundary == 0
-                    && credit_superseded == 0
-            ) {
-                pending_credits = if Buggy == 1 { pending_credits } else { 0 };
-                spent_credits = credit_arms;
-                observed_credit_boundary = 1;
-                credit_superseded = 1;
-                typed_class = 0;
-            }
-            action ExpireTypedCohort when (
-                pending_credits > 0 && observed_credit_boundary == 0
-                    && credit_expired == 0
-            ) {
-                pending_credits = if Buggy == 1 { pending_credits } else { 0 };
-                spent_credits = credit_arms;
-                observed_credit_boundary = 1;
-                credit_expired = 1;
-                typed_class = 0;
-            }
-            action ArmNextTypedCredit when (
-                observed_credit_boundary == 1 && next_generation_credit == 0
-                    && cold_two_cell_admitted == 0
-            ) {
-                next_generation_credit = 1;
-                recent_typing_activity = 1;
-            }
-            action ColdTwoCellMove when (
-                observed_credit_boundary == 1 && next_generation_credit == 1
-                    && cold_two_cell_admitted == 0
-            ) {
-                cold_two_cell_admitted = if pending_credits + next_generation_credit > 1 {
-                    1
-                } else {
-                    0
-                };
-                next_generation_credit = 0;
-            }
-
-            invariant WitnessRequired:
-                if witnessed == 0 { admitted == 0 } else { admitted == 1 };
-            invariant CandidateRequired:
-                if admitted == 1 { witnessed == 1 } else { admitted == 0 };
-            invariant CandidateFlagBounded: candidate_admitted <= 1;
-            invariant GestureAtMostOnce:
-                gesture_admissions <= gesture_arms && gesture_admissions <= 1;
-            invariant GestureHintBounded: gesture_hint <= 2;
-            invariant GestureArmsBounded: gesture_arms <= 1;
-            invariant NoMoveInputNeverArms:
-                if no_move_ignored == 1 {
-                    gesture_hint == 0 && gesture_arms == 0
-                } else {
-                    no_move_ignored == 0
-                };
-            invariant GestureClassUnambiguous:
-                if gesture_hint > 0 {
-                    typed_class == 0 && strong_class == 0
-                } else {
-                    typed_class <= 1 && strong_class <= 1
-                };
-            invariant QueuedDispatchRevokes:
-                if queued_revoked == 1 {
-                    gesture_hint == 0 && typed_class == 0
-                        && strong_class == 0 && admitted == 0
-                } else {
-                    queued_revoked == 0
-                };
-            invariant QueuedDispatchRetiresTypedCreditCohort:
-                if queued_revoked == 1 && credit_arms > 0 {
-                    pending_credits == 0 && spent_credits == credit_arms
-                        && observed_credit_boundary == 1
-                } else {
-                    queued_revoked <= 1
-                };
-            invariant AsyncPasteDispatchRevokes:
-                if async_paste_revoked == 1 {
-                    gesture_hint == 0 && typed_class == 0
-                        && strong_class == 0 && admitted == 0
-                } else {
-                    async_paste_revoked == 0
-                };
-            invariant DeclinedHiddenConsumes:
-                if hidden_declined == 1 {
-                    gesture_hint == 0 && typed_class == 0
-                        && strong_class == 0 && admitted == 0
-                } else {
-                    hidden_declined == 0
-                };
-            invariant TypedCreditConservation:
-                pending_credits + spent_credits == credit_arms;
-            invariant TypedCreditBounds:
-                credit_arms <= CreditCap && pending_credits <= CreditCap
-                    && spent_credits <= CreditCap
-                    && observed_credit_boundary <= 1;
-            invariant ObservedTypedBoundaryClearsCreditHighWater:
-                if observed_credit_boundary == 1 {
-                    pending_credits == 0 && spent_credits == credit_arms
-                } else {
-                    observed_credit_boundary == 0
-                };
-            invariant SpendingAdmissionKeepsRecentTypingActivity:
-                if spent_credits > 0 {
-                    recent_typing_activity == 1
-                } else {
-                    recent_typing_activity <= 1
-                };
-            invariant PostBoundaryCreditCannotPoolWithHistory:
-                cold_two_cell_admitted == 0;
-            invariant NextGenerationCreditBounded:
-                next_generation_credit <= 1;
-            invariant SupersessionRetiresTypedCreditCohort:
-                if credit_superseded == 1 {
-                    pending_credits == 0 && spent_credits == credit_arms
-                } else {
-                    credit_superseded == 0
-                };
-            invariant ExpiryRetiresTypedCreditCohort:
-                if credit_expired == 1 {
-                    pending_credits == 0 && spent_credits == credit_arms
-                } else {
-                    credit_expired == 0
-                };
-        }
-    }
-}
-
-/// One-shot causal-evidence gate shared by every cursor-light style and the
-/// classic comet. A user-input timestamp is only a classifier hint: typed and
-/// Backspace movement becomes drawable after an input-time baseline and an
-/// exact owned-cell diff prove the predicted source and target. Synthetic
-/// previews carry an explicit trusted candidate; unsupported input, a second
-/// unobserved event, scroll, hidden/same-cell completion, expiry, or any source /
-/// target mismatch consumes the candidate dark.
-/// Resident light is independently charged/projected: a coherent next frame
-/// retains it, as does a final process-sequence drift whose complete projection
-/// key (terminal/screen/caret/visibility/style) is stable. A final projection-
-/// key divergence suppresses it, and an unowned parser generation retires it —
-/// even at an unmoved cursor — UNLESS the batch is
-/// proven steady at the anchor (same terminal/screen identity, cursor anchor
-/// unmoved, probed anchor row content-identical), in which case the light
-/// survives while the candidate cohort still revokes fail-closed
-/// (`UnownedSteadyBatch`). Outside the explicitly rebased deferred-restore
-/// path below, an exact authored generation retires every prior resident pool
-/// before its admitted move forges fresh geometry; its row proof cannot
-/// certify older light elsewhere.
-///
-/// A multi-batch alt-screen key is the narrow third verdict
-/// (`AuthoredMotionBatch`): exact typed evidence is unavailable, so it cannot
-/// admit or birth typed light, but the submitted-key boundary may downgrade
-/// to the independently shape-gated MOTION path. Already-resident wake that a
-/// row probe attests byte-steady survives; the historical blackout mutant
-/// clears that wake even though the batch did not rewrite it.
-///
-/// One sole-next alt-screen generation may also be held while a transient
-/// save/status cursor leaves the candidate's material row unprobeable
-/// (`DeferredProbeHold`). The hold preserves already-resident geometry but is
-/// neither admission nor birth. The same generation's restored exact probe
-/// (`DeferredProbeRestore`) rebases the wake witness to the input-time row and
-/// retains only resident wake attested by that baseline/current proof before
-/// the ordinary observation can admit and forge fresh geometry. A byte-steady
-/// restored row instead consumes the typed proof dark as authored MOTION
-/// (`DeferredProbeMotion`), retaining only the same attested wake; a separate
-/// jump-shape observation may buy new light, while a small/invalid relocation
-/// cannot. A later generation or any invalid restore retires both candidate
-/// and resident; no second hold exists.
-///
-/// `Buggy=1` combines the historical timestamp-alone admission and fail-open
-/// final-extraction mutants. `EvidenceRequired` catches the first directly
-/// (`ArmTyped` -> `ObserveMove`); the projection/scroll invariants catch stale
-/// row-bound light retained across either kind of LOCK A/B coordinate drift.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn cursor_move_candidate_model() -> Model {
-    crate::ty_model! {
-        CursorMoveCandidate {
-            const Buggy = 0;
-            var phase = 0;          // 0 idle, 1 captured, 2 armed, 3 confirmed, 4 consumed
-            var kind = 0;           // 0 none, 1 typed, 2 Backspace, 3 synthetic
-            var fresh = 0;
-            var delivery_stable = 0;
-            var next_generation = 0;
-            var evidence_exact = 0;
-            var origin_match = 0;
-            var target_match = 0;
-            var admitted = 0;
-            var birth = 0;
-            var observations = 0;
-            var unsupported = 0;
-            var final_checked = 0;
-            var final_generation_match = 0;
-            var final_projection_key_match = 0;
-            var final_scroll_state_match = 0;
-            var projection = 0;
-            var resident_charged = 0;
-            var resident_projection = 0;
-            var resident_wake_attested = 0;
-            var unowned_rewrite = 0;
-            var candidate_rewrite = 0;
-            var authored_motion = 0;
-            var authored_motion_had_resident = 0;
-            var authored_motion_retained = 0;
-            var motion_shape = 0; // 0 unobserved, 1 admitted jump, 2 small/invalid
-            var deferred_probe = 0; // 0 none, 1 held, 2 exact, 3 retired, 4 motion
-            var deferred_had_resident = 0;
-            var deferred_hold_retained = 0;
-            var hidden_boundary = 0;
-            var style = 0;          // ten built-ins/custom selectors, 0..9
-            var engine = 0;         // 0 Glow, 1 classic trail
-            var host = 0;           // 0 native, 1 embedded pipeline
-            var birth_style = 0;
-            var birth_engine = 0;
-            var birth_host = 0;
-
-            action NextStyle when (phase == 0 && style <= 8) { style = style + 1; }
-            action NextEngine when (phase == 0 && engine == 0) { engine = 1; }
-            action NextHost when (phase == 0 && host == 0) { host = 1; }
-            action ChargeResident when (
-                phase == 0 && resident_charged == 0
-                    && unowned_rewrite == 0 && evidence_exact == 0
-            ) {
-                resident_charged = 1; resident_wake_attested = 0;
-            }
-            action AttestResidentWake when (
-                phase == 0 && resident_charged == 1
-                    && resident_wake_attested == 0
-            ) {
-                // The input-time row baseline covers the resident wake cells
-                // that an unchanged-generation restore may keep. This is a
-                // survival credential only, never an admission credential.
-                resident_wake_attested = 1;
-            }
-            action NextResidentFrame when (
-                final_checked == 1 && resident_charged == 1
-            ) {
-                final_checked = 0; final_generation_match = 0;
-                final_projection_key_match = 0;
-                final_scroll_state_match = 0;
-                projection = 0; resident_projection = 0;
-            }
-            action DeferredProbeHold when (
-                phase == 2 && kind == 1 && fresh == 1
-                    && delivery_stable == 1 && deferred_probe == 0
-                    && admitted == 0 && birth == 0
-            ) {
-                // The sole N+1 batch is visible, but its transient save/status
-                // cursor put the material row outside the coherent probe.
-                // Preserve both the candidate and current resident pool for
-                // one emitted frame; this state purchases no new light.
-                deferred_probe = 1;
-                deferred_had_resident = resident_charged;
-                deferred_hold_retained = if Buggy == 1 {
-                    if resident_charged == 1 { 0 } else { 1 }
-                } else { 1 };
-                admitted = 0; birth = 0; evidence_exact = 0;
-            }
-            action DeferredProbeRestore when (
-                phase == 2 && kind == 1 && deferred_probe == 1
-            ) {
-                // The cursor and material-row probe returned in the SAME N+1
-                // generation. Rebase the wake witness to the input snapshot,
-                // classify this as Exact despite the steady parser sequence,
-                // and retain only the baseline/current-attested resident
-                // subset. ObserveMove may then forge one fresh birth.
-                deferred_probe = 2; phase = 3;
-                next_generation = 1; evidence_exact = 1;
-                resident_charged = if Buggy == 1 {
-                    resident_charged
-                } else { resident_wake_attested };
-                resident_projection = 0;
-                final_checked = 0; final_generation_match = 0;
-                final_projection_key_match = 0;
-                final_scroll_state_match = 0; projection = 0;
-            }
-            action DeferredProbeMotion when (
-                phase == 2 && kind == 1 && deferred_probe == 1
-            ) {
-                // The held N+1 row restored byte-identical: the typed CONTENT
-                // claim is consumed, but the submitted-key boundary may offer
-                // a separate MOTION candidate. At this ownership step it is
-                // still dark. Keep only wake covered by the rebased input-row
-                // witness; ObserveAuthoredMotionJump/Small owns shape later.
-                deferred_probe = 4; phase = 4; motion_shape = 0;
-                authored_motion = 1;
-                motion_shape = 0;
-                authored_motion_had_resident = resident_charged;
-                authored_motion_retained = if Buggy == 1 {
-                    if resident_charged == 1 && resident_wake_attested == 0 {
-                        0
-                    } else { 1 }
-                } else { 1 };
-                candidate_rewrite = 1;
-                next_generation = 0; evidence_exact = 0;
-                admitted = 0; birth = 0; projection = 0;
-                resident_charged = if Buggy == 1 {
-                    resident_charged
-                } else { resident_wake_attested };
-                resident_projection = 0;
-                final_checked = 0; final_generation_match = 0;
-                final_projection_key_match = 0;
-                final_scroll_state_match = 0;
-            }
-            action DeferredProbeAdvance when (
-                phase == 2 && kind == 1 && deferred_probe == 1
-            ) {
-                // N+2 (or later) cannot borrow N+1's held candidate.
-                deferred_probe = 3; phase = 4;
-                admitted = 0; birth = 0; evidence_exact = 0; projection = 0;
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-            }
-            action DeferredProbeInvalid when (
-                phase == 2 && kind == 1 && deferred_probe == 1
-            ) {
-                // A second off-row hold, timeout, row mismatch, identity
-                // change, or invalid cursor restore is the same fail-closed
-                // terminal state: no candidate and no resident geometry.
-                deferred_probe = 3; phase = 4;
-                admitted = 0; birth = 0; evidence_exact = 0; projection = 0;
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-            }
-            action UnownedSteadyBatch when (
-                resident_charged == 1 || (phase > 0 && phase <= 3)
-            ) {
-                // An unowned batch PROVEN steady at the anchor: same
-                // terminal/screen identity, cursor anchor unmoved, probed
-                // anchor row content-identical under the implicit-blank lens.
-                // Resident light survives (the fence is proportionate); the
-                // hint/candidate cohort still revokes fail-closed exactly
-                // like the rewrite fence, so retention never admits or
-                // births anything.
-                candidate_rewrite = if phase > 0 && phase <= 3 { 1 } else { 0 };
-                phase = if phase > 0 && phase <= 3 { 4 } else { phase };
-                admitted = 0; birth = 0; projection = 0;
-                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
-                resident_charged = if deferred_probe == 1 {
-                    if Buggy == 1 { resident_charged } else { 0 }
-                } else { resident_charged };
-                resident_projection = if deferred_probe == 1 {
-                    if Buggy == 1 { resident_projection } else { 0 }
-                } else { resident_projection };
-                resident_wake_attested = if deferred_probe == 1 {
-                    if Buggy == 1 { resident_wake_attested } else { 0 }
-                } else { resident_wake_attested };
-            }
-            action UnownedContentRewrite when (
-                resident_charged == 1 || (phase > 0 && phase <= 3)
-            ) {
-                unowned_rewrite = 1;
-                candidate_rewrite = if phase > 0 && phase <= 3 { 1 } else { 0 };
-                phase = if Buggy == 1 {
-                    phase
-                } else {
-                    if phase > 0 && phase <= 3 { 4 } else { phase }
-                };
-                admitted = 0; birth = 0;
-                projection = if Buggy == 1 { projection } else { 0 };
-                resident_charged = if Buggy == 1 { 1 } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
-            }
-            action AuthoredMotionBatch when (
-                phase == 2 && kind == 1 && deferred_probe == 0
-            ) {
-                // The real key crossed a same-identity/same-alt-screen N+2
-                // redraw. Its CONTENT claim is consumed dark; only a separate
-                // jump-shaped Motion admission may later birth geometry. The
-                // already-attested resident wake survives this transition.
-                authored_motion = 1;
-                authored_motion_had_resident = resident_charged;
-                authored_motion_retained = if resident_charged == 1 {
-                    if Buggy == 1 { 0 } else { 1 }
-                } else { 1 };
-                candidate_rewrite = 1;
-                phase = 4; next_generation = 0; evidence_exact = 0;
-                admitted = 0; birth = 0; projection = 0;
-                resident_charged = if Buggy == 1 { 0 } else { resident_charged };
-                resident_projection = if Buggy == 1 { 0 } else { resident_projection };
-            }
-            action ObserveAuthoredMotionJump when (
-                phase == 4 && authored_motion == 1 && motion_shape == 0
-                    && observations == 0 && admitted == 0 && birth == 0
-                    && candidate_rewrite == 1 && unowned_rewrite == 0
-                    && hidden_boundary == 0 && final_checked == 0
-            ) {
-                // Admission belongs to the independently checked relocation
-                // shape, not to AuthoredMotion ownership itself.
-                motion_shape = 1; admitted = 1; birth = 1;
-                candidate_rewrite = 0;
-                birth_style = style; birth_engine = engine; birth_host = host;
-                observations = observations + 1;
-            }
-            action ObserveAuthoredMotionSmall when (
-                phase == 4 && authored_motion == 1 && motion_shape == 0
-                    && observations == 0 && admitted == 0 && birth == 0
-                    && candidate_rewrite == 1 && unowned_rewrite == 0
-                    && hidden_boundary == 0 && final_checked == 0
-            ) {
-                // A one-cell/small/invalid relocation consumes the candidate
-                // dark. The mutant restores the forbidden ownership-as-birth
-                // shortcut so the shape gate has a concrete counterexample.
-                motion_shape = 2;
-                admitted = if Buggy == 1 { 1 } else { 0 };
-                birth = if Buggy == 1 { 1 } else { 0 };
-                candidate_rewrite = 0;
-                birth_style = style; birth_engine = engine; birth_host = host;
-                observations = observations + 1;
-            }
-            action BeginResidentEpoch when (
-                unowned_rewrite == 1 && resident_charged == 0
-                    && resident_projection == 0
-            ) {
-                // The retirement marker describes the generation just
-                // crossed. Clear it explicitly before a later, independently
-                // admitted segment may become resident; never let
-                // ChargeResident silently overwrite a live retirement proof.
-                unowned_rewrite = 0; candidate_rewrite = 0;
-            }
-
-            action BeginCandidateEpoch when (
-                phase == 4 && admitted == 0 && birth == 0 && projection == 0
-                    && resident_projection == 0
-            ) {
-                phase = 0; kind = 0; fresh = 0; delivery_stable = 0;
-                next_generation = 0; evidence_exact = 0;
-                origin_match = 0; target_match = 0; observations = 0;
-                unsupported = 0; final_checked = 0;
-                final_generation_match = 0; final_projection_key_match = 0;
-                final_scroll_state_match = 0;
-                unowned_rewrite = 0;
-                candidate_rewrite = 0; hidden_boundary = 0; birth_style = 0;
-                authored_motion = 0; authored_motion_had_resident = 0;
-                authored_motion_retained = 0;
-                motion_shape = 0;
-                deferred_probe = 0; deferred_had_resident = 0;
-                deferred_hold_retained = 0; resident_wake_attested = 0;
-                birth_engine = 0; birth_host = 0;
-            }
-            action ArmTyped when (
-                phase == 0 && unowned_rewrite == 0 && hidden_boundary == 0
-            ) {
-                phase = 1; kind = 1; fresh = 1;
-                origin_match = 1; target_match = 1;
-            }
-            action ArmBackspace when (
-                phase == 0 && unowned_rewrite == 0 && hidden_boundary == 0
-            ) {
-                phase = 1; kind = 2; fresh = 1;
-                origin_match = 1; target_match = 1;
-            }
-            action ArmSynthetic when (
-                phase == 0 && unowned_rewrite == 0 && hidden_boundary == 0
-            ) {
-                phase = 2; kind = 3; fresh = 1; delivery_stable = 1;
-                origin_match = 1; target_match = 1;
-            }
-            action DeliverStable when (phase == 1) {
-                phase = 2; delivery_stable = 1;
-            }
-            action DeliverRaced when (phase == 1) {
-                phase = if Buggy == 1 { 2 } else { 4 };
-                delivery_stable = 0;
-            }
-            action DeliverQueued when (phase == 1) {
-                phase = 4; delivery_stable = 0;
-            }
-            action ConfirmTypedNext when (
-                phase == 2 && kind == 1 && deferred_probe == 0
-            ) {
-                phase = 3; next_generation = 1; evidence_exact = 1;
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-            }
-            action ConfirmBackspaceNext when (
-                phase == 2 && kind == 2 && deferred_probe == 0
-            ) {
-                phase = 3; next_generation = 1; evidence_exact = 1;
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-            }
-            action NextGenerationMismatch when (
-                phase == 2 && kind <= 2 && deferred_probe == 0
-            ) {
-                phase = 4; next_generation = 1;
-            }
-            action SkippedGeneration when (
-                phase == 2 && kind <= 2 && deferred_probe == 0
-            ) {
-                phase = 4; next_generation = 0;
-            }
-            action OriginMismatch when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; origin_match = 0;
-            }
-            action TargetMismatch when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; target_match = 0;
-            }
-            action Age when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; fresh = 0;
-            }
-            action ObserveMove when (
-                (phase == 2 || phase == 3)
-                    && (deferred_probe == 0 || deferred_probe == 2)
-            ) {
-                admitted = if kind == 3 {
-                    if fresh == 1 && origin_match == 1 { 1 } else { 0 }
-                } else {
-                    if Buggy == 1 {
-                        if fresh == 1 && origin_match == 1 && target_match == 1
-                        { 1 } else { 0 }
-                    } else {
-                        if phase == 3 && fresh == 1 && delivery_stable == 1
-                            && next_generation == 1 && evidence_exact == 1
-                            && origin_match == 1 && target_match == 1
-                        { 1 } else { 0 }
-                    }
-                };
-                birth = if kind == 3 {
-                    if fresh == 1 && origin_match == 1 { 1 } else { 0 }
-                } else {
-                    if Buggy == 1 {
-                        if fresh == 1 && origin_match == 1 && target_match == 1
-                        { 1 } else { 0 }
-                    } else {
-                        if phase == 3 && fresh == 1 && delivery_stable == 1
-                            && next_generation == 1 && evidence_exact == 1
-                            && origin_match == 1 && target_match == 1
-                        { 1 } else { 0 }
-                    }
-                };
-                birth_style = if Buggy == 1 { 0 } else { style };
-                birth_engine = if Buggy == 1 { 0 } else { engine };
-                birth_host = if Buggy == 1 { 0 } else { host };
-                phase = 4; observations = observations + 1;
-            }
-            action ReobserveConsumed when (phase == 4 && observations == 1) {
-                observations = if Buggy == 1 { 2 } else { 1 };
-            }
-            action ForgeUnadmittedBirth when (
-                phase == 4 && admitted == 0 && birth == 0
-            ) {
-                birth = if Buggy == 1 { 1 } else { 0 };
-            }
-            action FinalExtractSame when (
-                ((phase == 4 && admitted == 1) || resident_charged == 1)
-                    && final_checked == 0
-            ) {
-                final_checked = 1; final_generation_match = 1;
-                final_projection_key_match = 1;
-                final_scroll_state_match = 1;
-                projection = admitted; resident_projection = resident_charged;
-            }
-            action FinalExtractGenerationDrift when (
-                ((phase == 4 && admitted == 1) || resident_charged == 1)
-                    && final_checked == 0
-            ) {
-                final_checked = 1; final_generation_match = 0;
-                final_projection_key_match = 1;
-                final_scroll_state_match = 1;
-                // A sequence-only drift changed terminal content, not the
-                // terminal/screen/caret/visibility/style key that places
-                // cursor-owned light. Retain this frame's earned projection;
-                // the next coherent engine observation still owns content-
-                // rewrite retirement.
-                projection = admitted; resident_projection = resident_charged;
-            }
-            action FinalExtractProjectionKeyDrift when (
-                ((phase == 4 && admitted == 1) || resident_charged == 1)
-                    && final_checked == 0
-            ) {
-                final_checked = 1; final_generation_match = 0;
-                final_projection_key_match = 0;
-                final_scroll_state_match = 1;
-                projection = if Buggy == 1 { admitted } else { 0 };
-                resident_projection = if Buggy == 1 { resident_charged } else { 0 };
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                admitted = if Buggy == 1 { admitted } else { 0 };
-                birth = if Buggy == 1 { birth } else { 0 };
-                evidence_exact = if Buggy == 1 { evidence_exact } else { 0 };
-                phase = if Buggy == 1 { phase } else { 4 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
-            }
-            action FinalExtractScrollDrift when (
-                ((phase == 4 && admitted == 1) || resident_charged == 1)
-                    && final_checked == 0
-            ) {
-                final_checked = 1; final_generation_match = 0;
-                final_projection_key_match = 1;
-                final_scroll_state_match = 0;
-                // A LOCK A/B scroll changes every row-bound coordinate even
-                // when the terminal restores the caret to the same cell. The
-                // host has not translated this scratch, so it must suppress
-                // and retire rather than retain the sequence-only projection.
-                projection = if Buggy == 1 { admitted } else { 0 };
-                resident_projection = if Buggy == 1 { resident_charged } else { 0 };
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                admitted = if Buggy == 1 { admitted } else { 0 };
-                birth = if Buggy == 1 { birth } else { 0 };
-                evidence_exact = if Buggy == 1 { evidence_exact } else { 0 };
-                phase = if Buggy == 1 { phase } else { 4 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
-            }
-            action PromoteProjectedBirth when (
-                phase == 4 && birth == 1 && projection == 1
-                    && final_checked == 1 && final_projection_key_match == 1
-                    && final_scroll_state_match == 1
-                    && (resident_charged == 0
-                        || ((deferred_probe == 2 || deferred_probe == 4)
-                            && resident_wake_attested == 1))
-            ) {
-                // The freshly projected candidate geometry becomes the
-                // resident light a later terminal generation must fence. Its
-                // consumed evidence is no longer a licence for any new birth.
-                resident_charged = 1; resident_projection = 1;
-                resident_wake_attested = 0;
-                admitted = 0; projection = 0; evidence_exact = 0; birth = 0;
-            }
-            action CompleteNoMove when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; admitted = 0; birth = 0;
-            }
-            action Supersede when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; admitted = 0; birth = 0;
-            }
-            action UnsupportedInput when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; admitted = 0; birth = 0; unsupported = 1;
-            }
-            action ScrollBoundary when (
-                phase > 0 && phase <= 3 && deferred_probe == 0
-            ) {
-                phase = 4; admitted = 0; birth = 0;
-            }
-            action HiddenBoundary when (
-                (phase > 0 && phase <= 3) || resident_charged == 1
-                    || resident_projection == 1
-            ) {
-                hidden_boundary = 1;
-                phase = if Buggy == 1 { phase } else { 4 };
-                admitted = 0; birth = 0;
-                projection = if Buggy == 1 { projection } else { 0 };
-                resident_charged = if Buggy == 1 { resident_charged } else { 0 };
-                resident_projection = if Buggy == 1 { resident_projection } else { 0 };
-                resident_wake_attested = if Buggy == 1 {
-                    resident_wake_attested
-                } else { 0 };
-                deferred_probe = if deferred_probe == 1 { 3 } else { deferred_probe };
-            }
-
-            invariant EvidenceRequired:
-                if admitted == 1 && kind <= 2 && authored_motion == 0 {
-                    evidence_exact == 1
-                } else { admitted <= 1 };
-            invariant StableDeliveryRequired:
-                if admitted == 1 && kind <= 2 { delivery_stable == 1 } else { admitted <= 1 };
-            invariant NextGenerationRequired:
-                if admitted == 1 && kind <= 2 && authored_motion == 0 {
-                    next_generation == 1
-                } else { admitted <= 1 };
-            invariant ExactEndpointRequired:
-                if admitted == 1 {
-                    origin_match == 1 && (kind == 3 || target_match == 1)
-                } else { admitted == 0 };
-            invariant FreshRequired:
-                if admitted == 1 { fresh == 1 } else { admitted == 0 };
-            invariant BirthRequiresAdmission: birth <= admitted;
-            invariant ProjectionRequiresFinalProjectionKey:
-                if projection == 1 {
-                    admitted == 1 && final_checked == 1
-                        && final_projection_key_match == 1
-                        && final_scroll_state_match == 1
-                } else { projection == 0 };
-            invariant ResidentProjectionRequiresFinalProjectionKey:
-                if resident_projection == 1 {
-                    resident_charged == 1 && final_checked == 1
-                        && final_projection_key_match == 1
-                        && final_scroll_state_match == 1
-                } else { resident_projection == 0 };
-            invariant MatchingGenerationImpliesMatchingProjectionKey:
-                final_generation_match <= final_projection_key_match
-                    && final_generation_match <= final_scroll_state_match;
-            invariant DivergedProjectionKeyRetiresResident:
-                if final_checked == 1 && final_projection_key_match == 0 {
-                    projection == 0 && resident_charged == 0
-                        && resident_projection == 0
-                } else { final_checked <= 1 };
-            invariant ScrollDriftRetiresResident:
-                if final_checked == 1 && final_scroll_state_match == 0 {
-                    projection == 0 && resident_charged == 0
-                        && resident_projection == 0
-                } else { final_checked <= 1 };
-            invariant UnownedContentRewriteRetiresResident:
-                if unowned_rewrite == 1 {
-                    resident_charged == 0 && resident_projection == 0
-                } else { unowned_rewrite == 0 };
-            invariant UnownedContentRewriteConsumesCandidate:
-                if candidate_rewrite == 1 {
-                    phase == 4 && admitted == 0 && birth == 0
-                } else { candidate_rewrite == 0 };
-            invariant AuthoredMotionRetainsAttestedResident:
-                if authored_motion == 1 {
-                    authored_motion_retained == 1
-                } else { authored_motion == 0 };
-            invariant AuthoredMotionConsumesTypedProofDark:
-                if authored_motion == 1 && motion_shape == 0 {
-                    phase == 4 && kind == 1 && evidence_exact == 0
-                        && admitted == 0 && birth == 0
-                } else { authored_motion <= 1 };
-            invariant AuthoredMotionBirthRequiresJumpShape:
-                if authored_motion == 1 && birth == 1 {
-                    motion_shape == 1
-                } else { birth <= 1 };
-            invariant DeferredProbeHoldPreservesResidentWithoutBirth:
-                if deferred_probe == 1 {
-                    phase == 2 && kind == 1 && admitted == 0 && birth == 0
-                        && evidence_exact == 0 && deferred_hold_retained == 1
-                        && resident_charged == deferred_had_resident
-                } else { deferred_probe <= 4 };
-            invariant DeferredProbeRestoreKeepsOnlyAttestedWake:
-                if deferred_probe == 2 && evidence_exact == 1 {
-                    next_generation == 1
-                        && resident_charged == resident_wake_attested
-                        && resident_projection <= resident_wake_attested
-                } else { deferred_probe <= 4 };
-            invariant DeferredProbeMotionKeepsOnlyAttestedWakeDark:
-                if deferred_probe == 4 && motion_shape == 0 {
-                    phase == 4 && authored_motion == 1
-                        && evidence_exact == 0 && admitted == 0 && birth == 0
-                        && resident_charged == resident_wake_attested
-                        && resident_projection <= resident_wake_attested
-                } else { deferred_probe <= 4 };
-            invariant DeferredProbeFailureRetiresCandidateAndResident:
-                if deferred_probe == 3 {
-                    phase == 4 && admitted == 0 && birth == 0
-                        && evidence_exact == 0 && projection == 0
-                        && resident_charged == 0 && resident_projection == 0
-                        && resident_wake_attested == 0
-                } else { deferred_probe <= 4 };
-            invariant HiddenBoundaryDrainsCandidateAndResident:
-                if hidden_boundary == 1 {
-                    phase == 4 && admitted == 0 && birth == 0
-                        && resident_charged == 0 && resident_projection == 0
-                } else { hidden_boundary == 0 };
-            invariant ExactContentChangeRetiresPriorResident:
-                if evidence_exact == 1 {
-                    if deferred_probe == 2 {
-                        resident_charged == resident_wake_attested
-                            && resident_projection <= resident_wake_attested
-                    } else {
-                        resident_charged == 0 && resident_projection == 0
-                    }
-                } else { evidence_exact == 0 };
-            invariant AttestedWakeRequiresResident:
-                resident_wake_attested <= resident_charged;
-            invariant UnsupportedStaysDark:
-                if unsupported == 1 { admitted == 0 && birth == 0 } else { unsupported == 0 };
-            invariant CandidateConsumedOnce: observations <= 1;
-            invariant UniversalSelectorsBounded: style <= 9 && engine <= 1 && host <= 1;
-            invariant BirthBoundToSelectedStyleEngineHost:
-                if birth == 1 {
-                    birth_style == style && birth_engine == engine && birth_host == host
-                } else { birth == 0 };
-            invariant UniversalBirthNeedsCandidateEvidence:
-                if birth == 1 {
-                    kind == 3 || (delivery_stable == 1 && next_generation == 1
-                        && evidence_exact == 1 && origin_match == 1 && target_match == 1)
-                        || (authored_motion == 1 && motion_shape == 1)
-                } else { birth == 0 };
-            invariant CandidateBounds:
-                phase <= 4 && kind <= 3 && fresh <= 1 && delivery_stable <= 1
-                    && next_generation <= 1 && evidence_exact <= 1
-                    && origin_match <= 1 && target_match <= 1
-                    && final_checked <= 1 && final_generation_match <= 1
-                    && final_projection_key_match <= 1
-                    && final_scroll_state_match <= 1
-                    && candidate_rewrite <= 1
-                    && authored_motion <= 1 && authored_motion_had_resident <= 1
-                    && authored_motion_retained <= 1
-                    && motion_shape <= 2
-                    && deferred_probe <= 4 && deferred_had_resident <= 1
-                    && deferred_hold_retained <= 1
-                    && projection <= 1 && resident_charged <= 1
-                    && resident_projection <= 1 && resident_wake_attested <= 1
-                    && unowned_rewrite <= 1
-                    && hidden_boundary <= 1 && birth_style <= 9
-                    && birth_engine <= 1 && birth_host <= 1;
-        }
-    }
-}
-
-/// CURSOR ECHO COMMIT-RETRY protocol at the split terminal-lock boundary.
-///
-/// LOCK A may inspect the candidate's baseline generation before the terminal
-/// has published its echo. That same-generation observation is an AWAIT, not a
-/// refutation: it preserves both the pending candidate and already-resident
-/// cursor light, and neither admits nor births anything. If LOCK B then sees
-/// the sole next generation with the exact target/projection, it suppresses
-/// only the current LOCK-A projection and creates one retry credential while
-/// retaining any resident engine state. The following coherent LOCK-A pass
-/// consumes that credential exactly once, restores a coherent projection, and
-/// performs the confirmation/admission/birth. Both a cold engine and an
-/// already-streaming resident are modeled.
-///
-/// Four negative commit classes are explicit environment observations rather
-/// than implementation guesses: an intervening unowned generation, a wrong
-/// target, content-scroll divergence, or cursor-style divergence. Each retires
-/// the candidate and resident and cannot manufacture a retry or birth. After
-/// an exact straddle, a mismatching/advanced next observation retires the
-/// credential via `NextEchoRetire`; a lifecycle boundary cancels it via
-/// `LifecycleCancel`. Consumption, retirement, and cancellation are mutually
-/// exclusive, exhaustive terminal dispositions of that one credential.
-///
-/// `Buggy=1` is the observed blackout: the same-generation LOCK-A await drops
-/// the candidate and resident before LOCK B can witness the exact echo.
-/// `AwaitHoldsCandidateAndResident` supplies the concrete counterexample. The
-/// healthy model also states retry conservation
-/// (`pending + consumed + retired + cancelled == 1`) so the credential cannot
-/// stick or replay after any terminal disposition.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn cursor_echo_commit_retry_model() -> Model {
-    crate::ty_model! {
-        CursorEchoCommitRetry {
-            const Buggy = 0;
-            var phase = 0;              // 0 idle, 1 armed, 2 await, 3 retry, 4 terminal
-            var candidate_pending = 0;
-            var resident_present = 1;   // engine-owned streaming trail survives suppression
-            var current_projection = 1;
-            var resident_at_arm = 0;
-            var await_observed = 0;
-            var commit_kind = 0;        // 1 exact; 2 unowned; 3 target; 4 scroll; 5 style
-            var retry_pending = 0;
-            var retry_consumes = 0;
-            var retry_retirements = 0;
-            var retry_cancellations = 0;
-            var confirmations = 0;
+            // The class-blind licence term: 0 absent, 1 fresh, 2 present but
+            // stale. One slot, exactly like every `*_hint: Option<Instant>`.
+            var hint = 0;
+            // A live `reflow_hint`/`blink_hint`: morphology, never a licence.
+            var morphology = 0;
+            // The live arm's key was swallowed at the host boundary.
+            var swallowed = 0;
+            // Presses that armed a licence, and the four dispositions an arm can
+            // reach. `EveryArmReachesExactlyOneDisposition` is the conservation.
+            var arms = 0;
+            var consumed = 0;
+            var expired = 0;
+            var cleared = 0;
+            var superseded = 0;
+            // Moves that passed the licence seam (one per consumed arm).
             var admissions = 0;
+            // The press CREDIT budget (`RainbowState::type_press_ring`).
+            var credit_arms = 0;
+            var spent = 0;
+            var coalesce_births = 0;
+            // Light: minted this run, and earned light already on glass.
             var births = 0;
+            var resident = 0;
+            // The slimmed admission ring (`ctl trail`).
+            var spawns = 0;
+            var licensed_tally = 0;
+            var declined_tally = 0;
+            // Witnesses. Every one of these is a shape the proof era or a bare
+            // v0.43.0 revert really produces; all are 0 at the committed config.
+            var cold_admitted = 0;
+            var stale_admitted = 0;
+            var morphology_admitted = 0;
+            var swallow_admitted = 0;
+            var wiped = 0;
+            var credit_refunded = 0;
 
-            action SelectColdResident when (phase == 0 && resident_present == 1) {
-                resident_present = 0;
-                current_projection = 0;
+            // A press arms the licence and banks one cell credit. The stamp is
+            // ONE SLOT: a press over a live stamp supersedes it (the older arm
+            // is disposed of, its credit survives in the ring), which is why the
+            // conservation has four dispositions and not two.
+            action PressArmsLicense when (arms <= ArmCap - 1) {
+                superseded = if hint == 1 { superseded + 1 } else { superseded };
+                hint = 1;
+                arms = arms + 1;
+                credit_arms = credit_arms + 1;
+                swallowed = 0;
             }
-            action ArmTypedCandidate when (phase == 0) {
-                phase = 1;
-                candidate_pending = 1;
-                resident_at_arm = resident_present;
+            // A resize settle or a TUI repaint blink. Live, and never a licence.
+            action MorphologyStampArrives when (morphology == 0) {
+                morphology = 1;
             }
-            action LockASameGenerationAwait when (
-                phase == 1 && candidate_pending == 1
-            ) {
-                phase = 2;
-                await_observed = 1;
-                candidate_pending = if Buggy == 1 { 0 } else { 1 };
-                resident_present = if Buggy == 1 { 0 } else { resident_present };
-                current_projection = if Buggy == 1 { 0 } else { current_projection };
+            // The freshness window elapses: the stamp is still SET, and no
+            // longer fresh. That distinction is the whole point of the window.
+            action LicenseExpires when (hint == 1) {
+                hint = 2;
+                expired = expired + 1;
             }
-            action FinalExtractEchoStraddle when (
-                phase == 2 && candidate_pending == 1
-            ) {
-                phase = 3;
-                commit_kind = 1;
-                retry_pending = 1;
-                current_projection = 0;
-            }
-            action NextEchoSettle when (
-                phase == 3 && candidate_pending == 1
-                    && retry_pending == 1 && retry_consumes == 0
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                retry_pending = 0;
-                retry_consumes = 1;
-                resident_present = 1;
-                confirmations = 1;
-                admissions = 1;
-                births = 1;
-                current_projection = 1;
-            }
-            action NextEchoRetire when (
-                phase == 3 && candidate_pending == 1
-                    && retry_pending == 1 && retry_retirements == 0
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                retry_pending = 0;
-                retry_retirements = 1;
-            }
-            action LifecycleCancel when (
-                phase == 3 && candidate_pending == 1
-                    && retry_pending == 1 && retry_cancellations == 0
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                retry_pending = 0;
-                retry_cancellations = 1;
-            }
-            action LockBInterveningUnownedGeneration when (
-                phase == 2 && candidate_pending == 1
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                commit_kind = 2;
-            }
-            action LockBWrongTarget when (
-                phase == 2 && candidate_pending == 1
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                commit_kind = 3;
-            }
-            action LockBScrollDivergence when (
-                phase == 2 && candidate_pending == 1
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                commit_kind = 4;
-            }
-            action LockBStyleDivergence when (
-                phase == 2 && candidate_pending == 1
-            ) {
-                phase = 4;
-                candidate_pending = 0;
-                resident_present = 0;
-                current_projection = 0;
-                commit_kind = 5;
-            }
-
-            invariant AwaitHoldsCandidateAndResident:
-                if phase == 2 {
-                    await_observed == 1 && candidate_pending == 1
-                        && resident_present == resident_at_arm
-                        && current_projection == resident_at_arm
-                        && retry_pending == 0
-                        && retry_consumes == 0 && retry_retirements == 0
-                        && retry_cancellations == 0
-                        && confirmations == 0 && admissions == 0 && births == 0
-                } else { phase <= 4 };
-            invariant ExactCommitSchedulesOnlyOneRetry:
-                if phase == 3 {
-                    commit_kind == 1 && candidate_pending == 1
-                        && resident_present == resident_at_arm
-                        && current_projection == 0
-                        && retry_pending == 1
-                        && retry_consumes == 0 && retry_retirements == 0
-                        && retry_cancellations == 0 && confirmations == 0
-                        && admissions == 0 && births == 0
-                } else { phase <= 4 };
-            invariant RetryCredentialConserved:
-                if commit_kind == 1 {
-                    retry_pending + retry_consumes + retry_retirements
-                        + retry_cancellations == 1
+            // The classifier's `take_if` drops the stale stamp. `Buggy=1`
+            // refunds its cell to the press budget — the historical shape where
+            // a retired hint's cells funded a second stray multi-cell sweep.
+            action RetireStaleLicense when (hint == 2) {
+                hint = 0;
+                spent = if Buggy == 1 && spent > 0 { spent - 1 } else { spent };
+                credit_refunded = if Buggy == 1 && spent > 0 {
+                    1
                 } else {
-                    retry_pending == 0 && retry_consumes == 0
-                        && retry_retirements == 0 && retry_cancellations == 0
+                    credit_refunded
                 };
-            invariant ExactRetryConfirmsAndBirthsOnce:
-                if retry_consumes == 1 {
-                    phase == 4 && commit_kind == 1
-                        && candidate_pending == 0 && resident_present == 1
-                        && current_projection == 1 && retry_pending == 0
-                        && retry_retirements == 0 && retry_cancellations == 0
-                        && confirmations == 1 && admissions == 1 && births == 1
-                } else { retry_consumes == 0 };
-            invariant RetiredRetryStaysDark:
-                if retry_retirements == 1 {
-                    phase == 4 && commit_kind == 1
-                        && candidate_pending == 0 && resident_present == 0
-                        && current_projection == 0 && retry_pending == 0
-                        && retry_consumes == 0 && retry_cancellations == 0
-                        && confirmations == 0 && admissions == 0 && births == 0
-                } else { retry_retirements == 0 };
-            invariant CancelledRetryStaysDark:
-                if retry_cancellations == 1 {
-                    phase == 4 && commit_kind == 1
-                        && candidate_pending == 0 && resident_present == 0
-                        && current_projection == 0 && retry_pending == 0
-                        && retry_consumes == 0 && retry_retirements == 0
-                        && confirmations == 0 && admissions == 0 && births == 0
-                } else { retry_cancellations == 0 };
-            invariant InvalidCommitConsumesDark:
-                if commit_kind > 1 {
-                    phase == 4 && candidate_pending == 0 && resident_present == 0
-                        && current_projection == 0 && retry_pending == 0
-                        && retry_consumes == 0 && retry_retirements == 0
-                        && retry_cancellations == 0
-                        && confirmations == 0 && admissions == 0 && births == 0
-                } else { commit_kind <= 1 };
-            invariant RetryRequiresPendingCandidate:
-                retry_pending <= candidate_pending;
-            invariant ProjectionRequiresResident:
-                current_projection <= resident_present;
-            invariant BirthRequiresExactConsumedRetry:
-                births <= admissions && admissions <= confirmations
-                    && confirmations <= retry_consumes;
-            invariant CommitRetryBounds:
-                phase <= 4 && candidate_pending <= 1 && resident_present <= 1
-                    && current_projection <= 1 && resident_at_arm <= 1
-                    && await_observed <= 1 && commit_kind <= 5
-                    && retry_pending <= 1 && retry_consumes <= 1
-                    && retry_retirements <= 1 && retry_cancellations <= 1
-                    && confirmations <= 1 && admissions <= 1 && births <= 1;
+            }
+            // `clear_move_license`: a key this window swallowed is not an answer
+            // to the licence question, so its stamp must not outlive the
+            // boundary. `Buggy=1` lets it survive.
+            action SwallowedKeyClearsLicense when (hint == 1 && swallowed == 0) {
+                hint = if Buggy == 1 { 1 } else { 0 };
+                cleared = if Buggy == 1 { cleared } else { cleared + 1 };
+                swallowed = 1;
+            }
+            // The licensed typed echo: one hint, one echo. `Buggy=1` leaves the
+            // stamp live after consuming it, so one press funds every echo that
+            // follows — caught twice over, by the disposition conservation and
+            // by `admissions <= arms`.
+            action LicensedTypedMoveMintsLight when (
+                hint == 1 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                hint = if Buggy == 1 { 1 } else { 0 };
+                consumed = consumed + 1;
+                admissions = admissions + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
+                swallow_admitted = if swallowed == 1 { 1 } else { swallow_admitted };
+            }
+            // A batched multi-cell echo, backed by enough recent CELL credits to
+            // pay for every swept cell, SPENDS them: the same pool can never pay
+            // for a second stray sweep. `Buggy=1` paints the ribbon for free.
+            action AdmitCoalesceSpendsCredits when (
+                hint == 1 && coalesce_births == 0 && spawns <= MoveCap - 1
+                    && credit_arms - spent > CoalesceCells - 1
+            ) {
+                spawns = spawns + 1;
+                hint = 0;
+                consumed = consumed + 1;
+                admissions = admissions + 1;
+                spent = if Buggy == 1 { spent } else { spent + CoalesceCells };
+                coalesce_births = coalesce_births + 1;
+                births = births + 1;
+                resident = 1;
+                licensed_tally = licensed_tally + 1;
+                swallow_admitted = if swallowed == 1 { 1 } else { swallow_admitted };
+            }
+            // Licensed and classified, and the CREDIT budget alone refused it —
+            // vim's `w` is one press echoing as a multi-cell hop. It stays dark
+            // and pays nothing; the ring names `no-credits`. `Buggy=1` bills the
+            // budget it could not afford AND tells `ctl trail` it painted.
+            action StarvedCoalesceDeclines when (
+                hint == 1 && spawns <= MoveCap - 1
+                    && credit_arms - spent <= CoalesceCells - 1
+            ) {
+                spawns = spawns + 1;
+                hint = 0;
+                consumed = consumed + 1;
+                admissions = admissions + 1;
+                spent = if Buggy == 1 { spent + CoalesceCells } else { spent };
+                licensed_tally = if Buggy == 1 {
+                    licensed_tally + 1
+                } else {
+                    licensed_tally
+                };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
+            }
+            // THE COLD MOVE: program output nobody's fingers asked for. No
+            // stamp at all. `Buggy=1` is the pre-licence seam — v0.43.0's tick,
+            // which spawned on every presented cursor delta.
+            action ColdMoveDeclines when (hint == 0 && spawns <= MoveCap - 1) {
+                spawns = spawns + 1;
+                cold_admitted = if Buggy == 1 { 1 } else { cold_admitted };
+                births = if Buggy == 1 { births + 1 } else { births };
+                resident = if Buggy == 1 { 1 } else { resident };
+                licensed_tally = if Buggy == 1 {
+                    licensed_tally + 1
+                } else {
+                    licensed_tally
+                };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
+            }
+            // The same cold move, over light the user's own typing earned.
+            // `Buggy=1` is `clear_denied_move_visuals`: it refuses to mint AND
+            // wipes the ribbon, invisibly to the ring. That wipe is the darkness.
+            action ColdMoveOverEarnedLight when (
+                hint == 0 && resident == 1 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                resident = if Buggy == 1 { 0 } else { 1 };
+                wiped = if Buggy == 1 { 1 } else { wiped };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
+            }
+            // A move under a live reflow/blink stamp and nothing else. The
+            // stamp is consumed as morphology; it never licenses.
+            action MorphologyOnlyMoveDeclines when (
+                hint == 0 && morphology == 1 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                morphology = 0;
+                morphology_admitted = if Buggy == 1 {
+                    1
+                } else {
+                    morphology_admitted
+                };
+                births = if Buggy == 1 { births + 1 } else { births };
+                resident = if Buggy == 1 { 1 } else { resident };
+                licensed_tally = if Buggy == 1 {
+                    licensed_tally + 1
+                } else {
+                    licensed_tally
+                };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
+            }
+            // A move whose stamp is SET but stale. The window, not the field.
+            action StaleStampMoveDeclines when (
+                hint == 2 && spawns <= MoveCap - 1
+            ) {
+                spawns = spawns + 1;
+                stale_admitted = if Buggy == 1 { 1 } else { stale_admitted };
+                births = if Buggy == 1 { births + 1 } else { births };
+                resident = if Buggy == 1 { 1 } else { resident };
+                licensed_tally = if Buggy == 1 {
+                    licensed_tally + 1
+                } else {
+                    licensed_tally
+                };
+                declined_tally = if Buggy == 1 {
+                    declined_tally
+                } else {
+                    declined_tally + 1
+                };
+            }
+
+            invariant NoLightWithoutAFreshLicence: cold_admitted == 0;
+            invariant AStaleStampIsNotALicence: stale_admitted == 0;
+            invariant MorphologyStampsNeverLicence: morphology_admitted == 0;
+            invariant ASwallowedKeyNeverLicences: swallow_admitted == 0;
+            invariant DeclinedMovesNeverDestroyEarnedLight: wiped == 0;
+            invariant SpentCreditsNeverComeBack: credit_refunded == 0;
+            invariant EveryArmReachesExactlyOneDisposition:
+                arms == consumed + expired + cleared + superseded
+                    + (if hint == 1 { 1 } else { 0 });
+            invariant PairedAdmissionsNeverExceedArms: admissions <= arms;
+            invariant SpentCreditsNeverExceedArmed: spent <= credit_arms;
+            invariant ACoalesceRibbonIsPaidFor:
+                if coalesce_births == 1 {
+                    spent > CoalesceCells - 1
+                } else {
+                    coalesce_births == 0
+                };
+            invariant TheRingCannotClaimUnmintedLight: licensed_tally == births;
+            invariant TheRingScoresEverySpawnOnce:
+                licensed_tally + declined_tally == spawns;
+            invariant StateBounded:
+                hint <= 2 && morphology <= 1 && swallowed <= 1 && arms <= ArmCap
+                    && consumed <= ArmCap && expired <= ArmCap
+                    && cleared <= ArmCap && superseded <= ArmCap
+                    && admissions <= MoveCap && credit_arms <= ArmCap
+                    && spent <= ArmCap + CoalesceCells && coalesce_births <= 1
+                    && births <= MoveCap && resident <= 1 && spawns <= MoveCap
+                    && licensed_tally <= MoveCap && declined_tally <= MoveCap
+                    && cold_admitted <= 1 && stale_admitted <= 1
+                    && morphology_admitted <= 1 && swallow_admitted <= 1
+                    && wiped <= 1 && credit_refunded <= 1;
         }
     }
 }
 
-/// LIVENESS twin of the [`cursor_move_candidate_model`] confirmation seam —
-/// the rainbow-trail blackout's missing half. 201449c2 shipped the movement
-/// admission gate WITH a formal model that proved SAFETY (cold program output
-/// never paints trails) — and nobody stated that a real keystroke with a real
-/// echo ever ADMITS. The model's echo environment was idealized; real shells
-/// produce shapes it never contained, so a gate that provably never lied still
-/// provably never spoke. This model closes that class: an ENVIRONMENT
-/// ADVERSARY whose actions produce every audited echo shape, composed with the
-/// shipped confirmation decision (`CursorGlow::confirm_content_candidate`),
-/// under BOTH obligation families at once.
-///
-/// The adversary's shapes (`shape`), each an audited incident witness:
-///
-///   1 `KeyPlainEcho`         — the textbook echo: the typed glyph
-///       materializes at the caret in the single next processed generation.
-///   2 `KeyGhostSuggest` (E1) — zsh-autosuggestions POSTDISPLAY: the SAME
-///       echo batch also paints ghost text at/after the caret. The caret is
-///       the exactness frontier; post-caret cells are the shell's
-///       presentation zone and carry no veto.
-///   3 `KeySpaceOnBlanks` (E3) — a typed SPACE onto tail-filled implicit
-///       blanks: content-invisible under the implicit-blank lens; the
-///       materialization witness is STORAGE GROWTH of the stored row over the
-///       owned span.
-///   4 `KeyOvertypeSuggestion` (E4) — retyping under a VISIBLE suggestion:
-///       the typed glyph is already painted at the caret, so the echo is a
-///       NULL DIFF; the witness is the expected span already present plus the
-///       exact predicted landing under the one attributable generation.
-///   5 `KeySplitEcho` (E2) — the echo crosses TWO PTY read batches (baseline
-///       + 2, not + 1). REGISTERED STANDING GAP: the strict next-generation
-///       law retires it today (`StandingGapSplitEchoRetiresE2`). The gap's
-///       WIPE half is CLOSED fence-side (v0.55 dev): the revoked-target
-///       tombstone (`CursorGlow::take_fresh_revoked_target_tombstone`,
-///       `echo-after-stream`) judges the split echo's landing an
-///       UnownedRewrite so earned light survives — but it never CONFIRMS,
-///       so this model's confirm-seam retire is untouched and the invariant
-///       still binds: fixing the RETIRE itself stays a loud model edit.
-///   6 `KeyBurst` (E5) — several keys between rendered frames: the proof
-///       anchor is stale (the row probe predates the keystroke), and proof
-///       capture declines. REGISTERED STANDING GAP
-///       (`StandingGapBurstRetiresE5`).
-///   7 `ColdSpinner`          — cold program output, no keystroke at all.
-///   8 `KeyEchoSwallowed`     — the echo never arrives; an unrelated batch
-///       crosses the input boundary instead.
-///   9 `KeyDeviatingEcho`     — the shell echoes something other than the
-///       typed glyph at the caret.
-///  10 `KeyUnblinkedAltEcho`  — a per-key echo on a PLAIN alt screen with no
-///       repaint blink (`less` /-search typing, `vi` insert mode, a TUI whose
-///       ESC 7/ESC 8 streamer writes at another row): the echo itself is the
-///       textbook plain shape, but the PRE-FIX host withheld the row probe
-///       there (`probe_ok = !alt || blink_recent`), so the proof retired
-///       `no-row-probe` on every honest keystroke — the audit's named
-///       blind spot (the full-repaint/no-probe shape). The fixed host ships
-///       a ContentOnly probe instead; a host that truly has no probe still
-///       retires (fail-closed).
-///
-/// Obligation families:
-///
-///   SAFETY (kept, never traded away for liveness): cold, swallowed, and
-///   deviating shapes never confirm; every confirmation carries an armed
-///   keystroke, its delivered echo, the single attributable generation, a
-///   fresh anchor, an intact pre-caret prefix, and a materialization witness
-///   (`ConfirmIsWitnessed` and the per-shape dark invariants).
-///
-///   LIVENESS (the new family): every settled run over a shape the shipped
-///   code claims to handle — plain, E1, E3, E4, and the unblinked-alt echo —
-///   ends CONFIRMED (`LivePlainEchoConfirms`, `LiveGhostTextConfirmsE1`,
-///   `LiveBlankSpaceConfirmsE3`, `LiveOvertypeConfirmsE4`,
-///   `LiveUnblinkedAltEchoConfirms`), and every run
-///   reaches a decision at all (Tier-0 runs `find_deadlock` with
-///   `settled = 1` as the final predicate — the bounded eventuality).
-///
-///   STANDING GAPS (honest limits, stated as checked facts and reprinted by
-///   the Tier-0 driver — never silently waived): E2 and E5 settle RETIRED by
-///   design today. The strict generation law (split-batch echoes) and the
-///   multi-key stale anchor remain registered follow-ups to the blackout
-///   repair, alongside split-pane arming.
-///
-/// `Buggy = 1` is the pre-fix SYSTEM: the 201449c2 confirmation law verbatim
-/// — whole-row exactness (any post-caret change vetoes) and a
-/// newly-materialize-only witness (null diffs and content-invisible blanks
-/// cannot testify) — composed with the probe-starving alt host (shape 10's
-/// delivery withholds the row probe exactly as the old
-/// `probe_ok = !alt || blink_recent` gate did). That mutant is still
-/// SAFE — every safety invariant above holds at `Buggy = 1` — and that is
-/// precisely the audited defect class: only the LIVENESS family catches it
-/// (E1/E3/E4 settle retired), so a checker that stated safety alone would
-/// have called the mute gate green. Tier-1 binds the real
-/// `CursorGlow::confirm_content_candidate` decision to `Decide` per shape in
-/// `aterm-effects/src/cursor_glow.rs`
-/// (`real_confirm_content_candidate_refines_the_typed_echo_liveness_model`).
-#[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn typed_echo_liveness_model() -> Model {
-    crate::ty_model! {
-        TypedEchoLiveness {
-            const Buggy = 0;
-            var shape = 0;              // 0 unpicked, then the roster above
-            var armed = 0;              // a real typed keystroke armed a candidate
-            var echoed = 0;             // the environment delivered its batch
-            var gen_delta = 0;          // parser generations crossed since baseline
-            var stale_anchor = 0;       // proof capture predates the keystroke (E5)
-            var caret_material = 0;     // expected span present at the caret in the probe
-            var pre_caret_intact = 0;   // every cell BEFORE the caret content-identical
-            var post_caret_changed = 0; // presentation zone painted in the same batch (E1)
-            var content_changed = 0;    // row content differs under the implicit-blank lens
-            var storage_growth = 0;     // stored row grew to cover the owned span (E3)
-            var prepainted = 0;         // expected glyphs already at the caret at input (E4)
-            var probe_withheld = 0;     // the host supplied NO row probe this frame (10)
-            var confirmed = 0;
-            var retired = 0;
-            var settled = 0;            // the decision is final
-
-            // -- the environment adversary picks one echo shape --------------
-            action KeyPlainEcho when (shape == 0) { shape = 1; armed = 1; }
-            action KeyGhostSuggest when (shape == 0) { shape = 2; armed = 1; }
-            action KeySpaceOnBlanks when (shape == 0) { shape = 3; armed = 1; }
-            action KeyOvertypeSuggestion when (shape == 0) {
-                shape = 4; armed = 1; prepainted = 1;
-            }
-            action KeySplitEcho when (shape == 0) { shape = 5; armed = 1; }
-            action KeyBurst when (shape == 0) { shape = 6; armed = 1; stale_anchor = 1; }
-            action ColdSpinner when (shape == 0) { shape = 7; }
-            action KeyEchoSwallowed when (shape == 0) { shape = 8; armed = 1; }
-            action KeyDeviatingEcho when (shape == 0) { shape = 9; armed = 1; }
-            action KeyUnblinkedAltEcho when (shape == 0) { shape = 10; armed = 1; }
-
-            // -- the environment delivers the batch its shape promised -------
-            action EchoPlain when (shape == 1 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1; content_changed = 1;
-            }
-            action EchoWithGhostText when (shape == 2 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1; content_changed = 1; post_caret_changed = 1;
-            }
-            action EchoStorageGrowth when (shape == 3 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1; storage_growth = 1;
-            }
-            action EchoNullDiffOvertype when (shape == 4 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1;
-            }
-            action EchoSplitBatches when (shape == 5 && echoed == 0) {
-                echoed = 1; gen_delta = 2; caret_material = 1;
-                pre_caret_intact = 1; content_changed = 1;
-            }
-            action EchoAfterBurst when (shape == 6 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1; content_changed = 1;
-            }
-            action ColdPaint when (shape == 7 && echoed == 0) {
-                echoed = 1; gen_delta = 1; content_changed = 1;
-                post_caret_changed = 1;
-            }
-            action UnrelatedBatch when (shape == 8 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-            }
-            action EchoDeviates when (shape == 9 && echoed == 0) {
-                echoed = 1; gen_delta = 1; content_changed = 1;
-                pre_caret_intact = 1;
-            }
-            // Shape 10's echo IS the textbook plain echo; what differs is the
-            // HOST: pre-fix (`Buggy = 1`) it withheld the alt-screen row probe
-            // (no repaint blink ⇒ `probe_ok` false), post-fix it ships a
-            // ContentOnly probe, so only the fixed system can prove the echo.
-            action EchoOnUnblinkedAlt when (shape == 10 && echoed == 0) {
-                echoed = 1; gen_delta = 1; caret_material = 1;
-                pre_caret_intact = 1; content_changed = 1;
-                probe_withheld = if Buggy == 1 { 1 } else { 0 };
-            }
-
-            // -- the shipped confirmation decision ---------------------------
-            action Decide when (echoed == 1 && settled == 0) {
-                confirmed = if Buggy == 1 {
-                    // 201449c2 verbatim: whole-row exactness (any post-caret
-                    // change vetoes) + newly-materialize-only witness. A
-                    // withheld probe retires in BOTH laws (`no-row-probe` is
-                    // fail-closed today too); what Buggy=1 adds is the HOST
-                    // that withholds it on every unblinked-alt frame.
-                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
-                        && probe_withheld == 0
-                        && pre_caret_intact == 1 && caret_material == 1
-                        && content_changed == 1 && post_caret_changed == 0
-                        && prepainted == 0
-                    { 1 } else { 0 }
-                } else {
-                    // The shipped fix: caret-frontier exactness + any of the
-                    // three materialization witnesses (content diff, storage
-                    // growth, overtype-null-diff) — over a probe the host
-                    // actually supplied (ContentOnly suffices; see
-                    // `ProbeTrust` in aterm-effects).
-                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
-                        && probe_withheld == 0
-                        && pre_caret_intact == 1 && caret_material == 1
-                        && (content_changed == 1 || storage_growth == 1
-                            || prepainted == 1)
-                    { 1 } else { 0 }
-                };
-                retired = if Buggy == 1 {
-                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
-                        && probe_withheld == 0
-                        && pre_caret_intact == 1 && caret_material == 1
-                        && content_changed == 1 && post_caret_changed == 0
-                        && prepainted == 0
-                    { 0 } else { armed }
-                } else {
-                    if armed == 1 && gen_delta == 1 && stale_anchor == 0
-                        && probe_withheld == 0
-                        && pre_caret_intact == 1 && caret_material == 1
-                        && (content_changed == 1 || storage_growth == 1
-                            || prepainted == 1)
-                    { 0 } else { armed }
-                };
-                settled = 1;
-            }
-
-            // SAFETY — the 201449c2 protections, kept word for word.
-            invariant ColdSpinnerNeverConfirms:
-                if shape == 7 { confirmed == 0 } else { shape <= 10 };
-            invariant SwallowedEchoNeverConfirms:
-                if shape == 8 { confirmed == 0 } else { shape <= 10 };
-            invariant DeviatingEchoNeverConfirms:
-                if shape == 9 { confirmed == 0 } else { shape <= 10 };
-            invariant WithheldProbeNeverConfirms:
-                // FAIL-CLOSED, kept by the fix: making the probe AVAILABLE is
-                // the repair — a frame whose row cannot be probed still
-                // retires, in the fixed law and the mutant alike.
-                if probe_withheld == 1 { confirmed == 0 } else { probe_withheld == 0 };
-            invariant ConfirmIsWitnessed:
-                if confirmed == 1 {
-                    armed == 1 && echoed == 1 && gen_delta == 1
-                        && stale_anchor == 0 && pre_caret_intact == 1
-                        && caret_material == 1
-                } else { confirmed == 0 };
-            invariant SettledIsDecided:
-                if settled == 1 {
-                    confirmed + retired == armed
-                } else { confirmed == 0 && retired == 0 };
-
-            // LIVENESS — every handled shape's real echo eventually confirms.
-            invariant LivePlainEchoConfirms:
-                if settled == 1 && shape == 1 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveGhostTextConfirmsE1:
-                if settled == 1 && shape == 2 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveBlankSpaceConfirmsE3:
-                if settled == 1 && shape == 3 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveOvertypeConfirmsE4:
-                if settled == 1 && shape == 4 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveUnblinkedAltEchoConfirms:
-                // THE BLIND SPOT, CLOSED: a plain per-key echo on an
-                // unblinked alt screen (less /-search, vi insert, the
-                // ESC 7/ESC 8 streamer TUI) confirms — the fixed host ships
-                // the ContentOnly probe the proof needs. At Buggy=1 the
-                // probe-starving host retires it (`no-row-probe`), and ONLY
-                // this liveness obligation catches that: every safety
-                // invariant above holds on the mute mutant.
-                if settled == 1 && shape == 10 { confirmed == 1 } else { settled <= 1 };
-
-            // REGISTERED STANDING GAPS — checked facts, not aspirations: the
-            // strict generation law (E2) and the multi-key stale anchor (E5)
-            // retire real echoes today. Their Tier-0 driver reprints these as
-            // standing findings on every run; deleting either invariant (or
-            // one starting to fail because the gap was FIXED) must be a loud,
-            // deliberate model edit, not a silent drift.
-            invariant StandingGapSplitEchoRetiresE2:
-                if settled == 1 && shape == 5 {
-                    confirmed == 0 && retired == 1
-                } else { settled <= 1 };
-            invariant StandingGapBurstRetiresE5:
-                if settled == 1 && shape == 6 {
-                    confirmed == 0 && retired == 1
-                } else { settled <= 1 };
-
-            invariant EchoLivenessBounds:
-                shape <= 10 && armed <= 1 && echoed <= 1 && gen_delta <= 2
-                    && stale_anchor <= 1 && caret_material <= 1
-                    && pre_caret_intact <= 1 && post_caret_changed <= 1
-                    && content_changed <= 1 && storage_growth <= 1
-                    && prepainted <= 1 && probe_withheld <= 1
-                    && confirmed <= 1 && retired <= 1
-                    && settled <= 1;
-        }
-    }
-}
-
-/// THE DELETE SHAPE — the erase twin of [`typed_echo_liveness_model`], and the
-/// answer to R1 ("backspace KILLS my cursor trail").
-///
-/// 20003ffd repaired the TYPED arm of `CursorGlow::confirm_content_candidate`
-/// and said so plainly: "delete arm and generation-strictness untouched". So
-/// the DELETE arm went on carrying the 201449c2 laws verbatim — WHOLE-ROW
-/// exactness (any repaint at/after the vacated cell vetoes) and ONE hard
-/// materialization witness (glyph → blank at exactly that cell) — the same two
-/// laws that had been retiring 100% of honest typed echoes with the tokens
-/// `row-mismatch` and `row-unchanged`. A denied delete is not merely a delete
-/// that fails to draw: the batch reaches the generation fence unowned with the
-/// caret one column left of its anchor, is judged `UnownedRelocation`, and the
-/// wholesale teardown WIPES the ribbon the user already earned.
-///
-/// The mute-gate lesson generalizes exactly: a delete gate that provably never
-/// lies can still provably never speak, and safety alone calls it green. This
-/// model states the liveness family for the erase shapes a real shell actually
-/// produces.
-///
-/// The adversary's shapes (`shape`):
-///
-///   1 `KeyPlainErase`          — the textbook EOL Backspace: the vacated cell
-///       goes glyph → blank in the single next processed generation and
-///       nothing else on the row moves.
-///   2 `KeyEraseUnderSuggestion` (D1) — zsh/fish repaint POSTDISPLAY for the
-///       SHORTENED prefix in the very batch that erases, so the vacated cell
-///       reads a GHOST GLYPH, not a blank, and the suffix moves wholesale.
-///       Under whole-row exactness this is `row-mismatch` — the typed
-///       blackout's own token, still live on the delete side.
-///   3 `KeyEraseSpace` (D2)     — backspacing a SPACE (every word boundary).
-///       Under the implicit-blank lens the tail-filled baseline ALREADY reads
-///       `' '` at the vacated cell, so the glyph→blank witness is
-///       unsatisfiable and the row is content-identical: `row-unchanged`, the
-///       exact delete twin of the typed-SPACE blackout.
-///   4 `KeyEraseTrimmedEol` (D3) — an EOL erase on a grid that keeps rows
-///       TRIMMED: nothing is stored at the vacated column afterwards, so the
-///       stored row SHRINKS instead of showing a blank, and the caret is
-///       HIDDEN inside the shell's repaint bracket (no landing to read). The
-///       storage shrink is the only witness on offer — the delete twin of the
-///       typed STORAGE-GROWTH witness.
-///   5 `ColdSpinner`            — cold program output, no keystroke at all.
-///   6 `KeyEraseSwallowed`      — the app consumed Backspace without erasing:
-///       nothing vacated, nothing shrank, the caret never moved.
-///   7 `KeyErasePrefixMoved`    — content moved BEFORE the caret in the same
-///       batch. Attribution is disproven; the erase may not borrow the press.
-///   8 `KeySplitEraseEcho` (D-E2) — the erase echo crosses TWO PTY read
-///       batches. REGISTERED STANDING GAP, shared with the typed arm's E2.
-///
-/// Obligations:
-///
-///   SAFETY (kept, never traded for liveness): cold output, a swallowed erase,
-///   and an erase whose pre-caret prefix moved never confirm; every
-///   confirmation carries an armed Backspace, its delivered batch, the single
-///   attributable generation, an intact pre-caret prefix, and at least one
-///   erase witness (`EraseConfirmIsWitnessed`).
-///
-///   LIVENESS: every erase shape the repaired arm claims to handle — plain,
-///   D1, D2, D3 — settles CONFIRMED.
-///
-///   STANDING GAP: D-E2 settles RETIRED by design today, exactly as the typed
-///   arm's E2 does, and for the same strict next-generation law.
-///
-/// `Buggy = 1` is the pre-repair DELETE arm verbatim: whole-row exactness plus
-/// the vacated-cell-only witness. That mutant is SAFE — every safety invariant
-/// above holds on it — and MUTE for D1, D2 and D3, which is precisely the
-/// audited defect class: only the liveness family catches it. Tier-1 binds the
-/// real `CursorGlow::confirm_content_candidate` Delete arm to `Decide` per
-/// shape in `aterm-effects/src/cursor_glow.rs`
-/// (`real_confirm_content_candidate_refines_the_delete_echo_liveness_model`).
-#[must_use]
-// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
-// models above) — the MODEL it returns is what `ty` machine-checks.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn delete_echo_liveness_model() -> Model {
-    crate::ty_model! {
-        DeleteEchoLiveness {
-            const Buggy = 0;
-            var shape = 0;              // 0 unpicked, then the roster above
-            var armed = 0;              // a real Backspace armed a delete candidate
-            var echoed = 0;             // the environment delivered its batch
-            var gen_delta = 0;          // parser generations crossed since baseline
-            var pre_caret_intact = 0;   // every cell BEFORE the vacated cell identical
-            var post_caret_changed = 0; // the presentation zone repainted (D1)
-            var content_changed = 0;    // row content differs under the implicit-blank lens
-            var vacated = 0;            // the vacated cell went glyph -> blank
-            var storage_shrink = 0;     // the stored row no longer covers the cell (D3)
-            var caret_retreat = 0;      // the cursor landed on the EXACT predicted target
-            var confirmed = 0;
-            var retired = 0;
-            var settled = 0;            // the decision is final
-
-            // -- the environment adversary picks one erase shape -------------
-            action KeyPlainErase when (shape == 0) { shape = 1; armed = 1; }
-            action KeyEraseUnderSuggestion when (shape == 0) { shape = 2; armed = 1; }
-            action KeyEraseSpace when (shape == 0) { shape = 3; armed = 1; }
-            action KeyEraseTrimmedEol when (shape == 0) { shape = 4; armed = 1; }
-            action ColdSpinner when (shape == 0) { shape = 5; }
-            action KeyEraseSwallowed when (shape == 0) { shape = 6; armed = 1; }
-            action KeyErasePrefixMoved when (shape == 0) { shape = 7; armed = 1; }
-            action KeySplitEraseEcho when (shape == 0) { shape = 8; armed = 1; }
-
-            // -- the environment delivers the batch its shape promised -------
-            action ErasePlain when (shape == 1 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-                content_changed = 1; vacated = 1; caret_retreat = 1;
-            }
-            // The suffix repaint lands ON the vacated cell: no blank to read.
-            action EraseWithGhostRepaint when (shape == 2 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-                content_changed = 1; post_caret_changed = 1; caret_retreat = 1;
-            }
-            // A SPACE erased over tail-filled implicit blanks: invisible.
-            action EraseInvisibleBlank when (shape == 3 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-                caret_retreat = 1;
-            }
-            // Trimmed row + hidden caret: storage shrink is the sole witness.
-            action EraseStorageShrink when (shape == 4 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-                storage_shrink = 1;
-            }
-            action ColdPaint when (shape == 5 && echoed == 0) {
-                echoed = 1; gen_delta = 1; content_changed = 1;
-                post_caret_changed = 1;
-            }
-            action UnrelatedBatch when (shape == 6 && echoed == 0) {
-                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
-            }
-            action EraseRewritesPrefix when (shape == 7 && echoed == 0) {
-                echoed = 1; gen_delta = 1; content_changed = 1;
-                vacated = 1; caret_retreat = 1;
-            }
-            action EraseSplitBatches when (shape == 8 && echoed == 0) {
-                echoed = 1; gen_delta = 2; pre_caret_intact = 1;
-                content_changed = 1; vacated = 1; caret_retreat = 1;
-            }
-
-            // -- the shipped confirmation decision ---------------------------
-            action Decide when (echoed == 1 && settled == 0) {
-                confirmed = if Buggy == 1 {
-                    // 201449c2 verbatim, as the delete arm still carried it
-                    // after the typed repair: WHOLE-ROW exactness (any
-                    // presentation-zone repaint vetoes) + the vacated-cell
-                    // witness alone.
-                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
-                        && vacated == 1 && post_caret_changed == 0
-                    { 1 } else { 0 }
-                } else {
-                    // The repair, mirroring the typed arm: CARET-FRONTIER
-                    // exactness (the vacated cell is the frontier; cells
-                    // at/after it are the shell's presentation zone) + any of
-                    // the three erase witnesses — the cell vacated, the stored
-                    // row shrunk, or the caret landing on the exact predicted
-                    // target.
-                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
-                        && (vacated == 1 || storage_shrink == 1
-                            || caret_retreat == 1)
-                    { 1 } else { 0 }
-                };
-                retired = if Buggy == 1 {
-                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
-                        && vacated == 1 && post_caret_changed == 0
-                    { 0 } else { armed }
-                } else {
-                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
-                        && (vacated == 1 || storage_shrink == 1
-                            || caret_retreat == 1)
-                    { 0 } else { armed }
-                };
-                settled = 1;
-            }
-
-            // SAFETY — the 201449c2 protections, kept word for word.
-            invariant ColdEraseNeverConfirms:
-                if shape == 5 { confirmed == 0 } else { shape <= 8 };
-            invariant SwallowedEraseNeverConfirms:
-                if shape == 6 { confirmed == 0 } else { shape <= 8 };
-            invariant MovedPrefixNeverConfirms:
-                // Content moving BEFORE the caret disproves the attribution:
-                // a later jump may not claim causality the mismatch refuted.
-                if shape == 7 { confirmed == 0 } else { shape <= 8 };
-            invariant EraseConfirmIsWitnessed:
-                if confirmed == 1 {
-                    armed == 1 && echoed == 1 && gen_delta == 1
-                        && pre_caret_intact == 1
-                        && (vacated == 1 || storage_shrink == 1
-                            || caret_retreat == 1)
-                } else { confirmed == 0 };
-            invariant EraseSettledIsDecided:
-                if settled == 1 {
-                    confirmed + retired == armed
-                } else { confirmed == 0 && retired == 0 };
-
-            // LIVENESS — every handled erase shape eventually confirms. THIS
-            // is the family that catches the mute delete arm; every safety
-            // invariant above holds on it.
-            invariant LivePlainEraseConfirms:
-                if settled == 1 && shape == 1 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveGhostRepaintEraseConfirmsD1:
-                if settled == 1 && shape == 2 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveSpaceEraseConfirmsD2:
-                if settled == 1 && shape == 3 { confirmed == 1 } else { settled <= 1 };
-            invariant LiveTrimmedEolEraseConfirmsD3:
-                if settled == 1 && shape == 4 { confirmed == 1 } else { settled <= 1 };
-
-            // REGISTERED STANDING GAP — the strict next-generation law, shared
-            // with the typed arm's E2. A checked fact, reprinted by the Tier-0
-            // driver; fixing it must be a loud, deliberate model edit.
-            invariant StandingGapSplitEraseRetiresD2E:
-                if settled == 1 && shape == 8 {
-                    confirmed == 0 && retired == 1
-                } else { settled <= 1 };
-
-            invariant EraseLivenessBounds:
-                shape <= 8 && armed <= 1 && echoed <= 1 && gen_delta <= 2
-                    && pre_caret_intact <= 1 && post_caret_changed <= 1
-                    && content_changed <= 1 && vacated <= 1
-                    && storage_shrink <= 1 && caret_retreat <= 1
-                    && confirmed <= 1 && retired <= 1 && settled <= 1;
-        }
-    }
-}
 /// Cursor-owned pixels/cells live in the active viewport coordinate space.
 /// Entering retained history must immediately suppress the DEC cursor, both
 /// trail engines, every cursor body/companion overlay, and a later Retain

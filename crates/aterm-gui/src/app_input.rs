@@ -1139,574 +1139,6 @@ fn committed_char_cells(ch: char, ambiguous_width_double: bool) -> u16 {
     u16::try_from(width).unwrap_or(u16::MAX)
 }
 
-/// Exact rendered cell material expected from one committed Text/IME event.
-/// The first scalar of each grapheme is the terminal cell's lead character;
-/// every additional display column is represented by the same `\0` convention
-/// as `Terminal::row_cols_into`. Oversized/control-only commits deliberately
-/// return `None` and receive no cursor-motion cosmetics.
-fn committed_expected_cells(
-    text: &str,
-    ambiguous_width_double: bool,
-) -> Option<aterm_effects::cursor_trail::ExpectedCellSpan> {
-    use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
-
-    let shaping = TextShapingConfig {
-        ambiguous_width: if ambiguous_width_double {
-            AmbiguousWidth::Double
-        } else {
-            AmbiguousWidth::Single
-        },
-        ..TextShapingConfig::default()
-    };
-    if aterm_grapheme::str_width(text) == 0 {
-        return None;
-    }
-    let mut graphemes = aterm_grapheme::split_graphemes_with_config(text, &shaping);
-    let grapheme = graphemes.next()?;
-    // `row_cols_into` carries the terminal's rendered cell projection: the
-    // first scalar in the lead cell plus `\0` wide continuations. That is also
-    // the exact material a multi-scalar grapheme (VS16 emoji, ZWJ family,
-    // combining sequence, regional-indicator flag) can leave in this proof
-    // channel. Multiple graphemes remain a coalesced edit whose intermediate
-    // cursor/material transitions cannot be recovered from one row snapshot.
-    if graphemes.next().is_some() {
-        return None;
-    }
-    let width = grapheme.width;
-    if !(1..=2).contains(&width) {
-        return None;
-    }
-    let lead = grapheme.text.chars().next()?;
-    let cells = std::iter::once(lead).chain(std::iter::repeat_n('\0', width - 1));
-    aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(cells)
-}
-
-fn direct_expected_cell(
-    ch: char,
-    ambiguous_width_double: bool,
-) -> Option<aterm_effects::cursor_trail::ExpectedCellSpan> {
-    let mut utf8 = [0u8; 4];
-    committed_expected_cells(ch.encode_utf8(&mut utf8), ambiguous_width_double)
-}
-
-#[derive(Clone, Copy)]
-struct CommittedMoveProof {
-    terminal_origin: (u16, u16),
-    origin: (u16, u16),
-    target: (u16, u16),
-    terminal_material_row: u16,
-    material: (u16, u16),
-    col_offset: u16,
-    expected: aterm_effects::cursor_trail::ExpectedCellSpan,
-    /// Exact pre-delivery row prefix. Ordinary typed confirmation reuses it;
-    /// the rare bottom-scroll arm derives its terminal-defined blank prefix
-    /// only after delivery, avoiding a second 256-cell snapshot on every key.
-    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
-    baseline_generation: aterm_effects::cursor_trail::ContentGeneration,
-    bottom_scroll: bool,
-}
-
-#[derive(Clone, Copy)]
-struct DeleteMoveProof {
-    terminal_origin: (u16, u16),
-    origin: (u16, u16),
-    target: (u16, u16),
-    col_offset: u16,
-    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
-    /// Exact previous-row snapshot for a DECSET-45 col-zero Backspace. `None`
-    /// is the ordinary same-row EOL erase proof.
-    reverse_target_baseline: Option<aterm_effects::cursor_trail::ExpectedRowSnapshot>,
-    baseline_generation: aterm_effects::cursor_trail::ContentGeneration,
-}
-
-/// Translation from the focused terminal's pane-local grid into the cursor
-/// engines' coordinate space. Identity is the ordinary single-pane path. A
-/// nonzero translation is accepted only when the last composed frame binds the
-/// shared engine anchor to this exact session and its retained canonical layout
-/// origin projects the current Terminal caret back onto that anchor. Reading
-/// the frame's coordinate key avoids a pane-tree walk/allocation on every key.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CursorProofProjection {
-    row_offset: u16,
-    col_offset: u16,
-}
-
-/// Recover the focused pane's exact cell origin from the canonical coordinate
-/// key retained by the composed frame. Unlike the cursor engines' anchor, this
-/// placement does not change when PTY output moves the Terminal cursor between
-/// that frame and the next key event.
-fn composed_cursor_effect_offset(window: &crate::WindowState) -> Option<(u16, u16)> {
-    fn cell_offset(bits: u32) -> Option<u16> {
-        let value = f32::from_bits(bits).round();
-        (value.is_finite() && value >= 0.0 && value <= f32::from(u16::MAX)).then_some(value as u16)
-    }
-
-    let coordinate = window.last_layout_coordinate_space?;
-    if !coordinate.route.is_composed() {
-        return None;
-    }
-    Some((cell_offset(coordinate.y)?, cell_offset(coordinate.x)?))
-}
-
-impl CursorProofProjection {
-    const IDENTITY: Self = Self {
-        row_offset: 0,
-        col_offset: 0,
-    };
-
-    fn from_anchors(
-        effect_origin: (u16, u16),
-        terminal_origin: (u16, u16),
-        composed_session: Option<u64>,
-        composed_offset: Option<(u16, u16)>,
-        input_session: u64,
-        extension_window: Option<((u16, u16), u16)>,
-    ) -> Option<Self> {
-        // THE MASH EXTENSION WINDOW: while both engines hold the same fresh,
-        // unjudged Typed cohort, a new press's capture caret is accepted
-        // anywhere inside that cohort's claim window (its material caret
-        // through its predicted target, effect-space) — the terminal may have
-        // echoed `k` of the cohort's cells between the presses, which moves
-        // the caret without any frame updating the engine anchor. Never a
-        // manufactured offset: the identity/composed projection derivations
-        // below are unchanged, only the equality check widens to window
-        // membership — and only while a window exists at all.
-        let accepts = |projected: (u16, u16)| {
-            projected == effect_origin
-                || extension_window.is_some_and(|((row, start), len)| {
-                    projected.0 == row
-                        && projected.1 >= start
-                        && u32::from(projected.1) <= u32::from(start) + u32::from(len)
-                })
-        };
-        let projection = match composed_session {
-            // No composed-frame credential is the ordinary single-pane seam:
-            // only equal engine/Terminal anchors (or a window-accepted mash
-            // caret) can use its identity path.
-            None if composed_offset.is_none() && accepts(terminal_origin) => Self::IDENTITY,
-            None => return None,
-            // A composed anchor requires BOTH the exact focused session and
-            // its retained layout origin, even when that origin is (0, 0).
-            Some(session) if session == input_session => {
-                let (row_offset, col_offset) = composed_offset?;
-                Self {
-                    row_offset,
-                    col_offset,
-                }
-            }
-            Some(_) => return None,
-        };
-        // Same-session PTY output may move the local Terminal caret after the
-        // retained frame. Never manufacture an offset by subtracting that new
-        // caret from the old engine anchor: the canonical layout origin must
-        // project the CURRENT caret back onto the retained anchor exactly
-        // (or into the mash cohort's claim window).
-        if !accepts(projection.cell(terminal_origin)?) {
-            return None;
-        }
-        Some(projection)
-    }
-
-    fn cell(self, local: (u16, u16)) -> Option<(u16, u16)> {
-        Some((
-            local.0.checked_add(self.row_offset)?,
-            local.1.checked_add(self.col_offset)?,
-        ))
-    }
-}
-
-/// Predict the real Terminal cursor/material geometry for one simple grapheme
-/// under the conservative full-width DECAWM subset. Margins, no-wrap, and
-/// larger clusters fail closed. A glyph that fills the margin leaves the
-/// cursor on the final cell with deferred-wrap armed; a one-cell glyph that
-/// starts at an already-pending margin resolves the wrap before materializing
-/// on the next row. At the bottom row, that same transition is admitted only
-/// as a distinct scroll-owned shape whose engine proof must later witness one
-/// exact uniform upward row before it can compare the fresh bottom material.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CommittedMoveGeometry {
-    target: (u16, u16),
-    material: (u16, u16),
-    bottom_scroll: bool,
-}
-
-fn committed_move_geometry(
-    origin: (u16, u16),
-    cells: usize,
-    rows: u16,
-    cols: u16,
-    pending_wrap: bool,
-    auto_wrap: bool,
-    horizontal_margins: bool,
-) -> Option<CommittedMoveGeometry> {
-    if !auto_wrap || horizontal_margins || rows == 0 || cols == 0 || !(1..=2).contains(&cells) {
-        return None;
-    }
-    let (mut row, mut col) = origin;
-    let mut bottom_scroll = false;
-    let resolved_pending_wrap = pending_wrap;
-    if resolved_pending_wrap {
-        // This is the one cross-row transition whose complete MATERIAL proof
-        // fits the row channel below: the old row is already materialized and
-        // only its deferred-wrap bit changes. A wide glyph may additionally
-        // rewrite the old-row tail, so it remains dark.
-        if cells != 1 {
-            return None;
-        }
-        if let Some(next_row) = row.checked_add(1).filter(|row| *row < rows) {
-            row = next_row;
-        } else {
-            // A full-screen DECAWM linefeed at the bottom scrolls the content
-            // up and materializes on a freshly blank row at the same numeric
-            // coordinate. Rows < 2 have no retained departure row for the
-            // effect engines, so that degenerate geometry remains dark.
-            if rows < 2 || cols < 2 || row != rows.saturating_sub(1) {
-                return None;
-            }
-            bottom_scroll = true;
-        }
-        col = 0;
-    }
-    if cells == 2 && col.saturating_add(1) >= cols {
-        row = row.checked_add(1).filter(|row| *row < rows)?;
-        col = 0;
-    }
-    // A wide glyph PRE-wrapping from an unwrapped margin may blank the old-row
-    // tail. One-row evidence cannot prove that whole transition.
-    if row != origin.0 && !resolved_pending_wrap {
-        return None;
-    }
-    let material = (row, col);
-    let advance = col.saturating_add(cells as u16);
-    let target = (row, advance.min(cols.saturating_sub(1)));
-    Some(CommittedMoveGeometry {
-        target,
-        material,
-        bottom_scroll,
-    })
-}
-
-fn capture_committed_move_proof(
-    term: &aterm_core::terminal::Terminal,
-    expected: aterm_effects::cursor_trail::ExpectedCellSpan,
-    row: &mut Vec<char>,
-    projection: CursorProofProjection,
-) -> Option<CommittedMoveProof> {
-    let cursor = term.cursor();
-    let origin = (cursor.row, cursor.col);
-    let rows = term.rows();
-    let cols = term.cols();
-    let geometry = committed_move_geometry(
-        origin,
-        expected.as_slice().len(),
-        rows,
-        cols,
-        term.grid().pending_wrap(),
-        term.modes().auto_wrap,
-        term.grid().has_horizontal_margins(),
-    )?;
-    let target = geometry.target;
-    let material = geometry.material;
-    let effect_origin = projection.cell(origin)?;
-    let effect_target = projection.cell(target)?;
-    let effect_material = projection.cell(material)?;
-    let local_frontier = usize::from(material.1).checked_add(expected.as_slice().len())?;
-    let projected_frontier = usize::from(projection.col_offset).checked_add(local_frontier)?;
-    if projected_frontier > aterm_effects::cursor_trail::EXPECTED_ROW_CELLS_MAX {
-        return None;
-    }
-    term.row_cols_prefix_into(usize::from(material.0), local_frontier, row);
-    // Typed confirmation compares every cell BEFORE the materialization and
-    // the expected span itself; everything after it is the shell presentation
-    // zone. Capture exactly that frontier rather than the whole visible width,
-    // so a 300-column terminal with a caret near the left edge is not
-    // structurally dark. Sparse rows are filled through the frontier under the
-    // same implicit-blank convention the render-side proof uses.
-    row.resize(local_frontier, ' ');
-    if projection.col_offset != 0 {
-        let local_len = row.len();
-        row.resize(projected_frontier, ' ');
-        row.rotate_right(usize::from(projection.col_offset));
-        debug_assert_eq!(row.len(), local_len + usize::from(projection.col_offset));
-    }
-    let baseline = aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(row)?;
-    Some(CommittedMoveProof {
-        terminal_origin: origin,
-        origin: effect_origin,
-        target: effect_target,
-        terminal_material_row: material.0,
-        material: effect_material,
-        col_offset: projection.col_offset,
-        expected,
-        baseline,
-        baseline_generation: aterm_effects::cursor_trail::ContentGeneration {
-            process_sequence: term.pipeline_timestamps().process_sequence,
-            terminal_id: term.render_identity(),
-            alternate_screen: term.is_alternate_screen(),
-        },
-        bottom_scroll: geometry.bottom_scroll,
-    })
-}
-
-fn capture_full_projected_row(
-    term: &aterm_core::terminal::Terminal,
-    terminal_row: u16,
-    row: &mut Vec<char>,
-    projection: CursorProofProjection,
-) -> Option<aterm_effects::cursor_trail::ExpectedRowSnapshot> {
-    let local_len = usize::from(term.cols());
-    let projected_len = local_len.checked_add(usize::from(projection.col_offset))?;
-    if projected_len > aterm_effects::cursor_trail::EXPECTED_ROW_CELLS_MAX {
-        return None;
-    }
-    term.row_cols_prefix_into(usize::from(terminal_row), local_len, row);
-    row.resize(local_len, ' ');
-    if projection.col_offset != 0 {
-        row.resize(projected_len, ' ');
-        row.rotate_right(usize::from(projection.col_offset));
-    }
-    aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(row)
-}
-
-fn capture_delete_move_proof(
-    term: &aterm_core::terminal::Terminal,
-    row: &mut Vec<char>,
-    projection: CursorProofProjection,
-) -> Option<DeleteMoveProof> {
-    let cursor = term.cursor();
-    if term.grid().pending_wrap() {
-        return None;
-    }
-    let generation = aterm_effects::cursor_trail::ContentGeneration {
-        process_sequence: term.pipeline_timestamps().process_sequence,
-        terminal_id: term.render_identity(),
-        alternate_screen: term.is_alternate_screen(),
-    };
-    if cursor.col == 0 {
-        // DECSET 45 is the sole Terminal transition that makes a col-zero BS
-        // move. Horizontal margins have a different left/right edge contract
-        // and stay dark until their sub-grid projection is independently
-        // modeled. The vertical bound mirrors Terminal::execute exactly.
-        if !term.modes().reverse_wraparound || term.modes().left_right_margin_mode {
-            return None;
-        }
-        let min_row = if cursor.row >= term.grid().scroll_region().top {
-            term.grid().scroll_region().top
-        } else {
-            0
-        };
-        if cursor.row <= min_row {
-            return None;
-        }
-        let terminal_target = (cursor.row - 1, term.cols().checked_sub(1)?);
-        let baseline = capture_full_projected_row(term, cursor.row, row, projection)?;
-        let reverse_target_baseline =
-            capture_full_projected_row(term, terminal_target.0, row, projection)?;
-        return Some(DeleteMoveProof {
-            terminal_origin: (cursor.row, cursor.col),
-            origin: projection.cell((cursor.row, cursor.col))?,
-            target: projection.cell(terminal_target)?,
-            col_offset: projection.col_offset,
-            baseline,
-            reverse_target_baseline: Some(reverse_target_baseline),
-            baseline_generation: generation,
-        });
-    }
-
-    let target = (cursor.row, cursor.col - 1);
-    let baseline = capture_full_projected_row(term, cursor.row, row, projection)?;
-    let effect_target = projection.cell(target)?;
-    let erased = baseline.as_slice().get(usize::from(effect_target.1))?;
-    if *erased == ' ' || *erased == '\0' {
-        return None;
-    }
-    // The conservative proof is plain EOL Backspace only. Mid-line editor
-    // semantics may shift/repaint an arbitrary suffix; without an operation
-    // token that suffix cannot be attributed to this key exactly.
-    let fill = baseline
-        .as_slice()
-        .iter()
-        .rposition(|cell| *cell != ' ')
-        .map_or(0, |index| index + 1);
-    if fill != usize::from(cursor.col) + usize::from(projection.col_offset) {
-        return None;
-    }
-    Some(DeleteMoveProof {
-        terminal_origin: (cursor.row, cursor.col),
-        origin: projection.cell((cursor.row, cursor.col))?,
-        target: effect_target,
-        col_offset: projection.col_offset,
-        baseline,
-        reverse_target_baseline: None,
-        baseline_generation: generation,
-    })
-}
-
-fn committed_proof_still_current(
-    term: &aterm_core::terminal::Terminal,
-    origin: (u16, u16),
-    material_row: u16,
-    col_offset: u16,
-    baseline: aterm_effects::cursor_trail::ExpectedRowSnapshot,
-    generation: aterm_effects::cursor_trail::ContentGeneration,
-    row: &mut Vec<char>,
-) -> bool {
-    let cursor = term.cursor();
-    let current_generation = aterm_effects::cursor_trail::ContentGeneration {
-        process_sequence: term.pipeline_timestamps().process_sequence,
-        terminal_id: term.render_identity(),
-        alternate_screen: term.is_alternate_screen(),
-    };
-    if (cursor.row, cursor.col) != origin || current_generation != generation {
-        return false;
-    }
-    let baseline = baseline.as_slice();
-    let Some(local_baseline) = baseline.get(usize::from(col_offset)..) else {
-        return false;
-    };
-    term.row_cols_prefix_into(usize::from(material_row), local_baseline.len(), row);
-    row.resize(local_baseline.len(), ' ');
-    row.as_slice() == local_baseline
-}
-
-/// Upgrade a pre-write proof only after synchronous inline delivery, provided
-/// the post-write Terminal is still byte-for-byte at that captured boundary.
-/// This is a separate seam so the delivery race has a real-code Tier-1 control:
-/// any intervening process generation, identity/screen/cursor change, or row
-/// mutation cancels both engines and all plain-Backspace poof provenance.
-fn arm_committed_move_after_inline(
-    window: &mut crate::WindowState,
-    term: &Terminal,
-    at: std::time::Instant,
-    typed: Option<CommittedMoveProof>,
-    delete: Option<DeleteMoveProof>,
-) -> bool {
-    let mut row = std::mem::take(&mut window.poof_row_buf);
-    let armed = if let Some(proof) = typed
-        && committed_proof_still_current(
-            term,
-            proof.terminal_origin,
-            proof.terminal_material_row,
-            proof.col_offset,
-            proof.baseline,
-            proof.baseline_generation,
-            &mut row,
-        )
-        // The MASH EXTENSION accepts a proof captured inside the pending
-        // cohort's claim window (the terminal may have echoed part of the
-        // cohort between the presses); every non-extension arm keeps the
-        // exact anchor-equality gate.
-        && (window.cursor_glow.cursor_anchor() == Some(proof.origin)
-            || window.cursor_glow.typed_extension_accepts(at, proof.origin))
-        && (window.cursor_trail.cursor_anchor() == Some(proof.origin)
-            || window.cursor_trail.typed_extension_accepts(at, proof.origin))
-    {
-        if proof.bottom_scroll {
-            // A verified uniform full-screen scroll creates a fresh blank
-            // bottom line before the deferred glyph is written. Derive that
-            // baseline only on this rare path; storing a second bounded row in
-            // every ordinary hot-path proof would double its stack footprint.
-            let blanks = [' '; aterm_effects::cursor_trail::EXPECTED_ROW_CELLS_MAX];
-            if let Some(blank_baseline) =
-                aterm_effects::cursor_trail::ExpectedRowSnapshot::from_slice(
-                    &blanks[..proof.baseline.as_slice().len()],
-                )
-            {
-                window.cursor_glow.note_bottom_scroll_typed_expected(
-                    at,
-                    proof.expected,
-                    proof.target,
-                    proof.material,
-                    blank_baseline,
-                    proof.baseline_generation,
-                );
-                window.cursor_trail.note_bottom_scroll_typed_expected(
-                    at,
-                    proof.expected,
-                    proof.target,
-                    proof.material,
-                );
-            }
-        } else {
-            window.cursor_glow.note_typed_expected(
-                at,
-                proof.expected,
-                proof.target,
-                proof.material,
-                proof.baseline,
-                proof.baseline_generation,
-            );
-            window.cursor_trail.note_typed_expected(
-                at,
-                proof.expected,
-                proof.target,
-                proof.material,
-            );
-        }
-        window.cursor_glow.move_candidate_pending() && window.cursor_trail.move_candidate_pending()
-    } else if let Some(proof) = delete
-        && committed_proof_still_current(
-            term,
-            proof.terminal_origin,
-            proof.terminal_origin.0,
-            proof.col_offset,
-            proof.baseline,
-            proof.baseline_generation,
-            &mut row,
-        )
-        && proof.reverse_target_baseline.is_none_or(|baseline| {
-            proof
-                .terminal_origin
-                .0
-                .checked_sub(1)
-                .is_some_and(|target_row| {
-                    committed_proof_still_current(
-                        term,
-                        proof.terminal_origin,
-                        target_row,
-                        proof.col_offset,
-                        baseline,
-                        proof.baseline_generation,
-                        &mut row,
-                    )
-                })
-        })
-        && window.cursor_glow.cursor_anchor() == Some(proof.origin)
-        && window.cursor_trail.cursor_anchor() == Some(proof.origin)
-    {
-        if let Some(target_baseline) = proof.reverse_target_baseline {
-            window.cursor_glow.note_reverse_delete_candidate(
-                at,
-                proof.target,
-                proof.col_offset,
-                proof.baseline,
-                target_baseline,
-                proof.baseline_generation,
-            );
-            window
-                .cursor_trail
-                .note_reverse_delete_expected(at, proof.target);
-        } else {
-            window.cursor_glow.note_delete_candidate(
-                at,
-                proof.target,
-                proof.baseline,
-                proof.baseline_generation,
-            );
-            window.cursor_trail.note_delete_expected(at, proof.target);
-        }
-        window.cursor_glow.move_candidate_pending() && window.cursor_trail.move_candidate_pending()
-    } else {
-        false
-    };
-    if !armed {
-        window.cursor_glow.cancel_authored_move_candidate();
-        window.cursor_trail.cancel_authored_move_candidate();
-    }
-    window.poof_row_buf = row;
-    armed
-}
-
 fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     use aterm_types::keyboard::{Key as TKey, Modifiers as TMods, NamedKey as TNamed};
     let predict_candidate: Option<(Option<char>, bool)> = match ev {
@@ -2136,26 +1568,37 @@ fn feed_classified_press<T>(
 }
 
 impl App {
-    /// Supersede any unobserved exact cursor-move proof at a newer input
-    /// boundary. Unsupported/local input stays cosmetically dark, but it must
-    /// still close an older swallowed key's one-shot candidate.
-    pub(crate) fn cancel_cursor_move_candidate(&mut self, wid: WindowId) {
+    /// Close every LICENSE term at a newer input boundary.
+    ///
+    /// The license (docs/design/EFFECTS-LICENSE-REDESIGN.md) asks one question
+    /// at the spawn seam: did a human touch the keyboard just now. A key this
+    /// window SWALLOWED — a chord, a menu equivalent, a click, a wheel notch,
+    /// a paste — is not an answer to it, so its stamp must not outlive the
+    /// boundary and license whatever moves next. Unsupported/local input stays
+    /// cosmetically dark for exactly that reason.
+    ///
+    /// This is the whole of what the ~15 call sites below ever wanted from the
+    /// proof era's `cancel_cursor_move_candidate`. It mints nothing, judges
+    /// nothing, and — the point of the redesign — destroys no resident light:
+    /// it expires two timestamps.
+    pub(crate) fn clear_move_license(&mut self, wid: WindowId) {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.cancel_authored_move_candidate();
-            ws.cursor_trail.cancel_authored_move_candidate();
+            ws.cursor_glow.clear_typed(std::time::Instant::now());
+            ws.cursor_trail.clear_typed();
         }
     }
 
     /// Main-thread, session-resolving twin used by reply-bearing control
     /// operations that have no `InputEvent` of their own (notably `signal`).
-    /// `false` means the named session stopped being visible before this fence;
-    /// there is then no matching window candidate to clear and the authorized
-    /// background operation may continue.
-    pub(crate) fn cancel_cursor_move_candidate_for_session(&mut self, session: u64) -> bool {
+    /// `false` means the named session stopped being visible before this
+    /// fence; there is then no window holding a license for it and the
+    /// authorized background operation may continue.
+    pub(crate) fn clear_move_license_for_session(&mut self, session: u64) -> bool {
         // Focus notifications from two OS windows are not ordered: B may gain
         // focus before A reports its loss. Resolve every window currently
-        // presenting this session so an A-side proof cannot survive and become
-        // borrowable merely because `frontmost_window` already points at B.
+        // presenting this session so an A-side license cannot survive and
+        // become borrowable merely because `frontmost_window` already points
+        // at B.
         let targets: Vec<_> = self
             .windows
             .keys()
@@ -2165,30 +1608,30 @@ impl App {
             })
             .collect();
         for wid in &targets {
-            self.cancel_cursor_move_candidate(*wid);
+            self.clear_move_license(*wid);
         }
         !targets.is_empty()
     }
 
     /// External OS command surfaces (native menu key equivalents and
     /// accessibility actions) can consume an input before `on_key`/`App::input`.
-    /// Give them the same candidate-only supersession boundary without
-    /// manufacturing a key, cadence heat, or terminal bytes.
-    pub(crate) fn cancel_front_cursor_move_candidate(&mut self) {
+    /// Give them the same license boundary without manufacturing a key,
+    /// cadence heat, or terminal bytes.
+    pub(crate) fn clear_front_move_license(&mut self) {
         if let Some(wid) = self.frontmost_window {
-            self.cancel_cursor_move_candidate(wid);
+            self.clear_move_license(wid);
         }
     }
 
-    /// Candidate-only ingress fence for native tab-strip wakes. AppKit's
+    /// License-only ingress fence for native tab-strip wakes. AppKit's
     /// custom TabView consumes mouse and accessibility gestures without a
     /// winit pointer event, while controller `TabCmd` addresses the front
     /// window. Keeping both spellings here makes the headless regression drive
     /// the exact production boundary without fabricating an event loop.
-    pub(crate) fn cancel_tab_surface_cursor_move_candidate(&mut self, window: Option<WindowId>) {
+    pub(crate) fn clear_tab_surface_move_license(&mut self, window: Option<WindowId>) {
         match window {
-            Some(wid) => self.cancel_cursor_move_candidate(wid),
-            None => self.cancel_front_cursor_move_candidate(),
+            Some(wid) => self.clear_move_license(wid),
+            None => self.clear_front_move_license(),
         }
     }
 
@@ -2758,42 +2201,23 @@ impl App {
                 ..
             }
         );
-        let input_superseded_candidate = if release_only {
-            false
-        } else {
-            let pending = self.windows.get(&wid).is_some_and(|ws| {
-                ws.cursor_glow.move_candidate_pending() || ws.cursor_trail.move_candidate_pending()
-            });
-            // THE MASH EXCEPTION (owner: "when I typed that quickly, the
-            // cursor trail broke"): a PLAIN typed-glyph press — Character,
-            // Space, or a committed IME run, never Enter/Tab/nav/chords —
-            // while BOTH engines hold a fresh, unjudged Typed cohort is the
-            // extension seam's own input class. Superseding here is what
-            // killed the whole cohort at mash speed (several presses inside
-            // one frame slip); instead the press flows to the capture fence
-            // below, whose post-inline-write arm EXTENDS the cohort with this
-            // press's exact cells. Every other input class still supersedes
-            // exactly as before — including this same key when either
-            // engine's cohort is stale, judged, or shape-ineligible.
-            let extend_eligible = pending
-                && {
-                    let class = classify_press(&ev);
-                    class.typed_forward == Some(true) && !class.enter_like
-                }
-                && {
-                    let now = std::time::Instant::now();
-                    self.windows.get(&wid).is_some_and(|ws| {
-                        ws.cursor_glow.typed_candidate_extendable(now)
-                            && ws.cursor_trail.typed_candidate_extendable(now)
-                    })
-                };
-            if extend_eligible {
-                false
-            } else {
-                self.cancel_cursor_move_candidate(wid);
-                pending
+        // THE MASH EXCEPTION SURVIVES ITS MACHINERY (owner: "when I typed
+        // that quickly, the cursor trail broke"). The proof era closed every
+        // pending cohort here, which at mash speed — several presses inside
+        // one frame slip — killed the cohort the next press belonged to. A
+        // PLAIN typed-glyph press (Character, Space, or a committed IME run,
+        // never Enter/Tab/nav/chords) is now simply left alone: it re-stamps
+        // the same typed license a moment later and banks its own cell credit.
+        // Every other input class still closes the license cohort, so a
+        // swallowed key cannot license the move that follows a different
+        // gesture.
+        if !release_only {
+            let class = classify_press(&ev);
+            let plain_typed_glyph = class.typed_forward == Some(true) && !class.enter_like;
+            if !plain_typed_glyph {
+                self.clear_move_license(wid);
             }
-        };
+        }
         // SETTINGS MODAL: while the overlay owns this window, swallow PTY-bound input.
         // Human keys/clicks are already gated in `on_key`/`on_mouse_input`; CONTROLLER
         // bytes arrive HERE via `Wake::Input` (bypassing `on_key`), so the modal must
@@ -3073,14 +2497,9 @@ impl App {
                 // are indistinguishable in every observable variable and can
                 // therefore only be told apart by what this seam knew.
                 let press_kind = PressKind::of(is_release, is_repeat, inert_modifier);
-                // The exact pre-write proofs are produced only on a press-like
-                // event. Keep them available across the PTY dispatch below so
-                // the synchronous post-write fence can upgrade them; releases
-                // take the fail-closed tuple and can never arm or revoke one.
-                let (candidate_was_pending, typed_move_proof, delete_move_proof) = if let Some(
-                    input_now,
-                ) = input_now
-                {
+                // The LICENSE is stamped only on a press-like event; a
+                // release can neither grant one nor spend one.
+                if let Some(input_now) = input_now {
                     // Same §3 row 1 contract as `on_key`'s reset above: a bare
                     // modifier press is inert and leaves the blink phase alone.
                     // Gated on `inert_modifier` ONLY — never on `press_disturbs`
@@ -3155,54 +2574,6 @@ impl App {
                         bed: self.config.trail_sound_bed_or_default(),
                         tone_melody: self.config.tone_melody_or_default(),
                     });
-                    // Proof capture is eligible only when both engines own the
-                    // exact same source and no earlier commit is still pending.
-                    // In a split layout those anchors are window-space while
-                    // Terminal's cursor is pane-local. The last composed frame
-                    // binds that anchor to one exact session; the term-lock
-                    // scope below derives the translation from the two caret
-                    // readings only when that binding names THIS input target.
-                    // Reuse the window's row scratch so the key hot path does
-                    // not allocate or scan a row for unseeded/mismatched state.
-                    let (candidate_anchor, candidate_was_pending, mut proof_row_buf) = self
-                        .windows
-                        .get_mut(&wid)
-                        .map_or((None, false, None), |ws| {
-                            let engines_pending = ws.cursor_glow.move_candidate_pending()
-                                || ws.cursor_trail.move_candidate_pending();
-                            // THE MASH EXTENSION WINDOW: both engines must
-                            // hold the SAME fresh, unjudged Typed cohort for
-                            // this press to capture an extension proof; any
-                            // disagreement (or a superseding input class
-                            // upstream) keeps the old fail-closed gate.
-                            let extension_window = (!input_superseded_candidate)
-                                .then(|| ws.cursor_glow.typed_extension_window(input_now))
-                                .flatten()
-                                .filter(|window| {
-                                    ws.cursor_trail.typed_extension_window(input_now)
-                                        == Some(*window)
-                                });
-                            let pending = input_superseded_candidate
-                                || (engines_pending && extension_window.is_none());
-                            let origin = (!pending)
-                                .then(|| ws.cursor_glow.cursor_anchor())
-                                .flatten()
-                                .filter(|origin| ws.cursor_trail.cursor_anchor() == Some(*origin));
-                            let anchor = origin.map(|origin| {
-                                let (composed_session, composed_offset) =
-                                    if ws.composed_cursor_effect_valid {
-                                        (
-                                            ws.composed_cursor_effect_session,
-                                            composed_cursor_effect_offset(ws),
-                                        )
-                                    } else {
-                                        (None, None)
-                                    };
-                                (origin, composed_session, composed_offset, extension_window)
-                            });
-                            let buf = origin.map(|_| std::mem::take(&mut ws.poof_row_buf));
-                            (anchor, pending, buf)
-                        });
                     // ONE term-lock scope for every press-path terminal touch: the
                     // viewport snap, the "typing deselects" clear, and the predictor's
                     // cursor/cols/alt sample. These were three separate acquisitions
@@ -3218,8 +2589,6 @@ impl App {
                         kitty_owns_keyboard,
                         term_cols,
                         ambiguous_width_double,
-                        typed_move_proof,
-                        delete_move_proof,
                     ) = {
                         let mut t = term_lock(&term);
                         // SELECTION CUSTODY (R1). The kind short-circuits BEFORE
@@ -3276,62 +2645,14 @@ impl App {
                         // scalar: the `sample` above is gated on the predictor.
                         let term_cols = t.cols();
                         let ambiguous_width_double = t.modes().ambiguous_width_double;
-                        let typed_expected = (typed_forward == Some(true) && !enter_like)
-                            .then(|| {
-                                ime.and_then(|text| {
-                                    committed_expected_cells(text, ambiguous_width_double)
-                                })
-                                .or_else(|| {
-                                    typed.and_then(|ch| {
-                                        direct_expected_cell(ch, ambiguous_width_double)
-                                    })
-                                })
-                            })
-                            .flatten();
-                        let terminal_origin = {
-                            let cursor = t.cursor();
-                            (cursor.row, cursor.col)
-                        };
-                        let proof_projection = candidate_anchor.and_then(
-                            |(effect_origin, composed_session, composed_offset, extension_window)| {
-                                CursorProofProjection::from_anchors(
-                                    effect_origin,
-                                    terminal_origin,
-                                    composed_session,
-                                    composed_offset,
-                                    session,
-                                    extension_window,
-                                )
-                            },
-                        );
-                        let typed_move_proof = proof_projection.and_then(|projection| {
-                            typed_expected.zip(proof_row_buf.as_mut()).and_then(
-                                |(expected, row)| {
-                                    capture_committed_move_proof(&t, expected, row, projection)
-                                },
-                            )
-                        });
-                        let delete_move_proof = (typed_forward == Some(false))
-                            .then(|| {
-                                proof_projection.zip(proof_row_buf.as_mut()).and_then(
-                                    |(projection, row)| {
-                                        capture_delete_move_proof(&t, row, projection)
-                                    },
-                                )
-                            })
-                            .flatten();
                         // ATERM_TRACE_SPAWN press sensor (same once-sampled gate
-                        // as the render trace): one line per typed-class press
-                        // naming which arming precondition held, so a box where
-                        // the ribbon never lights is diagnosed at the capture
-                        // seam instead of inferred from downstream silence.
+                        // as the render trace): one line per typed-class press,
+                        // so a box where the ribbon never lights is diagnosed at
+                        // the input seam instead of inferred from downstream
+                        // silence.
                         if crate::app_render::trace_spawn_enabled() && typed_forward.is_some() {
                             eprintln!(
-                                "PRESS fwd={typed_forward:?} typed={typed:?} pend={} anchor={candidate_anchor:?} term={terminal_origin:?} projection={proof_projection:?} expect={} tproof={} dproof={} gen={}",
-                                candidate_was_pending,
-                                typed_expected.is_some(),
-                                typed_move_proof.is_some(),
-                                delete_move_proof.is_some(),
+                                "PRESS fwd={typed_forward:?} typed={typed:?} gen={}",
                                 t.pipeline_timestamps().process_sequence,
                             );
                         }
@@ -3343,15 +2664,8 @@ impl App {
                             kitty_owns_keyboard,
                             term_cols,
                             ambiguous_width_double,
-                            typed_move_proof,
-                            delete_move_proof,
                         )
                     };
-                    if let Some(buf) = proof_row_buf.take()
-                        && let Some(ws) = self.windows.get_mut(&wid)
-                    {
-                        ws.poof_row_buf = buf;
-                    }
                     // Publish what this press learned so the matching key RELEASE can
                     // decide LOCK-FREE whether it has anything to encode. Without a
                     // negotiated `REPORT_EVENT_TYPES` the encoder returns an empty vec
@@ -3381,9 +2695,10 @@ impl App {
                     // lock.
                     if let Some(ws) = self.windows.get_mut(&wid) {
                         ws.input_hot = true;
-                        // Every newer press supersedes an unobserved candidate.
-                        // Class-specific code below may arm a new exact proof;
-                        // raw/unsupported input deliberately leaves both dark.
+                        // Every newer press closes the older license term.
+                        // Class-specific code below re-stamps the license its
+                        // own class earns; raw/unsupported input deliberately
+                        // leaves both dark.
                         ws.cursor_glow.clear_typed(input_now);
                         ws.cursor_trail.clear_typed();
                         // ECHO-CORRELATION DEADLINE. Clearing the bypass on the FIRST
@@ -3455,13 +2770,11 @@ impl App {
                         if typed_forward == Some(false) {
                             ws.cursor_glow.note_backspace(input_now);
                         }
-                        // Feed only classifier/cadence state here. Movement
-                        // admission is stricter: after a successful inline PTY
-                        // write the host upgrades a simple same-row scalar to an
-                        // exact origin/content/target candidate. Plain Enter,
-                        // Shift+Enter, Tab, navigation and modified chords have
-                        // no causal landing proof and therefore stay dark even
-                        // when their classifier timestamps are fresh.
+                        // Feed only classifier/cadence state here. The
+                        // LICENSE itself is stamped below, per class: plain
+                        // Enter, Tab and modified chords stamp none at all and
+                        // therefore stay dark, however fresh their classifier
+                        // timestamps are.
                         let shift_enter_insert = enter_like && !typed_enter && is_alt;
                         // Composer-newline remains a useful morphology hint for
                         // non-movement consumers, but it is never provenance.
@@ -3487,10 +2800,10 @@ impl App {
                                 })
                                 .unwrap_or(1)
                                 .max(1);
-                            // Cadence/audio/activity see the commit now, but the
-                            // exact movement candidate is deferred until the
-                            // inline PTY write returns and the terminal proves
-                            // that no output raced ahead of delivery.
+                            // Cadence/audio/activity and the typed LICENSE are
+                            // stamped at the KEY. The engine spends the license
+                            // when the echo actually arrives — one hint, one
+                            // echo.
                             ws.cursor_glow.note_typed_cells(input_now, typed_cells);
                             ws.cursor_trail.note_typed(input_now);
                             // CLICK AT THE KEY, not at the echo (touch-to-glass
@@ -3578,10 +2891,11 @@ impl App {
                                 ws.cursor_cat.on_kill(input_now);
                             }
                         }
-                        // Unsupported movement classes are supersession-only.
-                        // Return, Tab, navigation and kill chords do not carry
-                        // causal content/target evidence, so they close any
-                        // swallowed exact candidate but never arm a replacement.
+                        // Unsupported movement classes close the license and
+                        // do not re-stamp it here. Return, Tab and kill chords
+                        // are not typing, so a swallowed key cannot license the
+                        // relocation that follows one (navigation re-stamps its
+                        // own class immediately below).
                         if (typed_enter && !shift_enter_insert)
                             || navigation_key
                             || kill_key
@@ -3590,23 +2904,20 @@ impl App {
                             ws.cursor_glow.clear_typed(input_now);
                             ws.cursor_trail.clear_typed();
                         }
-                        // ...except NAVIGATION, which since the jump-comet
-                        // work arms the MOTION candidate: a press whose whole
-                        // purpose is to move the cursor is the honest witness
-                        // of the jump that follows. Admission is shape-gated
-                        // engine-side (two or more rows, or a meteor-scale
-                        // sweep), so a small hop or an app that ignores the
-                        // key still lays nothing.
+                        // ...except NAVIGATION, which re-stamps its own class:
+                        // a press whose whole purpose is to move the cursor is
+                        // the honest witness of the jump that follows, and it
+                        // LICENSES that jump. Which choreography fires is the
+                        // classifier's call — a scrub earns no heat and no
+                        // meteor, and the trail's comet stays a typing effect.
                         if navigation_key {
                             ws.cursor_glow.note_motion(input_now);
-                            if let Some(origin) = ws.cursor_glow.cursor_anchor() {
-                                ws.cursor_trail.arm_motion(input_now, origin);
-                            }
+                            ws.cursor_trail.note_navigation(input_now);
                         }
                         // Establish KILL AFTER the generic disarm. Moving kills
                         // need `note_kill`'s fresh nav classifier; stationary
-                        // kills retain only their row-shrink poof proof and arm
-                        // no movement class.
+                        // kills keep only their row-shrink poof witness and
+                        // license no movement class.
                         if kill_key {
                             ws.cursor_glow.note_kill(input_now, kill_moves);
                         }
@@ -3759,7 +3070,6 @@ impl App {
                             }
                         }
                     }
-                    (candidate_was_pending, typed_move_proof, delete_move_proof)
                 } else {
                     // PRESS CUSTODY — the RELEASE arm. `input_now.is_some()` is
                     // exactly `!is_release` (debug-asserted above), so this else is
@@ -3785,7 +3095,6 @@ impl App {
                         let mut t = term_lock(&term);
                         let _ = apply_press_custody(&mut t, press_kind);
                     }
-                    (true, None, None)
                 };
                 // If a paste is currently draining for THIS session, submit this
                 // key onto the SAME per-session FIFO so it cannot overtake the
@@ -3803,55 +3112,6 @@ impl App {
                     input::EgressMode::Interactive,
                 );
                 let outcome = egress_to_outcome(egress);
-                // Exact cursor provenance begins only after a successful INLINE
-                // PTY write. Re-lock and require the terminal generation,
-                // identity, screen, cursor and full source row to remain exactly
-                // the pre-write snapshot. If output raced ahead (including an
-                // ultra-fast echo), the safe cosmetic result is dark; arming
-                // before delivery would let that unrelated batch borrow the key.
-                if wrote_inline
-                    && outcome == InputOutcome::Ok
-                    && !candidate_was_pending
-                    && let Some(armed_at) = input_now
-                    && (typed_move_proof.is_some() || delete_move_proof.is_some())
-                    && let Some(ws) = self.windows.get_mut(&wid)
-                {
-                    let t = term_lock(&term);
-                    let armed = arm_committed_move_after_inline(
-                        ws,
-                        &t,
-                        armed_at,
-                        typed_move_proof,
-                        delete_move_proof,
-                    );
-                    // ATERM_TRACE_SPAWN diagnostic (same once-sampled gate as
-                    // the render trace): did this press arm a content proof,
-                    // and at which processing generation? An `armed=false`
-                    // here means the post-write fence found the terminal
-                    // already past the captured boundary (an ultra-fast echo).
-                    if crate::app_render::trace_spawn_enabled() {
-                        eprintln!(
-                            "ARM armed={} typed={} delete={} gen={}",
-                            armed,
-                            typed_move_proof.is_some(),
-                            delete_move_proof.is_some(),
-                            t.pipeline_timestamps().process_sequence,
-                        );
-                    }
-                }
-                if wrote_inline
-                    && outcome == InputOutcome::Ok
-                    && input_now.is_some()
-                    && typed_forward == Some(false)
-                    && delete_move_proof.is_none()
-                    && let Some(ws) = self.windows.get_mut(&wid)
-                {
-                    // A Backspace with no exact input-time EOL proof may still
-                    // edit normally, but its timestamp/quench state cannot
-                    // license a later unrelated shrink/poof.
-                    ws.cursor_glow.cancel_authored_move_candidate();
-                    ws.cursor_trail.cancel_authored_move_candidate();
-                }
                 // A queued key has not crossed the PTY boundary yet, and a
                 // failed inline write never will. Its arrival-time cursor
                 // licences must not be spendable by concurrent program output.
@@ -4108,8 +3368,8 @@ impl App {
                     unreachable!()
                 };
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    ws.cursor_glow.cancel_authored_move_candidate();
-                    ws.cursor_trail.cancel_authored_move_candidate();
+                    ws.cursor_glow.clear_typed(std::time::Instant::now());
+                    ws.cursor_trail.clear_typed();
                     // `last_mouse_cell` is the PANE-LOCAL cell already published by
                     // `on_cursor_moved` (window cell minus the focused pane origin); do
                     // NOT clobber it with this event's coordinates — a follow-up press
@@ -4171,11 +3431,11 @@ impl App {
             // --- Focus reporting (kills j) -------------------------------------
             ev @ InputEvent::Focus(_) => {
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    // A focus report has no causally observable cursor target.
-                    // Whether the child consumes or ignores it, it supersedes
-                    // an older swallowed typed/delete proof.
-                    ws.cursor_glow.cancel_authored_move_candidate();
-                    ws.cursor_trail.cancel_authored_move_candidate();
+                    // A focus report is not a keystroke. Whether the child
+                    // consumes or ignores it, it closes an older swallowed
+                    // typed/delete license.
+                    ws.cursor_glow.clear_typed(std::time::Instant::now());
+                    ws.cursor_trail.clear_typed();
                 }
                 // SOLE focus-report egress (in `seam_egress`): identical bytes to
                 // the engine's `encode_focus_state` (ESC[I / ESC[O), gated on DEC
@@ -4204,8 +3464,8 @@ impl App {
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.cancel_authored_move_candidate();
-            ws.cursor_trail.cancel_authored_move_candidate();
+            ws.cursor_glow.clear_typed(std::time::Instant::now());
+            ws.cursor_trail.clear_typed();
         }
         // Carry the gesture-relevant fields out before `seam_egress` (which borrows
         // `ev`) for the tracking-OFF local fallback.
@@ -4271,8 +3531,8 @@ impl App {
         sink: &Arc<SinkWriter>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.cancel_authored_move_candidate();
-            ws.cursor_trail.cancel_authored_move_candidate();
+            ws.cursor_glow.clear_typed(std::time::Instant::now());
+            ws.cursor_trail.clear_typed();
         }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6), stamped HOST-side
         // at the input funnel BEFORE egress: an alt-screen wheel becomes PTY
@@ -4684,10 +3944,10 @@ impl App {
         term: &Arc<Mutex<Terminal>>,
     ) -> InputOutcome {
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // Viewport control is not terminal-cursor authorship. Close an
-            // older candidate before the coordinate class changes.
-            ws.cursor_glow.cancel_authored_move_candidate();
-            ws.cursor_trail.cancel_authored_move_candidate();
+            // Viewport control is not typing. Close the older license before
+            // the coordinate class changes.
+            ws.cursor_glow.clear_typed(std::time::Instant::now());
+            ws.cursor_trail.clear_typed();
         }
         // PHOSPHOR alt-screen scroll-quiet gate (design §6): PgUp/PgDn (and
         // the keybinding/controller scroll verbs) are reading intent exactly
@@ -4786,12 +4046,12 @@ impl App {
     ) -> InputOutcome {
         debug_assert!(matches!(&ev, InputEvent::Paste(_)));
         self.snap_to_bottom(wid);
-        // Paste is always asynchronous, so event-loop arrival is not delivery
-        // evidence. Supersede any older candidate and stay dark; a future
-        // completion-correlated text API can arm an exact content proof.
+        // A paste is not the user's fingers moving the caret: it is one
+        // gesture whose landing is asynchronous and arbitrarily large. Close
+        // the older license and stay dark.
         if let Some(ws) = self.windows.get_mut(&wid) {
-            ws.cursor_glow.cancel_authored_move_candidate();
-            ws.cursor_trail.cancel_authored_move_candidate();
+            ws.cursor_glow.clear_typed(std::time::Instant::now());
+            ws.cursor_trail.clear_typed();
         }
         // Enqueue the paste on the session's ordered FIFO: it writes OFF the UI
         // thread (a 16 MiB paste into a stalled child must never block the event
@@ -6011,7 +5271,7 @@ impl App {
         // local overlay/keybinding/native-view action that returns before the
         // PTY seam. Repeats are new attempts too; releases deliberately are not
         // (they may precede a delayed echo from their delivered press).
-        self.cancel_cursor_move_candidate(wid);
+        self.clear_move_license(wid);
         // A repeat belongs to the physical PRESS epoch, not to the content,
         // focus, modifiers, or keybinding state visible when winit delivers it.
         // Route it before even resetting this arrival window's blink: routing any
@@ -8356,10 +7616,10 @@ impl App {
         text: String,
         cursor: Option<(usize, usize)>,
     ) {
-        // Preedit is a newer user-input boundary but has no PTY delivery or
-        // causally correlated landing. Retire a swallowed older proof before
-        // native/modal handling can return locally.
-        self.cancel_cursor_move_candidate(wid);
+        // Preedit is a newer user-input boundary that sends no bytes at all,
+        // so it licenses nothing. Close the older license before native/modal
+        // handling can return locally.
+        self.clear_move_license(wid);
         // Track the composition on the WINDOW before any native-tab routing:
         // `ws.preedit` feeds `on_key`'s suppress_direct_send gate, so a preedit
         // that resolves while a native tab is frontmost must still update it —
@@ -8526,8 +7786,8 @@ impl App {
     pub(crate) fn on_ime_commit(&mut self, wid: WindowId, text: String) {
         // This fence must precede every early consumer below (native tabs,
         // rename/find fields, and the empty commit). A simple terminal commit
-        // may arm its own exact post-delivery proof later in `App::input`.
-        self.cancel_cursor_move_candidate(wid);
+        // stamps its own typed license later, in `App::input`.
+        self.clear_move_license(wid);
         // End the composition on the WINDOW even when a native tab consumes the
         // committed text — the same stale-preedit hazard as `on_ime_preedit`.
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -8747,7 +8007,7 @@ impl App {
     /// ever constructs the variant), so it stays warning-clean on every target.
     pub(crate) fn dispatch_menu_action(&mut self, el: &ActiveEventLoop, action: menu::MenuAction) {
         use menu::MenuAction;
-        self.cancel_front_cursor_move_candidate();
+        self.clear_front_move_license();
         if self.divert_menu_action_around_rename(action) {
             return;
         }
@@ -12439,9 +11699,7 @@ mod keystroke_press_side_effect_tests {
     use std::time::Instant;
 
     use super::{
-        CommittedMoveGeometry, CursorProofProjection, capture_committed_move_proof,
-        capture_delete_move_proof, classify_press, committed_char_cells, committed_expected_cells,
-        committed_move_geometry, committed_text_cells, committed_text_moves_cursor,
+        classify_press, committed_char_cells, committed_text_cells, committed_text_moves_cursor,
     };
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
@@ -12466,53 +11724,6 @@ mod keystroke_press_side_effect_tests {
             event_type: KeyEventType::Press,
         }
     }
-
-    /// Tier-1 projection for one pure input-evidence decision. `admitted` is
-    /// the result returned by the real helper in the calling test. The derived
-    /// action must produce that same bit, while flipping only the bit is the
-    /// non-vacuity control every action carries.
-    fn validate_cursor_input_evidence(action: &str, admitted: bool) {
-        let model = aterm_spec::derive::cursor_input_evidence_model();
-        let source = model.init_state();
-        let mut projected = source.clone();
-        assert!(model.fire(action, &mut projected), "enabled model action");
-        assert_eq!(projected[&"armed"], i64::from(admitted));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &projected,
-            Some(action),
-            "native cursor-input evidence decision",
-        );
-        assert!(ok, "real {action} projection rejected: {why}");
-
-        let mut forged = projected;
-        forged.insert("armed", i64::from(!admitted));
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &forged,
-            Some(action),
-            "native cursor-input evidence negative control",
-        );
-        assert!(!ok, "{action} accepted a forged opposite admission verdict");
-    }
-
-    /// SELECTION CUSTODY (R1) at the seam. Exactly one class of press may take
-    /// the user's reading position: a byte-producing PRESS — "start typing and
-    /// jump to the prompt". Three classes may not:
-    ///
-    ///   RELEASE — a Kitty REPORT_EVENT_TYPES key-up is not typing.
-    ///   REPEAT  — an auto-repeat tick is the same press continuing, and used to
-    ///             re-run the snap+clear at ~30 Hz, destroying any scroll or
-    ///             selection the user made mid-hold.
-    ///   INERT   — a bare modifier/lock key expresses no typing intent. This is
-    ///             the first half of ⌘-C.
-    ///
-    /// The typing case is asserted LAST and unchanged, which is the point: the
-    /// narrowing is surgical, not a removal of "typing snaps".
     #[test]
     fn typing_press_snaps_and_deselects_inert_and_repeat_and_release_do_not() {
         let mut app = App::headless_for_test();
@@ -12759,245 +11970,6 @@ mod keystroke_press_side_effect_tests {
     }
 
     #[test]
-    fn one_multiscalar_grapheme_has_exact_terminal_cell_material() {
-        for (text, cells) in [
-            ("⚠️", vec!['⚠', '\0']),
-            ("🇺🇸", vec!['🇺', '\0']),
-            ("👨‍👩‍👧‍👦", vec!['👨', '\0']),
-            ("e\u{0301}", vec!['e']),
-        ] {
-            assert_eq!(
-                committed_expected_cells(text, false)
-                    .expect("one rendered grapheme has a bounded cell projection")
-                    .as_slice(),
-                cells,
-                "the proof must use Terminal::row_cols_into's lead/continuation projection"
-            );
-        }
-        assert!(
-            committed_expected_cells("中🙂", false).is_none(),
-            "two graphemes still have an unobserved intermediate transition"
-        );
-        assert!(
-            committed_expected_cells("\u{0301}\u{fe0f}\u{200d}", false).is_none(),
-            "a base-less zero-cell cluster must never mint movement evidence"
-        );
-        validate_cursor_input_evidence("ArmMultiscalarGrapheme", true);
-        validate_cursor_input_evidence("RejectMultipleGraphemes", false);
-    }
-
-    #[test]
-    fn cursor_proof_projection_is_identity_or_session_bound() {
-        assert_eq!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), None, None, 7, None),
-            Some(CursorProofProjection::IDENTITY),
-            "the single-pane hot path needs no composed-frame credential"
-        );
-        assert_eq!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(7), Some((0, 0)), 7, None),
-            Some(CursorProofProjection::IDENTITY),
-            "a composed pane at window origin still uses its explicit credentials"
-        );
-        assert!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(8), Some((0, 0)), 7, None)
-                .is_none(),
-            "an origin-aligned sibling pane still carries the wrong session credential"
-        );
-        let split =
-            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), Some((5, 27)), 7, None)
-                .expect("the composed frame names this exact input session and pane origin");
-        assert_eq!(split.row_offset, 5);
-        assert_eq!(split.col_offset, 27);
-        assert_eq!(split.cell((3, 5)), Some((8, 32)));
-        assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(8), Some((5, 27)), 7, None)
-                .is_none(),
-            "a sibling pane's retained anchor cannot authorize this terminal"
-        );
-        assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), None, 7, None).is_none(),
-            "a composed session without its exact layout binding is insufficient"
-        );
-        assert!(
-            CursorProofProjection::from_anchors((1, 3), (2, 4), Some(7), Some((0, 0)), 7, None)
-                .is_none(),
-            "a mismatched projection is never clamped or inferred"
-        );
-        assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 5), Some(7), Some((5, 27)), 7, None)
-                .is_none(),
-            "same-session PTY cursor motion after compose invalidates the retained anchor"
-        );
-        validate_cursor_input_evidence("ArmSplitProjected", true);
-        validate_cursor_input_evidence("RejectSiblingSession", false);
-        validate_cursor_input_evidence("RejectMissingLayoutBinding", false);
-        validate_cursor_input_evidence("RejectMismatchedProjection", false);
-        validate_cursor_input_evidence("RejectStaleAnchor", false);
-
-        // THE MASH EXTENSION WINDOW: with both engines holding the same
-        // unjudged cohort at (2, 4) over 2 cells, a capture caret anywhere in
-        // columns 4..=6 of row 2 projects; outside the window the old exact
-        // law still refuses.
-        let window = Some(((2u16, 4u16), 2u16));
-        for col in 4..=6u16 {
-            assert_eq!(
-                CursorProofProjection::from_anchors((2, 4), (2, col), None, None, 7, window),
-                Some(CursorProofProjection::IDENTITY),
-                "a mash capture caret inside the cohort window projects (col {col})"
-            );
-        }
-        assert!(
-            CursorProofProjection::from_anchors((2, 4), (2, 7), None, None, 7, window).is_none(),
-            "one column past the cohort window is a real relocation"
-        );
-        assert!(
-            CursorProofProjection::from_anchors((2, 4), (3, 4), None, None, 7, window).is_none(),
-            "a different row is outside the cohort window"
-        );
-    }
-
-    #[test]
-    fn only_the_exact_one_cell_deferred_wrap_geometry_is_admitted() {
-        assert_eq!(
-            committed_move_geometry((2, 79), 1, 24, 80, true, true, false),
-            Some(CommittedMoveGeometry {
-                target: (3, 1),
-                material: (3, 0),
-                bottom_scroll: false,
-            }),
-            "a pending right-margin wrap materializes one glyph on the next row"
-        );
-        assert_eq!(
-            committed_move_geometry((2, 79), 2, 24, 80, true, true, false),
-            None,
-            "wide deferred-wrap material may rewrite the source-row tail"
-        );
-        assert_eq!(
-            committed_move_geometry((23, 79), 1, 24, 80, true, true, false),
-            Some(CommittedMoveGeometry {
-                target: (23, 1),
-                material: (23, 0),
-                bottom_scroll: true,
-            }),
-            "bottom pending-wrap geometry is admitted only through the scroll-owned proof"
-        );
-        assert_eq!(
-            committed_move_geometry((2, 79), 2, 24, 80, false, true, false),
-            None,
-            "wide pre-wrap from an unwrapped margin remains dark"
-        );
-        assert_eq!(
-            committed_move_geometry((2, 79), 1, 24, 80, true, false, false),
-            None,
-            "DECAWM off must never borrow wrap geometry"
-        );
-        validate_cursor_input_evidence("ArmDeferredWrap", true);
-        validate_cursor_input_evidence("RejectWideDeferredWrap", false);
-        validate_cursor_input_evidence("ArmBottomScrollFold", true);
-        validate_cursor_input_evidence("RejectBottomScrollSignal", false);
-    }
-
-    #[test]
-    fn reverse_wrap_backspace_requires_mode_previous_row_and_two_row_proof() {
-        let app = App::headless_for_test();
-        let term = app
-            .front_terminal(WindowId(0))
-            .expect("terminal")
-            .term
-            .clone();
-        let mut row = Vec::new();
-        {
-            let mut terminal = term_lock(&term);
-            terminal.resize(6, 40);
-            terminal.process(b"\x1b[?45h\x1b[3;1H");
-            let proof =
-                capture_delete_move_proof(&terminal, &mut row, CursorProofProjection::IDENTITY)
-                    .expect("DECSET-45 col-zero Backspace has two adjacent rows to prove");
-            assert_eq!(proof.terminal_origin, (2, 0));
-            assert_eq!(proof.target, (1, 39));
-            assert!(proof.reverse_target_baseline.is_some());
-
-            terminal.process(b"\x1b[?45l");
-            assert!(
-                capture_delete_move_proof(&terminal, &mut row, CursorProofProjection::IDENTITY,)
-                    .is_none(),
-                "ordinary col-zero Backspace is stationary and stays dark"
-            );
-
-            terminal.process(b"\x1b[?45h\x1b[1;1H");
-            assert!(
-                capture_delete_move_proof(&terminal, &mut row, CursorProofProjection::IDENTITY,)
-                    .is_none(),
-                "the top bound has no previous row and cannot fold"
-            );
-        }
-        validate_cursor_input_evidence("ArmReverseFold", true);
-        validate_cursor_input_evidence("RejectReverseWrapDisabled", false);
-        validate_cursor_input_evidence("RejectReverseTopRow", false);
-        validate_cursor_input_evidence("RejectReverseRowMismatch", false);
-    }
-
-    #[test]
-    fn wide_grid_typing_uses_the_exact_bounded_prefix() {
-        let app = App::headless_for_test();
-        let term = app
-            .front_terminal(WindowId(0))
-            .expect("terminal")
-            .term
-            .clone();
-        let expected = aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(['x']).unwrap();
-        let mut row = Vec::new();
-        {
-            let mut terminal = term_lock(&term);
-            terminal.resize(6, 300);
-            let proof = capture_committed_move_proof(
-                &terminal,
-                expected,
-                &mut row,
-                CursorProofProjection::IDENTITY,
-            )
-            .expect("grid width alone must not darken a left-side caret");
-            assert_eq!(proof.baseline.as_slice().len(), 1);
-            assert!(
-                row.capacity() <= aterm_effects::cursor_trail::EXPECTED_ROW_CELLS_MAX,
-                "bounded capture must not reserve for the 300-column suffix"
-            );
-
-            terminal.process(b"\x1b[1;257H");
-            assert_eq!(terminal.cursor().col, 256);
-            assert!(
-                capture_committed_move_proof(
-                    &terminal,
-                    expected,
-                    &mut row,
-                    CursorProofProjection::IDENTITY,
-                )
-                .is_none(),
-                "a proof frontier beyond the fixed cap still fails closed"
-            );
-
-            terminal.process(b"x");
-            let mut delete_row = vec!['!'];
-            assert!(
-                capture_delete_move_proof(
-                    &terminal,
-                    &mut delete_row,
-                    CursorProofProjection::IDENTITY,
-                )
-                .is_none(),
-                "a full-row delete proof wider than the fixed cap must fail dark"
-            );
-            assert_eq!(
-                delete_row,
-                ['!'],
-                "oversized delete rejection must precede every row scan or allocation"
-            );
-        }
-        validate_cursor_input_evidence("ArmWideGridPrefix", true);
-        validate_cursor_input_evidence("RejectOverCapFrontier", false);
-    }
-
-    #[test]
     fn failed_inline_key_write_revokes_every_new_movement_licence() {
         use std::time::Duration;
 
@@ -13082,33 +12054,37 @@ mod keystroke_press_side_effect_tests {
             assert!(glow_out.is_empty() && trail_out.is_empty());
         }
 
-        // Tier 1: a failed inline write is the same fail-closed
-        // "dispatch never reached PTY" transition as a key queued behind a
-        // paste. Bind the genuine WriteFailed path above to that derived
-        // revocation decision, with the retained-class mutant as control.
-        let model = aterm_spec::derive::rainbow_move_admission_model();
+        // Tier 1: a failed inline write never reached the PTY, so the key it
+        // carried is not an answer to "did a human touch the keyboard just
+        // now" — the licence model's swallow disposition, same as a key this
+        // window ate. Bind the genuine WriteFailed path above to it, with the
+        // retained-stamp mutant as control.
+        let model = aterm_spec::derive::cursor_hint_license_model();
         let mut source = model.init_state();
-        source.insert("typed_class", 1);
+        source.insert("hint", 1);
+        source.insert("arms", 1);
+        source.insert("credit_arms", 1);
         let mut projected = source.clone();
-        projected.insert("typed_class", 0);
-        projected.insert("queued_revoked", 1);
+        projected.insert("hint", 0);
+        projected.insert("cleared", 1);
+        projected.insert("swallowed", 1);
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &source,
             &projected,
-            Some("RevokeQueued"),
+            Some("SwallowedKeyClearsLicense"),
             "failed inline input revocation",
         );
         assert!(ok, "failed-write revocation rejected by model: {why}");
         let mut sticky = projected;
-        sticky.insert("typed_class", 1);
+        sticky.insert("hint", 1);
         let (ok, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &source,
             &sticky,
-            Some("RevokeQueued"),
+            Some("SwallowedKeyClearsLicense"),
             "failed inline input sticky-hint negative control",
         );
         assert!(!ok, "a failed write cannot retain its movement class");
@@ -14254,16 +13230,22 @@ mod paste_cursor_gesture_tests {
 
     #[test]
     fn empty_or_sanitizer_empty_paste_cannot_fund_a_program_trail() {
-        let model = aterm_spec::derive::rainbow_move_admission_model();
+        // Tier 1: an input with no possible cursor movement arms NO licence at
+        // all, which the model states from the other side — a licence stamp
+        // cannot appear unless a real press armed it. The positive case is that
+        // real press; the empty paste's shape is the control below.
+        let model = aterm_spec::derive::cursor_hint_license_model();
         let source = model.init_state();
-        let mut ignored = source.clone();
-        ignored.insert("no_move_ignored", 1);
+        let mut pressed = source.clone();
+        pressed.insert("hint", 1);
+        pressed.insert("arms", 1);
+        pressed.insert("credit_arms", 1);
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &source,
-            &ignored,
-            Some("IgnoreNoMoveInput"),
+            &pressed,
+            Some("PressArmsLicense"),
             "App empty-paste gesture decision",
         );
         assert!(ok, "empty-paste host decision rejected: {why}");
@@ -14276,16 +13258,16 @@ mod paste_cursor_gesture_tests {
         }
 
         // Negative control: the model rejects exactly the old host decision,
-        // where an empty event armed a fresh one-shot hint.
-        let mut wrongly_armed = ignored;
-        wrongly_armed.insert("gesture_hint", 1);
-        wrongly_armed.insert("gesture_arms", 1);
+        // where an empty event conjured a fresh one-shot licence with no press
+        // behind it — a stamp, but no arm to dispose of.
+        let mut wrongly_armed = source.clone();
+        wrongly_armed.insert("hint", 1);
         let (ok, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &source,
             &wrongly_armed,
-            Some("IgnoreNoMoveInput"),
+            Some("PressArmsLicense"),
             "App empty-paste arm negative control",
         );
         assert!(!ok, "an empty paste that arms a move must be rejected");
@@ -14303,32 +13285,35 @@ mod paste_cursor_gesture_tests {
             "a paste queued behind existing egress cannot fund concurrent program motion"
         );
 
-        // Tier 1: a real movement-capable paste first arms the generic class,
-        // then every asynchronous enqueue revokes it before the event loop can
-        // observe a frame. The mutant retains that arrival-time licence.
+        // Tier 1: a real movement-capable paste arms a licence on arrival, and
+        // every asynchronous enqueue clears it before the event loop can
+        // observe a frame — enqueue is not delivery, so the arrival-time stamp
+        // is swallowed at the boundary. The mutant retains it.
         let mut async_armed = model.init_state();
-        async_armed.insert("gesture_hint", 1);
-        async_armed.insert("gesture_arms", 1);
+        async_armed.insert("hint", 1);
+        async_armed.insert("arms", 1);
+        async_armed.insert("credit_arms", 1);
         let mut async_revoked = async_armed.clone();
-        async_revoked.insert("gesture_hint", 0);
-        async_revoked.insert("async_paste_revoked", 1);
+        async_revoked.insert("hint", 0);
+        async_revoked.insert("cleared", 1);
+        async_revoked.insert("swallowed", 1);
         let (ok, why) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &async_armed,
             &async_revoked,
-            Some("RevokeAsyncPaste"),
+            Some("SwallowedKeyClearsLicense"),
             "App asynchronous paste revocation",
         );
         assert!(ok, "async-paste revocation rejected: {why}");
         let mut sticky = async_revoked;
-        sticky.insert("gesture_hint", 1);
+        sticky.insert("hint", 1);
         let (ok, _) = aterm_spec::verify::validate_transition_tiered(
             &model,
             &[],
             &async_armed,
             &sticky,
-            Some("RevokeAsyncPaste"),
+            Some("SwallowedKeyClearsLicense"),
             "App asynchronous paste sticky-hint negative control",
         );
         assert!(
@@ -14702,9 +13687,7 @@ mod vi_dispatch_tests {
 /// when nothing could draw.
 #[cfg(test)]
 mod typed_kitty_summon_tests {
-    use super::{
-        CursorProofProjection, arm_committed_move_after_inline, capture_committed_move_proof,
-    };
+
     use crate::input::{InputEvent, Source};
     use crate::{App, WindowId, term_lock};
     use aterm_spec::derive::cursor_cat_model;
@@ -15008,994 +13991,10 @@ mod typed_kitty_summon_tests {
         bytes[..read as usize].to_vec()
     }
 
-    #[cfg(unix)]
-    fn cursor_move_after_input(ev: InputEvent, queued: bool) -> (bool, bool) {
-        cursor_move_after_input_fixture(ev, queued, CursorInputFixture::Plain)
-    }
 
-    #[cfg(unix)]
-    #[derive(Clone, Copy)]
-    enum CursorInputFixture {
-        Plain,
-        SplitProjected {
-            session_bound: bool,
-            stale_terminal_anchor: bool,
-        },
-        DeferredWrap,
-        BottomScroll {
-            scroll_signal_exact: bool,
-            generation_exact: bool,
-            material_exact: bool,
-        },
-        ReverseFold {
-            mutate_adjacent_row: bool,
-        },
-        WideGrid,
-    }
 
-    #[cfg(unix)]
-    fn confirm_fixture_candidate(
-        ws: &mut crate::WindowState,
-        cur: (u16, u16),
-        now: Instant,
-        generation: aterm_effects::cursor_trail::ContentGeneration,
-    ) -> bool {
-        let generation_evidence =
-            match ws
-                .cursor_glow
-                .confirm_content_candidate(Some(cur), now, generation)
-            {
-                Some(aterm_effects::cursor_glow::ContentCandidateDecision::Confirmed {
-                    at,
-                    origin,
-                    target,
-                }) => {
-                    ws.cursor_trail
-                        .confirm_content_candidate(at, origin, target);
-                    aterm_effects::cursor_glow::ContentGenerationEvidence::Exact
-                }
-                Some(aterm_effects::cursor_glow::ContentCandidateDecision::Retired {
-                    at,
-                    origin,
-                }) => {
-                    ws.cursor_trail.retire_content_candidate(at, origin);
-                    aterm_effects::cursor_glow::ContentGenerationEvidence::None
-                }
-                Some(aterm_effects::cursor_glow::ContentCandidateDecision::Downgraded {
-                    at,
-                    origin,
-                }) => {
-                    ws.cursor_trail.arm_motion(at, origin);
-                    aterm_effects::cursor_glow::ContentGenerationEvidence::AuthoredMotion
-                }
-                Some(aterm_effects::cursor_glow::ContentCandidateDecision::Deferred { .. }) => {
-                    aterm_effects::cursor_glow::ContentGenerationEvidence::DeferredProbe
-                }
-                None => aterm_effects::cursor_glow::ContentGenerationEvidence::None,
-            };
-        let ownership = ws.cursor_glow.observe_content_generation_with_evidence(
-            generation,
-            Some(cur),
-            generation_evidence,
-        );
-        let witness = ws.cursor_glow.batch_wake_witness();
-        ws.cursor_trail
-            .observe_content_generation(generation, ownership, witness.as_ref());
-        generation_evidence == aterm_effects::cursor_glow::ContentGenerationEvidence::Exact
-    }
 
-    #[cfg(unix)]
-    fn cursor_move_after_input_fixture(
-        ev: InputEvent,
-        queued: bool,
-        fixture: CursorInputFixture,
-    ) -> (bool, bool) {
-        let (glow, trail, _) = cursor_move_after_input_fixture_with_pulse(ev, queued, fixture);
-        (glow, trail)
-    }
 
-    #[cfg(unix)]
-    fn cursor_move_after_input_fixture_with_pulse(
-        ev: InputEvent,
-        queued: bool,
-        fixture: CursorInputFixture,
-    ) -> (
-        bool,
-        bool,
-        Option<aterm_effects::cursor_glow::CursorCatMotionKind>,
-    ) {
-        use crate::cursor_glow::{Geom, GlowStyle};
-        use crate::cursor_trail::TrailConfig;
-
-        let (mut app, sink, pipe) = app_with_private_pty();
-        let wid = WindowId(0);
-        let master = sink.master();
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-        let terminal = app.front_terminal(wid).unwrap().term.clone();
-        let session = app.front_terminal(wid).unwrap().session;
-        let grid_cols: u16 = if matches!(fixture, CursorInputFixture::WideGrid) {
-            300
-        } else {
-            40
-        };
-        let (local_seed, effect_offset, baseline_generation, baseline_scroll) = {
-            let mut term = term_lock(&terminal);
-            term.resize(6, grid_cols);
-            let (seed, offset) = match fixture {
-                CursorInputFixture::Plain
-                | CursorInputFixture::SplitProjected { .. }
-                | CursorInputFixture::WideGrid => ((0, 0), (0, 0)),
-                CursorInputFixture::DeferredWrap => {
-                    term.process(&vec![b'q'; usize::from(grid_cols)]);
-                    assert!(term.grid().pending_wrap(), "fixture owns a deferred wrap");
-                    let cursor = term.cursor();
-                    ((cursor.row, cursor.col), (0, 0))
-                }
-                CursorInputFixture::BottomScroll { .. } => {
-                    term.process(b"\x1b[6;1H");
-                    term.process(&vec![b'q'; usize::from(grid_cols)]);
-                    assert!(
-                        term.grid().pending_wrap(),
-                        "fixture owns a bottom deferred wrap"
-                    );
-                    let cursor = term.cursor();
-                    assert_eq!((cursor.row, cursor.col), (5, grid_cols - 1));
-                    ((cursor.row, cursor.col), (0, 0))
-                }
-                CursorInputFixture::ReverseFold { .. } => {
-                    term.process(b"\x1b[2;1H");
-                    term.process(&vec![b'r'; usize::from(grid_cols)]);
-                    term.process(b"\x1b[3;6Hs\x1b[3;1H\x1b[?45h");
-                    let cursor = term.cursor();
-                    assert_eq!((cursor.row, cursor.col), (2, 0));
-                    ((cursor.row, cursor.col), (0, 0))
-                }
-            };
-            (
-                seed,
-                offset,
-                aterm_effects::cursor_trail::ContentGeneration {
-                    process_sequence: term.pipeline_timestamps().process_sequence,
-                    terminal_id: term.render_identity(),
-                    alternate_screen: term.is_alternate_screen(),
-                },
-                term.content_scroll_state(),
-            )
-        };
-        let effect_offset = match fixture {
-            CursorInputFixture::SplitProjected { .. } => (2, 21),
-            _ => effect_offset,
-        };
-        let effect_seed = (
-            local_seed.0 + effect_offset.0,
-            local_seed.1 + effect_offset.1,
-        );
-        let focused_view = app
-            .active_visible_leaf_plan(wid)
-            .expect("fixture has a visible terminal leaf")
-            .focused;
-        let glow_cfg = app.glow_config();
-        assert!(glow_cfg.enabled && matches!(glow_cfg.style, GlowStyle::RainbowKitty));
-        let trail_cfg = TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(300),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.0,
-            warmth: 0.0,
-        };
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 6,
-            cols: usize::from(grid_cols),
-            origin_x: 0,
-            origin_y: 0,
-            win_w: grid_cols.saturating_mul(8),
-            win_h: 96,
-            head: 0,
-        };
-        let seed = Instant::now();
-        let mut glow_out = Vec::new();
-        let mut trail_out = Vec::new();
-        {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            if let CursorInputFixture::SplitProjected { session_bound, .. } = fixture {
-                ws.composed_cursor_effect_valid = true;
-                ws.composed_cursor_effect_session = Some(if session_bound {
-                    session
-                } else {
-                    session.wrapping_add(1)
-                });
-                ws.last_layout_coordinate_space = Some(crate::LayoutCoordinateSpaceKey {
-                    route: crate::VisibleContentRoute::Terminal { composed: true },
-                    focused: focused_view,
-                    zoomed: false,
-                    x: f32::from(effect_offset.1).to_bits(),
-                    y: f32::from(effect_offset.0).to_bits(),
-                    width: f32::from(grid_cols).to_bits(),
-                    height: 6.0f32.to_bits(),
-                    cell_width: 8,
-                    cell_height: 16,
-                    pad: 0,
-                    pad_top: 0,
-                    head: 0,
-                    scale: 1.0f64.to_bits(),
-                    surface_width: u32::from(grid_cols) * 8,
-                    surface_height: 96,
-                });
-            }
-            ws.cursor_glow
-                .tick(Some(effect_seed), seed, &glow_cfg, geom, &mut glow_out);
-            ws.cursor_trail
-                .tick(Some(effect_seed), seed, &trail_cfg, &mut trail_out);
-            assert_eq!(
-                ws.cursor_glow.observe_content_generation(
-                    baseline_generation,
-                    Some(effect_seed),
-                    false,
-                ),
-                aterm_effects::cursor_trail::GenerationOwnership::Steady,
-            );
-            ws.cursor_trail.observe_content_generation(
-                baseline_generation,
-                aterm_effects::cursor_trail::GenerationOwnership::Steady,
-                None,
-            );
-            if matches!(fixture, CursorInputFixture::BottomScroll { .. }) {
-                ws.cursor_scroll_state = Some(baseline_scroll);
-            }
-        }
-        let typed_echo = (!queued)
-            .then(|| match (fixture, &ev) {
-                (
-                    CursorInputFixture::ReverseFold {
-                        mutate_adjacent_row,
-                    },
-                    InputEvent::Key {
-                        key: Key::Named(NamedKey::Backspace),
-                        ..
-                    },
-                ) => Some(if mutate_adjacent_row {
-                    "\x1b[2;2HX\x1b[3;1H\x08".to_string()
-                } else {
-                    "\x08".to_string()
-                }),
-                (
-                    CursorInputFixture::BottomScroll { material_exact, .. },
-                    InputEvent::Key {
-                        key: Key::Character(_),
-                        ..
-                    },
-                ) => Some(if material_exact { "x" } else { "y" }.to_string()),
-                (
-                    _,
-                    InputEvent::Key {
-                        key: Key::Character(ch),
-                        ..
-                    },
-                ) => Some(ch.to_string()),
-                (_, InputEvent::Text(text)) => Some(text.clone()),
-                _ => None,
-            })
-            .flatten();
-        if matches!(
-            fixture,
-            CursorInputFixture::SplitProjected {
-                stale_terminal_anchor: true,
-                ..
-            }
-        ) {
-            let mut term = term_lock(&terminal);
-            term.process(b"\x1b[1;6H");
-            assert_eq!(
-                (term.cursor().row, term.cursor().col),
-                (0, 5),
-                "PTY output moved the local caret after the retained composed frame"
-            );
-        }
-        let pin = queued.then(|| super::paste_order::pin_ordering_for_test(&sink));
-        assert_eq!(
-            app.input(wid, ev, Source::Human),
-            crate::input::InputOutcome::Ok
-        );
-        let mut observed_cur = (effect_seed.0, effect_seed.1.saturating_add(1));
-        if let Some(echo) = typed_echo {
-            let (local_cur, generation, content_scroll_state, mut row, mut above, mut below) = {
-                let mut term = term_lock(&terminal);
-                if matches!(
-                    fixture,
-                    CursorInputFixture::BottomScroll {
-                        generation_exact: false,
-                        ..
-                    }
-                ) {
-                    term.process(b"\x1b]0;intervening\x07");
-                }
-                term.process(echo.as_bytes());
-                let cursor = term.cursor();
-                let mut row = Vec::new();
-                term.row_cols_into(usize::from(cursor.row), &mut row);
-                let capture_neighbor = |neighbor: Option<u16>| {
-                    neighbor.map(|neighbor| {
-                        let mut cells = Vec::new();
-                        term.row_cols_into(usize::from(neighbor), &mut cells);
-                        cells.resize(usize::from(term.cols()), ' ');
-                        cells
-                    })
-                };
-                let above = capture_neighbor(cursor.row.checked_sub(1));
-                let below =
-                    capture_neighbor(cursor.row.checked_add(1).filter(|row| *row < term.rows()));
-                // `row_cols_into` preserves the grid's sparse physical row;
-                // exact evidence compares the canonical visible row, including
-                // its implicit blank tail.
-                row.resize(usize::from(term.cols()), ' ');
-                (
-                    (cursor.row, cursor.col),
-                    aterm_effects::cursor_trail::ContentGeneration {
-                        process_sequence: term.pipeline_timestamps().process_sequence,
-                        terminal_id: term.render_identity(),
-                        alternate_screen: term.is_alternate_screen(),
-                    },
-                    term.content_scroll_state(),
-                    row,
-                    above,
-                    below,
-                )
-            };
-            if effect_offset.1 != 0 {
-                let shift = |row: &mut Vec<char>| {
-                    let len = row.len();
-                    row.resize(len + usize::from(effect_offset.1), ' ');
-                    row.rotate_right(usize::from(effect_offset.1));
-                };
-                shift(&mut row);
-                if let Some(above) = above.as_mut() {
-                    shift(above);
-                }
-                if let Some(below) = below.as_mut() {
-                    shift(below);
-                }
-            }
-            let cur = (local_cur.0 + effect_offset.0, local_cur.1 + effect_offset.1);
-            observed_cur = cur;
-            let ws = app.windows.get_mut(&wid).unwrap();
-            if let CursorInputFixture::BottomScroll {
-                scroll_signal_exact,
-                ..
-            } = fixture
-            {
-                if !scroll_signal_exact {
-                    ws.cursor_scroll_state = Some(aterm_core::terminal::ContentScrollState {
-                        invalidation_epoch: content_scroll_state.invalidation_epoch.wrapping_add(1),
-                        ..content_scroll_state
-                    });
-                }
-                let change = crate::app_render::sync_cursor_effect_scroll(ws, content_scroll_state);
-                if scroll_signal_exact {
-                    assert_eq!(change.translated_rows, 1);
-                    assert!(!change.invalidated);
-                } else {
-                    assert!(change.invalidated);
-                }
-                // Shipping render order: the scroll frame deliberately has no
-                // row probe, then the generation fence runs. The engine keeps
-                // only an exact one-row candidate for the following frame;
-                // both ticks must hold its translated departure anchor without
-                // admitting light before material is known.
-                assert!(!confirm_fixture_candidate(
-                    ws,
-                    cur,
-                    Instant::now(),
-                    generation
-                ));
-                let hold_at = Instant::now();
-                ws.cursor_glow
-                    .tick(Some(cur), hold_at, &glow_cfg, geom, &mut glow_out);
-                ws.cursor_trail
-                    .tick(Some(cur), hold_at, &trail_cfg, &mut trail_out);
-            }
-            ws.cursor_glow
-                .observe_row(cur.0, cur.1, &row, Instant::now());
-            ws.cursor_glow
-                .observe_neighbor_rows(above.as_deref(), below.as_deref());
-            confirm_fixture_candidate(ws, cur, Instant::now(), generation);
-        }
-        let moved = Instant::now();
-        let ws = app.windows.get_mut(&wid).unwrap();
-        let glow_fp =
-            ws.cursor_glow
-                .tick(Some(observed_cur), moved, &glow_cfg, geom, &mut glow_out);
-        let trail_fp = ws
-            .cursor_trail
-            .tick(Some(observed_cur), moved, &trail_cfg, &mut trail_out);
-        let glow_admitted = glow_fp != 0
-            || !glow_out.is_empty()
-            || !ws.cursor_glow.halos().is_empty()
-            || !ws.cursor_glow.under_quads().is_empty();
-        let trail_admitted = trail_fp != 0 || !trail_out.is_empty();
-
-        drop(pin);
-        for _ in 0..200 {
-            if !super::paste_order::is_ordering(master) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        assert!(!super::paste_order::is_ordering(master));
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
-        let cat_motion = ws
-            .cursor_glow
-            .take_cursor_cat_motion_pulse()
-            .map(|pulse| pulse.kind);
-        (glow_admitted, trail_admitted, cat_motion)
-    }
-
-    /// Only a stable inline delivery followed by the exact next-generation
-    /// content diff can light. Queued, Return, Tab, and zero-cell input stay
-    /// dark even if a numerically matching program move follows.
-    #[cfg(unix)]
-    #[test]
-    fn queued_key_and_tab_cannot_fund_concurrent_program_motion() {
-        assert_eq!(
-            cursor_move_after_input(key('x'), false),
-            (true, true),
-            "ordinary inline typing retains both cursor effects"
-        );
-        assert_eq!(
-            cursor_move_after_input(named(NamedKey::Enter), false),
-            (false, false),
-            "Return has no causal content witness"
-        );
-        assert_eq!(
-            cursor_move_after_input(key('x'), true),
-            (false, false),
-            "queued typed input has not authored a cursor landing yet"
-        );
-        assert_eq!(
-            cursor_move_after_input(named(NamedKey::Tab), true),
-            (false, false),
-            "queued Tab cannot license concurrent PTY output"
-        );
-        assert_eq!(
-            cursor_move_after_input(named(NamedKey::Tab), false),
-            (false, false),
-            "even delivered Tab cannot lend a timestamp to a later CUP"
-        );
-        assert_eq!(
-            cursor_move_after_input(InputEvent::Text("\u{0301}".to_string()), false),
-            (false, false),
-            "a zero-cell IME commit cannot lend a hint to later motion"
-        );
-        assert_eq!(
-            cursor_move_after_input(InputEvent::Text("中".to_string()), false),
-            (true, true),
-            "simple width-two CJK retains exact native content provenance"
-        );
-        assert_eq!(
-            cursor_move_after_input(InputEvent::Text("⚠️".to_string()), false),
-            (true, true),
-            "one multi-scalar grapheme retains its exact rendered-cell provenance"
-        );
-        assert_eq!(
-            cursor_move_after_input(InputEvent::Text("中🙂".to_string()), false),
-            (false, false),
-            "a multi-grapheme commit has no observable intermediate transition"
-        );
-
-        // Tier-1 projection of the real `wrote_inline == false` branch. The
-        // observable dark result above is paired with the abstract one-shot
-        // class withdrawal; retaining only that class is the negative control.
-        let model = aterm_spec::derive::rainbow_move_admission_model();
-        let mut armed = model.init_state();
-        armed.insert("typed_class", 1);
-        let mut revoked = armed.clone();
-        revoked.insert("typed_class", 0);
-        revoked.insert("queued_revoked", 1);
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &armed,
-            &revoked,
-            Some("RevokeQueued"),
-            "App queued cursor-licence revocation",
-        );
-        assert!(ok, "real queued-revocation decision rejected: {why}");
-        let mut sticky = revoked;
-        sticky.insert("typed_class", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &armed,
-            &sticky,
-            Some("RevokeQueued"),
-            "App queued-revocation negative control",
-        );
-        assert!(!ok, "a queued dispatch cannot retain its arrival licence");
-
-        // The exact-candidate lifecycle models the same shipping branch: the
-        // input-time baseline was captured, but a queued delivery consumes it
-        // before any content generation can be attributed to this key.
-        let candidate_model = aterm_spec::derive::cursor_move_candidate_model();
-        let mut captured = candidate_model.init_state();
-        assert!(candidate_model.fire("ArmTyped", &mut captured));
-        let mut queued = captured.clone();
-        assert!(candidate_model.fire("DeliverQueued", &mut queued));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &candidate_model,
-            &[],
-            &captured,
-            &queued,
-            Some("DeliverQueued"),
-            "real queued exact-candidate retirement",
-        );
-        assert!(ok, "queued exact candidate rejected: {why}");
-        let mut forged = queued;
-        forged.insert("phase", 2);
-        forged.insert("delivery_stable", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &candidate_model,
-            &[],
-            &captured,
-            &forged,
-            Some("DeliverQueued"),
-            "forged queued candidate retention",
-        );
-        assert!(!ok, "queued input cannot retain an armed exact candidate");
-    }
-
-    /// Real App-input binding for the coordinate transitions the old
-    /// origin-equality gate made structurally dark. The split case projects
-    /// both the candidate and row proof into window coordinates only with the
-    /// focused session credential; the wrap case starts from the Terminal's
-    /// real pending-wrap bit and confirms material on the next row.
-    #[cfg(unix)]
-    #[test]
-    fn split_projection_and_deferred_wrap_light_only_with_exact_evidence() {
-        assert_eq!(
-            cursor_move_after_input_fixture(
-                key('x'),
-                false,
-                CursorInputFixture::SplitProjected {
-                    session_bound: true,
-                    stale_terminal_anchor: false,
-                },
-            ),
-            (true, true),
-            "the focused split pane's exact window-space projection admits both engines"
-        );
-        assert_eq!(
-            cursor_move_after_input_fixture(
-                key('x'),
-                false,
-                CursorInputFixture::SplitProjected {
-                    session_bound: false,
-                    stale_terminal_anchor: false,
-                },
-            ),
-            (false, false),
-            "an identical geometric offset bound to a sibling session stays dark"
-        );
-        let stale_anchor = cursor_move_after_input_fixture(
-            key('x'),
-            false,
-            CursorInputFixture::SplitProjected {
-                session_bound: true,
-                stale_terminal_anchor: true,
-            },
-        );
-        assert_eq!(
-            stale_anchor,
-            (false, false),
-            "same-session PTY cursor motion after compose must revoke the stale anchor"
-        );
-        let stale_model = aterm_spec::derive::cursor_input_evidence_model();
-        let stale_source = stale_model.init_state();
-        let mut stale_projected = stale_source.clone();
-        assert!(stale_model.fire("RejectStaleAnchor", &mut stale_projected));
-        assert_eq!(
-            stale_projected[&"armed"],
-            i64::from(stale_anchor.0),
-            "the real interleave decision projects onto the derived rejection"
-        );
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &stale_model,
-            &[],
-            &stale_source,
-            &stale_projected,
-            Some("RejectStaleAnchor"),
-            "real same-session PTY interleave rejection",
-        );
-        assert!(ok, "stale-anchor rejection projection failed: {why}");
-        let mut stale_forged = stale_projected;
-        stale_forged.insert("armed", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &stale_model,
-            &[],
-            &stale_source,
-            &stale_forged,
-            Some("RejectStaleAnchor"),
-            "forged stale-anchor admission",
-        );
-        assert!(
-            !ok,
-            "the stale-anchor action must reject a forged admission"
-        );
-        assert_eq!(
-            cursor_move_after_input_fixture(key('x'), false, CursorInputFixture::WideGrid),
-            (true, true),
-            "a 300-column grid with a bounded left-side proof keeps both effects"
-        );
-        let wrap =
-            cursor_move_after_input_fixture(key('x'), false, CursorInputFixture::DeferredWrap);
-        assert_eq!(
-            wrap,
-            (true, true),
-            "one cell typed from a real deferred margin wrap keeps a continuous trail"
-        );
-        let model = aterm_spec::derive::cursor_input_evidence_model();
-        let source = model.init_state();
-        let mut projected = source.clone();
-        assert!(model.fire("ArmDeferredWrap", &mut projected));
-        assert_eq!(projected[&"armed"], i64::from(wrap.0));
-        assert_eq!(projected[&"trail_lit"], i64::from(wrap.1));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &projected,
-            Some("ArmDeferredWrap"),
-            "real deferred-wrap trail liveness",
-        );
-        assert!(ok, "real deferred-wrap output projection rejected: {why}");
-        let mut dark = projected;
-        dark.insert("trail_lit", 0);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &dark,
-            Some("ArmDeferredWrap"),
-            "forged deferred-wrap trail blackout",
-        );
-        assert!(!ok, "the derived transition must reject a wrap blackout");
-    }
-
-    /// Real App-input reachability bind for the ordinary long-running-shell
-    /// fold: a pending one-cell wrap at the physical bottom row produces one
-    /// uniform ContentScrollState step, the sole next processing generation,
-    /// exact fresh-line material, and a FoldForward kitty pulse. Removing any
-    /// one credential leaves both engines and the companion dark.
-    #[cfg(unix)]
-    #[test]
-    fn bottom_pending_wrap_reaches_all_consumers_only_with_exact_scroll_evidence() {
-        use aterm_effects::cursor_glow::CursorCatMotionKind;
-
-        let exact = cursor_move_after_input_fixture_with_pulse(
-            key('x'),
-            false,
-            CursorInputFixture::BottomScroll {
-                scroll_signal_exact: true,
-                generation_exact: true,
-                material_exact: true,
-            },
-        );
-        assert_eq!(
-            exact,
-            (true, true, Some(CursorCatMotionKind::FoldForward)),
-            "a real bottom DECAWM fold reaches glow, the one-cell trail seam, and kitty placement"
-        );
-
-        let bad_scroll = cursor_move_after_input_fixture_with_pulse(
-            key('x'),
-            false,
-            CursorInputFixture::BottomScroll {
-                scroll_signal_exact: false,
-                generation_exact: true,
-                material_exact: true,
-            },
-        );
-        assert_eq!(bad_scroll, (false, false, None));
-
-        let skipped_generation = cursor_move_after_input_fixture_with_pulse(
-            key('x'),
-            false,
-            CursorInputFixture::BottomScroll {
-                scroll_signal_exact: true,
-                generation_exact: false,
-                material_exact: true,
-            },
-        );
-        assert_eq!(skipped_generation, (false, false, None));
-
-        let wrong_material = cursor_move_after_input_fixture_with_pulse(
-            key('x'),
-            false,
-            CursorInputFixture::BottomScroll {
-                scroll_signal_exact: true,
-                generation_exact: true,
-                material_exact: false,
-            },
-        );
-        assert_eq!(wrong_material, (false, false, None));
-
-        let model = aterm_spec::derive::cursor_input_evidence_model();
-        let source = model.init_state();
-        let mut admitted = source.clone();
-        assert!(model.fire("ArmBottomScrollFold", &mut admitted));
-        assert_eq!(admitted[&"armed"], i64::from(exact.0));
-        assert_eq!(admitted[&"trail_lit"], i64::from(exact.1));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &admitted,
-            Some("ArmBottomScrollFold"),
-            "real bottom-scroll fold admission",
-        );
-        assert!(ok, "bottom-scroll admission projection failed: {why}");
-
-        for (action, observed, label) in [
-            (
-                "RejectBottomScrollSignal",
-                bad_scroll,
-                "invalidated scroll signal",
-            ),
-            (
-                "RejectBottomScrollGeneration",
-                skipped_generation,
-                "skipped processing generation",
-            ),
-            (
-                "RejectBottomScrollMaterial",
-                wrong_material,
-                "wrong fresh-line material",
-            ),
-        ] {
-            let mut rejected = source.clone();
-            assert!(model.fire(action, &mut rejected));
-            assert_eq!(rejected[&"armed"], i64::from(observed.0), "{label}");
-            let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &source,
-                &rejected,
-                Some(action),
-                label,
-            );
-            assert!(ok, "{label} projection failed: {why}");
-            let mut forged = rejected;
-            forged.insert("armed", 1);
-            let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-                &model,
-                &[],
-                &source,
-                &forged,
-                Some(action),
-                "forged bottom-scroll admission",
-            );
-            assert!(!ok, "{label} must reject a forged admission");
-        }
-    }
-
-    /// Tier-1 reachability bind for the DECSET-45 inverse fold. The real
-    /// Terminal processes an actual BS from local column zero, CursorGlow
-    /// confirms both adjacent rows in the sole next generation, CursorTrail
-    /// emits only the seam cell, and the authenticated kitty pulse carries the
-    /// reverse-fold placement verdict. A same-batch row rewrite is the negative
-    /// control: exact cursor geometry alone cannot spend it.
-    #[cfg(unix)]
-    #[test]
-    fn reverse_wrap_backspace_reaches_both_engines_and_kitty_only_with_two_stable_rows() {
-        use aterm_effects::cursor_glow::CursorCatMotionKind;
-
-        let exact = cursor_move_after_input_fixture_with_pulse(
-            named(NamedKey::Backspace),
-            false,
-            CursorInputFixture::ReverseFold {
-                mutate_adjacent_row: false,
-            },
-        );
-        assert_eq!(
-            exact,
-            (true, true, Some(CursorCatMotionKind::FoldReverse)),
-            "an exact reverse-wrap echo must reach glow, classic trail, and kitty placement"
-        );
-
-        let drift = cursor_move_after_input_fixture_with_pulse(
-            named(NamedKey::Backspace),
-            false,
-            CursorInputFixture::ReverseFold {
-                mutate_adjacent_row: true,
-            },
-        );
-        assert_eq!(
-            drift,
-            (false, false, None),
-            "rewriting either evidenced row in the BS batch retires the inverse fold"
-        );
-
-        let model = aterm_spec::derive::cursor_input_evidence_model();
-        let source = model.init_state();
-        let mut admitted = source.clone();
-        assert!(model.fire("ArmReverseFold", &mut admitted));
-        assert_eq!(admitted[&"armed"], i64::from(exact.0));
-        assert_eq!(admitted[&"trail_lit"], i64::from(exact.1));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &admitted,
-            Some("ArmReverseFold"),
-            "real DECSET-45 reverse-fold admission",
-        );
-        assert!(ok, "reverse-fold admission projection failed: {why}");
-
-        let mut rejected = source.clone();
-        assert!(model.fire("RejectReverseRowMismatch", &mut rejected));
-        assert_eq!(rejected[&"armed"], i64::from(drift.0));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &rejected,
-            Some("RejectReverseRowMismatch"),
-            "real reverse-fold adjacent-row mismatch",
-        );
-        assert!(ok, "reverse-fold rejection projection failed: {why}");
-        let mut forged = rejected;
-        forged.insert("armed", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &source,
-            &forged,
-            Some("RejectReverseRowMismatch"),
-            "forged reverse-fold row-mismatch admission",
-        );
-        assert!(!ok, "row drift must reject a forged reverse-fold admission");
-    }
-
-    /// Tier-1 bind for the native post-inline delivery fence. The exact same
-    /// production helper that `App::input` calls accepts a stable boundary and
-    /// rejects an intervening parser generation before arming either engine.
-    #[test]
-    fn native_exact_candidate_arms_only_after_a_stable_inline_boundary() {
-        use crate::cursor_glow::{Geom, GlowStyle};
-        use crate::cursor_trail::TrailConfig;
-
-        let prepare = || {
-            let mut app = App::headless_for_test();
-            let wid = WindowId(0);
-            app.config.cursor_trail = Some(true);
-            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
-            let glow_cfg = app.glow_config();
-            assert!(matches!(glow_cfg.style, GlowStyle::RainbowKitty));
-            let trail_cfg = TrailConfig {
-                enabled: true,
-                duration: Duration::from_millis(300),
-                max_len: 24,
-                color: 0x0050_FA7B,
-                intensity: 0.0,
-                warmth: 0.0,
-            };
-            let geom = Geom {
-                cw: 8,
-                ch: 16,
-                rows: 6,
-                cols: 40,
-                origin_x: 0,
-                origin_y: 0,
-                win_w: 320,
-                win_h: 96,
-                head: 0,
-            };
-            let now = Instant::now();
-            let mut glow_out = Vec::new();
-            let mut trail_out = Vec::new();
-            {
-                let ws = app.windows.get_mut(&wid).unwrap();
-                ws.cursor_glow
-                    .tick(Some((0, 0)), now, &glow_cfg, geom, &mut glow_out);
-                ws.cursor_trail
-                    .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
-            }
-            let terminal = app.front_terminal(wid).unwrap().term.clone();
-            let proof = {
-                let term = term_lock(&terminal);
-                let mut row = Vec::new();
-                capture_committed_move_proof(
-                    &term,
-                    aterm_effects::cursor_trail::ExpectedCellSpan::from_cells(['x']).unwrap(),
-                    &mut row,
-                    CursorProofProjection::IDENTITY,
-                )
-                .unwrap()
-            };
-            (app, terminal, proof, now)
-        };
-
-        let (mut stable, stable_term, stable_proof, stable_at) = prepare();
-        {
-            let term = term_lock(&stable_term);
-            let ws = stable.windows.get_mut(&WindowId(0)).unwrap();
-            assert!(arm_committed_move_after_inline(
-                ws,
-                &term,
-                stable_at,
-                Some(stable_proof),
-                None,
-            ));
-            assert!(
-                ws.cursor_glow.move_candidate_pending() && ws.cursor_trail.move_candidate_pending()
-            );
-        }
-
-        let (mut raced, raced_term, raced_proof, raced_at) = prepare();
-        {
-            // A title batch changes no source row or cursor, but it is still an
-            // intervening child-output generation and therefore breaks causal
-            // attribution before the post-write arm.
-            term_lock(&raced_term).process(b"\x1b]0;unrelated\x07");
-            let term = term_lock(&raced_term);
-            let ws = raced.windows.get_mut(&WindowId(0)).unwrap();
-            assert!(!arm_committed_move_after_inline(
-                ws,
-                &term,
-                raced_at,
-                Some(raced_proof),
-                None,
-            ));
-            assert!(
-                !ws.cursor_glow.move_candidate_pending()
-                    && !ws.cursor_trail.move_candidate_pending()
-            );
-        }
-
-        let model = aterm_spec::derive::cursor_move_candidate_model();
-        let source = model.init_state();
-        let mut captured = source.clone();
-        assert!(model.fire("ArmTyped", &mut captured));
-        let mut stable_projection = captured.clone();
-        assert!(model.fire("DeliverStable", &mut stable_projection));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &captured,
-            &stable_projection,
-            Some("DeliverStable"),
-            "native stable inline delivery",
-        );
-        assert!(ok, "stable native delivery rejected: {why}");
-        let mut raced_projection = captured.clone();
-        assert!(model.fire("DeliverRaced", &mut raced_projection));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &captured,
-            &raced_projection,
-            Some("DeliverRaced"),
-            "native pre-arm generation race",
-        );
-        assert!(ok, "raced native delivery rejected: {why}");
-        let mut forged = raced_projection;
-        forged.insert("phase", 2);
-        forged.insert("delivery_stable", 1);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &captured,
-            &forged,
-            Some("DeliverRaced"),
-            "native race forged stable negative control",
-        );
-        assert!(!ok, "an intervening native generation must fail closed");
-    }
 
     /// The reply-bearing control `signal` fence is deliberately not an empty
     /// synthetic key. It clears only the two exact movement candidates: no PTY
@@ -16053,8 +14052,8 @@ mod typed_kitty_summon_tests {
                 .tick(Some((0, 0)), now, &trail_cfg, &mut trail_out);
             ws.cursor_glow.note_synthetic_move(now);
             ws.cursor_trail.note_synthetic_move(now);
-            assert!(ws.cursor_glow.move_candidate_pending());
-            assert!(ws.cursor_trail.move_candidate_pending());
+            assert!(ws.cursor_glow.move_licensed(now));
+            assert!(ws.cursor_trail.move_licensed(now));
         }
         let (cadence_before, rain_deadline_before, input_hot_before) = {
             let ws = app.windows.get_mut(&wid).unwrap();
@@ -16066,11 +14065,11 @@ mod typed_kitty_summon_tests {
             )
         };
 
-        assert!(app.cancel_cursor_move_candidate_for_session(session));
+        assert!(app.clear_move_license_for_session(session));
         for candidate in [wid, second] {
             let ws = &app.windows[&candidate];
-            assert!(!ws.cursor_glow.move_candidate_pending());
-            assert!(!ws.cursor_trail.move_candidate_pending());
+            assert!(!ws.cursor_glow.move_licensed(now));
+            assert!(!ws.cursor_trail.move_licensed(now));
         }
         let ws = &app.windows[&wid];
         assert_eq!(ws.typing_cadence.sample(now), cadence_before);
@@ -16081,34 +14080,8 @@ mod typed_kitty_summon_tests {
             "candidate fence writes no PTY bytes"
         );
 
-        let model = aterm_spec::derive::cursor_move_candidate_model();
-        let mut pending = model.init_state();
-        assert!(model.fire("ArmSynthetic", &mut pending));
-        let mut canceled = pending.clone();
-        assert!(model.fire("UnsupportedInput", &mut canceled));
-        let (ok, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &pending,
-            &canceled,
-            Some("UnsupportedInput"),
-            "visible-front signal candidate-only fence",
-        );
-        assert!(ok, "control cancellation projection rejected: {why}");
-        let mut forged = canceled;
-        forged.insert("phase", 2);
-        let (ok, _) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &pending,
-            &forged,
-            Some("UnsupportedInput"),
-            "forged signal candidate retention",
-        );
-        assert!(!ok, "front signal cannot retain an older exact proof");
-
         assert!(
-            !app.cancel_cursor_move_candidate_for_session(session.wrapping_add(1)),
+            !app.clear_move_license_for_session(session.wrapping_add(1)),
             "a session that is no longer front has no visible candidate to clear"
         );
         drop(app);
@@ -16160,8 +14133,8 @@ mod typed_kitty_summon_tests {
 
             boundary(&mut app, wid);
             let ws = app.windows.get_mut(&wid).unwrap();
-            assert!(!ws.cursor_glow.move_candidate_pending());
-            assert!(!ws.cursor_trail.move_candidate_pending());
+            assert!(!ws.cursor_glow.move_licensed(now));
+            assert!(!ws.cursor_trail.move_licensed(now));
             let moved = now + Duration::from_millis(1);
             assert_eq!(
                 ws.cursor_glow
@@ -16202,13 +14175,13 @@ mod typed_kitty_summon_tests {
         // `dispatch_menu_action`; even an inert Copy with no selection reaches
         // it before rename/native/menu routing can return.
         assert_boundary_dark(App::headless_for_test(), |app, _wid| {
-            app.cancel_front_cursor_move_candidate();
+            app.clear_front_move_license();
         });
         assert_boundary_dark(App::headless_for_test(), |app, wid| {
-            app.cancel_tab_surface_cursor_move_candidate(Some(wid));
+            app.clear_tab_surface_move_license(Some(wid));
         });
         assert_boundary_dark(App::headless_for_test(), |app, _wid| {
-            app.cancel_tab_surface_cursor_move_candidate(None);
+            app.clear_tab_surface_move_license(None);
         });
         let source = include_str!("app_input.rs");
         let dispatch = source
@@ -16217,7 +14190,7 @@ mod typed_kitty_summon_tests {
             .1;
         assert!(
             dispatch
-                .find("cancel_front_cursor_move_candidate()")
+                .find("clear_front_move_license()")
                 .unwrap()
                 < dispatch.find("divert_menu_action_around_rename").unwrap(),
             "menu candidate fence must precede every local/no-op early return"
@@ -16230,7 +14203,7 @@ mod typed_kitty_summon_tests {
         let lib_source = include_str!("lib.rs");
         assert_eq!(
             lib_source
-                .matches("cancel_tab_surface_cursor_move_candidate")
+                .matches("clear_tab_surface_move_license")
                 .count(),
             8,
             "all custom tab-strip wake boundaries remain fenced",
@@ -16248,7 +14221,7 @@ mod typed_kitty_summon_tests {
         for wake in ["Wake::OperatorAction", "Wake::OperatorMenuOpening"] {
             let arm = lib_source.rsplit_once(wake).expect("operator wake arm").1;
             assert!(
-                arm.find("cancel_front_cursor_move_candidate").unwrap()
+                arm.find("clear_front_move_license").unwrap()
                     < arm.find("Wake::FleetInstances").unwrap(),
                 "{wake} must fence before its first no-op/dispatch path",
             );
