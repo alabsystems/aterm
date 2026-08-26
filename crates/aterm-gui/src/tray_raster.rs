@@ -18,11 +18,6 @@
 //! pen accumulates glyph advances in 26.6 fixed point with per-glyph rounding —
 //! placement error ≤ 0.5 px, drift-free (proven in `chrome_metrics`).
 
-// `rasterize_tray` and the `Canvas` helpers are CONSUMED by the GPU offscreen overlay
-// (Stage C2b) and the CPU softbuffer composite (Stage C3), which land next; until then
-// only the preview test exercises them.
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::f32::consts::TAU;
 use std::rc::Rc;
@@ -379,7 +374,7 @@ fn build_semantic_candidate(
 use std::ops::{Deref, DerefMut};
 
 use aterm_render::chrome_metrics::{baseline_in_row_q, px_to_q, q_round_to_px, q_to_px};
-use aterm_render::{GlyphImage, Renderer};
+use aterm_render::Renderer;
 
 use crate::widget::{DrawPrim, SpecimenTextBlending, TerminalSpecimenSpec, TextFace, TextWeight};
 
@@ -2213,6 +2208,11 @@ impl Canvas {
         }
     }
 
+    /// PNG bytes of this canvas. TEST-ONLY: the two preview escape hatches
+    /// (`ATERM_TRAY_PREVIEW`, `ATERM_TRAY_THEMES`) are the only callers, so the
+    /// shipping binary does not carry the encoder path. Gated rather than
+    /// `#[allow]`-ed, so it goes dead loudly if those previews are removed.
+    #[cfg(test)]
     fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
         {
@@ -2755,49 +2755,6 @@ impl Canvas {
                 let alpha = f32::from(bitmap[y * metrics.width + x]) / 255.0;
                 if alpha > 0.0 {
                     self.blend((gx + x as f32) as i32, (gy + y as f32) as i32, color, alpha);
-                }
-            }
-        }
-    }
-
-    fn blit_renderer_glyph(&mut self, pen: f32, baseline: f32, image: &GlyphImage, tint: [u8; 4]) {
-        let gx = pen.round() as i32 + image.xmin();
-        let gy = baseline.round() as i32 - (image.height() as i32 + image.ymin());
-        match image {
-            GlyphImage::Mono {
-                width,
-                height,
-                bytes,
-                ..
-            } => {
-                for y in 0..*height {
-                    for x in 0..*width {
-                        let alpha = f32::from(bytes[y * *width + x]) / 255.0;
-                        if alpha > 0.0 {
-                            self.blend(gx + x as i32, gy + y as i32, tint, alpha);
-                        }
-                    }
-                }
-            }
-            GlyphImage::Rgba {
-                width,
-                height,
-                bytes,
-                ..
-            } => {
-                for y in 0..*height {
-                    for x in 0..*width {
-                        let offset = (y * *width + x) * 4;
-                        let alpha = f32::from(bytes[offset + 3]) / 255.0;
-                        if alpha > 0.0 {
-                            self.blend(
-                                gx + x as i32,
-                                gy + y as i32,
-                                [bytes[offset], bytes[offset + 1], bytes[offset + 2], tint[3]],
-                                alpha,
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -3724,7 +3681,7 @@ mod tests {
             input: Arc::new(input),
             input_fingerprint: 1,
             prepared_font: PreparedSemanticFont {
-                candidate: identity.clone(),
+                candidate: identity,
                 snapshot: SemanticFontSnapshot {
                     status: "test renderer snapshot".to_string(),
                     ready_epoch: 1,
@@ -3733,7 +3690,6 @@ mod tests {
                 renderer: Some(Rc::new(renderer)),
             },
             theme: aterm_render::Theme::default(),
-            font: identity,
             font_px: 14.0,
             line_height: 1.0,
             baseline_adjust: 0,

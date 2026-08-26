@@ -9,11 +9,6 @@
 //! [`text_prim`] funnel, so every string maps to a named step of the type scale by
 //! construction.
 
-// `DrawPrim` is the shared draw IR consumed by the GPU overlay pass and the CPU
-// `tray_raster` fallback. A few variants (`Ring`, `Sparkline`) are part of the
-// vocabulary without a current construction site, so the module allows dead code.
-#![allow(dead_code)]
-
 use std::sync::Arc;
 
 use aterm_render::RenderInput;
@@ -163,7 +158,6 @@ pub(crate) struct TerminalSpecimenSpec {
     /// forks this private snapshot and never consults process-global state.
     pub(crate) prepared_font: crate::tray_raster::PreparedSemanticFont,
     pub(crate) theme: aterm_render::Theme,
-    pub(crate) font: SemanticFontCandidate,
     pub(crate) font_px: f32,
     pub(crate) line_height: f32,
     pub(crate) baseline_adjust: i32,
@@ -214,8 +208,9 @@ pub(crate) fn text_prim(
 /// Angles for arcs are clockwise fractions of a full turn starting at 12 o'clock.
 #[derive(Clone, Debug)]
 pub(crate) enum DrawPrim {
-    /// The frosted card. `blur` requests a background blur of the terminal beneath
-    /// (GPU only; the CPU path falls back to a flat translucent `fill`).
+    /// The frosted card. `blur` was specified to request a background blur of the
+    /// terminal beneath, on the GPU path only, with the CPU path falling back to a
+    /// flat translucent `fill`.
     Panel {
         x: f32,
         y: f32,
@@ -223,6 +218,19 @@ pub(crate) enum DrawPrim {
         h: f32,
         radius: f32,
         fill: Rgba,
+        /// UNREAD, and the "GPU only" story above is why: there is no GPU `DrawPrim`
+        /// consumer to read it. `aterm-gpu` never sees this IR — `tray_raster`
+        /// rasterizes the whole prim list to one RGBA buffer and the GPU backend
+        /// uploads that as a single overlay texture (see `tray_raster`'s module doc).
+        /// So no backend reads this field. 126 construction sites across 14 files pass
+        /// it; 123 pass `false` and the 3 that pass `true` (`settings.rs:5335` plus two
+        /// tray previews) get exactly the same pixels as the rest. Kept, not deleted,
+        /// because removing it is a mechanical edit across those 14 files that belongs
+        /// in its own change; audited 2026-08-25 and named here so it is a debt
+        /// somebody owes rather than something a module-scoped `#![allow(dead_code)]`
+        /// was hiding. Dies when a GPU prim path reads it, or when the field is
+        /// dropped crate-wide.
+        #[allow(dead_code)]
         blur: bool,
     },
     /// A concentric three-way gauge: faint full-circle `track` = CAPACITY; a bold
@@ -253,6 +261,14 @@ pub(crate) enum DrawPrim {
         track: Rgba,
     },
     /// A tiny throughput sparkline (network). Samples are 0..1 normalized.
+    ///
+    /// NEVER CONSTRUCTED in shipping code, audited 2026-08-25. It is fully READ —
+    /// `tray_raster::rasterize_tray_on_canvas` paints it and `prim_origin` places it
+    /// — and a test constructs it, so this is vocabulary with a renderer and no
+    /// producer: the network card that would emit throughput samples
+    /// (`conn_card.rs`) does not yet. Dies when that producer lands, or when the
+    /// variant and its rasterizer arm are dropped together.
+    #[allow(dead_code)]
     Sparkline {
         x: f32,
         y: f32,
@@ -261,13 +277,17 @@ pub(crate) enum DrawPrim {
         samples: Vec<f32>,
         color: Rgba,
     },
-    /// A status dot (network health), optionally "breathing" (GPU animates; CPU draws
-    /// it solid).
+    /// A status dot (network health). `breathe` was specified to make the GPU animate
+    /// it while the CPU drew it solid.
     Dot {
         cx: f32,
         cy: f32,
         r: f32,
         color: Rgba,
+        /// UNREAD, for the same reason as `Panel::blur` above: there is no GPU
+        /// `DrawPrim` consumer, so nothing animates on this flag and every
+        /// construction site passes `false`. Audited 2026-08-25; dies with `blur`.
+        #[allow(dead_code)]
         breathe: bool,
     },
     /// Free-positioned text, `px` tall, positioned by BASELINE (the grid

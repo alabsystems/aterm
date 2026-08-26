@@ -581,6 +581,17 @@ impl DraftJournalHost {
 
     /// Publish a fresh, sequence-aligned image before any document view becomes
     /// visible. A conflicting/corrupt prior image is renamed, never deleted.
+    ///
+    /// ALWAYS ON THE EVENT LOOP, hence no patience parameter: the one production
+    /// caller is `App::open_native_document_in_window` (`app_documents.rs:2555`),
+    /// which runs it SYNCHRONOUSLY inside a `&mut self` handler because the
+    /// `InitializedJournal` it returns is what the open flow needs to build the
+    /// view. There is nowhere to hand it: the document worker's queue carries
+    /// appends and rewrites, whose results arrive later through `Wake`, and an
+    /// open cannot proceed on a promise. So this path takes the frame-sized
+    /// budget and, past it, REPORTS BUSY rather than blocking longer — the
+    /// refusal `app_documents.rs:3143` pins, carrying the "retry opening Manual"
+    /// guidance that makes the user's retry the recovery path.
     pub(crate) fn initialize(
         &self,
         decision: JournalOpenDecision,
@@ -596,24 +607,28 @@ impl DraftJournalHost {
         }
         let bytes = encode_journal(&records).map_err(|error| format!("{error:?}"))?;
         let image_fingerprint = ContentFingerprint::of(&bytes);
-        let preserved_path = with_journal_lock(&decision.path, || {
-            let current = observe_journal_image(&decision.path)?;
-            if current != decision.expected_image {
-                return Err(format!(
-                    "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
+        let preserved_path = with_journal_lock(
+            &decision.path,
+            JournalLockPatience::EventLoop,
+            || {
+                let current = observe_journal_image(&decision.path)?;
+                if current != decision.expected_image {
+                    return Err(format!(
+                        "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
                      the document before initializing recovery",
-                    decision.expected_image, current
-                ));
-            }
-            let preserved = if decision.preserve_existing && current.exists {
-                Some(self.preserve_locked(&decision.path, current)?)
-            } else {
-                None
-            };
-            atomic_replace_locked(&decision.path, &bytes, current)
-                .map_err(|error| error.to_string())?;
-            Ok(preserved)
-        })?;
+                        decision.expected_image, current
+                    ));
+                }
+                let preserved = if decision.preserve_existing && current.exists {
+                    Some(self.preserve_locked(&decision.path, current)?)
+                } else {
+                    None
+                };
+                atomic_replace_locked(&decision.path, &bytes, current)
+                    .map_err(|error| error.to_string())?;
+                Ok(preserved)
+            },
+        )?;
         Ok(InitializedJournal {
             key: decision.key,
             path: decision.path,
@@ -666,12 +681,17 @@ impl DraftJournalHost {
     }
 }
 
+/// `patience` is the CALLER's declaration of which thread it is on, because that
+/// is the only place the answer is known: `app_documents.rs:193` runs this on the
+/// `aterm-native-document` worker, `app_documents.rs:1024` runs it inline on the
+/// thread that owns `App`. See [`JournalLockPatience`].
 pub(crate) fn execute_journal_append(
     path: &Path,
     key: JournalDocumentKey,
     plan: &JournalAppendPlan,
+    patience: JournalLockPatience,
 ) -> JournalAppendResult {
-    let result = with_journal_lock(path, || {
+    let result = with_journal_lock(path, patience, || {
         let existing = read_existing_journal(path, "preflight")?;
         let expected_image = plan
             .expected_image
@@ -722,11 +742,13 @@ pub(crate) fn execute_journal_append(
     }
 }
 
+/// `patience` carries the caller's thread, exactly as in [`execute_journal_append`].
 pub(crate) fn execute_journal_rewrite(
     path: &Path,
     plan: &JournalRewritePlan,
+    patience: JournalLockPatience,
 ) -> JournalRewriteResult {
-    let result = with_journal_lock(path, || {
+    let result = with_journal_lock(path, patience, || {
         let existing = read_existing_journal(path, "preflight")?;
         let actual = JournalImageGeneration::of(&existing);
         if actual.fingerprint == plan.fingerprint {
@@ -952,6 +974,7 @@ fn open_journal_lock(path: &Path) -> std::io::Result<File> {
 
 fn with_journal_lock<T>(
     path: &Path,
+    patience: JournalLockPatience,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
     let parent = path
@@ -967,17 +990,156 @@ fn with_journal_lock<T>(
         lock.set_permissions(fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("protect journal lock {}: {error}", lock_path.display()))?;
     }
-    lock.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => format!(
-            "recovery journal {} is busy; retry opening Manual or saving after the other \
-                 aterm process finishes",
-            path.display()
-        ),
-        std::fs::TryLockError::Error(error) => {
-            format!("lock journal {}: {error}", path.display())
-        }
-    })?;
+    take_journal_lock(&lock, path, patience.budget())?;
     operation()
+}
+
+/// THE DEFECT THESE BUDGETS CLOSE, and the two independent mechanisms that size
+/// them.
+///
+/// A `flock` belongs to the OPEN FILE DESCRIPTION, not to the process or the
+/// descriptor, and `fork` hands the child a second descriptor onto the SAME
+/// description. So between any child's fork and its `execve`, that child owns a
+/// copy of every lock this process held at fork time — the lock stays taken
+/// after WE close our descriptor, until the child's `O_CLOEXEC` fires. aterm
+/// forks for every shell (`aterm_pty::spawn_shell_with_pid`, a hand-rolled
+/// `forkpty` whose `libc::fork` is `aterm-pty/src/unix.rs:1698`, and whose child
+/// closes only the pty pair and the status pipe before `execve` — every other
+/// inherited descriptor, this lock included, rides to the exec), from a process
+/// whose document worker takes this lock for every draft append. A single
+/// `try_lock` therefore reports `WouldBlock` for a lock nobody wants, which is
+/// both a false diagnosis and a LOST APPEND: the reducer takes its failure
+/// branch and that document stops journaling.
+///
+/// A refusal is believed only once it outlasts the budget below. Two DIFFERENT
+/// mechanisms hold this lock for a stretch, and both are real — a constant sized
+/// for only one of them is a constant nobody can maintain:
+///
+///  1. FORK RESIDUE — a child of ours that has not reached `execve`. This is the
+///     mechanism above and it is self-inflicted: no other process is involved.
+///     Its duration is a scheduling latency, measured directly in this repo
+///     (`aterm-pty/src/unix.rs:739-744` times fork to the `O_CLOEXEC` status
+///     pipe's EOF, which IS this window): p50 2.99 ms, p99 6.0 ms, max 12.7 ms
+///     over n=5000 at ordinary load; p50 4.5 ms, p99 206 ms, MAX 523 ms over
+///     n=20000 under deliberately pathological load (loadavg 118 on 18 cores).
+///  2. A PEER'S DEVICE-BARRIER HOLD — a legitimate holder inside the locked
+///     section, which spans `sync_all` on the temporary (`atomic_replace_locked`,
+///     :1255) and `sync_directory` on the parent (:1271). Both are `F_FULLFSYNC`
+///     device-cache barriers on Apple targets, whose latency is bounded by the
+///     whole machine's I/O and not by the bytes written. Measured for THIS
+///     locked section: 9.13 ms mean / 13.9 ms p99 / 25.5 ms max over n=200 idle,
+///     and 20.5 ms mean / 42.9 ms p99 / 69.7 ms max over n=300 at loadavg 17 on
+///     18 cores with eight concurrent `fsync` writers. The sibling save path,
+///     whose locked section has the same two-barrier shape, was caught at
+///     82.5-279.7 ms in six leaked fixtures (`native_document_host.rs:2571`).
+///
+/// So the lock is held until the LATER of those clears, and the worst legitimate
+/// hold this repo has ever measured on either mechanism is 523 ms.
+///
+/// WHAT THIS DOES NOT FIX, stated plainly:
+///
+///  * A THRESHOLD, NOT A PROOF. Neither budget can distinguish "our own child has
+///    not `execve`d yet" from "a peer is mid-barrier" from "another aterm has the
+///    journal open"; it only decides how long a refusal must persist before it is
+///    believed. The deterministic cure is OWNER IDENTITY — have the holder write
+///    its `std::process::id()` into the lock file before publishing and read it on
+///    `WouldBlock` (an advisory lock never blocks reads), so self-inflicted residue
+///    is ridden out and a live peer is reported busy at once. That is a bigger
+///    change than this one and is not taken here.
+///  * NOT `fcntl(F_SETLK)`. POSIX record locks are per-PROCESS, so a second request
+///    from this process SUCCEEDS instead of contending — that would silently delete
+///    the exclusion between the event loop's `initialize` and the worker's
+///    `execute_journal_append`, which are genuinely concurrent — and they drop all
+///    of a process's locks on ANY `close()` of the file, which `with_journal_lock`
+///    performs on every call. `F_OFD_SETLK` keeps the per-description semantics but
+///    is inherited by `fork` exactly as `flock` is, so it fixes nothing here.
+///  * A GENUINELY CONTENDED OPEN COSTS THE EVENT LOOP ITS WHOLE BUDGET — 25 ms,
+///    one and a half frames, once per document open, and only when the lock is
+///    actually refused. Past it the open FAILS with the retry guidance rather than
+///    waiting longer.
+///  * NO `cfg` GATE, deliberately. Windows has no `fork`, so mechanism 1 cannot
+///    happen there and only mechanism 2 can hold the lock — but mechanism 1 is the
+///    only term that raises the budget, and it raises it solely on `Worker`, the
+///    thread that exists to absorb waits. The event loop's budget is the same 25 ms
+///    on every platform. A Windows-specific constant would buy nothing and add a
+///    second number to keep true.
+///  * SCOPED OUT, having been checked: the crate's other single-shot file
+///    `try_lock`s. `control_auth.rs`'s instance lease has the same `flock`
+///    inheritance but a different contract — it is taken once and held for the whole
+///    process lifetime, so a residue window cannot change who owns it, and the only
+///    consequence is that `sweep_dead_instance_namespaces_with` may see an abandoned
+///    namespace as live for one fork window and sweep it on a later launch.
+///    `kitty_log.rs`'s rotation lock is documented best-effort and skips the merge
+///    on any refusal, which loses a log line, not a draft. Neither is a lost user
+///    edit, which is the harm that justified spending a budget here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JournalLockPatience {
+    /// The caller is the thread that owns `App` — the event loop. Every
+    /// millisecond spent here is a dropped frame, so this budget is deliberately
+    /// in the same class as the sibling write lock's, and for the same reason
+    /// spelled out at `native_document_host.rs:1411-1422`. Pinned by
+    /// `the_event_loop_budget_stays_in_the_sibling_write_lock_class`.
+    EventLoop,
+    /// The caller is the `aterm-native-document` worker (`app_documents.rs:149`),
+    /// whose whole job is to keep exactly this work off the event loop. Parking
+    /// it costs no frame and drops no input; refusing costs an append.
+    Worker,
+}
+
+impl JournalLockPatience {
+    /// The ceiling this caller can afford. A CEILING, not a floor: an
+    /// uncontended take never sleeps at all under either value.
+    ///
+    /// EVENT LOOP — 25 ms. That is ~1.5 frames at 60 Hz and covers mechanism 1's
+    /// ordinary-load distribution (4x its p99, 2x its max) and mechanism 2's
+    /// idle distribution (~2x p99). It does NOT cover either tail, and is not
+    /// asked to: past it the honest answer is the refusal this module already
+    /// contracts for. Matching the sibling constant is deliberate — the same
+    /// number for the same thread means the next reader has ONE frame argument to
+    /// understand, not two, and the guard test named on `EventLoop` below fails if
+    /// the two ever drift apart.
+    ///
+    /// WORKER — 2 s. Sized from the measurements above, not from headroom under
+    /// some test's assertion: ~4x the worst legitimate hold ever measured on
+    /// either mechanism (523 ms), ~7x the worst peer barrier hold (279.7 ms),
+    /// and enough for the two to overlap and still clear. Validated
+    /// empirically as well as arithmetically: at 250 ms four journal tests still
+    /// lost appends with the machine at 8x core oversubscription, while 2 s held
+    /// across 40 consecutive full-suite runs. The sibling save path spends a
+    /// comparable total on this same hazard (25 ms inner x a 500 ms outer
+    /// `PREFLIGHT_RETRY_BUDGET` that re-runs the whole side-effect-free preflight,
+    /// lock acquisition included); the journal has no outer retry, so its budget
+    /// is the whole allowance rather than the inner slice of one.
+    const fn budget(self) -> std::time::Duration {
+        match self {
+            Self::EventLoop => crate::native_document_host::WRITE_LOCK_RETRY_BUDGET,
+            Self::Worker => std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+/// The journal's rendering of the crate's ONE bounded advisory-lock retry
+/// (`native_document_host::acquire_advisory_lock_within` — same loop, same
+/// exponential backoff clamped to the remaining budget, same "retry `WouldBlock`
+/// only, never `Error`" rule). This function adds nothing but the product
+/// vocabulary and the `path` those messages name.
+///
+/// Takes `budget` rather than reading a constant so that the value the whole fix
+/// turns on is a parameter a test can pin — see
+/// `a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent`.
+fn take_journal_lock(lock: &File, path: &Path, budget: std::time::Duration) -> Result<(), String> {
+    crate::native_document_host::acquire_advisory_lock_within(lock, budget).map_err(|refusal| {
+        match refusal {
+            crate::native_document_host::AdvisoryLockRefusal::Busy => format!(
+                "recovery journal {} is busy; retry opening Manual or saving after the \
+                 other aterm process finishes",
+                path.display()
+            ),
+            crate::native_document_host::AdvisoryLockRefusal::Failed(error) => {
+                format!("lock journal {}: {error}", path.display())
+            }
+        }
+    })
 }
 
 /// The sole production journal-image reader. The shared file-feed admission
@@ -1212,54 +1374,43 @@ fn sync_directory(_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+/// Retry an EVENT-LOOP-patience journal call while it reports the product's
+/// TRANSIENT contention error.
+///
+/// NOT a workaround for the engine — a stand-in for the USER. `initialize`
+/// runs on the thread that owns `App`, so by contract it spends one frame's
+/// budget and then REFUSES with "retry opening Manual" rather than parking the
+/// event loop (see [`JournalLockPatience`]). The recovery path for that
+/// refusal is a retry, and in a test there is no user to perform it. Under
+/// this binary's 3,500-test thread pool plus a process-global document worker
+/// that performs real journal rewrites, a fork window landing on a 25 ms
+/// budget is ordinary weather.
+///
+/// It cannot mask the engine fix. The ride-out this change adds is pinned by
+/// [`a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy`] and
+/// [`a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent`],
+/// neither of which goes anywhere near this helper.
+///
+/// Bounded, so a lock that never frees still fails; and only the busy error is
+/// retried — every other error returns on the first attempt.
+pub(crate) fn settle_busy<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match attempt() {
+            Err(error) if error.contains("is busy") && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            settled => return settled,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::document_store::{DocumentStore, TextEdit};
     #[cfg(unix)]
     use std::os::unix::fs::FileTypeExt as _;
-
-    /// Retry a journal operation while it reports the product's TRANSIENT
-    /// contention error.
-    ///
-    /// Journal writes take a sibling advisory lock, and this binary runs 2,400
-    /// tests on parallel threads plus a process-global document worker
-    /// (`native_document_queue`) that performs real journal rewrites. So a
-    /// "recovery journal ... is busy" is expected weather here, and the product
-    /// says so in the message: it is retryable, not a failure. Asserting success
-    /// at one instant asserted that every other writer had already finished —
-    /// which held when the suite ran alone and failed roughly one run in sixteen
-    /// under two concurrent suites.
-    ///
-    /// Bounded, so a lock that never frees still fails; and only the busy error
-    /// is retried — every other error returns on the first attempt.
-    fn settle_busy<T>(mut attempt: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            match attempt() {
-                Err(error) if error.contains("is busy") && std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                settled => return settled,
-            }
-        }
-    }
-
-    /// [`settle_busy`] for the rewrite path, which reports contention as a
-    /// `JournalRewriteResult::Failed` rather than an `Err`.
-    fn settle_rewrite(path: &Path, plan: &JournalRewritePlan) -> JournalRewriteResult {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        loop {
-            let result = execute_journal_rewrite(path, plan);
-            let busy = match &result {
-                JournalRewriteResult::Failed(message) => message.contains("is busy"),
-                _ => false,
-            };
-            if !busy || std::time::Instant::now() >= deadline {
-                return result;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
 
     fn test_root(name: &str) -> PathBuf {
         let root =
@@ -1396,6 +1547,163 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// A lock a peer still holds is WAITED OUT, not reported as another owner.
+    ///
+    /// This is the regression the whole fix exists for, and it is pinned WITHOUT a
+    /// fork, deliberately. `flock` is per open-file-description, so a second
+    /// `open_journal_lock` in THIS process contends with the first in exactly the
+    /// way a descriptor a forked child has not `execve`d away yet does — the
+    /// sibling module states and relies on the same equivalence
+    /// (`native_document_host.rs:2575`). A raw `fork()` from the libtest thread
+    /// pool would buy provenance and cost determinism: the parent has to build a
+    /// plan between the fork and the append, so a scheduling stall longer than the
+    /// child's hold makes the append succeed on its FIRST `try_lock` and the test
+    /// pass VACUOUSLY — green against a full revert. It would also inject the very
+    /// pathology under test into the suite, since a child that sleeps without
+    /// `execve` holds every OTHER thread's descriptor open for its whole life.
+    ///
+    /// A held lock is realistic at this duration for two independent reasons, both
+    /// measured, both named on [`JournalLockPatience`]: a peer inside its two
+    /// `F_FULLFSYNC` barriers (82.5-279.7 ms in the sibling's leaked fixtures), and
+    /// a child of ours between `fork` and `execve` (max 523 ms at n=20000 under
+    /// pathological load, `aterm-pty/src/unix.rs:739-744`).
+    ///
+    /// DETERMINISM comes from the second assertion, not the first: a regression to
+    /// a single `try_lock` returns `Failed` in microseconds, so it fails
+    /// `Committed` AND fails `waited >= HELD`. The budget is 2 s against a 200 ms
+    /// hold, so no scheduler stall can turn this into a false FAIL either.
+    #[test]
+    fn a_journal_lock_held_by_a_peer_is_waited_out_not_reported_busy() {
+        const HELD: std::time::Duration = std::time::Duration::from_millis(200);
+
+        let root = test_root("waited-lock");
+        let host = DraftJournalHost::new(root.clone()).unwrap();
+        let (mut store, id, disk) = snapshots("base");
+        let canonical = "file:///tmp/waited-lock.md";
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
+
+        let _ = store.transact(
+            id,
+            disk.seq,
+            vec![TextEdit {
+                range: 4..4,
+                insert: " newer".to_string(),
+            }],
+        );
+        let newer = store.snapshot(id).unwrap();
+        let mut reducer = DraftJournalReducer::new_with_key(id, initialized.key, disk.seq);
+        let mut plan = reducer.plan_snapshot(&newer).unwrap();
+        plan.expected_image = Some(initialized.image_fingerprint);
+
+        // Stands in for a peer mid-barrier, or for a forked child that has not
+        // reached `execve`: a SECOND description onto the same lock file. Taken
+        // through the product's own primitive, so this setup cannot be more
+        // fragile than the thing it sets up for.
+        let lock_path = journal_lock_path(&initialized.path).unwrap();
+        let holder = open_journal_lock(&lock_path).unwrap();
+        take_journal_lock(
+            &holder,
+            &initialized.path,
+            JournalLockPatience::Worker.budget(),
+        )
+        .unwrap();
+        let released = std::thread::spawn(move || {
+            std::thread::sleep(HELD);
+            drop(holder);
+        });
+
+        let started = std::time::Instant::now();
+        let result = execute_journal_append(
+            &initialized.path,
+            initialized.key,
+            &plan,
+            JournalLockPatience::Worker,
+        );
+        let waited = started.elapsed();
+        released.join().unwrap();
+
+        assert!(
+            matches!(result, JournalAppendResult::Committed(_)),
+            "a {HELD:?} holder must be waited out, not reported busy: {result:?}"
+        );
+        assert!(
+            waited >= HELD,
+            "the append cannot have published before the holder released: {waited:?}"
+        );
+        assert_eq!(
+            recover_journal_for(initialized.key, &fs::read(&initialized.path).unwrap())
+                .unwrap()
+                .text,
+            "base newer"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The budget is SPENT before a refusal, and a holder that never releases is
+    /// still refused. Pins the shrink direction: a regression to a single
+    /// `try_lock` — or to any budget smaller than the one asked for — returns in
+    /// microseconds and fails the `elapsed >= budget` assertion.
+    ///
+    /// Deliberately NO absolute upper bound: that assertion class is the one
+    /// full-suite load has already crossed twice in this crate, and the
+    /// refuses-without-blocking contract is owned by
+    /// `held_journal_lock_returns_busy_and_a_later_retry_succeeds` and by
+    /// [`the_event_loop_budget_stays_in_the_sibling_write_lock_class`], which pins
+    /// the growth direction without consulting a clock at all.
+    #[test]
+    fn a_permanently_held_journal_lock_is_refused_only_after_the_budget_is_spent() {
+        let root = test_root("budget-spent");
+        let host = DraftJournalHost::new(root.clone()).unwrap();
+        let (_store, _id, disk) = snapshots("base");
+        let canonical = "file:///tmp/budget-spent.md";
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let lock_path = journal_lock_path(&decision.path).unwrap();
+        let held = open_journal_lock(&lock_path).unwrap();
+        held.lock().unwrap();
+        let probe = open_journal_lock(&lock_path).unwrap();
+
+        let budget = std::time::Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let message = take_journal_lock(&probe, &decision.path, budget).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(message.contains("busy"), "{message}");
+        assert!(message.contains("retry opening Manual"), "{message}");
+        assert!(
+            elapsed >= budget,
+            "budget must actually be spent, got {elapsed:?}"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// The value the whole fix turns on, pinned WITHOUT a clock.
+    ///
+    /// `DraftJournalHost::initialize` runs synchronously on the thread that owns
+    /// `App` (`app_documents.rs:2555`), so its budget is a frame budget. Growing it
+    /// back toward the 30 s the busy guards assert would freeze the event loop for
+    /// exactly that long and every timing assertion in this file would still pass
+    /// green — which is why this guard compares constants instead of elapsed time.
+    /// Tying it to the sibling write lock's budget is the point: one thread, one
+    /// frame argument (`native_document_host.rs:1411-1422`), one number.
+    #[test]
+    fn the_event_loop_budget_stays_in_the_sibling_write_lock_class() {
+        assert_eq!(
+            JournalLockPatience::EventLoop.budget(),
+            crate::native_document_host::WRITE_LOCK_RETRY_BUDGET,
+            "the event-loop journal budget must stay the sibling write lock's budget"
+        );
+        assert!(
+            JournalLockPatience::EventLoop.budget() <= std::time::Duration::from_millis(32),
+            "two frames at 60 Hz is the ceiling for anything the event loop waits on"
+        );
+        assert!(
+            JournalLockPatience::Worker.budget() > JournalLockPatience::EventLoop.budget(),
+            "the worker is the thread that exists to absorb this wait"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn final_symlink_lock_is_refused_without_touching_its_victim() {
@@ -1461,13 +1769,8 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/hostile-persistence.md";
-        let initialized = host
-            .initialize(
-                host.inspect_open(canonical, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         let original = fs::read(&initialized.path).unwrap();
         let _ = store.transact(
             id,
@@ -1495,7 +1798,12 @@ mod tests {
         make_fifo(&initialized.path);
         let started = std::time::Instant::now();
         assert!(matches!(
-            execute_journal_append(&initialized.path, initialized.key, &append),
+            execute_journal_append(
+                &initialized.path,
+                initialized.key,
+                &append,
+                JournalLockPatience::Worker,
+            ),
             JournalAppendResult::Failed { message, .. }
                 if message.contains("regular non-link")
         ));
@@ -1515,7 +1823,7 @@ mod tests {
         fs::write(&victim, &original).unwrap();
         std::os::unix::fs::symlink(&victim, &initialized.path).unwrap();
         assert!(matches!(
-            settle_rewrite(&initialized.path, &rewrite),
+            execute_journal_rewrite(&initialized.path, &rewrite, JournalLockPatience::Worker),
             JournalRewriteResult::Failed(message) if message.contains("preflight")
         ));
         assert_eq!(fs::read(&victim).unwrap(), original);
@@ -1550,7 +1858,7 @@ mod tests {
         };
         let canonical = "file:///tmp/draft.md";
         let first = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-        host.initialize(first, &disk, &current).unwrap();
+        settle_busy(|| host.initialize(first.clone(), &disk, &current)).unwrap();
 
         let reopened = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
         assert_eq!(reopened.recovered_text.as_deref(), Some("base draft"));
@@ -1631,13 +1939,8 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (_store, _id, disk) = snapshots("base");
         let canonical = "file:///tmp/draft.md";
-        let initialized = host
-            .initialize(
-                host.inspect_open(canonical, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         let before = fs::read(&initialized.path).unwrap();
         let abandoned = initialized.path.parent().unwrap().join(".abandoned.tmp");
         fs::write(&abandoned, &before[..before.len() / 2]).unwrap();
@@ -1657,13 +1960,8 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (_store, _id, disk) = snapshots("private");
         let canonical = "file:///Users//example/Secret%20Draft.md";
-        let initialized = host
-            .initialize(
-                host.inspect_open(canonical, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         assert_eq!(
             fs::metadata(&root).unwrap().permissions().mode() & 0o777,
             0o700
@@ -1690,7 +1988,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
             .unwrap();
-        journals.initialize(decision, &disk, &disk).unwrap();
+        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
 
         let _ = store.transact(
             id,
@@ -1739,7 +2037,7 @@ mod tests {
         );
         assert!(journals.next_effect(id).unwrap().is_none());
 
-        let committed = execute_journal_append(&path, key, &first);
+        let committed = execute_journal_append(&path, key, &first, JournalLockPatience::Worker);
         assert_eq!(
             journals.complete_append(id, first.generation, committed),
             JournalCompletion::Durable {
@@ -1755,11 +2053,13 @@ mod tests {
         else {
             panic!("latest desired head must be queued")
         };
-        let result = execute_journal_append(&path, key, &latest);
-        assert!(matches!(
-            journals.complete_append(id, latest.generation, result),
-            JournalCompletion::Durable { seq, .. } if seq == third.seq
-        ));
+        let result = execute_journal_append(&path, key, &latest, JournalLockPatience::Worker);
+        let completion = journals.complete_append(id, latest.generation, result.clone());
+        assert!(
+            matches!(completion, JournalCompletion::Durable { seq, .. } if seq == third.seq),
+            "latest append must reduce durable at {:?}; got {completion:?} from {result:?}",
+            third.seq
+        );
         assert_eq!(journals.durable_seq(id), Some(third.seq));
         assert_eq!(
             recover_journal_for(key, &fs::read(path).unwrap())
@@ -1778,7 +2078,7 @@ mod tests {
         let decision = journals
             .inspect_open("file:///tmp/draft.md", disk.text.as_bytes())
             .unwrap();
-        journals.initialize(decision, &disk, &disk).unwrap();
+        settle_busy(|| journals.initialize(decision.clone(), &disk, &disk)).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -1828,7 +2128,7 @@ mod tests {
         else {
             panic!("checkpoint rewrite expected")
         };
-        let mut bad = match settle_rewrite(&path, &plan) {
+        let mut bad = match execute_journal_rewrite(&path, &plan, JournalLockPatience::Worker) {
             JournalRewriteResult::Committed(proof) => proof,
             other => panic!("rewrite failed: {other:?}"),
         };
@@ -1853,7 +2153,7 @@ mod tests {
         else {
             panic!("checkpoint retry expected")
         };
-        let result = settle_rewrite(&path, &plan);
+        let result = execute_journal_rewrite(&path, &plan, JournalLockPatience::Worker);
         assert_eq!(
             journals.complete_rewrite(id, plan.generation, result),
             JournalCompletion::Durable {
@@ -1880,13 +2180,8 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/draft.md";
-        let initialized = host
-            .initialize(
-                host.inspect_open(canonical, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         let rewrite = checkpoint_plan(
             initialized.key,
             JournalRewriteGeneration(1),
@@ -1910,12 +2205,17 @@ mod tests {
         let mut append = reducer.plan_snapshot(&newer).unwrap();
         append.expected_image = Some(initialized.image_fingerprint);
         assert!(matches!(
-            execute_journal_append(&initialized.path, initialized.key, &append),
+            execute_journal_append(
+                &initialized.path,
+                initialized.key,
+                &append,
+                JournalLockPatience::Worker,
+            ),
             JournalAppendResult::Committed(_)
         ));
 
         assert!(matches!(
-            settle_rewrite(&initialized.path, &rewrite),
+            execute_journal_rewrite(&initialized.path, &rewrite, JournalLockPatience::Worker),
             JournalRewriteResult::Failed(message) if message.contains("image changed")
         ));
         let recovered =
@@ -1931,13 +2231,8 @@ mod tests {
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (mut store, id, disk) = snapshots("base");
         let canonical = "file:///tmp/draft.md";
-        let initialized = host
-            .initialize(
-                host.inspect_open(canonical, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         let _ = store.transact(
             id,
             disk.seq,
@@ -1955,7 +2250,12 @@ mod tests {
             encode_journal(&[JournalRecord::snapshot_for(initialized.key, &other)]).unwrap();
         fs::write(&initialized.path, &other_image).unwrap();
         assert!(matches!(
-            execute_journal_append(&initialized.path, initialized.key, &plan),
+            execute_journal_append(
+                &initialized.path,
+                initialized.key,
+                &plan,
+                JournalLockPatience::Worker,
+            ),
             JournalAppendResult::Failed { message, .. } if message.contains("image changed")
         ));
         assert_eq!(fs::read(&initialized.path).unwrap(), other_image);
@@ -1994,7 +2294,7 @@ mod tests {
             }
             let retry_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
             let verdict = loop {
-                match execute_journal_append(&path, key, &plan) {
+                match execute_journal_append(&path, key, &plan, JournalLockPatience::Worker) {
                     JournalAppendResult::Committed(_) => break "committed",
                     JournalAppendResult::Failed { message, .. } if message.contains("busy") => {
                         assert!(
@@ -2021,13 +2321,8 @@ mod tests {
         let root = test_root("process-race");
         let host = DraftJournalHost::new(root.clone()).unwrap();
         let (_store, _id, disk) = snapshots("base");
-        let initialized = host
-            .initialize(
-                host.inspect_open(URI, disk.text.as_bytes()).unwrap(),
-                &disk,
-                &disk,
-            )
-            .unwrap();
+        let decision = host.inspect_open(URI, disk.text.as_bytes()).unwrap();
+        let initialized = settle_busy(|| host.initialize(decision.clone(), &disk, &disk)).unwrap();
         let mut children = Vec::new();
         for role in ["one", "two"] {
             children.push(

@@ -1575,6 +1575,21 @@ impl SettingsApp {
             // The Wallpaper page's calling card: arriving with NO wallpaper
             // attached opens the system picker right away (the page still
             // offers the button, and cancel simply leaves the page showing).
+            //
+            // macOS ONLY, and deliberately. This route is reachable from the
+            // CONTROL SOCKET (`aterm ctl open app settings /wallpaper`), and on
+            // Windows the picker is a modal that parks the main thread — so on
+            // that platform an auto-open turned a plain navigation into a
+            // 30-second wedge of every main-thread control verb (the `call_main`
+            // deadline), with a dialog nobody clicked for. Measured in the
+            // parity audit: `/appearance` -> OK, 0 dialogs; `/wallpaper` -> ERR
+            // "main-thread reply did not arrive within 30s", 1 dialog. macOS
+            // never saw it because `choose_local_file` was a None stub off macOS
+            // until the picker landed, so this line has always been a macOS
+            // behaviour in practice; it stays one explicitly. The explicit
+            // "Choose Image…" button below is live on every platform, so nothing
+            // is unreachable.
+            #[cfg(target_os = "macos")]
             if route == SettingsRoute::Wallpaper && view.raw_value(prefs::EDIT_WALLPAPER).is_none()
             {
                 cx.choose_wallpaper_image();

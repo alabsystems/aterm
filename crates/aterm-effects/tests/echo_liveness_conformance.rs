@@ -607,6 +607,124 @@ fn an_unarmed_honest_backspace_no_longer_kills_the_earned_ribbon() {
     );
 }
 
+/// THE OWNER'S SHAPE — `spawns=393 / ribbon_segments=0`, closed.
+///
+/// A typed key whose candidate RETIRES still produces an echo batch that
+/// advances the caret one column. Before the retired-echo retention tombstone
+/// that batch reached the generation fence with `Evidence::None`, identity
+/// held and anchor NOT held, matched no proportionate arm, and fell through to
+/// `clear_denied_move_visuals()` — which cleared `sparks` wholesale. So every
+/// CONFIRMED key added one spark and the first RETIRED key took the whole band
+/// to zero: a sawtooth pinned near zero, which is exactly the counter surface
+/// the owner reported (`spawns` climbing forever, `ribbon_segments` never
+/// accumulating).
+///
+/// This replays that through the real seams: build a ribbon, then drive ONE
+/// key whose candidate retires for `stale` (the single most common reason on
+/// the owner's own frame train — their `present_p95_ms=402.65` sits well above
+/// the 0.25 s admission bound), and require the earned band to survive.
+#[test]
+fn a_retired_typed_candidate_no_longer_kills_the_earned_ribbon() {
+    let t0 = Instant::now();
+    let mut cfg = cfg();
+    cfg.style = GlowStyle::RainbowKitty;
+    cfg.beam = false;
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let word = ['h', 'e', 'l', 'l', 'o'];
+    let mut row = [' '; 12];
+    row[0] = '$';
+    let mut now = t0;
+    glow.tick(Some((2, 2)), now, &cfg, geom(), &mut out);
+    glow.observe_row(2, 2, &row, now);
+    let mut seq = 100u32;
+    for (i, ch) in word.iter().enumerate() {
+        let col = 2 + i as u16;
+        now += Duration::from_millis(40);
+        let baseline = ExpectedRowSnapshot::from_slice(&row).unwrap();
+        glow.note_typed_expected(
+            now,
+            ExpectedCellSpan::from_cells([*ch]).unwrap(),
+            (2, col + 1),
+            (2, col),
+            baseline,
+            generation(seq),
+        );
+        row[usize::from(col)] = *ch;
+        now += Duration::from_millis(4);
+        glow.observe_row(2, col + 1, &row, now);
+        let decision = glow.confirm_content_candidate(Some((2, col + 1)), now, generation(seq + 1));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "key {ch} must confirm through the real seam: {decision:?}"
+        );
+        glow.observe_content_generation(generation(seq + 1), Some((2, col + 1)), true);
+        glow.tick(Some((2, col + 1)), now, &cfg, geom(), &mut out);
+        seq += 2;
+    }
+    let earned = glow.ribbon_segments();
+    assert!(
+        earned >= 4,
+        "the fixture must build a real ribbon first (got {earned} segments)"
+    );
+
+    // ONE MORE HONEST KEY — typed at human cadence, armed through the real
+    // classifier — whose confirming FRAME arrives late. The candidate retires
+    // `stale`; its echo still landed, so the caret sits one column on.
+    let col = 2 + word.len() as u16;
+    now += Duration::from_millis(40);
+    let baseline = ExpectedRowSnapshot::from_slice(&row).unwrap();
+    glow.note_typed_expected(
+        now,
+        ExpectedCellSpan::from_cells(['!']).unwrap(),
+        (2, col + 1),
+        (2, col),
+        baseline,
+        generation(seq),
+    );
+    row[usize::from(col)] = '!';
+    // The late frame: past TYPE_HINT_FRESH, so the seam must retire.
+    now += Duration::from_millis(400);
+    glow.observe_row(2, col + 1, &row, now);
+    let decision = glow.confirm_content_candidate(Some((2, col + 1)), now, generation(seq + 1));
+    assert!(
+        matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+        "the fixture must actually RETIRE this candidate: {decision:?}"
+    );
+
+    // THE DEFECT: this batch used to be judged UnownedRelocation and wipe.
+    let ownership = glow.observe_content_generation(generation(seq + 1), Some((2, col + 1)), false);
+    assert_ne!(
+        ownership,
+        GenerationOwnership::UnownedRelocation,
+        "a real keystroke's own echo is not a program relocation, even when its \
+         candidate retired"
+    );
+    glow.tick(Some((2, col + 1)), now, &cfg, geom(), &mut out);
+    let survived = glow.ribbon_segments();
+    assert!(
+        survived + 1 >= earned,
+        "a retired keystroke KILLED the trail: {earned} ribbon segments before, \
+         {survived} after"
+    );
+
+    // THE BAR, unchanged: the rescue is bound to a real press. A program's own
+    // one-column CUP, with no candidate behind it, is still a relocation and
+    // still wipes wholesale.
+    now += Duration::from_millis(40);
+    glow.observe_row(2, col + 2, &row, now);
+    assert_eq!(
+        glow.observe_content_generation(generation(seq + 3), Some((2, col + 2)), false),
+        GenerationOwnership::UnownedRelocation,
+        "cold output must still relocate wholesale"
+    );
+    assert_eq!(
+        glow.ribbon_segments(),
+        0,
+        "a cold relocation still takes the wholesale teardown"
+    );
+}
+
 /// R2 — THE SPARKLE TAIL, measured in EMITTED PIXELS through the real seams.
 ///
 /// The owner: *"my sparkles do not have the beautiful trail any more."* Every

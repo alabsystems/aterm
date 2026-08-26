@@ -486,6 +486,70 @@ fn unfocused_idle_window_paints_nothing_under_an_unpinned_capture() {
     probe_with("cold-spinner", "", Expect::Quiet, Capture::UnpinnedUnfocused);
 }
 
+/// Matrix rows 6a-6c: THE OWNER'S ACTUAL CONFIGURATION — a FOCUSED window,
+/// captured WITHOUT a recording pin. This is the hole every previous trail
+/// blackout fell through, and it is worth stating plainly because the shape of
+/// the gap is the whole lesson.
+///
+/// Before these rows, `UnpinnedFocused` existed but was spent entirely on the
+/// COMPANION rows (7 and 8), which assert that a cat or a pet is *present*.
+/// Every row that asserted trail INK was either PINNED (rows 1-4, where
+/// `ctl video` holds `motion_focus` open for the recorded window and therefore
+/// repairs the very gate under test) or UNFOCUSED (rows 5-6, which exercise
+/// the typed-wake path instead). The one combination nobody measured is the
+/// one every user is actually in: focused, unrecorded, typing into a TUI that
+/// repaints on its own.
+///
+/// MEASURED 2026-08-25 against HEAD, `fake-claude`, identical keys and
+/// thresholds, the ONLY variable being the capture:
+///   pinned `ctl video`   total_ink=5515  rainbow_run=98  PASS
+///   unpinned `ctl image`  total_ink=266   rainbow_run=5   FAIL (best_ink=38)
+/// A 14-20x ink collapse attributable to nothing but the instrument. The
+/// paired status rows named the mechanism: of ten keys typed, four confirmed
+/// and six retired `motion-downgrade`, with `focused=true motion_stage=full`
+/// throughout — the multi-batch generation fence condemning honest keystrokes
+/// because a concurrent spinner batch landed alongside the echo. A continuous
+/// recording cadence observes every generation singly, so the fence never
+/// trips and the row goes green over a stunted ribbon.
+///
+/// These rows are the falsification. Row 6c is their dark control: without it
+/// a scanner that simply counted cursor pixels could satisfy 6a and 6b.
+#[cfg(target_os = "macos")]
+#[test]
+fn focused_alt_screen_typing_paints_trail_ink_without_a_recording_pin() {
+    probe_with(
+        "fake-claude",
+        "r,a,i,n,b,o,w,space,o,n",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+    );
+}
+
+/// Row 6b: the same law beside an ESC7/ESC8 token streamer — unowned batches
+/// landing away from the caret several times a second, which is precisely the
+/// concurrent-decoration traffic that makes the batch counter a bad proxy.
+#[cfg(target_os = "macos")]
+#[test]
+fn focused_streamer_typing_paints_trail_ink_without_a_recording_pin() {
+    probe_with(
+        "streamer",
+        "h,e,l,l,o,space,w,o,r,l,d",
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+    );
+}
+
+/// Row 6c, the dark control for 6a/6b: a FOCUSED alt-screen spinner repainting
+/// on its own with NOTHING typed earns zero effect ink under the same unpinned
+/// capture. Cold program output must stay dark no matter how many batches it
+/// lands — the concurrent-decoration law relaxes a BATCH COUNT, never the
+/// requirement that a real keystroke armed the candidate.
+#[cfg(target_os = "macos")]
+#[test]
+fn focused_cold_spinner_paints_zero_ink_without_a_recording_pin() {
+    probe_with("cold-spinner", "", Expect::Dark, Capture::UnpinnedFocused);
+}
+
 /// Matrix row 7: THE SHIPPED DEFAULT, not the classic style the historical
 /// rows pin. The resident pet owes a full-body bitmap in the very first
 /// requested still (before typing has created any generic rainbow ink), stays

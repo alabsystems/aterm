@@ -15,8 +15,8 @@ use crate::native_document_io::{
     ObservedFileVersion, SaveReducer, SaveReduction,
 };
 use crate::native_document_journal::{
-    DocumentJournalStore, JournalCompletion, JournalEffect, execute_journal_append,
-    execute_journal_rewrite,
+    DocumentJournalStore, JournalCompletion, JournalEffect, JournalLockPatience,
+    execute_journal_append, execute_journal_rewrite,
 };
 
 #[derive(Clone, Copy)]
@@ -117,7 +117,12 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     let document = store.open(uri.to_string(), "base".to_string());
     let disk = store.snapshot(document).unwrap();
     let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
-    journals.initialize(decision, &disk, &disk).unwrap();
+    // The event-loop budget refuses rather than parks, so the caller retries —
+    // here the harness, in the product the user. See `settle_busy`.
+    crate::native_document_journal::settle_busy(|| {
+        journals.initialize(decision.clone(), &disk, &disk)
+    })
+    .unwrap();
     let mut protocol = Protocol {
         origin: disk.seq,
         inflight: 0,
@@ -168,7 +173,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     assert_transition(&model, &before, &after, "Edit");
 
     let before = after;
-    let result = execute_journal_append(&path, key, &first);
+    let result = execute_journal_append(&path, key, &first, JournalLockPatience::Worker);
     assert!(matches!(
         journals.complete_append(document, first.generation, result),
         JournalCompletion::Durable { seq, .. } if seq == first.target_seq
@@ -224,7 +229,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     assert!(!model.check_invariant("StaleProofIsNoOp", &stale_accept));
 
     let before = after_stale;
-    let result = execute_journal_append(&path, key, &latest);
+    let result = execute_journal_append(&path, key, &latest, JournalLockPatience::Worker);
     assert!(matches!(
         journals.complete_append(document, latest.generation, result),
         JournalCompletion::Durable { seq, .. } if seq == latest.target_seq
@@ -295,7 +300,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
     assert_transition(&model, &before, &after, "BeginCheckpoint");
 
     let before = after;
-    let result = execute_journal_rewrite(&path, &plan);
+    let result = execute_journal_rewrite(&path, &plan, JournalLockPatience::Worker);
     assert!(matches!(
         journals.complete_rewrite(document, plan.generation, result),
         JournalCompletion::Durable { seq, .. } if seq == plan.target_seq

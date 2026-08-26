@@ -1424,35 +1424,92 @@ fn write_lock_busy() -> String {
 /// MITIGATION for a proven hazard, NOT a proven cure for the
 /// `repeated_save_during_inflight_checkpoint_persists_the_latest_sequence` flake: the
 /// on-disk forensics narrow that failure to five exits and cannot distinguish them.
-const WRITE_LOCK_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_millis(25);
-
-/// Take the sibling write lock, riding out a transient holder for at most `budget`.
-/// The first attempt happens before any sleep, so an uncontended save is unchanged.
 ///
-/// Retries `WouldBlock` ONLY. `ENOTSUP` (a volume refusing advisory locks), `EBADF` and
-/// `EINVAL` never clear by waiting, and burning the budget on them would only make a
-/// permanent refusal slow. `WouldBlock` is not spurious here: std compiles `try_lock`
-/// to `flock(fd, LOCK_EX|LOCK_NB)` on Apple and maps only EAGAIN/EWOULDBLOCK onto it,
-/// whose one documented cause is a genuine conflicting lock.
-fn acquire_write_lock_within(lock_file: &File, budget: std::time::Duration) -> Result<(), String> {
+/// READ THE 200-ROUND FIGURE ABOVE AS "ORDINARY LOAD", NOT AS "WORST CASE". The same
+/// window measured at n=20000 under deliberately pathological load (loadavg 118 on 18
+/// cores) is p50 4.5 ms, p99 206 ms, MAX 523 ms — `aterm-pty/src/unix.rs:739-744`
+/// times exactly this interval, fork to the `O_CLOEXEC` status pipe's EOF at `execve`.
+/// 25 ms does not cover that tail and is not asked to: on this path the tail is
+/// absorbed by [`PREFLIGHT_RETRY_BUDGET`], which re-runs the whole side-effect-free
+/// preflight (lock acquisition included) for up to 500 ms. A caller with no such
+/// outer loop must size its budget against the pathological figure instead — see
+/// `native_document_journal::JournalLockPatience`.
+pub(crate) const WRITE_LOCK_RETRY_BUDGET: std::time::Duration =
+    std::time::Duration::from_millis(25);
+
+/// Why a bounded advisory-lock acquisition gave up. The two arms are the only two
+/// outcomes [`acquire_advisory_lock_within`] can refuse with, and they are NOT
+/// interchangeable: `Busy` is a report about a peer and is retryable by whoever
+/// asked; `Failed` is a property of the volume or the handle and never clears by
+/// waiting. Each caller renders them in its own product vocabulary — the save path
+/// says "retry Save", the journal says "retry opening Manual" — which is the only
+/// reason this is an enum instead of a `String`.
+pub(crate) enum AdvisoryLockRefusal {
+    Busy,
+    Failed(std::io::Error),
+}
+
+/// THE bounded advisory-lock retry for this crate. Every `flock` contender —
+/// [`acquire_write_lock_within`] here, `native_document_journal::take_journal_lock`
+/// there — goes through this one loop with its own budget; there is no second
+/// implementation of the policy below.
+///
+/// Riding out a refusal at all is not optional. `flock(2)` binds to the OPEN FILE
+/// DESCRIPTION, not the process: "file descriptors duplicated through dup(2) or
+/// fork(2) do not result in multiple instances of a lock, but rather multiple
+/// references to a single lock". A peer that forks while this lock is held hands the
+/// child a reference the holder's own `File::drop` cannot release, so the lock stays
+/// taken for the child's whole fork->execve window even with `O_CLOEXEC` set — and
+/// aterm forks for every shell (`aterm-pty/src/unix.rs:1698`, a hand-rolled `forkpty`).
+/// A single-shot `try_lock` reports that residue as another owner, which is both a
+/// false diagnosis and a lost write.
+///
+/// THE POLICY, in one place so it cannot drift:
+///
+///  * The first attempt happens BEFORE any sleep, so an uncontended caller is
+///    byte-for-byte as fast as a bare `try_lock`.
+///  * `WouldBlock` ONLY is retried. `ENOTSUP` (a volume refusing advisory locks),
+///    `EBADF` and `EINVAL` never clear by waiting, and burning the budget on them
+///    would only make a permanent refusal slow. `WouldBlock` is not spurious here:
+///    std compiles `try_lock` to `flock(fd, LOCK_EX|LOCK_NB)` on Apple and maps only
+///    EAGAIN/EWOULDBLOCK onto it, whose one documented cause is a genuine
+///    conflicting lock.
+///  * Exponential backoff to an 8 ms ceiling, each sleep clamped to what is left of
+///    the budget so the wait can never overshoot what the caller asked for. A fixed
+///    1 ms poll would spend the whole budget in wakeups for no extra resolution.
+///  * The budget is a CEILING, never a floor: `budget` is the most this can cost,
+///    and the caller — not this function — decides how much its thread can afford.
+pub(crate) fn acquire_advisory_lock_within(
+    lock_file: &File,
+    budget: std::time::Duration,
+) -> Result<(), AdvisoryLockRefusal> {
     let deadline = std::time::Instant::now() + budget;
     let mut backoff = std::time::Duration::from_millis(1);
     loop {
         match lock_file.try_lock() {
             Ok(()) => return Ok(()),
             Err(std::fs::TryLockError::Error(error)) => {
-                return Err(format!("could not acquire save lock: {error}"));
+                return Err(AdvisoryLockRefusal::Failed(error));
             }
             Err(std::fs::TryLockError::WouldBlock) => {
                 let remaining = deadline.saturating_duration_since(std::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(write_lock_busy());
+                    return Err(AdvisoryLockRefusal::Busy);
                 }
                 std::thread::sleep(backoff.min(remaining));
                 backoff = (backoff * 2).min(std::time::Duration::from_millis(8));
             }
         }
     }
+}
+
+/// The save path's rendering of [`acquire_advisory_lock_within`]: same loop, same
+/// rules, this module's vocabulary.
+fn acquire_write_lock_within(lock_file: &File, budget: std::time::Duration) -> Result<(), String> {
+    acquire_advisory_lock_within(lock_file, budget).map_err(|refusal| match refusal {
+        AdvisoryLockRefusal::Busy => write_lock_busy(),
+        AdvisoryLockRefusal::Failed(error) => format!("could not acquire save lock: {error}"),
+    })
 }
 
 fn acquire_write_lock(lock_file: &File) -> Result<(), String> {

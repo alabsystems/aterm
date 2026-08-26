@@ -552,9 +552,64 @@ mod tests {
     use super::{
         ALL_FILES, FOS_ALLOWMULTISELECT, FOS_FILEMUSTEXIST, FOS_FORCEFILESYSTEM,
         FOS_NODEREFERENCELINKS, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS, FilterSpecs, dialog_options,
-        is_cancelled, path_from_nul_terminated,
+        IFileOpenDialogVtbl, IShellItemVtbl, is_cancelled, path_from_nul_terminated,
     };
     use std::path::PathBuf;
+
+    /// STRUCTURAL FENCE on the hand-rolled vtables, in the shape this crate
+    /// already uses for hand-packed FFI (`task_dialog_config_layout_matches_the_sdk`
+    /// pins `size_of` + `offset_of!` on TASKDIALOGCONFIG for the same reason).
+    ///
+    /// The module declares every slot BEFORE a called one so the offsets land,
+    /// but nothing verified that shape: a dropped or reordered declared-but-
+    /// uncalled slot compiles perfectly and silently turns a call like
+    /// `(vt.get_result)(…)` into a wild indirect call into the shell's vtable.
+    /// The parity audit's COM review found the fence missing and the layout
+    /// correct; this keeps the second half true.
+    ///
+    /// The counts are the documented COM inheritance chains:
+    ///   IFileOpenDialog = IUnknown(3) + IModalWindow(1) + IFileDialog(17) = 21
+    ///   IShellItem      = IUnknown(3) + 3 = 6
+    #[test]
+    fn com_vtable_layout_matches_the_documented_slot_order() {
+        use std::mem::{offset_of, size_of};
+
+        assert_eq!(
+            size_of::<IFileOpenDialogVtbl>(),
+            21 * size_of::<usize>(),
+            "IFileOpenDialog vtable is IUnknown(3) + IModalWindow(1) + IFileDialog(17)"
+        );
+        assert_eq!(
+            size_of::<IShellItemVtbl>(),
+            6 * size_of::<usize>(),
+            "IShellItem vtable is IUnknown(3) + BindToHandler/GetParent/GetDisplayName"
+        );
+
+        // Every slot this module actually CALLS, pinned at its documented index.
+        let slot = |bytes: usize| bytes / size_of::<usize>();
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, release)), 2, "IUnknown::Release");
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, show)), 3, "IModalWindow::Show");
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, set_file_types)),
+            4,
+            "IFileDialog::SetFileTypes"
+        );
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, set_options)), 9, "SetOptions");
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, get_options)), 10, "GetOptions");
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, set_title)), 17, "SetTitle");
+        assert_eq!(
+            slot(offset_of!(IFileOpenDialogVtbl, set_ok_button_label)),
+            18,
+            "SetOkButtonLabel"
+        );
+        assert_eq!(slot(offset_of!(IFileOpenDialogVtbl, get_result)), 20, "GetResult is LAST");
+        assert_eq!(slot(offset_of!(IShellItemVtbl, release)), 2, "IUnknown::Release");
+        assert_eq!(
+            slot(offset_of!(IShellItemVtbl, get_display_name)),
+            5,
+            "IShellItem::GetDisplayName is LAST"
+        );
+    }
 
     /// Read one built `COMDLG_FILTERSPEC` row back through its raw pointers, the
     /// way the shell will.

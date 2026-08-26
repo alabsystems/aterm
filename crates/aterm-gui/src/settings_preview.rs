@@ -1350,7 +1350,6 @@ impl SettingsPreviewSpec {
             input_fingerprint,
             prepared_font: self.prepared_font.clone(),
             theme,
-            font: self.font_candidate.clone(),
             font_px: self.font_px,
             line_height: self.line_height,
             baseline_adjust: self.baseline_adjust,

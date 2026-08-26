@@ -39,7 +39,31 @@
 //! is `S_OK` as soon as the handles are owned.
 
 #![cfg(windows)]
-#![allow(dead_code)] // The whole module is staged behind `handoff_server_available`.
+// STAGED LANDING, and this one has NOT expired — audited 2026-08-25 alongside the
+// `status_surface.rs` removal, which is the standing precedent that a module-scoped
+// suppression must name what it hides and when it dies.
+//
+// WHAT IT HIDES: in the non-test `lib` target on Windows nothing calls `start`, so
+// everything reachable only from it is `never used` — `start`, `spawn_pump`,
+// `pump_until_quit`, `Broker`, `Broker::post_quit`, the `Msg`/`Point` layouts, the
+// four Win32 constants and the `extern "system"` declarations those functions are
+// the only callers of. That set is derived by reading the call graph, not by
+// compiling: this file cannot be linted from a non-Windows box (no Windows std in
+// the pinned toolchain here), so treat it as the shape, not a checked list. Every
+// one of them IS live in the `lib test` target — the four tests in this file drive
+// the refusal, the pump handshake, pump independence and the `Msg` layout — so the
+// module is TESTED, not merely parked.
+//
+// WHY IT MUST STAY: the one caller that would make them live is
+// `CoRegisterClassObject` + the class factory, which cannot be written until aterm
+// ships a proxy/stub for the interface (see the module doc above and
+// `crate::defterm_win::handoff_server_available`). Deleting the module instead would
+// throw away the shutdown handshake this file exists to get right.
+//
+// WHEN IT DIES: with the first production caller of `start`. Whoever lands that
+// caller re-runs the lint lane on Windows with this line removed, and fixes or
+// per-item-justifies whatever it actually exposes.
+#![allow(dead_code)]
 
 use std::io;
 use std::sync::mpsc;

@@ -86,7 +86,6 @@ mod app_tabs;
 /// worker, the Commit-time admission facts and `finish_update_handoff`. Split
 /// out of `app_input` verbatim; still an inherent `impl App`.
 mod app_update_handoff;
-mod status_surface;
 mod app_update_screen;
 mod app_window;
 #[cfg(test)]
@@ -1333,6 +1332,13 @@ fn confirm_multiline_paste_dialog(lines: usize, owner_hwnd: isize) -> bool {
     )
 }
 
+/// The crate-visible door to [`win32::alert_ok`], so `menu::notify` can raise a
+/// real alert on Windows instead of returning from an empty body.
+#[cfg(windows)]
+pub(crate) fn win_alert_ok(title: &str, body: &str) {
+    win32::alert_ok(0, title, body);
+}
+
 // The remaining platforms (Linux) have no native alert to wire — a fallback here
 // used to return `true` unconditionally, which made the pastejacking guard a
 // silent no-op exactly where the X11 clipboard makes pastejacking easiest (audit
@@ -1419,6 +1425,8 @@ mod win32 {
     const MB_TASKMODAL: u32 = 0x2000;
     const MB_SETFOREGROUND: u32 = 0x1_0000;
     const IDYES: i32 = 6;
+    /// `MB_OK` + the informational-alert bits used by [`alert_ok`].
+    const MB_OK: u32 = 0x0;
 
     /// A `windows_subsystem = "windows"` binary starts with NO std handles, so a
     /// console launch (`aterm-gui --help`, dev `cargo run`) would print nothing.
@@ -1566,6 +1574,37 @@ mod win32 {
         // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the (modal,
         // synchronous) call; the owner HWND is either 0 or a live winit window's.
         unsafe { MessageBoxW(owner_hwnd, body.as_ptr(), title.as_ptr(), style) == IDYES }
+    }
+
+    /// A blocking informational alert — the Windows twin of the macOS `NSAlert`
+    /// that [`crate::menu::notify`] raises. Off macOS `notify` used to be an
+    /// EMPTY BODY, and a `windows_subsystem = "windows"` launch has no stderr,
+    /// so a failure it reported reached the user through no channel at all: the
+    /// audit found a single click on the picker's unrestricted `*.*` row could
+    /// hit any of the document host's rejections and say nothing whatsoever.
+    /// Same owner/task-modal fallback as [`confirm_yes_no`].
+    pub(super) fn alert_ok(owner_hwnd: isize, title: &str, body: &str) {
+        fn wide(s: &str) -> Vec<u16> {
+            s.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+        let body = wide(body);
+        let title = wide(title);
+        let owner = if owner_hwnd == 0 {
+            // SAFETY: no arguments, no invariants — returns 0 when this thread
+            // has no active window, which the task-modal bit then covers.
+            unsafe { GetActiveWindow() }
+        } else {
+            owner_hwnd
+        };
+        let style = MB_OK
+            | MB_ICONWARNING
+            | MB_SETFOREGROUND
+            | if owner == 0 { MB_TASKMODAL } else { 0 };
+        // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the
+        // (modal, synchronous) call; the owner HWND is either 0 or live.
+        unsafe {
+            MessageBoxW(owner, body.as_ptr(), title.as_ptr(), style);
+        }
     }
 
     // ---- TaskDialogIndirect (comctl32 v6) confirm --------------------------------

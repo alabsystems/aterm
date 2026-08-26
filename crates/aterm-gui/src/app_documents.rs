@@ -19,8 +19,9 @@ use crate::native_document_host::{
     GrantAccess,
 };
 use crate::native_document_journal::{
-    DocumentJournalStore, JournalCompletion, JournalEffect, JournalRewriteGeneration,
-    JournalRewritePlan, JournalRewriteResult, execute_journal_append, execute_journal_rewrite,
+    DocumentJournalStore, JournalCompletion, JournalEffect, JournalLockPatience,
+    JournalRewriteGeneration, JournalRewritePlan, JournalRewriteResult, execute_journal_append,
+    execute_journal_rewrite,
 };
 use crate::native_editor::{EditorCommand, EditorEffect, Selection};
 use crate::{App, WindowId};
@@ -189,7 +190,15 @@ fn native_document_queue() -> Result<&'static std::sync::mpsc::Sender<NativeDocu
                                 plan,
                                 proxy,
                             } => {
-                                let result = execute_journal_append(&path, key, &plan);
+                                let result = execute_journal_append(
+                                    &path,
+                                    key,
+                                    &plan,
+                                    // This IS the worker thread: no frame to
+                                    // drop, so ride out the whole fork window
+                                    // rather than lose the append.
+                                    JournalLockPatience::Worker,
+                                );
                                 let _ = proxy.send_event(crate::Wake::NativeDocumentJournaled {
                                     document,
                                     generation: plan.generation,
@@ -202,7 +211,11 @@ fn native_document_queue() -> Result<&'static std::sync::mpsc::Sender<NativeDocu
                                 plan,
                                 proxy,
                             } => {
-                                let result = execute_journal_rewrite(&path, &plan);
+                                let result = execute_journal_rewrite(
+                                    &path,
+                                    &plan,
+                                    JournalLockPatience::Worker,
+                                );
                                 let _ =
                                     proxy.send_event(crate::Wake::NativeDocumentJournalRewritten {
                                         document,
@@ -1002,7 +1015,13 @@ impl App {
                         }
                         return Ok(());
                     }
-                    let result = execute_journal_append(&path, key, &plan);
+                    // NO worker to hand this to (`proxy` is None, so the queue
+                    // was never built), and this is the thread that owns `App`.
+                    // It takes the frame-sized budget for that reason, and its
+                    // refusal flows to `set_document_recovery_status` exactly as
+                    // any other journal failure does.
+                    let result =
+                        execute_journal_append(&path, key, &plan, JournalLockPatience::EventLoop);
                     let completion = self
                         .native_documents
                         .journals
@@ -1041,7 +1060,8 @@ impl App {
                         }
                         return Ok(());
                     }
-                    let result = execute_journal_rewrite(&path, &plan);
+                    let result =
+                        execute_journal_rewrite(&path, &plan, JournalLockPatience::EventLoop);
                     let completion = self
                         .native_documents
                         .journals
@@ -3121,6 +3141,13 @@ mod tests {
         let error = app
             .ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect_err("held journal lock must report busy");
+        // This bound is a LIVENESS check, not a budget check — see
+        // `REFUSES_WITHOUT_BLOCKING`. The SIZE of the wait this open can incur is
+        // pinned deterministically, without a clock, by the guard test named on
+        // `native_document_journal::JournalLockPatience::EventLoop`;
+        // tightening the bound here toward a frame would
+        // re-create exactly the load-sensitive assertion this constant was raised
+        // to escape.
         assert!(started.elapsed() < REFUSES_WITHOUT_BLOCKING);
         assert!(error.contains("busy"), "{error}");
         assert!(error.contains("retry opening Manual"), "{error}");

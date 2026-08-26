@@ -4872,6 +4872,15 @@ impl CursorGlow {
     const MAX_PARTICLES: usize = 512;
     /// Longest the rainbow ribbon streak can grow (cells) before the oldest are
     /// dropped — bounds a flat-out multi-line streak's quad count.
+    /// How many PTY batches may cross a single input boundary and still let
+    /// the typed candidate fall through to its CONTENT proof rather than being
+    /// condemned by the batch count alone — see the concurrent-decoration law
+    /// in [`Self::confirm_content_candidate`]. Sized for real decoration
+    /// traffic (a 150 ms spinner beside an echo is 2-3 batches; a token
+    /// streamer a few more) and deliberately far below anything that could be
+    /// a wrapped or reset sequence, which must keep the strict fence.
+    const CONCURRENT_DECORATION_BATCH_MAX: u32 = 16;
+
     const RAINBOW_MAX_CELLS: usize = 240;
     /// Longest same-row typed-coalesce the ribbon sweeps as CONTINUED TYPING
     /// (cells): batched echoes under fast typing / key-repeat rarely hop more
@@ -5254,6 +5263,31 @@ impl CursorGlow {
     /// Echo latency is tens of milliseconds; a quarter second covers a loaded
     /// PTY without correlating the candidate to a later, unrelated move.
     const TYPE_HINT_FRESH: f32 = 0.25;
+    /// THE RETENTION WINDOW, deliberately wider than the ADMISSION window
+    /// above — because they answer different questions and carry different
+    /// risk.
+    ///
+    /// [`Self::TYPE_HINT_FRESH`] governs whether a keystroke may SPAWN light:
+    /// it is a causality bound, and it must stay tight. This bound governs
+    /// only whether light the user ALREADY EARNED survives one batch. A
+    /// retention miss costs nothing that can be seen (the cells fade on their
+    /// own in a second or two); a retention FALSE NEGATIVE wipes the whole
+    /// ribbon, which is the defect the owner has now watched through five
+    /// releases.
+    ///
+    /// It must clear the real frame train, not the ideal one. The owner's own
+    /// live `ctl metrics` reports `present_p95_ms=402.65 present_p99_ms=738.20
+    /// max_frame_gap_ms=1986.00` — so a candidate retired for `stale` is very
+    /// often a PERFECTLY GOOD keystroke whose frame merely arrived late, and
+    /// its echo is still the next thing that lands. Judging that echo's
+    /// retention against the 0.25 s admission bound would expire the
+    /// tombstone before the frame that needs it ever runs.
+    ///
+    /// This NEVER admits, spawns, confirms, or feeds momentum — the consult's
+    /// only power is to route a batch to the proportionate fence instead of
+    /// the wholesale wipe — so a wide bound cannot manufacture light. It can
+    /// only decline to destroy some.
+    const RETIRED_ECHO_RETENTION_FRESH: f32 = 1.5;
     /// Freshness window for the RETURN classifier ([`Self::return_hint`]).
     const RETURN_HINT_FRESH: f32 = 0.25;
     /// Freshness window for the REFLOW classifier ([`Self::reflow_hint`]). It is
@@ -7357,7 +7391,7 @@ impl CursorGlow {
         if clock
             .saturating_duration_since(tombstone.revoked_at)
             .as_secs_f32()
-            > Self::TYPE_HINT_FRESH
+            > Self::RETIRED_ECHO_RETENTION_FRESH
         {
             self.revoked_target_tombstone = None;
             return None;
@@ -8182,6 +8216,75 @@ impl CursorGlow {
         now: Instant,
         current_generation: ContentGeneration,
     ) -> Option<ContentCandidateDecision> {
+        // THE RETIRED-ECHO RETENTION TOMBSTONE (the `spawns=393 /
+        // ribbon_segments=0` shape).
+        //
+        // Read the live candidate's identity BEFORE the seam below judges it,
+        // because every retire path in that seam calls
+        // [`Self::retire_move_candidate_at`], which sets `move_candidate =
+        // None`. That null is what made the E2 tombstone STRUCTURALLY
+        // UNREACHABLE from this seam: `revoke_unowned_hints` (the only other
+        // mint) reads `self.move_candidate`, so by the time the generation
+        // fence ran there was nothing left to remember.
+        //
+        // The consequence was the owner's whole complaint. A typed key whose
+        // candidate retires — `stale`, `row-mismatch`, `generation-skip`,
+        // `no-row-probe`, `probe-predates-key`, `unbaselined`, `no-move` —
+        // STILL produced an echo batch that advanced the caret one column.
+        // That batch reached `observe_content_generation_with_evidence` with
+        // `ContentGenerationEvidence::None`, identity held, anchor NOT held
+        // (the echo just moved the caret off the anchor), no backspace
+        // licence and no tombstone — so it fell through every proportionate
+        // arm to `clear_denied_move_visuals()` and the ENTIRE accumulated
+        // ribbon died in that one frame. An honest human keystroke was judged
+        // byte-for-byte the same as cold program output. That is why `spawns`
+        // climbed forever while `ribbon_segments` never accumulated: each
+        // CONFIRMED key adds one spark, and the first RETIRED key takes the
+        // whole band to zero. A sawtooth pinned near zero, not a ribbon.
+        //
+        // So a retired TYPED candidate leaves its predicted landing behind,
+        // exactly as a fence-revoked one does. The consult
+        // ([`Self::take_fresh_revoked_target_tombstone`]) still demands the
+        // batch's cursor sit on EXACTLY that predicted target, still one-shot,
+        // still expiring on a clock. THE COLD-OUTPUT LAW IS UNTOUCHED BY
+        // CONSTRUCTION: a candidate exists only after a real classified key
+        // press, so a cold PTY mints no tombstone, consumes none, and its
+        // relocations wipe exactly as before.
+        let retired_echo_tombstone =
+            self.move_candidate
+                .and_then(|candidate| match (candidate.intent, candidate.target) {
+                    (GlowMoveIntent::Typed(_), Some(target)) => Some(RevokedTargetTombstone {
+                        revoked_at: candidate.at,
+                        origin: candidate.origin,
+                        target,
+                        baseline_generation: candidate
+                            .baseline_generation
+                            .map(|generation| generation.process_sequence),
+                    }),
+                    _ => None,
+                });
+        let decision = self.confirm_content_candidate_judged(current_cursor, now, current_generation);
+        if let Some(ContentCandidateDecision::Retired { at, .. }) = decision
+            && let Some(tombstone) = retired_echo_tombstone
+            && tombstone.revoked_at == at
+        {
+            // Newest wins, exactly as the fence's own mint does. The
+            // wholesale teardowns still clear the slot, so only the retained
+            // paths keep it.
+            self.revoked_target_tombstone = Some(tombstone);
+        }
+        decision
+    }
+
+    /// The judgement half of [`Self::confirm_content_candidate`]. Split out so
+    /// the retired-echo tombstone above is minted from ONE place and covers
+    /// every retire reason this seam has — including reasons added later.
+    fn confirm_content_candidate_judged(
+        &mut self,
+        current_cursor: Option<(u16, u16)>,
+        now: Instant,
+        current_generation: ContentGeneration,
+    ) -> Option<ContentCandidateDecision> {
         let candidate = self.move_candidate?;
         if now.saturating_duration_since(candidate.at).as_secs_f32() > Self::TYPE_HINT_FRESH {
             self.log_confirm("stale", &candidate, current_generation, now);
@@ -8208,10 +8311,76 @@ impl CursorGlow {
             self.log_confirm("await-echo", &candidate, current_generation, now);
             return None;
         }
-        if current_generation.terminal_id != baseline_generation.terminal_id
-            || current_generation.alternate_screen != baseline_generation.alternate_screen
-            || current_generation.process_sequence
-                != baseline_generation.process_sequence.wrapping_add(1)
+        // THE CONCURRENT-DECORATION LAW. The batch counter is a PROXY for
+        // "causality is unattributable"; the CONTENT proof below is the
+        // evidence itself. On a modern full-screen TUI the proxy is wrong far
+        // more often than it is right: a Claude Code / vim / fzf frame runs a
+        // spinner, a clock, a token stream — decoration that repaints on its
+        // own cadence — so between the key press and the next observation TWO
+        // batches land (the decoration's, and the echo's) and
+        // `process_sequence` advances by 2 through no fault of the keystroke.
+        // MEASURED on the shipped `fake-claude` shape at HEAD: 10 keys typed,
+        // 4 confirmed, 6 retired `motion-downgrade`, ribbon capped at 3 cells.
+        // The gate failed on `rainbow_gap=7` (it allows <= 1) and, on one take,
+        // `ribbon_dark=4` — i.e. the trail BLACKED OUT for seven consecutive
+        // frames mid-typing, and some frames claimed a ribbon the raster did
+        // not carry. `total_ink` cleared its floor: the defect was interior
+        // blackout, never dimness. Under a `ctl video` recording pin the SAME
+        // binary and keys score `total_ink=5515 rainbow_run=98 rainbow_gap=0`
+        // — a continuous capture cadence observes every generation singly and
+        // the proxy never trips. That is why five releases shipped a broken
+        // ribbon behind a green matrix.
+        //
+        // So the multi-batch case no longer SHORT-CIRCUITS an alt-screen typed
+        // candidate. IDENTITY is still absolute — a different terminal or a
+        // screen swap kills the proof outright, below. But when the identity
+        // held, the candidate falls through to the exact-content witnesses
+        // (the typed cells materializing AT the caret, every cell BEFORE it
+        // untouched, the cursor landing on the exact predicted target). Those
+        // are strictly STRONGER evidence than a batch count, and a spinner
+        // repainting elsewhere on the screen cannot fake any of them. A
+        // candidate that fails them still downgrades at the `!row_changed`
+        // seam or retires on a row mismatch, exactly as before — so cold
+        // program movement gains nothing: it never armed a candidate, and it
+        // cannot materialize expected cells it was never given.
+        let identity_held = current_generation.terminal_id == baseline_generation.terminal_id
+            && current_generation.alternate_screen == baseline_generation.alternate_screen;
+        let concurrent_decoration = identity_held
+            && self.ctx_alt
+            && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+            && candidate.deferred_probe_generation.is_none()
+            // A BOUNDED FORWARD WINDOW. `process_sequence` is a `u32`, so a
+            // bare `wrapping_sub(..) >= 1` would read a BACKWARDS or wrapped
+            // sequence as an advance of ~4 billion and wave it through — the
+            // opposite of a fence. Decoration racing an echo is a handful of
+            // batches (a 150 ms spinner plus the echo is 2-3; a token streamer
+            // a few more); anything past this window is not a decoration race
+            // and keeps the historical strict fence.
+            && matches!(
+                current_generation
+                    .process_sequence
+                    .wrapping_sub(baseline_generation.process_sequence),
+                1..=Self::CONCURRENT_DECORATION_BATCH_MAX
+            )
+            // THE LANDING WITNESS, and the reason this relaxation cannot become
+            // a motion forgery. The caret must be sitting on the EXACT cell this
+            // candidate predicted when the key was pressed. Without it the law
+            // confirmed a vim-style motion whose letter happened to echo — 'm'
+            // materializing at its predicted column while the caret flew to
+            // column 12 — and drew a typed ribbon head at a cell the caret had
+            // already left. Caught by the jump-shaped NON-VACUITY arm of
+            // `coalesced_alt_generation_with_an_exact_echo_buys_its_typed_light`.
+            //
+            // A single-batch advance is unaffected: it never enters this arm and
+            // keeps its historical seams exactly as before.
+            && candidate
+                .target
+                .is_some_and(|target| current_cursor == Some(target));
+        if !concurrent_decoration
+            && (current_generation.terminal_id != baseline_generation.terminal_id
+                || current_generation.alternate_screen != baseline_generation.alternate_screen
+                || current_generation.process_sequence
+                    != baseline_generation.process_sequence.wrapping_add(1))
         {
             // More than one batch crossed the input boundary. Even if the row
             // now happens to match, causality is no longer attributable — the
@@ -9596,7 +9765,7 @@ impl CursorGlow {
         if self.revoked_target_tombstone.is_some_and(|tombstone| {
             now.saturating_duration_since(tombstone.revoked_at)
                 .as_secs_f32()
-                > Self::TYPE_HINT_FRESH
+                > Self::RETIRED_ECHO_RETENTION_FRESH
         }) {
             self.revoked_target_tombstone = None;
         }
@@ -29832,14 +30001,39 @@ mod tests {
 
     /// PRODUCTION-ORDER regression for the live streamer blackout: a key's
     /// echo and an ambient ESC-7/status/ESC-8 write can cross the render lock
-    /// as N+2 even though the final caret advanced by only one cell. The exact
-    /// content proof must downgrade (never forge typed light), while the same
-    /// authenticated generation preserves byte-steady resident wake through
+    /// as N+2 even though the final caret advanced by only one cell. The
+    /// authenticated generation must preserve byte-steady resident wake through
     /// BOTH engine ticks. Before `AuthoredMotion`, the generation fence called
     /// this an unowned relocation; after the first fence repair, each tick's
     /// denied one-cell Motion spawn wiped the retained wake a second time.
+    ///
+    /// THE LAW CHANGED 2026-08-25, and this test is where it is recorded.
+    /// It previously required the exact content proof to DOWNGRADE here —
+    /// "never forge typed light" — preserving the existing ribbon but refusing
+    /// to let this key earn any. That was the conservative half of the streamer
+    /// blackout repair, chosen before anyone had measured what it cost.
+    ///
+    /// It costs the entire trail. On any full-screen TUI — Claude Code, vim,
+    /// fzf — decoration repaints on its own cadence, so N+2 is not the unusual
+    /// case, it is EVERY keystroke. MEASURED on the shipped `fake-claude`
+    /// conformance shape: ten keys typed, four confirmed, six downgraded,
+    /// ribbon capped at three cells, and the gate red on `rainbow_gap=7`
+    /// (limit 1) with `ribbon_dark=4` on one take — a multi-frame interior
+    /// BLACKOUT mid-typing, not a dim trail. With this law the same shape
+    /// scores `total_ink=1093 rainbow_run=24 rainbow_gap=0 ribbon_dark=0`, and
+    /// the cold-output dark control still reports zero ink in every frame.
+    ///
+    /// What justifies the purchase is that the batch COUNT was only ever a
+    /// proxy for "causality is unattributable", while the content proof is the
+    /// evidence itself: the expected cells materialized AT the caret, every
+    /// cell before it untouched, and the caret landed on the exact predicted
+    /// target. A streamer writing off-row cannot produce that. What still
+    /// cannot buy light is a key whose echo never materialized (the
+    /// swallowed-key control) and a key whose caret landed somewhere other than
+    /// its predicted target (the jump-shaped NON-VACUITY arm at the end of this
+    /// test, which still downgrades).
     #[test]
-    fn coalesced_alt_generation_preserves_attested_wake_without_buying_light() {
+    fn coalesced_alt_generation_with_an_exact_echo_buys_its_typed_light() {
         let g = geom();
         let c = cfg(GlowStyle::RainbowKitty, true);
         let trail_cfg = TrailConfig {
@@ -29941,6 +30135,7 @@ mod tests {
 
         // The submitted `m` is baselined at N, but the restored frame reports
         // N+2 because the streamer's off-row batch coalesced with its echo.
+        // THE LAW CHANGED HERE — see the test doc above.
         let key_at = charged_at + Duration::from_millis(1);
         glow.note_typed_expected(
             key_at,
@@ -29955,51 +30150,48 @@ mod tests {
         let mut echoed = input_row;
         echoed[5] = 'm';
         glow.observe_row_with_trust(2, 6, &echoed, echo_at, ProbeTrust::ContentOnly);
+        let before_spawns = glow.spawns();
         let decision =
             glow.confirm_content_candidate(Some((2, 6)), echo_at, generation(42));
-        let Some(ContentCandidateDecision::Downgraded { at, origin }) = decision else {
-            panic!("N+2 alt echo must downgrade to Motion: {decision:?}");
+        let Some(ContentCandidateDecision::Confirmed { at, origin, target }) = decision else {
+            panic!(
+                "an N+2 echo that MATERIALIZED exactly must confirm and buy its \
+                 typed light: {decision:?}"
+            );
         };
-        trail.arm_motion(at, origin);
+        trail.confirm_content_candidate(at, origin, target);
         let ownership = glow.observe_content_generation_with_evidence(
             generation(42),
             Some((2, 6)),
-            ContentGenerationEvidence::AuthoredMotion,
+            ContentGenerationEvidence::Exact,
         );
-        assert_eq!(ownership, GenerationOwnership::AuthoredMotion);
+        assert_eq!(ownership, GenerationOwnership::Owned);
         let witness = glow.batch_wake_witness();
         trail.observe_content_generation(generation(42), ownership, witness.as_ref());
 
-        // Pin the no-purchase half at the shipping tick seam. The fence
-        // intentionally clears projectile glide state; this denied one-cell
-        // relocation may neither pump it back up nor update movement timing.
-        glow.heat_at = Some(echo_at);
-        let before_glide = (
-            glow.glide.vel.to_bits(),
-            glow.glide.dir,
-            glow.glide.run,
-            glow.glide.stars.len(),
-            glow.glide.last_fired,
-            glow.glide.head.map(|(x, y)| (x.to_bits(), y.to_bits())),
-            glow.glide.land_at,
-        );
-        let before_move = glow.last_move;
-        let before_spawns = glow.spawns();
-        let before_heat = (glow.heat.to_bits(), glow.coal.to_bits(), glow.flare.to_bits());
         glow.tick(Some((2, 6)), echo_at, &c, g, &mut glow_out);
         trail.tick(Some((2, 6)), echo_at, &trail_cfg, &mut trail_out);
         assert!(
             frame_has_output(&glow_out, &glow),
-            "the attested rainbow wake remains on glass after the glow tick"
+            "the rainbow wake remains on glass after the glow tick"
         );
         assert!(
             !trail_out.is_empty(),
-            "the attested classic comet remains on glass after its tick"
+            "the classic comet remains on glass after its tick"
+        );
+        // THE PURCHASE, which is the half that changed: this key earned light.
+        assert_eq!(
+            glow.spawns(),
+            before_spawns + 1,
+            "an exact coalesced echo must SPAWN — a ribbon that never grows past \
+             its newest head is the whole defect this law was written to fix"
         );
         assert!(
             glow.ribbon_segments() > 0,
-            "the coalesced frame must preserve the ribbon itself, not merely a pop/halo"
+            "the coalesced frame must carry the ribbon itself, not merely a pop/halo"
         );
+        // ...and every protection the previous law bought is still bought: the
+        // older byte-steady body survives the coalesced frame intact.
         for cell in &steady_ribbon_cells {
             assert!(
                 glow.sparks
@@ -30011,27 +30203,6 @@ mod tests {
         assert_eq!(glow.cursor_anchor(), Some((2, 6)));
         assert_eq!(trail.cursor_anchor(), Some((2, 6)));
         assert!(!glow.move_candidate_pending() && !trail.move_candidate_pending());
-        assert_eq!(glow.spawns(), before_spawns, "the denied step births no glow");
-        assert_eq!(glow.take_momentum_pulse(), None, "the denied step funds no cat pulse");
-        assert_eq!(
-            (
-                glow.glide.vel.to_bits(),
-                glow.glide.dir,
-                glow.glide.run,
-                glow.glide.stars.len(),
-                glow.glide.last_fired,
-                glow.glide.head.map(|(x, y)| (x.to_bits(), y.to_bits())),
-                glow.glide.land_at,
-            ),
-            before_glide,
-            "the denied step cannot pump the next genuine glide"
-        );
-        assert_eq!(glow.last_move, before_move);
-        assert_eq!(
-            (glow.heat.to_bits(), glow.coal.to_bits(), glow.flare.to_bits()),
-            before_heat,
-            "the denied step cannot purchase thermal momentum"
-        );
 
         // COLD NEGATIVE: naming AuthoredMotion without the downgraded
         // candidate cannot retain or create anything in either engine.
@@ -30473,6 +30644,205 @@ mod tests {
             );
         }
     }
+
+    /// THE CONCURRENT-DECORATION LAW. A full-screen TUI repaints its own
+    /// decoration — a spinner, a clock, a token stream — on a cadence that has
+    /// nothing to do with the keyboard. So a single keystroke routinely lands
+    /// with TWO batches between the press and the next observation: the
+    /// decoration's, and the echo's. The batch counter alone therefore cannot
+    /// mean "causality is unattributable"; it only means "something else was
+    /// also drawing".
+    ///
+    /// This is not a hypothetical. MEASURED 2026-08-25 on the shipped
+    /// `fake-claude` conformance shape: of ten keys typed, four confirmed and
+    /// six retired `motion-downgrade`, ribbon capped at three cells,
+    /// `best_ink=38` against a `--min-ink 150` gate — while the SAME binary
+    /// under a `ctl video` recording pin scored `total_ink=5515
+    /// rainbow_run=98`. The recording's continuous capture cadence observes
+    /// every generation singly, so the fence never trips; that is how five
+    /// releases shipped a stunted ribbon behind a green matrix.
+    ///
+    /// The witness that replaces the proxy is the content proof itself: the
+    /// typed cells materializing AT the caret, every cell BEFORE it untouched,
+    /// the cursor landing on the exact predicted target. A spinner repainting
+    /// elsewhere cannot fake any of the three.
+    #[test]
+    fn a_concurrent_decoration_batch_does_not_condemn_an_honest_keystroke() {
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let t0 = Instant::now();
+        let mut baseline_cells = [' '; 40];
+        for (index, ch) in "> hi".chars().enumerate() {
+            baseline_cells[index] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow_out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        // THE BASELINE PROBE. `confirm_content_candidate` compares this frame's
+        // row against the row as it stood at input time; without a prior
+        // observation there is no `row_prev` to compare to and the seam answers
+        // `None` (still pending) rather than any verdict at all. A fixture that
+        // skips it makes every NEGATIVE assertion here vacuous — `None` is not
+        // `Confirmed`, so the test would pass against a build that never
+        // confirms anything. Ask the production-order path for a real verdict.
+        glow.observe_row_with_trust(2, 4, &baseline_cells, t0, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(50), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+
+        let key = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(key, expected, (2, 5), (2, 4), baseline, generation(50));
+
+        // The echo lands: 'x' materializes at the caret, the prefix is intact,
+        // and the caret sits on the exact predicted target.
+        let mut echoed = baseline_cells;
+        echoed[4] = 'x';
+        let seen = key + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 5, &echoed, seen, ProbeTrust::ContentOnly);
+
+        // ...but the spinner repainted alongside it, so the batch counter
+        // advanced by TWO. Before the concurrent-decoration law this returned
+        // `Downgraded` and the ribbon never grew.
+        let decision = glow.confirm_content_candidate(Some((2, 5)), seen, generation(52));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "a two-batch advance whose content proof holds must CONFIRM, not \
+             downgrade — the spinner is not the keystroke's fault: {decision:?}"
+        );
+    }
+
+    /// The BOUND on the concurrent-decoration window, which is the other half
+    /// of why the relaxation is safe. `process_sequence` is a `u32`, so a
+    /// backwards or wrapped sequence subtracts to ~4 billion; read as a bare
+    /// "advanced by at least one" that would wave through exactly the case the
+    /// fence exists for. A distant sequence must keep the strict fence.
+    #[test]
+    fn a_wrapped_batch_sequence_is_not_a_decoration_race() {
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let t0 = Instant::now();
+        let mut baseline_cells = [' '; 40];
+        for (index, ch) in "> hi".chars().enumerate() {
+            baseline_cells[index] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow_out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        // THE BASELINE PROBE. `confirm_content_candidate` compares this frame's
+        // row against the row as it stood at input time; without a prior
+        // observation there is no `row_prev` to compare to and the seam answers
+        // `None` (still pending) rather than any verdict at all. A fixture that
+        // skips it makes every NEGATIVE assertion here vacuous — `None` is not
+        // `Confirmed`, so the test would pass against a build that never
+        // confirms anything. Ask the production-order path for a real verdict.
+        glow.observe_row_with_trust(2, 4, &baseline_cells, t0, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(50), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        let key = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(key, expected, (2, 5), (2, 4), baseline, generation(50));
+
+        // A perfectly good-looking echo — but the batch sequence went
+        // BACKWARDS, which is a reset, not a spinner.
+        let mut echoed = baseline_cells;
+        echoed[4] = 'x';
+        let seen = key + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 5, &echoed, seen, ProbeTrust::ContentOnly);
+
+        let decision = glow.confirm_content_candidate(Some((2, 5)), seen, generation(3));
+        // The exact verdict. Outside the bounded window the HISTORICAL strict
+        // fence owns this candidate, and for an alt-screen typed press that
+        // fence downgrades to Motion (retire is reserved for an identity
+        // change — a different terminal or a screen swap). What matters is that
+        // the wrapped sequence is NOT waved through as a decoration race: the
+        // positive test shares this fixture and reaches `Confirmed`, so landing
+        // on `Downgraded` here is a real discrimination, not a vacuous pass.
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Downgraded { .. })),
+            "a wrapped/reset sequence must keep the strict fence, never confirm \
+             as a decoration race: {decision:?}"
+        );
+    }
+
+    /// The negative control for the law above, and the reason it is safe: the
+    /// relaxation is of a BATCH COUNT, never of the evidence. Same two-batch
+    /// advance, same armed keystroke — but the expected cell never
+    /// materializes at the caret (the app swallowed the key). That candidate
+    /// must NOT confirm, or cold program output could borrow a keystroke's
+    /// proof simply by repainting twice.
+    #[test]
+    fn a_swallowed_key_still_cannot_borrow_the_proof_across_two_batches() {
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: true,
+        };
+        let t0 = Instant::now();
+        let mut baseline_cells = [' '; 40];
+        for (index, ch) in "> hi".chars().enumerate() {
+            baseline_cells[index] = ch;
+        }
+        let baseline = ExpectedRowSnapshot::from_slice(&baseline_cells).unwrap();
+        let expected = ExpectedCellSpan::from_cells(['x']).unwrap();
+
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let mut glow_out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.note_context(true);
+        // THE BASELINE PROBE. `confirm_content_candidate` compares this frame's
+        // row against the row as it stood at input time; without a prior
+        // observation there is no `row_prev` to compare to and the seam answers
+        // `None` (still pending) rather than any verdict at all. A fixture that
+        // skips it makes every NEGATIVE assertion here vacuous — `None` is not
+        // `Confirmed`, so the test would pass against a build that never
+        // confirms anything. Ask the production-order path for a real verdict.
+        glow.observe_row_with_trust(2, 4, &baseline_cells, t0, ProbeTrust::ContentOnly);
+        glow.tick(Some((2, 4)), t0, &c, g, &mut glow_out);
+        assert_eq!(
+            glow.observe_content_generation(generation(50), Some((2, 4)), false),
+            GenerationOwnership::Steady
+        );
+        let key = t0 + Duration::from_millis(1);
+        glow.note_typed_expected(key, expected, (2, 5), (2, 4), baseline, generation(50));
+
+        // The row is byte-identical to the baseline: nothing was echoed.
+        let seen = key + Duration::from_millis(8);
+        glow.observe_row_with_trust(2, 5, &baseline_cells, seen, ProbeTrust::ContentOnly);
+
+        let decision = glow.confirm_content_candidate(Some((2, 5)), seen, generation(52));
+        // The EXACT verdict, not merely "not Confirmed": the positive test above
+        // shares this fixture and reaches `Confirmed`, so a bare negation would
+        // still be worth little. A swallowed key on an alt screen is the
+        // motion-downgrade signature — the app consumed the letter and may have
+        // moved the caret itself — and that is what must come back.
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Downgraded { .. })),
+            "an unmaterialized echo must DOWNGRADE, never confirm, however many \
+             batches landed: {decision:?}"
+        );
+    }
+
 
     /// A byte-unchanged restored row is the swallowed-key Motion shape. It
     /// completes in the held generation too: keep attested resident wake, but

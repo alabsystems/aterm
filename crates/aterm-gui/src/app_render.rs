@@ -233,6 +233,13 @@ fn confirm_cursor_move_candidate(
 enum CursorFxCommit {
     Same,
     StableProjectionDrift,
+    /// The caret's VISIBILITY flipped between LOCK A and LOCK B while every
+    /// coordinate-space key — terminal identity, screen, caret cell, DECSCUSR
+    /// style, scroll clock — held. A DECTCEM toggle is not a coordinate
+    /// divergence: nothing the engines hold moved, so nothing they hold is
+    /// stale. The presented cursor style must still be rebound (LOCK B owns
+    /// it), but the resident engines keep their light AND their thermals.
+    VisibilityDrift,
     /// One exact authored content echo landed between LOCK A and LOCK B. The
     /// current projection is stale and must be suppressed, but both pending
     /// engine proofs remain valid for one coherent settle frame.
@@ -268,13 +275,16 @@ fn classify_cursor_fx_commit(
 ) -> CursorFxCommit {
     if observed.generation.terminal_id != committed.generation.terminal_id
         || observed.generation.alternate_screen != committed.generation.alternate_screen
-        || observed.visible != committed.visible
         || observed.style != committed.style
         || observed.scroll != committed.scroll
     {
         CursorFxCommit::Diverged
     } else if observed.cursor != committed.cursor {
+        // A caret that MOVED between the locks is still fenced exactly as
+        // before, hidden or not: the move is the coordinate divergence, and
+        // only the exact twin-owned sole-next echo witness retains it.
         if observed.visible
+            && committed.visible
             && pending_content_echo_straddles
             && committed.generation.process_sequence
                 == observed.generation.process_sequence.wrapping_add(1)
@@ -283,6 +293,31 @@ fn classify_cursor_fx_commit(
         } else {
             CursorFxCommit::Diverged
         }
+    } else if observed.visible != committed.visible {
+        // THE DECTCEM BRACKET, no longer a hard reset.
+        //
+        // Claude Code (and vim, and fzf) hide the caret INSIDE the per-keystroke
+        // DEC-2026 synchronized repaint and show it again at the end — the
+        // host's own LOCK-A comment documents that bracket. When the parser
+        // processed the hide between LOCK A and LOCK B, `visible` differed, this
+        // classified Diverged, and `retire_torn_cursor_fx` called
+        // `CursorGlow::reset()` — which is the ONLY per-frame path in the tree
+        // that also clears THERMALS, i.e. the rainbow kitty's momentum spine.
+        // On a TUI bracketing every keystroke that fires continuously, which
+        // parks the trail at the cold floor no matter how well the engine's own
+        // admission seams behave.
+        //
+        // It is also a straight contradiction of the engine's own law: "A hidden
+        // cursor is NOT relocation evidence — `None` frames are the alt screen's
+        // steady state" (`cursor_glow.rs`, the unowned generation fence). The
+        // host may not answer a question the engine has already decided.
+        //
+        // Nothing here weakens the fence. Every coordinate-space key held
+        // (checked above) and the caret did not move (checked above), so LOCK
+        // A's scratch is positionally exact; the only thing LOCK B owns that
+        // changed is whether the caret block itself paints, and that is
+        // precisely what the rebind below is for.
+        CursorFxCommit::VisibilityDrift
     } else if observed.generation.process_sequence != committed.generation.process_sequence {
         CursorFxCommit::StableProjectionDrift
     } else {
@@ -338,6 +373,13 @@ fn apply_cursor_fx_commit(window: &mut WindowState, commit: CursorFxCommit) -> b
             window.robi_tip_posted = None;
             window.robi_bubble_anchor = None;
             window.cursor_echo_settle_pending = true;
+            true
+        }
+        CursorFxCommit::VisibilityDrift => {
+            // Rebind the presented cursor style (LOCK B owns it, and the
+            // caret's visibility is part of that binding) — and touch NOTHING
+            // else. No engine teardown, no scratch drop: the projection is
+            // coordinate-exact.
             true
         }
         CursorFxCommit::Same | CursorFxCommit::StableProjectionDrift => false,
@@ -824,8 +866,10 @@ mod cursor_fx_generation_fence_tests {
         );
         assert_eq!(
             classify(committed, (3, 9), false, CursorStyle::SteadyBlock, false,),
-            CursorFxCommit::Diverged,
-            "a mid-frame visibility flip owns a hard reset"
+            CursorFxCommit::VisibilityDrift,
+            "a DECTCEM flip at a STATIONARY caret is not a coordinate divergence: \
+             it must not hard-reset the engines (that reset is the only per-frame \
+             path that also zeroes the rainbow kitty's momentum spine)"
         );
         assert_eq!(
             classify(committed, (4, 0), false, CursorStyle::SteadyBlock, true,),

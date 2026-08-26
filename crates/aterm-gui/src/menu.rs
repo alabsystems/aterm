@@ -1305,8 +1305,22 @@ pub fn local_file_picker_available() -> bool {
     false
 }
 
-/// Non-macOS stub: no native alert; the "Check for Updates" result is logged instead.
-#[cfg(not(target_os = "macos"))]
+/// WINDOWS: a real modal alert. This was an empty body until the parity audit
+/// found the consequence — a GUI-subsystem launch has no stderr, so every
+/// failure routed through `notify` (a rejected document path, an update-check
+/// result) reached the user through NO channel at all. The picker ships an
+/// unrestricted `*.*` row, so one click can reach any of the document host's
+/// rejections; silence there is the same class of defect as the dead button
+/// the picker itself was added to fix.
+#[cfg(windows)]
+pub fn notify(title: &str, body: &str) {
+    crate::win_alert_ok(title, body);
+}
+
+/// The remaining platforms (Linux) still have no native alert to wire; the
+/// caller's own `eprintln!` is the channel there, and a Linux GUI launch does
+/// keep its stderr.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn notify(_title: &str, _body: &str) {}
 
 /// Help, off macOS: the project page in the default browser, through the SAME
