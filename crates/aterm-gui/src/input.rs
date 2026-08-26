@@ -426,7 +426,7 @@ pub enum Egress {
 ///
 /// This is the SOLE reader of `mouse_encoding()` for coordinate selection; it runs
 /// under the caller's existing `term_lock`, so it adds no extra mode-read window.
-fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffset) -> (u16, u16) {
+pub(crate) fn report_coords(t: &Terminal, col: u16, row: u16, px_off: PixelOffset) -> (u16, u16) {
     use aterm_types::mouse::MouseEncoding;
     if t.mouse_encoding() == MouseEncoding::SgrPixel {
         let (cw, ch) = t.cell_pixel_size();
@@ -573,11 +573,14 @@ pub(crate) fn wheel_route(
 /// caller's lock. Only reads — the policy is still entirely in `wheel_route`.
 ///
 /// Split out of [`seam_egress`] so the derivation is reachable from a test on
-/// EVERY platform. The seam's own wheel tests need a pipe fd for `SinkWriter` and
-/// are therefore `#[cfg(unix)]`, which left the SELECTION CUSTODY Phase-2 Option
-/// override — the item the design calls load-bearing, "without this, Phase 4 is
-/// unreachable under any mouse-owning TUI" — unpinned on Windows, the platform
-/// where Alt is most likely to collide with something else. `alt_local`'s
+/// EVERY platform. The seam's own wheel tests used to need a POSIX pipe fd for
+/// `SinkWriter` and were therefore `#[cfg(unix)]`, which left the SELECTION
+/// CUSTODY Phase-2 Option override — the item the design calls load-bearing,
+/// "without this, Phase 4 is unreachable under any mouse-owning TUI" — unpinned
+/// on Windows, the platform where Alt is most likely to collide with something
+/// else. (The byte capture is cross-platform now, so the seam's own wheel tests
+/// run on Windows too; this pure derivation stays because a route test that needs
+/// no PTY at all is still the cheaper and sharper fence.) `alt_local`'s
 /// main-screen scoping lives here because it is a FACT about the engine (the alt
 /// screen carries no scrollback), not a policy choice.
 pub(crate) fn wheel_route_for(t: &Terminal, mods: u8) -> WheelRoute {
@@ -1115,23 +1118,254 @@ mod tests {
     use std::os::fd::FromRawFd;
     use std::sync::Arc;
 
-    // The pipe-backed egress helpers (and every test driving them) are POSIX-
-    // only (`libc::pipe` fds); the pure parser/encoder tests below run
-    // everywhere.
-    /// Drive ONE [`InputEvent`] through [`seam_egress`] against a pipe-backed
-    /// `SinkWriter` (the `cmd_paste` paste-to-pipe pattern) and return the exact
-    /// bytes that reached the "PTY".
+    /// A live PTY-master stand-in whose bytes the test can read back: the harness
+    /// every byte-level test in this module drives [`seam_egress`] against.
+    ///
+    /// WHY THIS TYPE EXISTS. Nearly half of this module's byte-level tests used to
+    /// be `#[cfg(unix)]` — including `sgr_pixel_1016_reports_true_pixel_coordinate`,
+    /// which pins the exact DEC 1016 contract the CELL-PX-1 defect broke, so that
+    /// regression could not have been caught on Windows at all. Nothing about the
+    /// SUBSTANCE of those tests is POSIX: `seam_egress` is source-blind, platform-
+    /// blind byte production. Only the HARNESS was — it needed `pipe(2)` and a raw
+    /// fd. Both platforms can supply a readable master, so both now do, and the
+    /// tests run everywhere:
+    ///
+    /// * POSIX — `pipe(2)`; the `SinkWriter`'s master IS the write-end fd.
+    /// * Windows — a `SinkWriter`'s master is not a handle at all but a key into
+    ///   aterm-pty's ConPTY session registry, so the equivalent is to REGISTER a
+    ///   session whose input handle is a pipe this test holds the read end of.
+    ///   [`aterm_pty::adopt_handoff`] is exactly that public constructor (it exists
+    ///   for the DefTerm hand-off: "here are the handles, make a session"), so the
+    ///   Windows twin drives the SAME production `write_frame` path — a real
+    ///   `WriteFile` on a real kernel pipe — never a stub.
+    ///
+    /// The remaining `#[cfg(unix)]` tests below are the ones whose ASSERTIONS are
+    /// POSIX (alternate-scroll ARROW COUNTS, which Windows multiplies by
+    /// `SPI_GETWHEELSCROLLLINES`; POSIX backslash path escaping), each marked with
+    /// the reason at its own gate.
     #[cfg(unix)]
+    struct CaptureSink {
+        /// Read end; `-1` once [`Self::drain`] has handed it to a `File`.
+        read: i32,
+        /// Write end — the `SinkWriter`'s master. `-1` once drained (the drain
+        /// closes it so the read can reach a real EOF).
+        write: i32,
+    }
+
+    #[cfg(unix)]
+    impl CaptureSink {
+        fn new() -> Self {
+            let mut fds = [0i32; 2];
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
+            Self {
+                read: fds[0],
+                write: fds[1],
+            }
+        }
+
+        /// The master a `SinkWriter` is built over.
+        fn master(&self) -> i32 {
+            self.write
+        }
+
+        /// Every byte the sink has written. Closes the write end first so the read
+        /// runs to a genuine EOF; one drain per capture is all any caller needs.
+        fn drain(&mut self) -> Vec<u8> {
+            if self.write >= 0 {
+                unsafe { libc::close(self.write) };
+                self.write = -1;
+            }
+            let mut buf = Vec::new();
+            let mut reader = unsafe { std::fs::File::from_raw_fd(self.read) };
+            self.read = -1; // the `File` owns it now and closes it on drop
+            reader.read_to_end(&mut buf).expect("read pipe");
+            buf
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for CaptureSink {
+        fn drop(&mut self) {
+            for fd in [self.read, self.write] {
+                if fd >= 0 {
+                    unsafe { libc::close(fd) };
+                }
+            }
+        }
+    }
+
+    /// See the POSIX twin's docs. On Windows the capture is an anonymous pipe
+    /// registered as a ConPTY session's INPUT handle, so `SinkWriter::write_frame`
+    /// reaches it through the ordinary `aterm_pty::write_some` path.
+    #[cfg(windows)]
+    struct CaptureSink {
+        /// The registry key `SinkWriter` writes through.
+        master: i32,
+        /// Read end of the pipe the session writes into (ours to close).
+        read: isize,
+        /// Our handle on the event the session holds as its "client process".
+        /// Signalling it releases the session's waiter thread immediately instead
+        /// of leaving it parked on the close grace.
+        stop: isize,
+    }
+
+    #[cfg(windows)]
+    impl CaptureSink {
+        /// Pipe buffer. Deliberately far larger than the system default: the
+        /// harness reads only AFTER `seam_egress` returns, and a burst test
+        /// (`MAX_WHEEL_BURST` reports) writing past a 4 KiB buffer with no reader
+        /// would block the blocking `WriteFile` forever — a hang instead of a
+        /// failure, which is a much worse signal. The largest burst the seam can
+        /// produce for ONE event is `MAX_WHEEL_BURST` (512) mouse reports of ten
+        /// bytes each — about 5 KiB — so 256 KiB is ~50x headroom without asking
+        /// the kernel for a megabyte on every capture.
+        const PIPE_BYTES: u32 = 256 * 1024;
+
+        fn new() -> Self {
+            let (mut read, mut write): (isize, isize) = (0, 0);
+            // SAFETY: two out-params, default security attributes, explicit size.
+            let ok = unsafe {
+                winapi::CreatePipe(&mut read, &mut write, std::ptr::null_mut(), Self::PIPE_BYTES)
+            };
+            assert_ne!(ok, 0, "CreatePipe for the egress capture");
+            // ONE event object under TWO handles, via the name: the session takes
+            // one as its `client_process` (the waiter only needs something
+            // waitable, and `adopt_handoff` REFUSES a null one), and we keep the
+            // other so `drop` can wake the waiter. A per-capture unique name so two
+            // concurrent tests can never share — or pre-signal — each other's.
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let nth = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let name: Vec<u16> = format!("aterm-egress-capture-{}-{nth}\0", std::process::id())
+                .encode_utf16()
+                .collect();
+            // SAFETY: NULL attrs; manual-reset, initially unsignaled; NUL-terminated
+            // wide name. The second call opens the SAME object (documented
+            // `CreateEventW` behaviour for an existing name).
+            let ours = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
+            let theirs = unsafe { winapi::CreateEventW(std::ptr::null_mut(), 1, 0, name.as_ptr()) };
+            assert!(ours != 0 && theirs != 0, "CreateEventW for the capture");
+            let spawned = aterm_pty::adopt_handoff(write, 0, 0, theirs)
+                .expect("register the capture session");
+            Self {
+                master: spawned.master,
+                read,
+                stop: ours,
+            }
+        }
+
+        fn master(&self) -> i32 {
+            self.master
+        }
+
+        /// Every byte the sink has written. `PeekNamedPipe` first: the session is
+        /// still live (its write end is open), so a read-to-EOF would block
+        /// forever — the byte COUNT already in the pipe is the exact answer,
+        /// because `write_frame` on Windows is a synchronous blocking `WriteFile`
+        /// that has fully returned before `seam_egress` did.
+        fn drain(&mut self) -> Vec<u8> {
+            let mut avail: u32 = 0;
+            // SAFETY: live read handle; every optional out-param is NULL-allowed.
+            let peeked = unsafe {
+                winapi::PeekNamedPipe(
+                    self.read,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut avail,
+                    std::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 || avail == 0 {
+                return Vec::new();
+            }
+            let mut buf = vec![0u8; avail as usize];
+            let mut got: u32 = 0;
+            // SAFETY: `buf` holds `avail` writable bytes; synchronous read.
+            let ok = unsafe {
+                winapi::ReadFile(
+                    self.read,
+                    buf.as_mut_ptr(),
+                    avail,
+                    &mut got,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(ok, 0, "ReadFile from the egress capture pipe");
+            buf.truncate(got as usize);
+            buf
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for CaptureSink {
+        fn drop(&mut self) {
+            // Wake the session's waiter (it is parked on the event we handed over),
+            // then unregister: the last `Arc` drop closes the pipe's write end and
+            // the session's copy of the event.
+            // SAFETY: handles this struct owns, closed exactly once.
+            unsafe { winapi::SetEvent(self.stop) };
+            aterm_pty::close_master(self.master);
+            unsafe {
+                winapi::CloseHandle(self.stop);
+                winapi::CloseHandle(self.read);
+            }
+        }
+    }
+
+    /// The kernel32 entry points the Windows capture needs. Hand-rolled
+    /// `extern "system"` against the already-linked kernel32, matching the house
+    /// style of `aterm_pty::windows::ffi` (flat C, no COM, no new dependency).
+    #[cfg(windows)]
+    mod winapi {
+        // Win32 ABI names verbatim, so they can be checked against the SDK headers
+        // line by line — the same rule `aterm_pty::windows::ffi` states.
+        #![allow(non_snake_case)]
+
+        use std::ffi::c_void;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            pub fn CreatePipe(
+                read: *mut isize,
+                write: *mut isize,
+                attrs: *mut c_void,
+                size: u32,
+            ) -> i32;
+            pub fn CreateEventW(
+                attrs: *mut c_void,
+                manual_reset: i32,
+                initial_state: i32,
+                name: *const u16,
+            ) -> isize;
+            pub fn SetEvent(event: isize) -> i32;
+            pub fn CloseHandle(handle: isize) -> i32;
+            pub fn PeekNamedPipe(
+                pipe: isize,
+                buf: *mut u8,
+                buf_len: u32,
+                read: *mut u32,
+                avail: *mut u32,
+                left_this_message: *mut u32,
+            ) -> i32;
+            pub fn ReadFile(
+                file: isize,
+                buf: *mut u8,
+                want: u32,
+                got: *mut u32,
+                overlapped: *mut c_void,
+            ) -> i32;
+        }
+    }
+
+    /// Drive ONE [`InputEvent`] through [`seam_egress`] against a real
+    /// [`SinkWriter`] over a readable master, and return the exact bytes that
+    /// reached the "PTY".
     fn egress_bytes(term: &Mutex<Terminal>, ev: &InputEvent) -> Vec<u8> {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let sink = SinkWriter::new(fds[1]);
+        let mut cap = CaptureSink::new();
+        let sink = SinkWriter::new(cap.master());
         seam_egress(term, &sink, ev, EgressMode::Interactive);
-        unsafe { libc::close(fds[1]) };
-        let mut buf = Vec::new();
-        let mut reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-        reader.read_to_end(&mut buf).expect("read pipe");
-        buf
+        drop(sink);
+        cap.drain()
     }
 
     /// `delivered` classifies a `write_frame` result: a full write is `Full`; a
@@ -1187,7 +1421,6 @@ mod tests {
     /// WOULD re-encode a real key. Empty bytes are a faithful no-op (`Full`), and a
     /// failed write is reported (`Failed`), never a false OK. (Guards against a future
     /// refactor "helpfully" routing KeySequence through the encoder.)
-    #[cfg(unix)]
     #[test]
     fn key_sequence_egress_is_verbatim_and_reply_faithful() {
         // Kitty disambiguate + DECCKM: a real ArrowUp here would be re-encoded, but the
@@ -1218,7 +1451,6 @@ mod tests {
     /// An IME commit has no physical key identity. Under Kitty report-all,
     /// preserve it as one keyless event; never leak one decimal CSI-u key report
     /// per Unicode codepoint into the PTY.
-    #[cfg(unix)]
     #[test]
     fn ime_commit_report_all_is_one_keyless_event_at_the_pty_seam() {
         let term = term_with(&[b"\x1b[>8u"]);
@@ -1283,7 +1515,6 @@ mod tests {
     }
 
     /// A wheel event carrying mouse modifier bits (see `App::mouse_modifiers`).
-    #[cfg(unix)]
     fn wheel_mods(dir: WheelDir, lines: i32, mods: u8) -> InputEvent {
         InputEvent::Wheel {
             dir,
@@ -1297,27 +1528,21 @@ mod tests {
 
     /// Drive ONE event through [`seam_egress`] and return the [`Egress`] verdict
     /// (the variant the viewport side-effects key off), discarding any PTY bytes.
-    #[cfg(unix)]
     fn egress_of(term: &Mutex<Terminal>, ev: &InputEvent) -> Egress {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let sink = SinkWriter::new(fds[1]);
-        let e = seam_egress(term, &sink, ev, EgressMode::Interactive);
-        unsafe {
-            libc::close(fds[1]);
-            libc::close(fds[0]);
-        }
-        e
+        let cap = CaptureSink::new();
+        let sink = SinkWriter::new(cap.master());
+        seam_egress(term, &sink, ev, EgressMode::Interactive)
     }
 
     /// SELECTION CUSTODY Phase 2 — the LOCAL-SCROLL OVERRIDE, on EVERY platform.
     ///
-    /// The two `Egress`-level tests below say the same thing through the real seam,
-    /// but they need a pipe fd and are `#[cfg(unix)]`. This one goes through
-    /// [`wheel_route_for`] — the engine reads plus the policy table, no sink — so
-    /// the override the design calls load-bearing ("without this, Phase 4 is
-    /// unreachable under any mouse-owning TUI") is pinned on Windows too, where Alt
-    /// is most likely to collide with something else.
+    /// The two `Egress`-level tests below say the same thing through the real seam
+    /// (and now do so on every platform — see [`CaptureSink`]). This one goes
+    /// through [`wheel_route_for`] — the engine reads plus the policy table, no
+    /// sink at all — so the override the design calls load-bearing ("without this,
+    /// Phase 4 is unreachable under any mouse-owning TUI") stays pinned even for a
+    /// target with no PTY of any kind, and fails at the policy table rather than at
+    /// a byte string when it regresses.
     #[test]
     fn the_option_wheel_override_routes_locally_on_every_platform() {
         use aterm_types::mouse::{ALT_MASK, SHIFT_MASK};
@@ -1374,7 +1599,6 @@ mod tests {
     /// the user cannot reach their own scrollback at all. With Option held the wheel
     /// scrolls this terminal instead — the wheel half of the gesture
     /// `press_starts_selection` already gives selection under tracking.
-    #[cfg(unix)]
     #[test]
     fn option_wheel_scrolls_locally_under_mouse_tracking() {
         use aterm_types::mouse::ALT_MASK;
@@ -1401,6 +1625,16 @@ mod tests {
     /// …and it is scoped to the MAIN screen. The alt screen is built with zero
     /// scrollback, so an override there would reach nothing WHILE costing the
     /// alternate-scroll arrows that are how `less`/`man`/`git log` scroll.
+    ///
+    /// STILL `#[cfg(unix)]`, and not for want of a harness (the byte capture is
+    /// cross-platform now — see [`CaptureSink`]): the assertion is `== b"\x1b[A"`,
+    /// ONE arrow for one line, which is true only where `wheel_platform_lines` is
+    /// the identity. On Windows the same gesture is worth `SPI_GETWHEELSCROLLLINES`
+    /// arrows — a number that belongs to whoever's machine runs the suite and so
+    /// can never be asserted. The Windows side of that multiply has its own test,
+    /// `wheel_scale_is_the_platform_distance_not_one_line`, and the ROUTE half of
+    /// this test (Option must not steal a tracking app's report) is pinned on every
+    /// platform by `the_option_wheel_override_routes_locally_on_every_platform`.
     #[cfg(unix)]
     #[test]
     fn the_local_scroll_override_leaves_the_alt_screen_alone() {
@@ -1427,6 +1661,11 @@ mod tests {
     /// no mouse tracking, a wheel becomes arrow-key PRESSES (one per line), encoded
     /// through the LIVE keyboard mode (SS3 under DECCKM), and the local viewport is
     /// left alone (`Egress::Reported`, not `TrackingOff`).
+    ///
+    /// STILL `#[cfg(unix)]`: every assertion here counts ARROWS (`2` lines → two
+    /// `ESC[A`), and Windows multiplies that count by the live
+    /// `SPI_GETWHEELSCROLLLINES` — an unassertable machine setting. See
+    /// `wheel_scale_is_the_platform_distance_not_one_line` for the Windows half.
     #[cfg(unix)]
     #[test]
     fn alt_screen_alternate_scroll_converts_wheel_to_arrows() {
@@ -1446,7 +1685,6 @@ mod tests {
 
     /// Mouse tracking takes precedence: a tracking app gets a real SGR wheel report,
     /// never a synthesized arrow.
-    #[cfg(unix)]
     #[test]
     fn alt_screen_mouse_tracking_beats_alternate_scroll() {
         let term = term_with(&[
@@ -1462,7 +1700,6 @@ mod tests {
     /// but with SHIFT on the event — the seam falls back to the local viewport
     /// (`TrackingOff` carrying the gesture's lines) and writes NOTHING, so a
     /// shifted report byte (`64|SHIFT_MASK`) can never leak to the app.
-    #[cfg(unix)]
     #[test]
     fn shift_wheel_bypasses_a_tracking_app_with_no_report_bytes() {
         let term = term_with(&[
@@ -1493,7 +1730,6 @@ mod tests {
 
     /// Alternate scroll applies only on the ALT screen: on the main screen the wheel
     /// falls back to local scrollback (`Egress::TrackingOff`), no arrows synthesized.
-    #[cfg(unix)]
     #[test]
     fn alternate_scroll_only_on_the_alt_screen() {
         let term = term_with(&[b"\x1b[?1007h"]);
@@ -1586,7 +1822,6 @@ mod tests {
 
     /// An app can turn alternate scroll OFF (?1007l): the wheel then falls back to
     /// the local scrollback viewport even on the alt screen.
-    #[cfg(unix)]
     #[test]
     fn alt_screen_with_1007_off_falls_back_to_viewport() {
         let term = term_with(&[b"\x1b[?1049h", b"\x1b[?1007l"]);
@@ -1601,6 +1836,9 @@ mod tests {
     /// lines-per-detent is the identity ([`wheel_platform_lines`]). On Windows the
     /// same gesture is worth `SPI_GETWHEELSCROLLLINES` arrows; see
     /// `wheel_scale_is_the_platform_distance_not_one_line`.
+    ///
+    /// STILL `#[cfg(unix)]` for exactly the reason its own name states — the
+    /// harness is cross-platform now ([`CaptureSink`]), the ASSERTION is not.
     #[cfg(unix)]
     #[test]
     fn alternate_scroll_emits_one_arrow_per_line() {
@@ -1617,7 +1855,6 @@ mod tests {
     /// CONTROLLER was bounded and a human gesture was not — a divergence the seam
     /// exists to make impossible, and live exposure once the horizontal axis
     /// started dividing trackpad pixel deltas by the (small) cell WIDTH.
-    #[cfg(unix)]
     #[test]
     fn the_report_burst_is_clamped_at_both_ends_for_every_source() {
         let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]);
@@ -1692,7 +1929,6 @@ mod tests {
     /// two REAL builders feed `seam_egress` structurally-equal events for the same
     /// intent — so the chain Human-builder → seam == Controller-builder → seam is
     /// complete, not tautological.
-    #[cfg(unix)]
     #[test]
     fn bytes_human_eq_controller() {
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
@@ -1885,7 +2121,6 @@ mod tests {
     /// `parse_ctrl`, `parse_mouse`) as the controller side. For the named-key /
     /// ctrl-chord intents both sides land on the identical `InputEvent` — and then
     /// `seam_egress` gives identical bytes.
-    #[cfg(unix)]
     #[test]
     fn builders_converge() {
         use aterm_types::keyboard::{Key, Modifiers, NamedKey};
@@ -1990,7 +2225,6 @@ mod tests {
     /// byte test would pass even if someone reintroduced a source branch. Here the
     /// buggy variant drops the modifier bits for the controller, so a Ctrl+Shift
     /// chord diverges. This proves the test has teeth.
-    #[cfg(unix)]
     #[test]
     fn buggy_source_branch_is_detectable() {
         use aterm_types::keyboard::{Key, Modifiers};
@@ -2051,7 +2285,6 @@ mod tests {
     /// flagged: a non-positive `lines` must NOT silently emit zero reports while a
     /// positive one emits N. With tracking ON, `lines: 0` and `lines: -3` both
     /// behave as exactly ONE report (the clamp to >= 1), identical to `lines: 1`.
-    #[cfg(unix)]
     #[test]
     fn wheel_lines_clamped_to_one() {
         let term = term_with(&[b"\x1b[?1000h", b"\x1b[?1006h"]); // Normal + SGR tracking
@@ -2091,7 +2324,6 @@ mod tests {
     /// `row*ch+y = 47`; `encode_sgr` adds the spec's +1, so the bytes are
     /// `ESC [ < 0 ; 35 ; 48 M`. This is the whole point of the lane: the report
     /// carries the real winit sub-cell pixel, not a cell-derived one.
-    #[cfg(unix)]
     #[test]
     fn sgr_pixel_1016_reports_true_pixel_coordinate() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -2126,7 +2358,6 @@ mod tests {
     /// (30, 40) → `ESC [ < 0 ; 31 ; 41 M`. So a controller-driven 1016 press is
     /// still pixel-correct (the cell origin), and the sub-cell offset is purely
     /// additive on top.
-    #[cfg(unix)]
     #[test]
     fn sgr_pixel_1016_cell_origin_is_top_left_pixel() {
         let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -2341,6 +2572,12 @@ mod tests {
     /// the bytes are the escaped path + trailing space verbatim (ESC/C1 are still
     /// stripped); with DEC 2004 ON they are wrapped in the `ESC[200~ … ESC[201~`
     /// guards — exactly like Cmd-V, and exactly what iTerm sends a 2004-mode app.
+    ///
+    /// STILL `#[cfg(unix)]`: `shell_escape_path` DISPATCHES on the platform, and the
+    /// expected bytes here are the POSIX backslash form (`/p/My\ File`). Windows
+    /// drops quote instead (`shell_escape_path_windows`), which
+    /// `shell_escape_path_windows_*` already pins on every target; only the
+    /// end-to-end paste bytes for the POSIX form live here.
     #[cfg(unix)]
     #[test]
     fn dropped_path_pastes_escaped_with_trailing_space() {
@@ -2466,9 +2703,10 @@ mod tests {
     /// THE I12 DECISION TABLE: Shift bypasses tracking AND alt-scroll — before
     /// either test, so a shifted wheel can never reach `encode_mouse_wheel`
     /// (whose SHIFT_MASK fold would leak a shifted report) — while the unshifted
-    /// rows keep the pre-I12 precedence exactly. Pure, so it runs (and pins the
-    /// contract) on every platform, unlike the pipe-backed `#[cfg(unix)]` seam
-    /// byte tests around it.
+    /// rows keep the pre-I12 precedence exactly. Pure, so it pins the contract with
+    /// no PTY of any kind — the seam byte tests around it reach the same rows
+    /// through a real `SinkWriter` on every platform ([`CaptureSink`]), but this one
+    /// names the offending ROW when a precedence edit regresses.
     #[test]
     fn wheel_route_shift_bypasses_tracking_before_every_other_test() {
         use super::{WheelRoute, wheel_route};

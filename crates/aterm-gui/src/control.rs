@@ -225,7 +225,18 @@ pub(crate) struct DimsSnapshot {
     /// are `round(logical·scale)`, and `head` is the synthetic band's remainder
     /// at that scale — so without it a reader can only INFER the DPI by dividing
     /// back out of the font, which the explicit-font and clamped paths make
-    /// wrong. `1.0` when no window is selected (headless).
+    /// wrong. A headless boot is NOT a missing window: it still selects one and
+    /// reports that window's own record (`geometry` = `headless`).
+    ///
+    /// When NO window holds the session — `geometry` = `detached`, the branch
+    /// that reads cell size, pad, `pad_top`, head and `font_px` off the live
+    /// SHARED backend — this is `App::detached_scale` instead: a `--scale` /
+    /// `$ATERM_FORCE_SCALE` pin if one is set (the only scale a headless boot
+    /// ever has), else the scale of the window that backend is currently tuned
+    /// to, else the front window's, else the lowest stable window id's, and a
+    /// literal `1.0` only when no window exists at all. So a detached record
+    /// still names the DPI the pad and font beside it were derived from, rather
+    /// than asserting 1.0 over them.
     pub(crate) scale: f64,
     pub(crate) window: Option<u64>,
     pub(crate) window_rows: u32,

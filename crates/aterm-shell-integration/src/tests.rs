@@ -62,18 +62,130 @@ fn bash_shell() -> &'static str {
     }
 }
 
+/// Resolve an interpreter for the live-spawn tests: an explicit `$ATERM_TEST_<SHELL>`
+/// override first, then the well-known absolute install paths, then a `$PATH` scan.
+///
+/// The `$PATH` scan and the override are LOAD-BEARING, not conveniences. Before
+/// they existed, [`zsh_shell`] and [`fish_shell`] probed a fixed list of absolute
+/// paths and nothing else, so on any host whose zsh/fish lives somewhere else —
+/// a Homebrew-on-Linux prefix, a Nix profile, a `dpkg-deb -x` prefix on a box
+/// without root — every one of the ~13 live zsh/fish tests took its
+/// `else { return; }` arm and printed "not installed; skipping". The suite went
+/// green while testing NOTHING, which is exactly how the fish loader-guard bug
+/// (see `test_fish_loaded_guard_survives_an_empty_override`) shipped: fish's
+/// integration was dead in every aterm session and no test on the machine ever
+/// ran fish to notice. A skip that is indistinguishable from a pass is worse
+/// than a missing test, so make the probe find the shell wherever it is, and
+/// give CI a way to say exactly which binary to use.
+///
+/// Returns an owned path (a `$PATH` hit is not a compile-time constant); the
+/// callers' `Option<&'static str>` shape is preserved by interning the result in
+/// a `OnceLock`, so no call site changes and the probe runs at most once.
+#[cfg(unix)]
+fn resolve_test_shell(env_override: &str, candidates: &[&str], name: &str) -> Option<String> {
+    if let Some(explicit) = std::env::var_os(env_override) {
+        let explicit = std::path::PathBuf::from(explicit);
+        // An explicit override that does not exist is an OPERATOR ERROR, not a
+        // reason to silently skip: fail loudly rather than pretend the shell is
+        // simply absent.
+        assert!(
+            explicit.is_file(),
+            "{env_override} points at {explicit:?}, which is not a file"
+        );
+        return Some(explicit.to_string_lossy().into_owned());
+    }
+    if let Some(found) = candidates
+        .iter()
+        .find(|candidate| std::path::Path::new(candidate).is_file())
+    {
+        return Some((*found).to_string());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+}
+
 #[cfg(unix)]
 /// Absolute path to a `zsh` binary, or `None` to skip the spawning tests on a
 /// host without zsh installed (mirrors [`fish_shell`]). Probing an absolute path
 /// rather than bare `"zsh"` keeps the spawn hermetic and avoids a misleading
 /// "No such file or directory" failure where zsh simply isn't present.
+/// `$ATERM_TEST_ZSH` overrides; otherwise `$PATH` is searched after the
+/// well-known locations (see [`resolve_test_shell`]).
 fn zsh_shell() -> Option<&'static str> {
-    ["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh", "/opt/homebrew/bin/zsh"]
-        .into_iter()
-        .find(|candidate| std::path::Path::new(candidate).exists())
+    static ZSH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    ZSH.get_or_init(|| {
+        resolve_test_shell(
+            "ATERM_TEST_ZSH",
+            &["/bin/zsh", "/usr/bin/zsh", "/usr/local/bin/zsh", "/opt/homebrew/bin/zsh"],
+            "zsh",
+        )
+    })
+    .as_deref()
+}
+
+/// A private, EMPTY home directory for every shell this suite spawns.
+///
+/// Created once per test process and shared by [`shell_command`]; tests that
+/// need their own populated home (the `shell.d` repros) still set `HOME`
+/// themselves afterwards, which overrides this.
+///
+/// The subdirectories are pre-created so fish never has to `mkdir` (and warn
+/// about) its config/data dirs on first run. A `static` is never dropped, so
+/// the (empty) tree outlives the run by design — pid-named, and cheaper than
+/// racing parallel test threads over a shared cleanup.
+#[cfg(unix)]
+fn hermetic_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::temp_dir()
+            .join(format!("aterm-si-hermetic-home-{}", std::process::id()));
+        for sub in ["config/fish/conf.d", "data/fish", "state", "cache"] {
+            std::fs::create_dir_all(home.join(sub))
+                .expect("create hermetic HOME for shell integration tests");
+        }
+        home
+    })
+    .as_path()
 }
 
 /// Spawn a shell with a hermetic environment for integration tests.
+///
+/// # The developer's own dotfiles are NOT part of the fixture
+///
+/// Every live test in this file spawns an INTERACTIVE shell (`fish -i -c`,
+/// `zsh -i -c`, `bash --noprofile --norc -i -c`) and several of them assert on
+/// byte-exact stdout. Without a redirected `HOME` those shells read whatever
+/// the person running `cargo test` happens to have on disk, and anything those
+/// files print lands in the same stdout the assertions compare:
+///
+///   - fish `-i` sources `$XDG_CONFIG_HOME/fish/config.fish` (default
+///     `$HOME/.config/fish`), its `conf.d/`, and the *universal* variables in
+///     `fish_variables` — where a stray `ATERM_*` would survive every
+///     `env_remove` below, because it is restored INSIDE the child;
+///   - zsh `-i` (the shell.d and prompt-override repros pass no `-f`) sources
+///     `$ZDOTDIR`/`$HOME`'s `.zshenv` and `.zshrc`;
+///   - `$XDG_DATA_DIRS/fish/vendor_conf.d` auto-loads vendor snippets — which
+///     is exactly how aterm installs its OWN fish integration, so a developer
+///     with aterm installed had the shipped script loaded (setting the
+///     "already loaded" guard to `1`) before the test's `source` ever ran;
+///   - and the integration scripts themselves read `$HOME`: all three prepend
+///     `$HOME/.aterm/bin` to `PATH` and `source $HOME/.aterm/shell.d/*`, which
+///     bash executes even under `--noprofile --norc`.
+///
+/// So point `HOME`, `ZDOTDIR` and the XDG base dirs at [`hermetic_home`] — an
+/// empty directory this process owns. `XDG_DATA_DIRS` is narrowed to it too, so
+/// no vendor `conf.d` (aterm's own included) is auto-loaded. A test that wants
+/// one of these back sets it AFTER calling this, which overrides.
+///
+/// Residual, deliberately not overridden: system-wide files (`/etc/zshenv`,
+/// `/etc/zsh/zshrc`, `/etc/fish/config.fish`). Those are not the developer's,
+/// and suppressing them for zsh would need `-f`, which the shell.d repro
+/// exists to avoid.
+///
+/// # The exported ATERM_* vars
 ///
 /// A developer running these tests inside aterm has the shipped integration
 /// active in their own shell, which `export`s several vars the scripts read at
@@ -84,7 +196,9 @@ fn zsh_shell() -> Option<&'static str> {
 ///   - `ATERM_BANNER_B64` is base64-decoded to stdout on load, which would
 ///     corrupt the exact-stdout assertions in the urlencode/report-cwd tests;
 ///   - `ATERM_SUITE_VERSION` / `ATERM_PROMPT_STYLE` / `ATERM_DISABLE_PROMPT_TITLES`
-///     alter prompt/title behavior.
+///     alter prompt/title behavior; the `ATERM_PROMPT_*_COLOR` quintet feeds
+///     `set_color`, and an inherited empty one used to make fish print
+///     `set_color: Unknown color ""` into the asserted stream.
 ///
 /// Strip them all so each test sources the script fresh regardless of the
 /// developer's own active integration. Tests that need a specific var
@@ -99,9 +213,27 @@ fn shell_command(shell: &str) -> Command {
         "ATERM_BANNER_B64",
         "ATERM_PROMPT_STYLE",
         "ATERM_DISABLE_PROMPT_TITLES",
+        "ATERM_PROMPT_HOST_COLOR",
+        "ATERM_PROMPT_PATH_COLOR",
+        "ATERM_PROMPT_GIT_COLOR",
+        "ATERM_PROMPT_ERROR_COLOR",
+        "ATERM_PROMPT_SEP_COLOR",
+        // The one ATERM_* var aterm really injects into every spawned shell
+        // (lib.rs's spawn env). A suite that inherits a live session's nonce
+        // is testing that session's identity, not the script's behaviour —
+        // and the #8015 scrub it should be exercising becomes unobservable.
+        "ATERM_SHELL_NONCE",
     ] {
         cmd.env_remove(var);
     }
+    let home = hermetic_home();
+    cmd.env("HOME", home)
+        .env("ZDOTDIR", home)
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_STATE_HOME", home.join("state"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("XDG_DATA_DIRS", home.join("data"));
     cmd
 }
 
@@ -1201,23 +1333,494 @@ fn test_zsh_mark_functions_invoke_id_suffix() {
 #[test]
 fn test_fish_mark_functions_invoke_id_suffix() {
     let script = scripts::FISH;
-    // Fish has no $() — it uses outer parens for command substitution.
+    // The suffix is INTERPOLATED from a precomputed variable, never glued on as
+    // a command substitution. In fish, `"133;A"(cmd)` is a cartesian product, so
+    // a `cmd` that prints nothing (an empty nonce — this script's own documented
+    // pre-nonce fallback, and what the header's manual `source` install always
+    // produces) collapses the whole thing to ZERO arguments: `__aterm_osc` was
+    // then called with no argv and emitted a bare empty `ESC ] BEL` instead of
+    // the mark. Pin the interpolated spelling so the substitution form cannot
+    // come back. (Live counterpart: `test_fish_emits_all_133_marks_without_a_nonce`.)
     for expected in [
-        r#""133;A"(__aterm_id_suffix)"#,
-        r#""133;B"(__aterm_id_suffix)"#,
-        r#""133;C"(__aterm_id_suffix)"#,
-        r#""133;D;$argv[1]"(__aterm_id_suffix)"#,
+        r#""133;A$__aterm_id_suffix_str""#,
+        r#""133;B$__aterm_id_suffix_str""#,
+        r#""133;C$__aterm_id_suffix_str""#,
+        r#""133;D;$argv[1]$__aterm_id_suffix_str""#,
+        r#""633;E;$encoded$__aterm_id_suffix_str""#,
     ] {
         assert!(
             script.contains(expected),
-            "fish script must emit OSC 133 with id suffix; \
+            "fish script must emit the OSC with an INTERPOLATED id suffix; \
              missing exact substring {expected:?}"
         );
     }
     assert!(
-        script.contains(r#""633;E;"(__aterm_encode_cmd "$argv")(__aterm_id_suffix)"#),
-        "fish script must emit OSC 633;E with id suffix"
+        script.contains(r#"set -g __aterm_id_suffix_str ";id=$__aterm_shell_nonce""#),
+        "fish script must precompute the id suffix from the captured nonce"
     );
+    // No emitter may go back to gluing a command substitution onto a mark
+    // string. Scan CODE only: the script documents the broken spelling in a
+    // comment so the next reader knows why it cannot come back, and that
+    // explanation must not itself trip the guard.
+    let code: String = script
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for banned in [
+        r#""133;A"(__aterm_id_suffix)"#,
+        r#""133;B"(__aterm_id_suffix)"#,
+        r#""133;C"(__aterm_id_suffix)"#,
+        r#""133;D;$argv[1]"(__aterm_id_suffix)"#,
+        r#""633;E;"(__aterm_encode_cmd "$argv")(__aterm_id_suffix)"#,
+    ] {
+        assert!(
+            !code.contains(banned),
+            "fish emitter re-introduced a glued command substitution ({banned:?}): \
+             an empty nonce makes that expand to ZERO arguments and the mark vanishes"
+        );
+    }
+}
+
+/// The NESTED-LAUNCH lifeline, fish edition — the bug that made fish's whole
+/// integration dead weight in EVERY aterm session.
+///
+/// `aterm-gui`'s spawn env assembly deliberately overrides an inherited
+/// `ATERM_SHELL_INTEGRATION_INSTALLED` with an EMPTY STRING on every integrated
+/// spawn, so a shell nested inside aterm re-loads the integration instead of
+/// seeing the outer shell's exported `1` and bailing. bash and zsh spell their
+/// loader guard `[[ -n "$..." ]]`, which an empty value defuses exactly as
+/// designed — and `spawn.rs`'s `nested_launch_guard_name_matches_the_shipped_scripts`
+/// pins precisely that, for zsh and bash ONLY.
+///
+/// fish spelled it `set -q`, which asks whether the variable is DEFINED, not
+/// whether it is non-empty. The empty override therefore read as "already
+/// loaded" and the script returned before defining a single function. Measured
+/// on Linux with fish 4.2.1 under aterm 0.55.0: `aterm ctl blocks` -> "no
+/// results" and `status` fell back to `reasons=fg_job`, in every fish session.
+///
+/// This is the static half (it runs on hosts without fish); the live half is
+/// `test_fish_integration_loads_under_an_empty_guard_override`.
+#[test]
+fn test_fish_loaded_guard_survives_an_empty_override() {
+    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+        assert!(
+            script.contains(r#"if test -n "$ATERM_SHELL_INTEGRATION_INSTALLED""#),
+            "{label} fish script must guard on NON-EMPTINESS, matching the \
+             bash/zsh `[[ -n … ]]` spelling that aterm's empty-string spawn \
+             override is built to defuse"
+        );
+        assert!(
+            !script.contains("if set -q ATERM_SHELL_INTEGRATION_INSTALLED"),
+            "{label} fish script re-introduced the `set -q` loader guard: \
+             `set -q` is true for an empty-but-SET variable, so aterm's \
+             nested-launch override kills the integration outright"
+        );
+    }
+}
+
+/// Source the fish integration in an interactive fish and return the whole
+/// [`std::process::Output`] (some tests assert on stderr — `set_color` reports
+/// a bad color there without failing the shell).
+///
+/// `extra_env` is applied AFTER [`shell_command`]'s hermetic scrub, so a test
+/// can put a variable back deliberately (including as an empty-but-SET value,
+/// which is the whole point of the loader-guard regression). `shell_command`
+/// also points `HOME`/`XDG_*` at [`hermetic_home`], so the `-i` startup never
+/// reads the developer's own `config.fish`, `conf.d`, universal variables or
+/// vendor snippets into the asserted stream.
+#[cfg(unix)]
+fn fish_integration_output(
+    fish: &str,
+    extra_env: &[(&str, &str)],
+    body: &str,
+) -> std::process::Output {
+    let script = format!(
+        "{}/src/scripts/aterm_shell_integration.fish",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let command = format!("source \"$ATERM_TEST_SCRIPT\" >/dev/null 2>&1; {body}");
+    let mut cmd = shell_command(fish);
+    cmd.arg("-i")
+        .arg("-c")
+        .arg(&command)
+        .env("ATERM_TEST_SCRIPT", &script);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let output = cmd
+        .output()
+        .unwrap_or_else(|error| panic!("spawn fish for integration test: {error}"));
+    assert!(
+        output.status.success(),
+        "fish integration body should succeed; stdout: {:?}; stderr: {:?}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
+/// [`fish_integration_output`], keeping only stdout.
+#[cfg(unix)]
+fn run_fish_integration(fish: &str, extra_env: &[(&str, &str)], body: &str) -> String {
+    String::from_utf8_lossy(&fish_integration_output(fish, extra_env, body).stdout).into_owned()
+}
+
+/// Live half of [`test_fish_loaded_guard_survives_an_empty_override`]: with the
+/// guard variable SET BUT EMPTY — byte-for-byte what aterm's spawn seam injects
+/// into every integrated session — the integration must still load.
+///
+/// Under the `set -q` guard this returned `LOADED=1` (function undefined),
+/// which is the state a live fish tab was in: no marks, no blocks, and
+/// `ATERM_SHELL_NONCE` left un-scrubbed in the environment because the #8015
+/// scrub also lives past the guard.
+#[cfg(unix)]
+#[test]
+fn test_fish_integration_loads_under_an_empty_guard_override() {
+    let Some(fish) = fish_shell() else {
+        eprintln!(
+            "fish not installed; skipping \
+             test_fish_integration_loads_under_an_empty_guard_override"
+        );
+        return;
+    };
+    let stdout = run_fish_integration(
+        fish,
+        &[
+            ("ATERM_SHELL_INTEGRATION_INSTALLED", ""),
+            // A nonce MUST be present for the scrub assertion below to
+            // discriminate: with no nonce in the environment `set -q` is
+            // trivially false and the check would pass even when the guard
+            // fired early and the script never ran a line.
+            (
+                "ATERM_SHELL_NONCE",
+                "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899",
+            ),
+        ],
+        "functions -q __aterm_mark_prompt_start; echo LOADED=$status; \
+         echo NONCE_SCRUBBED=(set -q ATERM_SHELL_NONCE; echo $status)",
+    );
+    assert!(
+        stdout.contains("LOADED=0"),
+        "an empty ATERM_SHELL_INTEGRATION_INSTALLED must NOT be read as \
+         'already loaded' — aterm sets it empty on purpose so a nested shell \
+         re-loads the integration. stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("NONCE_SCRUBBED=1"),
+        "the #8015 nonce scrub lives past the loader guard, so a guard that \
+         fires too early also leaks ATERM_SHELL_NONCE to every child process. \
+         stdout: {stdout:?}"
+    );
+}
+
+/// Every OSC 133/633 mark must survive an EMPTY nonce.
+///
+/// fish glues a command substitution to a string as a CARTESIAN PRODUCT, so the
+/// old `__aterm_osc "133;A"(__aterm_id_suffix)` spelling expanded to ZERO
+/// arguments whenever `__aterm_id_suffix` printed nothing — and it prints
+/// nothing exactly when the nonce is empty, which is this script's documented
+/// pre-nonce fallback and the unavoidable state of the header's manual
+/// `source`-from-config.fish install. `__aterm_osc` then ran
+/// `printf '\e]%s\a'` with no argv and emitted a bare, malformed empty OSC.
+/// Measured on fish 4.2.1 before the fix: OSC 7 arrived and 133;A/B/C/D plus
+/// 633;E were ALL absent from the wire.
+///
+/// bash and zsh interpolate a possibly-empty parameter and never had this
+/// failure mode, which is why an integration that looked correct in review —
+/// and passed every static fish test — emitted nothing at all.
+#[cfg(unix)]
+#[test]
+fn test_fish_emits_all_133_marks_without_a_nonce() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping test_fish_emits_all_133_marks_without_a_nonce");
+        return;
+    };
+    let stdout = run_fish_integration(
+        fish,
+        // No ATERM_SHELL_NONCE at all: the unnonced fallback path.
+        &[("ATERM_DISABLE_PROMPT_TITLES", "1")],
+        "__aterm_mark_prompt_start; __aterm_mark_command_start; \
+         __aterm_mark_exec_start; __aterm_mark_exec_finish 7; \
+         __aterm_fish_preexec 'echo hi'",
+    );
+    let expected = concat!(
+        "\u{1b}]133;A\u{7}",
+        "\u{1b}]133;B\u{7}",
+        "\u{1b}]133;C\u{7}",
+        "\u{1b}]133;D;7\u{7}",
+        "\u{1b}]633;E;echo\\x20hi\u{7}",
+        "\u{1b}]133;C\u{7}",
+    );
+    assert_eq!(
+        stdout, expected,
+        "un-nonced fish must still emit every OSC 133/633 mark verbatim"
+    );
+    assert!(
+        !stdout.contains("\u{1b}]\u{7}"),
+        "fish emitted a bare empty OSC (ESC ] BEL) — the signature of a mark \
+         string collapsed to zero arguments by an empty command substitution. \
+         stdout: {stdout:?}"
+    );
+}
+
+/// The nonced path must keep emitting the exact same `;id=<hex>` bytes it did
+/// before the suffix moved from a command substitution to a variable — the fix
+/// for the un-nonced case must not change nonced output at all.
+#[cfg(unix)]
+#[test]
+fn test_fish_marks_carry_the_nonce_when_set() {
+    let Some(fish) = fish_shell() else {
+        eprintln!("fish not installed; skipping test_fish_marks_carry_the_nonce_when_set");
+        return;
+    };
+    let nonce = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+    let stdout = run_fish_integration(
+        fish,
+        &[
+            ("ATERM_SHELL_NONCE", nonce),
+            ("ATERM_DISABLE_PROMPT_TITLES", "1"),
+        ],
+        "__aterm_mark_prompt_start; __aterm_mark_exec_finish 0",
+    );
+    assert_eq!(
+        stdout,
+        format!("\u{1b}]133;A;id={nonce}\u{7}\u{1b}]133;D;0;id={nonce}\u{7}"),
+        "nonced fish marks must be byte-identical to the pre-fix spelling"
+    );
+}
+
+// ─── `set -q` is definedness; every ATERM_* read here wants EMPTINESS ─────
+//
+// The loader-guard fix taught this once. These pin the whole class, because
+// the same misspelling survived in five more places after it: the prompt-style
+// selector, the two tab-title guards, the five prompt-colour defaults and the
+// suite-version export.
+
+/// Static sweep (runs on hosts without fish): NO `set -q` on an `ATERM_*`
+/// variable, in either copy of the script.
+///
+/// bash and zsh read every one of these with `-n` / `-z` / `${VAR:-default}`,
+/// all of which treat UNSET and EMPTY alike; aterm's spawn seam and the user's
+/// own environment both deliver empty values. `set -q` asks a different
+/// question and answers it wrongly for exactly the empty case.
+///
+/// `ATERM_SHELL_NONCE` is the single allowed exception and is documented as
+/// such in the script: both arms leave `$__aterm_shell_nonce` empty for an
+/// empty env var, so definedness cannot change the nonce, and taking the arm
+/// additionally runs the `set -e` scrub that stops an empty
+/// `ATERM_SHELL_NONCE` from being inherited by every child process.
+#[test]
+fn test_fish_never_tests_definedness_of_an_aterm_variable() {
+    for (label, script) in [("embedded", scripts::FISH), ("app-bundle", APP_FISH_RESOURCE)] {
+        let offenders: Vec<&str> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with('#'))
+            .filter(|line| line.contains("set -q ATERM_"))
+            .filter(|line| !line.contains("set -q ATERM_SHELL_NONCE"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{label} fish script tests DEFINEDNESS of an ATERM_* variable: {offenders:?}. \
+             Use `test -n \"$VAR\"` / `test -z \"$VAR\"` — `set -q` is true for an \
+             empty-but-SET variable, and empty is the value aterm's spawn seam and \
+             the user's environment actually deliver (see the loader-guard note at \
+             the top of the script)."
+        );
+    }
+}
+
+/// An EMPTY `ATERM_PROMPT_STYLE` must fall through to the user's own prompt.
+///
+/// `if set -q ATERM_PROMPT_STYLE; and test "$ATERM_PROMPT_STYLE" != "none"` was
+/// true for an empty value, so `__aterm_custom_prompt` ran with `style=""`, its
+/// `switch` matched no case, and fish printed NOTHING between the 133;A and
+/// 133;B marks — no aterm prompt AND no user prompt. bash and zsh both spell
+/// this `[[ -n "$ATERM_PROMPT_STYLE" && … ]]`.
+///
+/// Both branches are stubbed so the assertion pins WHICH one ran without
+/// depending on fish's own `share/functions` (`prompt_pwd` and friends), which
+/// a `dpkg-deb -x` prefix may not carry.
+#[cfg(unix)]
+#[test]
+fn test_fish_empty_prompt_style_falls_through_to_the_user_prompt() {
+    let Some(fish) = fish_shell() else {
+        eprintln!(
+            "fish not installed; skipping \
+             test_fish_empty_prompt_style_falls_through_to_the_user_prompt"
+        );
+        return;
+    };
+    let body = "function __aterm_custom_prompt; printf 'CUSTOM'; end; \
+                function __aterm_original_fish_prompt; printf 'ORIGINAL'; end; \
+                fish_prompt";
+    for (style, expected) in [("", "ORIGINAL"), ("none", "ORIGINAL"), ("minimal", "CUSTOM")] {
+        let stdout = run_fish_integration(
+            fish,
+            &[
+                ("ATERM_PROMPT_STYLE", style),
+                ("ATERM_DISABLE_PROMPT_TITLES", "1"),
+            ],
+            body,
+        );
+        assert_eq!(
+            stdout,
+            format!("\u{1b}]133;A\u{7}{expected}\u{1b}]133;B\u{7}"),
+            "ATERM_PROMPT_STYLE={style:?} must select the {expected} prompt branch"
+        );
+    }
+}
+
+/// An EMPTY `ATERM_DISABLE_PROMPT_TITLES` must NOT disable titles.
+///
+/// bash and zsh spell the guard `[[ -z "${ATERM_DISABLE_PROMPT_TITLES:-}" ]]`,
+/// so empty means "not disabled". fish's `not set -q` read empty as "disabled"
+/// and silently dropped the OSC 0 tab title — in fish only.
+#[cfg(unix)]
+#[test]
+fn test_fish_empty_disable_prompt_titles_still_emits_titles() {
+    let Some(fish) = fish_shell() else {
+        eprintln!(
+            "fish not installed; skipping \
+             test_fish_empty_disable_prompt_titles_still_emits_titles"
+        );
+        return;
+    };
+    let with_title = concat!(
+        "\u{1b}]633;E;echo\\x20hi\u{7}",
+        "\u{1b}]0;echo hi\u{7}",
+        "\u{1b}]133;C\u{7}",
+    );
+    let without_title = concat!("\u{1b}]633;E;echo\\x20hi\u{7}", "\u{1b}]133;C\u{7}");
+    let body = "__aterm_fish_preexec 'echo hi'";
+    assert_eq!(
+        run_fish_integration(fish, &[("ATERM_DISABLE_PROMPT_TITLES", "")], body),
+        with_title,
+        "an EMPTY ATERM_DISABLE_PROMPT_TITLES means 'not disabled' in bash and \
+         zsh; fish must agree and still emit the OSC 0 title"
+    );
+    // Negative control: the opt-out itself must keep working.
+    assert_eq!(
+        run_fish_integration(fish, &[("ATERM_DISABLE_PROMPT_TITLES", "1")], body),
+        without_title,
+        "a non-empty ATERM_DISABLE_PROMPT_TITLES must still suppress the title"
+    );
+}
+
+/// EMPTY `ATERM_PROMPT_*_COLOR` values must fall back to the documented
+/// defaults, not reach `set_color` as the empty string.
+///
+/// `set -l hc (set -q ATERM_PROMPT_HOST_COLOR; and echo $ATERM_PROMPT_HOST_COLOR; or echo 2)`
+/// took the `set -q` arm for an empty-but-set variable; `echo` then printed a
+/// bare newline, so `hc` was the empty string and the `or echo 2` default was
+/// never reached — `set_color ""`, which fish answers with
+/// `set_color: Unknown color ""` (exit 2) on stderr, on EVERY prompt render.
+/// bash and zsh spell all five `${ATERM_PROMPT_*_COLOR:-<default>}`, which
+/// substitutes for empty too.
+///
+/// `set_color` (and `prompt_pwd`) are stubbed rather than observed through
+/// stderr: fish functions shadow builtins, so the stub captures the exact
+/// argument the script computed, which is the actual subject here and is
+/// independent of which colour spellings a given fish build accepts.
+#[cfg(unix)]
+#[test]
+fn test_fish_empty_prompt_colors_fall_back_to_defaults() {
+    let Some(fish) = fish_shell() else {
+        eprintln!(
+            "fish not installed; skipping test_fish_empty_prompt_colors_fall_back_to_defaults"
+        );
+        return;
+    };
+    let body = "function set_color; printf '<%s>' $argv; end; \
+                function prompt_pwd; printf '~/x'; end; \
+                __aterm_custom_prompt";
+    let empty_colors = [
+        ("ATERM_PROMPT_STYLE", "minimal"),
+        ("ATERM_PROMPT_HOST_COLOR", ""),
+        ("ATERM_PROMPT_PATH_COLOR", ""),
+        ("ATERM_PROMPT_GIT_COLOR", ""),
+        ("ATERM_PROMPT_ERROR_COLOR", ""),
+        ("ATERM_PROMPT_SEP_COLOR", ""),
+    ];
+    // `minimal` renders <path-color> pwd <normal> <prompt-color> $ <normal>;
+    // the defaults are path=4 and (last status 0) separator=8.
+    assert_eq!(
+        run_fish_integration(fish, &empty_colors, body),
+        "<4>~/x<normal> <8>$<normal> ",
+        "empty ATERM_PROMPT_*_COLOR values must fall back to the same defaults \
+         bash and zsh get from `${{ATERM_PROMPT_*_COLOR:-N}}`, not reach \
+         `set_color \"\"`"
+    );
+    // Positive control: an explicitly set colour is still honoured.
+    assert_eq!(
+        run_fish_integration(
+            fish,
+            &[
+                ("ATERM_PROMPT_STYLE", "minimal"),
+                ("ATERM_PROMPT_PATH_COLOR", "5"),
+            ],
+            body,
+        ),
+        "<5>~/x<normal> <8>$<normal> ",
+        "a non-empty ATERM_PROMPT_PATH_COLOR must still reach set_color"
+    );
+}
+
+/// Hygiene pin: no shell this suite spawns may read the developer's `$HOME`.
+///
+/// [`shell_command`] is the single seam for every bash/zsh/fish spawn here, and
+/// several of those spawns are interactive (`-i`) and assert on byte-exact
+/// stdout. Before this, `HOME` was left alone: `fish -i` sourced the developer's
+/// `~/.config/fish/config.fish`, `conf.d/` and universal variables, `zsh -i`
+/// sourced their `~/.zshrc`, and all three integration scripts sourced
+/// `$HOME/.aterm/shell.d/*` — bash included, `--noprofile --norc`
+/// notwithstanding, because the script does that sourcing itself. Anything
+/// those files print lands in the asserted stream, so the suite could be
+/// broken — or quietly steered — by files that are none of its business.
+#[cfg(unix)]
+#[test]
+fn test_spawned_shells_never_read_the_developers_home() {
+    let hermetic = hermetic_home().to_string_lossy().into_owned();
+    if let Ok(developer_home) = std::env::var("HOME") {
+        assert_ne!(
+            hermetic, developer_home,
+            "the test HOME must not be the developer's own"
+        );
+    }
+    // `echo $VAR` is spelled identically in bash, zsh and fish.
+    let probe = "echo $HOME; echo $XDG_CONFIG_HOME; echo $XDG_DATA_HOME; echo $XDG_DATA_DIRS";
+    let mut shells: Vec<(&str, Vec<&str>)> =
+        vec![(bash_shell(), vec!["--noprofile", "--norc", "-i"])];
+    if let Some(zsh) = zsh_shell() {
+        shells.push((zsh, vec!["-i"]));
+    }
+    if let Some(fish) = fish_shell() {
+        shells.push((fish, vec!["-i"]));
+    }
+    for (shell, args) in shells {
+        let output = shell_command(shell)
+            .args(&args)
+            .arg("-c")
+            .arg(probe)
+            .output()
+            .unwrap_or_else(|error| panic!("spawn {shell} for the HOME hygiene probe: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let reported: Vec<&str> = stdout.lines().filter(|l| !l.is_empty()).collect();
+        assert_eq!(
+            reported.len(),
+            4,
+            "{shell} should report HOME + three XDG dirs; stdout: {stdout:?}; stderr: {:?}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for value in reported {
+            assert!(
+                value.starts_with(&hermetic),
+                "{shell} was handed {value:?}, which is outside the hermetic home \
+                 {hermetic:?} — the suite would read the developer's own dotfiles"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1284,11 +1887,20 @@ fn run_id_suffix_via_shell(
     String::from_utf8(output.stdout).expect("id-suffix output should be UTF-8")
 }
 
+/// Absolute path to a `fish` binary, or `None` to skip the spawning tests on a
+/// host without fish installed. `$ATERM_TEST_FISH` overrides; otherwise `$PATH`
+/// is searched after the well-known locations (see [`resolve_test_shell`]).
 #[cfg(unix)]
 fn fish_shell() -> Option<&'static str> {
-    ["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish"]
-        .into_iter()
-        .find(|candidate| std::path::Path::new(candidate).exists())
+    static FISH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    FISH.get_or_init(|| {
+        resolve_test_shell(
+            "ATERM_TEST_FISH",
+            &["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish"],
+            "fish",
+        )
+    })
+    .as_deref()
 }
 
 #[cfg(unix)]

@@ -464,6 +464,12 @@ pub struct CursorTrail {
     /// their classifier roles, but no style may birth trail geometry unless
     /// this candidate also matches the seeded origin and the observed landing.
     move_candidate: Option<MoveCandidate>,
+    /// The staged unjudged tail of a `confirmed-prefix` split, projected from
+    /// the glow twin by the host ([`Self::rearm_typed_remainder`]). Installed
+    /// into [`Self::move_candidate`] by the same tick that consumes the
+    /// prefix-confirmed cohort (with the typed hint re-armed at its stamp);
+    /// dropped fail-closed if that slot never frees.
+    rearmed_remainder: Option<MoveCandidate>,
     /// One-frame exception attached only to an authenticated alt-screen
     /// typed-to-MOTION downgrade. If its observed relocation is too small to
     /// satisfy the motion jump gate, consume it dark without wiping the
@@ -622,8 +628,151 @@ impl CursorTrail {
         self.type_hint = Some(now);
         // Text-blind callers may still feed cadence/classifier state, but they
         // cannot create an admission candidate. Use `note_typed_expected` when
-        // exact committed cell material is available.
-        self.move_candidate = None;
+        // exact committed cell material is available. THE MASH EXCEPTION
+        // (mirrors `CursorGlow::note_typed_cells`): a fresh, unjudged Typed
+        // cohort survives the next typed glyph's cadence note — several
+        // presses land inside one frame at mash speed, and killing the cohort
+        // here is what broke the trail. Keeping it admits nothing new.
+        if !self.typed_candidate_extendable(now) {
+            self.move_candidate = None;
+        }
+    }
+
+    /// Whether the pending candidate is a MASH-EXTENDABLE Typed cohort —
+    /// the classic twin of [`crate::cursor_glow::CursorGlow::typed_candidate_extendable`],
+    /// kept predicate-identical (minus the generation terms this engine does
+    /// not carry) so the two engines extend or refuse in lockstep.
+    #[must_use]
+    pub fn typed_candidate_extendable(&self, now: Instant) -> bool {
+        self.move_candidate.is_some_and(|candidate| {
+            matches!(candidate.intent, MoveIntent::Typed(_))
+                && !candidate.content_confirmed
+                && candidate.bottom_scroll.is_none()
+                && candidate.material == Some(candidate.origin)
+                && candidate.target.is_some()
+                && now.saturating_duration_since(candidate.at).as_secs_f32()
+                    <= Self::TYPE_HINT_FRESH
+        })
+    }
+
+    /// The pending cohort's claim window as `(material, span_cells)` — the
+    /// classic twin of
+    /// [`crate::cursor_glow::CursorGlow::typed_extension_window`]. The host's
+    /// capture fence requires the two engines' windows to be EQUAL before it
+    /// delivers an extension proof, keeping the twins in lockstep.
+    #[must_use]
+    pub fn typed_extension_window(&self, now: Instant) -> Option<((u16, u16), u16)> {
+        if !self.typed_candidate_extendable(now) {
+            return None;
+        }
+        let candidate = self.move_candidate?;
+        let MoveIntent::Typed(span) = candidate.intent else {
+            return None;
+        };
+        let material = candidate.material?;
+        Some((
+            material,
+            span.as_slice().len().min(usize::from(u16::MAX)) as u16,
+        ))
+    }
+
+    /// Host-facing capture-window twin of
+    /// [`crate::cursor_glow::CursorGlow::typed_extension_accepts`]: whether a
+    /// new press's proof captured at `origin` may extend the pending cohort —
+    /// the caret must sit inside the cohort's claim window (material caret
+    /// through predicted target) on the material row.
+    #[must_use]
+    pub fn typed_extension_accepts(&self, now: Instant, origin: (u16, u16)) -> bool {
+        self.typed_extension_window(now)
+            .is_some_and(|((row, start), len)| {
+                origin.0 == row
+                    && origin.1 >= start
+                    && u32::from(origin.1) <= u32::from(start) + u32::from(len)
+            })
+    }
+
+    /// EXTEND the pending Typed cohort with one more real press — the classic
+    /// twin of `CursorGlow::extend_typed_candidate`, minus the baseline and
+    /// generation halves (the glow engine owns those proofs; this engine's
+    /// candidate is confirmed only by the glow's projected verdict). Same
+    /// window contiguity, same sweep-cap roll by whole glyphs, same target
+    /// advance and stamp refresh.
+    fn extend_typed_candidate(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        material: (u16, u16),
+    ) -> bool {
+        if !self.typed_candidate_extendable(now) {
+            return false;
+        }
+        let Some(candidate) = self.move_candidate else {
+            return false;
+        };
+        let (MoveIntent::Typed(span), Some((row, start)), Some(target)) =
+            (candidate.intent, candidate.material, candidate.target)
+        else {
+            return false;
+        };
+        let old = span.as_slice();
+        let add = expected.as_slice();
+        if material.0 != row
+            || material.1 < start
+            || usize::from(material.1) > usize::from(start) + old.len()
+        {
+            return false;
+        }
+        let total = old.len() + add.len();
+        let mut dropped = total.saturating_sub(EXPECTED_MOVE_CELLS_MAX);
+        while dropped < old.len() && old.get(dropped).copied() == Some('\0') {
+            dropped += 1;
+        }
+        if dropped > old.len() {
+            return false;
+        }
+        let Some(kept) =
+            ExpectedCellSpan::from_cells(old[dropped..].iter().chain(add.iter()).copied())
+        else {
+            return false;
+        };
+        let Ok(new_start_col) = u16::try_from(usize::from(start) + dropped) else {
+            return false;
+        };
+        let Some(new_target_col) = target.1.checked_add(add.len() as u16) else {
+            return false;
+        };
+        let Some(live) = self.move_candidate.as_mut() else {
+            return false;
+        };
+        live.at = now;
+        live.intent = MoveIntent::Typed(kept);
+        live.material = Some((row, new_start_col));
+        live.target = Some((target.0, new_target_col));
+        true
+    }
+
+    /// Re-arm the unjudged tail of a `confirmed-prefix` split, projected from
+    /// the glow twin ([`crate::cursor_glow::CursorGlow::confirmed_prefix_remainder`]).
+    /// Staged, not armed in place: this frame's spawn must first consume the
+    /// prefix-confirmed cohort, so the remainder is installed by the same
+    /// tick right after that consumption (mirroring the glow engine's own
+    /// install) — or dropped fail-closed if the slot never frees.
+    pub fn rearm_typed_remainder(
+        &mut self,
+        at: Instant,
+        expected: ExpectedCellSpan,
+        target: (u16, u16),
+        material: (u16, u16),
+    ) {
+        self.rearmed_remainder = Some(MoveCandidate {
+            at,
+            origin: material,
+            intent: MoveIntent::Typed(expected),
+            target: Some(target),
+            material: Some(material),
+            content_confirmed: false,
+            bottom_scroll: None,
+        });
     }
 
     /// Arm typed movement with exact committed terminal-cell material.
@@ -643,8 +792,17 @@ impl CursorTrail {
         let pending = self.move_candidate.is_some();
         self.note_typed(now);
         if pending {
+            // THE MASH FIX (see the glow twin's `note_typed_expected`): a new
+            // real press extends the pending Typed cohort instead of
+            // invalidating both.
+            if self.extend_typed_candidate(now, expected, material) {
+                return;
+            }
             // One one-shot timestamp cannot correlate two unobserved commits.
             // Invalidate both rather than silently replacing the older proof.
+            // (`note_typed` above kept an extendable cohort alive, so a
+            // refused extension must close it here explicitly.)
+            self.move_candidate = None;
             self.type_hint = None;
             return;
         }
@@ -730,6 +888,7 @@ impl CursorTrail {
     /// Fail-closed boundary for an input with no exact movement proof.
     pub fn cancel_authored_move_candidate(&mut self) {
         self.candidate_superseded |= self.move_candidate.is_some();
+        self.rearmed_remainder = None;
         self.clear_typed();
     }
 
@@ -1211,6 +1370,7 @@ impl CursorTrail {
         self.nav_hint = None;
         self.move_hint = None;
         self.move_candidate = None;
+        self.rearmed_remainder = None;
         self.preserve_wake_on_denied_motion = false;
         self.preserve_wake_on_rejected_bottom_scroll = None;
         self.deferred_probe_hold = false;
@@ -1246,6 +1406,7 @@ impl CursorTrail {
             self.nav_hint = None;
             self.move_hint = None;
             self.move_candidate = None;
+            self.rearmed_remainder = None;
             self.preserve_wake_on_denied_motion = false;
             self.preserve_wake_on_rejected_bottom_scroll = None;
             self.deferred_probe_hold = false;
@@ -1367,6 +1528,17 @@ impl CursorTrail {
         // landing observation. Hidden/stationary frames spend it too, so it
         // can never escape and preserve wake across an unrelated later CUP.
         self.preserve_wake_on_rejected_bottom_scroll = None;
+        // PREFIX-SPLIT REMAINDER INSTALL (the glow twin's mirror): the spawn
+        // above consumed the prefix-confirmed cohort, so the staged remainder
+        // becomes the pending candidate for the next generation, with the
+        // typed hint re-armed at the newest press stamp. One-shot: dropped
+        // fail-closed if the slot is still occupied.
+        if let Some(remainder) = self.rearmed_remainder.take()
+            && self.move_candidate.is_none()
+        {
+            self.type_hint = Some(remainder.at);
+            self.move_candidate = Some(remainder);
+        }
 
         // Decay: drop fully-faded sparks (age >= its own baked lifetime). An
         // ignited spark carries a longer `life_ms`, so it lingers past the base fade.

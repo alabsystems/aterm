@@ -29,8 +29,8 @@ use aterm_spec::derive::{
     cursor_cat_fold_model, cursor_cat_model, cursor_cat_motion_pulse_routing_model,
     cursor_cutout_clip_model, cursor_echo_commit_retry_model, cursor_effect_scroll_model,
     cursor_model, cursor_move_candidate_model, cursor_scroll_signal_model,
-    cursor_viewport_lifecycle_model,
-    damage_to_present_model, deco_band_containment_model, deco_phase_model, done_mark_lru_model,
+    cursor_viewport_lifecycle_model, damage_to_present_model, deco_band_containment_model,
+    deco_phase_model, delete_echo_liveness_model, done_mark_lru_model,
     dsu_quiescence_model, effect_phase_lock_model, effect_present_rebase_model,
     effect_presentability_settle_model,
     emacs_search_navigation_model, emacs_search_repeat_work_model, evict_full_model,
@@ -8709,6 +8709,159 @@ fn derived_typed_echo_liveness_proves_and_catches_the_mute_gate() {
     );
 }
 
+/// LIVENESS for the DELETE arm of the movement-admission confirm seam — R1,
+/// the owner's "backspace KILLS my cursor trail".
+///
+/// 20003ffd repaired the typed arm and left the delete arm on the 201449c2
+/// laws verbatim, so the mute-gate defect simply moved house: a suggestion
+/// repaint (`row-mismatch`), a space erase (`row-unchanged`), or a
+/// trimmed-row EOL erase all retired, and because a DENIED delete batch then
+/// reaches the generation fence unowned with the caret one column left of its
+/// anchor, the wholesale `UnownedRelocation` teardown WIPED the ribbon the
+/// user had already earned. Safety alone called that gate green — again.
+///
+/// This drives [`delete_echo_liveness_model`]'s environment adversary through
+/// both families:
+///   * SAFETY: cold output, a swallowed erase, and an erase whose pre-caret
+///     prefix moved stay dark, at Buggy=0 AND at Buggy=1 (the mutant's whole
+///     point is that it is safe and mute).
+///   * LIVENESS: every handled erase shape — plain, D1 suggestion repaint,
+///     D2 space erase, D3 trimmed-row EOL shrink — settles CONFIRMED, and
+///     every run reaches a decision (`find_deadlock` with `settled = 1`).
+///   * NON-VACUITY: every adversary action fires in the committed variant.
+///   * REGISTERED STANDING GAP, reprinted every run: D-E2 (an erase echo
+///     split across two PTY read batches) settles RETIRED under the strict
+///     next-generation law, exactly as the typed arm's E2 does.
+#[test]
+fn derived_delete_echo_liveness_proves_and_catches_the_mute_delete_arm() {
+    let model = delete_echo_liveness_model();
+    assert_proves_and_catches(&model);
+
+    // EVENTUALITY: no reachable wedge short of a settled decision, in either
+    // variant — the mute mutant also settles; its defect is WHICH way.
+    for buggy in [0, 1] {
+        let m = aterm_spec::interp::with_buggy(&model, buggy);
+        let wedge = aterm_spec::interp::find_deadlock(&m, |s| s.get("settled") == Some(&1));
+        assert!(
+            wedge.is_none(),
+            "Buggy={buggy}: a run wedged before deciding: {wedge:?}"
+        );
+    }
+
+    // NON-VACUITY: every environment shape and the decision edge fire.
+    let fired = aterm_spec::interp::fired_actions(&model);
+    for action in [
+        "KeyPlainErase",
+        "KeyEraseUnderSuggestion",
+        "KeyEraseSpace",
+        "KeyEraseTrimmedEol",
+        "ColdSpinner",
+        "KeyEraseSwallowed",
+        "KeyErasePrefixMoved",
+        "KeySplitEraseEcho",
+        "ErasePlain",
+        "EraseWithGhostRepaint",
+        "EraseInvisibleBlank",
+        "EraseStorageShrink",
+        "ColdPaint",
+        "UnrelatedBatch",
+        "EraseRewritesPrefix",
+        "EraseSplitBatches",
+        "Decide",
+    ] {
+        assert!(
+            fired.contains(action),
+            "{action} never fires — the erase adversary is vacuous"
+        );
+    }
+
+    let run = |m: &Model, key: &str, echo: &str| {
+        let mut s = m.init_state();
+        assert!(m.fire(key, &mut s), "shape pick: {key}");
+        assert!(m.fire(echo, &mut s), "delivery: {echo}");
+        assert!(m.fire("Decide", &mut s), "decision after {echo}");
+        assert_eq!(s["settled"], 1);
+        s
+    };
+
+    // LIVENESS witnesses: each handled erase shape confirms, concretely.
+    for (key, echo) in [
+        ("KeyPlainErase", "ErasePlain"),
+        ("KeyEraseUnderSuggestion", "EraseWithGhostRepaint"),
+        ("KeyEraseSpace", "EraseInvisibleBlank"),
+        ("KeyEraseTrimmedEol", "EraseStorageShrink"),
+    ] {
+        let s = run(&model, key, echo);
+        assert_eq!(s["confirmed"], 1, "{key}: a handled real erase must admit");
+        assert_eq!(s["retired"], 0, "{key}: a confirmed erase is not also retired");
+    }
+
+    // SAFETY witnesses: the 201449c2 protections, concretely dark.
+    for (key, echo) in [
+        ("ColdSpinner", "ColdPaint"),
+        ("KeyEraseSwallowed", "UnrelatedBatch"),
+        ("KeyErasePrefixMoved", "EraseRewritesPrefix"),
+    ] {
+        let s = run(&model, key, echo);
+        assert_eq!(s["confirmed"], 0, "{key}: must stay dark");
+    }
+
+    // REGISTERED STANDING FINDING — reprinted on every run.
+    let s = run(&model, "KeySplitEraseEcho", "EraseSplitBatches");
+    assert_eq!(s["confirmed"], 0, "the split erase echo must not confirm today");
+    assert_eq!(s["retired"], 1, "the split erase echo settles retired, not undecided");
+    eprintln!(
+        "STANDING FINDING (registered, unresolved): D-E2: an ERASE echo split across two PTY \
+         read batches (generation baseline+2) settles RETIRED — the same strict \
+         next-generation law that holds the typed arm's E2 open"
+    );
+
+    // THE AUDITED DEFECT CLASS, pinned: the pre-repair delete arm is SAFE and
+    // MUTE. Every safety invariant holds on its D1/D2/D3 runs; only the
+    // liveness family catches it — exactly as with the typed blackout.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    for (key, echo, liveness_invariant) in [
+        (
+            "KeyEraseUnderSuggestion",
+            "EraseWithGhostRepaint",
+            "LiveGhostRepaintEraseConfirmsD1",
+        ),
+        ("KeyEraseSpace", "EraseInvisibleBlank", "LiveSpaceEraseConfirmsD2"),
+        (
+            "KeyEraseTrimmedEol",
+            "EraseStorageShrink",
+            "LiveTrimmedEolEraseConfirmsD3",
+        ),
+    ] {
+        let s = run(&buggy, key, echo);
+        assert_eq!(s["confirmed"], 0, "{key}: the pre-repair delete arm retires this erase");
+        for safety in [
+            "ColdEraseNeverConfirms",
+            "SwallowedEraseNeverConfirms",
+            "MovedPrefixNeverConfirms",
+            "EraseConfirmIsWitnessed",
+            "EraseSettledIsDecided",
+        ] {
+            assert!(
+                buggy.check_invariant(safety, &s),
+                "{key}: the mute delete arm must PASS safety `{safety}` — its defect is liveness"
+            );
+        }
+        assert!(
+            !buggy.check_invariant(liveness_invariant, &s),
+            "{key}: only `{liveness_invariant}` catches the mute delete arm"
+        );
+    }
+    // The textbook EOL Backspace still confirmed under the old law: the delete
+    // arm was not dead, it was a gate whose environment model missed every
+    // real shell — the identical shape of the typed blackout.
+    let plain = run(&buggy, "KeyPlainErase", "ErasePlain");
+    assert_eq!(
+        plain["confirmed"], 1,
+        "the pre-repair delete arm does confirm the idealized EOL erase — that is why \
+         safety testing alone shipped it"
+    );
+}
 /// Retained history is a different coordinate space from the active cursor.
 /// Every cursor-owned pixel/cell is suppressed immediately, a retained capture
 /// stays dark, and the hidden resident-pet lifecycle keeps progressing until

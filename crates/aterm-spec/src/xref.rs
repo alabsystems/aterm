@@ -336,6 +336,16 @@ pub fn model_registry() -> Vec<Model> {
         // reprinted by the Tier-0 driver. Tier-1 binds the real
         // confirm_content_candidate in aterm-effects/src/cursor_glow.rs.
         typed_echo_liveness_model(),
+        // The ERASE twin of the shape above (R1, "backspace KILLS my cursor
+        // trail"): 20003ffd repaired the typed arm and left the delete arm on
+        // the 201449c2 laws — whole-row exactness + the vacated-cell-only
+        // witness — so a suggestion repaint, a space erase, or a trimmed-row
+        // EOL erase all retired, and the denied batch then reached the
+        // generation fence and WIPED the resident ribbon. Same prove-and-catch
+        // discipline: the mute delete arm is SAFE, and only the liveness
+        // family catches it. Tier-1 binds the real Delete arm of
+        // confirm_content_candidate in aterm-effects/src/cursor_glow.rs.
+        delete_echo_liveness_model(),
         cursor_viewport_lifecycle_model(),
         cursor_effect_scroll_model(),
         cursor_scroll_signal_model(),

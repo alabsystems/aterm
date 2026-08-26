@@ -50,9 +50,13 @@ pub enum GlowStyle {
     /// Phaser — a full-spectrum hue sweep along the comet and over time. Reads as
     /// a laser/phaser sweep, not the banded rainbow the kitty delivers.
     Phaser,
-    /// Rainbow kitty — a momentum-driven BANDED rainbow ribbon: six crisp stacked stripes
-    /// (the iconic rainbow) stream the swept path, brighter/longer with typing
-    /// heat, with a sparse twinkling starfield. Additive, so text stays legible.
+    /// Rainbow kitty — a momentum-driven BANDED rainbow ribbon streaming the
+    /// swept path, brighter/longer with typing heat, with a sparse twinkling
+    /// starfield. Additive, so text stays legible. The DEFAULT presentation is
+    /// the 0.43 UNDERLINE: a flat under-baseline strip whose hue bands roll
+    /// per cell along the line; the `… tall` spellings
+    /// ([`Self::style_names_tall_ribbon`]) opt into the banding-era tall body
+    /// — six crisp stacked stripes the glyphs sit inside.
     RainbowKitty,
     /// Phaser comet + a shower of additive spark particles.
     Sparkle,
@@ -129,6 +133,26 @@ impl GlowStyle {
         Self::style_names_kitty_pet(s) || Self::style_names_dog_pet(s)
     }
 
+    /// Whether this style string asks for the **TALL banded ribbon** — the
+    /// banding-era presentation where the six-stripe rainbow fills the glyph
+    /// cell and the letters sit inside it.
+    ///
+    /// The DEFAULT rainbow presentation is the 0.43-era read: a flat
+    /// under-baseline wake strip in the inter-line leading (owner, 2026-08-24:
+    /// "the underline rainbow has been changed" — it must come back). The tall
+    /// look keeps its admirers behind these explicit spellings, following the
+    /// pet predicates' pattern: both resolve to [`GlowStyle::RainbowKitty`],
+    /// so every style-keyed table — momentum law, starfield, sound palette,
+    /// retract machinery — is shared; only the ribbon body's geometry forks,
+    /// at the one place that draws it ([`GlowConfig::ribbon_tall`]).
+    #[must_use]
+    pub fn style_names_tall_ribbon(s: &str) -> bool {
+        let s = s.trim();
+        ["rainbow kitty tall", "rainbow tall", "tall rainbow", "nyan tall"]
+            .iter()
+            .any(|o| s.eq_ignore_ascii_case(o))
+    }
+
     /// The RESOLVED style's diagnostic name — what `trail status` prints
     /// beside the raw config string, so a spelling that fell back to the
     /// default is legible as a fallback rather than as an endorsement. Stable
@@ -184,6 +208,14 @@ impl GlowStyle {
             "dog pet",
             "pet dog",
             "rainbow puppy pet",
+            // …and the TALL-ribbon spellings: the banding-era tall body is a
+            // PRESENTATION of the same style (`style_names_tall_ribbon`), not
+            // an eleventh GlowStyle — the default spelling gets the 0.43
+            // under-baseline strip.
+            "rainbow kitty tall",
+            "rainbow tall",
+            "tall rainbow",
+            "nyan tall",
         ]) {
             Self::RainbowKitty
         } else if any(&["sparkle", "sparkles", "phaser-sparkle", "rainbow-sparkle"]) {
@@ -293,6 +325,17 @@ pub struct GlowConfig {
     /// how much trail you want behind your hand is a preference. `0.0` (or any
     /// non-finite value) turns the wake OFF entirely — no plume, no cost.
     pub wake_persist_s: f32,
+    /// The rainbow ribbon's DARK-THEME PRESENTATION. `false` — the DEFAULT —
+    /// is the 0.43 read the owner asked back for: a FLAT UNDER-BASELINE
+    /// strip, [`RAINBOW_UNDERLINE_H`] of a cell tall, centred on the row
+    /// boundary beneath the typed row (the wake plume's own spine), one hue
+    /// band per CELL rolling along the line. `true` opts back into the
+    /// banding-era TALL body — the six-stripe band the glyphs sit inside —
+    /// for the spellings [`GlowStyle::style_names_tall_ribbon`] names.
+    /// Everything else about the ribbon (cohort admission, segment survival,
+    /// retract, momentum, starfield, light-theme rail) is shared between the
+    /// two presentations.
+    pub ribbon_tall: bool,
 }
 
 /// Whether a raw `cursor_trail_style` string draws its own additive comet beam.
@@ -1751,6 +1794,37 @@ const RAINBOW_WAKE_COV: f32 = 180.0;
 /// against each other through this constant.
 const RAINBOW_WAKE_H_HEAD: f32 = 0.25;
 const RAINBOW_WAKE_H_TAIL: f32 = 0.11;
+
+/// The DEFAULT dark-theme ribbon strip's height, as a fraction of the cell —
+/// the 0.43 UNDERLINE read ([`GlowConfig::ribbon_tall`] == `false`).
+///
+/// Sized INSIDE the wake plume's own envelope — between its swollen head
+/// ([`RAINBOW_WAKE_H_HEAD`], 0.25) and its cooling tail
+/// ([`RAINBOW_WAKE_H_TAIL`], 0.11) — because the two marks share one spine
+/// (the row boundary under the typed row) and have to read as ONE strip of
+/// light: the plume is the strip's hot nozzle, the ribbon is its banded body
+/// streaming behind. A strip taller than the wake head would read as a second
+/// unrelated bar under the plume; the 2 px floor keeps it visible at tiny
+/// cell metrics. Pinned by `rainbow_default_ribbon_is_a_flat_under_baseline_strip`.
+const RAINBOW_UNDERLINE_H: f32 = 0.22;
+
+/// The underline strip's coverage ceiling — ONE ceiling for every hue, unlike
+/// the tall body's per-band [`RAINBOW_BAND_COV_CAPS`].
+///
+/// Uniform on purpose, twice over. VISUALLY: the strip lays ONE band per
+/// CELL, so per-hue ceilings (57 for yellow, 120 for violet) would alternate
+/// bright and dim cells along the line — a continuous underline reading as
+/// beads, the exact defect the light rail's RX widening fixed on white.
+/// SMOOTHNESS: the vanish drain's per-frame loss is bounded by the heaviest
+/// cell; uniform weights keep the tail-first retreat as even as the tall
+/// body's (whose six co-resident bands average out per cell) —
+/// `rainbow_ribbon_vanishes_without_a_visible_step` measures this.
+///
+/// The VALUE is the tightest entry the six band centres read from the
+/// certified table (yellow's 57), so every hue sits at or under its own
+/// contrast-bar ceiling even where the strip's bottom feather laps the next
+/// row's ascender band.
+const RAINBOW_UNDERLINE_COV_CAP: f32 = 57.0;
 /// The soft BLOOM under the plume: a wide flat halo per few segments, at this
 /// share of the segment's coverage. Gives the hard-edged core depth without
 /// blurring it — bright things stay small, big things stay dim.
@@ -3708,6 +3782,18 @@ pub struct CursorGlow {
     /// The timestamp hints above remain classifier inputs, never provenance by
     /// themselves.
     move_candidate: Option<GlowMoveCandidate>,
+    /// The UNJUDGED TAIL of a mash cohort whose arrived prefix the confirm
+    /// seam just proved (`confirmed-prefix`): a partial echo delivered only
+    /// the first cells of an extended Typed span, so the proven prefix is
+    /// confirmed for THIS frame's spawn while the remainder — already rebased
+    /// onto the judged generation and the observed caret, per the
+    /// next-generation law — waits here for the same tick to consume the
+    /// confirmed cohort. Installed into [`Self::move_candidate`] (plus a
+    /// re-armed typed hint and the remainder's own cell credits, the unspent
+    /// share of the presses that funded it) right after the spawn point;
+    /// dropped fail-closed if that slot is still occupied. `u8` is the
+    /// remainder's cell count, bounded by [`Self::RAINBOW_TYPED_SWEEP_MAX`].
+    rearmed_remainder: Option<(GlowMoveCandidate, u8)>,
     /// One-frame exception attached only to a validated alt-screen
     /// typed-to-MOTION downgrade. If its relocation is too small for the
     /// motion jump gate, consume it dark without wiping row-probe-attested
@@ -3779,6 +3865,22 @@ pub struct CursorGlow {
     /// cursor cat, so the delete burst fires whether or not the cat is flying
     /// (the cat's tongue-out "oops" layers on top when it happens to be present).
     bs_poof_hint: Option<Instant>,
+    /// THE BACKSPACE RETREAT LICENCE: `(press instant, the caret cell at press
+    /// time)`, minted by [`Self::note_backspace`] and by nothing else.
+    ///
+    /// It grants exactly ONE thing — that the two DENIAL seams retire
+    /// PROPORTIONATELY instead of wholesale for the user's own one-column
+    /// erase retreat. It never admits light: no spawn path reads it, and both
+    /// seams still return their denial verdict.
+    ///
+    /// See [`Self::backspace_retreat_licensed`] for why this is a separate
+    /// field rather than a read of `bs_poof_hint`: the fence consumes the
+    /// fail-closed hint cohort (`revoke_unowned_hints`) before `tick` runs, so
+    /// a hint-based licence would be gone by the time `spawn` judges the same
+    /// frame's move — and `spawn`'s teardown is the second half of the kill.
+    /// The anchor is captured at PRESS time so an intervening tick cannot move
+    /// the cell the licence names.
+    bs_retreat_licence: Option<(Instant, (u16, u16))>,
     /// Legacy kill/fallback timing witness: the cursor row's FILL as it stood
     /// when the erase key arrived —
     /// `(row, fill)`, stamped by [`Self::note_backspace`] AND [`Self::note_kill`]
@@ -4192,6 +4294,27 @@ struct GlowMoveCandidate {
     bottom_scroll: Option<BottomScrollProof>,
 }
 
+/// The unjudged TAIL of a `confirmed-prefix` split as the host reads it
+/// ([`CursorGlow::confirmed_prefix_remainder`]) to project the same re-arm
+/// onto the classic trail twin: the newest press stamp, the remaining exact
+/// cells, the cohort's final predicted landing, and the observed caret the
+/// tail re-anchors at.
+#[derive(Clone, Copy, Debug)]
+pub struct PrefixRemainder {
+    /// The cohort's newest press stamp (the tail keeps it).
+    pub at: Instant,
+    /// The remaining expected cells.
+    pub expected: ExpectedCellSpan,
+    /// The cohort's final predicted landing.
+    pub target: (u16, u16),
+    /// The observed caret the tail re-anchors at (its origin AND material).
+    pub material: (u16, u16),
+}
+
+/// The confirm seam's staged prefix-split outcome: the remainder candidate,
+/// the prefix landing, and the prefix write span.
+type PrefixSplitPlan = (GlowMoveCandidate, (u16, u16), (u16, u16, u16));
+
 /// What [`CursorGlow::revoked_target_tombstone`] remembers about a Typed
 /// candidate the unowned fence revoked before its echo was judged — the E2
 /// split-batch collision's first half. See the field doc for the law.
@@ -4270,6 +4393,15 @@ pub enum AdmissionPhase {
     /// tally counter: the scoreboard law
     /// `armed == confirmed + retired + pending` must keep holding.
     Tombstone,
+    /// A NEW typed press EXTENDED the pending Typed cohort in place (the mash
+    /// seam — see [`CursorGlow::note_typed_expected`]): its expected cells
+    /// were appended to the pending span and the stamp refreshed, instead of
+    /// the whole cohort retiring `superseded`. Ring-only, like
+    /// [`Self::Tombstone`]: the cohort stays ONE armed lifecycle whose single
+    /// later verdict (confirmed/retired) balances it, so this row moves no
+    /// tally counter — but the keystroke leaves a trace, which is the whole
+    /// reason the ring exists.
+    Extended,
 }
 
 impl AdmissionPhase {
@@ -4281,6 +4413,7 @@ impl AdmissionPhase {
             Self::Confirmed => "confirmed",
             Self::Retired => "retired",
             Self::Tombstone => "tombstone",
+            Self::Extended => "extended",
         }
     }
 }
@@ -4430,9 +4563,10 @@ impl AdmissionLog {
                 self.tally.last_retire_reason = Some(record.reason);
             }
             // Ring-only: the candidate this tombstone stood for was already
-            // counted (its `unowned-batch` retire). Bumping any counter here
+            // counted (its `unowned-batch` retire), and an extension continues
+            // the ONE armed cohort it belongs to. Bumping any counter here
             // would break `armed == confirmed + retired + pending`.
-            AdmissionPhase::Tombstone => {}
+            AdmissionPhase::Tombstone | AdmissionPhase::Extended => {}
         }
         self.records[self.head] = Some(record);
         self.head = (self.head + 1) % ADMISSION_LOG_CAP;
@@ -4496,6 +4630,10 @@ pub struct TrailStatus<'a> {
     /// envelope reported a bright `intensity` for frames that were never drawn.
     /// Fillers must fold it; `effective == false` ⇒ `intensity == 0.0`.
     pub intensity: f32,
+    /// The ribbon's dark-theme PRESENTATION as the raw spelling resolves it:
+    /// `"underline"` (the default 0.43 flat under-baseline strip) or `"tall"`
+    /// (the gated banded body — [`GlowStyle::style_names_tall_ribbon`]).
+    pub ribbon_look: &'static str,
     /// The cumulative admission scoreboard.
     pub tally: AdmissionTally,
     /// Moves the spawn seam admitted ([`CursorGlow::spawns`]).
@@ -4547,7 +4685,7 @@ impl TrailStatus<'_> {
             "trail style={:?} resolved={} config_enabled={} effective={} focused={} \
              motion={} motion_stage={} shed={:.2} intensity={:.2} \
              armed={} candidates_confirmed={} retired={} last_retire_reason={} spawns={} \
-             ribbon_active={} ribbon_segments={} ribbon_hue_bands={} sparks={} \
+             ribbon_active={} ribbon_look={} ribbon_segments={} ribbon_hue_bands={} sparks={} \
              momentum={:.2} momentum_display={:.2} speed={:.1} \
              glow_active={} pet_active={} cat_active={}",
             self.style_raw,
@@ -4565,6 +4703,7 @@ impl TrailStatus<'_> {
             self.tally.last_retire_reason.unwrap_or("none"),
             self.spawns,
             self.ribbon_active(),
+            self.ribbon_look,
             self.ribbon_segments,
             self.ribbon_hue_bands,
             self.sparks,
@@ -5249,7 +5388,16 @@ impl CursorGlow {
     /// takes to actually fade, so the vanish is continuous instead of a
     /// staircase of whole-cell deletions ending in a cliff. Short enough that
     /// the retract still reads as a retract rather than a slow dissolve.
-    const RAINBOW_RETRACT_FADE: f32 = 0.13;
+    ///
+    /// LENGTHENED 0.13 → 0.20 with the underline default: the flat strip
+    /// concentrates each cell's light in one band instead of a tall graded
+    /// stack, so the same per-cell fade slope is a visibly larger share of
+    /// the whole mark — measured worst single-frame loss 7.9% of peak at
+    /// 0.13, inside the vanish pin's bounds at 0.20 (both presentations;
+    /// `rainbow_ribbon_vanishes_without_a_visible_step`). Still well inside
+    /// the swoosh's ending: grace + reach + retract + this = ~1.50 s, under
+    /// the [`Self::RAINBOW_SWOOSH_LIFE`] floor.
+    const RAINBOW_RETRACT_FADE: f32 = 0.20;
     /// Floor on a rainbow kitty typing spark's life so the exit swoosh (grace + reach +
     /// retract ≈ 1.30s) always terminates the ribbon before the natural cosine
     /// fade can — the swoosh IS the ending, never a passive dim-out.
@@ -5794,6 +5942,9 @@ impl CursorGlow {
         // the erase (a ContentOnly probe licenses nothing — see
         // [`ProbeTrust`]).
         self.bs_poof_hint = Some(now);
+        // MINT THE RETREAT LICENCE against the caret cell as it stands right
+        // now, before any echo: see [`Self::bs_retreat_licence`].
+        self.bs_retreat_licence = self.cursor_anchor().map(|anchor| (now, anchor));
         // Stamp the PRE-erase row fill while it is still the pre-erase row (see
         // [`Self::bs_baseline`]). `row_cur_meta` is the probe from this frame if
         // one has landed; otherwise `row_prev_meta` is the last presented truth.
@@ -5913,8 +6064,18 @@ impl CursorGlow {
         self.type_hint = Some(now);
         // Text-blind width/cadence feeds never admit movement. A native or
         // embedder host with exact committed cells upgrades this below through
-        // `note_typed_expected`.
-        self.discard_move_candidate("superseded");
+        // `note_typed_expected`. THE MASH EXCEPTION: a fresh, UNJUDGED Typed
+        // cohort is not superseded by the next typed glyph — at mash speed
+        // several presses land before one frame can judge the first, and this
+        // discard was the seam that killed the whole cohort ("two keys in
+        // flight across one frame slip kills both"). Keeping it admits
+        // nothing: the kept candidate's exact claim is unchanged and is still
+        // judged by the same confirm proof; if the exact extension for THIS
+        // press follows (`note_typed_expected`), it appends there — and if it
+        // never arrives, the cohort's own judgment stays fail-closed.
+        if !self.typed_candidate_extendable(now) {
+            self.discard_move_candidate("superseded");
+        }
         let credits = cells.clamp(1, Self::RAINBOW_TYPED_SWEEP_MAX as u16) as u8;
         self.rainbow.type_press_ring[self.rainbow.type_press_head] = Some((now, credits));
         self.rainbow.type_press_head =
@@ -5948,8 +6109,24 @@ impl CursorGlow {
             self.note_typed_cells(now, expected.as_slice().len() as u16);
         }
         if pending {
+            // THE MASH FIX (owner: "when I typed that quickly, the cursor
+            // trail broke"): a NEW real press while a Typed cohort is still
+            // PENDING (unjudged) EXTENDS that cohort — append this press's
+            // exact cells, advance the predicted target by its width, refresh
+            // the stamp — instead of retiring both. The confirm seam then
+            // proves the WHOLE extended span against the echo batch (the
+            // multi-cell coalesce path it already owns). Extension is bounded
+            // and evidence-gated inside `extend_typed_candidate`; anything it
+            // refuses falls to the old law below.
+            if self.extend_typed_candidate(now, expected, material, baseline_row, baseline_generation)
+            {
+                return;
+            }
             // A single latest hint cannot distinguish two unobserved commits.
             // Retire the whole cohort instead of replacing the older proof.
+            // (`note_typed_cells` above kept an extendable cohort alive, so a
+            // refused extension must close it here explicitly.)
+            self.discard_move_candidate("superseded");
             self.retire_move_candidate_at(now);
             return;
         }
@@ -5987,10 +6164,220 @@ impl CursorGlow {
         if expected.as_slice().len() == 1
             && let Some(candidate) = self.move_candidate.as_mut()
             && candidate.at == now
-            && matches!(candidate.intent, GlowMoveIntent::Typed(_))
+            // EXACT intent equality, not just "some Typed": a mash extension
+            // reuses the press stamp, and a scroll credential minted for one
+            // press must never attach to an extended multi-press cohort.
+            && candidate.intent == GlowMoveIntent::Typed(expected)
         {
             candidate.bottom_scroll = Some(BottomScrollProof::AwaitUniformUpOne);
         }
+    }
+
+    /// Whether the pending candidate is a MASH-EXTENDABLE Typed cohort: a
+    /// plain same-row typed claim (origin == material — pending-wrap and
+    /// scroll shapes stay one-press), still UNJUDGED (no confirm ran, no
+    /// deferred hold), and still fresh at `now`. This is the shared gate for
+    /// three seams that must agree: the host's capture fence (whether to
+    /// deliver the next press's exact proof at all), [`Self::note_typed_cells`]
+    /// (whether the cadence note supersedes the cohort), and
+    /// [`Self::note_typed_expected`]'s extension arm. True never admits
+    /// anything — it only says the cohort may still be APPENDED to.
+    #[must_use]
+    pub fn typed_candidate_extendable(&self, now: Instant) -> bool {
+        self.move_candidate.is_some_and(|candidate| {
+            matches!(candidate.intent, GlowMoveIntent::Typed(_))
+                && !candidate.content_confirmed
+                && candidate.bottom_scroll.is_none()
+                && candidate.deferred_probe_generation.is_none()
+                && candidate.material == Some(candidate.origin)
+                && candidate.target.is_some()
+                && candidate.baseline_generation.is_some()
+                && now.saturating_duration_since(candidate.at).as_secs_f32()
+                    <= Self::TYPE_HINT_FRESH
+        })
+    }
+
+    /// The pending cohort's CLAIM WINDOW as `(material, span_cells)` — where
+    /// a new press's proof may honestly be captured: the material caret
+    /// through the predicted target (`material.1 ..= material.1 + span`) on
+    /// the material row. Interior points are the capture carets after `k` of
+    /// the cohort's cells already echoed (the terminal processed part of the
+    /// cohort between the presses); the ends are the nothing-echoed and
+    /// everything-echoed boundaries. `None` unless the cohort is extendable.
+    #[must_use]
+    pub fn typed_extension_window(&self, now: Instant) -> Option<((u16, u16), u16)> {
+        if !self.typed_candidate_extendable(now) {
+            return None;
+        }
+        let candidate = self.move_candidate?;
+        let GlowMoveIntent::Typed(span) = candidate.intent else {
+            return None;
+        };
+        let material = candidate.material?;
+        Some((
+            material,
+            span.as_slice().len().min(usize::from(u16::MAX)) as u16,
+        ))
+    }
+
+    /// Host-facing twin of [`Self::typed_candidate_extendable`] that also
+    /// answers whether a proof captured at `origin` sits inside the pending
+    /// cohort's claim window (see [`Self::typed_extension_window`]).
+    #[must_use]
+    pub fn typed_extension_accepts(&self, now: Instant, origin: (u16, u16)) -> bool {
+        self.typed_extension_window(now)
+            .is_some_and(|((row, start), len)| {
+                origin.0 == row
+                    && origin.1 >= start
+                    && u32::from(origin.1) <= u32::from(start) + u32::from(len)
+            })
+    }
+
+    /// EXTEND the pending Typed cohort with one more REAL press's exact
+    /// evidence (the mash seam — every call is downstream of the host's
+    /// post-inline-write capture, never of a timestamp alone). `true` means
+    /// the cohort now carries this press: expected span appended (bounded by
+    /// [`Self::RAINBOW_TYPED_SWEEP_MAX`]; past the cap the window ROLLS
+    /// forward, whole glyphs only, and the rolled-out cells are patched into
+    /// the baseline so their materialization is still checked), predicted
+    /// target advanced by the new cells, stamp refreshed to this press, and
+    /// the baseline/generation REBASED onto this press's capture — each press
+    /// re-pins the sole-next-generation window at a boundary the host just
+    /// attested byte-for-byte (`committed_proof_still_current`), so the
+    /// composite claim never spans an unattested gap. `false` refuses:
+    /// different terminal/screen, a backwards generation, a capture caret
+    /// outside the cohort's claim window, or a claim that no longer fits its
+    /// bounds — the caller then applies the old retire-the-cohort law.
+    fn extend_typed_candidate(
+        &mut self,
+        now: Instant,
+        expected: ExpectedCellSpan,
+        material: (u16, u16),
+        baseline_row: ExpectedRowSnapshot,
+        baseline_generation: ContentGeneration,
+    ) -> bool {
+        if !self.typed_candidate_extendable(now) {
+            return false;
+        }
+        let Some(candidate) = self.move_candidate else {
+            return false;
+        };
+        let (GlowMoveIntent::Typed(span), Some((row, start)), Some(target), Some(generation)) = (
+            candidate.intent,
+            candidate.material,
+            candidate.target,
+            candidate.baseline_generation,
+        ) else {
+            return false;
+        };
+        // Identity + direction: the new proof must come from the same
+        // terminal and screen, at or after the cohort's pinned boundary. A
+        // pane switch, a screen flip, or a backwards stamp can never extend.
+        if baseline_generation.terminal_id != generation.terminal_id
+            || baseline_generation.alternate_screen != generation.alternate_screen
+            || baseline_generation
+                .process_sequence
+                .wrapping_sub(generation.process_sequence)
+                > u32::from(u16::MAX)
+        {
+            return false;
+        }
+        let old = span.as_slice();
+        let add = expected.as_slice();
+        // Contiguity: the new press was captured with the caret INSIDE the
+        // cohort's claim window (see `typed_extension_accepts`) — after `k`
+        // cohort cells echoed the caret sits at `start + k`, never elsewhere.
+        if material.0 != row
+            || material.1 < start
+            || usize::from(material.1) > usize::from(start) + old.len()
+        {
+            return false;
+        }
+        // COHERENCE of the capture boundary: a caret past the cohort start
+        // means part of the cohort's echo was PROCESSED — and a processing
+        // bout always advances the sequence. A window-interior caret at an
+        // UNADVANCED generation is not a state the attested host capture can
+        // produce (it is the E5 two-unobserved-commits forgery shape), so it
+        // refuses rather than widening the window.
+        if material.1 > start
+            && baseline_generation.process_sequence == generation.process_sequence
+        {
+            return false;
+        }
+        // Compose the claim; past the sweep cap the window ROLLS forward by
+        // whole glyphs (a '\0' continuation must never lead the kept span).
+        let total = old.len() + add.len();
+        let mut dropped = total.saturating_sub(Self::RAINBOW_TYPED_SWEEP_MAX);
+        while dropped < old.len() && old.get(dropped).copied() == Some('\0') {
+            dropped += 1;
+        }
+        if dropped > old.len() {
+            return false;
+        }
+        let Some(kept) =
+            ExpectedCellSpan::from_cells(old[dropped..].iter().chain(add.iter()).copied())
+        else {
+            return false;
+        };
+        let new_start = usize::from(start) + dropped;
+        let frontier = usize::from(start) + total;
+        let Ok(new_start_col) = u16::try_from(new_start) else {
+            return false;
+        };
+        let Some(new_target_col) = target.1.checked_add(add.len() as u16) else {
+            return false;
+        };
+        if frontier > crate::cursor_trail::EXPECTED_ROW_CELLS_MAX {
+            return false;
+        }
+        // ADOPT this press's attested baseline (the newest pinned boundary),
+        // patched with any rolled-out glyphs so the cells that left the
+        // expected span are still proven by the prefix-unchanged check.
+        let adopted = baseline_row.as_slice();
+        let mut row_buf = [' '; crate::cursor_trail::EXPECTED_ROW_CELLS_MAX];
+        let baseline_len = adopted.len().max(frontier);
+        for (col, slot) in row_buf.iter_mut().enumerate().take(baseline_len) {
+            *slot = padded_probe_cell(adopted, col);
+        }
+        for (i, &cell) in old[..dropped].iter().enumerate() {
+            row_buf[usize::from(start) + i] = cell;
+        }
+        let Some(new_baseline) = ExpectedRowSnapshot::from_slice(&row_buf[..baseline_len]) else {
+            return false;
+        };
+        let Some(live) = self.move_candidate.as_mut() else {
+            return false;
+        };
+        live.at = now;
+        live.intent = GlowMoveIntent::Typed(kept);
+        live.material = Some((row, new_start_col));
+        live.target = Some((target.0, new_target_col));
+        live.baseline_row = Some(new_baseline);
+        live.baseline_generation = Some(baseline_generation);
+        let record = AdmissionRecord {
+            seq: 0,
+            phase: AdmissionPhase::Extended,
+            reason: "extended",
+            intent: "typed",
+            at: now,
+            origin: candidate.origin,
+            target: Some((target.0, new_target_col)),
+            baseline_generation: Some(baseline_generation.process_sequence),
+            decided_generation: None,
+            alternate_screen: baseline_generation.alternate_screen,
+        };
+        self.admission_log.push(record);
+        if Self::trace_confirm_enabled() {
+            eprintln!(
+                "EXTEND cells={} span={} start={} target={:?} base={}",
+                add.len(),
+                kept.as_slice().len(),
+                new_start_col,
+                (target.0, new_target_col),
+                baseline_generation.process_sequence,
+            );
+        }
+        true
     }
 
     /// Record a main-screen ENTER classifier stamp. It never admits movement:
@@ -6088,6 +6475,25 @@ impl CursorGlow {
     #[must_use]
     pub fn reflow_hint_armed(&self) -> bool {
         self.reflow_hint.is_some()
+    }
+
+    /// The staged remainder of a `confirmed-prefix` split — readable between
+    /// the confirm seam and this frame's tick, which installs it. The host
+    /// projects it onto the classic trail twin
+    /// ([`crate::cursor_trail::CursorTrail::rearm_typed_remainder`]) so both
+    /// engines re-arm the SAME unjudged tail; reading it moves nothing.
+    #[must_use]
+    pub fn confirmed_prefix_remainder(&self) -> Option<PrefixRemainder> {
+        let (remainder, _) = self.rearmed_remainder.as_ref()?;
+        let GlowMoveIntent::Typed(span) = remainder.intent else {
+            return None;
+        };
+        Some(PrefixRemainder {
+            at: remainder.at,
+            expected: span,
+            target: remainder.target?,
+            material: remainder.material?,
+        })
     }
 
     /// How many committed CELL CREDITS landed within the trailing `window`
@@ -6604,7 +7010,13 @@ impl CursorGlow {
         self.return_hint = None;
         self.reflow_hint = None;
         self.newline_hint = None;
+        // A newer input class closes the erase retreat licence too: it may
+        // only ever speak for the press that minted it.
+        self.bs_retreat_licence = None;
         self.preserve_wake_on_rejected_bottom_scroll = None;
+        // Supersession closes the cohort INCLUDING an unjudged prefix-split
+        // tail still waiting for its install tick.
+        self.rearmed_remainder = None;
         self.discard_move_candidate("superseded");
         // The quench hint is dropped only once its OWN echo had a fair chance
         // to land (~2 frames): a fast backspace→Enter pair must not lose the
@@ -6623,6 +7035,7 @@ impl CursorGlow {
     /// the exact candidate, every classifier, and the typed-credit cohort retire.
     pub fn cancel_authored_move_candidate(&mut self) {
         self.candidate_superseded |= self.move_candidate.is_some();
+        self.rearmed_remainder = None;
         if let Some(typed_at) = self.type_hint.take() {
             self.retire_typed_commits_through(typed_at);
         }
@@ -6862,13 +7275,20 @@ impl CursorGlow {
             self.revoke_unowned_hints();
             return GenerationOwnership::UnownedSteady;
         }
-        if identity_held && anchor_held {
+        if identity_held && (anchor_held || self.backspace_retreat_licensed(current_cursor)) {
             // A rewrite that held identity and anchor: a streaming TUI
             // repainting around a parked cursor. The correlation ledger
             // retires (a denied delta can never pair with its old key), but
             // wake cells the probe attests untouched keep their light — this
             // is the batch cadence Claude-Code-style TUIs emit continuously,
             // and the wholesale wipe here was the dominant pixel-killer.
+            //
+            // …and the ONE anchor move that joins it: the user's own
+            // Backspace, retreating exactly one column on the anchor row
+            // under a live key licence. See
+            // [`Self::backspace_retreat_licensed`] — this is R1's load-bearing
+            // half, because the host's delete proof cannot arm for most honest
+            // erases and those batches arrive here with no candidate at all.
             self.retire_denied_move_keeping_validated_wake();
             return GenerationOwnership::UnownedRewrite;
         }
@@ -6949,6 +7369,52 @@ impl CursorGlow {
         Some(tombstone)
     }
 
+    /// THE BACKSPACE RETREAT LICENCE — the owner's "backspace KILLS my trail".
+    ///
+    /// The host's exact delete proof is deliberately narrow: `app_input`'s
+    /// `capture_delete_move_proof` refuses a blank erase outright and refuses
+    /// ANY row carrying content after the caret (an autosuggestion, a
+    /// highlighted suffix, a mid-line edit). So most honest Backspaces never
+    /// arm a candidate at all, and their echo batch reaches this fence
+    /// unowned. There the caret's one-column retreat moved the anchor,
+    /// `anchor_held` went false, and the batch was judged
+    /// [`GenerationOwnership::UnownedRelocation`] — whose wholesale
+    /// [`Self::clear_denied_move_visuals`] wiped the ribbon, the sparks, the
+    /// particles, and (the verdict is projected verbatim) the classic trail's
+    /// comet and the cursor companion's momentum. Measured live: one
+    /// space-erasing Backspace took 65% of the accumulated ink out in a single
+    /// frame and it never came back. That is a KILL, not a failure to draw.
+    ///
+    /// The licence RETAINS light the user already earned; it never ADMITS
+    /// any — the returned verdict routes to
+    /// [`Self::retire_denied_move_keeping_validated_wake`], which still
+    /// revokes the whole fail-closed classifier cohort and still kills every
+    /// cell whose content this batch rewrote (the erased cell among them). No
+    /// spawn path reads it.
+    ///
+    /// COLD OUTPUT CANNOT REACH IT, which is the bar 201449c2 set:
+    ///   * [`Self::bs_retreat_licence`] is minted ONLY by
+    ///     [`Self::note_backspace`], a host KEY PRESS. A spinner, a progress
+    ///     bar, or a program repainting one cell per frame holds no licence
+    ///     and still takes the wholesale path.
+    ///   * The shape must be the shape a Backspace makes: the SAME row as the
+    ///     caret cell the press was made at, and EXACTLY one column left of
+    ///     it. A jump, a row change, or a multi-cell retreat is still a
+    ///     relocation.
+    ///   * It is bounded in time and consumed on use: it expires after
+    ///     [`Self::TYPE_HINT_FRESH`] at the top of every [`Self::tick`], it is
+    ///     consumed by the `spawn` seam that judges the very move it names,
+    ///     and every wholesale teardown drops it with the rest of the
+    ///     fail-closed state.
+    fn backspace_retreat_licensed(&self, current_cursor: Option<(u16, u16)>) -> bool {
+        let (Some((row, col)), Some((_, (anchor_row, anchor_col)))) =
+            (current_cursor, self.bs_retreat_licence)
+        else {
+            return false;
+        };
+        row == anchor_row && anchor_col.checked_sub(1) == Some(col)
+    }
+
     /// The per-column attestation of the batch this fence just judged, for the
     /// classic trail twin: it holds no probe of its own, so the host threads
     /// this witness into its fence to apply the same proportionate retention.
@@ -7009,6 +7475,9 @@ impl CursorGlow {
         if revoke_bs {
             self.bs_baseline = None;
             self.confirmed_delete_span = None;
+        }
+        if self.bs_retreat_licence.is_some_and(|(licensed, _)| licensed == at) {
+            self.bs_retreat_licence = None;
         }
         if revoke_typed_cohort {
             // `type_hint` is the sole/latest correlation witness. Revoking it
@@ -7538,7 +8007,7 @@ impl CursorGlow {
         now: Instant,
     ) {
         if !matches!(reason, "await-echo" | "deferred-off-row-probe") {
-            let phase = if reason == "confirmed" {
+            let phase = if matches!(reason, "confirmed" | "confirmed-prefix") {
                 AdmissionPhase::Confirmed
             } else {
                 AdmissionPhase::Retired
@@ -7862,6 +8331,14 @@ impl CursorGlow {
         // candidate's own proof shows it materialized — which the generation
         // fence needs so a keystroke's echo stops condemning the ribbon head
         // sitting on the cell it just wrote. See [`Self::owned_write_span`].
+        //
+        // PARTIAL-ECHO SPLIT of a mash-extended span (the E2-adjacent case):
+        // when only a PREFIX of the expected cells arrived in this judged
+        // batch, the Typed arm plans a prefix confirm here — the remainder
+        // candidate (rebased on this generation at the observed caret, so the
+        // next-generation law keeps holding), the prefix landing, and the
+        // prefix write span — and the `!confirmed` handler below executes it.
+        let mut prefix_plan: Option<PrefixSplitPlan> = None;
         let (confirmed, row_changed, write_span) = match candidate.intent {
             GlowMoveIntent::Typed(expected) => {
                 let material = candidate.material?;
@@ -8024,6 +8501,86 @@ impl CursorGlow {
                         current.len(),
                     );
                 }
+                // PREFIX SPLIT: the observed caret sits STRICTLY INSIDE the
+                // expected span — the batch delivered only the first cells of
+                // a mash-extended cohort. The caret itself picks the split
+                // (after echoing p cells it sits at start+p, nowhere else);
+                // the arrived cells must read exactly, must not end inside a
+                // wide glyph, every cell before the span must be untouched,
+                // and the prefix needs a real materialization witness against
+                // the armed baseline (newly-appearing glyphs, storage growth
+                // for an all-blank run, or the caret-advance form — the
+                // landing on the split point IS the gate here). Anything less
+                // falls through to the ordinary retire/downgrade law.
+                if !exact
+                    && candidate.bottom_scroll.is_none()
+                    && candidate.deferred_probe_generation.is_none()
+                    && expected.len() >= 2
+                    && let Some(cursor) = current_cursor
+                    && cursor.0 == material.0
+                    && usize::from(cursor.1) > start
+                    && usize::from(cursor.1) < end
+                {
+                    let p = usize::from(cursor.1) - start;
+                    let arrived = &expected[..p];
+                    let whole_glyph_boundary = expected.get(p).copied() != Some('\0');
+                    let arrived_reads_exact = arrived
+                        .iter()
+                        .enumerate()
+                        .all(|(k, &cell)| padded_probe_cell(current, start + k) == cell);
+                    let prefix_zone_held = (0..start).all(|col| {
+                        padded_probe_cell(baseline, col) == padded_probe_cell(current, col)
+                    });
+                    let all_blank = arrived.iter().all(|&cell| cell == ' ');
+                    let materialized_p = arrived
+                        .iter()
+                        .enumerate()
+                        .any(|(k, &cell)| padded_probe_cell(baseline, start + k) != cell)
+                        || (all_blank
+                            && (current.len() >= start + p
+                                || arrived.iter().enumerate().all(|(k, &cell)| {
+                                    padded_probe_cell(baseline, start + k) == cell
+                                })));
+                    if whole_glyph_boundary
+                        && arrived_reads_exact
+                        && prefix_zone_held
+                        && materialized_p
+                        && end <= crate::cursor_trail::EXPECTED_ROW_CELLS_MAX
+                        && let Some(remainder_span) =
+                            ExpectedCellSpan::from_cells(expected[p..].iter().copied())
+                    {
+                        // The remainder's baseline is THIS judged probe row
+                        // through the claim frontier: the observed truth the
+                        // next sole generation must extend.
+                        let mut row_buf = [' '; crate::cursor_trail::EXPECTED_ROW_CELLS_MAX];
+                        for (col, slot) in row_buf.iter_mut().enumerate().take(end) {
+                            *slot = padded_probe_cell(current, col);
+                        }
+                        if let Some(remainder_baseline) =
+                            ExpectedRowSnapshot::from_slice(&row_buf[..end])
+                        {
+                            let landing = (material.0, cursor.1);
+                            prefix_plan = Some((
+                                GlowMoveCandidate {
+                                    at: candidate.at,
+                                    origin: landing,
+                                    intent: GlowMoveIntent::Typed(remainder_span),
+                                    target: candidate.target,
+                                    material: Some(landing),
+                                    baseline_row: Some(remainder_baseline),
+                                    reverse_target_baseline: None,
+                                    reverse_left_col: None,
+                                    baseline_generation: Some(current_generation),
+                                    deferred_probe_generation: None,
+                                    content_confirmed: false,
+                                    bottom_scroll: None,
+                                },
+                                landing,
+                                (material.0, material.1, cursor.1),
+                            ));
+                        }
+                    }
+                }
                 (
                     exact,
                     changed,
@@ -8086,29 +8643,111 @@ impl CursorGlow {
                     // Same sparse-storage law as the typed arm: an EOL erase is
                     // exactly where the stored row SHRINKS below the tail-filled
                     // baseline width, so the raw length equality retired every
-                    // honest Backspace echo on a trimmed-row host. The erased
-                    // cell must still go glyph -> blank and every survivor must
-                    // be content-identical.
-                    let width = baseline.len().max(current.len());
+                    // honest Backspace echo on a trimmed-row host. Both sides are
+                    // therefore read through the implicit-blank lens.
                     let changed = probe_rows_content_differ(baseline, current);
+                    // PRESENTATION-ZONE LAW, the delete twin. The first shipped
+                    // delete law demanded every unowned cell across the WHOLE row
+                    // stay content-identical — the identical law the typed arm
+                    // dropped in 20003ffd, and for the identical reason: a shell
+                    // repaints its autosuggestion for the SHORTENED prefix in the
+                    // very batch that erases, so an honest Backspace retired
+                    // `row-mismatch`. `col` IS the post-erase caret (the vacated
+                    // cell), so cells at/after it are the shell's presentation
+                    // zone and carry no veto. Causality still rests on the
+                    // untouched prefix, the single attributable generation
+                    // (enforced above), the erase witness below, and the cursor
+                    // landing on the exact predicted target.
+                    let prefix_intact = (0..col)
+                        .all(|i| padded_probe_cell(baseline, i) == padded_probe_cell(current, i));
+                    // MATERIALIZATION WITNESSES FOR AN ERASE — the delete twins of
+                    // the typed arm's three:
+                    //
+                    //   VACATED (the classic, and the only one the first law had):
+                    //   the cell went glyph -> blank. Unsatisfiable whenever the
+                    //   erased cell was ALREADY blank under the tail-filled lens
+                    //   (backspacing a SPACE — the word boundary) or whenever the
+                    //   shell repainted a suggestion glyph into it.
+                    let vacated = padded_probe_cell(baseline, col) != ' '
+                        && padded_probe_cell(current, col) == ' ';
+                    //   SHRANK (the twin of the typed STORAGE-GROWTH witness): the
+                    //   stored row no longer materially covers the erased column.
+                    //   A swallowed echo on a row the grid keeps padded cannot
+                    //   fake it, and it makes the trimmed-row EOL erase provable
+                    //   with no content diff at all.
+                    let shrank = current.len() <= col && baseline.len() > col;
+                    //   CARET RETREAT (the twin of the typed CARET-ADVANCE
+                    //   witness): the observed cursor landed on the EXACT
+                    //   predicted target. A swallowed erase never moves the caret;
+                    //   a bare program CUP has no armed candidate to borrow; and
+                    //   the press that armed this candidate is a real host key.
+                    //   This is the witness that carries the space erase and the
+                    //   suggestion repaint, exactly as caret-advance carries the
+                    //   typed space.
+                    let caret_retreat = current_cursor == Some(target);
                     let exact = target.0 == candidate.origin.0
-                        && padded_probe_cell(baseline, col) != ' '
-                        && padded_probe_cell(current, col) == ' '
-                        && (0..width).all(|i| {
-                            i == col
-                                || padded_probe_cell(baseline, i)
-                                    == padded_probe_cell(current, i)
-                        });
-                    // An ERASE leaves a blank where a glyph was; the ribbon never
-                    // lays on a deletion echo (it poofs instead), so there is no
-                    // wake cell here whose survival the exemption would decide.
-                    // Narrower is safer: no span.
-                    (exact, changed, None)
+                        && prefix_intact
+                        && (vacated || shrank || caret_retreat);
+                    // THE PROVEN WRITE SPAN: this candidate's own proof shows it
+                    // materialized exactly the vacated cell, so the generation
+                    // fence may exempt that one cell from byte-steadiness — the
+                    // same narrow exemption the typed arm publishes, and for the
+                    // same reason (a ribbon head sitting there must not be
+                    // condemned by the very edit the proof verified).
+                    //
+                    // OWNER, 2026-08-25: *"there are gaps when deleting."*
+                    // Without this exemption the erase's own byte change
+                    // condemned the ribbon head sitting on that cell and the
+                    // fence deleted the spark where it stood, in one frame,
+                    // while the light to its left stayed lit — a HOLE in the
+                    // middle of the band, read as broken rather than
+                    // retreating. Keeping the cell hands it to the RETRACT,
+                    // which eases it out tail-first over
+                    // [`Self::RAINBOW_RETRACT_FADE`] (see
+                    // [`Self::rainbow_retract_erased`]).
+                    (
+                        exact,
+                        changed,
+                        Some((target.0, target.1, target.1.saturating_add(1))),
+                    )
                 }
             }
             _ => (false, false, None),
         };
         if !confirmed {
+            // PREFIX CONFIRM (partial echo of a mash-extended span): the
+            // arrived cells proved exactly, so the cohort must not hard-fail.
+            // Confirm the prefix for THIS frame's spawn — the live candidate's
+            // target collapses to the observed split point so the admission
+            // gate's landing check still binds — and stage the remainder
+            // (already rebased on this judged generation at the observed
+            // caret, with the newest press stamp) for the same tick to
+            // install once the spawn consumes the confirmed prefix. The
+            // remainder is a NEW armed lifecycle; its `armed` row is logged
+            // at install so the scoreboard law keeps holding.
+            if let Some((remainder, landing, span)) = prefix_plan
+                && let Some(live) = self
+                    .move_candidate
+                    .as_mut()
+                    .filter(|live| live.at == candidate.at && live.origin == candidate.origin)
+            {
+                live.content_confirmed = true;
+                live.target = Some(landing);
+                let remainder_cells = match remainder.intent {
+                    GlowMoveIntent::Typed(span) => {
+                        span.as_slice().len().min(Self::RAINBOW_TYPED_SWEEP_MAX) as u8
+                    }
+                    _ => 0,
+                };
+                self.rearmed_remainder = Some((remainder, remainder_cells));
+                self.owned_write_span = Some(span);
+                self.log_confirm("confirmed-prefix", &candidate, current_generation, now);
+                return Some(ContentCandidateDecision::Confirmed {
+                    at: candidate.at,
+                    origin: candidate.origin,
+                    target: landing,
+                });
+            }
             // The first post-input processing batch completed without the exact
             // owned diff. This is a mismatch even when another row/title was
             // the only visible mutation; a later batch may not borrow it.
@@ -8505,7 +9144,11 @@ impl CursorGlow {
         self.preserve_wake_on_rejected_bottom_scroll = None;
         self.deferred_probe_hold = false;
         self.deferred_probe_pending = None;
+        self.rearmed_remainder = None;
         self.clear_visual_geometry();
+        // Nothing survives a wholesale teardown, the erase retreat licence
+        // least of all: there is no light left for it to have spared.
+        self.bs_retreat_licence = None;
         self.rainbow.clear_admission();
         self.sound_cues.clear();
         self.clear_keyed_clicks();
@@ -8638,22 +9281,47 @@ impl CursorGlow {
     /// wholesale wipe, exactly as before.
     ///
     /// The cell-anchored WAKE families retain per attested cell (sparks; the
-    /// rainbow tail memory, ink pops and nozzle). The at-cursor TRANSIENT
-    /// families — `particles` (typing twinkles, shooting-star debris, poof
-    /// sparkles) here, and the rainbow landing `bursts` in the rainbow twin —
-    /// are EXEMPT from this proportionate fence outright (v0.43.0 law,
-    /// restored): they are sub-second flashes (0.26-1.4 s lifetimes) born
-    /// only from admitted moves or key-hint-licensed poofs, and a byte-steady
-    /// repaint elsewhere cannot invalidate a flash at the caret. Under a
-    /// streaming TUI's batch cadence the old per-batch clear killed them
-    /// within tens of ms of birth — structurally invisible twinkles, the
-    /// owner's "I don't see the sparkles" — so they now live their own
-    /// lifetimes here and die only of age or of a WHOLESALE teardown
+    /// rainbow tail memory, ink pops and nozzle).
+    ///
+    /// THE SPARKLE TAIL (R2, owner: "my sparkles do not have the beautiful
+    /// trail any more"). Sparkle's trail IS its particle train: every other
+    /// style's tail is drawn by the cell-anchored sparks, but sparkle's whole
+    /// wake is the glitter it sheds behind the caret. 172b972e made this fence
+    /// proportionate for the sparks and deliberately left every projectile
+    /// family on the wholesale rule — so each keystroke's OWN echo wiped the
+    /// entire particle population before its burst spawned, and sparkle was
+    /// structurally reduced to a puff at the caret with nothing behind it
+    /// (measured: ~1.0 cell of ink behind the caret fenced, ~9.25 unfenced).
+    ///
+    /// The at-cursor TRANSIENT families — `particles` (typing twinkles,
+    /// shooting-star debris, poof sparkles) here, and the rainbow landing
+    /// `bursts` in the rainbow twin — are therefore EXEMPT from this
+    /// proportionate fence outright (v0.43.0 law, restored): they are
+    /// sub-second flashes (0.26-1.4 s lifetimes) born only from admitted moves
+    /// or key-hint-licensed poofs, they are advanced ANALYTICALLY away from
+    /// their birth pixel so no column's byte-steadiness can speak for where
+    /// they now are, and a repaint elsewhere cannot invalidate a flash at the
+    /// caret. Under a streaming TUI's batch cadence the old per-batch clear
+    /// killed them within tens of ms of birth — structurally invisible
+    /// twinkles, the owner's "I don't see the sparkles" — so they now live
+    /// their own lifetimes here and die only of age or of a WHOLESALE teardown
     /// ([`Self::clear_visual_geometry`] — relocations, identity changes,
     /// resets — which still clears them: a real relocation strands at-cursor
-    /// light). The remaining projectile/positional families (glide, meteors,
-    /// vapor, bolts, ring, crown, style fades) stay on the per-batch rule: a
-    /// row probe cannot attest their sub-cell positions.
+    /// light).
+    ///
+    /// (A per-BIRTH-CELL content fence for the glitter was the other candidate
+    /// law for R2 and is WITHDRAWN at the merge: it judges a grain by a cell it
+    /// has already flown out of, it contradicts the outright exemption its own
+    /// sibling family — the landing `bursts`, born at the same pixels from the
+    /// same event — carries two lines above, and on a host that repaints the
+    /// whole caret row every batch, which is exactly the host R2 was reported
+    /// against, it kills the trail this repair exists to restore. Retention is
+    /// never a mint either way, so nothing the cold-output law protects turns
+    /// on the choice.)
+    ///
+    /// The remaining projectile/positional families (glide, meteors, vapor,
+    /// bolts, ring, crown, style fades) stay on the per-batch rule: a row probe
+    /// cannot attest their sub-cell positions.
     ///
     /// `owned_write` is the ONE narrow exemption, and only the Owned path may
     /// pass it: the cells the candidate confirmed THIS batch materialized (see
@@ -8867,6 +9535,14 @@ impl CursorGlow {
         geom: Geom,
         out: &mut Vec<GlowQuad>,
     ) -> u64 {
+        // The Backspace retreat licence is time-bounded: it may only speak for
+        // the batch its own key press produced. Expiring it at the TOP of the
+        // frame keeps a stale press from ever reaching this tick's `spawn`.
+        if self.bs_retreat_licence.is_some_and(|(at, _)| {
+            now.saturating_duration_since(at).as_secs_f32() > Self::TYPE_HINT_FRESH
+        }) {
+            self.bs_retreat_licence = None;
+        }
         self.last_ch = geom.ch.min(u16::MAX as usize) as u16;
         out.clear();
         self.halo_out.clear();
@@ -9297,6 +9973,29 @@ impl CursorGlow {
         // landing. Hidden/stationary ticks spend it too, so it cannot be
         // borrowed by a later unrelated cursor move.
         self.preserve_wake_on_rejected_bottom_scroll = None;
+        // PREFIX-SPLIT REMAINDER INSTALL: the spawn above just consumed the
+        // confirmed prefix of a mash cohort, so the staged remainder becomes
+        // the pending candidate for the next generation — with the typed hint
+        // re-armed at the newest press stamp and the remainder's own cell
+        // credits restored (the unspent share of the presses that funded it;
+        // the prefix spawn's blanket `retire_typed_commits_through` was
+        // coarser than the split). ONE-SHOT either way: if the slot is still
+        // occupied (a hidden-cursor frame never spawned), the stage drops
+        // fail-closed rather than waiting to outlive its evidence.
+        if let Some((remainder, credit_cells)) = self.rearmed_remainder.take()
+            && self.move_candidate.is_none()
+        {
+            self.move_candidate = Some(remainder);
+            self.type_hint = Some(remainder.at);
+            if credit_cells > 0 {
+                self.rainbow.type_press_ring[self.rainbow.type_press_head] =
+                    Some((remainder.at, credit_cells));
+                self.rainbow.type_press_head =
+                    (self.rainbow.type_press_head + 1) % Self::RAINBOW_TYPED_SWEEP_MAX;
+                self.rainbow.last_committed_type = Some(remainder.at);
+            }
+            self.log_armed();
+        }
         // The TYPING WAKE's sub-cell nozzle (rainbow kitty only — every other style's
         // state and emission stay byte-identical). Three float ops; the plume it
         // anchors is only ever emitted while the pop ring is non-empty, so a
@@ -10175,6 +10874,27 @@ impl CursorGlow {
             // in one exhaustive teardown: leaving even a non-typing spark,
             // beam/bolt/water endpoint, meteor, vapor wisp, ring, or outgoing
             // crossfade alive would strand it over unrelated content.
+            //
+            // …EXCEPT for the user's own Backspace retreat, which is the
+            // SECOND half of R1's kill. The generation fence sparing the
+            // ribbon is not enough: this seam runs immediately after it, on
+            // the same frame, and judged the very same one-column retreat
+            // unwitnessed (the host could not arm an exact delete candidate,
+            // so nothing admits it) — and wiped everything the fence had just
+            // spared. Measured on the real seams: 5 ribbon segments survived
+            // the fence and this teardown took them to 0. Under the licence
+            // the teardown becomes PROPORTIONATE — cells the row probe attests
+            // this batch did not rewrite keep their light, the erased cell
+            // does not — and the move is STILL denied: `false` is returned
+            // exactly as before, no spark is laid, no thermal is fed, no
+            // sound is cued. See [`Self::backspace_retreat_licensed`].
+            if self.backspace_retreat_licensed(Some((cr, cc))) {
+                self.bs_retreat_licence = None;
+                // Preserves the independently earned key-time audio itself,
+                // exactly as the wholesale twin does.
+                self.retire_denied_move_keeping_validated_wake();
+                return false;
+            }
             self.clear_denied_move_visuals();
             return false;
         }
@@ -10758,8 +11478,45 @@ impl CursorGlow {
             shape_wrap,
             navigation,
             scrolled,
+            deletion,
             ..
         } = mv;
+        // DELETES RETRACT (owner: "there are gaps when deleting"). A confirmed
+        // Backspace-shaped landing — same row, caret retreating LEFT into the
+        // cell it just blanked — hands the ribbon beyond the new caret to the
+        // shared retract fade, tail-first, so the band eases BACK into the
+        // cursor instead of losing its erased columns where they stand. See
+        // [`Self::rainbow_retract_erased`] for the contiguity/ease argument.
+        //
+        // PLACEMENT mirrors the re-anchor arm below: before the style arms, on
+        // the deletion path, which runs no later ribbon rebuild of its own.
+        //
+        // The off-row deletes are already owned: a Backspace WRAP-BACK lands on
+        // the row ABOVE and is caught by the general OFF-ROW arm at the bottom
+        // of this function, and a multi-cell (coalesced) delete echo is not
+        // `typing` at all, so it takes the abandoned-ribbon clamp above.
+        if matches!(cfg.style, GlowStyle::RainbowKitty) && deletion && cr == pr && cc < pc {
+            self.rainbow_retract_erased(now, (cr, cc));
+            // THE TAIL REBASE, the other half — and without it this is worse
+            // than cosmetic. `rainbow.tail` still names the PRE-delete head, so
+            // the four-letter re-lay in the spawn path (and the exit swoosh's
+            // reach) would find those retreated cells and RE-LIGHT them, laying
+            // fresh ribbon over columns the user just erased. Anchor at the
+            // caret and keep only the history BEHIND it, exactly as the
+            // relocation arms do.
+            let mut rebased = [Some((cr, cc)), None, None];
+            let mut slot = 1;
+            for cell in self.rainbow.tail.into_iter().flatten() {
+                if slot >= rebased.len() {
+                    break;
+                }
+                if cell.0 == cr && cell.1 < cc {
+                    rebased[slot] = Some(cell);
+                    slot += 1;
+                }
+            }
+            self.rainbow.tail = rebased;
+        }
         // A real jump slams the FLARE to full: Fire ignites white-hot at the leap
         // (the payoff moment) regardless of typing heat, then cools on its own tau.
         // It also forgets the rainbow kitty tail memory — a jump must never resurrect
@@ -15184,6 +15941,85 @@ impl CursorGlow {
         0.5 * (1.0 + (std::f32::consts::PI * k).cos())
     }
 
+    /// DELETES RETRACT — the ribbon retreats toward the new caret instead of
+    /// being punched full of holes.
+    ///
+    /// OWNER, 2026-08-25: *"there are gaps when deleting."* A confirmed
+    /// Backspace used to take the ribbon out AT THE DELETED COLUMNS, one cell
+    /// at a time, in the frame the erase landed: the light left of the
+    /// deletion stayed lit, the erased columns went black instantly, and the
+    /// band read as BROKEN rather than as retreating.
+    ///
+    /// This routes the delete into the machinery the finger-lift already uses.
+    /// Every live ribbon cell on the landing row at or beyond the new caret is
+    /// stamped with the shared [`Spark::fade_at`] — the SAME multiplier the
+    /// exit swoosh's drain stamps, eased to zero over
+    /// [`Self::RAINBOW_RETRACT_FADE`] by [`Self::retract_fade_of`] — so each
+    /// cell leaves from exactly the brightness it had. Two properties follow,
+    /// and they are what the owner asked for:
+    ///
+    /// * **CONTIGUOUS at every frame.** Each delete stamps a SUFFIX of the
+    ///   band and the stamps only move later as the caret walks left
+    ///   (`get_or_insert` never restamps a cell), so the cells go out
+    ///   right-to-left and the lit run is unbroken from the caret backward.
+    ///   Nothing is ever removed from the MIDDLE.
+    /// * **TAIL-FIRST, and it EASES.** The doomed cells are ranked on the
+    ///   drain's own [`RainbowState::rank_scratch`], farthest-from-the-caret
+    ///   first, and their stamps are staggered across
+    ///   [`Self::RAINBOW_RETRACT_FADE`] so a multi-cell retreat drains as a
+    ///   wave rather than blinking out as a block. The whole retreat therefore
+    ///   finishes within `2 × RAINBOW_RETRACT_FADE` — the finger-lift drain's
+    ///   own [`Self::RAINBOW_RETRACT_DUR`] — so a delete still reads as a
+    ///   retract, never as a slow dissolve. Owner's standing ruling on the
+    ///   drain, *"the rainbow on the cursor isn't always smoothly vanishing"*,
+    ///   is what forbids the alternatives: deleting the cells STEPS, and
+    ///   clamping their `life` steps too (`env` rides `age / life`, so the
+    ///   coverage jumps at the instant of the clamp — see [`Spark::fade_at`]).
+    ///
+    /// CONTENT HONESTY comes free from the same stamp: the fade begins
+    /// IMMEDIATELY on the farthest cell and is short, so no cell holds
+    /// full-brightness light over a glyph that is already gone. No new proof
+    /// or gate is needed to say so.
+    ///
+    /// Costs one bounded pass over the resident ribbon (capped at
+    /// [`Self::RAINBOW_MAX_CELLS`]) per confirmed delete echo, on the shared
+    /// scratch, so it allocates nothing after the first retract of a session.
+    fn rainbow_retract_erased(&mut self, now: Instant, head: (u16, u16)) {
+        let (cr, cc) = head;
+        let mut ranked = std::mem::take(&mut self.rainbow.rank_scratch);
+        ranked.clear();
+        ranked.extend(
+            self.sparks
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.typing && s.row == cr && s.col >= cc)
+                .map(|(i, s)| (i32::from(s.col - cc), i)),
+        );
+        if ranked.is_empty() {
+            self.rainbow.rank_scratch = ranked;
+            return;
+        }
+        // Farthest from the caret leaves FIRST — the tail of the retreat.
+        // (No `kill_scratch` companion here, unlike the exit swoosh's drain:
+        // that one marks a bool vec because it walks the sparks and asks
+        // "was this one selected?", while this one walks the SELECTION and
+        // needs each cell's RANK to stagger it — `enumerate` indices are
+        // unique, so the ranked list already is the mark.)
+        ranked.sort_unstable_by_key(|&(m, _)| std::cmp::Reverse(m));
+        // The stagger shrinks as the doomed set grows, so the newest doomed
+        // cell's stamp is always at least as late as the previous delete's —
+        // which is what makes the extinction order (and therefore the
+        // contiguity) hold across a whole Backspace RUN, at any cadence.
+        let step = Self::RAINBOW_RETRACT_FADE / ranked.len() as f32;
+        for (rank, &(_, idx)) in ranked.iter().enumerate() {
+            let at = now + Duration::from_secs_f32(step * rank as f32);
+            // `get_or_insert`: a cell an earlier delete (or the exit swoosh)
+            // already selected keeps ITS stamp and cannot restart its fade.
+            self.sparks[idx].fade_at.get_or_insert(at);
+        }
+        self.rainbow.rank_scratch = ranked;
+    }
+
     fn rainbow_exit_swoosh(&mut self, now: Instant, geom: Geom) {
         let Some(last_type) = self.last_type else {
             return;
@@ -17039,8 +17875,142 @@ impl CursorGlow {
         }
     }
 
-    /// ONE swept cell of the DARK-THEME ribbon BODY (under-ink): iridescent
-    /// coverage, feathered gradient rows, momentum wave. Returns `false` when
+    /// ONE swept cell's IRIDESCENT COVERAGE — the ribbon's per-cell brightness
+    /// after the shimmer noise and the travelling specular glint (the TALL
+    /// body's "magic" channels; the default underline deliberately holds its
+    /// brightness steady — see `emit_rainbow_underline_dark`).
+    ///
+    /// COVERAGE ONLY: hue selection stays with each emitter. A deterministic
+    /// two-octave value-noise shimmers each cell (±[`Self::RAINBOW_IRID_AMP`]
+    /// at full momentum) and a bright glint (~2 cells wide) sweeps head→tail
+    /// along the SPATIAL parameter `sp` as the phase advances. Both amplitudes
+    /// ride the eased spine SQUARED, so a COLD ribbon (`rainbow.disp == 0`)
+    /// returns the clamped request untouched — the flat crisp idle contract.
+    fn rainbow_cell_cov(&self, s: &Spark, sp: f32, cov_f: f32) -> f32 {
+        let base = cov_f.clamp(0.0, RAINBOW_BAND_COV_CAP_MAX);
+        if self.rainbow.disp < 0.005 {
+            base
+        } else {
+            let noise = rainbow_irid_noise(s.col, s.row, self.rainbow.phase); // -1..1
+            // WIDER DYNAMIC RANGE: the shimmer + glint amplitudes ride the
+            // spine SQUARED, not linearly, so a hot ribbon shimmers distinctly
+            // more than a warm one (the contrast between a stroll and a sprint
+            // widens) while disp = 1 stays bounded by the cov cap as before.
+            let disp2 = self.rainbow.disp * self.rainbow.disp;
+            let shimmer = 1.0 + Self::RAINBOW_IRID_AMP * disp2 * noise;
+            let gc = self.rainbow.phase.fract(); // glint centre: head(0)→tail(1)
+            // Rides the SPATIAL parameter: a highlight travelling DOWN the
+            // ribbon is a claim about where light sits, not about how old a
+            // cell is. On `u` the glint landed on scattered cells whenever the
+            // cadence varied, because `u`'s denominator is per-spark.
+            let gd = (sp - gc) / Self::RAINBOW_GLINT_WIDTH;
+            let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
+            let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
+            (base * shimmer + glint_add).clamp(0.0, RAINBOW_BAND_COV_CAP_MAX)
+        }
+    }
+
+    /// ONE swept cell of the DEFAULT dark-theme ribbon — **THE UNDERLINE**,
+    /// the 0.43 read restored (owner, 2026-08-24: "the underline rainbow has
+    /// been changed"): a FLAT strip, [`RAINBOW_UNDERLINE_H`] of a cell tall
+    /// (2 px floor), centred on the ROW BOUNDARY beneath the typed row — the
+    /// same spine the typing wake streams along, and the dark twin of the
+    /// light theme's leading rail — so the ribbon underlines the words instead
+    /// of standing the glyphs inside a tall band.
+    ///
+    /// WHAT IT KEEPS from the banding-era body, on purpose:
+    /// - PER-CELL HUE BANDS: the cell's hue is the SHARED column band
+    ///   ([`rainbow_band_index_at`] over the momentum-rotated
+    ///   [`rainbow_momentum_bands`] anchors) — the same band the light rail,
+    ///   the wake ramp and the glyph tint resolve for that column, so the
+    ///   strip is a banded rainbow rolling along the line and every layer
+    ///   stays one palette (`ribbon_hue_bands` keeps climbing in `trail
+    ///   status`).
+    /// - SEGMENT SURVIVAL + RETRACT: it draws the same `sparks`, under the
+    ///   same envelope/cov machinery (the request carries env × head
+    ///   clearance; the retract fade multiplies in after the band cap), so
+    ///   cohort confirmation, the finger-lift drain and the tail-first
+    ///   retreat behave identically in both presentations.
+    ///
+    /// WHAT IT DROPS: the travelling vertical wave, the width taper, the
+    /// shimmer/glint brightness modulation and the six stacked stripes — an
+    /// underline is straight and CALM (its colour rolls, its brightness holds
+    /// steady), and six hues cannot resolve inside ~0.22 of a cell (the same
+    /// argument `rainbow_slab_at` makes against sub-pixel blends).
+    ///
+    /// GEOMETRY: the spine clamps inside the effects box exactly like the
+    /// wake's (`emit_rainbow_wake`), so a shell prompt on the LAST row keeps
+    /// the whole strip visible instead of losing its bottom half. The strip
+    /// straddles the boundary — half in this row's descender margin, half in
+    /// the next row's ascender margin — and rides the `under` stream, beneath
+    /// every glyph. Edges lay a 1 px half-coverage feather so adjacent rows of
+    /// light melt instead of cutting. Returns `false` when the quad budget ran
+    /// out, exactly like the tall body.
+    fn emit_rainbow_underline_dark(
+        &self,
+        s: &Spark,
+        cov_nr: f32,
+        retract: f32,
+        geom: Geom,
+        under: &mut Vec<GlowQuad>,
+    ) -> bool {
+        let cw = geom.cw as i32;
+        let ch = geom.ch as i32;
+        // THE SHARED BAND — one hue per cell, resolved in the momentum-rotated
+        // anchors so a hot ribbon's spectrum breathes exactly as the tall
+        // body's does.
+        let bands = rainbow_momentum_bands(
+            s.col as f32,
+            s.row as f32,
+            self.rainbow.phase,
+            self.rainbow.disp,
+        );
+        let bi = rainbow_band_index_at(s.col, self.rainbow.phase);
+        // ONE ceiling for every hue (see [`RAINBOW_UNDERLINE_COV_CAP`]), and
+        // NO shimmer/glint brightness modulation: the underline is a CALM
+        // steady strip — its colour rolls with the phase, its brightness does
+        // not. The iridescence channels stay with the tall body (where the
+        // "more magical" ask was made); here a travelling brightness bump
+        // would both ripple a mark whose whole identity is flatness and drop
+        // a draining cell by its own bonus mid-fade — the sparkle of this
+        // presentation is the wake plume riding over the strip's nozzle,
+        // exactly as 0.43 read.
+        let cov = cov_nr.clamp(0.0, RAINBOW_UNDERLINE_COV_CAP) * retract;
+        if cov < 1.0 {
+            return true;
+        }
+        let x = geom.origin_x as i32 + s.col as i32 * cw;
+        let h = ((ch as f32 * RAINBOW_UNDERLINE_H).round() as i32).clamp(2, ch.max(2));
+        let half = h as f32 * 0.5;
+        // The wake's spine law: the row boundary under the typed row, pulled
+        // inside the effects box on the edge rows so the strip never clips.
+        let spine = (geom.origin_y as f32 + (s.row as f32 + 1.0) * ch as f32)
+            .min(geom.fx_bot() as f32 - half)
+            .max(geom.fx_top() as f32 + half);
+        let top = (spine - half).round() as i32;
+        let rgb = bands[bi];
+        // 1 px half-coverage feather rows + crisp core. `push_rect` may split
+        // a lay across the row boundary, so budget two quads per lay.
+        let edge_cov = ((cov * 0.5) as u8).max(1);
+        for (dy, hh, c) in [
+            (0, 1, edge_cov),
+            (1, h - 2, cov as u8),
+            (h - 1, 1, edge_cov),
+        ] {
+            if under.len() + 2 > Self::MAX_QUADS {
+                return false;
+            }
+            push_rect(under, geom, x, top + dy, cw, hh, premul_rgb(rgb, c));
+        }
+        true
+    }
+
+    /// ONE swept cell of the GATED tall DARK-THEME ribbon BODY (under-ink):
+    /// iridescent coverage, feathered gradient rows, momentum wave — the
+    /// banding-era presentation, kept for the
+    /// [`GlowStyle::style_names_tall_ribbon`] spellings
+    /// ([`GlowConfig::ribbon_tall`]); the DEFAULT look is
+    /// [`Self::emit_rainbow_underline_dark`]. Returns `false` when
     /// the quad budget ran out — the caller aborts the pass exactly as the
     /// inlined original did.
     #[allow(
@@ -17076,27 +18046,7 @@ impl CursorGlow {
         // The per-CELL bound is the LARGEST any band may take; the real,
         // hue-specific ceiling lands per ROW below, where the gradient position
         // — and therefore the colour emitted — is known.
-        let base = cov_f.clamp(0.0, RAINBOW_BAND_COV_CAP_MAX);
-        let cell_cov = if self.rainbow.disp < 0.005 {
-            base
-        } else {
-            let noise = rainbow_irid_noise(s.col, s.row, self.rainbow.phase); // -1..1
-            // WIDER DYNAMIC RANGE: the shimmer + glint amplitudes ride the
-            // spine SQUARED, not linearly, so a hot ribbon shimmers distinctly
-            // more than a warm one (the contrast between a stroll and a sprint
-            // widens) while disp = 1 stays bounded by the cov cap as before.
-            let disp2 = self.rainbow.disp * self.rainbow.disp;
-            let shimmer = 1.0 + Self::RAINBOW_IRID_AMP * disp2 * noise;
-            let gc = self.rainbow.phase.fract(); // glint centre: head(0)→tail(1)
-            // Rides the SPATIAL parameter: a highlight travelling DOWN the
-            // ribbon is a claim about where light sits, not about how old a
-            // cell is. On `u` the glint landed on scattered cells whenever the
-            // cadence varied, because `u`'s denominator is per-spark.
-            let gd = (sp - gc) / Self::RAINBOW_GLINT_WIDTH;
-            let glint = (-(gd * gd)).exp(); // localized specular highlight 0..1
-            let glint_add = Self::RAINBOW_GLINT_COV * disp2 * glint;
-            (base * shimmer + glint_add).clamp(0.0, RAINBOW_BAND_COV_CAP_MAX)
-        };
+        let cell_cov = self.rainbow_cell_cov(s, sp, cov_f);
         // Window-absolute cell anchor; the ribbon stays inside its own cell,
         // so `push_rect`'s origin-anchored row tag is still the true cell row.
         let x = geom.origin_x as i32 + s.col as i32 * cw;
@@ -17517,10 +18467,14 @@ impl CursorGlow {
         true
     }
 
-    /// Emit the RAINBOW KITTY banded rainbow ribbon: for every swept cell, six crisp
-    /// non-overlapping horizontal stripes (red→violet, top→bottom) in fixed
-    /// [`RAINBOW_BANDS`] colours, faded tail→head over each spark's own lifetime, plus a
-    /// sparse twinkling starfield. The ribbon BODY renders into `under` — the
+    /// Emit the RAINBOW KITTY banded rainbow ribbon: for every swept cell, a
+    /// band of fixed [`RAINBOW_BANDS`] colour, faded tail→head over each
+    /// spark's own lifetime, plus a sparse twinkling starfield. The DEFAULT
+    /// dark presentation is the 0.43 UNDERLINE — a flat under-baseline strip,
+    /// one hue band per cell rolling red→violet along the line
+    /// ([`Self::emit_rainbow_underline_dark`]); the banding-era TALL body (six
+    /// crisp stacked stripes the glyphs sit inside) is gated behind
+    /// [`GlowConfig::ribbon_tall`]. The ribbon BODY renders into `under` — the
     /// `glow_under` stream, composited beneath the glyph pass — so typed letters
     /// draw OVER the rainbow at full contrast (the user-review legibility ask);
     /// only the starfield (probed off glyph cells) rides `out` above the ink.
@@ -17683,7 +18637,28 @@ impl CursorGlow {
                 Some((hr, hc)) if hr == s.row && hc < s.col => -1.0,
                 _ => 1.0,
             };
-            if !self.emit_rainbow_body_dark(s, sp, dsp, tail_dir, cov_f, clearance, geom, under) {
+            // THE PRESENTATION FORK — geometry only, everything upstream
+            // (admission, envelopes, retract, clearance) is shared: the
+            // DEFAULT is the 0.43 flat under-baseline strip; the tall banded
+            // body survives behind its explicit spelling
+            // (`GlowStyle::style_names_tall_ribbon` → `cfg.ribbon_tall`).
+            let body_fits = if cfg.ribbon_tall {
+                self.emit_rainbow_body_dark(s, sp, dsp, tail_dir, cov_f, clearance, geom, under)
+            } else {
+                // RETRACT AFTER THE CAP — the light rail's law, adopted for the
+                // same reason it was adopted there: a capped cell whose request
+                // sits ABOVE its band ceiling would spend the first half of the
+                // exit swoosh invisibly (min(req·retract, cap) holds flat until
+                // the product crosses the cap) and then fall in the remaining
+                // half — a compressed, steppy drain. Reconstructing the
+                // un-retracted request and multiplying the retract in AFTER the
+                // clamp makes the strip leave from exactly the brightness it
+                // shows, easing the whole way (`rainbow_ribbon_vanishes_
+                // without_a_visible_step` holds for this presentation too).
+                let cov_nr = if retract > 0.0 { cov_f / retract } else { 0.0 };
+                self.emit_rainbow_underline_dark(s, cov_nr, retract, geom, under)
+            };
+            if !body_fits {
                 return;
             }
             if !self.emit_rainbow_starfield(s, age, env, edge, cfg, geom, out) {
@@ -21116,6 +22091,9 @@ mod tests {
             head_dx: 0.5,
             pack: None,
             wake_persist_s: RAINBOW_WAKE_PERSIST,
+            // The shipping default: the 0.43 underline strip. Tests that pin
+            // the GATED tall body opt in per-test (`c.ribbon_tall = true`).
+            ribbon_tall: false,
         }
     }
 
@@ -25904,6 +26882,438 @@ mod tests {
         assert!(ok, "synthetic candidate rejected: {why}");
     }
 
+    /// R1 — THE BACKSPACE KILL, the fence half. The host's delete proof is
+    /// deliberately narrow (`capture_delete_move_proof` refuses a blank
+    /// erase, and refuses ANY row carrying content after the caret), so most
+    /// honest Backspaces reach the generation fence with NO candidate at all.
+    /// There the caret's one-column retreat moved the anchor, `anchor_held`
+    /// went false, and the batch was judged `UnownedRelocation` — whose
+    /// wholesale `clear_transient_state` wiped the ribbon, the sparks, the
+    /// particles and (projected onto the twin and the companion) the pet's
+    /// momentum. That is the owner's "backspace KILLS my trail": not a
+    /// failure to draw, a kill. A REAL Backspace key press licenses the
+    /// PROPORTIONATE arm instead: attested-steady cells keep the light the
+    /// user already earned. Retention only — nothing is admitted here.
+    #[test]
+    fn an_honest_backspace_retreat_keeps_the_ribbon_the_user_earned() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 5,
+            alternate_screen: false,
+        };
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        // `wwwwwwwww`, caret one past the last glyph.
+        let mut before = [' '; 16];
+        before[..9].fill('w');
+        glow.observe_row(2, 9, &before, t0);
+        let t1 = t0 + Duration::from_millis(8);
+        // The tick rotates this probe into `row_prev`, so the fence below has
+        // an attesting PAIR to read.
+        glow.tick(Some((2, 9)), t1, &c, g, &mut out);
+        // The first generation observation is a silent baseline.
+        assert_eq!(
+            glow.observe_content_generation(generation(40), Some((2, 9)), false),
+            GenerationOwnership::Steady
+        );
+        // The ribbon the user earned on the columns they typed.
+        for col in 2..9u16 {
+            glow.sparks.push(Spark {
+                row: 2,
+                col,
+                born_cov: 200,
+                pos: 1.0,
+                life: 5.0,
+                typing: true,
+                hue: 0.25,
+                born: t1,
+                fade_at: None,
+            });
+        }
+        let earned = glow.sparks.len();
+
+        // The user presses Backspace. The host cannot arm the exact candidate
+        // (this is the refused class), so no candidate exists at the fence.
+        let at = t1 + Duration::from_millis(4);
+        glow.note_backspace(at);
+        assert!(
+            !glow.move_candidate_pending(),
+            "this test is about the UNARMED honest Backspace"
+        );
+        // The erase echo lands: column 8 goes blank, the caret retreats one cell.
+        let mut after = before;
+        after[8] = ' ';
+        let echo = at + Duration::from_millis(4);
+        glow.observe_row(2, 8, &after, echo);
+        let ownership = glow.observe_content_generation(generation(41), Some((2, 8)), false);
+
+        assert_ne!(
+            ownership,
+            GenerationOwnership::UnownedRelocation,
+            "a real Backspace's own one-column retreat is not a program relocation"
+        );
+        assert_eq!(
+            glow.sparks.len(),
+            earned - 1,
+            "only the ERASED column loses its light; the earned prefix survives"
+        );
+        assert!(
+            glow.sparks.iter().all(|spark| spark.col < 8),
+            "the vacated cell keeps no light: {:?}",
+            glow.sparks.iter().map(|s| s.col).collect::<Vec<_>>()
+        );
+    }
+
+    /// THE BAR for the arm above: cold program output must STILL never keep
+    /// light through a caret relocation. The retreat licence is minted by
+    /// `note_backspace` — a host KEY PRESS — and by nothing else, so a
+    /// spinner, a progress bar, or a program repainting one cell per frame
+    /// that happens to move the caret one column left takes the wholesale
+    /// `UnownedRelocation` path exactly as before. The licence is also bound
+    /// to the EXACT cell the press was made at, so a program's follow-on
+    /// retreat further down the row is a relocation again.
+    #[test]
+    fn a_cold_one_column_retreat_still_relocates_wholesale() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 5,
+            alternate_screen: false,
+        };
+        let lay = |glow: &mut CursorGlow, at: Instant| {
+            for col in 2..9u16 {
+                glow.sparks.push(Spark {
+                    row: 2,
+                    col,
+                    born_cov: 200,
+                    pos: 1.0,
+                    life: 5.0,
+                    typing: true,
+                    hue: 0.25,
+                    born: at,
+                    fade_at: None,
+                });
+            }
+        };
+        let mut before = [' '; 16];
+        before[..9].fill('w');
+        let mut after = before;
+        after[8] = ' ';
+
+        // (a) No key at all — a program's own one-cell retreat.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.observe_row(2, 9, &before, t0);
+        let t1 = t0 + Duration::from_millis(8);
+        glow.tick(Some((2, 9)), t1, &c, g, &mut out);
+        glow.observe_content_generation(generation(40), Some((2, 9)), false);
+        glow.observe_row(2, 8, &after, t1);
+        lay(&mut glow, t1);
+        assert_eq!(
+            glow.observe_content_generation(generation(41), Some((2, 8)), false),
+            GenerationOwnership::UnownedRelocation,
+            "cold output owns no retreat licence"
+        );
+        assert!(glow.sparks.is_empty(), "cold relocation still wipes wholesale");
+
+        // (b) A real Backspace, then a SECOND unowned retreat: the licence is
+        // one-shot, so the follow-up is wiped.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.observe_row(2, 9, &before, t0);
+        glow.tick(Some((2, 9)), t1, &c, g, &mut out);
+        glow.observe_content_generation(generation(40), Some((2, 9)), false);
+        glow.observe_row(2, 8, &after, t1);
+        glow.note_backspace(t1);
+        lay(&mut glow, t1);
+        assert_ne!(
+            glow.observe_content_generation(generation(41), Some((2, 8)), false),
+            GenerationOwnership::UnownedRelocation,
+            "the real press earns its one proportionate batch"
+        );
+        assert!(!glow.sparks.is_empty());
+        let t2 = t1 + Duration::from_millis(8);
+        glow.tick(Some((2, 8)), t2, &c, g, &mut out);
+        glow.observe_row(2, 7, &after, t2);
+        assert_eq!(
+            glow.observe_content_generation(generation(42), Some((2, 7)), false),
+            GenerationOwnership::UnownedRelocation,
+            "the licence names one cell; a follow-on retreat is a relocation again"
+        );
+        assert!(glow.sparks.is_empty());
+    }
+
+    /// R1 — the CONFIRM half. The Delete arm still carried the pre-20003ffd
+    /// laws verbatim: WHOLE-ROW exactness (any repaint at/after the vacated
+    /// cell vetoes) and ONE hard materialization witness (glyph → blank at
+    /// exactly that cell). Those are the two tokens — `row-mismatch` and
+    /// `row-unchanged` — that were retiring 100% of honest TYPED echoes
+    /// before the typed repair. This pins the delete twin of that repair:
+    /// caret-frontier scoping, plus witnesses fit for an ERASE (the stored
+    /// row shrinking, and the caret retreat that a swallowed erase can never
+    /// fake).
+    #[test]
+    fn the_delete_arm_confirms_the_erase_shapes_a_real_shell_produces() {
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 11,
+            alternate_screen: false,
+        };
+        // Arm one exact Delete candidate erasing (2, col) from origin (2, col+1).
+        let arm = |baseline_cells: &[char; 12], col: u16, seq: u32| {
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            glow.tick(Some((2, col + 1)), t0, &c, g, &mut out);
+            let at = t0 + Duration::from_millis(1);
+            glow.note_backspace(at);
+            glow.note_delete_candidate(
+                at,
+                (2, col),
+                ExpectedRowSnapshot::from_slice(baseline_cells).unwrap(),
+                generation(seq),
+            );
+            (glow, at)
+        };
+
+        // D1 — ERASE UNDER A LIVE SUGGESTION. zsh/fish repaint POSTDISPLAY for
+        // the SHORTENED prefix in the very echo batch that erases: the vacated
+        // cell reads a GHOST glyph, not a blank, and the whole-row law vetoed
+        // on every column of the suggestion. `row-mismatch` — the typed
+        // blackout's own token.
+        let suggested: [char; 12] = ['$', ' ', 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's'];
+        let (mut glow, at) = arm(&suggested, 4, 10);
+        // Backspace over the 't' of `git`: the prefix shortens to `$ gi` and
+        // the shell repaints its suggestion from the vacated column on.
+        let reshown: [char; 12] = ['$', ' ', 'g', 'i', 'v', 'e', ' ', 'u', 'p', ' ', ' ', ' '];
+        let echo = at + Duration::from_millis(1);
+        glow.observe_row(2, 4, &reshown, echo);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo, generation(11));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D1 erase under a repainted suggestion must confirm: {decision:?}"
+        );
+
+        // D2 — ERASING A SPACE (the word boundary). Under the implicit-blank
+        // lens the tail-filled baseline already reads ' ' at the vacated cell,
+        // so the glyph→blank witness is unsatisfiable and the row is
+        // content-identical: `row-unchanged`, the delete twin of the typed
+        // SPACE blackout.
+        let mut spaced = [' '; 12];
+        spaced[0] = '$';
+        spaced[2] = 'g';
+        spaced[3] = 'i';
+        spaced[4] = 't';
+        let (mut glow, at) = arm(&spaced, 5, 20);
+        let echo = at + Duration::from_millis(1);
+        glow.observe_row(2, 5, &spaced, echo);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo, generation(21));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D2 erase of a SPACE must confirm on the caret retreat: {decision:?}"
+        );
+
+        // D3 — EOL ERASE ON A TRIMMED-ROW GRID: the stored row SHRINKS below
+        // the vacated column instead of storing a blank there. Storage shrink
+        // is the delete twin of the typed storage-growth witness.
+        let mut filled = [' '; 12];
+        filled[0] = '$';
+        filled[2] = 'g';
+        filled[3] = 'i';
+        filled[4] = 't';
+        let (mut glow, at) = arm(&filled, 4, 30);
+        let trimmed = ['$', ' ', 'g', 'i'];
+        let echo = at + Duration::from_millis(1);
+        glow.observe_row(2, 4, &trimmed, echo);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo, generation(31));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D3 trimmed-row EOL erase must confirm on the storage shrink: {decision:?}"
+        );
+
+        // SAFETY, unchanged: content moving BEFORE the caret disproves the
+        // attribution, and a swallowed erase (the caret never moved, nothing
+        // vacated, nothing shrank) can never borrow the press.
+        let (mut glow, at) = arm(&filled, 4, 40);
+        let mut prefix_moved = filled;
+        prefix_moved[2] = 'X';
+        prefix_moved[4] = ' ';
+        let echo = at + Duration::from_millis(1);
+        glow.observe_row(2, 4, &prefix_moved, echo);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo, generation(41));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a delete whose PREFIX moved must retire: {decision:?}"
+        );
+
+        let (mut glow, at) = arm(&filled, 4, 50);
+        let echo = at + Duration::from_millis(1);
+        glow.observe_row(2, 5, &filled, echo);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo, generation(51));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a swallowed erase — nothing vacated, no shrink, caret parked — must retire: \
+             {decision:?}"
+        );
+    }
+
+    /// R2 — THE SPARKLES LOST THEIR TRAIL. Sparkle's tail is its GLITTER
+    /// PARTICLE train, and `retire_geometry_keeping_validated_wake` cleared
+    /// the whole particle population on every judged batch. 172b972e rescued
+    /// the CELL-ANCHORED family (sparks, the rainbow tail memory) with the
+    /// per-column steady predicate and left the projectiles on the wholesale
+    /// rule — so every keystroke wiped the previous keystroke's glitter
+    /// before its own burst spawned, and sparkle could only ever be a puff at
+    /// the caret. The particle family is now EXEMPT from that fence outright
+    /// (the v0.43.0 law restored in 2f5ab57b — see the fence's own doc for why
+    /// the per-birth-cell variant this test first shipped was withdrawn at the
+    /// merge), so the train lives its own lifetimes.
+    ///
+    /// This is the SPARKLE-style twin of
+    /// `particles_and_bursts_survive_the_proportionate_fence_but_die_on_relocation`:
+    /// same law, driven through the style whose entire wake IS the glitter,
+    /// over real `geom()` cell centres, on the OWNED (confirmed-echo) arm that
+    /// R2 was measured against.
+    #[test]
+    fn the_sparkle_glitter_train_outlives_the_keystroke_that_follows_it() {
+        let g = geom();
+        let c = cfg(GlowStyle::Sparkle, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 7,
+            alternate_screen: false,
+        };
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut row = [' '; 16];
+        row[..6].fill('s');
+        glow.observe_row(2, 6, &row, t0);
+        let t1 = t0 + Duration::from_millis(8);
+        glow.tick(Some((2, 6)), t1, &c, g, &mut out);
+        assert_eq!(
+            glow.observe_content_generation(generation(59), Some((2, 6)), false),
+            GenerationOwnership::Steady
+        );
+        // Glitter shed over the cells the user already typed (columns 2..6),
+        // each grain born inside its own cell exactly as `spawn_burst_particles`
+        // places them.
+        for col in 2..6u16 {
+            let (cx, cy) = g.cell_center(2, col);
+            glow.particles.push(Particle {
+                x0: cx,
+                y0: cy,
+                vx: 0.0,
+                vy: 0.0,
+                gy: 0.0,
+                life: 5.0,
+                hue: 0.5,
+                cov_scale: 1.0,
+                born: t1,
+            });
+        }
+        // …and one grain over a cell this batch is about to REWRITE.
+        let (rx, ry) = g.cell_center(2, 9);
+        glow.particles.push(Particle {
+            x0: rx,
+            y0: ry,
+            vx: 0.0,
+            vy: 0.0,
+            gy: 0.0,
+            life: 5.0,
+            hue: 0.5,
+            cov_scale: 1.0,
+            born: t1,
+        });
+        let mut rewritten = row;
+        rewritten[9] = 'Z';
+        glow.observe_row(2, 6, &rewritten, t1 + Duration::from_millis(1));
+
+        let ownership = glow.observe_content_generation(generation(60), Some((2, 6)), true);
+        assert_eq!(ownership, GenerationOwnership::Owned);
+        assert_eq!(
+            glow.particles.len(),
+            5,
+            "the glitter behind the caret survives its own keystroke's echo"
+        );
+        // The four grains over the cells the user typed — the trail proper —
+        // are all still there, and so is the fifth: a grain is a projectile
+        // already flying away from its birth pixel, so the rewritten cell
+        // underneath it does not speak for it. Only age and the WHOLESALE
+        // teardowns retire the family (the relocation half of that law is
+        // asserted by
+        // `particles_and_bursts_survive_the_proportionate_fence_but_die_on_relocation`).
+        for col in 2..6u16 {
+            let (cx, _) = g.cell_center(2, col);
+            assert!(
+                glow.particles.iter().any(|p| (p.x0 - cx).abs() < 0.5),
+                "the grain born over column {col} must survive the echo"
+            );
+        }
+        assert!(
+            glow.particles.iter().any(|p| (p.x0 - rx).abs() < 0.5),
+            "an at-cursor transient is not fenced by the content under it"
+        );
+    }
+
+    /// THE BAR for R2: particle RETENTION adds no mint path. A stream of
+    /// unowned batches with no candidate — a spinner, a progress bar, a
+    /// program repainting one cell per frame — still paints nothing at all.
+    #[test]
+    fn cold_output_mints_no_glitter_however_the_fence_retires() {
+        let g = geom();
+        let c = cfg(GlowStyle::Sparkle, true);
+        let t0 = Instant::now();
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        let mut row = [' '; 16];
+        row[..6].fill('s');
+        glow.observe_row(2, 6, &row, t0);
+        glow.tick(Some((2, 6)), t0, &c, g, &mut out);
+        glow.observe_content_generation(
+            ContentGeneration {
+                process_sequence: 99,
+                terminal_id: 7,
+                alternate_screen: false,
+            },
+            Some((2, 6)),
+            false,
+        );
+        let mut now = t0;
+        for step in 0..12u32 {
+            now += Duration::from_millis(16);
+            // One cell repainted per frame, caret parked — the coldest paint
+            // the gate exists to refuse.
+            let mut painted = row;
+            painted[10] = if step % 2 == 0 { '-' } else { '\\' };
+            glow.observe_row(2, 6, &painted, now);
+            glow.observe_content_generation(
+                ContentGeneration {
+                    process_sequence: 100 + step,
+                    terminal_id: 7,
+                    alternate_screen: false,
+                },
+                Some((2, 6)),
+                false,
+            );
+            glow.tick(Some((2, 6)), now, &c, g, &mut out);
+            assert!(
+                glow.particles.is_empty(),
+                "cold output minted glitter at step {step}"
+            );
+            assert!(
+                !frame_has_output(&out, &glow),
+                "cold output painted at step {step}"
+            );
+        }
+    }
     /// A plain Backspace classifier is not an erase proof. If the host cannot
     /// arm the exact EOL one-cell candidate (blank/column-zero/wide/failed or
     /// raced delivery), a later unrelated shrink and retreat must not borrow
@@ -26910,6 +28320,238 @@ mod tests {
         );
     }
 
+    /// REFINEMENT BINDING for [`aterm_spec::derive::delete_echo_liveness_model`]
+    /// — the ERASE twin of the anti-drift lock above, and R1's proof obligation.
+    ///
+    /// 20003ffd repaired the TYPED arm and its own report said "delete arm and
+    /// generation-strictness untouched", so the mute-gate defect simply moved
+    /// house: the Delete arm went on enforcing WHOLE-ROW exactness and the
+    /// vacated-cell-only witness — the two laws that had been retiring 100% of
+    /// honest typed echoes — and a denied delete does not merely fail to draw,
+    /// it reaches the generation fence unowned and WIPES the resident ribbon.
+    /// For EVERY modeled erase shape this drives the real
+    /// [`CursorGlow::confirm_content_candidate`] Delete arm and asserts the
+    /// code's decision IS the model's `Decide` transition.
+    ///
+    /// Shapes bound: the plain EOL erase; D1 an erase under a repainted
+    /// suggestion; D2 erasing a SPACE (the word boundary); D3 a trimmed-row
+    /// EOL erase behind a hidden caret (the storage-shrink witness); the
+    /// registered standing gap D-E2 (split batches); and the safety three —
+    /// cold output, a swallowed erase, an erase whose pre-caret prefix moved.
+    #[test]
+    fn real_confirm_content_candidate_refines_the_delete_echo_liveness_model() {
+        let model = aterm_spec::derive::delete_echo_liveness_model();
+        let g = geom();
+        let c = cfg(GlowStyle::Lumen, true);
+        let t0 = Instant::now();
+        let generation = |process_sequence| ContentGeneration {
+            process_sequence,
+            terminal_id: 23,
+            alternate_screen: false,
+        };
+        let env_state = |key: &'static str, echo: &'static str| {
+            let mut state = model.init_state();
+            for action in [key, echo] {
+                let before = state.clone();
+                assert!(model.fire(action, &mut state), "environment step {action}");
+                let (ok, why) = aterm_spec::verify::validate_transition_tiered(
+                    &model,
+                    &[],
+                    &before,
+                    &state,
+                    Some(action),
+                    action,
+                );
+                assert!(ok, "environment step {action} rejected: {why}");
+            }
+            state
+        };
+        let assert_refines =
+            |label: &str, pre: &aterm_spec::interp::State, decision: Option<ContentCandidateDecision>| {
+                let mut post = pre.clone();
+                post.insert("settled", 1);
+                post.insert(
+                    "confirmed",
+                    i64::from(matches!(
+                        decision,
+                        Some(ContentCandidateDecision::Confirmed { .. })
+                    )),
+                );
+                post.insert(
+                    "retired",
+                    i64::from(matches!(
+                        decision,
+                        Some(ContentCandidateDecision::Retired { .. })
+                    )),
+                );
+                assert_eq!(
+                    model.successors("Decide", pre).as_slice(),
+                    std::slice::from_ref(&post),
+                    "{label}: the shipping delete decision must refine Decide"
+                );
+                assert_eq!(
+                    aterm_spec::interp::admits(&model, pre, &post),
+                    Some("Decide"),
+                    "{label}: projected decision transition must be admitted"
+                );
+                for invariant in &model.invariants {
+                    assert!(
+                        model.check_invariant(invariant.name, &post),
+                        "{label}: post-state violates {}::{}: {post:?}",
+                        model.name,
+                        invariant.name
+                    );
+                }
+            };
+        // Arm ONE real Delete candidate: Backspace at (2, col+1) erasing
+        // (2, col) over `baseline_cells`.
+        let arm = |baseline_cells: &[char; 12], col: u16, seq: u32| {
+            let mut glow = CursorGlow::default();
+            let mut out = Vec::new();
+            glow.tick(Some((2, col + 1)), t0, &c, g, &mut out);
+            let at = t0 + Duration::from_millis(1);
+            glow.note_backspace(at);
+            glow.note_delete_candidate(
+                at,
+                (2, col),
+                ExpectedRowSnapshot::from_slice(baseline_cells).unwrap(),
+                generation(seq),
+            );
+            assert!(glow.move_candidate_pending(), "the delete candidate must arm");
+            glow
+        };
+        let echo_at = t0 + Duration::from_millis(2);
+        // `$ git`, caret one past the 't'.
+        let mut prompt = [' '; 12];
+        prompt[0] = '$';
+        prompt[2] = 'g';
+        prompt[3] = 'i';
+        prompt[4] = 't';
+
+        // PLAIN: the vacated cell goes glyph -> blank, nothing else moves.
+        let mut erased = prompt;
+        erased[4] = ' ';
+        let mut glow = arm(&prompt, 4, 10);
+        glow.observe_row(2, 4, &erased, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo_at, generation(11));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "the plain EOL erase must confirm: {decision:?}"
+        );
+        assert_refines("plain erase", &env_state("KeyPlainErase", "ErasePlain"), decision);
+
+        // D1 SUGGESTION REPAINT: the shell repaints POSTDISPLAY for the
+        // SHORTENED prefix in the same batch, so the vacated cell reads a
+        // ghost glyph and the whole suffix moves. Whole-row exactness vetoed
+        // this on every column — `row-mismatch`, the typed blackout's token.
+        let suggested: [char; 12] = ['$', ' ', 'g', 'i', 't', ' ', 's', 't', 'a', 't', 'u', 's'];
+        let reshown: [char; 12] = ['$', ' ', 'g', 'i', 'v', 'e', ' ', 'u', 'p', ' ', ' ', ' '];
+        let mut glow = arm(&suggested, 4, 20);
+        glow.observe_row(2, 4, &reshown, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo_at, generation(21));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D1 erase under a repainted suggestion must confirm: {decision:?}"
+        );
+        assert_refines(
+            "D1 suggestion repaint",
+            &env_state("KeyEraseUnderSuggestion", "EraseWithGhostRepaint"),
+            decision,
+        );
+
+        // D2 SPACE ERASE (the word boundary): under the implicit-blank lens
+        // the tail-filled baseline already reads ' ' at the vacated cell, so
+        // the row is content-identical — `row-unchanged`, the delete twin of
+        // the typed-SPACE blackout. The caret retreat is the witness.
+        let mut glow = arm(&prompt, 5, 30);
+        glow.observe_row(2, 5, &prompt, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo_at, generation(31));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D2 erase of a SPACE must confirm: {decision:?}"
+        );
+        assert_refines(
+            "D2 space erase",
+            &env_state("KeyEraseSpace", "EraseInvisibleBlank"),
+            decision,
+        );
+
+        // D3 TRIMMED-ROW EOL ERASE behind a HIDDEN caret (the shell's own
+        // repaint bracket hides it — Claude Code's DEC-2026 frame does this
+        // per keystroke): nothing is stored at the vacated column afterwards
+        // and there is no landing to read. The storage SHRINK is the sole
+        // witness — the delete twin of typed storage growth.
+        let trimmed = ['$', ' ', 'g', 'i'];
+        let mut glow = arm(&prompt, 4, 40);
+        glow.observe_row(2, 4, &trimmed, echo_at);
+        let decision = glow.confirm_content_candidate(None, echo_at, generation(41));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+            "D3 trimmed-row EOL erase must confirm on the storage shrink: {decision:?}"
+        );
+        assert_refines(
+            "D3 storage shrink",
+            &env_state("KeyEraseTrimmedEol", "EraseStorageShrink"),
+            decision,
+        );
+
+        // D-E2 STANDING GAP: the erase echo crosses TWO PTY read batches.
+        let mut glow = arm(&prompt, 4, 50);
+        glow.observe_row(2, 4, &erased, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo_at, generation(52));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "D-E2 split erase echo retires today (standing gap): {decision:?}"
+        );
+        assert_refines(
+            "D-E2 split erase",
+            &env_state("KeySplitEraseEcho", "EraseSplitBatches"),
+            decision,
+        );
+
+        // COLD SPINNER (safety): output only — there is no candidate at all.
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((2, 5)), t0, &c, g, &mut out);
+        let spinner = ['$', ' ', 'g', 'i', 't', ' ', '|'];
+        glow.observe_row(2, 5, &spinner, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo_at, generation(61));
+        assert_eq!(decision, None, "cold output has no delete candidate to decide");
+        assert_refines("cold spinner", &env_state("ColdSpinner", "ColdPaint"), decision);
+
+        // SWALLOWED ERASE (safety): the app consumed Backspace — nothing
+        // vacated, nothing shrank, the caret never moved.
+        let mut glow = arm(&prompt, 4, 70);
+        glow.observe_row(2, 5, &prompt, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 5)), echo_at, generation(71));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "a swallowed erase must retire: {decision:?}"
+        );
+        assert_refines(
+            "swallowed erase",
+            &env_state("KeyEraseSwallowed", "UnrelatedBatch"),
+            decision,
+        );
+
+        // MOVED PREFIX (safety): content moved BEFORE the caret in the same
+        // batch — the attribution is disproven, whatever else happened.
+        let mut moved = erased;
+        moved[2] = 'X';
+        let mut glow = arm(&prompt, 4, 80);
+        glow.observe_row(2, 4, &moved, echo_at);
+        let decision = glow.confirm_content_candidate(Some((2, 4)), echo_at, generation(81));
+        assert!(
+            matches!(decision, Some(ContentCandidateDecision::Retired { .. })),
+            "an erase whose pre-caret prefix moved must retire: {decision:?}"
+        );
+        assert_refines(
+            "moved prefix",
+            &env_state("KeyErasePrefixMoved", "EraseRewritesPrefix"),
+            decision,
+        );
+    }
+
     /// OWNER REGRESSION (v0.52), symptom 1 — *"each new word causes the
     /// trail to disappear"* — THE WORD BOUNDARY. Typing `ab cd` on the alt
     /// screen through the real seams (note → probe → confirm → fence → tick,
@@ -27008,6 +28650,320 @@ mod tests {
             segments_after_word >= 4,
             "'ab cd' must leave a multi-word ribbon, got {segments_after_word} segment(s). \
              Observed: [{observed}]"
+        );
+    }
+
+    /// THE OWNER'S MASH (stage 1 of the 2026-08 complaints): *"when I typed
+    /// that quickly, the cursor trail broke"* — a captured frame of the real
+    /// window showed the mash line with ZERO ribbon pixels. At mash speed
+    /// several presses land inside one frame slip, so the second press used
+    /// to find the first press's Typed candidate still PENDING and
+    /// `note_typed_expected` retired the WHOLE cohort ("two keys in flight
+    /// across one frame slip kills both" — the audit's §8): nothing ever
+    /// confirmed at exactly the speed where the ribbon should be most
+    /// glorious. The fix EXTENDS the pending cohort per press instead —
+    /// append the press's exact cells, advance the target, refresh the stamp
+    /// — and the confirm seam proves the whole extended span against the
+    /// coalesced echo batch (the multi-glyph machinery the engine already
+    /// had: RAINBOW_TYPED_SWEEP_MAX typed-coalesce + press CELL CREDITS).
+    ///
+    /// Drives 12 presses at 3 per frame through the REAL seams
+    /// (`note_typed_expected` → `observe_row` → `confirm` →
+    /// `observe_content_generation` → `tick`), exactly the host's per-frame
+    /// choreography at mash speed: within one frame the terminal has
+    /// processed nothing, so every press of the frame captures at the same
+    /// caret with the same generation and a single-glyph claim; then ONE
+    /// echo batch delivers all three glyphs and one rendered frame judges
+    /// it. Asserts: ZERO cohort retires, `ribbon_segments` CLIMBS across the
+    /// mash, and the admission ring shows the coalesced confirms (one
+    /// `armed` + two `extended` + one `confirmed` per frame cohort).
+    #[test]
+    fn rainbow_ribbon_survives_a_three_per_frame_mash() {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let main_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 6,
+            alternate_screen: false,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(main_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the fence baseline"
+        );
+
+        let glyphs = ['m', 'a', 's', 'h', 't', 'y', 'p', 'i', 'n', 'g', 'o', 'k'];
+        let mut stored: Vec<char> = Vec::new();
+        let mut segments_by_frame = Vec::new();
+        for frame in 0..4usize {
+            let base_col = (frame * 3) as u16;
+            let generation = 10 + frame as u32;
+            let frame_t = t0 + Duration::from_millis(frame as u64 * 16 + 1);
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            // THREE presses inside one frame slip. Each is what the host's
+            // capture fence delivers at mash speed: the same unmoved caret,
+            // the same unprocessed generation, this press's own glyph.
+            for k in 0..3usize {
+                let at = frame_t + Duration::from_millis(k as u64 * 3);
+                let ch = glyphs[frame * 3 + k];
+                let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+                glow.note_typed_expected(
+                    at,
+                    expected,
+                    (2, base_col + 1),
+                    (2, base_col),
+                    baseline,
+                    main_gen(generation),
+                );
+                assert!(
+                    glow.move_candidate_pending(),
+                    "frame {frame} press {k} must leave the cohort PENDING (extended, not retired)"
+                );
+            }
+            // ONE coalesced echo batch materializes all three glyphs and one
+            // rendered frame judges it.
+            stored.extend_from_slice(&glyphs[frame * 3..frame * 3 + 3]);
+            let probe_at = frame_t + Duration::from_millis(12);
+            glow.observe_row_with_trust(2, base_col + 3, &stored, probe_at, ProbeTrust::ContentOnly);
+            let decision =
+                glow.confirm_content_candidate(Some((2, base_col + 3)), probe_at, main_gen(generation + 1));
+            let confirmed = matches!(decision, Some(ContentCandidateDecision::Confirmed { .. }));
+            let ownership = glow.observe_content_generation(
+                main_gen(generation + 1),
+                Some((2, base_col + 3)),
+                confirmed,
+            );
+            glow.tick(Some((2, base_col + 3)), probe_at, &c, g, &mut scratch);
+            let _ = write!(
+                observed,
+                "frame{frame}: decision={decision:?} ownership={ownership:?} segments={}; ",
+                glow.ribbon_segments()
+            );
+            assert!(
+                confirmed,
+                "frame {frame}'s echo batch must confirm the WHOLE extended span. Observed: [{observed}]"
+            );
+            assert_eq!(
+                ownership,
+                GenerationOwnership::Owned,
+                "frame {frame}: the confirmed mash echo owns its batch. Observed: [{observed}]"
+            );
+            segments_by_frame.push(glow.ribbon_segments());
+        }
+
+        // ZERO cohort retires across the whole mash — the old law retired one
+        // cohort per extra press.
+        let tally = glow.admission_tally();
+        assert_eq!(
+            tally.retired, 0,
+            "the mash must retire NOTHING (last_retire_reason={:?}). Observed: [{observed}]",
+            tally.last_retire_reason
+        );
+        assert_eq!(
+            (tally.armed, tally.confirmed),
+            (4, 4),
+            "each frame cohort arms once and confirms once. Observed: [{observed}]"
+        );
+        let extended = glow
+            .admission_log()
+            .filter(|record| record.phase == AdmissionPhase::Extended)
+            .count();
+        assert_eq!(
+            extended, 8,
+            "presses 2 and 3 of each frame EXTEND the cohort (ring rows). Observed: [{observed}]"
+        );
+        // The ribbon CLIMBS across the mash: every frame ends with more live
+        // typing sparks than the one before, and 12 presses leave a long band.
+        for pair in segments_by_frame.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "ribbon_segments must climb across the mash, got {segments_by_frame:?}. \
+                 Observed: [{observed}]"
+            );
+        }
+        assert!(
+            segments_by_frame.last().copied().unwrap_or(0) >= 9,
+            "12 mashed presses must leave a long live band, got {segments_by_frame:?}. \
+             Observed: [{observed}]"
+        );
+    }
+
+    /// COLD CONTROL for the mash fix: the SAME frame choreography — same
+    /// generations, same 3-cell caret hops, same probes — with NO presses.
+    /// Cold output must buy nothing: no candidate ever exists, every hop is
+    /// judged an unowned relocation, the admission ring stays empty, and not
+    /// one ribbon segment is born (the cold-output law the extension must not
+    /// weaken).
+    #[test]
+    fn cold_three_cell_hops_lay_no_ribbon_and_leave_no_ring() {
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let main_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 6,
+            alternate_screen: false,
+        };
+        let mut scratch = typed_scratch();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(main_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+        );
+        let glyphs = ['m', 'a', 's', 'h', 't', 'y', 'p', 'i', 'n', 'g', 'o', 'k'];
+        let mut stored: Vec<char> = Vec::new();
+        for frame in 0..4usize {
+            let base_col = (frame * 3) as u16;
+            let generation = 10 + frame as u32;
+            let frame_t = t0 + Duration::from_millis(frame as u64 * 16 + 1);
+            stored.extend_from_slice(&glyphs[frame * 3..frame * 3 + 3]);
+            let probe_at = frame_t + Duration::from_millis(12);
+            glow.observe_row_with_trust(2, base_col + 3, &stored, probe_at, ProbeTrust::ContentOnly);
+            let decision =
+                glow.confirm_content_candidate(Some((2, base_col + 3)), probe_at, main_gen(generation + 1));
+            assert_eq!(decision, None, "cold output has no candidate to decide");
+            let ownership = glow.observe_content_generation(
+                main_gen(generation + 1),
+                Some((2, base_col + 3)),
+                false,
+            );
+            assert_eq!(
+                ownership,
+                GenerationOwnership::UnownedRelocation,
+                "a cold 3-cell hop is a relocation, exactly as before"
+            );
+            glow.tick(Some((2, base_col + 3)), probe_at, &c, g, &mut scratch);
+            assert_eq!(
+                glow.ribbon_segments(),
+                0,
+                "cold frame {frame} must lay no ribbon"
+            );
+        }
+        assert_eq!(
+            glow.admission_log().count(),
+            0,
+            "cold output must leave the admission ring empty — nothing armed"
+        );
+    }
+
+    /// PARTIAL ECHO of a mash-extended span (the E2-adjacent split): the PTY
+    /// delivers a 3-press cohort's echoes as 1 + 2 across two batches. The
+    /// judged batch proves only the arrived PREFIX — which must NOT hard-fail
+    /// the cohort: the confirm seam admits the prefix (`confirmed-prefix`,
+    /// with the landing collapsed to the observed split point) and re-arms
+    /// the REMAINDER fresh at the observed caret with the newest press stamp
+    /// and this judged generation as its baseline — inside the
+    /// next-generation law, so the second batch confirms it exactly like an
+    /// ordinary cohort.
+    #[test]
+    fn partial_echo_confirms_the_prefix_and_rearms_the_remainder() {
+        use std::fmt::Write as _;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let main_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 6,
+            alternate_screen: false,
+        };
+        let mut scratch = typed_scratch();
+        let mut observed = String::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((2, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(main_gen(10), Some((2, 0)), false),
+            GenerationOwnership::Steady,
+        );
+        // Three presses inside one frame slip: the cohort claims "abc" at
+        // columns 0..3, landing (2, 3).
+        let blank = [' '; 40];
+        let baseline = ExpectedRowSnapshot::from_slice(&blank).unwrap();
+        for (k, ch) in ['a', 'b', 'c'].into_iter().enumerate() {
+            let at = t0 + Duration::from_millis(1 + k as u64 * 3);
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(at, expected, (2, 1), (2, 0), baseline, main_gen(10));
+        }
+        // BATCH 1 (sole next generation): only 'a' arrived; the caret sits at
+        // the split point.
+        let batch1_at = t0 + Duration::from_millis(12);
+        glow.observe_row_with_trust(2, 1, &['a'], batch1_at, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 1)), batch1_at, main_gen(11));
+        let _ = write!(observed, "batch1: decision={decision:?}; ");
+        assert!(
+            matches!(
+                decision,
+                Some(ContentCandidateDecision::Confirmed {
+                    target: (2, 1),
+                    ..
+                })
+            ),
+            "the arrived prefix must confirm at its observed landing: {observed}"
+        );
+        let ring = glow.admission_log().last().map(|r| (r.phase, r.reason));
+        assert_eq!(
+            ring,
+            Some((AdmissionPhase::Confirmed, "confirmed-prefix")),
+            "the ring names the prefix confirm: {observed}"
+        );
+        assert_eq!(
+            glow.observe_content_generation(main_gen(11), Some((2, 1)), true),
+            GenerationOwnership::Owned,
+            "the prefix echo owns its batch: {observed}"
+        );
+        glow.tick(Some((2, 1)), batch1_at, &c, g, &mut scratch);
+        let segments_after_prefix = glow.ribbon_segments();
+        assert!(
+            glow.move_candidate_pending(),
+            "the remainder must be RE-ARMED after the prefix spawn: {observed}"
+        );
+        // BATCH 2: 'b' and 'c' arrive; the remainder confirms like any cohort.
+        let batch2_at = t0 + Duration::from_millis(28);
+        glow.observe_row_with_trust(2, 3, &['a', 'b', 'c'], batch2_at, ProbeTrust::ContentOnly);
+        let decision = glow.confirm_content_candidate(Some((2, 3)), batch2_at, main_gen(12));
+        let _ = write!(observed, "batch2: decision={decision:?}; ");
+        assert!(
+            matches!(
+                decision,
+                Some(ContentCandidateDecision::Confirmed {
+                    target: (2, 3),
+                    ..
+                })
+            ),
+            "the re-armed remainder must confirm against its sole next generation: {observed}"
+        );
+        assert_eq!(
+            glow.observe_content_generation(main_gen(12), Some((2, 3)), true),
+            GenerationOwnership::Owned,
+            "the remainder echo owns its batch: {observed}"
+        );
+        glow.tick(Some((2, 3)), batch2_at, &c, g, &mut scratch);
+        let _ = write!(observed, "segments={}; ", glow.ribbon_segments());
+        let tally = glow.admission_tally();
+        assert_eq!(
+            tally.retired, 0,
+            "a split echo retires NOTHING (last_retire_reason={:?}): {observed}",
+            tally.last_retire_reason
+        );
+        assert_eq!(
+            (tally.armed, tally.confirmed),
+            (2, 2),
+            "cohort + re-armed remainder each arm and confirm once: {observed}"
+        );
+        assert!(
+            glow.ribbon_segments() > segments_after_prefix && glow.ribbon_segments() >= 3,
+            "all three mashed cells must join the live band \
+             (after prefix {segments_after_prefix}, final {}): {observed}",
+            glow.ribbon_segments()
         );
     }
 
@@ -31204,6 +33160,10 @@ mod tests {
         const DEFAULT_FG: u32 = 0x00C8_D3F5;
         let g = geom();
         let mut c = cfg(GlowStyle::RainbowKitty, true);
+        // The 56→per-band-cap history this oracle certifies is the TALL body's
+        // (six stacked slabs directly under the typed glyphs); the default
+        // underline strip shares the same caps via `rainbow_band_coverage`.
+        c.ribbon_tall = true;
         c.intensity = 1.0;
         c.radius = 0.0;
         c.ring = false;
@@ -31302,7 +33262,10 @@ mod tests {
     fn rainbow_emits_six_crisp_bands_per_cell() {
         let g = geom();
         let mut glow = CursorGlow::default();
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // The six-stacked-stripes contract belongs to the GATED tall body
+        // (`rainbow kitty tall`); the default underline lays ONE band per cell.
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let t = Instant::now();
         let mut out = Vec::new();
         // Seed the previous position, then a 4-cell horizontal move lays a ribbon.
@@ -31365,6 +33328,172 @@ mod tests {
         assert!(band_bot - band_top >= 6, "band has visible height");
     }
 
+    /// THE DEFAULT PRESENTATION IS THE 0.43 UNDERLINE (owner, 2026-08-24: "the
+    /// underline rainbow has been changed" — restored): with no tall spelling,
+    /// the dark-theme ribbon renders as a FLAT under-baseline strip —
+    /// [`RAINBOW_UNDERLINE_H`] (0.22) of a cell tall, centred on the row
+    /// boundary beneath the typed row — never as the tall banded body the
+    /// glyphs sit inside. Pins the exact geometry (top edge, height, full cell
+    /// width), the per-cell rolling hue bands, and the bounded per-cell quad
+    /// cost, so the look cannot silently drift again.
+    #[test]
+    fn rainbow_default_ribbon_is_a_flat_under_baseline_strip() {
+        let g = geom();
+        let mut glow = CursorGlow::default();
+        let c = cfg(GlowStyle::RainbowKitty, true); // DEFAULT: no tall opt-in
+        let t = Instant::now();
+        let mut out = Vec::new();
+        // An 8-cell coalesced sweep (the RAINBOW_TYPED_SWEEP_MAX lane) lays a
+        // multi-cell ribbon in one observed move.
+        glow.tick(Some((2, 2)), t, &c, g, &mut out);
+        glow.note_synthetic_typed(t, 8);
+        glow.tick(Some((2, 10)), t, &c, g, &mut out);
+        // Freeze COLD so the momentum rotation is identity and every cell's
+        // hue is its exact `RAINBOW_BANDS` anchor.
+        glow.rainbow.disp = 0.0;
+        let phase = glow.rainbow.phase;
+        let mut under = Vec::new();
+        glow.emit_rainbow(
+            t + Duration::from_millis(120),
+            &c,
+            g,
+            &mut under,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_invariants(&under, g);
+        let ch = g.ch as i32;
+        let cw = g.cw as u16;
+        // THE PINNED GEOMETRY. Strip height: 0.22 of the cell (2 px floor);
+        // spine: the row boundary beneath typed row 2; top edge: half the
+        // strip above it — i.e. at 1 − 0.11 = 0.875 of the typed cell.
+        let h = ((g.ch as f32 * RAINBOW_UNDERLINE_H).round() as i32).max(2);
+        assert_eq!(h, 4, "0.22 of a 16 px cell is a 4 px strip");
+        let spine = 3 * ch;
+        let top = (spine as f32 - h as f32 * 0.5).round() as i32;
+        assert_eq!(top - 2 * ch, 14, "top edge at 0.875 of the typed cell");
+        let ribbon: Vec<&GlowQuad> = under.iter().filter(|q| is_ribbon_quad(q.color)).collect();
+        assert!(!ribbon.is_empty(), "the strip must emit");
+        let mut cells = std::collections::BTreeMap::<u16, Vec<&GlowQuad>>::new();
+        for q in &ribbon {
+            // FULL cell width — no wave, no width taper: an underline is
+            // straight.
+            assert_eq!(q.w, cw, "underline quads span the whole cell: {q:?}");
+            // …and every photon lives inside [top, top + h): under the
+            // baseline, straddling the boundary, never in the glyph interior.
+            assert!(
+                q.y as i32 >= top && (q.y as i32 + q.h as i32) <= top + h,
+                "underline stays in its strip band (y {} h {} vs [{top}, {}))",
+                q.y,
+                q.h,
+                top + h
+            );
+            cells.entry(q.x / cw).or_default().push(q);
+        }
+        assert!(
+            cells.len() >= 6,
+            "the sweep lays a multi-cell ribbon: {} cells",
+            cells.len()
+        );
+        let mut seen_bands = std::collections::BTreeSet::new();
+        for (cell, quads) in &cells {
+            // Bounded cost: at most 6 quads per cell (edge + boundary-split
+            // core + edge) — the budget the emitter reserves per lay.
+            assert!(quads.len() <= 6, "cell {cell} cost {} quads", quads.len());
+            // ONE hue per cell: every quad is the cell's own shared-band
+            // colour, premultiplied (edges at half coverage), so the strip is
+            // a banded rainbow rolling ALONG the line.
+            let bi = rainbow_band_index_at(*cell, phase);
+            seen_bands.insert(bi);
+            let rgb = RAINBOW_BANDS[bi];
+            let (er, eg, eb) = ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+            let emax = er.max(eg).max(eb);
+            for q in quads {
+                let m = ((q.color >> 16) & 0xff)
+                    .max((q.color >> 8) & 0xff)
+                    .max(q.color & 0xff);
+                for (got, want) in [
+                    ((q.color >> 16) & 0xff, er * m / emax),
+                    ((q.color >> 8) & 0xff, eg * m / emax),
+                    (q.color & 0xff, eb * m / emax),
+                ] {
+                    assert!(
+                        got.abs_diff(want) <= 2,
+                        "cell {cell} carries its own band hue {rgb:#08x}: {:#08x}",
+                        q.color
+                    );
+                }
+            }
+        }
+        // The per-cell hue bands ROLL (the banding-era fidelity win the
+        // underline keeps): an 8-cell sweep crosses band boundaries.
+        assert!(
+            seen_bands.len() >= 2,
+            "hue bands roll along the line: {seen_bands:?}"
+        );
+    }
+
+    /// THE TALL LOOK IS GATED, NOT GONE: the banding-era tall body answers
+    /// only its explicit spellings (`rainbow kitty tall` and siblings), which
+    /// parse to the same [`GlowStyle::RainbowKitty`]; every other rainbow
+    /// spelling — the default — reads the underline. Pins both the spelling
+    /// predicate and the emitted geometry fork.
+    #[test]
+    fn rainbow_tall_spelling_gates_the_banded_body() {
+        // The spellings: tall opts in; the plain and pet spellings do not.
+        for s in ["rainbow kitty tall", "rainbow tall", "tall rainbow", "nyan tall"] {
+            assert_eq!(GlowStyle::parse(s), GlowStyle::RainbowKitty, "{s}");
+            assert!(GlowStyle::style_names_tall_ribbon(s), "{s}");
+        }
+        for s in ["rainbow kitty", "rainbow", "nyan", "rainbow kitty pet", "comet"] {
+            assert!(!GlowStyle::style_names_tall_ribbon(s), "{s}");
+        }
+        // The geometry fork: same sweep, both presentations. The tall body
+        // climbs into the glyph interior (well above the strip band); the
+        // default never leaves it.
+        let g = geom();
+        let ch = g.ch as i32;
+        let spine = 3 * ch;
+        let strip_top = spine - 2;
+        let lay = |tall: bool| -> Vec<GlowQuad> {
+            let mut c = cfg(GlowStyle::RainbowKitty, true);
+            c.ribbon_tall = tall;
+            let mut glow = CursorGlow::default();
+            let t = Instant::now();
+            let mut out = Vec::new();
+            glow.tick(Some((2, 2)), t, &c, g, &mut out);
+            glow.note_synthetic_typed(t, 8);
+            glow.tick(Some((2, 10)), t, &c, g, &mut out);
+            glow.rainbow.disp = 0.0;
+            let mut under = Vec::new();
+            glow.emit_rainbow(
+                t + Duration::from_millis(120),
+                &c,
+                g,
+                &mut under,
+                &mut Vec::new(),
+                &mut Vec::new(),
+            );
+            under
+        };
+        let tall = lay(true);
+        assert!(
+            tall.iter()
+                .filter(|q| is_ribbon_quad(q.color))
+                .any(|q| (q.y as i32) < strip_top - 4),
+            "the tall spelling still draws the banded body in the glyph cell"
+        );
+        let under = lay(false);
+        assert!(
+            !under.is_empty()
+                && under
+                    .iter()
+                    .filter(|q| is_ribbon_quad(q.color))
+                    .all(|q| (q.y as i32) >= strip_top),
+            "the default never enters the glyph interior"
+        );
+    }
+
     /// The ribbon is purely ADDITIVE and text-safe: every band quad's premultiplied
     /// coverage is capped below full, so a solid ribbon only tints — never washes out —
     /// the glyphs beneath it.
@@ -31418,6 +33547,9 @@ mod tests {
     fn rainbow_hot_ribbon_has_visible_travelling_wave() {
         let g = geom();
         let mut c = cfg(GlowStyle::RainbowKitty, true);
+        // The travelling wave is TALL-body geometry; the default underline is
+        // deliberately dead flat (an underline is straight).
+        c.ribbon_tall = true;
         c.intensity = 1.0;
         c.radius = 0.0;
         c.ring = false;
@@ -31476,6 +33608,10 @@ mod tests {
             head: 0,
         };
         let mut c = cfg(GlowStyle::RainbowKitty, true);
+        // The per-strip wave path this budget audits is the GATED tall body's;
+        // the default underline costs ≤ 6 quads per cell (pinned in
+        // `rainbow_default_ribbon_is_a_flat_under_baseline_strip`).
+        c.ribbon_tall = true;
         c.intensity = 1.0;
         let mut glow = CursorGlow::default();
         let mut out = Vec::new();
@@ -32388,7 +34524,7 @@ mod tests {
         // one `RAINBOW_RETRACT_FADE` later than it used to be: the last cells the
         // drain selects now EASE out over that window instead of being deleted
         // where they stand, so the swoosh's true end is
-        // `RETRACT_DUR + RETRACT_FADE`. That extra ~130 ms is the fix.
+        // `RETRACT_DUR + RETRACT_FADE`. That extra ~200 ms is the fix.
         glow.tick(
             Some((3, 10)),
             t_last
@@ -32407,6 +34543,233 @@ mod tests {
             "retract empties the ribbon: {:?}",
             lit(&glow)
         );
+    }
+
+    /// DELETES RETRACT — OWNER, 2026-08-25: *"there are gaps when deleting."*
+    ///
+    /// THE DEFECT, exactly: a confirmed Backspace blanks the cell the caret
+    /// retreats into, the content fence retires a cell whose bytes changed,
+    /// and so the ribbon lost its light AT THE DELETED COLUMN, in one frame,
+    /// while the cells left of it stayed lit — a HOLE in the middle of the
+    /// band. Six glyphs then three Backspaces left `{1,2,3,4,6}` lit with the
+    /// caret at 5: the ribbon read as BROKEN, not as retreating.
+    ///
+    /// THE LAW, driven through the real seams (`note_backspace` /
+    /// `note_typed_expected` -> `observe_row_with_trust` ->
+    /// `confirm_content_candidate` -> `observe_content_generation` -> `tick`)
+    /// and measured through engine state, never pixels:
+    ///
+    /// * (a) **NO INTERIOR GAP, EVER.** At every sampled frame across the
+    ///   whole retreat the lit ribbon columns are one CONTIGUOUS run, and that
+    ///   run stays attached to the caret — it never detaches, and a column
+    ///   never goes dark while a column beyond it is still lit.
+    /// * (b) **THE RETREAT EASES.** Each deleted column's coverage DECLINES
+    ///   across several ticks and no column drops from full to zero in a
+    ///   single frame — the owner's standing ruling on the drain ("the rainbow
+    ///   on the cursor isn't always smoothly vanishing"), applied to deletes.
+    #[test]
+    fn backspaces_retract_the_ribbon_instead_of_punching_holes_in_it() {
+        use std::collections::BTreeMap;
+        let g = geom();
+        let c = cfg(GlowStyle::RainbowKitty, true);
+        let row = 2u16;
+        let main_gen = |seq: u32| ContentGeneration {
+            process_sequence: seq,
+            terminal_id: 7,
+            alternate_screen: false,
+        };
+        // PER-CELL RIBBON COVERAGE straight out of engine state: the spark's
+        // birth coverage under BOTH envelopes the emitter applies to it — its
+        // own age profile and the shared RETRACT FADE (`Spark::fade_at`). This
+        // is the ribbon as the engine knows it, which is what the measurement
+        // rule asks for.
+        let coverage = |glow: &CursorGlow, now: Instant| -> BTreeMap<u16, f32> {
+            let mut lit = BTreeMap::new();
+            for s in glow.sparks.iter().filter(|s| s.typing && s.row == row) {
+                let age = now.saturating_duration_since(s.born).as_secs_f32();
+                if age >= s.life {
+                    continue;
+                }
+                let u = (age / s.life).clamp(0.0, 1.0);
+                let tail = 0.32 + 0.45 * glow.rainbow.disp;
+                let env = if u < 1.0 - tail {
+                    1.0
+                } else {
+                    let k = ((u - (1.0 - tail)) / tail).clamp(0.0, 1.0);
+                    0.5 * (1.0 + (std::f32::consts::PI * k).cos())
+                };
+                let cov = f32::from(s.born_cov) * env * glow.retract_fade_of(now, s);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let slot = lit.entry(s.col).or_insert(0.0f32);
+                *slot = slot.max(cov);
+            }
+            lit
+        };
+
+        let mut scratch = typed_scratch();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((row, 0)), t0, &c, g, &mut scratch);
+        assert_eq!(
+            glow.observe_content_generation(main_gen(10), Some((row, 0)), false),
+            GenerationOwnership::Steady,
+            "the first observation establishes the fence baseline"
+        );
+
+        // SIX GLYPHS at a human cadence, one per frame.
+        let mut stored: Vec<char> = Vec::new();
+        for (k, ch) in ['r', 'i', 'b', 'b', 'o', 'n'].into_iter().enumerate() {
+            let col = k as u16;
+            let seq = 10 + k as u32 * 2;
+            let at = t0 + Duration::from_millis(k as u64 * 60 + 1);
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            let expected = ExpectedCellSpan::from_cells([ch]).unwrap();
+            glow.note_typed_expected(
+                at,
+                expected,
+                (row, col + 1),
+                (row, col),
+                baseline,
+                main_gen(seq),
+            );
+            stored.push(ch);
+            let probe_at = at + Duration::from_millis(8);
+            glow.observe_row_with_trust(row, col + 1, &stored, probe_at, ProbeTrust::ContentOnly);
+            let decision =
+                glow.confirm_content_candidate(Some((row, col + 1)), probe_at, main_gen(seq + 1));
+            assert!(
+                matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+                "glyph {k} must confirm: {decision:?}"
+            );
+            assert_eq!(
+                glow.observe_content_generation(main_gen(seq + 1), Some((row, col + 1)), true),
+                GenerationOwnership::Owned,
+                "glyph {k}'s echo owns its batch"
+            );
+            glow.tick(Some((row, col + 1)), probe_at, &c, g, &mut scratch);
+        }
+        let typed_at = t0 + Duration::from_millis(5 * 60 + 9);
+        assert_eq!(
+            glow.ribbon_segments(),
+            6,
+            "six glyphs lay a six-cell ribbon"
+        );
+        let full = coverage(&glow, typed_at);
+        assert_eq!(
+            full.keys().copied().collect::<Vec<_>>(),
+            (1..=6).collect::<Vec<u16>>(),
+            "…spanning columns 1..=6 with no hole: {:?}",
+            full.keys().collect::<Vec<_>>()
+        );
+        let peak: BTreeMap<u16, f32> = full.clone();
+
+        // THREE BACKSPACES, 60 ms apart, each through the whole seam chain.
+        // Every frame in the retreat is sampled: the delete frames themselves
+        // and a 16 ms present loop under them, which is where a one-frame
+        // blackout or a hole would show.
+        let mut frames: Vec<(u16, BTreeMap<u16, f32>)> = Vec::new();
+        let mut sample_at = typed_at;
+        for k in 0..3usize {
+            let caret_before = 6 - k as u16;
+            let caret_after = caret_before - 1;
+            let seq = 30 + k as u32 * 2;
+            let at = t0 + Duration::from_millis(360 + k as u64 * 60);
+            let mut before = [' '; 40];
+            before[..stored.len()].copy_from_slice(&stored);
+            let baseline = ExpectedRowSnapshot::from_slice(&before).unwrap();
+            glow.note_backspace(at);
+            glow.note_delete_candidate(at, (row, caret_after), baseline, main_gen(seq));
+            stored.pop();
+            let probe_at = at + Duration::from_millis(8);
+            glow.observe_row_with_trust(row, caret_after, &stored, probe_at, ProbeTrust::ContentOnly);
+            let decision =
+                glow.confirm_content_candidate(Some((row, caret_after)), probe_at, main_gen(seq + 1));
+            assert!(
+                matches!(decision, Some(ContentCandidateDecision::Confirmed { .. })),
+                "backspace {k} must confirm its exact one-cell erase: {decision:?}"
+            );
+            assert_eq!(
+                glow.observe_content_generation(main_gen(seq + 1), Some((row, caret_after)), true),
+                GenerationOwnership::Owned,
+                "backspace {k}'s echo owns its batch"
+            );
+            glow.tick(Some((row, caret_after)), probe_at, &c, g, &mut scratch);
+            frames.push((caret_after, coverage(&glow, probe_at)));
+            // …and the present loop between this delete and the next.
+            sample_at = probe_at;
+            while sample_at + Duration::from_millis(16) < at + Duration::from_millis(60) {
+                sample_at += Duration::from_millis(16);
+                glow.tick(Some((row, caret_after)), sample_at, &c, g, &mut scratch);
+                frames.push((caret_after, coverage(&glow, sample_at)));
+            }
+        }
+        // …then run the caret out to the end of the retreat.
+        let caret = 3u16;
+        for _ in 0..24 {
+            sample_at += Duration::from_millis(16);
+            glow.tick(Some((row, caret)), sample_at, &c, g, &mut scratch);
+            frames.push((caret, coverage(&glow, sample_at)));
+        }
+
+        // (a) NO INTERIOR GAP, AT ANY FRAME.
+        for (i, (caret, lit)) in frames.iter().enumerate() {
+            if lit.is_empty() {
+                continue;
+            }
+            let cols: Vec<u16> = lit.keys().copied().collect();
+            let (lo, hi) = (cols[0], cols[cols.len() - 1]);
+            assert_eq!(
+                usize::from(hi - lo) + 1,
+                cols.len(),
+                "frame {i} (caret {caret}) has an INTERIOR GAP in the ribbon: {cols:?}"
+            );
+            assert!(
+                hi + 1 >= *caret,
+                "frame {i}: the ribbon detached from the caret {caret} (lit {cols:?})"
+            );
+        }
+        // The retreat really happened: by the end the ribbon is back behind
+        // the caret, and nothing is still lit over the erased columns.
+        let (_, last) = frames.last().expect("frames were sampled");
+        assert!(
+            last.keys().all(|&col| col < caret),
+            "the tail retreated behind the caret {caret}: {:?}",
+            last.keys().collect::<Vec<_>>()
+        );
+
+        // (b) THE RETREAT EASES — per erased column, across ticks.
+        for col in [6u16, 5, 4, 3] {
+            let series: Vec<f32> = frames
+                .iter()
+                .map(|(_, lit)| lit.get(&col).copied().unwrap_or(0.0))
+                .collect();
+            let top = peak[&col];
+            let easing = series
+                .iter()
+                .filter(|&&v| v > 0.0 && v < top * 0.98)
+                .count();
+            assert!(
+                easing >= 2,
+                "column {col} must DECLINE across several ticks, not blink out \
+                 (peak {top:.1}, series {series:?})"
+            );
+            // …and no single frame may drop it off a cliff. The cosine ease
+            // over RAINBOW_RETRACT_FADE loses at most ~13% of a cell's light
+            // per 16 ms frame; a whole-cell removal loses 100%.
+            let mut prev = top;
+            for (i, &v) in series.iter().enumerate() {
+                assert!(
+                    prev - v <= top * 0.35,
+                    "column {col} fell off a CLIFF at frame {i} ({prev:.1} -> {v:.1}, \
+                     peak {top:.1}): series {series:?}"
+                );
+                prev = v;
+            }
+        }
     }
 
     /// Sparse-frame regression: if the compositor delivers no frame until
@@ -32957,10 +35320,16 @@ mod tests {
         // separates them structurally rather than by brightness — with a full
         // cell of margin for the perpendicular band offsets.
         let ribbon_only_x = 9 * g.cw as u16;
+        // …and the ZOOM probe is column-bounded for the mirrored reason: the
+        // default underline strip straddles the row-0/row-1 boundary, so the
+        // ribbon's BOTTOM halves tag row 1 over the typed columns (2..=10).
+        // The streak's row-1..3 course runs from ~col 16 toward col 32, so a
+        // bound at col 12 separates the two structurally, with margin.
+        let zoom_only_x = 12 * g.cw as u16;
         let under = glow.under_quads();
         let last_zoom = under
             .iter()
-            .rposition(|q| (1..=3).contains(&q.row) && spectrum(q.color));
+            .rposition(|q| (1..=3).contains(&q.row) && q.x >= zoom_only_x && spectrum(q.color));
         let first_ribbon = under
             .iter()
             .position(|q| q.row == 0 && q.x < ribbon_only_x && spectrum(q.color));
@@ -32994,7 +35363,10 @@ mod tests {
             win_h: 192,
             head: 0,
         };
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // The ≤ 3-strips × ≤ 14-rows audit is the TALL body's worst case; the
+        // default underline is bounded far lower and pinned separately.
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let mut glow = CursorGlow::default();
         let born = Instant::now();
         rainbow_uniform_ribbon(&mut glow, born, 255, 0..32);
@@ -34150,7 +36522,10 @@ mod tests {
     #[test]
     fn rainbow_ribbon_is_a_smooth_feathered_gradient() {
         let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // Multi-row gradient + feather are TALL-body geometry (the default
+        // underline is a flat strip with 1 px edge feathers).
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let cw = g.cw as u16;
         let born = Instant::now();
         let cov = |color: u32| {
@@ -34282,6 +36657,9 @@ mod tests {
     fn rainbow_iridescence_never_exceeds_cov_cap() {
         let g = geom();
         let mut c = cfg(GlowStyle::RainbowKitty, true);
+        // Shimmer + glint are TALL-body channels (the underline holds its
+        // brightness steady by design).
+        c.ribbon_tall = true;
         c.intensity = 1.0;
         let born = Instant::now();
         let mut glow = CursorGlow::default();
@@ -34384,7 +36762,10 @@ mod tests {
     #[test]
     fn rainbow_glint_sweeps_with_momentum() {
         let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // The travelling specular glint is a TALL-body channel (the underline
+        // holds its brightness steady by design).
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let cw = g.cw as u16;
         // A STAGGERED ribbon: head (col 14) born at `now` (u == 0), older cells
         // laid progressively earlier, so u increases toward the tail.
@@ -35158,21 +37539,22 @@ mod tests {
         // the stranded light is still fading proves nothing about the tail.
         // Only the MINT path can put brand-new full-life light back on the dead
         // row, and reaching it needs a key LATE enough that the retirement has
-        // already been reaped: t = 100 ms + [`RAINBOW_RETRACT_FADE`] = 230 ms.
+        // already been reaped: t = 100 ms + [`RAINBOW_RETRACT_FADE`] = 300 ms.
         //
         // …and EARLY enough that the stale cells are still IN the tail. The
         // memory is three slots deep and the typing path pushes the new head in
         // on every key, so the pre-relocation cells are rolled out after exactly
         // two more keystrokes — which is the same "next two keystrokes" window
-        // the bug report describes. A first follow-up key at 300 ms sits inside
-        // both bounds; putting it any later would make this test silently
+        // the bug report describes. A first follow-up key at 310 ms sits inside
+        // both bounds (just past the 300 ms reap, clear of the exact-boundary
+        // race); putting it any later would make this test silently
         // vacuous by testing a tail that had already flushed itself.
-        for (k, ms) in [(1u16, 300u64), (2, 340)] {
+        for (k, ms) in [(1u16, 310u64), (2, 350)] {
             glow.note_synthetic_typed(at(ms), 1);
             glow.tick(Some((land, lc + k)), at(ms), &c, g, &mut out);
         }
         // Settle past the retirement's own fade-out ([`RAINBOW_RETRACT_FADE`],
-        // 0.13 s, stamped at t=100 ms — a stamped spark is reaped once its fade
+        // 0.20 s, stamped at t=100 ms — a stamped spark is reaped once its fade
         // has actually finished) AND past the late follow-up key that could have
         // re-minted the dead row, but far short of a ribbon's own life, so the
         // landing row is still unambiguously lit.
@@ -35488,7 +37870,10 @@ mod tests {
     #[test]
     fn rainbow_ribbon_shape_ignores_per_spark_lifetime() {
         let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // The glint this fixture tracks is a TALL-body channel (the underline
+        // holds its brightness steady by design).
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let cw = g.cw as u16;
         let base = Instant::now();
         let now = base + Duration::from_millis(500);
@@ -35593,7 +37978,10 @@ mod tests {
             win_h: 144,
             head: 0,
         };
-        let c = cfg(GlowStyle::RainbowKitty, true);
+        // Band-width growth with disp is TALL-body geometry; the underline's
+        // height is fixed at RAINBOW_UNDERLINE_H regardless of momentum.
+        let mut c = cfg(GlowStyle::RainbowKitty, true);
+        c.ribbon_tall = true;
         let born = Instant::now();
         // Over-bright born_cov so even the feathered edge rows clear the ribbon
         // colour floor — the measured span then tracks the true band height.
@@ -37843,49 +40231,81 @@ mod tests {
     #[test]
     fn rainbow_ribbon_vanishes_without_a_visible_step() {
         let g = geom();
-        let c = cfg(GlowStyle::RainbowKitty, true);
-        let t0 = Instant::now();
-        let mut out = Vec::new();
-        let mut glow = CursorGlow::default();
-        let mut t = t0;
-        glow.tick(Some((2, 4)), t, &c, g, &mut out);
-        for i in 1..=10u16 {
-            t += Duration::from_millis(90);
-            glow.note_synthetic_typed(t, 1);
-            glow.tick(Some((2, 4 + i)), t, &c, g, &mut out);
-        }
+        // Both presentations ride the SAME drain (swoosh schedule, retract
+        // fade, envelopes), but they concentrate light differently, so each is
+        // measured against its own peak and its own staircase-defect scale.
+        let drain = |tall: bool| -> (i64, i64, f32) {
+            let mut c = cfg(GlowStyle::RainbowKitty, true);
+            c.ribbon_tall = tall;
+            let t0 = Instant::now();
+            let mut out = Vec::new();
+            let mut glow = CursorGlow::default();
+            let mut t = t0;
+            glow.tick(Some((2, 4)), t, &c, g, &mut out);
+            for i in 1..=10u16 {
+                t += Duration::from_millis(90);
+                glow.note_synthetic_typed(t, 1);
+                glow.tick(Some((2, 4 + i)), t, &c, g, &mut out);
+            }
 
-        let lit = |glow: &CursorGlow| -> i64 {
-            glow.under_quads()
-                .iter()
-                .filter(|q| is_ribbon_quad(q.color))
-                .map(|q| {
-                    let cov = ((q.color >> 16) & 0xff)
-                        .max((q.color >> 8) & 0xff)
-                        .max(q.color & 0xff) as i64;
-                    cov * i64::from(q.w) * i64::from(q.h)
-                })
-                .sum()
+            let lit = |glow: &CursorGlow| -> i64 {
+                glow.under_quads()
+                    .iter()
+                    .filter(|q| is_ribbon_quad(q.color))
+                    .map(|q| {
+                        let cov = ((q.color >> 16) & 0xff)
+                            .max((q.color >> 8) & 0xff)
+                            .max(q.color & 0xff) as i64;
+                        cov * i64::from(q.w) * i64::from(q.h)
+                    })
+                    .sum()
+            };
+
+            let (mut prev, mut peak, mut worst) = (0i64, 0i64, 0.0f32);
+            for f in 0..200 {
+                t += Duration::from_millis(16);
+                out.clear();
+                glow.tick(Some((2, 14)), t, &c, g, &mut out);
+                let total = lit(&glow);
+                peak = peak.max(total);
+                if f > 0 && peak > 0 {
+                    worst = worst.max((prev - total).max(0) as f32 / peak as f32);
+                }
+                prev = total;
+            }
+            (peak, prev, worst)
         };
 
-        let (mut prev, mut peak, mut worst) = (0i64, 0i64, 0.0f32);
-        for f in 0..200 {
-            t += Duration::from_millis(16);
-            out.clear();
-            glow.tick(Some((2, 14)), t, &c, g, &mut out);
-            let total = lit(&glow);
-            peak = peak.max(total);
-            if f > 0 && peak > 0 {
-                worst = worst.max((prev - total).max(0) as f32 / peak as f32);
-            }
-            prev = total;
-        }
-        assert!(peak > 10_000, "the fixture must lay a real ribbon: {peak}");
-        assert_eq!(prev, 0, "and it must be fully gone by the end");
+        // GATED TALL body: the geometry this pin was authored against keeps
+        // its original bound byte-for-byte.
+        let (peak, end, worst) = drain(true);
+        assert!(peak > 10_000, "the tall fixture must lay a real ribbon: {peak}");
+        assert_eq!(end, 0, "and it must be fully gone by the end");
         assert!(
             worst < 0.06,
-            "the ribbon must ease out, not step: worst single-frame loss was \
-             {:.1}% of peak",
+            "the tall ribbon must ease out, not step: worst single-frame loss \
+             was {:.1}% of peak",
+            worst * 100.0
+        );
+
+        // DEFAULT underline strip: the same drain against a peak roughly a
+        // quarter of the tall body's (a flat capped strip has no hot multi-row
+        // crest), so identical absolute smoothness measures larger here. The
+        // bound is scaled to this geometry's own defect signature: deleting
+        // ONE still-lit cell outright measures >= ~10% of this peak (a whole
+        // cell is ~1/9 of the resident strip), and the pre-fix staircase
+        // measured far above that — 8% refutes both while holding the drain
+        // to the same per-cell easing the tall body shows.
+        let (peak, end, worst) = drain(false);
+        assert!(
+            peak > 10_000,
+            "the underline fixture must lay a real ribbon: {peak}"
+        );
+        assert_eq!(end, 0, "and it must be fully gone by the end");
+        assert!(
+            worst < 0.08,
+            "the underline must ease out, not step: worst single-frame loss \
+             was {:.1}% of peak",
             worst * 100.0
         );
     }
@@ -43734,11 +46154,42 @@ halo = "add"
                 .all(|q| (q.y as i32 - boundary).abs() <= pad + 1),
             "the plume hugs the row boundary"
         );
+        // DEFAULT (underline) presentation: the ribbon body shares the plume's
+        // spine — every under-ink quad is contained in the strip band around
+        // the row boundary — while the ROUTING stays disjoint (body under the
+        // ink, plume over it, asserted by the stream membership above).
+        let half_u = (g.ch as f32 * RAINBOW_UNDERLINE_H * 0.5).ceil() as i32;
         assert!(
             glow.under_quads()
                 .iter()
+                .all(|q| q.y as i32 >= boundary - half_u
+                    && q.y as i32 + q.h as i32 <= boundary + half_u),
+            "the default ribbon strip hugs the row boundary under the baseline"
+        );
+        // GATED TALL presentation: the banding-era body keeps the old spatial
+        // disjointness — wholly inside the glyph band, never in the leading.
+        let mut tall_cfg = c;
+        tall_cfg.ribbon_tall = true;
+        let mut tall = CursorGlow::default();
+        let t1 = Instant::now();
+        type_run(
+            &mut tall,
+            TypeRun {
+                row: 2,
+                from: 2,
+                keys: 8,
+                gap_ms: 40,
+            },
+            &tall_cfg,
+            g,
+            t1,
+        );
+        assert!(!tall.under_quads().is_empty(), "tall body present");
+        assert!(
+            tall.under_quads()
+                .iter()
                 .all(|q| (q.y as i32 - boundary).abs() > pad),
-            "the ribbon body stays inside the glyph band, never in the leading"
+            "the tall ribbon body stays inside the glyph band, never in the leading"
         );
     }
 
@@ -45168,6 +47619,7 @@ halo = "add"
                 last_retire_reason: Some("generation-skip"),
             },
             spawns: 8,
+            ribbon_look: "underline",
             ribbon_segments: 4,
             ribbon_hue_bands: 4,
             sparks: 4,
@@ -45195,6 +47647,7 @@ halo = "add"
             " last_retire_reason=generation-skip",
             " spawns=8",
             " ribbon_active=true",
+            " ribbon_look=underline",
             " ribbon_segments=4",
             " ribbon_hue_bands=4",
             " sparks=4",

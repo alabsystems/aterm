@@ -419,7 +419,10 @@ pub(crate) fn cmd_dims(
 /// structured twin) names WHICH producer armed them. `deadline_owner` alone is a
 /// last-writer snapshot and cannot do that — it reported the 2026-08 spin as
 /// `title_summary` when the producer was the session-status observer, now its
-/// own `session_status` owner.
+/// own `session_status` owner. Beside it, `past_arm_streak_heals=<owner>:<n>,...`
+/// names every producer whose windowed past-arm streak (> 90% of its last 32
+/// arms already past, at ANY lateness) the fold is actively clamping to frame
+/// cadence — a live, named scheduler bug, not a suspicion.
 ///
 /// STARTUP: `first_present_ms` keeps the compatibility-stable GUI
 /// `main_entry` → startup-metrics publication point inside the first
@@ -561,6 +564,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
+    let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     format!(
         "OK backend={backend} rows={rows} cols={cols} frames={} \
@@ -587,6 +591,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
          deadline_arms_by_owner={} \
+         past_arm_streak_heals={} \
          stale_arm_heals={} \
          max_frame_gap_ms={:.2} \
          rust_main_to_first_present_ms={:.2} \
@@ -683,6 +688,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         deadline_arm_pairs(&arms),
+        streak_heal_pairs(&streak_heals),
         m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
@@ -773,6 +779,34 @@ fn deadline_arm_object(arms: &[crate::metrics::OwnerArms]) -> String {
     let body = arms
         .iter()
         .map(|a| format!("\"{}\":{{\"arms\":{},\"past\":{}}}", a.owner, a.arms, a.past_arms))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// Render the per-owner WINDOWED streak-heal ledger as `owner:heals` pairs,
+/// comma-joined — the arms `record_deadline`'s 32-arm past/future window
+/// detector clamped to frame cadence (wake follow-ups items 18/19). Surfaced
+/// BESIDE `deadline_arms_by_owner` on purpose: that field says who kept
+/// arming the past, this one says whose spin the fold is actively healing.
+/// Same self-labelling discipline; `none` when no owner was ever clamped.
+fn streak_heal_pairs(heals: &[(&'static str, u64)]) -> String {
+    if heals.is_empty() {
+        // Never emit a bare `key=` — every field in this line carries a token.
+        return "none".to_string();
+    }
+    heals
+        .iter()
+        .map(|(owner, count)| format!("{owner}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same streak-heal ledger as a JSON object for the structured twin.
+fn streak_heal_object(heals: &[(&'static str, u64)]) -> String {
+    let body = heals
+        .iter()
+        .map(|(owner, count)| format!("\"{owner}\":{count}"))
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{body}}}")
@@ -885,6 +919,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
     let arms = crate::metrics::deadline_arm_attribution();
+    let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     json_ok(&format!(
         "{{\"backend\":\"{backend}\",\"rows\":{rows},\"cols\":{cols},\
@@ -913,7 +948,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
          \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\
-         \"deadline_arms_by_owner\":{},\"stale_arm_heals\":{},\
+         \"deadline_arms_by_owner\":{},\"past_arm_streak_heals\":{},\
+         \"stale_arm_heals\":{},\
          \"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
          \"rust_main_to_first_visible_ms\":{:.2},\
@@ -1009,6 +1045,7 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         deadline_arm_object(&arms),
+        streak_heal_object(&streak_heals),
         m.stale_arm_heals,
         ms(m.max_frame_gap_ns),
         ms(m.rust_main_to_first_present_ns),
@@ -3867,6 +3904,9 @@ mod tests {
             "past_deadline_arms=",
             // ITEM 6: the per-owner ledger that names a spin's producer.
             "deadline_arms_by_owner=",
+            // ITEMS 18/19: the per-owner ledger that names the spin the fold
+            // is actively healing (the windowed past-arm streak clamp).
+            "past_arm_streak_heals=",
             // ITEM 10 tail surfacing: a healthy median must never again be the
             // only thing the summary shows.
             "n_input=",
@@ -3956,6 +3996,7 @@ mod tests {
             "deadline_late_ms",
             "past_deadline_arms",
             "deadline_arms_by_owner",
+            "past_arm_streak_heals",
             "n_input",
             "input_p50_ms",
             "input_p95_ms",
@@ -4118,6 +4159,23 @@ mod tests {
             );
         }
 
+        // ITEMS 18/19: the windowed streak-heal ledger rides beside the arm
+        // ledger with the same self-labelling shape — an object in JSON…
+        let heals = value
+            .get("past_arm_streak_heals")
+            .expect("the streak-heal ledger is published");
+        assert!(
+            heals.is_object(),
+            "the streak-heal ledger must be a keyed object: {heals}"
+        );
+        for (owner, count) in heals.as_object().expect("object") {
+            assert!(!owner.is_empty(), "every heal entry is named");
+            assert!(
+                count.as_u64().is_some(),
+                "{owner} publishes a plain heal count"
+            );
+        }
+
         // The text twin never emits a bare `key=`: a whitespace-splitting
         // reader (the spin probe is a shell one-liner) always gets a token.
         let text = super::cmd_metrics(None, "");
@@ -4126,6 +4184,15 @@ mod tests {
             .find_map(|tok| tok.strip_prefix("deadline_arms_by_owner="))
             .expect("the text form publishes the ledger");
         assert!(!field.is_empty(), "empty ledgers render as `none`, not `\"\"`");
+        // …and `owner:count` pairs (or `none`) in text.
+        let heal_field = text
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("past_arm_streak_heals="))
+            .expect("the text form publishes the streak-heal ledger");
+        assert!(
+            !heal_field.is_empty(),
+            "an empty streak-heal ledger renders as `none`, not `\"\"`"
+        );
     }
 
     #[test]

@@ -15,8 +15,12 @@
 //! pushes `update_if_active(|| settings_tree(state))` on change is the OS event-loop
 //! wiring (runtime-verified with a real screen reader), built on top of this seam.
 //!
-//! Gated behind the default-on `a11y-accesskit` feature (see this crate's
-//! `Cargo.toml`); builds that explicitly disable the feature omit AccessKit.
+//! Gated behind the OFF-BY-DEFAULT `a11y-accesskit` feature (see this crate's
+//! `Cargo.toml`, which records why it left the default build). A stock Linux/Windows
+//! build compiles none of this and publishes no accessibility tree at all — there is
+//! no degraded fallback, because AccessKit is the only cross-platform publisher aterm
+//! has. Everything below is therefore reachable only from
+//! `cargo build -p aterm-gui --features a11y-accesskit`.
 
 // macOS: AccessKit's NSAccessibility provider and the `a11y-appkit` grid publisher both
 // claim the content view's accessibility tree — enabling both yields a corrupt/duplicated
@@ -27,7 +31,10 @@ compile_error!(
      (both claim the content view's accessibility tree); enable at most one"
 );
 
-use accesskit::{Action, Node, NodeId, Role, Toggled, Tree, TreeId, TreeUpdate};
+use accesskit::{
+    Action, Node, NodeId, Rect, Role, TextDirection, TextPosition, TextSelection, Toggled, Tree,
+    TreeId, TreeUpdate,
+};
 
 use crate::prefs::{EditField, EditKind};
 use crate::settings::SettingsState;
@@ -37,6 +44,59 @@ const ROOT: NodeId = NodeId(0);
 /// DEFAULT-2: the single `Role::Terminal` node under [`ROOT`] when NO overlay is open —
 /// carries the visible grid text so a screen reader reads the terminal itself.
 const GRID: NodeId = NodeId(1);
+/// The in-grid tab strip's `Role::TabList` under [`ROOT`], published only when the strip
+/// is actually on screen AND is a switcher (≥ 2 tabs — a solo strip paints the window
+/// title, not a switcher, so publishing a one-item tab list would describe a control the
+/// user cannot see).
+const TAB_LIST: NodeId = NodeId(2);
+/// Tab items are `TAB_BASE + tab_index`. A high, disjoint range so a tab id can never be
+/// mistaken for a Settings control id (`field_index + 1`) or a section group
+/// ([`GROUP_BASE`]) by [`crate::app::App::on_accessibility_action`]'s routing.
+const TAB_BASE: u64 = 1 << 40;
+/// One `Role::TextRun` per visible grid ROW — at `ROW_BASE + row_index * RUNS_PER_ROW`,
+/// plus one id per extra run a row wider than [`RUN_CHARS`] is split into. Disjoint from
+/// every other id range above, and STABLE across frames: AccessKit's consumer diffs the
+/// previous tree against the new one by node id, and it is precisely that diff which
+/// synthesises the `object:text-changed` and `object:text-caret-moved` events a screen
+/// reader listens for. Reusing row ids per frame is what makes "a line of output
+/// arrived" an insert event rather than a remove-and-add of the whole screen.
+const ROW_BASE: u64 = 1 << 48;
+
+/// Characters per text run. AccessKit's word starts are `[u8]` and its consumer
+/// addresses them with a `u8` cast of the query offset, so 256 is the widest a
+/// run can be and still answer word queries correctly.
+const RUN_CHARS: usize = 256;
+
+/// Run-id stride per row: the id space a single row may spend on its runs. A
+/// row wider than `RUN_CHARS * RUNS_PER_ROW` characters would collide with the
+/// next row's ids, so the chunker stops there and the last run carries the
+/// remainder (a 65,536-column terminal is not a case worth id-space for).
+const RUNS_PER_ROW: u64 = 256;
+
+/// Split one row into runs no wider than [`RUN_CHARS`] characters, on character
+/// boundaries. A row that fits comes back as a single borrowed chunk, so the
+/// common case allocates one `String` exactly as it did before.
+fn row_chunks(line: &str) -> Vec<String> {
+    let count = line.chars().count();
+    if count <= RUN_CHARS {
+        return vec![line.to_string()];
+    }
+    let cap = RUN_CHARS * RUNS_PER_ROW as usize;
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for (i, ch) in line.chars().enumerate() {
+        if !current.is_empty()
+            && i % RUN_CHARS == 0
+            && (chunks.len() as u64) < RUNS_PER_ROW - 1
+            && i < cap
+        {
+            chunks.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    chunks.push(current);
+    chunks
+}
 
 /// Section `Role::Group` nodes live in a high, disjoint id range so they never collide with
 /// a control id (`field_index + 1`). This is load-bearing: the OS routes an activate/focus
@@ -282,23 +342,268 @@ pub(crate) fn empty_tree() -> TreeUpdate {
     }
 }
 
-/// DEFAULT-2: the accessibility tree for a plain terminal session (no overlay open) — a
-/// `Role::Window` root parenting ONE read-only `Role::Terminal` node whose value is the
-/// visible grid text (`AccessibleSnapshot::value()`), labelled [`crate::accessibility::LABEL`].
-/// This is what a screen reader reads on a bare session; previously `push_a11y_tree` handed
-/// it [`empty_tree`] (a childless root), so VoiceOver announced nothing. The grid text is the
-/// SAME snapshot the SIGUSR1 `.txt` capture and the AppKit publisher use, so the three never
-/// diverge.
-pub(crate) fn grid_tree(snap: &crate::accessibility::AccessibleSnapshot) -> TreeUpdate {
+/// Where the visible grid sits inside the window's client area, in PHYSICAL pixels —
+/// the coordinate space `accesskit_winit` publishes root window bounds in, so a node's
+/// `bounds` here lands on the same pixels the glyphs did.
+///
+/// Optional at the call site: without it the grid still exposes a complete AT-SPI `Text`
+/// interface (text, caret, line/word/character granularity); only the geometric extras —
+/// `Component` extents and `GetCharacterExtents` — are unavailable. Absent geometry is
+/// therefore a degradation, never a wrong answer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct GridGeometry {
+    /// Left edge of column 0, physical px from the client area's left edge.
+    pub(crate) origin_x: f64,
+    /// Top edge of grid row 0 — BELOW the tab strip, matching the snapshot, which
+    /// drops the strip rows.
+    pub(crate) origin_y: f64,
+    /// One cell's advance width in physical px.
+    pub(crate) cell_w: f64,
+    /// One cell's line height in physical px.
+    pub(crate) cell_h: f64,
+    /// Top edge of the in-grid tab strip band, physical px (`origin_y` minus the
+    /// strip's rows). Equal to `origin_y` when no strip is on screen.
+    pub(crate) strip_y: f64,
+    /// Height of the whole strip band in physical px; `0.0` when no strip is drawn.
+    pub(crate) strip_h: f64,
+}
+
+/// One publishable tab of the in-grid strip: the label the strip painted, whether it is
+/// the active tab, and its COLUMN span (`start_col..end_col`) taken straight from the
+/// cached `TabSegment` hit geometry the mouse uses — so the announced bounds and the
+/// clickable pixels are the same rectangle by construction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GridTab {
+    /// The tab's index in the window's tab set — the argument `switch_tab_in` takes.
+    pub(crate) index: usize,
+    /// The label the strip painted for this tab.
+    pub(crate) title: String,
+    /// This is the active tab.
+    pub(crate) selected: bool,
+    /// First column of the tab's segment, inclusive.
+    pub(crate) start_col: u16,
+    /// One past the tab's last column.
+    pub(crate) end_col: u16,
+}
+
+/// The node id for tab `index`, and its inverse.
+fn tab_node_id(index: usize) -> NodeId {
+    NodeId(TAB_BASE + index as u64)
+}
+
+/// Decode a screen reader's action target back to a tab index, or `None` when the id is
+/// not one of [`grid_tree`]'s tab items. Rejects ids outside the tab range rather than
+/// clamping: a stale request must be a no-op, never a switch to the wrong tab.
+pub(crate) fn tab_index_for(node: NodeId) -> Option<usize> {
+    node.0
+        .checked_sub(TAB_BASE)
+        .filter(|offset| *offset < (ROW_BASE - TAB_BASE))
+        .map(|offset| offset as usize)
+}
+
+/// Word starts within one line, in CHARACTER indices, as AccessKit defines them: index 0
+/// always starts a word, and every non-whitespace character preceded by whitespace starts
+/// the next one (trailing whitespace stays with the word it follows, a line's leading
+/// whitespace is its own word). This is what gives a screen reader working
+/// `GetStringAtOffset(.., WORD_START)` on a terminal line.
+///
+/// The `[u8]` index space is why a run is capped at [`RUN_CHARS`] characters
+/// ([`row_chunks`]): the consumer addresses this list by casting the QUERY
+/// offset to `u8`, so a run longer than 256 characters answers word queries
+/// about the wrong word rather than merely losing precision. Within a run the
+/// indices are exact, and the `break` below is a belt-and-braces guard on an
+/// invariant the chunker already holds.
+fn word_starts_of(line: &str) -> Vec<u8> {
+    let mut starts = vec![0u8];
+    let mut prev_ws = false;
+    for (i, ch) in line.chars().enumerate() {
+        if i > 0 && prev_ws && !ch.is_whitespace() {
+            let Ok(index) = u8::try_from(i) else { break };
+            starts.push(index);
+        }
+        prev_ws = ch.is_whitespace();
+    }
+    starts
+}
+
+/// DEFAULT-2: the accessibility tree for a plain terminal session (no overlay open).
+///
+/// A `Role::Window` root parenting the visible tab strip (when it is on screen and is a
+/// switcher) and ONE read-only `Role::Terminal` node labelled
+/// [`crate::accessibility::LABEL`]. The terminal node carries the visible screen as a REAL
+/// text document: one `Role::TextRun` child per grid row, each holding that row's text
+/// with its hard line break included, per-character lengths, and — when `geom` is known —
+/// per-character positions and widths. That structure is what makes the platform publish
+/// an AT-SPI `Text` interface (`accesskit_consumer::Node::supports_text_ranges` requires
+/// `Role::Terminal` PLUS at least one text run), which is the difference between a screen
+/// reader announcing the bare name "aterm terminal" and being able to read, review and
+/// navigate the screen by line, word and character.
+///
+/// The caret is published as a degenerate [`TextSelection`] anchored on the cursor's row
+/// run at the cursor's column — the same offset [`crate::accessibility::AccessibleSnapshot::cursor_offset`]
+/// reports, so the AT-SPI `CaretOffset` and the macOS `AXSelectedTextRange` cannot
+/// diverge. A hidden cursor (DECTCEM) publishes NO selection at all rather than a bogus
+/// one, which AT-SPI reports as offset `-1`.
+///
+/// The events follow from the structure, not from a second code path: AccessKit's consumer
+/// diffs this tree against the previously published one and synthesises
+/// `object:text-changed:insert` / `:delete` from the row text that actually changed and
+/// `object:text-caret-moved` from the selection focus that actually moved. That is why the
+/// row node ids ([`ROW_BASE`]) must stay stable across frames.
+///
+/// The grid text is the SAME snapshot the SIGUSR1 `.txt` capture and the AppKit publisher
+/// use, so the three never diverge.
+pub(crate) fn grid_tree(
+    snap: &crate::accessibility::AccessibleSnapshot,
+    geom: Option<GridGeometry>,
+    tabs: &[GridTab],
+) -> TreeUpdate {
+    // One text run per visible row. `split_inclusive` keeps each row's terminating '\n'
+    // inside its run, which is exactly how AccessKit represents a hard line break: it is
+    // one character of the run, and a caret at end-of-line sits ON it, not past it.
+    let lines: Vec<&str> = snap.value().split_inclusive('\n').collect();
+    let mut nodes: Vec<(NodeId, Node)> = Vec::with_capacity(lines.len() + tabs.len() + 3);
+    let mut row_ids: Vec<NodeId> = Vec::with_capacity(lines.len());
+
+    for (row, line) in lines.iter().enumerate() {
+        // ONE RUN PER ROW, UNLESS THE ROW OUTRUNS u8 ADDRESSING. AccessKit
+        // carries word starts as `[u8]` AND the consumer addresses them by
+        // casting the QUERY offset to u8 (accesskit_consumer's
+        // `word_starts.binary_search(&(pos.character_index as u8))`), so on a
+        // row longer than 256 characters a query at column 281 wraps to 25 and
+        // answers about a different word entirely — measured on a 300-column
+        // instance. Capping the LIST cannot stop the query from wrapping; only
+        // keeping every run inside the addressable range can. So a wide row is
+        // split into consecutive runs, each its own text run with its own
+        // word starts, which is exactly what runs are for.
+        for (chunk_index, chunk) in row_chunks(line).into_iter().enumerate() {
+        let line = &chunk;
+        let id = NodeId(ROW_BASE + row as u64 * RUNS_PER_ROW + chunk_index as u64);
+        row_ids.push(id);
+        let mut run = Node::new(Role::TextRun);
+        run.set_value((*line).to_string());
+        run.set_character_lengths(
+            line.chars()
+                .map(|c| u8::try_from(c.len_utf8()).unwrap_or(4))
+                .collect::<Vec<u8>>(),
+        );
+        run.set_word_starts(word_starts_of(line.strip_suffix('\n').unwrap_or(line)));
+        if let Some(g) = geom {
+            // One character per cell (`push_visible_row` emits exactly one char per
+            // rendered cell, wide-glyph continuations included), so the character index
+            // IS the column. The hard line break is zero-width at the end of the row.
+            let mut positions: Vec<f32> = Vec::with_capacity(line.len());
+            let mut widths: Vec<f32> = Vec::with_capacity(line.len());
+            let col0 = chunk_index * RUN_CHARS;
+            for (i, ch) in line.chars().enumerate() {
+                positions.push(((col0 + i) as f64 * g.cell_w) as f32);
+                widths.push(if ch == '\n' { 0.0 } else { g.cell_w as f32 });
+            }
+            run.set_character_positions(positions);
+            run.set_character_widths(widths);
+            let y0 = g.origin_y + row as f64 * g.cell_h;
+            run.set_bounds(Rect {
+                x0: g.origin_x,
+                y0,
+                x1: g.origin_x + snap.cols as f64 * g.cell_w,
+                y1: y0 + g.cell_h,
+            });
+        }
+        nodes.push((id, run));
+        }
+    }
+
     let mut grid = Node::new(Role::Terminal);
     grid.set_label(crate::accessibility::LABEL);
+    // Retained for the platforms whose "value" is a plain string (UIA, NSAccessibility);
+    // AT-SPI's Value interface is numeric and correctly ignores it, reading the text runs
+    // above through the Text interface instead.
     grid.set_value(snap.value().to_string());
     grid.set_read_only();
+    grid.set_text_direction(TextDirection::LeftToRight);
+    grid.set_children(row_ids);
+    if let Some(g) = geom {
+        grid.set_bounds(Rect {
+            x0: g.origin_x,
+            y0: g.origin_y,
+            x1: g.origin_x + snap.cols as f64 * g.cell_w,
+            y1: g.origin_y + lines.len() as f64 * g.cell_h,
+        });
+    }
+    // The caret: a degenerate selection on the cursor's row run. Clamped to the row's
+    // trimmed length exactly like `cursor_offset`, so a caret parked in trailing blanks
+    // lands on the line break rather than off the end of the run.
+    if let Some((crow, ccol)) = snap.cursor
+        && let Some(line) = lines.get(crow)
+    {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line).chars().count();
+        // The caret names the RUN it sits in, not the row: a row wider than
+        // `RUN_CHARS` is published as several runs ([`row_chunks`]), and a
+        // position addressed against the row's first run with a column past its
+        // end is off the end of that node.
+        let clamped = ccol.min(trimmed);
+        let run = (clamped / RUN_CHARS).min(RUNS_PER_ROW as usize - 1);
+        let position = TextPosition {
+            node: NodeId(ROW_BASE + crow as u64 * RUNS_PER_ROW + run as u64),
+            character_index: clamped - run * RUN_CHARS,
+        };
+        grid.set_text_selection(TextSelection {
+            anchor: position,
+            focus: position,
+        });
+    }
+    nodes.push((GRID, grid));
+
+    // The tab strip, when one is on screen and switching between tabs is a thing the user
+    // can actually do. Each tab is focusable and clickable; the OS routes both back
+    // through `tab_index_for`.
+    let mut root_children: Vec<NodeId> = Vec::with_capacity(2);
+    if !tabs.is_empty() {
+        let mut items: Vec<NodeId> = Vec::with_capacity(tabs.len());
+        for tab in tabs {
+            let id = tab_node_id(tab.index);
+            let mut node = Node::new(Role::Tab);
+            node.set_label(tab.title.clone());
+            node.set_selected(tab.selected);
+            node.add_action(Action::Click);
+            node.add_action(Action::Focus);
+            if let Some(g) = geom
+                && tab.end_col > tab.start_col
+            {
+                node.set_bounds(Rect {
+                    x0: g.origin_x + f64::from(tab.start_col) * g.cell_w,
+                    y0: g.strip_y,
+                    x1: g.origin_x + f64::from(tab.end_col) * g.cell_w,
+                    y1: g.strip_y + g.strip_h,
+                });
+            }
+            items.push(id);
+            nodes.push((id, node));
+        }
+        let mut list = Node::new(Role::TabList);
+        list.set_label("Tabs");
+        list.set_children(items);
+        if let Some(g) = geom
+            && g.strip_h > 0.0
+        {
+            list.set_bounds(Rect {
+                x0: g.origin_x,
+                y0: g.strip_y,
+                x1: g.origin_x + snap.cols as f64 * g.cell_w,
+                y1: g.strip_y + g.strip_h,
+            });
+        }
+        nodes.push((TAB_LIST, list));
+        root_children.push(TAB_LIST);
+    }
+    root_children.push(GRID);
+
     let mut root = Node::new(Role::Window);
     root.set_label("aterm");
-    root.set_children(vec![GRID]);
+    root.set_children(root_children);
+    nodes.push((ROOT, root));
     TreeUpdate {
-        nodes: vec![(ROOT, root), (GRID, grid)],
+        nodes,
         tree: Some(Tree::new(ROOT)),
         tree_id: TreeId::ROOT,
         focus: GRID,
@@ -314,25 +619,46 @@ mod tests {
         SettingsState::from_config(&Config::default())
     }
 
+    /// A real engine's visible grid, so every assertion below runs against the genuine
+    /// `AccessibleSnapshot::value()` (the anti-divergence anchor with the SIGUSR1 `.txt`
+    /// snapshot), not a hand-written string.
+    fn live_grid(
+        rows: u16,
+        cols: u16,
+        bytes: &[u8],
+        cursor: Option<(usize, usize)>,
+    ) -> crate::accessibility::AccessibleSnapshot {
+        let mut term = aterm_core::terminal::Terminal::new(rows, cols);
+        term.process(bytes);
+        let cells: Vec<_> = (0..usize::from(rows)).map(|r| term.render_row(r)).collect();
+        crate::accessibility::AccessibleSnapshot::from_cells(&cells, usize::from(cols), cursor)
+    }
+
+    fn node<'a>(update: &'a TreeUpdate, id: NodeId) -> &'a Node {
+        &update.nodes.iter().find(|(n, _)| *n == id).unwrap().1
+    }
+
+    const GEOM: GridGeometry = GridGeometry {
+        origin_x: 8.0,
+        origin_y: 30.0,
+        cell_w: 9.0,
+        cell_h: 18.0,
+        strip_y: 12.0,
+        strip_h: 18.0,
+    };
+
     /// DEFAULT-2: `grid_tree` publishes the terminal grid as a read-only `Role::Terminal`
     /// node under a `Role::Window` root, carrying the snapshot's visible text — what a
-    /// screen reader reads on a plain session. Built from a real engine so the text is the
-    /// genuine `AccessibleSnapshot::value()` (the anti-divergence anchor with the SIGUSR1
-    /// `.txt` snapshot).
+    /// screen reader reads on a plain session.
     #[test]
     fn grid_tree_publishes_the_terminal_grid() {
-        let mut term = aterm_core::terminal::Terminal::new(2, 10);
-        term.process(b"hello");
-        let cells: Vec<_> = (0..2).map(|r| term.render_row(r)).collect();
-        let snap = crate::accessibility::AccessibleSnapshot::from_cells(&cells, 10, Some((0, 5)));
-
-        let update = grid_tree(&snap);
-        assert_eq!(update.nodes.len(), 2, "a Window root + one Terminal child");
+        let snap = live_grid(2, 10, b"hello", Some((0, 5)));
+        let update = grid_tree(&snap, None, &[]);
         assert_eq!(update.focus, GRID);
-        let root = &update.nodes.iter().find(|(id, _)| *id == ROOT).unwrap().1;
-        let grid = &update.nodes.iter().find(|(id, _)| *id == GRID).unwrap().1;
+        let root = node(&update, ROOT);
+        let grid = node(&update, GRID);
         assert_eq!(root.role(), Role::Window);
-        assert_eq!(root.children(), [GRID]);
+        assert_eq!(root.children(), [GRID], "no strip published without tabs");
         assert_eq!(grid.role(), Role::Terminal);
         assert_eq!(
             grid.value(),
@@ -345,6 +671,299 @@ mod tests {
             snap.value().starts_with("hello"),
             "sanity: real text, got {:?}",
             snap.value()
+        );
+    }
+
+    /// THE POINT OF THIS MODULE'S TERMINAL BRANCH: the grid is a real text document, not
+    /// an opaque node with a name. `accesskit_consumer::Node::supports_text_ranges()` —
+    /// the exact predicate `accesskit_atspi_common` consults before it puts
+    /// `org.a11y.atspi.Text` on the node — requires `Role::Terminal` PLUS at least one
+    /// `Role::TextRun` child, so the row runs below are what turn "aterm terminal" into a
+    /// screen a blind user can read. One run per visible row, each carrying its own hard
+    /// line break as one character, and the runs concatenating BYTE-FOR-BYTE back to the
+    /// snapshot text.
+    #[test]
+    fn terminal_node_publishes_one_text_run_per_row() {
+        let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
+        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let grid = node(&update, GRID);
+        let rows: Vec<NodeId> = (0..3).map(|r| NodeId(ROW_BASE + r * RUNS_PER_ROW)).collect();
+        assert_eq!(grid.children(), rows, "one text run per visible row");
+
+        let mut rebuilt = String::new();
+        for (r, id) in rows.iter().enumerate() {
+            let run = node(&update, *id);
+            assert_eq!(run.role(), Role::TextRun, "row {r} is a text run");
+            let value = run.value().unwrap();
+            assert!(
+                value.ends_with('\n'),
+                "row {r} carries its line break: {value:?}"
+            );
+            assert_eq!(
+                run.character_lengths().len(),
+                value.chars().count(),
+                "row {r}: one character length per character, line break included"
+            );
+            assert_eq!(
+                run.character_lengths()
+                    .iter()
+                    .map(|n| *n as usize)
+                    .sum::<usize>(),
+                value.len(),
+                "row {r}: character lengths cover every UTF-8 byte"
+            );
+            rebuilt.push_str(value);
+        }
+        assert_eq!(
+            rebuilt,
+            snap.value(),
+            "the runs ARE the snapshot text — the a11y document and the SIGUSR1 capture \
+             cannot drift"
+        );
+        assert!(rebuilt.starts_with("alpha\nbeta\n"), "sanity: {rebuilt:?}");
+    }
+
+    /// The caret is a degenerate selection on the cursor's row run, at the cursor's
+    /// column, and it lands on exactly the offset `AccessibleSnapshot::cursor_offset`
+    /// reports — the number AT-SPI serves as `CaretOffset` and macOS as
+    /// `AXSelectedTextRange`. Both are derived here from the same clamped column, so the
+    /// two platforms cannot disagree about where the cursor is.
+    #[test]
+    fn caret_is_a_degenerate_selection_at_the_cursor() {
+        let snap = live_grid(3, 12, b"alpha\r\nbeta", Some((1, 4)));
+        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let selection = node(&update, GRID).text_selection().copied().unwrap();
+        assert_eq!(
+            selection.anchor, selection.focus,
+            "a caret, not a selection"
+        );
+        assert_eq!(
+            selection.focus.node,
+            NodeId(ROW_BASE + RUNS_PER_ROW),
+            "on row 1's run"
+        );
+        assert_eq!(selection.focus.character_index, 4);
+        // The global offset this resolves to: "alpha\n" is 6 characters, + column 4.
+        assert_eq!(snap.cursor_offset(), Some(10));
+    }
+
+    /// A caret parked in a row's trailing blanks clamps ONTO that row's hard line break
+    /// (AccessKit's rule: "when the caret is at the end of such a line, the focus should
+    /// be on the line break, not after it"), matching `cursor_offset`'s own clamp.
+    #[test]
+    fn caret_in_trailing_blanks_clamps_onto_the_line_break() {
+        let snap = live_grid(2, 20, b"hi", Some((0, 17)));
+        let update = grid_tree(&snap, None, &[]);
+        let selection = node(&update, GRID).text_selection().copied().unwrap();
+        assert_eq!(selection.focus.node, NodeId(ROW_BASE));
+        assert_eq!(
+            selection.focus.character_index, 2,
+            "clamped to the trimmed row length — the index of the '\\n'"
+        );
+        assert_eq!(
+            snap.cursor_offset(),
+            Some(2),
+            "same offset as the AppKit publisher"
+        );
+    }
+
+    /// A hidden cursor (DECTCEM) publishes NO selection rather than a bogus one; AT-SPI
+    /// then reports caret offset -1, which is the honest answer.
+    #[test]
+    fn hidden_cursor_publishes_no_caret() {
+        let snap = live_grid(2, 10, b"hello", None);
+        let update = grid_tree(&snap, None, &[]);
+        assert_eq!(node(&update, GRID).text_selection(), None);
+        assert_eq!(snap.cursor_offset(), None);
+    }
+
+    /// Row node ids are STABLE across frames. This is what makes AccessKit's consumer diff
+    /// report "one line changed" (an `object:text-changed` insert/delete pair) instead of
+    /// tearing the whole screen down and rebuilding it, and it is the reason a screen
+    /// reader hears the new output line rather than the entire visible buffer.
+    /// A row wider than the `[u8]` word-index space is published as SEVERAL
+    /// runs. Measured before this: accesskit's consumer addresses word starts
+    /// by casting the query offset to `u8`, so on a 300-column row a query at
+    /// column 281 wrapped to 25 and answered about a different word. Capping
+    /// the list could not stop the query from wrapping; keeping every run
+    /// inside the addressable range can.
+    #[test]
+    fn a_row_wider_than_the_index_space_is_split_into_addressable_runs() {
+        let cols: u16 = 300;
+        let text: Vec<u8> = std::iter::repeat_n(b'w', 290).collect();
+        let snap = live_grid(2, cols, &text, Some((0, 281)));
+        let update = grid_tree(&snap, None, &[]);
+        let grid = node(&update, GRID);
+
+        // Row 0 spends more than one run; every run stays addressable.
+        let runs: Vec<NodeId> = grid.children().to_vec();
+        let row0: Vec<&NodeId> = runs
+            .iter()
+            .filter(|id| id.0 >= ROW_BASE && id.0 < ROW_BASE + RUNS_PER_ROW)
+            .collect();
+        assert!(
+            row0.len() >= 2,
+            "a {cols}-column row must not ride one run: {row0:?}"
+        );
+        for id in &runs {
+            let run = node(&update, *id);
+            let chars = run.value().map_or(0, |v| v.chars().count());
+            assert!(
+                chars <= RUN_CHARS,
+                "run {id:?} is {chars} characters — past the u8 query space"
+            );
+        }
+
+        // The caret at column 281 names the run it actually sits in, with an
+        // index inside that run rather than an offset off the end of run 0.
+        let sel = grid.text_selection().copied().expect("a caret");
+        assert_eq!(sel.focus.node, NodeId(ROW_BASE + 1), "the SECOND run of row 0");
+        assert_eq!(sel.focus.character_index, 281 - RUN_CHARS);
+    }
+
+    #[test]
+    fn row_ids_are_stable_across_frames() {
+        let first = grid_tree(&live_grid(3, 12, b"one", Some((0, 3))), None, &[]);
+        let second = grid_tree(&live_grid(3, 12, b"one\r\ntwo", Some((1, 3))), None, &[]);
+        let ids = |u: &TreeUpdate| node(u, GRID).children().to_vec();
+        assert_eq!(ids(&first), ids(&second), "same row ids frame to frame");
+        assert_ne!(
+            node(&second, NodeId(ROW_BASE + RUNS_PER_ROW)).value(),
+            node(&first, NodeId(ROW_BASE + RUNS_PER_ROW)).value(),
+            "…while the changed row's text genuinely differs"
+        );
+    }
+
+    /// Per-character geometry: one cell per character, so the character index IS the
+    /// column, and the hard line break is zero-width at the end of the row. This is what
+    /// `GetCharacterExtents` and braille cursor routing read.
+    #[test]
+    fn character_geometry_tracks_the_cell_grid() {
+        let snap = live_grid(2, 10, b"abc", Some((0, 3)));
+        let update = grid_tree(&snap, Some(GEOM), &[]);
+        let run = node(&update, NodeId(ROW_BASE));
+        assert_eq!(run.value(), Some("abc\n"));
+        assert_eq!(run.character_positions().unwrap(), [0.0, 9.0, 18.0, 27.0]);
+        assert_eq!(
+            run.character_widths().unwrap(),
+            [9.0, 9.0, 9.0, 0.0],
+            "the line break occupies no cell"
+        );
+        assert_eq!(
+            run.bounds().unwrap(),
+            Rect {
+                x0: 8.0,
+                y0: 30.0,
+                x1: 8.0 + 10.0 * 9.0,
+                y1: 48.0
+            },
+            "row 0 spans the full grid width, one cell tall"
+        );
+        assert_eq!(
+            node(&update, GRID).bounds().unwrap(),
+            Rect {
+                x0: 8.0,
+                y0: 30.0,
+                x1: 98.0,
+                y1: 66.0
+            },
+            "the terminal node covers every visible row"
+        );
+    }
+
+    /// Without geometry the Text interface is untouched — only the geometric extras go
+    /// missing. A degraded answer, never a wrong one.
+    #[test]
+    fn missing_geometry_degrades_only_the_geometry() {
+        let snap = live_grid(2, 10, b"abc", Some((0, 3)));
+        let update = grid_tree(&snap, None, &[]);
+        let run = node(&update, NodeId(ROW_BASE));
+        assert_eq!(run.value(), Some("abc\n"));
+        assert_eq!(run.character_lengths().len(), 4);
+        assert_eq!(run.character_positions(), None);
+        assert_eq!(run.bounds(), None);
+        assert_eq!(node(&update, GRID).bounds(), None);
+        assert!(
+            node(&update, GRID).text_selection().is_some(),
+            "caret still published"
+        );
+    }
+
+    /// Word starts follow AccessKit's definition, which is what gives a screen reader a
+    /// working "read next word" on a terminal line: index 0 always starts a word, leading
+    /// whitespace is its own word, and trailing whitespace belongs to the word it follows.
+    #[test]
+    fn word_starts_follow_the_accesskit_definition() {
+        assert_eq!(word_starts_of("hello world"), [0, 6]);
+        assert_eq!(word_starts_of("  ab"), [0, 2]);
+        assert_eq!(word_starts_of(""), [0]);
+        assert_eq!(word_starts_of("   "), [0]);
+        assert_eq!(word_starts_of("$ echo hi"), [0, 2, 7]);
+        let update = grid_tree(&live_grid(1, 20, b"echo hi", Some((0, 7))), None, &[]);
+        assert_eq!(node(&update, NodeId(ROW_BASE)).word_starts(), [0, 5]);
+    }
+
+    /// The tab strip publishes as a `Role::TabList` of focusable, clickable `Role::Tab`
+    /// items carrying the strip's own labels and selection, with bounds taken from the
+    /// SAME segment spans the mouse hit-tests — and each item's id decodes back to the
+    /// index `switch_tab_in` takes.
+    #[test]
+    fn tab_strip_publishes_as_a_tab_list() {
+        let snap = live_grid(2, 40, b"hi", Some((0, 2)));
+        let tabs = vec![
+            GridTab {
+                index: 0,
+                title: "build".into(),
+                selected: false,
+                start_col: 0,
+                end_col: 10,
+            },
+            GridTab {
+                index: 1,
+                title: "logs".into(),
+                selected: true,
+                start_col: 10,
+                end_col: 20,
+            },
+        ];
+        let update = grid_tree(&snap, Some(GEOM), &tabs);
+        assert_eq!(
+            node(&update, ROOT).children(),
+            [TAB_LIST, GRID],
+            "the strip is announced before the grid, as it is painted"
+        );
+        let list = node(&update, TAB_LIST);
+        assert_eq!(list.role(), Role::TabList);
+        assert_eq!(list.children(), [tab_node_id(0), tab_node_id(1)]);
+        let logs = node(&update, tab_node_id(1));
+        assert_eq!(logs.role(), Role::Tab);
+        assert_eq!(logs.label(), Some("logs"));
+        assert_eq!(logs.is_selected(), Some(true));
+        assert!(logs.supports_action(Action::Click));
+        assert!(logs.supports_action(Action::Focus));
+        assert_eq!(node(&update, tab_node_id(0)).is_selected(), Some(false));
+        assert_eq!(
+            logs.bounds().unwrap(),
+            Rect {
+                x0: 8.0 + 10.0 * 9.0,
+                y0: 12.0,
+                x1: 8.0 + 20.0 * 9.0,
+                y1: 30.0
+            },
+            "the announced rectangle is the clickable segment"
+        );
+        assert_eq!(tab_index_for(tab_node_id(1)), Some(1));
+        assert_eq!(tab_index_for(GRID), None, "the grid is not a tab");
+        assert_eq!(tab_index_for(ROOT), None);
+        assert_eq!(
+            tab_index_for(NodeId(ROW_BASE)),
+            None,
+            "a row run is not a tab"
+        );
+        assert_eq!(
+            tab_index_for(NodeId(GROUP_BASE)),
+            None,
+            "a settings group is not a tab"
         );
     }
 

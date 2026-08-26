@@ -3004,6 +3004,228 @@ pub fn typed_echo_liveness_model() -> Model {
     }
 }
 
+/// THE DELETE SHAPE — the erase twin of [`typed_echo_liveness_model`], and the
+/// answer to R1 ("backspace KILLS my cursor trail").
+///
+/// 20003ffd repaired the TYPED arm of `CursorGlow::confirm_content_candidate`
+/// and said so plainly: "delete arm and generation-strictness untouched". So
+/// the DELETE arm went on carrying the 201449c2 laws verbatim — WHOLE-ROW
+/// exactness (any repaint at/after the vacated cell vetoes) and ONE hard
+/// materialization witness (glyph → blank at exactly that cell) — the same two
+/// laws that had been retiring 100% of honest typed echoes with the tokens
+/// `row-mismatch` and `row-unchanged`. A denied delete is not merely a delete
+/// that fails to draw: the batch reaches the generation fence unowned with the
+/// caret one column left of its anchor, is judged `UnownedRelocation`, and the
+/// wholesale teardown WIPES the ribbon the user already earned.
+///
+/// The mute-gate lesson generalizes exactly: a delete gate that provably never
+/// lies can still provably never speak, and safety alone calls it green. This
+/// model states the liveness family for the erase shapes a real shell actually
+/// produces.
+///
+/// The adversary's shapes (`shape`):
+///
+///   1 `KeyPlainErase`          — the textbook EOL Backspace: the vacated cell
+///       goes glyph → blank in the single next processed generation and
+///       nothing else on the row moves.
+///   2 `KeyEraseUnderSuggestion` (D1) — zsh/fish repaint POSTDISPLAY for the
+///       SHORTENED prefix in the very batch that erases, so the vacated cell
+///       reads a GHOST GLYPH, not a blank, and the suffix moves wholesale.
+///       Under whole-row exactness this is `row-mismatch` — the typed
+///       blackout's own token, still live on the delete side.
+///   3 `KeyEraseSpace` (D2)     — backspacing a SPACE (every word boundary).
+///       Under the implicit-blank lens the tail-filled baseline ALREADY reads
+///       `' '` at the vacated cell, so the glyph→blank witness is
+///       unsatisfiable and the row is content-identical: `row-unchanged`, the
+///       exact delete twin of the typed-SPACE blackout.
+///   4 `KeyEraseTrimmedEol` (D3) — an EOL erase on a grid that keeps rows
+///       TRIMMED: nothing is stored at the vacated column afterwards, so the
+///       stored row SHRINKS instead of showing a blank, and the caret is
+///       HIDDEN inside the shell's repaint bracket (no landing to read). The
+///       storage shrink is the only witness on offer — the delete twin of the
+///       typed STORAGE-GROWTH witness.
+///   5 `ColdSpinner`            — cold program output, no keystroke at all.
+///   6 `KeyEraseSwallowed`      — the app consumed Backspace without erasing:
+///       nothing vacated, nothing shrank, the caret never moved.
+///   7 `KeyErasePrefixMoved`    — content moved BEFORE the caret in the same
+///       batch. Attribution is disproven; the erase may not borrow the press.
+///   8 `KeySplitEraseEcho` (D-E2) — the erase echo crosses TWO PTY read
+///       batches. REGISTERED STANDING GAP, shared with the typed arm's E2.
+///
+/// Obligations:
+///
+///   SAFETY (kept, never traded for liveness): cold output, a swallowed erase,
+///   and an erase whose pre-caret prefix moved never confirm; every
+///   confirmation carries an armed Backspace, its delivered batch, the single
+///   attributable generation, an intact pre-caret prefix, and at least one
+///   erase witness (`EraseConfirmIsWitnessed`).
+///
+///   LIVENESS: every erase shape the repaired arm claims to handle — plain,
+///   D1, D2, D3 — settles CONFIRMED.
+///
+///   STANDING GAP: D-E2 settles RETIRED by design today, exactly as the typed
+///   arm's E2 does, and for the same strict next-generation law.
+///
+/// `Buggy = 1` is the pre-repair DELETE arm verbatim: whole-row exactness plus
+/// the vacated-cell-only witness. That mutant is SAFE — every safety invariant
+/// above holds on it — and MUTE for D1, D2 and D3, which is precisely the
+/// audited defect class: only the liveness family catches it. Tier-1 binds the
+/// real `CursorGlow::confirm_content_candidate` Delete arm to `Decide` per
+/// shape in `aterm-effects/src/cursor_glow.rs`
+/// (`real_confirm_content_candidate_refines_the_delete_echo_liveness_model`).
+#[must_use]
+// Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling
+// models above) — the MODEL it returns is what `ty` machine-checks.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn delete_echo_liveness_model() -> Model {
+    crate::ty_model! {
+        DeleteEchoLiveness {
+            const Buggy = 0;
+            var shape = 0;              // 0 unpicked, then the roster above
+            var armed = 0;              // a real Backspace armed a delete candidate
+            var echoed = 0;             // the environment delivered its batch
+            var gen_delta = 0;          // parser generations crossed since baseline
+            var pre_caret_intact = 0;   // every cell BEFORE the vacated cell identical
+            var post_caret_changed = 0; // the presentation zone repainted (D1)
+            var content_changed = 0;    // row content differs under the implicit-blank lens
+            var vacated = 0;            // the vacated cell went glyph -> blank
+            var storage_shrink = 0;     // the stored row no longer covers the cell (D3)
+            var caret_retreat = 0;      // the cursor landed on the EXACT predicted target
+            var confirmed = 0;
+            var retired = 0;
+            var settled = 0;            // the decision is final
+
+            // -- the environment adversary picks one erase shape -------------
+            action KeyPlainErase when (shape == 0) { shape = 1; armed = 1; }
+            action KeyEraseUnderSuggestion when (shape == 0) { shape = 2; armed = 1; }
+            action KeyEraseSpace when (shape == 0) { shape = 3; armed = 1; }
+            action KeyEraseTrimmedEol when (shape == 0) { shape = 4; armed = 1; }
+            action ColdSpinner when (shape == 0) { shape = 5; }
+            action KeyEraseSwallowed when (shape == 0) { shape = 6; armed = 1; }
+            action KeyErasePrefixMoved when (shape == 0) { shape = 7; armed = 1; }
+            action KeySplitEraseEcho when (shape == 0) { shape = 8; armed = 1; }
+
+            // -- the environment delivers the batch its shape promised -------
+            action ErasePlain when (shape == 1 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+                content_changed = 1; vacated = 1; caret_retreat = 1;
+            }
+            // The suffix repaint lands ON the vacated cell: no blank to read.
+            action EraseWithGhostRepaint when (shape == 2 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+                content_changed = 1; post_caret_changed = 1; caret_retreat = 1;
+            }
+            // A SPACE erased over tail-filled implicit blanks: invisible.
+            action EraseInvisibleBlank when (shape == 3 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+                caret_retreat = 1;
+            }
+            // Trimmed row + hidden caret: storage shrink is the sole witness.
+            action EraseStorageShrink when (shape == 4 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+                storage_shrink = 1;
+            }
+            action ColdPaint when (shape == 5 && echoed == 0) {
+                echoed = 1; gen_delta = 1; content_changed = 1;
+                post_caret_changed = 1;
+            }
+            action UnrelatedBatch when (shape == 6 && echoed == 0) {
+                echoed = 1; gen_delta = 1; pre_caret_intact = 1;
+            }
+            action EraseRewritesPrefix when (shape == 7 && echoed == 0) {
+                echoed = 1; gen_delta = 1; content_changed = 1;
+                vacated = 1; caret_retreat = 1;
+            }
+            action EraseSplitBatches when (shape == 8 && echoed == 0) {
+                echoed = 1; gen_delta = 2; pre_caret_intact = 1;
+                content_changed = 1; vacated = 1; caret_retreat = 1;
+            }
+
+            // -- the shipped confirmation decision ---------------------------
+            action Decide when (echoed == 1 && settled == 0) {
+                confirmed = if Buggy == 1 {
+                    // 201449c2 verbatim, as the delete arm still carried it
+                    // after the typed repair: WHOLE-ROW exactness (any
+                    // presentation-zone repaint vetoes) + the vacated-cell
+                    // witness alone.
+                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
+                        && vacated == 1 && post_caret_changed == 0
+                    { 1 } else { 0 }
+                } else {
+                    // The repair, mirroring the typed arm: CARET-FRONTIER
+                    // exactness (the vacated cell is the frontier; cells
+                    // at/after it are the shell's presentation zone) + any of
+                    // the three erase witnesses — the cell vacated, the stored
+                    // row shrunk, or the caret landing on the exact predicted
+                    // target.
+                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
+                        && (vacated == 1 || storage_shrink == 1
+                            || caret_retreat == 1)
+                    { 1 } else { 0 }
+                };
+                retired = if Buggy == 1 {
+                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
+                        && vacated == 1 && post_caret_changed == 0
+                    { 0 } else { armed }
+                } else {
+                    if armed == 1 && gen_delta == 1 && pre_caret_intact == 1
+                        && (vacated == 1 || storage_shrink == 1
+                            || caret_retreat == 1)
+                    { 0 } else { armed }
+                };
+                settled = 1;
+            }
+
+            // SAFETY — the 201449c2 protections, kept word for word.
+            invariant ColdEraseNeverConfirms:
+                if shape == 5 { confirmed == 0 } else { shape <= 8 };
+            invariant SwallowedEraseNeverConfirms:
+                if shape == 6 { confirmed == 0 } else { shape <= 8 };
+            invariant MovedPrefixNeverConfirms:
+                // Content moving BEFORE the caret disproves the attribution:
+                // a later jump may not claim causality the mismatch refuted.
+                if shape == 7 { confirmed == 0 } else { shape <= 8 };
+            invariant EraseConfirmIsWitnessed:
+                if confirmed == 1 {
+                    armed == 1 && echoed == 1 && gen_delta == 1
+                        && pre_caret_intact == 1
+                        && (vacated == 1 || storage_shrink == 1
+                            || caret_retreat == 1)
+                } else { confirmed == 0 };
+            invariant EraseSettledIsDecided:
+                if settled == 1 {
+                    confirmed + retired == armed
+                } else { confirmed == 0 && retired == 0 };
+
+            // LIVENESS — every handled erase shape eventually confirms. THIS
+            // is the family that catches the mute delete arm; every safety
+            // invariant above holds on it.
+            invariant LivePlainEraseConfirms:
+                if settled == 1 && shape == 1 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveGhostRepaintEraseConfirmsD1:
+                if settled == 1 && shape == 2 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveSpaceEraseConfirmsD2:
+                if settled == 1 && shape == 3 { confirmed == 1 } else { settled <= 1 };
+            invariant LiveTrimmedEolEraseConfirmsD3:
+                if settled == 1 && shape == 4 { confirmed == 1 } else { settled <= 1 };
+
+            // REGISTERED STANDING GAP — the strict next-generation law, shared
+            // with the typed arm's E2. A checked fact, reprinted by the Tier-0
+            // driver; fixing it must be a loud, deliberate model edit.
+            invariant StandingGapSplitEraseRetiresD2E:
+                if settled == 1 && shape == 8 {
+                    confirmed == 0 && retired == 1
+                } else { settled <= 1 };
+
+            invariant EraseLivenessBounds:
+                shape <= 8 && armed <= 1 && echoed <= 1 && gen_delta <= 2
+                    && pre_caret_intact <= 1 && post_caret_changed <= 1
+                    && content_changed <= 1 && vacated <= 1
+                    && storage_shrink <= 1 && caret_retreat <= 1
+                    && confirmed <= 1 && retired <= 1 && settled <= 1;
+        }
+    }
+}
 /// Cursor-owned pixels/cells live in the active viewport coordinate space.
 /// Entering retained history must immediately suppress the DEC cursor, both
 /// trail engines, every cursor body/companion overlay, and a later Retain

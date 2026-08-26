@@ -1990,6 +1990,33 @@ mod tests {
         }
     }
 
+    /// The same two rows against the LIVE platform predicate rather than a hand-
+    /// written bool — the wiring `App::palette_live` actually feeds in.
+    ///
+    /// This is where the Windows gap showed: the predicate was literally
+    /// `cfg!(target_os = "macos")`, so the rows greyed out on a platform where
+    /// BOTH document runtimes already work (the socket drives them today) purely
+    /// because no picker was linked. With `menu::choose_local_file` answering
+    /// through `IFileOpenDialog`, a picker-bearing platform must report live rows.
+    #[test]
+    fn the_file_rows_track_the_live_platform_predicate() {
+        let available = crate::menu::local_file_picker_available();
+        let mut state = PaletteState::new();
+        state.resolve(&PaletteLive {
+            local_file_picker_available: available,
+            ..PaletteLive::default()
+        });
+        for action in [MenuAction::OpenMarkdown, MenuAction::OpenEditor] {
+            let row = state.rows.iter().find(|row| row.action == action).unwrap();
+            assert_eq!(
+                row.enabled, available,
+                "{action:?} must be exactly as enabled as the picker is real"
+            );
+            #[cfg(any(target_os = "macos", windows))]
+            assert!(row.enabled, "{action:?} on a platform that HAS a picker");
+        }
+    }
+
     #[test]
     fn move_wraps_over_filtered_set() {
         let mut s = PaletteState::new();

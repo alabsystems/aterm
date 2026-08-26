@@ -270,6 +270,7 @@ impl EffectsPipeline {
                 head_dx: 0.5,
                 pack: None,
                 wake_persist_s: RAINBOW_WAKE_PERSIST,
+                ribbon_tall: false,
             },
             glow_color_from_cursor: true,
             glow_accent_from_cursor: true,
@@ -921,6 +922,11 @@ impl EffectsPipeline {
             // The host's typing-wake preference survives a reconfigure exactly
             // like its intensity/colour choices do.
             wake_persist_s: self.glow_cfg.wake_persist_s,
+            // The ribbon's presentation is a SPELLING of the style (like the
+            // pet companions), so it re-derives from the raw string on every
+            // reconfigure: `rainbow kitty tall` opts into the banding-era tall
+            // body, everything else gets the default 0.43 underline strip.
+            ribbon_tall: crate::cursor_glow::GlowStyle::style_names_tall_ribbon(style),
         };
         if !enabled {
             self.glow.reset();

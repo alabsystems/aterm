@@ -5562,7 +5562,27 @@ mod tests {
         // be what deletes its last word.
         let outline_rect = LogicalRect::new(16.0, 40.0, 220.0 - 32.0, 32.0);
         let outline_slot = outline_rect.width - 22.0;
-        let heading = "Getting started with aterm";
+        let outline_px = 14.0;
+        // DERIVED, not hardcoded: the premise is a relationship between the
+        // slot and the two faces' advances, and the UI face ladder moves under
+        // this test (a Noto/DejaVu swap shifted the old fixture from 159.7pt to
+        // 172.0pt regular and falsified it outright). Grow a real heading to the
+        // LONGEST prefix that still fits at rest — one character more would
+        // overflow, so the semibold cut of that same text necessarily does too,
+        // which is exactly the row this test is about.
+        let source = "Getting started with aterm on a Linux desktop today";
+        let mut heading_owned = String::new();
+        for ch in source.chars() {
+            let mut candidate = heading_owned.clone();
+            candidate.push(ch);
+            if crate::tray_raster::ui_text_width_for(TextFace::Ui, &candidate, outline_px)
+                > outline_slot
+            {
+                break;
+            }
+            heading_owned = candidate;
+        }
+        let heading: &str = heading_owned.trim_end();
         // MEASURE AT THE SIZE THE PAINTER USES. The premise below used the ambient
         // `px`, which the chip section above had shadowed to
         // `native_type_px(TypeStep::Secondary)` — 13.0 — while every
@@ -5572,7 +5592,6 @@ mod tests {
         // semibold FITS, when at the painted size it measures 160.4 / 166.2 and
         // overflows by 0.2pt — which is the whole case this test exists to pin.
         // Named so the two cannot drift apart again.
-        let outline_px = 14.0;
         let outline_painted = |selected: bool| {
             let mut control = Control::new(
                 ButtonSpec::new(heading),

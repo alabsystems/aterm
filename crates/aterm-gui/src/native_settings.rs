@@ -8823,6 +8823,14 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
             .width(Length::Fill)
             .height(Length::Fixed(22.0)),
     );
+    // The button is only as real as the platform's picker. It carried NO
+    // platform gate at all while `menu::choose_local_file` had a `None` stub off
+    // macOS, so a click took focus and hover, opened nothing, and left the status
+    // line saying "No wallpaper" — the repo's no-dead-click law broken on the one
+    // surface that never asked. It asks now, through the SAME predicate the
+    // palette's File rows use, so Windows (which has a real `IFileOpenDialog`)
+    // lights up and anything without a picker greys out honestly instead.
+    let picker = crate::menu::local_file_picker_available();
     let choose = UiNode::new(
         "settings/wallpaper/choose",
         UiContent::Button(
@@ -8831,7 +8839,7 @@ fn wallpaper_page(state: &SettingsViewState, width: SettingsWidth) -> Vec<UiNode
                 ActionId::new("settings/wallpaper/choose"),
             )
             .state(ControlState {
-                enabled: !pending,
+                enabled: picker && !pending,
                 busy: pending,
                 ..ControlState::default()
             })
@@ -16568,6 +16576,70 @@ mod tests {
         for (position, field) in state.legacy.fields.iter().enumerate() {
             assert_eq!(state.field_index_of(field.key), Some(position));
         }
+    }
+
+    /// Depth-first lookup of one node by key, for the page-shape assertions
+    /// below (the Wallpaper card nests its controls under a `top_card`).
+    fn node_by_key<'a>(nodes: &'a [UiNode], key: &str) -> Option<&'a UiNode> {
+        for node in nodes {
+            if node.key.as_str() == key {
+                return Some(node);
+            }
+            if let Some(found) = node_by_key(&node.children, key) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    /// THE DEAD CLICK, pinned. "Choose Image…" carried no platform gate at all
+    /// while `menu::choose_local_file` was a `None` stub off macOS: it painted
+    /// enabled, took focus and hover, opened nothing, and left the status line
+    /// saying "No wallpaper" — the one place the Windows build broke the repo's
+    /// no-dead-click law.
+    ///
+    /// The button's enabled state must now track the platform picker exactly, so
+    /// the row can never again claim an authority the process does not have. On
+    /// this machine (Windows, with a real `IFileOpenDialog`) that means ENABLED —
+    /// which is also the proof the ungating actually reached this surface.
+    #[test]
+    fn choose_image_is_enabled_exactly_when_a_picker_exists() {
+        let state = SettingsViewState::new(&Config::default());
+        let page = wallpaper_page(&state, SettingsWidth::Wide);
+        let choose =
+            node_by_key(&page, "settings/wallpaper/choose").expect("the Wallpaper page offers it");
+        let UiContent::Button(control) = &choose.content else {
+            panic!("Choose Image… is a button control");
+        };
+        assert_eq!(control.spec.label, "Choose Image…");
+        assert_eq!(
+            control.state.enabled,
+            crate::menu::local_file_picker_available(),
+            "the button must be exactly as enabled as the platform picker is real"
+        );
+        #[cfg(any(target_os = "macos", windows))]
+        assert!(
+            control.state.enabled,
+            "this platform HAS a picker, so the button must be live"
+        );
+    }
+
+    /// Detach is gated on something else entirely (is a wallpaper attached?) and
+    /// must not have been swept up by the picker gate — the ungating brief is
+    /// "leave everything gated for other reasons alone".
+    #[test]
+    fn detach_stays_gated_on_an_attached_wallpaper_not_on_the_picker() {
+        let state = SettingsViewState::new(&Config::default());
+        let page = wallpaper_page(&state, SettingsWidth::Wide);
+        let detach =
+            node_by_key(&page, "settings/wallpaper/detach").expect("the Wallpaper page offers it");
+        let UiContent::Button(control) = &detach.content else {
+            panic!("Detach is a button control");
+        };
+        assert!(
+            !control.state.enabled,
+            "a default config has no wallpaper, so there is nothing to detach"
+        );
     }
 
     fn audited_availability() -> SettingsAvailability {

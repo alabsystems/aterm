@@ -175,6 +175,11 @@ mod defterm_broker_win;
 mod defterm_win;
 #[cfg(windows)]
 mod explorer_win;
+/// The `IFileOpenDialog` behind `menu::choose_local_file` on Windows — the
+/// capability whose absence used to grey out File ▸ Open Markdown / Open File in
+/// Editor and leave Settings ▸ Wallpaper's "Choose Image…" an enabled no-op.
+#[cfg(windows)]
+mod file_picker_win;
 /// The seamless handoff's out-of-band transport: the single-use `SCM_RIGHTS`
 /// rendezvous a parent binds before launching its successor. macOS-only,
 /// because the launched lane and the PTY-device proof term both are.
@@ -6616,6 +6621,13 @@ struct WindowState {
     /// a window's metrics track its own DPI rather than the most-recently-scaled
     /// window's. See [`MetricsView`]. Seeded at the base (1×) scale until attach.
     metrics: MetricsView,
+    /// CELL-PX-1 memo: the `(cell_w, cell_h)` device-pixel pair this window last
+    /// reported to its sessions' engines via [`App::sync_cell_pixel_size`]. `None`
+    /// until the first push (so a window born before its backend was joined still
+    /// gets one). Purely a lock-avoidance memo — the sync runs at every raster
+    /// seam, and re-taking every engine mutex per frame would serialize the UI
+    /// thread behind a flooding background tab's reader.
+    cell_px_reported: Option<(u16, u16)>,
     /// Titlebar band height in POINTS (logical), captured from AppKit at attach
     /// (see `AppRt::titlebar_band_pts`). Kept in points — not px — so a scale
     /// change recomputes the device-px headroom (`round(head_pts · scale)`)
@@ -8839,6 +8851,9 @@ impl WindowState {
             // headless never attaches, so accepting an invented 1x default here would
             // permanently split native layout from the framebuffer at an explicit font.
             metrics,
+            // No cell size has been reported to any engine of this window yet, so
+            // the first `sync_cell_pixel_size` always pushes (CELL-PX-1).
+            cell_px_reported: None,
             head_pts: 0.0, // no chrome measured until attach_os_window queries AppKit
             last_windowed_band_pts: 0.0, // no good windowed sample yet either
             mods: ModifiersState::empty(),
@@ -11268,6 +11283,84 @@ impl App {
     /// bounded frame store to the encode worker as ONE job. The control client's
     /// pending reply is answered by the worker after index.json (the completion
     /// marker) is on disk. No-op when nothing is recording.
+    /// Judge the in-flight recording's clocks on ONE event-loop wake — called
+    /// from `new_events` for EVERY `StartCause`, not just `ResumeTimeReached`.
+    /// The v0.51 law: a clock is armed only on evidence its judge will
+    /// actually see; `fold_video_deadlines` re-arms `deadline`/`next_frame`
+    /// each `about_to_wait` turn, so this judge must run on the `WaitCancelled`
+    /// wakes that preempt the armed `WaitUntil` too, or an already-past video
+    /// deadline is re-armed turn after turn (the video:104/104-past-arms spin)
+    /// while finalize/pacing starve. Cheap no-op when nothing is recording.
+    /// Pinned by `service_video_wake_consumes_due_clocks_on_any_wake`.
+    fn service_video_wake(&mut self) {
+        // The blocking control handler owns a drop guard for its request. A
+        // timeout/unwind flips this shared token; retire the tap on the next
+        // event-loop turn instead of exporting bytes for an absent client.
+        if self
+            .video_rec
+            .as_ref()
+            .is_some_and(|recording| recording.cancel.is_cancelled())
+        {
+            self.video_finalize();
+        }
+        // VIDEO introspection deadline: an idle screen presents nothing, so
+        // the post-present finalize may never run — the armed `WaitUntil`
+        // (folded in `about_to_wait`) wakes us here to finalize instead.
+        // A mid-capture RESIZE also finalizes NOW: the tap halted itself
+        // (ring sized for the old geometry), so waiting out the remaining
+        // duration would only delay the dump the client is blocked on.
+        let video_due = self.video_rec.as_ref().is_some_and(|r| {
+            Instant::now() >= r.deadline
+                || self
+                    .windows
+                    .get(&r.window)
+                    .and_then(|ws| match &ws.present {
+                        Some(
+                            PresentTarget::Gpu { window_gpu, .. }
+                            | PresentTarget::Virtual { window_gpu },
+                        ) => self
+                            .backend
+                            .gpu_ref()
+                            .and_then(|g| g.video_status(window_gpu)),
+                        _ => None,
+                    })
+                    .is_some_and(|(_, resized)| resized)
+        });
+        if video_due {
+            self.video_finalize();
+        }
+        // The recording loop's due frame: HEADLESS PRESENT-REAL (a
+        // glass-less window gets no compositor redraws, so this WaitUntil
+        // tick drives the SAME `redraw_window` path into the virtual
+        // target) and `pace` on glass (same starvation logic). RepaintKey
+        // early-out and all — an unchanged screen honestly mints no new
+        // frame. Re-armed HERE, not in the post-present hook, exactly
+        // because that early-out returns before the hook; cadence is the
+        // window's frame interval clamped to <= 60fps
+        // (AURORA_TICK_INTERVAL). Deliberately NOT the panel-rate
+        // `effect_tick_interval` the live effect train now takes: a capture
+        // file is watched later, off this panel, so paying 120 frames a
+        // second of ring + PNG encode would double the artefact for
+        // cadence nobody will play it back at.
+        let due_offscreen = self
+            .video_rec
+            .as_ref()
+            .and_then(|r| r.next_frame.map(|nf| (r.window, nf)))
+            .filter(|&(_, nf)| Instant::now() >= nf);
+        if let Some((wid, _)) = due_offscreen {
+            let interval = self
+                .windows
+                .get(&wid)
+                .and_then(|ws| ws.frame_interval)
+                .unwrap_or(self.frame_interval)
+                .max(AURORA_TICK_INTERVAL);
+            if let Some(rec) = self.video_rec.as_mut() {
+                rec.next_frame = Some(Instant::now() + interval);
+            }
+            self.redraw_window(wid);
+        }
+    }
+
     pub(crate) fn video_finalize(&mut self) {
         let Some(rec) = self.video_rec.take() else {
             return;
@@ -12778,11 +12871,14 @@ impl App {
         // The split inherits the focused pane's cwd (the pane it was split from)
         // unless the caller named one — see `split_focused_pane_in`.
         let cwd = cwd_override.or_else(|| self.focused_pane_cwd(owner));
+        // CELL-PX-1: the owner window's real cell box for the newborn split engine.
+        let cell_px = self.spawn_cell_px(owner);
         match spawn_session(
             id,
             owner,
             rows,
             cols,
+            cell_px,
             &self.session_factory,
             &proxy,
             cwd.as_deref(),
@@ -14591,76 +14687,21 @@ impl ApplicationHandler<Wake> for App {
         if !matches!(cause, StartCause::Init) {
             crate::watchdog::beat(crate::watchdog::Breadcrumb::NewEvents);
         }
-        // The blocking control handler owns a drop guard for its request. A
-        // timeout/unwind flips this shared token; retire the tap on the next
-        // event-loop turn instead of exporting bytes for an absent client.
-        if self
-            .video_rec
-            .as_ref()
-            .is_some_and(|recording| recording.cancel.is_cancelled())
-        {
-            self.video_finalize();
-        }
+        // VIDEO wake judgment, on EVERY cause (the v0.51 law: a clock is armed
+        // only on evidence its judge will actually see). `fold_video_deadlines`
+        // re-arms `deadline`/`next_frame` on every `about_to_wait` turn, but
+        // this judge used to run only under `StartCause::ResumeTimeReached` —
+        // so a loop kept awake by external events (`WaitCancelled` pressure:
+        // PTY output, pointer traffic, control requests) re-armed an
+        // already-past video deadline turn after turn without ever consuming
+        // it (`deadline_arms_by_owner` read video:104/104 past during one
+        // recording episode). Judging here, before the cause gate, consumes a
+        // due deadline no matter which cause woke the loop.
+        self.service_video_wake();
         // A `WaitUntil` deadline fired: a bell-flash end and/or a blink tick. On a
         // single `ResumeTimeReached` wake, several windows' deadlines may have
         // passed at once, so service EVERY window (not just the frontmost).
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
-            // VIDEO introspection deadline: an idle screen presents nothing, so
-            // the post-present finalize may never run — the armed `WaitUntil`
-            // (folded in `about_to_wait`) wakes us here to finalize instead.
-            // A mid-capture RESIZE also finalizes NOW: the tap halted itself
-            // (ring sized for the old geometry), so waiting out the remaining
-            // duration would only delay the dump the client is blocked on.
-            let video_due = self.video_rec.as_ref().is_some_and(|r| {
-                Instant::now() >= r.deadline
-                    || self
-                        .windows
-                        .get(&r.window)
-                        .and_then(|ws| match &ws.present {
-                            Some(
-                                PresentTarget::Gpu { window_gpu, .. }
-                                | PresentTarget::Virtual { window_gpu },
-                            ) => self
-                                .backend
-                                .gpu_ref()
-                                .and_then(|g| g.video_status(window_gpu)),
-                            _ => None,
-                        })
-                        .is_some_and(|(_, resized)| resized)
-            });
-            if video_due {
-                self.video_finalize();
-            }
-            // The recording loop's due frame: HEADLESS PRESENT-REAL (a
-            // glass-less window gets no compositor redraws, so this WaitUntil
-            // tick drives the SAME `redraw_window` path into the virtual
-            // target) and `pace` on glass (same starvation logic). RepaintKey
-            // early-out and all — an unchanged screen honestly mints no new
-            // frame. Re-armed HERE, not in the post-present hook, exactly
-            // because that early-out returns before the hook; cadence is the
-            // window's frame interval clamped to <= 60fps
-            // (AURORA_TICK_INTERVAL). Deliberately NOT the panel-rate
-            // `effect_tick_interval` the live effect train now takes: a capture
-            // file is watched later, off this panel, so paying 120 frames a
-            // second of ring + PNG encode would double the artefact for
-            // cadence nobody will play it back at.
-            let due_offscreen = self
-                .video_rec
-                .as_ref()
-                .and_then(|r| r.next_frame.map(|nf| (r.window, nf)))
-                .filter(|&(_, nf)| Instant::now() >= nf);
-            if let Some((wid, _)) = due_offscreen {
-                let interval = self
-                    .windows
-                    .get(&wid)
-                    .and_then(|ws| ws.frame_interval)
-                    .unwrap_or(self.frame_interval)
-                    .max(AURORA_TICK_INTERVAL);
-                if let Some(rec) = self.video_rec.as_mut() {
-                    rec.next_frame = Some(Instant::now() + interval);
-                }
-                self.redraw_window(wid);
-            }
             let now = Instant::now();
             let frame_interval = self.frame_interval; // read before borrowing windows
             let mut to_redraw: Vec<WindowId> = Vec::new();
@@ -20815,6 +20856,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         WindowId(0),
         rows,
         cols,
+        // CELL-PX-1: the BOOT session has no metrics to be seeded from — on a
+        // windowed launch the backend build is still running on its own thread and
+        // every metric read on a `Pending` slot is a deliberate panic. The first
+        // `apply_window_scale` (which every raster seam runs, and `attach_os_window`
+        // reaches right after the join) pushes the real cell box via
+        // `App::sync_cell_pixel_size`, before any frame is on glass.
+        None,
         &session_factory,
         &proxy,
         restore_cwd0.as_deref(),
@@ -31584,7 +31632,7 @@ mod spec_xref_gate {
         let live_modules = registered_modules();
         assert_eq!(
             live_modules.len(),
-            144,
+            145,
             "update the live TrustIr report-shape regression when the registry changes"
         );
         let mut live_report = format!(
@@ -35633,6 +35681,113 @@ mod headless_video_tests {
         // recording-lost error rather than a silent empty artifact.
         let msg = rx.recv().expect("finalize answers the pending client");
         assert!(msg.starts_with("ERR video"), "honest reply, got: {msg}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// FIX (2026-08-24 wake diagnosis): the video judge runs on EVERY
+    /// `new_events` cause, not only `ResumeTimeReached`. Under sustained
+    /// `WaitCancelled` pressure the timer cause never fires while
+    /// `fold_video_deadlines` re-arms the same past instant every
+    /// `about_to_wait` turn — the recording episode that read
+    /// `deadline_arms_by_owner` video:104/104 past. `new_events` now calls
+    /// `service_video_wake` unconditionally (before its cause gate); this
+    /// drives that judge exactly as a non-timer wake does and asserts every
+    /// due video clock is CONSUMED — the v0.51 law: a clock is armed only on
+    /// evidence its judge will actually see.
+    #[test]
+    fn service_video_wake_consumes_due_clocks_on_any_wake() {
+        // (a) A past hard-stop deadline finalizes without a timer wake.
+        let mut app = super::App::headless_for_test();
+        let (root, path, dir) = test_video_dir("video-wake-judge-finalize");
+        let (reply, rx) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        app.video_rec = Some(VideoRec {
+            window: WindowId(0),
+            deadline: now - Duration::from_millis(1),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::SwapchainTap,
+            next_frame: None,
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+        app.service_video_wake();
+        assert!(
+            app.video_rec.is_none(),
+            "a due deadline must be consumed on ANY wake, not only ResumeTimeReached"
+        );
+        assert_eq!(
+            fold_video_deadlines(app.video_rec.as_ref(), None),
+            None,
+            "idle-zero: the judge leaves nothing armed once it finalizes"
+        );
+        // The CPU test backend has no GPU take: the client gets the honest
+        // recording-lost error rather than a silent empty artifact.
+        let msg = rx.recv().expect("the blocked client is answered");
+        assert!(msg.starts_with("ERR video"), "honest reply, got: {msg}");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(root);
+
+        // (b) A due paced `next_frame` is consumed and re-armed AHEAD of now
+        // (never left in the past for the fold to re-arm turn after turn),
+        // while the recording itself lives on toward its hard stop.
+        let mut app = super::App::headless_for_test();
+        let (root, _path, dir) = test_video_dir("video-wake-judge-pace");
+        let (reply, _rx) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        app.video_rec = Some(VideoRec {
+            window: WindowId(0),
+            deadline: now + Duration::from_secs(60),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::OffscreenPresentReal,
+            next_frame: Some(now - Duration::from_millis(5)),
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+        app.service_video_wake();
+        let rec = app.video_rec.as_ref().expect("pacing does not finalize");
+        let next = rec
+            .next_frame
+            .expect("the paced recording loop stays armed");
+        assert!(
+            next > now,
+            "the past next_frame is consumed and re-armed into the future"
+        );
+        drop(app); // the drop fail-safe answers the client; not under test here
+        let _ = std::fs::remove_dir_all(root);
+
+        // (c) Nothing due: a spurious (WaitCancelled-shaped) wake changes
+        // nothing — the judge is a cheap no-op, not a scheduler.
+        let mut app = super::App::headless_for_test();
+        let (root, _path, dir) = test_video_dir("video-wake-judge-idle");
+        let (reply, _rx) = std::sync::mpsc::channel();
+        let now = Instant::now();
+        let armed_frame = now + Duration::from_secs(30);
+        app.video_rec = Some(VideoRec {
+            window: WindowId(0),
+            deadline: now + Duration::from_secs(60),
+            started_us: 0,
+            keys: false,
+            key_log: Vec::new(),
+            mode: VideoMode::OffscreenPresentReal,
+            next_frame: Some(armed_frame),
+            dir,
+            cancel: VideoCancellation::new(),
+            reply,
+        });
+        app.service_video_wake();
+        let rec = app.video_rec.as_ref().expect("nothing due: recording kept");
+        assert_eq!(
+            rec.next_frame,
+            Some(armed_frame),
+            "an undue paced frame is left exactly as armed"
+        );
+        drop(app);
         let _ = std::fs::remove_dir_all(root);
     }
 

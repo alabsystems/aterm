@@ -1260,11 +1260,30 @@ impl CursorProofProjection {
         composed_session: Option<u64>,
         composed_offset: Option<(u16, u16)>,
         input_session: u64,
+        extension_window: Option<((u16, u16), u16)>,
     ) -> Option<Self> {
+        // THE MASH EXTENSION WINDOW: while both engines hold the same fresh,
+        // unjudged Typed cohort, a new press's capture caret is accepted
+        // anywhere inside that cohort's claim window (its material caret
+        // through its predicted target, effect-space) — the terminal may have
+        // echoed `k` of the cohort's cells between the presses, which moves
+        // the caret without any frame updating the engine anchor. Never a
+        // manufactured offset: the identity/composed projection derivations
+        // below are unchanged, only the equality check widens to window
+        // membership — and only while a window exists at all.
+        let accepts = |projected: (u16, u16)| {
+            projected == effect_origin
+                || extension_window.is_some_and(|((row, start), len)| {
+                    projected.0 == row
+                        && projected.1 >= start
+                        && u32::from(projected.1) <= u32::from(start) + u32::from(len)
+                })
+        };
         let projection = match composed_session {
             // No composed-frame credential is the ordinary single-pane seam:
-            // only equal engine/Terminal anchors can use its identity path.
-            None if composed_offset.is_none() && effect_origin == terminal_origin => Self::IDENTITY,
+            // only equal engine/Terminal anchors (or a window-accepted mash
+            // caret) can use its identity path.
+            None if composed_offset.is_none() && accepts(terminal_origin) => Self::IDENTITY,
             None => return None,
             // A composed anchor requires BOTH the exact focused session and
             // its retained layout origin, even when that origin is (0, 0).
@@ -1280,8 +1299,9 @@ impl CursorProofProjection {
         // Same-session PTY output may move the local Terminal caret after the
         // retained frame. Never manufacture an offset by subtracting that new
         // caret from the old engine anchor: the canonical layout origin must
-        // project the CURRENT caret back onto the retained anchor exactly.
-        if projection.cell(terminal_origin)? != effect_origin {
+        // project the CURRENT caret back onto the retained anchor exactly
+        // (or into the mash cohort's claim window).
+        if !accepts(projection.cell(terminal_origin)?) {
             return None;
         }
         Some(projection)
@@ -1572,8 +1592,14 @@ fn arm_committed_move_after_inline(
             proof.baseline_generation,
             &mut row,
         )
-        && window.cursor_glow.cursor_anchor() == Some(proof.origin)
-        && window.cursor_trail.cursor_anchor() == Some(proof.origin)
+        // The MASH EXTENSION accepts a proof captured inside the pending
+        // cohort's claim window (the terminal may have echoed part of the
+        // cohort between the presses); every non-extension arm keeps the
+        // exact anchor-equality gate.
+        && (window.cursor_glow.cursor_anchor() == Some(proof.origin)
+            || window.cursor_glow.typed_extension_accepts(at, proof.origin))
+        && (window.cursor_trail.cursor_anchor() == Some(proof.origin)
+            || window.cursor_trail.typed_extension_accepts(at, proof.origin))
     {
         if proof.bottom_scroll {
             // A verified uniform full-screen scroll creates a fresh blank
@@ -2738,8 +2764,35 @@ impl App {
             let pending = self.windows.get(&wid).is_some_and(|ws| {
                 ws.cursor_glow.move_candidate_pending() || ws.cursor_trail.move_candidate_pending()
             });
-            self.cancel_cursor_move_candidate(wid);
-            pending
+            // THE MASH EXCEPTION (owner: "when I typed that quickly, the
+            // cursor trail broke"): a PLAIN typed-glyph press — Character,
+            // Space, or a committed IME run, never Enter/Tab/nav/chords —
+            // while BOTH engines hold a fresh, unjudged Typed cohort is the
+            // extension seam's own input class. Superseding here is what
+            // killed the whole cohort at mash speed (several presses inside
+            // one frame slip); instead the press flows to the capture fence
+            // below, whose post-inline-write arm EXTENDS the cohort with this
+            // press's exact cells. Every other input class still supersedes
+            // exactly as before — including this same key when either
+            // engine's cohort is stale, judged, or shape-ineligible.
+            let extend_eligible = pending
+                && {
+                    let class = classify_press(&ev);
+                    class.typed_forward == Some(true) && !class.enter_like
+                }
+                && {
+                    let now = std::time::Instant::now();
+                    self.windows.get(&wid).is_some_and(|ws| {
+                        ws.cursor_glow.typed_candidate_extendable(now)
+                            && ws.cursor_trail.typed_candidate_extendable(now)
+                    })
+                };
+            if extend_eligible {
+                false
+            } else {
+                self.cancel_cursor_move_candidate(wid);
+                pending
+            }
         };
         // SETTINGS MODAL: while the overlay owns this window, swallow PTY-bound input.
         // Human keys/clicks are already gated in `on_key`/`on_mouse_input`; CONTROLLER
@@ -3115,9 +3168,22 @@ impl App {
                         .windows
                         .get_mut(&wid)
                         .map_or((None, false, None), |ws| {
-                            let pending = input_superseded_candidate
-                                || ws.cursor_glow.move_candidate_pending()
+                            let engines_pending = ws.cursor_glow.move_candidate_pending()
                                 || ws.cursor_trail.move_candidate_pending();
+                            // THE MASH EXTENSION WINDOW: both engines must
+                            // hold the SAME fresh, unjudged Typed cohort for
+                            // this press to capture an extension proof; any
+                            // disagreement (or a superseding input class
+                            // upstream) keeps the old fail-closed gate.
+                            let extension_window = (!input_superseded_candidate)
+                                .then(|| ws.cursor_glow.typed_extension_window(input_now))
+                                .flatten()
+                                .filter(|window| {
+                                    ws.cursor_trail.typed_extension_window(input_now)
+                                        == Some(*window)
+                                });
+                            let pending = input_superseded_candidate
+                                || (engines_pending && extension_window.is_none());
                             let origin = (!pending)
                                 .then(|| ws.cursor_glow.cursor_anchor())
                                 .flatten()
@@ -3132,7 +3198,7 @@ impl App {
                                     } else {
                                         (None, None)
                                     };
-                                (origin, composed_session, composed_offset)
+                                (origin, composed_session, composed_offset, extension_window)
                             });
                             let buf = origin.map(|_| std::mem::take(&mut ws.poof_row_buf));
                             (anchor, pending, buf)
@@ -3227,13 +3293,14 @@ impl App {
                             (cursor.row, cursor.col)
                         };
                         let proof_projection = candidate_anchor.and_then(
-                            |(effect_origin, composed_session, composed_offset)| {
+                            |(effect_origin, composed_session, composed_offset, extension_window)| {
                                 CursorProofProjection::from_anchors(
                                     effect_origin,
                                     terminal_origin,
                                     composed_session,
                                     composed_offset,
                                     session,
+                                    extension_window,
                                 )
                             },
                         );
@@ -8363,6 +8430,17 @@ impl App {
     /// fully resolved PIXEL rectangle changes; a hidden cursor is left untouched.
     /// `cur` is the focused pane's cursor in pane
     /// sub-coords and `off` its window-space origin (matching the present path).
+    ///
+    /// THE CARET, NOT THE ENGINE CURSOR. Every caller passes the cell the caret is
+    /// actually ON, which while a composition is in flight is NOT the engine cursor:
+    /// nothing has reached the PTY yet, so the engine still points at the column the
+    /// composition BEGINS at, and the caret is that plus everything composed so far
+    /// (`aterm_core::render::ime_preedit_caret_col`, the same walk the overlay paints
+    /// with). The find well and the rename well have always passed their own splice's
+    /// caret cell; the grid's two present paths do the same. `vis` is likewise the
+    /// CARET's visibility, which a painted composition forces true — the composition
+    /// is on screen whether or not DECTCEM is showing the terminal cursor, and it is
+    /// what the candidate list must hug.
     pub(crate) fn report_ime_cursor_area(
         &mut self,
         wid: WindowId,
@@ -12711,41 +12789,42 @@ mod keystroke_press_side_effect_tests {
     #[test]
     fn cursor_proof_projection_is_identity_or_session_bound() {
         assert_eq!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), None, None, 7),
+            CursorProofProjection::from_anchors((2, 4), (2, 4), None, None, 7, None),
             Some(CursorProofProjection::IDENTITY),
             "the single-pane hot path needs no composed-frame credential"
         );
         assert_eq!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(7), Some((0, 0)), 7),
+            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(7), Some((0, 0)), 7, None),
             Some(CursorProofProjection::IDENTITY),
             "a composed pane at window origin still uses its explicit credentials"
         );
         assert!(
-            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(8), Some((0, 0)), 7,)
+            CursorProofProjection::from_anchors((2, 4), (2, 4), Some(8), Some((0, 0)), 7, None)
                 .is_none(),
             "an origin-aligned sibling pane still carries the wrong session credential"
         );
-        let split = CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), Some((5, 27)), 7)
-            .expect("the composed frame names this exact input session and pane origin");
+        let split =
+            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), Some((5, 27)), 7, None)
+                .expect("the composed frame names this exact input session and pane origin");
         assert_eq!(split.row_offset, 5);
         assert_eq!(split.col_offset, 27);
         assert_eq!(split.cell((3, 5)), Some((8, 32)));
         assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(8), Some((5, 27)), 7,)
+            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(8), Some((5, 27)), 7, None)
                 .is_none(),
             "a sibling pane's retained anchor cannot authorize this terminal"
         );
         assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), None, 7).is_none(),
+            CursorProofProjection::from_anchors((7, 31), (2, 4), Some(7), None, 7, None).is_none(),
             "a composed session without its exact layout binding is insufficient"
         );
         assert!(
-            CursorProofProjection::from_anchors((1, 3), (2, 4), Some(7), Some((0, 0)), 7,)
+            CursorProofProjection::from_anchors((1, 3), (2, 4), Some(7), Some((0, 0)), 7, None)
                 .is_none(),
             "a mismatched projection is never clamped or inferred"
         );
         assert!(
-            CursorProofProjection::from_anchors((7, 31), (2, 5), Some(7), Some((5, 27)), 7,)
+            CursorProofProjection::from_anchors((7, 31), (2, 5), Some(7), Some((5, 27)), 7, None)
                 .is_none(),
             "same-session PTY cursor motion after compose invalidates the retained anchor"
         );
@@ -12754,6 +12833,27 @@ mod keystroke_press_side_effect_tests {
         validate_cursor_input_evidence("RejectMissingLayoutBinding", false);
         validate_cursor_input_evidence("RejectMismatchedProjection", false);
         validate_cursor_input_evidence("RejectStaleAnchor", false);
+
+        // THE MASH EXTENSION WINDOW: with both engines holding the same
+        // unjudged cohort at (2, 4) over 2 cells, a capture caret anywhere in
+        // columns 4..=6 of row 2 projects; outside the window the old exact
+        // law still refuses.
+        let window = Some(((2u16, 4u16), 2u16));
+        for col in 4..=6u16 {
+            assert_eq!(
+                CursorProofProjection::from_anchors((2, 4), (2, col), None, None, 7, window),
+                Some(CursorProofProjection::IDENTITY),
+                "a mash capture caret inside the cohort window projects (col {col})"
+            );
+        }
+        assert!(
+            CursorProofProjection::from_anchors((2, 4), (2, 7), None, None, 7, window).is_none(),
+            "one column past the cohort window is a real relocation"
+        );
+        assert!(
+            CursorProofProjection::from_anchors((2, 4), (3, 4), None, None, 7, window).is_none(),
+            "a different row is outside the cohort window"
+        );
     }
 
     #[test]

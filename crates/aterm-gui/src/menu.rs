@@ -1259,11 +1259,50 @@ pub fn install(_proxy: &winit::event_loop::EventLoopProxy<crate::Wake>) -> Optio
 #[cfg(not(target_os = "macos"))]
 pub fn update_version_menu(_handle: &MenuHandle, _staged: Option<(u64, &str)>, _realized: bool) {}
 
-/// No portable native picker is linked off macOS. The global action remains visible in
-/// the cross-platform command palette, but acquires no filesystem authority here.
-#[cfg(not(target_os = "macos"))]
+/// Windows: the shell's own Common Item Dialog (`IFileOpenDialog`), with the
+/// macOS panel's exact semantics — one existing local file, aliases resolved, no
+/// type restriction, cancel is `None`. See [`crate::file_picker_win`].
+#[cfg(windows)]
+pub fn choose_local_file(title: &str, prompt: &str) -> Option<std::path::PathBuf> {
+    crate::file_picker_win::choose(title, prompt)
+}
+
+/// No portable native picker is linked on the REMAINING targets (Linux). The
+/// global action remains visible in the cross-platform command palette, but
+/// acquires no filesystem authority there — and every surface that would spend
+/// one asks [`local_file_picker_available`] first, so the row greys out instead
+/// of accepting a dead click.
+#[cfg(not(any(target_os = "macos", windows)))]
 pub fn choose_local_file(_title: &str, _prompt: &str) -> Option<std::path::PathBuf> {
     None
+}
+
+/// Whether [`choose_local_file`] can actually produce a path here — the ONE
+/// predicate every picker-backed surface gates on (the palette's File rows, and
+/// Settings ▸ Wallpaper's "Choose Image…").
+///
+/// It exists because those surfaces used to disagree: the palette greyed its rows
+/// out on `cfg!(target_os = "macos")` while the Settings button stayed
+/// unconditionally enabled, so on Windows one surface was honestly wrong (the
+/// capability was there, only the dialog was missing) and the other was a dead
+/// click. Routing both through here means a platform gains or loses the rows and
+/// the button together, and can never gain one without the other.
+///
+/// Windows answers with a live probe rather than a `cfg!` — see
+/// [`crate::file_picker_win::available`].
+#[cfg(target_os = "macos")]
+pub fn local_file_picker_available() -> bool {
+    true
+}
+
+#[cfg(windows)]
+pub fn local_file_picker_available() -> bool {
+    crate::file_picker_win::available()
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+pub fn local_file_picker_available() -> bool {
+    false
 }
 
 /// Non-macOS stub: no native alert; the "Check for Updates" result is logged instead.
@@ -2270,9 +2309,23 @@ mod macos {
 #[cfg(test)]
 mod tests {
     use super::{
-        MENU_MODEL, MenuAction, MenuEntry, menu_chrome_lines, native_menu_action_enabled,
-        set_active_tab_is_terminal, staged_apply_label, version_menu_bar_title,
+        MENU_MODEL, MenuAction, MenuEntry, local_file_picker_available, menu_chrome_lines,
+        native_menu_action_enabled, set_active_tab_is_terminal, staged_apply_label,
+        version_menu_bar_title,
     };
+
+    /// Both document runtimes already worked on Windows — the socket can drive
+    /// them today — so the rows greying out there was the picker's absence
+    /// leaking into a capability claim. With a real `IFileOpenDialog` linked, the
+    /// two platforms that HAVE a picker must both report one.
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn a_platform_with_a_picker_says_so() {
+        assert!(
+            local_file_picker_available(),
+            "macOS has NSOpenPanel and Windows has IFileOpenDialog"
+        );
+    }
 
     /// REGRESSION: the menu bar badged "v0.14.0 ⬆️" over a row reading "Update to
     /// v0.14.0 — restart now", which reads as an offer to update a build to itself.

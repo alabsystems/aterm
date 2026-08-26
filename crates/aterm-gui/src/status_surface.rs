@@ -16,15 +16,12 @@
 //! install, the updater, drive dials — is app-scoped, and every window's
 //! band shows the same truth.
 
-// STAGED LANDING. `ActivityKind`, `ActivityOutcome` and `ActivityKind::as_str` are
-// the producer-facing vocabulary this engine was built to accept — the `appstatus`
-// verb's `kind=` tokens — and the producers that will call them land next. Until
-// then they are `never used` and the workspace lint gate is `-D warnings`, so the
-// whole gate goes red for everyone rather than only for this file's author.
-//
-// Scoped to this module and explained rather than sprinkled per-item, so it is one
-// line to delete when the producers arrive. If they do NOT arrive, this comment is
-// the evidence that the vocabulary was speculative and should be removed instead.
+// ENGINE AHEAD OF ITS RENDERERS. The feed landed complete (owner-directed,
+// docs/design/STATUS-SURFACE.md) but the frame paths that will ask it for a
+// FilamentState and a LaneLine are not written yet, so every producer-facing
+// verb reads as dead on this build. Scoped to the module and removed the
+// moment the first renderer lands — a bare allow on the crate would hide the
+// real dead code this gate exists to catch.
 #![allow(dead_code)]
 
 use std::collections::VecDeque;
@@ -332,7 +329,6 @@ impl StatusFeed {
     /// The message lane's line this frame, if any: live activities rotate
     /// newest-first every [`Self::LANE_ROTATE`]; a finished activity's line
     /// lingers then fades. `budget` is the renderer's character budget.
-    #[must_use]
     pub fn lane(&self, now: Instant, budget: usize) -> Option<LaneLine> {
         if self.live.is_empty() {
             return None;
@@ -440,11 +436,9 @@ impl Activity {
     pub fn title(&self) -> &str {
         &self.title
     }
-    #[must_use]
     pub fn message(&self) -> Option<&str> {
         self.message.as_deref()
     }
-    #[must_use]
     pub fn progress_pair(&self) -> Option<(u64, u64)> {
         self.progress.map(|p| (p.num, p.den))
     }
@@ -452,7 +446,6 @@ impl Activity {
     pub fn began(&self) -> Instant {
         self.began
     }
-    #[must_use]
     pub fn outcome(&self) -> Option<&ActivityOutcome> {
         self.finished.as_ref().map(|(_, outcome)| outcome)
     }

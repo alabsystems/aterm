@@ -207,10 +207,20 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
 /// face by handing its bytes to the slice entry point, which copied them —
 /// so the moment the first CJK cell (or `⏸`) drew, the face's FILE was resident
 /// TWICE, permanently, and nothing ever read the second copy: `get` keeps its
-/// own handle and discards the one it is given. MEASURED on this Linux host at
-/// 4.03 MB (`DroidSansFallbackFull.ttf`, the broad tier) + 0.64 MB
-/// (`NotoSansSymbols2-Regular.ttf`, the symbol slot); on macOS the same two
-/// slots are `Hiragino Sans GB.ttc` (23.5 MB) and `Arial Unicode.ttf` (23.3 MB).
+/// own handle and discards the one it is given. MEASURED on this Linux host —
+/// means of three paired runs — as −3,907 kB of RSS on the broad tier
+/// (`DroidSansFallbackFull.ttf`, 4,033,420 B) and −647 kB on the symbol slot
+/// (`NotoSansSymbols2-Regular.ttf`, 656,852 B): each file's own size, to within
+/// 1% (`docs/measured/memory-footprint-2026-08-24.md` §11–12).
+///
+/// NOT extrapolated to macOS. Its chain slots are far bigger files
+/// (`Hiragino Sans GB.ttc` 23.5 MB, `Arial Unicode.ttf` 23.3 MB), but the DEFAULT
+/// macOS path never paid this at all: `select_rasterizer` returns CoreText,
+/// which draws from the bytes, so no chain face is fontdue-materialised and the
+/// duplicate never existed. It was reachable there only under
+/// `ATERM_RASTERIZER=fontdue` or the CoreText fail-safe — and unmeasured, this
+/// crate's memory numbers all being Linux ones.
+///
 /// Passing the handle over instead makes the entry's key the copy the caller was
 /// already holding — the exact bargain [`shared_parsed_face_owned`] strikes for
 /// the styled tier.
@@ -3108,7 +3118,12 @@ impl LazyFontdue {
     /// store as that entry's key ([`intern_parsed_font_owned`]): the bytes this
     /// cell is materialising are already resident in [`DISCOVERED_FONT_BYTES`] for
     /// the life of the process, so a slice here made the file resident twice —
-    /// measured at 4.67 MB on this Linux host's two chain slots, ~47 MB on macOS's.
+    /// measured on this Linux host at −3,907 kB (broad tier) + −647 kB (symbol
+    /// slot) of RSS. That arithmetic does NOT carry to macOS's much bigger chain
+    /// faces: `select_rasterizer` returns CoreText by default there, and CoreText
+    /// draws from the bytes, so the default path never materialises a chain face
+    /// and never held one twice (only `ATERM_RASTERIZER=fontdue` or the CoreText
+    /// fail-safe reached this at all, and neither is measured).
     /// [`Self::get_at`] strikes the same bargain against the other store.
     fn get(&self, bytes: &std::sync::Arc<Vec<u8>>) -> Option<&std::sync::Arc<fontdue::Font>> {
         if self.0.get().is_none() {

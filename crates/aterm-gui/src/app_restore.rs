@@ -806,6 +806,8 @@ impl App {
         let Some((rows, cols)) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols)) else {
             return;
         };
+        // CELL-PX-1: the host window's real cell box for every newborn engine.
+        let cell_px = self.spawn_cell_px(wid);
         for adopted in orphans {
             let id = self.next_session_id;
             match spawn_session(
@@ -813,6 +815,7 @@ impl App {
                 wid,
                 rows,
                 cols,
+                cell_px,
                 &self.session_factory,
                 &proxy,
                 None,
@@ -1444,6 +1447,8 @@ impl App {
             wid,
             rows,
             cols,
+            // CELL-PX-1: the host window's real cell box for the newborn engine.
+            self.spawn_cell_px(wid),
             &self.session_factory,
             &proxy,
             terminal.cwd.as_deref(),
@@ -1992,6 +1997,8 @@ impl App {
         reuse_first: Option<u64>,
     ) -> Option<pane::PaneTree> {
         let (rows, cols) = self.windows.get(&wid).map(|ws| (ws.rows, ws.cols))?;
+        // CELL-PX-1: the host window's real cell box for every newborn engine.
+        let cell_px = self.spawn_cell_px(wid);
         // A real run always has a proxy; the headless test harness (None) never gets
         // here (restore is never taken for headless runs). Guard, don't panic.
         let proxy = self.proxy.clone()?;
@@ -2020,6 +2027,7 @@ impl App {
                 wid,
                 rows,
                 cols,
+                cell_px,
                 &self.session_factory,
                 &proxy,
                 leaf.cwd(),

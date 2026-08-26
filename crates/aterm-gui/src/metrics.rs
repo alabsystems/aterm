@@ -270,6 +270,62 @@ static STALE_ARM_EPISODE: AtomicBool = AtomicBool::new(false);
 const STALE_ARM_HEAL_FLOOR_NS: u64 = 250_000_000;
 const STALE_ARM_HEAL_FLOOR: Duration = Duration::from_nanos(STALE_ARM_HEAL_FLOOR_NS);
 
+// PER-OWNER PAST-ARM STREAK HEAL (follow-ups items 18/19): the detector the
+// 250 ms floor above is structurally blind to. That heal only *considers* arms
+// with `late > 250 ms`, so a producer arming `Instant::now()` every turn — the
+// exact pre-fix `next_title_summary_retry` shape — spins at full event-loop
+// rate with `late ≈ 0` and takes the branch that RESETS its streak; and its
+// single global streak slot is defeated outright by two owners alternating
+// stale arms. This detector is DECOUPLED from the floor and PER OWNER: each
+// owner keeps a 32-arm past/future window ([`PAST_ARM_HISTORY_BY_OWNER`],
+// packed bits + fill count, single-writer event-loop state), and when more
+// than 90% of one owner's last 32 arms were already past when armed
+// (>= [`PAST_ARM_WINDOW_TRIGGER`] of [`PAST_ARM_WINDOW`]) that owner's
+// re-arms are clamped to `now + frame` — a spin degrades to display cadence
+// instead of the event loop's floor — and counted in a NAMED per-owner heal
+// ledger ([`PAST_ARM_STREAK_HEALS_BY_OWNER`], surfaced as
+// `past_arm_streak_heals` beside `deadline_arms_by_owner`). Occasional past
+// arms never trigger: a busy turn's late arm is legitimate, and the window
+// tolerates 3 healthy arms in 32. When the coarser 250 ms heal already moved
+// the same arm further out, that stronger clamp is kept — this one only ever
+// raises a deadline that would otherwise re-arm the past.
+const PAST_ARM_WINDOW: u32 = 32;
+/// `> 90%` of the 32-arm window: `ceil(0.9 * 32) + ...` — the smallest count
+/// strictly greater than 28.8 past arms.
+const PAST_ARM_WINDOW_TRIGGER: u32 = 29;
+/// One 60 Hz display frame: the clamp cadence for a windowed-streak spin. The
+/// producer's own work still runs (its deadline stays armed and near), but at
+/// frame rate rather than event-loop rate.
+const PAST_ARM_STREAK_CLAMP_NS: u64 = 16_666_667;
+const PAST_ARM_STREAK_CLAMP: Duration = Duration::from_nanos(PAST_ARM_STREAK_CLAMP_NS);
+/// Low 32 bits: the last-32-arms past bits (bit 0 = newest; 1 = armed already
+/// past). Bits 32..: how many arms the window has seen, saturating at 32.
+static PAST_ARM_HISTORY_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
+    [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
+static PAST_ARM_STREAK_HEALS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
+    [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
+const PAST_ARM_BITS_MASK: u64 = 0xFFFF_FFFF;
+
+/// Advance one owner's packed past-arm window by one arm and decide whether
+/// the streak detector fires. PURE on the packed word so the law is
+/// unit-testable with synthetic histories: the trigger requires a FULL window
+/// (32 arms seen) with >= [`PAST_ARM_WINDOW_TRIGGER`] of them past — never a
+/// short, mostly-past warmup.
+const fn past_arm_window_step(packed: u64, past: bool) -> (u64, bool) {
+    let bits = (((packed & PAST_ARM_BITS_MASK) << 1) | past as u64) & PAST_ARM_BITS_MASK;
+    let seen = {
+        let next = (packed >> 32) + 1;
+        if next > PAST_ARM_WINDOW as u64 {
+            PAST_ARM_WINDOW as u64
+        } else {
+            next
+        }
+    };
+    let trigger =
+        seen == PAST_ARM_WINDOW as u64 && bits.count_ones() >= PAST_ARM_WINDOW_TRIGGER;
+    ((seen << 32) | bits, trigger)
+}
+
 // Inter-frame GAP: wall time between two CONSECUTIVE presents (present→present),
 // the direct hitch/stutter signal ARENA-SCROLL wants — `max_frame_render_ms`
 // times ONE frame's own work, but a scrub that skips a frame (tier decode
@@ -2013,7 +2069,11 @@ pub fn update_present_drop_disposition(reason: PresentDropReason, parked: bool) 
 /// Returns the deadline the caller should actually arm: normally the input,
 /// unchanged — clamped to `now + STALE_ARM_HEAL_FLOOR` only when the SAME
 /// owner arms a deadline more than the floor in the past on consecutive turns
-/// (see the `STALE_ARM_HEALS` statics' note). A single late arm passes through
+/// (see the `STALE_ARM_HEALS` statics' note), and clamped to
+/// `now + PAST_ARM_STREAK_CLAMP` (one display frame) when > 90% of that
+/// owner's last [`PAST_ARM_WINDOW`] arms were already past regardless of HOW
+/// late (the windowed detector's note above `PAST_ARM_HISTORY_BY_OWNER`; the
+/// stronger of the two clamps wins). A single late arm passes through
 /// untouched: a busy turn legitimately computes a deadline that is already
 /// behind it, and healing that would delay real work. The recorded
 /// `deadline_late_ms`/`past_deadline_arms` always describe the REQUESTED
@@ -2040,6 +2100,11 @@ pub fn record_deadline(
             STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
             STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
             note_owner_arm(owner, false);
+            // A healthy arm feeds the owner's 32-arm window too: it dilutes a
+            // past streak instead of resetting it, which is exactly what makes
+            // this detector immune to the `late ≈ 0`/"a nanosecond in the
+            // future" blip that clears the consecutive-turn latch above.
+            let _ = note_past_arm_window(owner, false);
             (owner, clock_now.saturating_add(ahead), 0)
         }
         Some(deadline) => {
@@ -2064,6 +2129,20 @@ pub fn record_deadline(
             } else if late <= STALE_ARM_HEAL_FLOOR_NS {
                 STALE_ARM_STREAK_OWNER.store(DeadlineOwner::None as u64, Ordering::Relaxed);
                 STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
+            }
+            // The WINDOWED per-owner detector (items 18/19): fires when > 90%
+            // of this owner's last 32 arms were already past, at ANY lateness
+            // — the `late ≈ 0` spin the floor above cannot see, and the
+            // alternating-owner spin its single streak slot cannot see. Clamp
+            // this owner's re-arm to one display frame ahead unless a stronger
+            // heal (the 250 ms floor above) already moved it further out; the
+            // clamped arms are counted in the owner's NAMED streak-heal ledger.
+            if note_past_arm_window(owner, true) {
+                let clamp = now + PAST_ARM_STREAK_CLAMP;
+                if armed.is_none_or(|current| current < clamp) {
+                    armed = Some(clamp);
+                    note_past_arm_streak_heal(owner);
+                }
             }
             (owner, clock_now.saturating_sub(late), late)
         }
@@ -2092,6 +2171,41 @@ fn note_owner_arm(owner: DeadlineOwner, past: bool) {
     if past {
         PAST_DEADLINE_ARMS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Push one arm into the owner's windowed past/future history and report
+/// whether the streak detector fires (see the `PAST_ARM_HISTORY_BY_OWNER`
+/// note). Single-writer state — only the event-loop thread records deadlines —
+/// so the load/store pair is not a torn read-modify-write in practice, and
+/// Relaxed matches every other counter on this path.
+fn note_past_arm_window(owner: DeadlineOwner, past: bool) -> bool {
+    if matches!(owner, DeadlineOwner::None) {
+        return false;
+    }
+    let Some(slot) = usize::try_from(owner as u64)
+        .ok()
+        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
+    else {
+        return false;
+    };
+    let packed = PAST_ARM_HISTORY_BY_OWNER[slot].load(Ordering::Relaxed);
+    let (next, trigger) = past_arm_window_step(packed, past);
+    PAST_ARM_HISTORY_BY_OWNER[slot].store(next, Ordering::Relaxed);
+    trigger
+}
+
+/// Book one arm the WINDOWED streak detector actually clamped, against its
+/// owner. Kept per-owner (not one global counter) for the same reason as
+/// `deadline_arms_by_owner`: a heal that cannot name its producer sends the
+/// investigation to the wrong module.
+fn note_past_arm_streak_heal(owner: DeadlineOwner) {
+    let Some(slot) = usize::try_from(owner as u64)
+        .ok()
+        .filter(|i| *i < DEADLINE_OWNER_SLOTS)
+    else {
+        return;
+    };
+    PAST_ARM_STREAK_HEALS_BY_OWNER[slot].fetch_add(1, Ordering::Relaxed);
 }
 
 /// One owner's arm ledger since the last [`reset`].
@@ -2127,6 +2241,22 @@ pub fn deadline_arm_attribution() -> Vec<OwnerArms> {
                 arms,
                 past_arms,
             })
+        })
+        .collect()
+}
+
+/// Per-owner ledger of arms the WINDOWED streak detector clamped
+/// (`(owner label, heals)`; see the `PAST_ARM_HISTORY_BY_OWNER` note).
+/// Sparse — non-zero owners only — and surfaced beside
+/// `deadline_arms_by_owner` for the same reason that field exists: ANY
+/// non-zero entry names a producer that kept re-arming the past across a full
+/// 32-arm window, i.e. a live scheduler bug degraded to frame cadence.
+#[must_use]
+pub fn past_arm_streak_heal_attribution() -> Vec<(&'static str, u64)> {
+    (0..DEADLINE_OWNER_SLOTS)
+        .filter_map(|slot| {
+            let heals = PAST_ARM_STREAK_HEALS_BY_OWNER[slot].load(Ordering::Relaxed);
+            (heals != 0).then(|| (DeadlineOwner::from_raw(slot as u64).as_str(), heals))
         })
         .collect()
 }
@@ -2253,6 +2383,14 @@ pub fn reset() {
     STALE_ARM_HEALS.store(0, Ordering::Relaxed);
     STALE_ARM_STREAK_OWNER.store(0, Ordering::Relaxed);
     STALE_ARM_EPISODE.store(false, Ordering::Relaxed);
+    // The windowed detector's ledger AND history clear together: the counters
+    // are window stats, and the packed histories are detection state whose
+    // stale 32-arm windows would otherwise convict the fresh measurement
+    // window with the previous one's evidence.
+    for slot in 0..DEADLINE_OWNER_SLOTS {
+        PAST_ARM_HISTORY_BY_OWNER[slot].store(0, Ordering::Relaxed);
+        PAST_ARM_STREAK_HEALS_BY_OWNER[slot].store(0, Ordering::Relaxed);
+    }
     // Frame-gap window: clear the max AND the previous-present stamp so the idle
     // gap straddling the reset is never counted (the next present starts fresh).
     MAX_FRAME_GAP_NS.store(0, Ordering::Relaxed);
@@ -2636,6 +2774,17 @@ pub fn snapshot() -> Snapshot {
         startup_gpu_cell_pipeline_ns: gpu.cell_pipeline_ns,
     }
 }
+
+/// `record_deadline` and `reset` mutate PROCESS-GLOBAL state — the stale-arm
+/// streak latch, the per-owner arm counters, and the windowed past-arm
+/// histories — so the tests that drive them cannot interleave: one test's
+/// healthy arm clears another's streak, both book arms into the same tables,
+/// and an unserialized `reset()` erases arms another test just booked (the
+/// pre-2026-08-25 flake in `arms_are_attributed_to_the_owner_that_armed_them`).
+/// Serialize the drivers. At module scope because the drivers span
+/// `startup_phase_tests` (reset) and `histogram_tests` (record_deadline).
+#[cfg(test)]
+static SCHEDULER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod startup_worker_tests {
@@ -3033,6 +3182,13 @@ mod startup_phase_tests {
 
     #[test]
     fn reset_preserves_the_immutable_startup_fact() {
+        // `reset()` zeroes the per-owner arm tables the serialized
+        // `record_deadline` drivers increment-and-read, so an unserialized
+        // reset lands mid-test and (pre-existing flake) erased the arms
+        // `arms_are_attributed_to_the_owner_that_armed_them` had just booked.
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = *STARTUP_PRESENT.get_or_init(|| StartupPresentSample {
             gui_entry_ns: 35,
             rust_main_ns: 36,
@@ -3245,12 +3401,6 @@ mod histogram_tests {
     /// self-rearming `WaitUntil(past)` spin, and the fold must clamp it to
     /// `now + floor` and count the heal so the loop survives the whole class
     /// visibly.
-    /// `record_deadline` mutates PROCESS-GLOBAL state — the stale-arm streak
-    /// latch and the per-owner arm counters — so the tests that drive it cannot
-    /// interleave: one test's healthy arm clears another's streak, and both
-    /// book arms into the same table. Serialize the drivers.
-    static SCHEDULER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn consecutive_same_owner_stale_arms_heal_to_the_floor() {
         let _serial = SCHEDULER_STATE
@@ -3303,6 +3453,178 @@ mod histogram_tests {
 
         // Leave no streak behind for other tests.
         assert_eq!(record_deadline(owner, Some(future), now), Some(future));
+    }
+
+    /// The PURE window law behind the items-18/19 detector: a trigger needs a
+    /// FULL 32-arm window with more than 90% of it past (>= 29 of 32) — never
+    /// a short mostly-past warmup — and a healthy arm DILUTES the window
+    /// instead of resetting it (the property the consecutive-turn latch above
+    /// lacks, and exactly how a `late ≈ 0`/nanosecond-in-the-future blip used
+    /// to hide a spin).
+    #[test]
+    fn past_arm_window_step_requires_a_full_window_over_ninety_percent_past() {
+        let run = |arms: &[bool]| {
+            let mut packed = 0u64;
+            let mut last = false;
+            for &past in arms {
+                let (next, trigger) = past_arm_window_step(packed, past);
+                packed = next;
+                last = trigger;
+            }
+            (packed, last)
+        };
+        // 31 consecutive past arms: window not yet full, never triggers.
+        let mut warmup = vec![true; 31];
+        assert!(!run(&warmup).1, "a not-yet-full window must not convict");
+        // The 32nd closes an all-past window; the fill count saturates at 32.
+        warmup.push(true);
+        let (packed, trigger) = run(&warmup);
+        assert!(trigger, "32/32 past is the streak signature");
+        assert_eq!(packed >> 32, u64::from(PAST_ARM_WINDOW), "fill saturates");
+        assert!(
+            past_arm_window_step(packed, true).1,
+            "the streak keeps triggering while it persists"
+        );
+        // Boundary: 29/32 past (> 90%) triggers; 28/32 does not.
+        let mut edge = vec![false; 3];
+        edge.extend(std::iter::repeat_n(true, 29));
+        assert!(run(&edge).1, "29 of 32 past is over the 90% line");
+        let mut under = vec![false; 4];
+        under.extend(std::iter::repeat_n(true, 28));
+        assert!(!run(&under).1, "28 of 32 past is under the 90% line");
+        // Dilution, not reset: one healthy arm inside an otherwise-past
+        // window leaves 31/32 past — still a conviction.
+        let mut interleaved = vec![true; 16];
+        interleaved.push(false);
+        interleaved.extend(std::iter::repeat_n(true, 16));
+        assert!(
+            run(&interleaved).1,
+            "a single healthy blip must not acquit a windowed spin"
+        );
+    }
+
+    /// ITEMS 18/19 (2026-08-24 wake follow-ups): the WINDOWED per-owner
+    /// detector heals the two flavours the 250 ms floor above is structurally
+    /// blind to — the `late ≈ 0` spin (every arm barely past, each one taking
+    /// the branch that RESETS the consecutive-turn latch) and two owners
+    /// alternating stale arms (defeating the single global streak slot). The
+    /// clamp is one display frame, so a healed spin degrades to cadence, and
+    /// every clamped arm lands in the owner's NAMED ledger beside
+    /// `deadline_arms_by_owner`.
+    #[test]
+    fn windowed_past_arm_streaks_heal_at_any_lateness_and_per_owner() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let clear = |owner: DeadlineOwner| {
+            PAST_ARM_HISTORY_BY_OWNER[owner as usize].store(0, Ordering::Relaxed);
+            PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].store(0, Ordering::Relaxed);
+        };
+        let heals_of =
+            |owner: DeadlineOwner| PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].load(Ordering::Relaxed);
+        let now = Instant::now();
+        let future = now + Duration::from_millis(5);
+        // 1 ms late: UNDER the 250 ms floor, so the consecutive-turn heal
+        // above never fires — this is the pre-fix `arms Instant::now() every
+        // turn` shape, previously invisible.
+        let barely = now - Duration::from_millis(1);
+
+        // (1) The `late ≈ 0` spin, on the fix's own owner: 31 barely-late arms
+        // pass through (an honest busy stretch must not be delayed), the arm
+        // that completes an all-past window is clamped to one frame ahead and
+        // counted, and the heal SUSTAINS while the spin does.
+        let video = DeadlineOwner::Video;
+        clear(video);
+        for _ in 0..31 {
+            assert_eq!(
+                record_deadline(video, Some(barely), now),
+                Some(barely),
+                "a not-yet-full window never heals"
+            );
+        }
+        assert_eq!(heals_of(video), 0);
+        assert_eq!(
+            record_deadline(video, Some(barely), now),
+            Some(now + PAST_ARM_STREAK_CLAMP),
+            "arm 32 of an all-past window is clamped to now + one frame"
+        );
+        assert_eq!(
+            record_deadline(video, Some(barely), now),
+            Some(now + PAST_ARM_STREAK_CLAMP),
+            "the clamp sustains at frame cadence while the spin persists"
+        );
+        assert_eq!(heals_of(video), 2);
+        assert!(
+            past_arm_streak_heal_attribution()
+                .iter()
+                .any(|&(owner, heals)| owner == "video" && heals == 2),
+            "the ledger NAMES the producer it clamped"
+        );
+
+        // (2) 28/32 past stays under the > 90% trigger: occasional lateness —
+        // even a lot of it — is not the streak signature.
+        let word = DeadlineOwner::WordDecorations;
+        clear(word);
+        for _ in 0..4 {
+            assert_eq!(record_deadline(word, Some(future), now), Some(future));
+        }
+        for _ in 0..28 {
+            assert_eq!(
+                record_deadline(word, Some(barely), now),
+                Some(barely),
+                "28 of 32 past must pass through unhealed"
+            );
+        }
+        assert_eq!(heals_of(word), 0);
+
+        // (3) Two owners ALTERNATING deeply stale arms: the global
+        // consecutive-turn latch never sees the same owner twice in a row and
+        // stays silent, but each owner's own window convicts it.
+        let (left, right) = (DeadlineOwner::CursorEffect, DeadlineOwner::Predictor);
+        let stale = now - Duration::from_secs(2);
+        clear(left);
+        clear(right);
+        let floor_heals_before = STALE_ARM_HEALS.load(Ordering::Relaxed);
+        for _ in 0..31 {
+            assert_eq!(record_deadline(left, Some(stale), now), Some(stale));
+            assert_eq!(record_deadline(right, Some(stale), now), Some(stale));
+        }
+        assert_eq!(
+            STALE_ARM_HEALS.load(Ordering::Relaxed),
+            floor_heals_before,
+            "the single-slot consecutive heal is defeated by alternation"
+        );
+        assert_eq!(
+            record_deadline(left, Some(stale), now),
+            Some(now + PAST_ARM_STREAK_CLAMP)
+        );
+        assert_eq!(
+            record_deadline(right, Some(stale), now),
+            Some(now + PAST_ARM_STREAK_CLAMP)
+        );
+        assert_eq!((heals_of(left), heals_of(right)), (1, 1));
+
+        // (4) When the coarser 250 ms heal already moved a consecutive
+        // same-owner arm further out, the stronger clamp is KEPT and the
+        // windowed ledger does not double-count that arm.
+        assert_eq!(
+            record_deadline(left, Some(stale), now),
+            Some(now + PAST_ARM_STREAK_CLAMP),
+            "first consecutive offence: the floor heal is not armed yet"
+        );
+        assert_eq!(heals_of(left), 2);
+        assert_eq!(
+            record_deadline(left, Some(stale), now),
+            Some(now + STALE_ARM_HEAL_FLOOR),
+            "the stronger (floor) clamp wins over the frame clamp"
+        );
+        assert_eq!(heals_of(left), 2, "an arm the floor heal owns is not re-counted");
+
+        // Leave neither latch nor window residue behind for other tests.
+        assert_eq!(record_deadline(left, Some(future), now), Some(future));
+        for owner in [video, word, left, right] {
+            clear(owner);
+        }
     }
 
     /// ITEM 8, and the append-only wire contract that protects it. `SessionStatus`

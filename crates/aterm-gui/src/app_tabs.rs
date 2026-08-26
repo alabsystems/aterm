@@ -2829,11 +2829,17 @@ impl App {
         let cwd = cwd_override
             .map(str::to_string)
             .or_else(|| self.focused_pane_cwd(owner));
+        // CELL-PX-1: the owner window's real cell box, installed in the newborn
+        // engine at construction — this is the tab that used to answer DEC 1016 and
+        // size OSC 1337 images from the engine's 8x16 placeholder until the user
+        // happened to drag the window.
+        let cell_px = self.spawn_cell_px(owner);
         match spawn_session(
             id,
             owner,
             rows,
             cols,
+            cell_px,
             &self.session_factory,
             &proxy,
             cwd.as_deref(),

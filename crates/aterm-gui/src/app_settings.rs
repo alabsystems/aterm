@@ -1649,6 +1649,20 @@ impl App {
         let grid_snap = (!has_overlay && native_update.is_none())
             .then(|| self.grid_snapshot(wid))
             .flatten();
+        // The grid's on-screen geometry and the tab strip it sits under. Both are read
+        // from state the frame ALREADY computed (`win_cell_size`/`win_pad_top` metrics,
+        // and the very `tab_segments` the mouse hit-tests against), so this adds no
+        // layout work — and, like everything else here, it is only reached once an OS
+        // a11y client has attached.
+        let grid_geometry = grid_snap
+            .is_some()
+            .then(|| self.grid_a11y_geometry(wid))
+            .flatten();
+        let grid_tabs = if grid_snap.is_some() {
+            self.grid_a11y_tabs(wid)
+        } else {
+            Vec::new()
+        };
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -1660,7 +1674,10 @@ impl App {
                 Some(Ok((update, published))) => (update, Some(published)),
                 Some(Err(_)) => (crate::accesskit_tree::empty_tree(), None),
                 None => match &grid_snap {
-                    Some(snap) => (crate::accesskit_tree::grid_tree(snap), None),
+                    Some(snap) => (
+                        crate::accesskit_tree::grid_tree(snap, grid_geometry, &grid_tabs),
+                        None,
+                    ),
                     None => (crate::accesskit_tree::empty_tree(), None),
                 },
             },
@@ -1673,6 +1690,86 @@ impl App {
             return;
         };
         adapter.update_if_active(move || update);
+    }
+
+    /// Where window `wid`'s visible grid (and the tab strip above it) landed in the client
+    /// area, in PHYSICAL pixels — the space `accesskit_winit` reports root window bounds
+    /// in. Straight from the window's own metrics, the same numbers the frame was laid out
+    /// with; `None` for an unknown window or a degenerate cell size, in which case the
+    /// tree simply omits geometry (the Text interface is unaffected).
+    #[cfg(feature = "a11y-accesskit")]
+    fn grid_a11y_geometry(
+        &self,
+        wid: crate::WindowId,
+    ) -> Option<crate::accesskit_tree::GridGeometry> {
+        // An unknown window would silently fall back to the SHARED backend metrics, which
+        // is another window's geometry — fail closed instead.
+        if !self.windows.contains_key(&wid) {
+            return None;
+        }
+        let (cw, ch) = self.win_cell_size(wid);
+        if cw == 0 || ch == 0 {
+            return None;
+        }
+        let strip_rows = usize::from(self.tab_strip_rows);
+        // The strip band starts below the top pad + chrome headroom; the GRID starts below
+        // the band — exactly `native_content_origin_y`, and exactly where `grid_snapshot`
+        // re-bases the cursor to.
+        let strip_y = self.win_pad_top(wid).saturating_add(self.win_head(wid));
+        Some(crate::accesskit_tree::GridGeometry {
+            origin_x: self.win_pad(wid) as f64,
+            origin_y: self.native_content_origin_y(wid) as f64,
+            cell_w: cw as f64,
+            cell_h: ch as f64,
+            strip_y: strip_y as f64,
+            strip_h: (strip_rows * ch) as f64,
+        })
+    }
+
+    /// The in-grid tab strip of window `wid` as publishable a11y items, or empty when
+    /// there is nothing a screen reader should be told about.
+    ///
+    /// Empty unless the strip is actually ON SCREEN (`tab_strip_rows > 0`) and holds at
+    /// least two tabs: a solo strip is painted as the window TITLE, not a switcher (see
+    /// `TabSegment::solo`), so publishing a one-item tab list would announce a control
+    /// that is not there. Labels come from the window's `strip_titles_scratch` and column
+    /// spans from its cached `tab_segments` — the very buffers the last paint filled and
+    /// the mouse hit-tests against, so the announced tab and the clickable tab are the
+    /// same one by construction.
+    #[cfg(feature = "a11y-accesskit")]
+    fn grid_a11y_tabs(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridTab> {
+        if self.tab_strip_rows == 0 {
+            return Vec::new();
+        }
+        let Some(ws) = self.windows.get(&wid) else {
+            return Vec::new();
+        };
+        if ws.tab_set.len() < 2 {
+            return Vec::new();
+        }
+        let active = ws.tab_set.active_index();
+        ws.tab_segments
+            .iter()
+            .filter_map(|segment| {
+                let crate::tab_bar::TabHit::Select(index) = segment.kind else {
+                    return None;
+                };
+                if segment.solo {
+                    return None;
+                }
+                Some(crate::accesskit_tree::GridTab {
+                    index,
+                    title: ws
+                        .strip_titles_scratch
+                        .get(index)
+                        .cloned()
+                        .unwrap_or_else(|| "aterm".to_string()),
+                    selected: active == Some(index),
+                    start_col: segment.start_col,
+                    end_col: segment.end_col,
+                })
+            })
+            .collect()
     }
 
     /// P2: handle an event from a window's AccessKit adapter (delivered as
@@ -1733,6 +1830,25 @@ impl App {
             .and_then(|ws| ws.overlay.as_ref())
             .map(crate::overlay::Overlay::kind);
         let Some(kind) = kind else {
+            // No overlay: the published tree is either a native tab app's projection or
+            // the terminal grid. Only the grid tree mints tab ids, and it mints them in a
+            // range no other builder uses, so decoding one here cannot steal a native
+            // app's request. Focus and Click both mean "show me this tab" — a tab strip
+            // has no separate select-vs-activate step.
+            if matches!(
+                req.action,
+                accesskit::Action::Click | accesskit::Action::Focus
+            ) && let Some(index) = crate::accesskit_tree::tab_index_for(req.target_node)
+            {
+                self.switch_tab_in(wid, index);
+                if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+                    w.request_redraw();
+                }
+                // Republish synchronously: a screen reader must hear the new selection
+                // even if the visual frame is coalesced away.
+                self.push_a11y_tree(wid);
+                return;
+            }
             self.on_native_accessibility_action(wid, req);
             return;
         };

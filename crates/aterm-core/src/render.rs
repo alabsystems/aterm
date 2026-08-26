@@ -2403,67 +2403,81 @@ impl RenderInput {
             ..RenderCell::default()
         };
         let start_col = self.cursor_col;
-        let mut col = self.cursor_col;
-        let mut caret_col: Option<usize> = None;
-        let caret = caret_byte.unwrap_or(preedit.len());
-        for (byte, ch) in preedit.char_indices() {
-            if caret_col.is_none() && byte >= caret {
-                caret_col = Some(col);
-            }
-            let width = if cjk {
-                aterm_grapheme::char_width_cjk(ch)
-            } else {
-                aterm_grapheme::char_width(ch)
-            };
-            if width == 0 {
-                continue;
-            }
-            if col + width > cols {
-                break; // truncate: a wide char never straddles the edge
-            }
-            // Materialize the ragged tail up to (and including) the cells this
-            // character occupies — the gate above proves `col + width <= cols`,
-            // so the row never grows past the frame's width.
-            if cells.len() < col + width {
-                cells.resize(col + width, pad);
-            }
-            let lead = crate::terminal::RenderCell {
-                ch,
-                fg: seed.fg,
-                bg: seed.bg,
-                wide: false,
-                emoji_presentation: false,
-                text_presentation: false,
-                bold: false,
-                italic: false,
-                underline: crate::terminal::UnderlineStyle::Single,
-                strikethrough: false,
-                overline: false,
-                underline_color: None,
-            };
-            if let Some(cell) = cells.get_mut(col) {
-                *cell = lead;
-            }
-            if width == 2
-                && let Some(cont) = cells.get_mut(col + 1)
-            {
-                *cont = crate::terminal::RenderCell {
-                    ch: ' ',
-                    wide: true,
+        // A composition that STARTS on a wide character's continuation column is
+        // overwriting that character's right half — exactly what the write path
+        // does when you type into it — so its LEAD must go too. Left standing,
+        // the renderer draws the old glyph across both columns and paints it
+        // straight over the composition's first cell: the same failure the
+        // `clusters` drop below fixes for multi-scalar graphemes, which plain
+        // wide characters do not go through. Read BEFORE the walk overwrites it.
+        let straddled_lead =
+            (start_col > 0 && cells.get(start_col).is_some_and(|c| c.wide)).then(|| start_col - 1);
+        let (end_col, caret_col) = walk_ime_preedit(
+            preedit,
+            caret_byte,
+            cjk,
+            start_col,
+            cols,
+            |ch, col, width| {
+                // Materialize the ragged tail up to (and including) the cells
+                // this character occupies — the walk proves `col + width <=
+                // cols`, so the row never grows past the frame's width.
+                if cells.len() < col + width {
+                    cells.resize(col + width, pad);
+                }
+                let lead = crate::terminal::RenderCell {
+                    ch,
+                    fg: seed.fg,
+                    bg: seed.bg,
+                    wide: false,
+                    emoji_presentation: false,
+                    text_presentation: false,
+                    bold: false,
+                    italic: false,
                     underline: crate::terminal::UnderlineStyle::Single,
-                    ..lead
+                    strikethrough: false,
+                    overline: false,
+                    underline_color: None,
                 };
-            }
-            col += width;
-        }
+                if let Some(cell) = cells.get_mut(col) {
+                    *cell = lead;
+                }
+                if width == 2
+                    && let Some(cont) = cells.get_mut(col + 1)
+                {
+                    *cont = crate::terminal::RenderCell {
+                        ch: ' ',
+                        wide: true,
+                        underline: crate::terminal::UnderlineStyle::Single,
+                        ..lead
+                    };
+                }
+            },
+        );
         // The overlay puts its scalar in `ch`, but a cell that previously held a
         // MULTI-SCALAR grapheme also has that text in `clusters` (and its marks
         // in `combining`), and both renderers prefer those over `ch` when they
         // resolve the glyph. Left behind, composing over a flag or a ZWJ emoji
         // would paint the OLD grapheme on top of the new composition. Free in
         // the common case: a row with no complex graphemes has an empty list.
-        if col > start_col {
-            let covered = start_col..col;
+        if end_col > start_col {
+            let mut lo = start_col;
+            let mut hi = end_col;
+            if let Some(lead) = straddled_lead
+                && let Some(cell) = cells.get_mut(lead)
+            {
+                *cell = pad;
+                lo = lead;
+            }
+            // The mirror at the far end: a composition that STOPS inside a wide
+            // character leaves that character's continuation behind with its
+            // lead already overwritten — a stranded blank wearing the old cell's
+            // background, one column wider than the composition really is.
+            if cells.get(end_col).is_some_and(|c| c.wide) {
+                cells[end_col] = pad;
+                hi = end_col + 1;
+            }
+            let covered = lo..hi;
             if let Some(clusters) = self.clusters.get_mut(row) {
                 clusters.retain(|(c, _)| !covered.contains(c));
             }
@@ -2471,7 +2485,7 @@ impl RenderInput {
                 combining.retain(|(c, _)| !covered.contains(c));
             }
         }
-        self.cursor_col = caret_col.unwrap_or(col).min(cols.saturating_sub(1));
+        self.cursor_col = caret_col;
     }
 
     /// The frame's IMPLICIT BLANK at viewport cell (`row`, `col`): the cell the
@@ -2502,6 +2516,82 @@ impl RenderInput {
             ..RenderCell::default()
         })
     }
+}
+
+/// THE ONE column walk an IME composition takes: every character's width under
+/// the frame's ambiguous-width mode, the right-edge truncation, and where the
+/// platform's caret byte lands among them.
+///
+/// [`RenderInput::overlay_ime_preedit`] paints through `emit` (called once per
+/// character that FITS, with its scalar, its starting column and its width);
+/// [`ime_preedit_caret_col`] passes a no-op and keeps only the caret. Sharing
+/// the walk is the point: the composition's ink and the rectangle the OS
+/// candidate window is anchored on are then the same arithmetic, so they cannot
+/// drift apart the way two hand-kept copies would.
+///
+/// Returns `(end_col, caret_col)` — the column the composition stopped at
+/// (truncation included) and the caret's final, row-clamped column.
+fn walk_ime_preedit(
+    preedit: &str,
+    caret_byte: Option<usize>,
+    cjk: bool,
+    start_col: usize,
+    cols: usize,
+    mut emit: impl FnMut(char, usize, usize),
+) -> (usize, usize) {
+    let mut col = start_col;
+    let mut caret_col: Option<usize> = None;
+    let caret = caret_byte.unwrap_or(preedit.len());
+    for (byte, ch) in preedit.char_indices() {
+        if caret_col.is_none() && byte >= caret {
+            caret_col = Some(col);
+        }
+        let width = if cjk {
+            aterm_grapheme::char_width_cjk(ch)
+        } else {
+            aterm_grapheme::char_width(ch)
+        };
+        // Zero-width characters (a combining mark fresh off a dead key) merge
+        // into the preceding cell like the write path would: nothing to draw,
+        // nothing to advance.
+        if width == 0 {
+            continue;
+        }
+        if col + width > cols {
+            break; // truncate: a wide char never straddles the edge
+        }
+        emit(ch, col, width);
+        col += width;
+    }
+    (col, caret_col.unwrap_or(col).min(cols.saturating_sub(1)))
+}
+
+/// WHERE THE COMPOSITION'S OWN CARET IS, in columns — the same answer
+/// [`RenderInput::overlay_ime_preedit`] leaves in `cursor_col`, resolved without
+/// painting anything.
+///
+/// The OS candidate window is anchored on the caret RECTANGLE the host reports
+/// (`set_ime_cursor_area`), and an in-flight composition has not reached the PTY
+/// yet — so the ENGINE cursor still sits at the column the composition STARTS
+/// at, and anchoring there walks the candidate list left by the whole width of
+/// what you have typed so far. Japanese phrase input routinely composes twenty
+/// columns before committing; the list ends up under the beginning of the
+/// phrase instead of under the cursor. The find well and the rename well already
+/// anchor on their own splice's caret cell — this is the grid's version of the
+/// same answer, for the split, single-pane and capture paths alike.
+///
+/// `start_col` is the frame's cursor column and `cols` the frame width, both in
+/// the same coordinate space the overlay would paint in (pane-local for a split
+/// leaf).
+#[must_use]
+pub fn ime_preedit_caret_col(
+    preedit: &str,
+    caret_byte: Option<usize>,
+    cjk: bool,
+    start_col: usize,
+    cols: usize,
+) -> usize {
+    walk_ime_preedit(preedit, caret_byte, cjk, start_col, cols, |_, _, _| {}).1
 }
 
 #[cfg(test)]
@@ -2777,6 +2867,286 @@ mod ime_preedit_ragged_row_tests {
             "the covered cell's grapheme goes with it"
         );
         assert_eq!(f.cluster_at(0, 2), None, "and nothing else is disturbed");
+    }
+}
+
+/// THE NEIGHBOURS OF THE RAGGED-ROW FIX — the cases materializing the row could
+/// plausibly have broken, driven (like the module above) from real `Terminal`
+/// extractions so the geometry is the engine's.
+///
+/// Materialization only ever runs when `cells.len() < col + width`, so a row
+/// that is already full must come out exactly as it did before the fix; and the
+/// right-edge gate runs BEFORE the `resize`, so a composition that does not fit
+/// must not grow the row on its way to being truncated. Column 0 of a row with
+/// NO written prefix is the extreme of the ragged case (`cells[row]` is an empty
+/// `Vec`, not a short one), and the `cjk` argument — the one input no test in
+/// this file exercised — has to reach the width call it selects.
+#[cfg(test)]
+mod ime_preedit_neighbour_tests {
+    use super::RenderInput;
+    use crate::terminal::{Rgb, Terminal, UnderlineStyle};
+
+    /// A host-configured terminal (resolved defaults, as every windowed frame
+    /// has) after `bytes`.
+    fn painted_frame(rows: u16, cols: u16, bytes: &[u8]) -> RenderInput {
+        let mut term = Terminal::new(rows, cols);
+        term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
+        term.set_default_background(Rgb::new(0x1B, 0x1D, 0x1E));
+        term.process(bytes);
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, rows.into(), cols.into());
+        f
+    }
+
+    /// A FULL row: `resize` never fires, and the seed must still come from the
+    /// cursor cell that genuinely exists there — not from the live default the
+    /// ragged fallback introduced. This is the pre-fix path, unchanged.
+    #[test]
+    fn a_full_row_keeps_its_length_and_still_seeds_from_its_own_cursor_cell() {
+        let mut f = painted_frame(2, 10, b"abc\x1b[31;44mdefghij\r\x1b[4G");
+        assert_eq!(f.cells[0].len(), 10, "fixture: the row is FULL");
+        assert_eq!((f.cursor_row, f.cursor_col), (0, 3));
+        let (fg, bg) = (f.cells[0][3].fg, f.cells[0][3].bg);
+        assert_ne!(
+            (fg, bg),
+            ([0xC0, 0xC5, 0xCE], [0x1B, 0x1D, 0x1E]),
+            "fixture: the cursor cell must NOT be wearing the frame defaults, or \
+             this cannot tell the two seeds apart"
+        );
+
+        f.overlay_ime_preedit("XY", None, false);
+        assert_eq!(f.cells[0].len(), 10, "materializing never grows a full row");
+        assert_eq!(f.cells[0][3].ch, 'X');
+        assert_eq!(f.cells[0][4].ch, 'Y');
+        assert_eq!(
+            (f.cells[0][3].fg, f.cells[0][3].bg),
+            (fg, bg),
+            "the cursor cell still wins the seed"
+        );
+        assert_eq!(f.cells[0][5].ch, 'f', "nothing right of it moved");
+        assert_eq!(f.cursor_col, 5);
+    }
+
+    /// Column 0 of a row with NO written prefix at all — `cells[row]` is empty,
+    /// the extreme of the raggedness. This is the second line of a wrapped
+    /// prompt, and every line of a freshly cleared screen.
+    #[test]
+    fn a_composition_at_column_zero_of_an_unwritten_row_is_painted() {
+        let mut f = painted_frame(3, 20, b"$ \r\n");
+        assert!(
+            f.cells[1].is_empty(),
+            "fixture: the row has no written prefix at all"
+        );
+        assert_eq!((f.cursor_row, f.cursor_col), (1, 0));
+
+        f.overlay_ime_preedit("日", None, false);
+        assert_eq!(f.cells[1].len(), 2);
+        assert_eq!(f.cells[1][0].ch, '日');
+        assert!(f.cells[1][1].wide, "the continuation is materialized too");
+        assert_eq!(f.cells[1][0].underline, UnderlineStyle::Single);
+        assert_eq!(
+            f.cells[1][0].bg,
+            [0x1B, 0x1D, 0x1E],
+            "an empty row has no last cell — the live default is the only seed"
+        );
+        assert_eq!(f.cursor_col, 2);
+    }
+
+    /// WIDER THAN THE ROW'S REMAINDER: the composition grows the row to the
+    /// frame's width and stops there. The gate proves `col + width <= cols`
+    /// before the `resize`, so truncation can never extend past the frame.
+    #[test]
+    fn a_composition_longer_than_the_row_remainder_stops_at_the_frame_edge() {
+        let mut f = painted_frame(2, 8, b"$ ");
+        // に ほ ん take columns 2..8; ご would need 8..10.
+        f.overlay_ime_preedit("にほんご", None, false);
+        assert_eq!(f.cells[0].len(), 8, "grown to the frame width, never past it");
+        let row: String = f.cells[0].iter().map(|c| c.ch).collect();
+        assert_eq!(row, "$ に ほ ん ");
+        assert_eq!(f.cursor_col, 7, "the caret clamps to the last column");
+    }
+
+    /// A WIDE char with exactly one column left. The right-edge gate fires
+    /// before the `resize`, so nothing is painted AND nothing is materialized —
+    /// the frame is byte-identical but for the caret clamp.
+    #[test]
+    fn a_wide_composition_with_one_column_left_paints_nothing_and_grows_nothing() {
+        let mut f = painted_frame(2, 8, b"$ ");
+        f.cursor_col = 7;
+        let before = f.clone();
+        f.overlay_ime_preedit("日", None, false);
+        assert_eq!(f.cells, before.cells, "not one cell was touched");
+        assert_eq!(f.cursor_col, 7, "and the caret stays on the cell it was on");
+    }
+
+    /// The platform caret at byte 0 — the composition is painted in full and
+    /// the cursor sits at its START, not after it. (The caret is resolved on the
+    /// same walk that materializes, so the two cannot disagree.)
+    #[test]
+    fn the_platform_caret_at_offset_zero_anchors_at_the_composition_start() {
+        let mut f = painted_frame(2, 20, b"$ ");
+        f.overlay_ime_preedit("にほん", Some(0), false);
+        assert_eq!(f.cursor_col, 2, "the composition's first column");
+        assert_eq!(f.cells[0][2].ch, 'に', "and all of it is still painted");
+        assert_eq!(f.cells[0][6].ch, 'ん');
+    }
+
+
+    /// The `cjk` argument — DECSET 8840 / `ambiguous_width_double`, read off the
+    /// same `Terminal` under the same lock as the extraction — must reach the
+    /// width call, or the composition would occupy different columns than the
+    /// committed text.
+    #[test]
+    fn the_ambiguous_width_flag_widens_the_composition_it_is_given() {
+        let mut narrow = painted_frame(2, 20, b"$ ");
+        narrow.overlay_ime_preedit("±", None, false);
+        assert_eq!(narrow.cells[0].len(), 3, "EA-Ambiguous is narrow by default");
+        assert!(!narrow.cells[0][2].wide);
+
+        let mut wide = painted_frame(2, 20, b"$ ");
+        wide.overlay_ime_preedit("±", None, true);
+        assert_eq!(wide.cells[0].len(), 4, "and double under the CJK width mode");
+        assert!(wide.cells[0][3].wide);
+        assert_eq!(wide.cursor_col, 4);
+    }
+
+    /// Composing ONTO a wide character. The overlay's contract is that the
+    /// composition occupies exactly the columns the committed text will, and the
+    /// write path takes the WHOLE wide character with it — so neither half may
+    /// be left standing. A stranded CONTINUATION is a blank wearing the old
+    /// cell's background, one column wider than the composition really is.
+    #[test]
+    fn composing_onto_a_wide_characters_lead_takes_its_continuation_too() {
+        let mut f = painted_frame(2, 10, "日本\r".as_bytes());
+        assert!(f.cells[0][1].wide, "fixture: 日 owns columns 0 and 1");
+        assert_eq!(f.cursor_col, 0);
+
+        f.overlay_ime_preedit("a", None, false);
+        assert_eq!(f.cells[0][0].ch, 'a');
+        assert!(!f.cells[0][1].wide, "the orphaned continuation is cleared");
+        assert_eq!(f.cells[0][1].ch, ' ');
+        assert_eq!(
+            f.cells[0][1].underline,
+            UnderlineStyle::None,
+            "and it is not dressed as composition"
+        );
+        assert_eq!(f.cells[0][2].ch, '本', "the next character is untouched");
+    }
+
+    /// The other half of the same rule, and the worse of the two: a stranded
+    /// LEAD is re-drawn across BOTH its columns, painting the old glyph straight
+    /// over the composition's first cell — the composition is invisible.
+    #[test]
+    fn composing_onto_a_wide_characters_continuation_takes_its_lead_too() {
+        let mut f = painted_frame(2, 10, "日本\r\x1b[2G".as_bytes());
+        assert_eq!(
+            f.cursor_col, 1,
+            "fixture: the caret sits on 日's continuation"
+        );
+
+        f.overlay_ime_preedit("a", None, false);
+        assert_eq!(f.cells[0][1].ch, 'a');
+        assert_eq!(
+            f.cells[0][0].ch, ' ',
+            "the lead cannot stay — it would be redrawn over the composition"
+        );
+        assert!(!f.cells[0][0].wide);
+        assert_eq!(f.cells[0][2].ch, '本', "and 本 is untouched");
+    }
+
+    /// The cluster drop follows the cells it clears: a MULTI-SCALAR wide
+    /// grapheme composed onto from its continuation column has its `clusters`
+    /// entry at the LEAD, one column left of where the composition starts.
+    #[test]
+    fn composing_onto_a_graphemes_continuation_drops_the_cluster_at_its_lead() {
+        let mut term = Terminal::new(2, 10);
+        term.process("\u{1F1EF}\u{1F1F5}xy\r\u{1b}[2G".as_bytes());
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, 2, 10);
+        assert_eq!(f.cluster_at(0, 0), Some("\u{1F1EF}\u{1F1F5}"));
+        assert_eq!(f.cursor_col, 1, "fixture: caret on the flag's second column");
+
+        f.overlay_ime_preedit("a", None, false);
+        assert_eq!(f.cells[0][1].ch, 'a');
+        assert_eq!(
+            f.cluster_at(0, 0),
+            None,
+            "the cleared lead's grapheme goes with it"
+        );
+    }
+}
+
+/// THE ANCHOR AND THE INK ARE ONE WALK.
+///
+/// [`ime_preedit_caret_col`] is what the OS candidate window is anchored on;
+/// [`RenderInput::overlay_ime_preedit`] is what the user sees. They run the same
+/// `walk_ime_preedit`, and this is the proof that they cannot disagree — across
+/// every shape the walk has a branch for.
+#[cfg(test)]
+mod ime_preedit_caret_query_tests {
+    use super::{RenderInput, ime_preedit_caret_col};
+    use crate::terminal::{Rgb, Terminal};
+
+    fn prompt(cols: u16, cursor_col: usize) -> RenderInput {
+        let mut term = Terminal::new(2, cols);
+        term.set_default_foreground(Rgb::new(0xC0, 0xC5, 0xCE));
+        term.set_default_background(Rgb::new(0x1B, 0x1D, 0x1E));
+        term.process(b"$ ");
+        let mut f = RenderInput::empty();
+        term.cell_frame_into(&mut f, 2, cols.into());
+        f.cursor_col = cursor_col;
+        f
+    }
+
+    #[test]
+    fn the_caret_query_returns_exactly_the_column_the_paint_lands_on() {
+        // (preedit, caret byte, cjk, start column, frame cols)
+        let cases: &[(&str, Option<usize>, bool, usize, u16)] = &[
+            ("にほん", None, false, 2, 20),        // caret trails
+            ("にほん", Some(0), false, 2, 20),     // caret at the start
+            ("にほん", Some(3), false, 2, 20),     // caret between に and ほ
+            ("ab", Some(1), false, 3, 20),         // narrow, mid-composition
+            ("にほんご", None, false, 2, 8),       // truncated at the edge
+            ("日", None, false, 7, 8),             // not one column fits
+            ("e\u{0301}", None, false, 0, 20),     // a zero-width combining mark
+            ("±", None, true, 2, 20),              // EA-Ambiguous, CJK mode
+            ("±", None, false, 2, 20),             // …and narrow mode
+            ("", None, false, 2, 20),              // no composition at all
+            ("にほん", Some(999), false, 2, 20),   // caret past the end
+        ];
+        for &(preedit, caret, cjk, start, cols) in cases {
+            let mut f = prompt(cols, start);
+            f.overlay_ime_preedit(preedit, caret, cjk);
+            let queried = ime_preedit_caret_col(preedit, caret, cjk, start, usize::from(cols));
+            assert_eq!(
+                queried, f.cursor_col,
+                "anchor and ink disagree for {preedit:?} caret={caret:?} cjk={cjk} \
+                 start={start} cols={cols}"
+            );
+        }
+    }
+
+    /// The whole point of the query, stated once: while a composition is in
+    /// flight the ENGINE cursor has not moved — the committed text has not
+    /// reached the PTY — so the engine column is where the composition BEGINS,
+    /// and the caret is that plus everything typed so far.
+    #[test]
+    fn the_anchor_moves_with_the_composition_the_engine_cursor_does_not() {
+        let engine_col = 2;
+        let mut last = engine_col;
+        for phrase in ["に", "にほ", "にほん", "にほんご"] {
+            let caret = ime_preedit_caret_col(phrase, None, false, engine_col, 40);
+            assert!(
+                caret > last,
+                "{phrase:?} must anchor right of {last} (got {caret})"
+            );
+            last = caret;
+        }
+        assert_eq!(
+            last, 10,
+            "four full-width kana past the prompt — eight columns the engine \
+             cursor knows nothing about"
+        );
     }
 }
 

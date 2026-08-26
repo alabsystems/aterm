@@ -21,6 +21,18 @@
 //! harvested store restores capture-sequence order across asynchronous map
 //! callbacks, then applies byte-budgeted lowest-sequence eviction with a
 //! separate count. The present path pays one `Option` branch when the tap is off.
+//!
+//! THE PER-PIXEL CONVERSION RUNS OFF THE PRESENT THREAD: a mapped slot's raw
+//! padded bytes are memcpy'd out and shipped to the recording's dedicated
+//! conversion worker ([`ConvertWorker`]), which runs [`mapped_to_rgba8`] — the
+//! f16 decode + scRGB→SDR tonemap + sRGB encode + 2×2 downscale — and hands
+//! finished RGBA8 frames back for the ordered, budgeted store. The present
+//! thread's per-frame cost is one bounded memcpy plus channel traffic. (The
+//! conversion used to run synchronously in `after_present`, and one 7.25 s EDR
+//! recording episode starved input to p99 201 ms with 21 wake heals.) When no
+//! thread can be spawned (wasm, exhaustion) the harvest falls back to the old
+//! inline conversion; a worker more than [`CONVERT_BACKLOG`] frames behind is
+//! a counted mid-stream drop, never a block.
 
 use std::collections::VecDeque;
 use std::sync::mpsc;
@@ -186,8 +198,9 @@ pub fn ordered_capture_store_push(
 /// The finalized recording handed to the dump path.
 pub struct VideoTake {
     pub frames: VecDeque<CapturedFrame>,
-    /// Frames LOST mid-stream (staging ring saturated / map failure / device
-    /// loss), counted so the artifact is honest about coverage. Budget
+    /// Frames LOST mid-stream (staging ring saturated / map failure /
+    /// conversion backlog or failure / device loss), counted so the artifact
+    /// is honest about coverage. Budget
     /// evictions are counted separately in `evicted` (they truncate the HEAD
     /// of the recording, a different honesty story than a mid-stream skip).
     pub dropped: u64,
@@ -398,7 +411,8 @@ pub struct VideoTap {
     store: VecDeque<CapturedFrame>,
     store_bytes: usize,
     budget_bytes: usize,
-    /// Mid-stream losses (ring saturation / map failure / device loss).
+    /// Mid-stream losses (ring saturation / map failure / conversion backlog
+    /// or failure / device loss).
     dropped: u64,
     /// Head truncations (budget drop-oldest evictions).
     evicted: u64,
@@ -430,6 +444,11 @@ pub struct VideoTap {
     mixed_capture_encoding: bool,
     bpp: u32,
     resized_early_stop: bool,
+    /// Dedicated conversion lane: the per-pixel decode/tonemap/downscale runs
+    /// on this worker so `after_present` never pays per-pixel work on the
+    /// present thread. `None` — spawn failed, or the worker died mid-take —
+    /// falls back to the old inline conversion.
+    worker: Option<ConvertWorker>,
 }
 
 /// Staging-ring depth: enough to absorb a GPU running a frame or two behind
@@ -437,6 +456,84 @@ pub struct VideoTap {
 const RING: usize = 4;
 /// Default RAM budget for the harvested store (bytes).
 pub const DEFAULT_BUDGET: usize = 512 * 1024 * 1024;
+
+/// Upper bound on conversions dispatched to the worker and not yet adopted
+/// back into the store. At ring depth on purpose: it bounds the transient
+/// raw-copy RAM to what the staging ring already commits, and a worker that
+/// far behind means conversion cannot keep pace with presents — the recorder
+/// discipline then counts a drop rather than ever blocking (or slowing) the
+/// present thread the way the old inline conversion did.
+const CONVERT_BACKLOG: usize = RING;
+
+/// One mapped slot's RAW padded bytes en route to the conversion worker, with
+/// the per-frame facts the pure [`mapped_to_rgba8`] needs. Per-tap geometry
+/// and format travel in the worker's closure instead — they are fixed for a
+/// recording's lifetime (a mid-capture resize finalizes the tap).
+struct ConvertJob {
+    raw: Vec<u8>,
+    seq: u64,
+    t_us: u64,
+    capture_encoding: CaptureEncoding,
+}
+
+/// The recording's dedicated conversion lane. The worker thread lives exactly
+/// as long as the tap (its job sender drops with the tap / at `finish`), runs
+/// [`mapped_to_rgba8`] per job, and answers with `Some(frame)` or `None` on a
+/// conversion error (adopted as one counted mid-stream loss).
+struct ConvertWorker {
+    job_tx: mpsc::Sender<ConvertJob>,
+    result_rx: mpsc::Receiver<Option<CapturedFrame>>,
+    /// Jobs dispatched and not yet adopted; bounded by [`CONVERT_BACKLOG`].
+    pending: usize,
+    handle: std::thread::JoinHandle<()>,
+}
+
+/// Spawn the dedicated conversion worker for one recording. `None` when the
+/// platform cannot spawn a thread (wasm, thread exhaustion) — the harvest then
+/// falls back to converting inline on the present thread, the old behavior.
+fn spawn_convert_worker(
+    src_w: u32,
+    src_h: u32,
+    padded_row: usize,
+    format: wgpu::TextureFormat,
+    half_res: bool,
+) -> Option<ConvertWorker> {
+    let (job_tx, job_rx) = mpsc::channel::<ConvertJob>();
+    let (result_tx, result_rx) = mpsc::channel::<Option<CapturedFrame>>();
+    let handle = std::thread::Builder::new()
+        .name("aterm-video-convert".to_string())
+        .spawn(move || {
+            while let Ok(job) = job_rx.recv() {
+                let frame = mapped_to_rgba8(
+                    &job.raw,
+                    src_w,
+                    src_h,
+                    padded_row,
+                    format,
+                    job.capture_encoding,
+                    half_res,
+                )
+                .ok()
+                .map(|(rgba, w, h)| CapturedFrame {
+                    seq: job.seq,
+                    t_us: job.t_us,
+                    w,
+                    h,
+                    rgba,
+                });
+                if result_tx.send(frame).is_err() {
+                    return; // tap gone: nothing is left to adopt results
+                }
+            }
+        })
+        .ok()?;
+    Some(ConvertWorker {
+        job_tx,
+        result_rx,
+        pending: 0,
+        handle,
+    })
+}
 
 /// Bytes per source pixel for every destination format the presented-frame taps
 /// support. Kept independent of a device so the decode contract can be tested
@@ -557,8 +654,9 @@ fn mapped_to_rgba8(
     // byte), so `decode[n]` is EXACTLY what `srgb_to_linear(n as f32 / 255.0)`
     // returns for that same n — this is a bit-identical substitution, not an
     // approximation. It trades 12 `powf` per OUTPUT pixel (4 samples × 3
-    // channels) for 256 `powf` per frame, which matters because the harvest runs
-    // synchronously on the present thread. The encode side keeps its `powf`:
+    // channels) for 256 `powf` per frame, which still matters off-thread (the
+    // conversion worker must keep pace with presents or frames drop) and
+    // matters doubly on the no-thread inline fallback. The encode side keeps its `powf`:
     // `srgb8_from_linear` produces the stored pixel byte and its rounding is a
     // pinned parity artifact. Only the downsampling path decodes, so the table
     // is skipped otherwise.
@@ -646,6 +744,11 @@ impl VideoTap {
         // correct for both the 4-byte SDR and 8-byte f16 formats.
         let padded = padded_row_bytes(src_w, bpp);
         let size = padded * src_h as u64;
+        // A stride that does not fit `usize` cannot be converted on ANY thread;
+        // the (unreachable in practice) fallback keeps the old inline path.
+        let worker = usize::try_from(padded)
+            .ok()
+            .and_then(|row| spawn_convert_worker(src_w, src_h, row, format, opts.half_res));
         let (done_tx, done_rx) = mpsc::channel();
         let slots = (0..RING)
             .map(|i| Slot {
@@ -681,6 +784,7 @@ impl VideoTap {
             mixed_capture_encoding: false,
             bpp,
             resized_early_stop: false,
+            worker,
         })
     }
 
@@ -834,8 +938,10 @@ impl VideoTap {
 
     /// Post-present hook (GUI-side, right after `frame.present()` returned):
     /// stamp the just-enqueued copy with the same-clock time, issue its
-    /// map_async, then NON-BLOCKING poll + harvest any completed earlier maps.
-    /// Bounded work; never waits on the GPU.
+    /// map_async, then NON-BLOCKING poll + harvest any completed earlier maps
+    /// (a raw memcpy handed to the conversion worker — never per-pixel work
+    /// here) and adopt any finished conversions into the store. Bounded work;
+    /// never waits on the GPU or the worker.
     pub fn after_present(&mut self, device: &wgpu::Device, t_us: u64) {
         // Stamp + map the newest Pending slot (at most one per present).
         for (i, slot) in self.slots.iter_mut().enumerate() {
@@ -873,8 +979,13 @@ impl VideoTap {
         self.harvest_ready();
     }
 
-    /// Drain the completion channel and copy out every mapped slot.
+    /// Drain the completion channel: adopt finished off-thread conversions,
+    /// then route every newly mapped slot toward RGBA8. A dispatched slot is
+    /// copied out raw and unmapped HERE, so a slot's lifetime is still bounded
+    /// by map latency alone — conversion lag can never saturate the staging
+    /// ring, it can only (bounded, counted) drop via [`CONVERT_BACKLOG`].
     fn harvest_ready(&mut self) {
+        self.adopt_converted();
         while let Ok((idx, ok)) = self.done_rx.try_recv() {
             let (seq, t_us, capture_encoding) = match self.slots[idx].state {
                 SlotState::InFlight {
@@ -891,8 +1002,7 @@ impl VideoTap {
             };
             let transition = video_slot_transition(self.slots[idx].state.phase(), event)
                 .expect("a current map callback belongs to an in-flight slot");
-            if ok {
-                let frame = self.copy_out(idx, seq, t_us, capture_encoding);
+            if ok && let Some(frame) = self.convert_or_dispatch(idx, seq, t_us, capture_encoding) {
                 self.push_frame(frame);
             }
             if transition.count_drop {
@@ -904,10 +1014,72 @@ impl VideoTap {
                 _ => unreachable!("a completed video map always releases its slot"),
             }
         }
+        self.adopt_converted();
     }
 
-    /// Strip row padding + swizzle/decode + (optionally) 2×2 box-downscale one
-    /// mapped slot into a tightly-packed RGBA8 frame.
+    /// Route one successfully mapped slot's bytes toward RGBA8. With a live
+    /// worker the padded bytes are memcpy'd out (bounded, no per-pixel work)
+    /// and the decode/tonemap/downscale runs OFF the present thread; the
+    /// result is adopted by a later [`Self::adopt_converted`] drain, so this
+    /// returns `None`. `Some(frame)` is the inline fallback (no worker, or the
+    /// worker died) — the old synchronous behavior, pushed by the caller. A
+    /// worker already [`CONVERT_BACKLOG`] frames behind means conversion is
+    /// not keeping pace: count one mid-stream drop rather than queueing
+    /// unbounded raw copies or blocking the present thread.
+    fn convert_or_dispatch(
+        &mut self,
+        idx: usize,
+        seq: u64,
+        t_us: u64,
+        capture_encoding: CaptureEncoding,
+    ) -> Option<CapturedFrame> {
+        if let Some(worker) = self.worker.as_mut() {
+            if worker.pending >= CONVERT_BACKLOG {
+                self.dropped += 1;
+                return None;
+            }
+            let raw = self.slots[idx].buffer.slice(..).get_mapped_range().to_vec();
+            match worker.job_tx.send(ConvertJob {
+                raw,
+                seq,
+                t_us,
+                capture_encoding,
+            }) {
+                Ok(()) => {
+                    worker.pending += 1;
+                    return None;
+                }
+                // Worker died (its thread panicked): fall back to inline
+                // conversion for the rest of the recording.
+                Err(_) => self.worker = None,
+            }
+        }
+        Some(self.copy_out(idx, seq, t_us, capture_encoding))
+    }
+
+    /// Non-blocking adoption of finished off-thread conversions into the
+    /// ordered, budgeted store. A conversion failure is one counted mid-stream
+    /// loss, exactly like a map failure.
+    fn adopt_converted(&mut self) {
+        loop {
+            let Some(worker) = self.worker.as_mut() else {
+                return;
+            };
+            let Ok(result) = worker.result_rx.try_recv() else {
+                return;
+            };
+            worker.pending = worker.pending.saturating_sub(1);
+            match result {
+                Some(frame) => self.push_frame(frame),
+                None => self.dropped += 1,
+            }
+        }
+    }
+
+    /// INLINE FALLBACK (no conversion worker): strip row padding +
+    /// swizzle/decode + (optionally) 2×2 box-downscale one mapped slot into a
+    /// tightly-packed RGBA8 frame, synchronously on the calling (present)
+    /// thread.
     fn copy_out(
         &self,
         idx: usize,
@@ -957,14 +1129,19 @@ impl VideoTap {
         self.resized_early_stop
     }
 
-    /// Frames harvested so far (for `video status`).
+    /// Frames harvested so far (for `video status`). Includes frames dispatched
+    /// to the conversion worker and not yet adopted: they were captured, and
+    /// counting them keeps this progress read equivalent to the old
+    /// synchronous harvest (a conversion failure later books a drop instead).
     #[must_use]
     pub fn frames_so_far(&self) -> usize {
-        self.store.len()
+        self.store.len() + self.worker.as_ref().map_or(0, |worker| worker.pending)
     }
 
-    /// Finalize: BLOCKING drain of in-flight maps (off the hot path by
-    /// definition — the recording is over), then hand the store out.
+    /// Finalize: BLOCKING drain of in-flight maps and dispatched conversions
+    /// (off the hot path by definition — the recording is over), then hand the
+    /// store out. Every frame the worker was still converting is adopted
+    /// before the take is sealed, so deferring the tonemap loses nothing.
     pub fn finish(mut self, device: &wgpu::Device) -> VideoTake {
         let any_inflight = self
             .slots
@@ -985,6 +1162,31 @@ impl VideoTap {
                     }
                 }
             }
+        }
+        // Conversion lane drain: dropping the job sender lets the worker run
+        // its queue dry and exit; every outstanding result is adopted here. A
+        // worker that died with jobs outstanding is counted honestly.
+        if let Some(ConvertWorker {
+            job_tx,
+            result_rx,
+            mut pending,
+            handle,
+        }) = self.worker.take()
+        {
+            drop(job_tx);
+            while pending > 0 {
+                match result_rx.recv() {
+                    Ok(Some(frame)) => self.push_frame(frame),
+                    Ok(None) => self.dropped += 1,
+                    Err(_) => {
+                        self.dropped += pending as u64;
+                        pending = 0;
+                        continue;
+                    }
+                }
+                pending -= 1;
+            }
+            let _ = handle.join();
         }
         let (dw, dh) = if self.half_res {
             (self.src_w.div_ceil(2), self.src_h.div_ceil(2))
@@ -1569,6 +1771,7 @@ mod tests {
             mixed_capture_encoding: false,
             bpp: 4,
             resized_early_stop: false,
+            worker: None,
         }
     }
 
@@ -1684,6 +1887,84 @@ mod tests {
         assert_eq!(tail.evicted, 1);
         assert_eq!(tail.dropped, 0);
         assert_eq!(tail.store_bytes, 2 * 16);
+    }
+
+    /// The OFF-THREAD conversion lane (the harvest no longer tonemaps on the
+    /// present thread) is a pure relocation: for both the SDR swizzle and the
+    /// EDR f16 scRGB→SDR tonemap path the worker's output is BYTE-IDENTICAL
+    /// to the inline [`mapped_to_rgba8`] fallback, frame stamps ride through
+    /// untouched, and dropping the job sender drains + exits the worker (the
+    /// `finish`/tap-drop lifecycle).
+    #[test]
+    fn convert_worker_matches_inline_conversion_and_drains_on_drop() {
+        let stride = 256; // COPY_BYTES_PER_ROW_ALIGNMENT padding
+        // SDR: 2x2 RGBA8 sRGB, full res.
+        let sdr_rows: [&[u8]; 2] = [
+            &[1, 2, 3, 255, 9, 8, 7, 128],
+            &[0, 0, 0, 0, 255, 255, 255, 255],
+        ];
+        let sdr_raw = padded_fixture(&sdr_rows, stride);
+        let sdr_enc = encoding(wgpu::TextureFormat::Rgba8Unorm, CaptureColorSpace::Srgb, 1.0);
+        // EDR: 2x2 RGBA16F scRGB with an above-1.0 highlight, half res (the
+        // downsampling path exercises the decode table + premultiplied filter).
+        let edr_pixels: Vec<u8> = [
+            half_pixel([0x3C00, 0x0000, 0x0000, 0x3C00]), // 1.0 red
+            half_pixel([0x4400, 0x4400, 0x4400, 0x3C00]), // 4.0 highlight
+            half_pixel([0x0000, 0x3800, 0x0000, 0x3C00]), // 0.5 green
+            half_pixel([0x0000, 0x0000, 0x3C00, 0x3800]), // blue, alpha 0.5
+        ]
+        .concat();
+        let edr_rows: [&[u8]; 2] = [&edr_pixels[..16], &edr_pixels[16..]];
+        let edr_raw = padded_fixture(&edr_rows, stride);
+        let edr_enc = encoding(
+            wgpu::TextureFormat::Rgba16Float,
+            CaptureColorSpace::ExtendedLinearSrgb,
+            1.0,
+        );
+        for (label, raw, format, enc, half_res) in [
+            ("sdr", sdr_raw, wgpu::TextureFormat::Rgba8Unorm, sdr_enc, false),
+            (
+                "edr",
+                edr_raw,
+                wgpu::TextureFormat::Rgba16Float,
+                edr_enc,
+                true,
+            ),
+        ] {
+            let (inline_rgba, inline_w, inline_h) =
+                mapped_to_rgba8(&raw, 2, 2, stride, format, enc, half_res)
+                    .expect("inline conversion");
+            let worker = spawn_convert_worker(2, 2, stride, format, half_res)
+                .expect("native test hosts spawn threads");
+            worker
+                .job_tx
+                .send(ConvertJob {
+                    raw,
+                    seq: 7,
+                    t_us: 42,
+                    capture_encoding: enc,
+                })
+                .expect("worker alive");
+            let frame = worker
+                .result_rx
+                .recv()
+                .expect("worker answers")
+                .expect("conversion succeeds");
+            assert_eq!(
+                (frame.seq, frame.t_us, frame.w, frame.h),
+                (7, 42, inline_w, inline_h),
+                "{label}: stamps and geometry ride through the worker untouched"
+            );
+            assert_eq!(
+                frame.rgba, inline_rgba,
+                "{label}: the off-thread harvest must be byte-identical to inline"
+            );
+            drop(worker.job_tx);
+            worker
+                .handle
+                .join()
+                .expect("worker exits when the tap drops its sender");
+        }
     }
 
     /// PHASE-2 LAW: `should_capture` with fps=10 (interval 100ms) accepts a

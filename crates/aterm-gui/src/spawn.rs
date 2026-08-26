@@ -549,6 +549,11 @@ pub(crate) fn spawn_session(
     window: WindowId,
     rows: u16,
     cols: u16,
+    // CELL-PX-1: the OWNING WINDOW's real cell size in device pixels, installed in
+    // the newborn engine at construction so DEC 1016 (SGR-pixel) mouse reports and
+    // OSC 1337 inline-image sizing are right on a tab nobody has resized yet. See
+    // [`new_live_terminal`] for why the BOOT session passes `None`.
+    cell_px: Option<(u16, u16)>,
     factory: &SessionFactory,
     proxy: &EventLoopProxy<Wake>,
     // Per-spawn working-directory override: a new tab / split / window passes the
@@ -795,6 +800,7 @@ pub(crate) fn spawn_session(
         cols,
         factory.terminal_config.as_ref(),
         factory.appearance,
+        cell_px,
     )));
 
     // SEAMLESS SCREEN CARRY: hydrate the adopted engine with the outgoing
@@ -1463,11 +1469,23 @@ mod park_reader_tests {
 /// git log) scroll under the wheel out of the box. Programs keep full control — CSI
 /// ?1007l turns it off, ?1007h back on; DECRQM reports the live state. Mirrors the
 /// pre-refactor `session::build_terminal` default so the default-on is unit-testable.
-fn new_live_terminal(
+///
+/// CELL PIXEL SIZE (`cell_px`): the frontend's REAL font metrics for the window
+/// this session is born into, installed here at construction. Two wire contracts
+/// read it — DEC 1016 (SGR-pixel mouse) reports, and the OSC 1337 `File=`
+/// inline-image footprint math — and until this seam existed the ONLY writer was
+/// the resize path, so a freshly opened tab answered both from the engine's
+/// headless 8x16 placeholder until the user happened to drag the window. `None`
+/// keeps that placeholder and is reserved for the BOOT session, whose backend is
+/// still being built on another thread (`Backend::cell_geometry` on a `Pending`
+/// slot is a hard panic by design); `App::sync_cell_pixel_size` corrects it from
+/// the first `apply_window_scale`, which every raster seam runs.
+pub(crate) fn new_live_terminal(
     rows: u16,
     cols: u16,
     cfg: Option<&aterm_core::config::TerminalConfig>,
     appearance: aterm_types::Appearance,
+    cell_px: Option<(u16, u16)>,
 ) -> Terminal {
     // SCROLL-1: attach a tiered scrollback STORE at construction so the user-facing
     // `scrollback_lines` (and the engine memory budget) stop being silent no-ops. A
@@ -1505,6 +1523,13 @@ fn new_live_terminal(
     // value already matches (the common `Dark`-desktop path). The window-attach and
     // `ThemeChanged` paths (`apply_os_color_scheme`) still own the live-flip push.
     t.set_color_scheme(appearance);
+    // CELL-PX-1: the real font metrics of the window this session is born into, so
+    // the very FIRST DEC 1016 report and the very FIRST OSC 1337 image on a
+    // never-resized tab are already correct (see this function's docs). Clamped to
+    // 1 because a zero axis is a divide-by-zero for the image footprint math.
+    if let Some((cw, ch)) = cell_px {
+        t.set_cell_pixel_size(cw.max(1), ch.max(1));
+    }
     // apply_config never touches alternate_scroll, so ordering is irrelevant; set it
     // last to make the default-on unmistakable.
     t.modes_mut().alternate_scroll = true;
@@ -3440,12 +3465,12 @@ mod kitty_transfer_tests {
     /// an app can still turn it off with ?1007l.
     #[test]
     fn alternate_scroll_defaults_on_for_a_live_session() {
-        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark);
+        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
         assert!(
             t.modes().alternate_scroll,
             "DEC 1007 must default ON for a live session"
         );
-        let mut t2 = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark);
+        let mut t2 = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
         t2.process(b"\x1b[?1007l");
         assert!(
             !t2.modes().alternate_scroll,
@@ -3462,7 +3487,7 @@ mod kitty_transfer_tests {
         use aterm_core::config::TerminalConfig;
         // No config: the store is present and the unified ring + store total is
         // the advertised default (`aterm_scrollback::DEFAULT_LINE_LIMIT`).
-        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark);
+        let t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
         assert!(
             t.scrollback().is_some(),
             "SCROLL-1: a live session must attach a tiered scrollback store"
@@ -3477,7 +3502,7 @@ mod kitty_transfer_tests {
             scrollback_limit: Some(5_000),
             ..TerminalConfig::default()
         };
-        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark);
+        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark, None);
         assert_eq!(
             t.grid().scrollback_line_limit(),
             Some(5_000),
@@ -3489,7 +3514,7 @@ mod kitty_transfer_tests {
             scrollback_limit: None,
             ..TerminalConfig::default()
         };
-        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark);
+        let t = new_live_terminal(10, 40, Some(&tc), aterm_types::Appearance::Dark, None);
         // Store still attached (so the `None` below is "unlimited", not "no store" —
         // `scrollback_line_limit()` collapses both to `None`).
         assert!(
@@ -3510,7 +3535,7 @@ mod kitty_transfer_tests {
     /// lines scrolled off the ring were discarded and this count could never pass 10k.)
     #[test]
     fn live_session_retains_scrollback_past_the_10k_ring() {
-        let mut t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark);
+        let mut t = new_live_terminal(10, 40, None, aterm_types::Appearance::Dark, None);
         // ~12k line feeds ⇒ ~12k scrolls, far past the 10k ring. Content-free is fine —
         // we count retained lines, not their bytes; the default 100k limit won't evict.
         t.process(&vec![b'\n'; 12_000]);
@@ -3529,10 +3554,10 @@ mod kitty_transfer_tests {
     fn live_session_adopts_the_os_color_scheme_at_construction() {
         use aterm_types::Appearance;
         // Dark (the engine default) — unchanged baseline.
-        let dark = new_live_terminal(10, 40, None, Appearance::Dark);
+        let dark = new_live_terminal(10, 40, None, Appearance::Dark, None);
         assert_eq!(dark.color_scheme(), Appearance::Dark);
         // Light desktop: the fresh engine must REPORT light, not the dark default.
-        let mut light = new_live_terminal(10, 40, None, Appearance::Light);
+        let mut light = new_live_terminal(10, 40, None, Appearance::Light, None);
         assert_eq!(
             light.color_scheme(),
             Appearance::Light,

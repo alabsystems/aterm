@@ -6493,6 +6493,11 @@ pub(crate) fn resolve_cursor_glow(
         // The host's taste dial; the engine fails it OFF on a non-finite value,
         // and the resolver has already clamped it into 0..=1.5 s.
         wake_persist_s: inputs.wake_persist_s,
+        // The ribbon's presentation rides the RAW spelling, like the pet
+        // companions do: `cursor_trail_style = "rainbow kitty tall"` (and its
+        // siblings) opts into the banding-era tall body; every other rainbow
+        // spelling gets the default 0.43 flat under-baseline strip.
+        ribbon_tall: GlowStyle::style_names_tall_ribbon(inputs.style_raw),
     }
 }
 
@@ -7822,6 +7827,16 @@ impl App {
     /// correctness-preserving. Honors the auto-font / no-force-scale gate, matching
     /// [`Self::attach_os_window`]'s derivation.
     pub(crate) fn apply_window_scale(&mut self, wid: WindowId) {
+        // CELL-PX-1, and FIRST for the same reason the pad/head re-tune below is
+        // hoisted above the pinned-font early return: the cell pixel size the
+        // engines report over DEC 1016 and size OSC 1337 images with is a property
+        // of the window's resolved metrics regardless of HOW the font was pinned,
+        // so an explicit `$ATERM_FONT_PX` / `config.font_px` / `--scale` must not
+        // route around it. This is also the seam that corrects the BOOT session,
+        // spawned before the backend build was joined (`cell_px: None`) — every
+        // raster seam runs `apply_window_scale`, so the first frame fixes it.
+        // Guarded by a per-window memo, so the steady state takes no engine locks.
+        self.sync_cell_pixel_size(wid);
         // Pad + head are PER-WINDOW variants of the ONE shared backend regardless
         // of how the font size is pinned — re-tune them BEFORE the pinned-font
         // early return (adversarial review: with a pinned font, a Settings
@@ -9312,6 +9327,28 @@ impl App {
                 m
             };
             ws.metrics.head = head;
+        }
+        // CELL-PX-1: every window's resolved cell box may have just moved (a font
+        // zoom, a `font_size` / `font_family` reload, a theme whose metrics differ),
+        // so report the new one to the engines HERE rather than waiting for each
+        // window's next raster seam. `apply_window_scale` alone would leave a
+        // BACKGROUND window's sessions answering DEC 1016 and sizing OSC 1337
+        // images from the pre-change cell box for as long as that window went
+        // unpainted — a shell does not stop emitting because its window is behind
+        // another. This is a metrics-change seam, not a per-frame one, so the
+        // engine locks it takes are rare; the per-window memo makes the windows
+        // whose resolved size did not actually move free anyway.
+        //
+        // A FACE swap resolves here against the face still installed on the shared
+        // backend (`set_font_px_with` refreshes metrics BEFORE `rebuild_backend`,
+        // deliberately — the re-grid needs the new px). That is exactly right for a
+        // pure zoom, and merely early for a face change: the memo keys on the
+        // RESOLVED size, so the first post-rebuild `apply_window_scale` still
+        // pushes when the new face resolves differently. It can never strand a
+        // stale value.
+        let wids: Vec<crate::WindowId> = self.windows.keys().copied().collect();
+        for wid in wids {
+            self.sync_cell_pixel_size(wid);
         }
     }
 

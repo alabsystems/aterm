@@ -187,7 +187,13 @@ impl App {
             terminal_front,
             can_reopen_closed_tab: self.can_reopen_closed_tab(),
             can_reopen_closed_view: self.can_reopen_closed_view(),
-            local_file_picker_available: cfg!(target_os = "macos"),
+            // A live capability question, not a platform one. It was
+            // `cfg!(target_os = "macos")` while macOS owned the only picker;
+            // Windows has a real `IFileOpenDialog` now, and both document
+            // runtimes already worked here — so the rows come alive from the
+            // same predicate Settings ▸ Wallpaper's button asks, and stay grey
+            // wherever the dialog genuinely cannot open.
+            local_file_picker_available: crate::menu::local_file_picker_available(),
             staged,
             realized,
             // Reduced motion pins the realized celebration fade at full alpha.

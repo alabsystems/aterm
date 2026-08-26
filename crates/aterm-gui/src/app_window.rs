@@ -545,6 +545,12 @@ impl App {
             wid,
             rows,
             cols,
+            // CELL-PX-1: `wid` is not in `self.windows` yet, so this resolves through
+            // `win_cell_size`'s documented unknown-window fallback (the live shared
+            // backend) — the best available answer until the attach below records
+            // this window's own metrics, at which point `apply_window_scale`'s
+            // `sync_cell_pixel_size` corrects it.
+            self.spawn_cell_px(wid),
             &self.session_factory,
             &proxy,
             cwd.as_deref(),
@@ -814,6 +820,20 @@ impl App {
         // only exists after a deliberate user action. So it runs on the
         // first-present hook in `app_render` instead, where it is off time-to-glass
         // and still far earlier than any overlay can be opened.
+
+        // CELL-PX-1: THE JOIN IS THE FIRST INSTANT REAL FONT METRICS EXIST. The BOOT
+        // session was spawned before it — deliberately, so the window-server round
+        // trip overlaps the build — and therefore carries the engine's 8x16
+        // placeholder (`spawn_session(.., cell_px: None, ..)`). Push every window's
+        // real cell box the moment it is knowable, so a shell that emits an OSC 1337
+        // image or a DEC 1016 report in its FIRST bytes is already answered from the
+        // font, not the placeholder. `apply_window_scale` re-pushes if this window's
+        // display resolves a different scale a moment later (the memo keys on the
+        // resolved cell size, so that second push is not suppressed).
+        let windows: Vec<WindowId> = self.windows.keys().copied().collect();
+        for wid in windows {
+            self.sync_cell_pixel_size(wid);
+        }
     }
 
     /// Pin the GPU-only effect/swapchain knobs (bloom, shimmer, the H1 backdrop

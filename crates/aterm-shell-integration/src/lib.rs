@@ -97,16 +97,18 @@ impl ShellType {
     /// detects correctly.
     #[must_use]
     pub fn detect(shell_path: &str) -> Self {
-        let name = Path::new(shell_path)
-            .file_name()
-            // Function-path spelling (not `|n| n.to_str()`): the closure body
-            // gets std's internal unsafe/UTF-8 machinery inlined into this
-            // frame, where the L0 gate refutes it; the opaque callee keeps the
-            // obligation at the std boundary. Behavior-identical: this is the
-            // eta-reduced form of the same call.
-            .and_then(std::ffi::OsStr::to_str)
-            .unwrap_or("")
-            .to_ascii_lowercase();
+        // BOTH separators, on every host. `Path::file_name` splits on the
+        // separator of the platform doing the LOOKING, so on Linux a Windows
+        // program path — `C:\Windows\System32\wsl.exe`, which is exactly what
+        // the WSL and cmd aliases resolve to — contains no `/` and comes back
+        // whole, and every match below misses. The shell path is data (a config
+        // value, a remote handoff, a test fixture), not a fact about this host,
+        // so the split is spelled for both.
+        let tail = shell_path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(shell_path);
+        let name = tail.to_ascii_lowercase();
         let name = name.strip_suffix(".exe").unwrap_or(&name);
         match name {
             "zsh" => Self::Zsh,

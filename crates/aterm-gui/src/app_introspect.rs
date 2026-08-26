@@ -1681,6 +1681,51 @@ impl App {
         Ok(self.dims_snapshot(session, rows, cols))
     }
 
+    /// The DPI scale a DETACHED session's `dims` record is derived from — the one
+    /// case where no window holds the session, so [`Self::dims_snapshot`] has no
+    /// per-window record to read and reports the LIVE SHARED backend instead.
+    ///
+    /// That backend is not scale-less: `apply_window_scale` tunes it to exactly one
+    /// window's [`crate::MetricsView`] at a time, so the scale the detached cells /
+    /// pad / font were actually derived from is that window's — recoverable rather
+    /// than unknowable. In order:
+    ///
+    /// 1. A force pin (`--scale` / `$ATERM_FORCE_SCALE`) overrides every window's
+    ///    real factor, and is the only scale a headless boot ever has.
+    /// 2. The window whose metric record the backend currently carries (the same
+    ///    equality `apply_window_scale` guards its re-tune with), so the reported
+    ///    scale and the pad/font reported beside it describe ONE window.
+    /// 3. Failing an exact match (a live zoom moves `font_px` without a per-window
+    ///    re-record), the same deterministic window `dims_snapshot` itself prefers:
+    ///    the front window, else the lowest stable id. A real DPI beats a literal.
+    /// 4. `1.0` only when there is no window at all — which is exactly the seed the
+    ///    pre-attach cell/pad values in that branch are built from, so the record
+    ///    stays internally consistent.
+    fn detached_scale(&self) -> f64 {
+        if let Some(pinned) = crate::app_config::resolve_force_scale() {
+            return pinned;
+        }
+        // `windows` is a BTreeMap, so both scans below are id-ordered: a detached
+        // `dims` is as repeatable as an attached one.
+        let tuned = if self.backend.is_pending() {
+            None
+        } else {
+            self.windows.values().find(|ws| {
+                (ws.metrics.font_px - self.font_px).abs() < 0.5
+                    && ws.metrics.pad == self.backend.pad()
+                    && ws.metrics.pad_top == self.backend.pad_top()
+                    && ws.metrics.head == self.backend.head()
+            })
+        };
+        tuned
+            .or_else(|| {
+                self.frontmost_window
+                    .and_then(|wid| self.windows.get(&wid))
+                    .or_else(|| self.windows.values().next())
+            })
+            .map_or(1.0, |ws| ws.scale)
+    }
+
     /// Project one selected session through the LIVE geometry of a deterministic
     /// window that contains it. Prefer the front window when it contains the
     /// session; otherwise choose the lowest stable logical window id. This makes
@@ -1708,8 +1753,10 @@ impl App {
         // per-window record (the W12 source of truth `attach_os_window` seeds and
         // `on_scale_factor_changed` keeps current), NOT from the live shared
         // backend — the backend is re-tuned to whichever window last drew, so on a
-        // mixed-DPI desktop it would report the wrong window's DPI.
-        let scale = selected.map_or(1.0, |wid| self.windows[&wid].scale);
+        // mixed-DPI desktop it would report the wrong window's DPI. With no window
+        // holding the session the DETACHED branch below reports that shared backend,
+        // so the scale is read the same way instead of being asserted as 1.0.
+        let scale = selected.map_or_else(|| self.detached_scale(), |wid| self.windows[&wid].scale);
 
         let (
             cell_w,
@@ -6324,6 +6371,49 @@ mod dims_snapshot_tests {
         assert_eq!(
             app.try_dims_snapshot(0, &term).unwrap_err(),
             "terminal busy; retry dims"
+        );
+    }
+
+    /// A DETACHED session (no window holds it) still has a knowable DPI: the
+    /// shared backend its cells/pad/font are read out of is tuned to one window's
+    /// record. `dims` used to answer a flat `scale=1.0` there, which on a 2x
+    /// display contradicted every other field in the same record.
+    #[test]
+    fn detached_dims_reports_the_scale_its_own_geometry_came_from() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let metrics = crate::MetricsView::for_scale(2.0);
+        {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            ws.scale = 2.0;
+            ws.metrics = metrics;
+        }
+        // Tune the shared backend to that window, exactly as `apply_window_scale`
+        // does before the window composes.
+        app.font_px = metrics.font_px;
+        app.backend.activate_px(metrics.font_px);
+        app.backend.set_pad(metrics.pad);
+        app.backend.set_pad_top(metrics.pad_top);
+        app.backend.set_head(metrics.head);
+
+        let attached = app.dims_snapshot(0, 24, 80);
+        let detached = app.dims_snapshot(u64::MAX, 24, 80);
+        assert_eq!(
+            (detached.geometry, detached.window),
+            ("detached", None),
+            "no window contains this session"
+        );
+        assert!(
+            (detached.scale - 2.0).abs() < f64::EPSILON,
+            "the detached record reports the 2x it was derived from, not 1.0 \
+             (scale={})",
+            detached.scale
+        );
+        assert_eq!(
+            (detached.scale, detached.font_px, detached.pad),
+            (attached.scale, attached.font_px, attached.pad),
+            "one backend, one scale: detaching a session cannot change the DPI \
+             the same pixels were rasterized at"
         );
     }
 
