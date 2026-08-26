@@ -54,6 +54,19 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 fn main() {
+    // ONE NAME FOR "the accessibility tree is compiled in". It is a FEATURE on
+    // macOS/Windows (where the platform has its own surface, or the weight is
+    // genuinely optional) and a PLATFORM FACT on Linux, where AccessKit is the
+    // only path to AT-SPI and therefore to a screen reader. Folding both here
+    // keeps 70-odd cfg sites from having to spell the policy — and keeps the
+    // policy in one place when it changes again.
+    println!("cargo::rustc-check-cfg=cfg(a11y_tree)");
+    let a11y_feature = std::env::var_os("CARGO_FEATURE_A11Y_ACCESSKIT").is_some();
+    let linux = std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+    if a11y_feature || linux {
+        println!("cargo::rustc-cfg=a11y_tree");
+    }
+
     // Derive the updater-key fingerprint from the SAME compile-time input that
     // `aterm-update::PINNED_UPDATE_PUBKEY` consumes.  `build_info.rs` places this
     // exact fixed-width value in `__DATA,__aterm_upin`, allowing the release

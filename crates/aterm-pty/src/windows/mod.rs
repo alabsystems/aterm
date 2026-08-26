@@ -36,6 +36,10 @@ mod ffi;
 mod shell;
 mod winpath;
 
+// Published so config validation can ask the REAL resolver how a `shell` value
+// would resolve, rather than modelling it (see `ShellResolution`).
+pub use shell::{ShellResolution, classify_shell_name};
+
 use std::collections::HashMap;
 use std::ffi::{OsStr, c_void};
 use std::io;

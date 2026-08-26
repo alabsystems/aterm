@@ -11,7 +11,7 @@
 //! sharpness. This module produces exactly that coverage: the same skrifa
 //! outline the [`crate::hinted`] seam draws (LCD hint target, FreeType's
 //! `FT_LOAD_TARGET_LCD` twin), rasterized at 3× horizontal resolution by the
-//! same `ab_glyph_rasterizer` fill, then run through FreeType's default FIR5
+//! same [`crate::raster`] coverage fill, then run through FreeType's default FIR5
 //! LCD filter and folded into 3-bytes-per-texel per-channel coverage.
 //!
 //! STAGE-1 SCOPE (the RFC's §4 step 1, deliberately narrow so every state
@@ -185,7 +185,7 @@ pub(crate) fn subpixel_glyph_raster(
     // Fill at 3× horizontal resolution: the same outline, x scaled AFTER the
     // translate so subpixel k of pixel column i is the sample at
     // `x_min + (3i + k)/3` — 1 texel = 1 physical subpixel.
-    let mut ras = ab_glyph_rasterizer::Rasterizer::new(w_sub, h);
+    let mut ras = crate::raster::Rasterizer::new(w_sub, h);
     pen.fill(&mut ras, x_min, y_max, 3.0);
     let mut cov = vec![0u8; w_sub * h];
     ras.for_each_pixel(|i, a| {

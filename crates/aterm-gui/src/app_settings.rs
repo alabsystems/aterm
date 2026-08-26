@@ -1603,7 +1603,7 @@ impl App {
     /// (`update_if_active`). Called by every overlay mutator, so opening/mutating ANY surface
     /// refreshes the tree — not just Settings.
     pub(crate) fn overlay_a11y_update(&mut self) {
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         if let Some(wid) = self.frontmost_window {
             self.push_a11y_tree(wid);
         }
@@ -1621,7 +1621,7 @@ impl App {
     /// *after* walking every visible cell into a string, on every present. Attachment always
     /// arrives as `InitialTreeRequested`, which raises the latch and then publishes here, so
     /// the first tree a screen reader sees is unchanged.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn push_a11y_tree(&mut self, wid: crate::WindowId) {
         if self
             .windows
@@ -1697,7 +1697,7 @@ impl App {
     /// in. Straight from the window's own metrics, the same numbers the frame was laid out
     /// with; `None` for an unknown window or a degenerate cell size, in which case the
     /// tree simply omits geometry (the Text interface is unaffected).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn grid_a11y_geometry(
         &self,
         wid: crate::WindowId,
@@ -1736,7 +1736,7 @@ impl App {
     /// spans from its cached `tab_segments` — the very buffers the last paint filled and
     /// the mouse hit-tests against, so the announced tab and the clickable tab are the
     /// same one by construction.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn grid_a11y_tabs(&self, wid: crate::WindowId) -> Vec<crate::accesskit_tree::GridTab> {
         if self.tab_strip_rows == 0 {
             return Vec::new();
@@ -1775,7 +1775,7 @@ impl App {
     /// P2: handle an event from a window's AccessKit adapter (delivered as
     /// `Wake::Accessibility`): the OS a11y client requesting the initial tree, an action
     /// request from a screen reader, or deactivation.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn on_accessibility_event(&mut self, event: accesskit_winit::Event) {
         use accesskit_winit::WindowEvent as AkWindowEvent;
         let Some(wid) = self.winit_to_window.get(&event.window_id).copied() else {
@@ -1817,7 +1817,7 @@ impl App {
     /// - **Palette** — a filtered row id contains its current target-set epoch and slot:
     ///   Focus moves the cursor, Click selects then activates the command (a disabled row
     ///   carries no Click, and a delayed request from an old tab/generation is rejected).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn on_accessibility_action(&mut self, wid: crate::WindowId, req: accesskit::ActionRequest) {
         use crate::overlay::OverlayKind;
         // Screen-reader actions bypass keyboard/pointer ingress. Even an
@@ -3014,7 +3014,7 @@ mod tests {
     /// arrives far too late to save the work. The window's `a11y_active` latch is what moves
     /// that test to the front — it must start DOWN (the adapter exists for every OS window,
     /// attached or not), rise on the attach edge, and fall again on detach.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn accessibility_publish_latches_on_attach_and_clears_on_detach() {
         let mut app = App::headless_for_test();
@@ -3048,7 +3048,7 @@ mod tests {
     /// or unsupported request is a newer external-input boundary, so it must
     /// retire an older exact cursor candidate before native/overlay routing can
     /// return without consuming it.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn accessibility_action_supersedes_pending_cursor_candidate() {
         use accesskit::{Action, ActionRequest, NodeId, TreeId};
@@ -3088,8 +3088,11 @@ mod tests {
                 .tick(Some((0, 0)), now, &trail_cfg, &mut trail);
             ws.cursor_glow.note_synthetic_move(now);
             ws.cursor_trail.note_synthetic_move(now);
-            assert!(ws.cursor_glow.move_candidate_pending());
-            assert!(ws.cursor_trail.move_candidate_pending());
+            // The synthetic note licenses the move it is about to make: the
+            // engines' own predicate, since `move_candidate_pending` retired
+            // with the admission-scoreboard rework.
+            assert!(ws.cursor_glow.move_licensed(now));
+            assert!(ws.cursor_trail.move_licensed(now));
         }
 
         let winit_id = winit::window::WindowId::from(17u64);
@@ -3104,8 +3107,10 @@ mod tests {
             }),
         });
         let ws = app.windows.get_mut(&wid).unwrap();
-        assert!(!ws.cursor_glow.move_candidate_pending());
-        assert!(!ws.cursor_trail.move_candidate_pending());
+        // …and an a11y action that targets no live node revokes that licence,
+        // so the move it would have decorated draws nothing.
+        assert!(!ws.cursor_glow.move_licensed(now));
+        assert!(!ws.cursor_trail.move_licensed(now));
         let moved = now + Duration::from_millis(1);
         assert_eq!(
             ws.cursor_glow

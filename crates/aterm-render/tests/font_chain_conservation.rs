@@ -29,10 +29,13 @@ use aterm_render::{FaceId, Renderer, Theme};
 
 /// Every policy in the domain (2^3).
 fn all_policies() -> impl Iterator<Item = ChainPolicy> {
-    (0u8..8).map(|b| ChainPolicy {
+    (0u8..16).map(|b| ChainPolicy {
         runtime_discovery: b & 1 == 1,
         sealed: (b >> 1) & 1 == 1,
         wants_emoji: (b >> 2) & 1 == 1,
+        // The PUA reorder (a dedicated symbol face outranks the broad chain for a
+        // private-use point) is policy, so the laws must hold over it too.
+        prefers_symbol: (b >> 3) & 1 == 1,
     })
 }
 
@@ -279,4 +282,62 @@ fn a_genuine_miss_still_gives_up() {
         FaceId::Primary,
         "the resolver must not invent coverage for a noncharacter"
     );
+}
+
+/// PRIVATE USE: a dedicated symbol face outranks the broad text chain.
+///
+/// THE REGRESSION THIS PINS, measured on glass: giving the Windows fallback
+/// chain a Hangul face made `arial.ttf` reachable for the first time, and arial
+/// maps exactly ONE private-use code point — U+F301. A Nerd Font logo that had
+/// always drawn from the bundled Symbols Nerd Font silently became arial's dot,
+/// because the broad chain answered first. PUA carries no Unicode meaning, so a
+/// broad face mapping one is asserting a private convention that is unlikely to
+/// be the one the author meant; the dedicated symbol face wins.
+///
+/// The `.notdef` guard is the other half: when the symbol face does NOT have the
+/// point, the broad chain's incidental coverage is still better than tofu.
+#[test]
+fn a_private_use_point_prefers_the_symbol_face_over_the_broad_chain() {
+    let bit = |t: Tier| 1u8 << (t as u8);
+    let both = bit(Tier::Fallback) | bit(Tier::Symbol);
+
+    let text = ChainPolicy {
+        runtime_discovery: true,
+        sealed: false,
+        wants_emoji: false,
+        prefers_symbol: false,
+    };
+    let pua = ChainPolicy {
+        prefers_symbol: true,
+        ..text
+    };
+
+    // Both faces cover it: an ASSIGNED point takes the broad chain (unchanged),
+    // a PRIVATE-USE point takes the symbol face (the fix).
+    assert_eq!(
+        resolve_chain(&mut BitProbe::new(both, 0), text),
+        Resolution::Face(FaceId::Fallback),
+        "an assigned code point still takes the broad chain first"
+    );
+    assert_eq!(
+        resolve_chain(&mut BitProbe::new(both, 0), pua),
+        Resolution::Face(FaceId::SymbolFallback),
+        "a private-use point takes the dedicated symbol face"
+    );
+
+    // Only the broad chain has it: PUA must NOT fall through to `.notdef` —
+    // incidental coverage still beats tofu.
+    assert_eq!(
+        resolve_chain(&mut BitProbe::new(bit(Tier::Fallback), 0), pua),
+        Resolution::Face(FaceId::Fallback),
+        "with no symbol coverage the broad chain still answers a private-use point"
+    );
+
+    // Only the symbol face has it: unchanged either way.
+    for policy in [text, pua] {
+        assert_eq!(
+            resolve_chain(&mut BitProbe::new(bit(Tier::Symbol), 0), policy),
+            Resolution::Face(FaceId::SymbolFallback),
+        );
+    }
 }

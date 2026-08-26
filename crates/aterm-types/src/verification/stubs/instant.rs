@@ -51,14 +51,14 @@ impl VerifyInstant {
     /// matching `std::time::Instant::duration_since`. Under the counter's
     /// monotonic-`now()` invariant `self.ticks >= earlier.ticks` always holds,
     /// so `saturating_sub` returns exactly `self.ticks - earlier.ticks`.
-    // Skip: web_time::Duration accessors (third-party absent bodies).
+    // Skip: aterm_time::Duration accessors (third-party absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn duration_since(&self, earlier: VerifyInstant) -> Duration {
         Duration::from_millis(self.ticks.saturating_sub(earlier.ticks))
     }
 
     /// Returns `Some(t)` where `t` is the instant `self + duration`, or `None` on overflow.
-    // Skip: web_time::Duration accessors (third-party absent bodies).
+    // Skip: aterm_time::Duration accessors (third-party absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn checked_add(&self, duration: Duration) -> Option<Self> {
         let millis = duration.as_millis();
@@ -69,7 +69,7 @@ impl VerifyInstant {
     }
 
     /// Returns `Some(t)` where `t` is the instant `self - duration`, or `None` on underflow.
-    // Skip: web_time::Duration accessors (third-party absent bodies).
+    // Skip: aterm_time::Duration accessors (third-party absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn checked_sub(&self, duration: Duration) -> Option<Self> {
         let millis = duration.as_millis();
@@ -95,7 +95,7 @@ impl std::ops::Add<Duration> for VerifyInstant {
         trust_verify,
         trust::contract_panic(message_contains = "overflow when adding duration to instant")
     )]
-    // Skip: third-party `web_time::Duration` accessors (absent bodies).
+    // Skip: third-party `aterm_time::Duration` accessors (absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     fn add(self, duration: Duration) -> Self {
         self.checked_add(duration)
@@ -119,7 +119,7 @@ impl std::ops::Sub<Duration> for VerifyInstant {
             message_contains = "overflow when subtracting duration from instant"
         )
     )]
-    // Skip: third-party `web_time::Duration` accessors (absent bodies).
+    // Skip: third-party `aterm_time::Duration` accessors (absent bodies).
     #[cfg_attr(trust_verify, trust::skip)]
     fn sub(self, duration: Duration) -> Self {
         self.checked_sub(duration)

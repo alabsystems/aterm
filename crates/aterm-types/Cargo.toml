@@ -33,7 +33,7 @@ aterm-error = { workspace = true }
 aterm-log = { workspace = true }
 # Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
 # `current_time_ms()` doesn't panic "time not implemented".
-web-time = { workspace = true }
+aterm-time = { workspace = true }
 serde = { workspace = true, optional = true }
 
 [dev-dependencies]

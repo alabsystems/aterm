@@ -1399,8 +1399,20 @@ mod tests {
     /// 42-crate list this derivation replaced (itself derived 2026-07-13
     /// from `cargo tree -p aterm-gui --edges normal`, macOS host target) —
     /// verified equal at the switchover, and re-verified against
-    /// `cargo tree --target all` (identical: no cfg-gated workspace path
-    /// dep exists today, so the cfg-deps-IN decision is currently a no-op).
+    /// `cargo tree --target all`.
+    ///
+    /// The cfg-deps-IN decision is NO LONGER a no-op. `aterm-shell-integration`
+    /// reaches `aterm-uds` through a `cfg(any(unix, windows))` target section
+    /// (the one audited entropy surface, for the capability-nonce mint), which
+    /// is the workspace's first cfg-gated workspace path dep. The derivation
+    /// deliberately OVER-approximates there — a cfg-gated edge is IN on every
+    /// platform — because the census's job is to scan every source file that
+    /// could be process code, and scanning a file that a given target does not
+    /// link is safe while missing one is not. `aterm-uds` was already in this
+    /// GUI closure through `aterm-session`/`aterm-control` anyway, so the
+    /// over-approximation costs this pin nothing; the wasm twin
+    /// (`wasm_census.rs`) is where it actually shows, and it is written up
+    /// there.
     #[test]
     fn derived_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
@@ -1461,6 +1473,12 @@ mod tests {
             "crates/aterm-sixel/src",
             "crates/aterm-suggest/src",
             "crates/aterm-tempfile/src",
+            // Entered the closure when the first-party clock replaced
+            // `web-time`: aterm-core, -types, -effects, -gpu, -predict,
+            // -policy, -observe and -agent all sample time through it now. A
+            // normal [dependencies] edge, so it is GUI process code — it holds
+            // no locks, but the census walks it for exactly that reason.
+            "crates/aterm-time/src",
             "crates/aterm-types/src",
             "crates/aterm-uds/src",
             "crates/aterm-update/src",

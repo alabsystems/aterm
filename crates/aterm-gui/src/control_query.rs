@@ -625,6 +625,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          startup_gpu_pipe_bloom_ms={:.2} startup_gpu_pipe_vbuf_ms={:.2} \
          startup_gpu_pipe_tail_ms={:.2} startup_gpu_tail_ms={:.2} \
          startup_gpu_cell_pipeline_ms={} \
+         effect_pipeline_builds={} effect_pipeline_build_ms={:.2} \
+         effect_pipelines_built={} \
          first_present_ms={:.2} first_visible_ms={:.2}\n",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -744,6 +746,9 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.startup_gpu_pipe_tail_ns),
         ms(m.startup_gpu_tail_ns),
         cell_pipeline_pairs(&m.startup_gpu_cell_pipeline_ns),
+        m.effect_pipeline_builds,
+        ms(m.effect_pipeline_build_ns),
+        effect_pipeline_names(m.effect_pipeline_built_mask),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
     )
@@ -778,7 +783,12 @@ fn deadline_arm_pairs(arms: &[crate::metrics::OwnerArms]) -> String {
 fn deadline_arm_object(arms: &[crate::metrics::OwnerArms]) -> String {
     let body = arms
         .iter()
-        .map(|a| format!("\"{}\":{{\"arms\":{},\"past\":{}}}", a.owner, a.arms, a.past_arms))
+        .map(|a| {
+            format!(
+                "\"{}\":{{\"arms\":{},\"past\":{}}}",
+                a.owner, a.arms, a.past_arms
+            )
+        })
         .collect::<Vec<_>>()
         .join(",");
     format!("{{{body}}}")
@@ -824,6 +834,25 @@ fn cell_pipeline_pairs(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_C
         .map(|(name, ns)| format!("{name}:{:.2}", *ns as f64 / 1e6))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Name the EFFECT pipelines a `effect_pipeline_built_mask` says were compiled,
+/// comma-joined, or `none` — the same ONE self-labelling field discipline as
+/// [`cell_pipeline_pairs`], for the same reason: a reader never has to know the
+/// slot order, and a new `EffectPipeline` cannot silently shift someone else's
+/// bit. `none` is the healthy reading for a launch with the shipped defaults.
+fn effect_pipeline_names(mask: u64) -> String {
+    let built = aterm_gpu::EFFECT_PIPELINE_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| mask & (1u64 << slot) != 0)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>();
+    if built.is_empty() {
+        "none".to_string()
+    } else {
+        built.join(",")
+    }
 }
 
 /// The same split as a JSON object, so the structured twin stays parseable
@@ -982,6 +1011,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"startup_gpu_pipe_bloom_ms\":{:.2},\"startup_gpu_pipe_vbuf_ms\":{:.2},\
          \"startup_gpu_pipe_tail_ms\":{:.2},\"startup_gpu_tail_ms\":{:.2},\
          \"startup_gpu_cell_pipeline_ms\":{},\
+         \"effect_pipeline_builds\":{},\"effect_pipeline_build_ms\":{:.2},\
+         \"effect_pipelines_built\":\"{}\",\
          \"first_present_ms\":{:.2},\"first_visible_ms\":{:.2}}}",
         m.frames_presented,
         ms(m.last_present_latency_ns),
@@ -1101,6 +1132,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.startup_gpu_pipe_tail_ns),
         ms(m.startup_gpu_tail_ns),
         cell_pipeline_object(&m.startup_gpu_cell_pipeline_ns),
+        m.effect_pipeline_builds,
+        ms(m.effect_pipeline_build_ns),
+        effect_pipeline_names(m.effect_pipeline_built_mask),
         ms(m.first_present_ns),
         ms(m.first_visible_ns),
     ))
@@ -3963,6 +3997,12 @@ mod tests {
             "startup_gpu_pipe_cell_ms=",
             "startup_gpu_tail_ms=",
             "startup_gpu_cell_pipeline_ms=",
+            // The demand-build ledger: `0` on a default launch is the standing
+            // proof the nine effect pipelines are not compiled for pixels the
+            // config never draws.
+            "effect_pipeline_builds=",
+            "effect_pipeline_build_ms=",
+            "effect_pipelines_built=",
             "first_present_ms=",
         ] {
             assert!(
@@ -4051,6 +4091,9 @@ mod tests {
             "startup_gpu_pipe_cell_ms",
             "startup_gpu_tail_ms",
             "startup_gpu_cell_pipeline_ms",
+            "effect_pipeline_builds",
+            "effect_pipeline_build_ms",
+            "effect_pipelines_built",
             "first_present_ms",
         ] {
             assert!(
@@ -4138,7 +4181,10 @@ mod tests {
     #[test]
     fn the_per_owner_arm_ledger_is_self_labelling_in_both_forms() {
         let reply = super::cmd_metrics_json(None, "");
-        let body = reply.strip_prefix("OK 1\n").expect("status frame").trim_end();
+        let body = reply
+            .strip_prefix("OK 1\n")
+            .expect("status frame")
+            .trim_end();
         let value: serde_json::Value = serde_json::from_str(body).expect("valid metrics JSON");
         let arms = value
             .get("deadline_arms_by_owner")
@@ -4150,11 +4196,17 @@ mod tests {
         for (owner, entry) in arms.as_object().expect("object") {
             assert!(!owner.is_empty(), "every entry is named");
             assert!(
-                entry.get("arms").and_then(serde_json::Value::as_u64).is_some(),
+                entry
+                    .get("arms")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
                 "{owner} publishes its arm count"
             );
             assert!(
-                entry.get("past").and_then(serde_json::Value::as_u64).is_some(),
+                entry
+                    .get("past")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_some(),
                 "{owner} publishes its PAST arm count — the spin signature"
             );
         }
@@ -4183,7 +4235,10 @@ mod tests {
             .split_whitespace()
             .find_map(|tok| tok.strip_prefix("deadline_arms_by_owner="))
             .expect("the text form publishes the ledger");
-        assert!(!field.is_empty(), "empty ledgers render as `none`, not `\"\"`");
+        assert!(
+            !field.is_empty(),
+            "empty ledgers render as `none`, not `\"\"`"
+        );
         // …and `owner:count` pairs (or `none`) in text.
         let heal_field = text
             .split_whitespace()

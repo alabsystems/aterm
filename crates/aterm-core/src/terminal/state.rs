@@ -90,9 +90,9 @@ pub struct Terminal {
     /// would otherwise fire the callback millions of times per second,
     /// wasting CPU on cross-language callback overhead even when the UI
     /// layer has its own rate limiting.
-    // web_time::Instant (std on native, JS clock on wasm): assigned from
+    // aterm_time::Instant (std on native, JS clock on wasm): assigned from
     // transient.process_now, so must share its type.
-    pub(super) last_bell_time: Option<web_time::Instant>,
+    pub(super) last_bell_time: Option<aterm_time::Instant>,
     /// Monotonic count of bells that FIRED (past the throttle), for poll/watermark
     /// observers — the `subscribe events` stream emits `EVENT … bell` when it
     /// advances. Distinct from the take-and-clear `bell_pending` edge flag: this

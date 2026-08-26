@@ -4765,6 +4765,26 @@ pub(crate) fn cursor_cat_presentation_enabled(
     collection_hello || (animate_cat && ordinary_kitty_cursor_enabled(cursor_trail_enabled, style))
 }
 
+/// WHO OWNS THE RESIDENT PET — the config half of its presentation law, split out
+/// so ownership and presentation can never drift apart.
+///
+/// The three terms here are the ones that mean "this window is supposed to have a
+/// pet at all": the trail master is on, the selected style IS the pet style, and the
+/// resolved trail is in pet mode. Deliberately EXCLUDED is everything that merely
+/// hides a pet that still exists — focus, a scrolled viewport, the load-shed latch —
+/// because those come back, and a resident that forgot itself on every blur would
+/// return as a different cat.
+///
+/// [`retire_pet_without_owner`] is the consumer that matters: it is the switch.
+#[inline]
+pub(crate) fn resident_pet_owner_present(
+    pet_mode: bool,
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+) -> bool {
+    pet_mode && cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
+}
+
 /// The resident pet's presentation law, shared by glass and explicit capture.
 /// Unlike the earned flying kitty, the pet does not require animation or
 /// typing momentum: it sleeps and watches at the caret whenever its surface is
@@ -4776,10 +4796,47 @@ pub(crate) fn resident_pet_presentation_enabled(
     cursor_trail_enabled: bool,
     style: crate::cursor_glow::GlowStyle,
 ) -> bool {
-    pet_mode
-        && cursor_companion_presentable
-        && cursor_trail_enabled
-        && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
+    cursor_companion_presentable
+        && resident_pet_owner_present(pet_mode, cursor_trail_enabled, style)
+}
+
+/// NOTHING THE RESIDENT PET OWNS MAY OUTLIVE ITS SWITCH: drop it all the moment its
+/// trail owner goes away.
+///
+/// The exact twin of [`retire_kitty_cursor_without_owner`], which the earned flying
+/// kitty has always had and the resident pet never did. Without it the only lever a
+/// host had was to stop feeding the brain a caret, and that is a graceful EXIT rather
+/// than a switch — `PetBrain::tick`'s no-caret arm fades over `FADE_OUT` and keeps the
+/// MOTE lane drifting on its own clock.
+///
+/// WHAT LEAKED, stated precisely (the pixel story is NOT the story). Every pet emitter
+/// — single-pane, composed, and the three capture arms — already gates on
+/// [`resident_pet_presentation_enabled`], the same predicate this switch moves, so the
+/// very first frame after `cursor_trail = false` draws no pet and no mote: the glass is
+/// clean. What survived was the BRAIN, and through it the frame train.
+/// `PetBrain::needs_frames()` stays true for the whole `FADE_OUT` ramp and for every
+/// mote left in the lane, and `App::cursor_dependents_need_frame_cadence` (lib.rs)
+/// consumes that directly — it takes `animate_cursor_cat && cursor_pet.needs_frames()`
+/// and does NOT take the trail master as a term. So the switch the user threw to make
+/// the terminal quieter left the window presenting at 60 fps, for a second or more, to
+/// animate a companion it had already stopped drawing. On the owner's minimal-fast
+/// Windows directive that is the whole point of the switch, undone.
+///
+/// Called every frame from every path that ticks the brain, live and capture, so
+/// startup-with-the-trail-off, a hot config reload, a style change and a serious-mode
+/// toggle all retire through this one line.
+/// [`aterm_effects::kitty_pet::PetBrain::retire_unowned`] no-ops on an already-retired
+/// brain, so "off" costs one predicate per frame.
+#[inline]
+pub(crate) fn retire_pet_without_owner(
+    pet_mode: bool,
+    cursor_trail_enabled: bool,
+    style: crate::cursor_glow::GlowStyle,
+    pet: &mut aterm_effects::kitty_pet::PetBrain,
+) {
+    if !resident_pet_owner_present(pet_mode, cursor_trail_enabled, style) {
+        pet.retire_unowned();
+    }
 }
 
 /// Emit the cursor-owned companion sprites for a single-grid frame.
@@ -4919,6 +4976,111 @@ mod resident_pet_presentation_tests {
         ] {
             assert!(!denied, "every resident-pet owner gate is necessary");
         }
+    }
+}
+
+/// THE HOST HALF OF THE RESIDENT'S SWITCH — [`retire_pet_without_owner`].
+///
+/// The engine half ([`aterm_effects::kitty_pet::PetBrain::retire_unowned`]) has its
+/// own test for what retirement means. What is pinned HERE is the wiring: which
+/// config verdicts count as "no owner", that an owned pet is not touched, and — the
+/// property the whole switch exists for — that a retired pet stops claiming the
+/// host's 60 fps effects lane. `App::cursor_dependents_need_frame_cadence` consumes
+/// `cursor_pet.needs_frames()` and does NOT take the trail master as a term, so a
+/// brain left mid-fade with motes in the lane keeps a window presenting at frame
+/// cadence to animate a companion the same switch already stopped drawing.
+#[cfg(test)]
+mod retire_pet_without_owner_tests {
+    use super::retire_pet_without_owner;
+    use crate::cursor_glow::GlowStyle;
+    use aterm_effects::kitty_pet::{PetBrain, PetSense};
+    use std::time::{Duration, Instant};
+
+    /// A pet that is awake, visible and owes frames — the state a switch has to be
+    /// able to interrupt. Returns the brain and the clock it stopped at.
+    fn a_live_pet() -> (PetBrain, Instant) {
+        let sense = |now, caret| PetSense {
+            now,
+            caret,
+            rows: 24,
+            cols: 80,
+            cell_w: 10,
+            cell_h: 20,
+            reduced_motion: false,
+            output_burst: false,
+            pointer: None,
+        };
+        let mut pet = PetBrain::default();
+        let mut t = Instant::now();
+        // Walk the caret so the resident is genuinely mid-motion, not merely faded in.
+        for step in 0u16..40 {
+            t += Duration::from_millis(16);
+            let _ = pet.tick(sense(t, Some((4, 10 + step % 8))));
+        }
+        assert!(pet.is_active(), "fixture: a visible resident");
+        assert!(pet.needs_frames(), "fixture: it is claiming the lane");
+        (pet, t)
+    }
+
+    /// The wiring, verdict by verdict. Ownership is `pet_mode && trail && the pet
+    /// style`; anything less retires, and the owned case must not be disturbed.
+    #[test]
+    fn every_missing_owner_retires_the_pet_and_a_present_one_never_does() {
+        // OWNED — the negative control. Nothing is taken away.
+        let (mut owned, _) = a_live_pet();
+        retire_pet_without_owner(true, true, GlowStyle::RainbowKitty, &mut owned);
+        assert!(
+            owned.is_active() && owned.needs_frames(),
+            "an owned resident must survive the level call it takes every frame"
+        );
+
+        // …and each way of losing the owner, one at a time.
+        for (what, pet_mode, trail, style) in [
+            (
+                "the trail master went off",
+                true,
+                false,
+                GlowStyle::RainbowKitty,
+            ),
+            (
+                "the style stopped being the pet",
+                true,
+                true,
+                GlowStyle::Lumen,
+            ),
+            (
+                "pet mode resolved off",
+                false,
+                true,
+                GlowStyle::RainbowKitty,
+            ),
+        ] {
+            let (mut pet, _) = a_live_pet();
+            retire_pet_without_owner(pet_mode, trail, style, &mut pet);
+            assert!(!pet.is_active(), "{what}: the pet must paint nothing");
+            assert!(
+                !pet.needs_frames(),
+                "{what}: …and must release the host's frame lane at once — \
+                 `cursor_dependents_need_frame_cadence` reads exactly this"
+            );
+        }
+    }
+
+    /// LEVEL, NOT EDGE: hosts call this on every frame the pet has no owner, so the
+    /// steady "off" state must be a no-op that keeps owing nothing. (A switch that
+    /// only fired on an edge would miss a window that STARTED with the trail off.)
+    #[test]
+    fn retiring_an_already_retired_pet_is_a_no_op() {
+        let (mut pet, _) = a_live_pet();
+        for _ in 0..4 {
+            retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut pet);
+            assert!(!pet.is_active() && !pet.needs_frames());
+        }
+        // A fresh brain — the startup-with-the-trail-already-off case — is
+        // untouched and still owes nothing.
+        let mut fresh = PetBrain::default();
+        retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut fresh);
+        assert!(!fresh.is_active() && !fresh.needs_frames());
     }
 }
 
@@ -6977,17 +7139,20 @@ pub(crate) fn pet_hit_rect_win(
 /// A still-fading brain frame can retain non-zero alpha after its caret was
 /// hidden; presentation must win so history clears the old clickable body on
 /// the very first suppressed frame.
+///
+/// The four grid metrics `body_px` needs ride in as one [`EffectGeom`] rather
+/// than four scalars: they are one thing (this surface's grid), the emitter that
+/// must agree with this rect already speaks that type, and four positional `u16`s
+/// in a row are exactly the shape a `cols`/`rows` swap hides in.
 fn pet_hit_rect_for_frame(
     pet_visible: bool,
     sing: f32,
     frame: &aterm_effects::kitty_pet::PetFrame,
-    cell_w: u16,
-    cell_h: u16,
-    cols: u16,
+    geom: aterm_effects::word_decorations::EffectGeom,
     origin: (i32, i32),
 ) -> Option<(i32, i32, i32, i32)> {
     let body = (pet_companion_admitted(pet_visible, sing) && frame.alpha > 0)
-        .then(|| frame.body_px(cell_w, cell_h, cols))
+        .then(|| frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows))
         .flatten();
     pet_hit_rect_win(body, origin)
 }
@@ -7310,6 +7475,17 @@ mod pet_sing_swap_tests {
     use aterm_effects::cursor_glow::{CursorCatMotionKind, CursorCatMotionPulse};
     use aterm_effects::kitty_pet::{PetBrain, PetSense};
     use std::time::{Duration, Instant};
+
+    /// The grid the hit-box cases below resolve against — the same 10x20 cell on
+    /// an 80x30 surface their `PetSense` uses, so the rect and the brain agree.
+    fn hit_geom() -> aterm_effects::word_decorations::EffectGeom {
+        aterm_effects::word_decorations::EffectGeom {
+            cell_w: 10,
+            cell_h: 20,
+            rows: 30,
+            cols: 80,
+        }
+    }
 
     /// The pet yields exactly at the S115 face-swap threshold — below it the
     /// pet keeps the caret, at/above it the singing face owns it — and a
@@ -7813,7 +7989,7 @@ mod pet_sing_swap_tests {
         let live_pet = pet.tick(sense(t0 + Duration::from_millis(500), Some((4, 12))));
         assert!(live_pet.alpha > 0, "negative control owns a resident pet");
         assert!(
-            pet_hit_rect_for_frame(true, 0.0, &live_pet, 10, 20, 80, (0, 0)).is_some(),
+            pet_hit_rect_for_frame(true, 0.0, &live_pet, hit_geom(), (0, 0)).is_some(),
             "the live pet owns a clickable body"
         );
         let hidden_pet = pet.tick(sense(t0 + Duration::from_millis(600), None));
@@ -7822,7 +7998,7 @@ mod pet_sing_swap_tests {
             "the brain is still fading on the first history frame"
         );
         assert_eq!(
-            pet_hit_rect_for_frame(false, 0.0, &hidden_pet, 10, 20, 80, (0, 0)),
+            pet_hit_rect_for_frame(false, 0.0, &hidden_pet, hit_geom(), (0, 0)),
             None,
             "history clears the hit target before the brain's fade completes"
         );
@@ -11797,6 +11973,7 @@ mod motion_policy_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: crate::VideoMode::OffscreenPresentReal,
             next_frame: None,
             dir,
@@ -15108,7 +15285,7 @@ impl App {
         )
         .unwrap_or(u32::MAX);
         let height = u32::try_from(rows.saturating_mul(ch).saturating_add(pad)).unwrap_or(u32::MAX);
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         let overlay_open = self
             .windows
             .get(&id)
@@ -15259,7 +15436,7 @@ impl App {
             });
         }
         self.splice_tab_strip_with(id, tab_strip);
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         if !overlay_open {
             self.stage_native_accessibility(id, view, &compiled);
         }
@@ -15762,7 +15939,7 @@ impl App {
                 });
             window.input_scratch.snapshot_seq = window.input_scratch.snapshot_seq.wrapping_add(1);
         }
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         if !overlay_open {
             self.stage_visible_native_accessibility(id);
         }
@@ -17470,6 +17647,15 @@ impl App {
                 glow_cfg.enabled && cursor_companions_allowed,
                 glow_cfg.style,
             );
+            // THE SWITCH, BEFORE THE TICK. An unowned pet is retired outright here
+            // (motes and all) rather than left to fade, because the tick below is
+            // the last one the scheduler owes it — see `retire_pet_without_owner`.
+            retire_pet_without_owner(
+                pet_mode,
+                glow_cfg.enabled && cursor_companions_allowed,
+                glow_cfg.style,
+                &mut ws.cursor_pet,
+            );
             // THE BRAIN TICKS UNCONDITIONALLY, exactly like `cursor_cat.frame`
             // above and for exactly the same reason: the scheduler asks
             // `cursor_pet.needs_frames()` (lib.rs) whether to keep the 60 fps
@@ -17594,9 +17780,12 @@ impl App {
                 pet_visible,
                 cat_frame.sing,
                 &pet_frame,
-                glow_geom.cw.min(usize::from(u16::MAX)) as u16,
-                glow_geom.ch.min(usize::from(u16::MAX)) as u16,
-                glow_geom.cols.min(usize::from(u16::MAX)) as u16,
+                aterm_effects::word_decorations::EffectGeom {
+                    cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
+                    cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
+                    rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
+                    cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
+                },
                 (i32::from(origin_x), i32::from(origin_y)),
             );
             let glow_fp = glow_fp ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
@@ -17733,6 +17922,7 @@ impl App {
                                             effect_geom.cell_w,
                                             effect_geom.cell_h,
                                             effect_geom.cols,
+                                            effect_geom.rows,
                                         )
                                     })
                                     .flatten(),
@@ -20893,7 +21083,10 @@ impl App {
                 .map(|cell| crate::word_decorations::CompanionOnGlass {
                     cell,
                     body_px: companion_pet
-                        .then(|| ctx.pet.body_px(geom.cell_w, geom.cell_h, geom.cols))
+                        .then(|| {
+                            ctx.pet
+                                .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+                        })
                         .flatten(),
                 });
             let pane_fp = ws.word_decos.tick(
@@ -22099,6 +22292,14 @@ impl App {
                 cat_motion_pulse,
                 &mut ws.cursor_cat,
             );
+            // The single-pane seam's twin: an unowned resident is retired outright,
+            // motes included, rather than left to fade on frames nobody owes it.
+            retire_pet_without_owner(
+                pet_mode,
+                glow_cfg.enabled && cursor_companions_allowed,
+                glow_cfg.style,
+                &mut ws.cursor_pet,
+            );
             ws.cursor_cat
                 .set_collection_presentable(now, cursor_companion_presentable);
             if !cursor_companions_allowed {
@@ -22279,9 +22480,12 @@ impl App {
                 pet_visible,
                 cat_frame.sing,
                 &pet_frame,
-                glow_cw.min(usize::from(u16::MAX)) as u16,
-                glow_ch.min(usize::from(u16::MAX)) as u16,
-                pane_cols,
+                aterm_effects::word_decorations::EffectGeom {
+                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
+                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
+                    rows: pane_rows,
+                    cols: pane_cols,
+                },
                 pet_origin,
             );
             (cat_frame, alpha, riff, pet_frame)

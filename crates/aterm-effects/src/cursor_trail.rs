@@ -20,7 +20,7 @@
 //! resulting [`TrailCell`]s and never sees this state.
 
 use std::time::Duration;
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_render::TrailCell;
 

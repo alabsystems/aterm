@@ -58,7 +58,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use web_time::{Duration, Instant};
+use aterm_time::{Duration, Instant};
 
 /// The exclusive legs of one cold GPU-renderer build.
 ///
@@ -89,8 +89,10 @@ pub enum Leg {
     PipeShader = 6,
     /// Uniform buffer/bind-group and glyph-atlas layout + sampler.
     PipeUniformAtlas = 7,
-    /// All twelve cell render pipelines (see [`cell_pipeline_ns`] for the
-    /// per-pipeline split).
+    /// The cell render pipelines a COLD BUILD creates (see [`cell_pipeline_ns`]
+    /// for the per-pipeline split). Three since the effect pipelines went
+    /// demand-driven — `renderer::EffectPipelines` builds the other nine the
+    /// first frame that binds them, which for the shipped defaults is never.
     PipeCell = 8,
     /// Blit shader, layouts, NEAREST sampler, invert uniform.
     PipeBlit = 9,
@@ -112,27 +114,23 @@ pub enum Leg {
 pub const LEG_COUNT: usize = 15;
 
 /// How many cell render pipelines `build_cell_pipelines` builds, each timed
-/// individually. Twelve of the thirteen pipelines a cold build creates (the
-/// thirteenth is the bloom composite, under [`Leg::PipeBloom`]); at a vertex and
-/// a fragment entry point apiece that is 24 of the 26 cold shader compiles.
-pub const CELL_PIPELINE_COUNT: usize = 12;
+/// individually. THREE — the background fill, the mono glyph pass, and the
+/// colour-emoji pass, the only cell pipelines a frame with the shipped defaults
+/// binds.
+///
+/// It was TWELVE until the effect pipelines went demand-driven. That eager
+/// twelve measured **157.92 ms** on a dx12 Windows launch, of which **136.13 ms**
+/// was the nine effect pipelines (`fire_add` 57.21 + `fire_over` 53.86 alone
+/// were two thirds), and every one of those milliseconds landed on
+/// time-to-first-present. The nine now live in `renderer::EffectPipelines`,
+/// built the first frame that binds them — which for `cursor_trail = false`,
+/// `hdr_glow = false` is never. This constant is the standing proof: if it ever
+/// grows back, a launch is paying for pixels again.
+pub const CELL_PIPELINE_COUNT: usize = 3;
 
 /// Names of the [`CELL_PIPELINE_COUNT`] slots, in build order. Read by the
 /// frontend so the wire can label the split without duplicating the order.
-pub const CELL_PIPELINE_NAMES: [&str; CELL_PIPELINE_COUNT] = [
-    "bg",
-    "cursor_blend",
-    "glyph",
-    "color_glyph",
-    "glow_add",
-    "rain_glow",
-    "rain_glow_over",
-    "fire_add",
-    "fire_over",
-    "deco_over",
-    "deco_add",
-    "sprite_over",
-];
+pub const CELL_PIPELINE_NAMES: [&str; CELL_PIPELINE_COUNT] = ["bg", "glyph", "color_glyph"];
 
 static LEG_NS: [AtomicU64; LEG_COUNT] = [const { AtomicU64::new(0) }; LEG_COUNT];
 static CELL_PIPELINE_NS: [AtomicU64; CELL_PIPELINE_COUNT] =
@@ -196,11 +194,53 @@ pub fn cell_pipeline_ns() -> [u64; CELL_PIPELINE_COUNT] {
     std::array::from_fn(|index| CELL_PIPELINE_NS[index].load(Ordering::Relaxed))
 }
 
+/// THE DEMAND-BUILD LEDGER: how many effect pipelines this PROCESS has compiled
+/// on demand, and the wall time it spent doing it.
+///
+/// Process-global (not per-renderer) for the same reason the legs above are: the
+/// question a reader asks is "what did this launch compile", and the H1
+/// fail-soft path can build a SECOND renderer whose per-instance counters would
+/// answer only for itself.
+///
+/// UNLIKE the legs, these ACCUMULATE rather than first-write-wins: an effect
+/// switched on at minute ten is exactly the event worth seeing, so a later build
+/// must add to the ledger, not be discarded as "not the cold build".
+///
+/// This is the standing proof of the whole demand-driven design. A default
+/// launch must read `0 builds / 0 ns` for as long as it draws no effect; the
+/// moment it reads non-zero without an effect having been switched on, the gate
+/// has re-eagerised and a launch is paying for pixels again.
+static EFFECT_BUILDS: AtomicU64 = AtomicU64::new(0);
+static EFFECT_BUILD_NS: AtomicU64 = AtomicU64::new(0);
+/// WHICH slots were built, as a bitmask over `renderer::EffectPipeline as usize`.
+/// The count alone says a launch paid for something; only the mask says WHAT, and
+/// "what" is the whole diagnostic — a stray `deco_over` from an editor's undercurl
+/// and a re-eagerised `fire_add` are the same `1` but very different news.
+static EFFECT_BUILT_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// Book one demand-built effect pipeline (slot `index`) into the ledger.
+pub(crate) fn record_effect_build(index: usize, elapsed: Duration) {
+    EFFECT_BUILDS.fetch_add(1, Ordering::Relaxed);
+    EFFECT_BUILD_NS.fetch_add(slot_ns(elapsed), Ordering::Relaxed);
+    if index < u64::BITS as usize {
+        EFFECT_BUILT_MASK.fetch_or(1u64 << index, Ordering::Relaxed);
+    }
+}
+
+/// `(count, nanoseconds, slot bitmask)` of effect pipelines this process has
+/// demand-built. `(0, 0, 0)` is the healthy reading for a launch with the shipped
+/// defaults.
+pub fn effect_build_ledger() -> (u64, u64, u64) {
+    (
+        EFFECT_BUILDS.load(Ordering::Relaxed),
+        EFFECT_BUILD_NS.load(Ordering::Relaxed),
+        EFFECT_BUILT_MASK.load(Ordering::Relaxed),
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{
-        CELL_PIPELINE_COUNT, CELL_PIPELINE_NAMES, Duration, LEG_COUNT, Leg, slot_ns,
-    };
+    use super::{CELL_PIPELINE_COUNT, CELL_PIPELINE_NAMES, Duration, LEG_COUNT, Leg, slot_ns};
 
     #[test]
     fn leg_count_covers_every_variant() {

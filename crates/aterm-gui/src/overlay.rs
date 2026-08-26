@@ -57,7 +57,7 @@ pub(crate) trait OverlayModel {
     /// (screen readers) that can never diverge from the glass. Feature-gated because the
     /// AccessKit dep is opt-in; when present it is REQUIRED for every variant, so a surface
     /// left out is a compile error (the same exhaustive-fan-out guarantee as the rest).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate;
 }
 
@@ -74,7 +74,7 @@ impl OverlayModel for SettingsState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         SettingsState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::accesskit_tree::settings_tree(self)
     }
@@ -96,7 +96,7 @@ impl OverlayModel for AboutState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         AboutState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::about::about_a11y(self)
     }
@@ -117,7 +117,7 @@ impl OverlayModel for UpdateState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         UpdateState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::update_screen::update_a11y(self)
     }
@@ -138,7 +138,7 @@ impl OverlayModel for PaletteState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         PaletteState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::palette::palette_a11y(self)
     }
@@ -158,7 +158,7 @@ impl OverlayModel for ConnCardState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         ConnCardState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::conn_card::conn_card_a11y(self)
     }
@@ -179,7 +179,7 @@ impl OverlayModel for ConnectionMapState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         ConnectionMapState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::connection_map::map_a11y(self)
     }
@@ -200,7 +200,7 @@ impl OverlayModel for SessionPickerState {
     fn scroll_extent(&self) -> (usize, usize, usize) {
         SessionPickerState::scroll_extent(self)
     }
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
         crate::session_picker::picker_a11y(self)
     }

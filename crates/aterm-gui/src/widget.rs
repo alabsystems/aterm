@@ -539,8 +539,18 @@ mod tests {
                 let t = line.trim_start();
                 let is_comment =
                     t.starts_with("//") || t.starts_with("///") || t.starts_with("//!");
-                let is_pattern =
-                    line.contains("..") || line.contains("matches!") || line.contains("if let");
+                // PATTERNS, not constructions. The `..` / `matches!` / `if let`
+                // spellings were the ones this scanner knew; a `let`-else
+                // destructuring spreads its fields over the FOLLOWING lines, so
+                // the needle's own line carries none of those markers and a
+                // reader of prims got flagged as a writer of them. A binding
+                // form is the discriminator: a construction is never the first
+                // token after `let`.
+                let is_pattern = line.contains("..")
+                    || line.contains("matches!")
+                    || line.contains("if let")
+                    || t.starts_with("let ")
+                    || t.starts_with("} = ");
                 if is_comment || is_pattern {
                     continue;
                 }

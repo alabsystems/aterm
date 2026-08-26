@@ -197,6 +197,17 @@ softbuffer = "0.4"
 # presence, gates compilation.
 accesskit = { version = "0.24", optional = true }
 accesskit_winit = { version = "=0.33.1", optional = true }
+
+# LINUX CARRIES THE TREE UNCONDITIONALLY (owner's call, 2026-08-26). On macOS the
+# accessibility surface is native (`a11y-appkit`), so the AccessKit stack there is
+# genuinely optional weight. On Linux it is the ONLY surface: measured on a stock
+# build with the feature off, the AT-SPI registry reports ZERO applications for
+# aterm while a GTK app sits in the same registry, found by the same walker — i.e.
+# a blind Linux user gets no terminal at all, not a degraded one. A default that
+# ships an unusable product to save 61 packages is the wrong trade, so these are
+# plain dependencies here and the `a11y-accesskit` feature stays as the opt-in for
+# the platforms that do not need it. `build.rs` folds both into one `a11y_tree`
+# cfg so the code never has to spell the platform.
 # Config file parsing. Both crates are ALREADY in this binary's tree (via the
 # engine's config + policy crates), so this adds bindings, not weight.
 serde = { workspace = true }
@@ -334,6 +345,11 @@ rustix = { version = "=1.1.4", features = ["fs"] }
 # pulls it), so this adds bindings, not weight. `default-features = false` selects
 # only the pure-Rust connection (no libxcb FFI).
 x11rb = { version = "0.13", default-features = false }
+# The accessibility tree, unconditionally — see the note beside the optional
+# entries above. AccessKit's Unix backend is what reaches AT-SPI, which is what
+# Orca reads; without it a Linux build exposes nothing at all.
+accesskit = "0.24"
+accesskit_winit = "=0.33.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # NSBeep for the audible bell + NSWindow.setColorSpace to drop the per-frame

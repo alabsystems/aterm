@@ -39,11 +39,7 @@ aterm-scene = { workspace = true }
 # (byte-identical to the pre-extraction aterm-gui build), a JS clock on wasm32 —
 # the state machines stay clockless (the host injects `now`), but wasm hosts
 # need a constructible Instant to synthesize one from an advance(dt) stream.
-web-time = { workspace = true }
-# Tiny public-domain bitmap faces used only to author the 64-slot PHOSPHOR
-# material ROM from literal sampled output characters. The live renderer still
-# consumes the existing backend-neutral SceneAtlas/SpriteQuad contract.
-font8x8 = { workspace = true }
+aterm-time = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 # Native config-referenced visual feeds are opened O_NONBLOCK/O_NOFOLLOW on
@@ -51,6 +47,15 @@ font8x8 = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The 499 glyphs PHOSPHOR's literal
+# material ROM draws with are PUBLIC-DOMAIN DATA, now carried in-tree
+# (src/matrix_rain/bitmap_font.rs) instead of reached through ~10.6k lines of
+# third-party Rust. This entry keeps the crate for `tests/font8x8_oracle.rs`,
+# which asserts the copy answers identically for EVERY code point in Unicode —
+# so faithfulness is re-proved on every test run, not asserted once at copy
+# time. The four `examples/*_demo.rs` glyph-row fixtures also draw from it,
+# which is dev-only by definition.
+font8x8 = { workspace = true }
 # The ty models the sparkle tests run (identity episodes, flash limiter).
 aterm-spec = { workspace = true }
 # Atlas PNG dumps for visual iteration (gated behind ATERM_CAT_DUMP); dev-only.

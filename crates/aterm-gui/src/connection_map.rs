@@ -663,7 +663,7 @@ impl ConnectionMapState {
     }
 
     /// A11y row-identity epoch over the item list (the palette's scheme).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -687,7 +687,7 @@ impl ConnectionMapState {
     }
 
     /// Decode a node minted by the CURRENT epoch to its item index.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn a11y_item_index(&self, node: accesskit::NodeId) -> Option<usize> {
         let slot = usize::try_from(node.0 & u64::from(u32::MAX))
             .ok()?
@@ -918,7 +918,7 @@ pub(crate) fn map_tray(state: &ConnectionMapState, g: &SettingsGeom, theme: Them
 
 /// The map's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the chip/arrow items, epoch-guarded ids, focus follows the cursor.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn map_a11y(state: &ConnectionMapState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
@@ -967,7 +967,7 @@ pub(crate) fn map_a11y(state: &ConnectionMapState) -> accesskit::TreeUpdate {
 }
 
 /// Mint a row node id (epoch high half, `slot + 1` low — the palette scheme).
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
     accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
 }

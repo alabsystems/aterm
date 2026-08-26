@@ -296,7 +296,7 @@ impl AboutState {
 /// root is `NodeId(0)`; row `i` is `NodeId(i + 1)` (the site Link's id is
 /// [`site_node_id`]); the OK button is `NodeId(rows.len() + 1)`. A `Click` on the site
 /// Link opens the browser; a `Click` anywhere else closes.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn about_a11y(state: &AboutState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
@@ -345,7 +345,7 @@ pub(crate) fn about_a11y(state: &AboutState) -> accesskit::TreeUpdate {
 /// The a11y `NodeId` (row index + 1) of the site-link row — the Link node
 /// [`about_a11y`] publishes; the About branch of `App::on_accessibility_action`
 /// routes its `Click` to the browser open (any other `Click` closes).
-#[cfg(all(test, feature = "a11y-accesskit"))]
+#[cfg(all(test, a11y_tree))]
 pub(crate) fn site_node_id(state: &AboutState) -> Option<u64> {
     state
         .rows
@@ -1419,7 +1419,7 @@ mod tests {
     /// ANTI-DIVERGENCE for the retired card fixture: its test projection and a11y
     /// node/label set stay in bijection. Shipping `controls about` is separately bound
     /// to the compiled native Settings route in `app_introspect`.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn about_a11y_nodeset_matches_controls_keys() {
         use accesskit::{Action, Role};
@@ -1498,7 +1498,7 @@ mod tests {
     /// NEGATIVE CONTROL (non-vacuity): dropping a provenance row from the model drops its
     /// a11y node too — proving the conformance test would catch a stale/hard-coded tree
     /// rather than passing against a fixed node list.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn about_a11y_tree_tracks_the_model() {
         use accesskit::Role;

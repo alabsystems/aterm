@@ -95,7 +95,7 @@
 
 use core::f32::consts::TAU;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use crate::cat_baker::CatColorKey;
 use crate::pet_glyphs_gen::{PET_GLYPH_IDS, PET_GLYPHS, PetGlyphId};
@@ -1236,7 +1236,19 @@ impl PetFrame {
     /// y1)`, right/bottom exclusive: exactly the dest rect the emitter draws
     /// (`WordDecorations::pet_cursor`, which calls this so the two can never
     /// drift). Feet on the row baseline, the arc's lift folded in,
-    /// squash/stretch about the feet, left/right clamped to the grid.
+    /// squash/stretch about the feet, clamped to the grid on ALL FOUR sides.
+    ///
+    /// THE VERTICAL CLAMP IS NOT DECORATION, it is the containment law. This lane's
+    /// dest rect is a `FreeSprite`, whose plane honours a SIGNED origin so a sprite
+    /// may deliberately peek off-grid (`stamp_free_sprite`), and the tab-strip splice
+    /// shifts every free sprite down by `strip_rows · cell_h`. The art is `ART_ROWS`
+    /// (1.7) tall standing on its row's baseline, so a pet on terminal row 0 resolves
+    /// a top edge ~0.7 cells ABOVE the grid — which after the splice is not empty
+    /// padding but the TAB STRIP, and the cat's head paints over the tab titles.
+    /// Clamping keeps the resident inside the terminal it lives in: on row 0 it
+    /// stands a little low rather than climbing into the chrome. (Robi is the
+    /// deliberate exception — he is opt-in, he has his own `robi::body_px`, and going
+    /// up the ladder past the top is his whole act.)
     ///
     /// Hosts hand this rect to the word-cat engine as the companion's
     /// pixel-yield box (`CompanionOnGlass::body_px`): the one-cat-per-caret
@@ -1248,7 +1260,13 @@ impl PetFrame {
     /// `None` when nothing is on glass (`alpha == 0`) or the cell metrics are
     /// degenerate — the same frames the emitter draws nothing for.
     #[must_use]
-    pub fn body_px(&self, cell_w: u16, cell_h: u16, cols: u16) -> Option<(i32, i32, i32, i32)> {
+    pub fn body_px(
+        &self,
+        cell_w: u16,
+        cell_h: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Option<(i32, i32, i32, i32)> {
         if self.alpha == 0 || cell_w == 0 || cell_h == 0 {
             return None;
         }
@@ -1264,11 +1282,16 @@ impl PetFrame {
         let dest_w = ((nat_w as f32 * self.scale_x).round() as i32).clamp(1, i32::from(u16::MAX));
         let dest_h = ((nat_h as f32 * self.scale_y).round() as i32).clamp(1, i32::from(u16::MAX));
         let grid_w = i32::from(cols).saturating_mul(i32::from(cell_w));
+        let grid_h = i32::from(rows).saturating_mul(i32::from(cell_h));
         let cx = (self.col * f32::from(cell_w)).round() as i32 + nat_w / 2;
         let baseline = ((self.row + 1.0) * f32::from(cell_h)).round() as i32
             - (self.lift * f32::from(cell_h)).round() as i32;
         let x0 = (cx - dest_w / 2).clamp(0, (grid_w - dest_w).max(0));
-        Some((x0, x0 + dest_w, baseline - dest_h, baseline))
+        // The y twin of the x clamp on the line above — see the doc note: a free
+        // sprite that leaves the grid vertically lands in the tab strip, not in
+        // empty padding.
+        let y0 = (baseline - dest_h).clamp(0, (grid_h - dest_h).max(0));
+        Some((x0, x0 + dest_w, y0, y0 + dest_h))
     }
 }
 
@@ -3410,8 +3433,7 @@ impl PetBrain {
         // A live pursuit keeps the standing-gap doors SHUT: a chase runs on
         // paws (that is what makes it a chase) — only a latched caret intent
         // may still fly.
-        if (self.pending_pounce
-            || (self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
+        if (self.pending_pounce || (self.pursuit_t.is_none() && gap.abs() >= POUNCE_GAP))
             && gap.abs() > ARRIVED
         {
             self.pending_pounce = false;
@@ -3561,7 +3583,11 @@ impl PetBrain {
                     .is_some_and(|at| self.clock - at >= f64::from(HANDOFF_DEBOUNCE))
             {
                 let limit = (f32::from(sense.cols) - width).max(0.0);
-                let edge = if self.col >= f32::from(cc) { limit } else { 0.0 };
+                let edge = if self.col >= f32::from(cc) {
+                    limit
+                } else {
+                    0.0
+                };
                 let old = self.worn.unwrap_or(pair);
                 self.worn = Some(pair);
                 self.pending_worn = None;
@@ -4713,7 +4739,9 @@ impl PetBrain {
     fn resolve_departures(&mut self) -> [Option<PetDepartureSprite>; PET_DEPARTURES_MAX] {
         let mut out = [None; PET_DEPARTURES_MAX];
         for (i, slot) in out.iter_mut().enumerate() {
-            let Some(d) = self.departures[i] else { continue };
+            let Some(d) = self.departures[i] else {
+                continue;
+            };
             let t = (self.clock - d.born) as f32;
             let life = d.life();
             if !(0.0..life).contains(&t) {
@@ -5096,6 +5124,64 @@ impl PetBrain {
         self.alpha > 0.0
     }
 
+    /// THE RESIDENT'S SWITCH, HONOURED AT ONCE: drop everything this brain owns
+    /// because its owner went away — the cursor-trail master turned off, the trail
+    /// style stopped being the pet style, or serious mode took the glass.
+    ///
+    /// The flying kitty has had this for as long as it has had an owner
+    /// (`kitty_cursor::CursorCat::retire_unowned_cursor_motion`, driven by the host's
+    /// `retire_kitty_cursor_without_owner`); the resident pet had NOTHING. Hosts could
+    /// only stop feeding it a caret, and `tick`'s no-caret arm is a graceful EXIT, not
+    /// a switch: it ramps `alpha` down over [`FADE_OUT`] and — read the arm — drops
+    /// departures, latches and play state while deliberately leaving the MOTE lane
+    /// running ("until the lanes empty, the slow arm keeps running their clocks every
+    /// frame").
+    ///
+    /// WHAT THAT COSTS — measured against the host, not assumed. The pet's PIXELS were
+    /// already safe: every emitter gates on the same presentation predicate the switch
+    /// moves, so the first frame after the flip draws no pet and no mote. What survived
+    /// the switch was this brain's STATE, and through it the FRAME TRAIN.
+    /// [`Self::needs_frames`] is true while `alpha` is mid-fade and true for every mote
+    /// still in the lane, and that is exactly what a host's effects scheduler consumes
+    /// (in the native GUI, `cursor_dependents_need_frame_cadence` — which takes the
+    /// pet's `needs_frames()` and does NOT take the trail master as a term). So
+    /// switching the companion off left the window running its 60 fps effects lane, for
+    /// the whole fade plus the whole remaining life of every z already in flight, to
+    /// animate a companion nobody can see. A switch that keeps costing frames after it
+    /// is thrown has not been honoured.
+    ///
+    /// So: no fade, no drift, no owed frames. This is the exact state a fresh window
+    /// starts in ([`Self::default`] — asleep, invisible, lanes empty, `needs_frames()`
+    /// false), which is also what `WindowState::drain_serious_effects` already
+    /// assigns for the serious-mode edge; this method is that same law made reachable
+    /// per-frame and idempotent.
+    ///
+    /// LEVEL, NOT EDGE — the `retire_kitty_cursor_without_owner` discipline. Hosts
+    /// call it every frame the pet has no owner, so a config reload, a style swap, a
+    /// serious-mode toggle and a startup with the trail already off all take the same
+    /// path and none of them needs an edge detector. An already-retired brain returns
+    /// on the guard below without writing anything, so the steady "off" state costs
+    /// one predicate per frame and cannot churn the resident's identity.
+    ///
+    /// It is NOT the presentation gate. Focus loss, a scrolled viewport and a
+    /// load-shed all hide the pet WITHOUT taking its ownership away, and a resident
+    /// that forgot itself every time the window blurred would come back a different
+    /// cat. Hosts pass ownership only: `pet_mode && cursor_trail && style == the pet`.
+    pub fn retire_unowned(&mut self) {
+        if self.alpha == 0.0
+            && self.last_caret.is_none()
+            && self.motes.iter().all(Option::is_none)
+            && self.departures.iter().all(Option::is_none)
+            && !self.needs_frames()
+        {
+            return;
+        }
+        // The species is host-asserted every frame (`set_species`) and the worn look
+        // is re-synced on every emission (`sync_look`), so neither needs carrying
+        // across: the next appearance dresses itself from the live verdict.
+        *self = Self::default();
+    }
+
     /// Host sync for the pet's identity — the flying kitty's per-appearance
     /// look latch (`kitty_cursor::CursorCat::set_look`), extended to the pet:
     /// ONE APPEARANCE WEARS ONE CAT. The host passes this frame's verdict for
@@ -5298,10 +5384,7 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for cat in cats {
             let dog = PetSpecies::Dog.skin(cat);
-            let (cat_id, dog_id) = (
-                PET_GLYPHS[cat as usize].id,
-                PET_GLYPHS[dog as usize].id,
-            );
+            let (cat_id, dog_id) = (PET_GLYPHS[cat as usize].id, PET_GLYPHS[dog as usize].id);
             assert_ne!(
                 dog, cat,
                 "{cat_id} fell back to the cat frame — no dog counterpart"
@@ -5340,7 +5423,10 @@ mod tests {
         let mut pet = PetBrain::default();
         let t = Instant::now();
         for i in 0..40 {
-            pet.tick(sense(t + Duration::from_millis(i * 40), Some((4, 10 + i as u16 % 7))));
+            pet.tick(sense(
+                t + Duration::from_millis(i * 40),
+                Some((4, 10 + i as u16 % 7)),
+            ));
         }
         let before = pet.tick(sense(t + Duration::from_millis(1600), Some((4, 20))));
         pet.set_species(PetSpecies::Dog);
@@ -6044,7 +6130,10 @@ mod tests {
         input.reduced_motion = true;
         let frame = pet.tick(input);
 
-        assert_eq!(frame.alpha, 255, "the first requested still is already visible");
+        assert_eq!(
+            frame.alpha, 255,
+            "the first requested still is already visible"
+        );
         assert_eq!(frame.lift, 0.0);
         assert_eq!((frame.scale_x, frame.scale_y), (1.0, 1.0));
         assert!(matches!(frame.action, PetAction::Sit | PetAction::Sleep));
@@ -6829,6 +6918,99 @@ mod tests {
             hz < 3.0,
             "z births at {hz} Hz — over WCAG 2.3.1's 3 Hz general-flash bound"
         );
+    }
+
+    /// Drive a fresh brain to the exact state the orphan-mote report caught on
+    /// glass: light sleep, with a `Zee` actually drifting off the head anchor.
+    /// Returns the clock and that frame. Deterministic (this engine reads no wall
+    /// clock and draws no randomness), so two brains driven this way are equal.
+    fn sleeper_with_a_live_zee(start: Instant) -> (PetBrain, Instant) {
+        let mut pet = PetBrain::default();
+        let t = awake(&mut pet, start, 4, 10);
+        let (mut t, _) = idle(&mut pet, t, (4, 12), SLEEP_AFTER + 0.1);
+        for _ in 0..400 {
+            t += Duration::from_millis(16);
+            let f = pet.tick(sense(t, Some((4, 12))));
+            if f.motes
+                .iter()
+                .flatten()
+                .any(|m| m.kind == PetMoteKind::Zee && m.alpha > 0)
+            {
+                return (pet, t);
+            }
+        }
+        panic!("fixture: the sleeper never dreamed a visible z");
+    }
+
+    /// NOTHING THE PET OWNS MAY OUTLIVE ITS SWITCH.
+    ///
+    /// Withholding the caret is a graceful EXIT, not a switch: `tick`'s no-caret
+    /// arm ramps the body down over `FADE_OUT` and deliberately leaves the mote
+    /// lane running ("until the lanes empty, the slow arm keeps running their
+    /// clocks every frame"). That is right for a pet that lost sight of the cursor
+    /// and wrong for one whose OWNER went away: a fade and a drift are requests for
+    /// MORE frames, made at the instant the user said stop. Both halves of that
+    /// leftover are pinned below — the live mote, and the `needs_frames()` claim on
+    /// the host's 60 fps effects lane that a mote (or a half-faded body) keeps
+    /// alive.
+    ///
+    /// So this pins the two levers against one another on one fixture: the
+    /// caret-withheld CONTROL still carries the z and still asks for the lane, and
+    /// [`PetBrain::retire_unowned`] does neither.
+    #[test]
+    fn retire_unowned_kills_a_live_mote_where_withholding_the_caret_does_not() {
+        let start = Instant::now();
+
+        // CONTROL — the only lever hosts had before: stop feeding a caret.
+        let (mut control, mut ct) = sleeper_with_a_live_zee(start);
+        ct += Duration::from_millis(16);
+        let drifting = control.tick(sense(ct, None));
+        assert!(
+            drifting.motes.iter().flatten().any(|m| m.alpha > 0),
+            "fixture: withholding the caret leaves the mote lane drifting — that \
+             is the behaviour this switch exists to overrule"
+        );
+        assert!(
+            control.needs_frames(),
+            "…and it is still asking for the 60 fps lane it is about to lose"
+        );
+
+        // THE SWITCH, on an identical brain.
+        let (mut pet, mut t) = sleeper_with_a_live_zee(start);
+        assert!(pet.is_active(), "fixture: a visible pet");
+        assert!(pet.needs_frames(), "fixture: a drifting z owns the lane");
+        pet.retire_unowned();
+        assert!(!pet.is_active(), "a retired pet paints nothing");
+        assert!(!pet.needs_frames(), "…and owes the scheduler no frames");
+
+        // The next frame a host would emit from carries nothing at all — no fade
+        // to sit through, no mote left in the lane.
+        t += Duration::from_millis(16);
+        let after = pet.tick(sense(t, None));
+        assert_eq!(after.alpha, 0, "the body is gone at once, not fading");
+        assert!(
+            after.motes.iter().all(Option::is_none),
+            "the mote lane must be empty, found {:?}",
+            after
+                .motes
+                .iter()
+                .flatten()
+                .map(|m| m.kind)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            after.departures.iter().all(Option::is_none),
+            "and no departing body either"
+        );
+
+        // LEVEL, NOT EDGE: hosts call it every frame the switch is off, so an
+        // already-retired brain must be a no-op that still owes nothing.
+        pet.retire_unowned();
+        assert!(!pet.needs_frames(), "retirement is idempotent");
+        t += Duration::from_millis(16);
+        let still = pet.tick(sense(t, None));
+        assert_eq!(still.alpha, 0);
+        assert!(still.motes.iter().all(Option::is_none));
     }
 
     /// The purr tell: a settled, contented cat floats ♪ and ♥ motes on the

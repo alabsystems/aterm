@@ -17,11 +17,6 @@
 
 use std::sync::OnceLock;
 
-use font8x8::{
-    BASIC_FONTS, BLOCK_FONTS, BOX_FONTS, GREEK_FONTS, HIRAGANA_FONTS, LATIN_FONTS, MISC_FONTS,
-    UnicodeFonts,
-};
-
 /// Master glyph cell width in bits (one `u32` row per scanline).
 pub const MASTER_W: usize = 24;
 /// Master glyph cell height in scanlines.
@@ -317,17 +312,14 @@ pub(crate) fn decorative_master() -> &'static RomMaster {
 /// Hiragana. Unsupported code points are skipped by the material sampler; they
 /// are never substituted with a different-looking character and therefore can
 /// never make the "real output" contract dishonest.
+///
+/// One binary search over [`super::bitmap_font`], the in-tree public-domain
+/// glyph table, where this used to walk a seven-table fallback chain through a
+/// third-party trait. Same answer for every code point in Unicode, held there
+/// by `tests/font8x8_oracle.rs`.
 #[must_use]
 pub fn material_bitmap(c: char) -> Option<[u8; 8]> {
-    BASIC_FONTS
-        .get(c)
-        .or_else(|| LATIN_FONTS.get(c))
-        .or_else(|| GREEK_FONTS.get(c))
-        .or_else(|| BOX_FONTS.get(c))
-        .or_else(|| BLOCK_FONTS.get(c))
-        .or_else(|| HIRAGANA_FONTS.get(c))
-        .or_else(|| MISC_FONTS.get(c))
-        .filter(|bitmap| bitmap.iter().any(|&row| row != 0))
+    super::bitmap_font::bitmap(c)
 }
 
 /// Author a hybrid 64-slot master whose prefix is the exact `chars` supplied

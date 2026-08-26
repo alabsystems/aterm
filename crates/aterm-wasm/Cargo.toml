@@ -22,16 +22,16 @@ aterm-core = { path = "../aterm-core", default-features = false, features = ["si
 aterm-render = { path = "../aterm-render", default-features = false }
 aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # The shared cursor-wake + sparkle-words engines (the SAME art the native app
-# runs — extracted from aterm-gui). Closure is wasm32-clean (web-time clock).
+# runs — extracted from aterm-gui). Closure is wasm32-clean (aterm-time clock).
 aterm-effects = { path = "../aterm-effects" }
 # The shared mosh-style predictive-echo state machine (the SAME predictor the
 # native app runs — extracted from aterm-gui). Pure + clock-injected; the
-# predict_api module samples the real monotonic clock for it (web-time below).
+# predict_api module samples the real monotonic clock for it (aterm-time below).
 aterm-predict = { workspace = true }
 # Real monotonic clock for the predict_api host seam: std Instant on native,
 # performance.now() on wasm32 — the predictor's echo reconciliation runs on
 # REAL time (the glitch-expiry self-heal), unlike the deterministic effects clock.
-web-time = { workspace = true }
+aterm-time = { workspace = true }
 # aterm_types::Appearance for the set_color_scheme binding (aterm-core does not
 # re-export it). default-features = false pins out serde/winit -> wasm32-clean.
 aterm-types = { workspace = true }

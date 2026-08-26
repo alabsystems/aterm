@@ -167,7 +167,7 @@ define_terminal_handler! {
     title: super::TitleState => title,
     bell_callback: Option<Box<dyn FnMut() + Send>> => bell_callback,
     kitty_file_resolver: Option<Box<dyn Fn(crate::terminal::kitty_graphics::KittyMedium, &str) -> Option<Vec<u8>> + Send>> => kitty_file_resolver,
-    last_bell_time: Option<web_time::Instant> => last_bell_time,
+    last_bell_time: Option<aterm_time::Instant> => last_bell_time,
     bell_total: u64 => bell_total,
     cursor_style_callback: Option<Box<dyn FnMut(aterm_types::CursorStyle) + Send>> => cursor_style_callback,
     default_cursor_style: aterm_types::CursorStyle => default_cursor_style,

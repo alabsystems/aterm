@@ -20,7 +20,7 @@ aterm-grapheme = { workspace = true }
 # (byte-identical to the pre-extraction aterm-gui build), a JS clock on wasm32 —
 # the state machine stays clockless (the host injects `now`), but wasm hosts
 # need a constructible Instant to sample their real monotonic clock.
-web-time = { workspace = true }
+aterm-time = { workspace = true }
 
 [dev-dependencies]
 aterm-spec = { workspace = true }

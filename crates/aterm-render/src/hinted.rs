@@ -20,7 +20,7 @@
 //! This module is the non-CoreText twin of the macOS `ct_glyph` seam: skrifa runs the
 //! font's OWN TrueType bytecode or the FreeType-ported autohinter
 //! ([`skrifa::outline::HintingInstance`]) and hands back a grid-fitted outline
-//! in pixel space, which the SAME `ab_glyph_rasterizer` coverage fill as the
+//! in pixel space, which the SAME [`crate::raster`] coverage fill as the
 //! FONT-2 variation path (`variation::varied_glyph_raster`) turns into an
 //! 8-bit mask in fontdue's metric convention
 //! `(width, height, xmin, ymin, advance, bytes)`. Every function returns
@@ -318,7 +318,7 @@ pub(crate) fn hinted_glyph_raster(
     // filled block. See `variation::RASTER_PAD` for the full mechanism and the
     // measured damage map ('?' at ppem 17, '2' at ppem 19 on the default face).
     let pad = crate::variation::RASTER_PAD as f32;
-    let mut ras = ab_glyph_rasterizer::Rasterizer::new(
+    let mut ras = crate::raster::Rasterizer::new(
         w + 2 * crate::variation::RASTER_PAD,
         h + 2 * crate::variation::RASTER_PAD,
     );
@@ -341,7 +341,7 @@ enum Cmd {
 }
 
 /// Collects a skrifa outline (pixels, y up) and its ink bounds, then replays
-/// it into an `ab_glyph_rasterizer` grid (pixels, y DOWN, origin at the ink
+/// it into a [`crate::raster`] grid (pixels, y DOWN, origin at the ink
 /// box's top-left) — the same mapping as `variation::OutlineToRaster`, minus
 /// the design-unit scale (skrifa already delivers pixel coordinates).
 /// `pub(crate)` for the subpixel raster ([`crate::subpixel`]), which replays
@@ -376,21 +376,21 @@ impl PathPen {
     /// with the x axis scaled by `xs` AFTER the translate (`xs = 1.0` is the
     /// exact identity — multiplying an f32 by 1.0 is bit-precise — and `3.0`
     /// is the subpixel raster's horizontal oversample). Contours are
-    /// implicitly closed (TrueType/CFF convention; ab_glyph needs the closing
+    /// implicitly closed (TrueType/CFF convention; the rasterizer needs the closing
     /// edge for nonzero winding), matching `OutlineToRaster`.
     pub(crate) fn fill(
         &self,
-        ras: &mut ab_glyph_rasterizer::Rasterizer,
+        ras: &mut crate::raster::Rasterizer,
         x_min: f32,
         y_max: f32,
         xs: f32,
     ) {
-        let map = |x: f32, y: f32| ab_glyph_rasterizer::point((x - x_min) * xs, y_max - y);
-        let mut last = ab_glyph_rasterizer::point(0.0, 0.0);
+        let map = |x: f32, y: f32| crate::raster::point((x - x_min) * xs, y_max - y);
+        let mut last = crate::raster::point(0.0, 0.0);
         let mut start = last;
-        let close = |ras: &mut ab_glyph_rasterizer::Rasterizer,
-                     last: &mut ab_glyph_rasterizer::Point,
-                     start: ab_glyph_rasterizer::Point| {
+        let close = |ras: &mut crate::raster::Rasterizer,
+                     last: &mut crate::raster::Point,
+                     start: crate::raster::Point| {
             if *last != start {
                 ras.draw_line(*last, start);
                 *last = start;
@@ -597,7 +597,7 @@ mod tests {
     fn generous_slack_raster(pen: &PathPen, w: usize, h: usize) -> Vec<u8> {
         const SLACK: usize = 4;
         let (x_min, y_max) = (pen.min_x.floor(), pen.max_y.ceil());
-        let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
+        let mut ras = crate::raster::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
         pen.fill(&mut ras, x_min - SLACK as f32, y_max + SLACK as f32, 1.0);
         let gw = w + 2 * SLACK;
         let mut cov = vec![0u8; w * h];
@@ -697,7 +697,7 @@ mod tests {
     ///
     /// Grid fitting snaps stem edges to whole pixels, so a fitted outline
     /// routinely sits EXACTLY on `x = floor(min_x)` — the coverage grid's left
-    /// edge. `ab_glyph_rasterizer` marches x incrementally down a segment's
+    /// edge. [`crate::raster`] marches x incrementally down a segment's
     /// scanlines, drifts a sub-ULP past that edge, floors to `-1`, and drops the
     /// whole scanline's area; `for_each_pixel`'s single running accumulator then
     /// carries the loss through every remaining texel and the glyph paints as a

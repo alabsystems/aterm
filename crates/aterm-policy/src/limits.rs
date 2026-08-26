@@ -54,9 +54,9 @@
 
 use std::collections::HashMap;
 use std::time::Duration;
-// web_time::Instant == std::time::Instant on native; JS clock on wasm32 (engine-wide
-// web_time discipline — std::time::Instant::now() panics on wasm).
-use web_time::Instant;
+// aterm_time::Instant == std::time::Instant on native; JS clock on wasm32 (engine-wide
+// aterm_time discipline — std::time::Instant::now() panics on wasm).
+use aterm_time::Instant;
 
 use crate::{Policy, RateLimit};
 

@@ -9,12 +9,12 @@
 //! current [`Instant`] as a parameter instead of reading the clock, so the
 //! full transition space is unit-testable without sleeping.
 
-// web_time::Instant is std::time::Instant on native (byte-identical) and a JS-clock
+// aterm_time::Instant is std::time::Instant on native (byte-identical) and a JS-clock
 // instant on wasm32, where Instant::now() panics. Every Instant in the engine's clock
 // seam (transient.process_now, last_bell_time, ClockReading) must be this same type so
 // they interoperate. Duration is unaffected by wasm and stays std::time.
 use std::time::Duration;
-use web_time::Instant;
+use aterm_time::Instant;
 
 /// How long a visual bell keeps the frame flashed (inverted/dimmed).
 pub const FLASH_DURATION: Duration = Duration::from_millis(100);

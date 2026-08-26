@@ -33,6 +33,8 @@ use std::path::{Component, Path, PathBuf};
 
 use aterm_digest::Sha256;
 
+use crate::tarread::EntryType as TarEntryType;
+
 /// Why an archive entry was refused. Any variant aborts the entire staged group — a
 /// half-extracted bundle never activates (§7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -195,15 +197,15 @@ impl std::fmt::Display for ExtractError {
 
 impl std::error::Error for ExtractError {}
 
-/// Map a `tar` entry type to our [`EntryKind`]; anything that is not a plain file or
+/// Map a tar entry type to our [`EntryKind`]; anything that is not a plain file or
 /// directory is treated as a disallowed kind (refused by [`vet_entry`]).
-fn classify(ty: tar::EntryType) -> EntryKind {
+fn classify(ty: TarEntryType) -> EntryKind {
     match ty {
-        tar::EntryType::Regular | tar::EntryType::Continuous => EntryKind::Regular,
-        tar::EntryType::Directory => EntryKind::Directory,
-        tar::EntryType::Symlink => EntryKind::Symlink,
-        tar::EntryType::Link => EntryKind::Hardlink,
-        _ => EntryKind::Other,
+        TarEntryType::Regular | TarEntryType::Continuous => EntryKind::Regular,
+        TarEntryType::Directory => EntryKind::Directory,
+        TarEntryType::Symlink => EntryKind::Symlink,
+        TarEntryType::Link => EntryKind::Hardlink,
+        TarEntryType::Other => EntryKind::Other,
     }
 }
 
@@ -552,11 +554,12 @@ that would not describe everything under it: ");
     // legitimate large file still streams while a single entry's structural reads stay
     // under TAR_ENTRY_STRUCTURAL_BUDGET.
     let budget = std::rc::Rc::new(std::cell::Cell::new(TAR_ENTRY_STRUCTURAL_BUDGET));
-    let mut tar = tar::Archive::new(CappedReader {
+    let mut tar = crate::tarread::Archive::new(CappedReader {
         inner: decoder,
         budget: std::rc::Rc::clone(&budget),
     });
-    // We drive extraction ourselves — never tar's `unpack` — so every entry is vetted.
+    // We drive extraction ourselves — the reader is a PARSER with no `unpack` at all
+    // (crate::tarread) — so every entry is vetted before a byte reaches the disk.
     let mut remaining = max_total_bytes;
     // ONE copy buffer for the whole archive. A `[0u8; 64 * 1024]` local inside
     // `write_capped` would be zero-initialized per ENTRY and LLVM cannot elide it (the
@@ -575,10 +578,12 @@ that would not describe everything under it: ");
         // Fresh per-entry structural allowance (does NOT roll over, so a bomb at any
         // entry position is capped at TAR_ENTRY_STRUCTURAL_BUDGET, not that × count).
         budget.set(TAR_ENTRY_STRUCTURAL_BUDGET);
-        // `next()` is where the tar crate resolves GNU longname/longlink/PAX extension
-        // headers by reading their body — a budget trip here maps to TooLarge.
-        let Some(entry) = entries.next() else { break };
-        let mut entry = entry.map_err(map_tar_io)?;
+        // `next_entry()` is where the reader resolves GNU longname/longlink/PAX
+        // extension headers by reading their body through this same CappedReader — a
+        // budget trip here maps to TooLarge.
+        let Some(mut entry) = entries.next_entry().map_err(map_tar_io)? else {
+            break;
+        };
         count += 1;
         if count > max_entries {
             return Err(ExtractError::TooLarge);
@@ -650,7 +655,12 @@ that would not describe everything under it: ");
                 // decompression-bomb vector if the attacker-chosen header declares a huge
                 // size. A legitimate directory always declares size 0, so a non-zero
                 // declared size names no valid bundle: refuse it fail-closed.
-                let declared = entry.header().entry_size().unwrap_or(0);
+                // The EFFECTIVE size — the reader's, after any PAX `size`
+                // record overrode the header field. Reading `header()` here
+                // would let an `x` record declare 0 while the ustar field
+                // declares gigabytes (or the reverse), which is the exact
+                // reader-disagreement this guard exists to close.
+                let declared = entry.entry_size();
                 if declared != 0 {
                     return Err(ExtractError::TooLarge);
                 }

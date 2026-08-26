@@ -18,6 +18,58 @@ use crate::{
     App, Backend, FONT_PX, FONT_PX_MAX, FONT_PX_MIN, PresentTarget, WindowId, keybinding, term_lock,
 };
 
+/// THE PLATFORM DEFAULT for decoration that paints OVER content the user is trying
+/// to read. `true` everywhere except WINDOWS.
+///
+/// WHY THE SPLIT, from this repo's own history rather than taste. The owner's
+/// standing Windows directive is a minimal, fast, native terminal, and it was
+/// already shipped once: `6272bd7a` ("fix(windows/ux): minimal fast defaults — kill
+/// typing lag, yellow cast, HUD, loud cursor") turned `cursor_trail`,
+/// `cursor_trail_bloom`, `stream_fade` and `show_hud` OFF after a Windows audit
+/// traced typing lag to "decorative work shipped ON by default doing full-frame GPU
+/// presents on the keystroke hot path", and `d22ba722` ("keep 6272bd7a minimal-fast
+/// defaults OFF; correct the stale tests") restored that after a test-driven revert
+/// put them back.
+///
+/// TODAY IT OWNS EXACTLY ONE KEY: `pkg_progress_effects`, the provisioning card's
+/// party trim — the cat that stands on the progress bar of the first-run "Installing
+/// the ALab toolchain" toast. It is the decoration the 2026-08 Windows audit actually
+/// caught covering text a user needed, and it is the one whose default no other
+/// surface re-derives, so flipping it changes the product and nothing else.
+///
+/// WHAT IS NOT IN IT YET, and why — read before adding a key:
+///
+/// * `cursor_trail` (and `cursor_trail_bloom`, which only decorates it). This is the
+///   audit's headline — the default STYLE became `rainbow kitty pet`, a permanently
+///   resident, walking, full-body cat drawn `FreeZ::OverText` across live output,
+///   long after `5b11ff2c` made the "batteries-on delight" call about a ~260 ms
+///   aurora. Flipping it here is a one-line change and it is NOT the work: native
+///   Settings seeds every row from the RESOLVED config, so a Windows default of OFF
+///   re-baselines eleven projection tests — the disclosure ladder ("Inactive · Cursor
+///   trail Off" on every dependent row), the music-suppression reason, the
+///   cursor-runway preview, the compact pickers' pagination and two paint-overflow
+///   matrices. Those new screens are CORRECT (they are what a macOS user with
+///   `cursor_trail = false` sees today) but nobody has reviewed them, and the
+///   fixtures cannot dodge it by seeding the key: writing it makes the row Modified,
+///   which changes the very projection they measure. A cheaper aim at the same
+///   target is to split the default STYLE instead of the master, leaving the aurora
+///   (the thing that was actually decided) alone.
+/// * `[sparkle_words] enabled` — the word engine pushes its animal heads
+///   `FreeZ::UnderText`, so every glyph still draws on top of the fur and it never
+///   covers live output. (It is also a live product gate in native Settings with its
+///   own disclosure ladder and migration path.) See
+///   [`Config::sparkle_words_enabled_or_default`].
+/// * `hdr_glow`, `cursor_fire_shimmer` — both default ON, and both only do work on
+///   frames carrying cursor-GLOW quads, which the trail produces.
+/// * `stream_fade` (already OFF everywhere since `6272bd7a`), `show_hud` (a retired
+///   key — the HUD is gone), functional motion, the visual bell, cursor blink, and
+///   everything already opt-in (Robi, the ambient sound bed).
+///
+/// Nothing here silences a key the user set: every consumer is
+/// `Option::unwrap_or(DEFAULT_DECORATIVE_EFFECTS)`, so an explicit `true` in
+/// `aterm.toml` turns the effect on, on Windows exactly like anywhere else.
+pub(crate) const DEFAULT_DECORATIVE_EFFECTS: bool = !cfg!(windows);
+
 /// User config file (`$XDG_CONFIG_HOME/aterm/aterm.toml`, else
 /// `~/.config/aterm/aterm.toml`). Every field is optional; unknown keys are
 /// ignored (forward-compatible). Precedence at startup is env var > config >
@@ -2773,8 +2825,37 @@ impl Config {
     /// additive aurora on each cursor move and decays to EXACTLY 0% idle, so a still
     /// screen costs nothing. The GPU bloom pass is effect-frame-only and load-sheds
     /// under pressure. Opt out with `cursor_trail = false`.
+    ///
+    /// STILL ON ON WINDOWS, and that is an open question rather than a settled one:
+    /// see [`DEFAULT_DECORATIVE_EFFECTS`], which carries the platform split and spells
+    /// out exactly what this key would cost. The resident walking cat it brings (the
+    /// default STYLE became `rainbow kitty pet` after the delight call was made about
+    /// a ~260 ms aurora) is what the 2026-08 Windows audit objected to, and turning
+    /// this key off by platform re-baselines eleven native-Settings projection tests —
+    /// a Settings review, not a default change.
     pub(crate) fn cursor_trail_or_default(&self) -> bool {
         self.cursor_trail.unwrap_or(true)
+    }
+
+    /// Whether a config APPLY should warm the demand-driven effect pipelines
+    /// (`aterm_gpu::EffectPipeline`) off the frame path.
+    ///
+    /// The nine effect-only cell pipelines are built by `encode_frame` the first
+    /// frame that binds one, so a launch compiles none of them. Correctness never
+    /// depends on this predicate — it only decides whether a config apply pays a
+    /// compile EARLY so the first frame that draws a newly-enabled effect does not
+    /// hitch.
+    ///
+    /// Keyed on the cursor-trail master because that is the sole producer of the
+    /// only four pipelines whose inline build is a visible hitch: `fire_add` +
+    /// `fire_over` (111.07 ms together on dx12) and `rain_glow` +
+    /// `rain_glow_over` (17.70). With the trail off none of those can be bound,
+    /// and the five that remain reachable are each well under one frame — so an
+    /// unconditional warm would hand a `cursor_trail = false` owner the exact
+    /// 136 ms of never-drawn compiles this whole design removes, merely moved off
+    /// the launch and onto their first config save.
+    pub(crate) fn warms_effect_pipelines(&self) -> bool {
+        self.cursor_trail_or_default()
     }
 
     /// Trail sound effects on/off (`trail_sounds`, default ON — they are
@@ -2809,10 +2890,13 @@ impl Config {
     }
 
     /// Progress-card party trim — rainbow bar, sparkles, the cat — on the
-    /// toolchain-provisioning card (default ON — opt-OUT; see the field doc:
-    /// the card itself stays fully functional when this is off).
+    /// toolchain-provisioning card (default [`DEFAULT_DECORATIVE_EFFECTS`]: ON as an
+    /// opt-OUT everywhere except Windows, where the minimal-fast directive makes it
+    /// an opt-IN; see the field doc — the card itself stays fully functional and
+    /// legible either way).
     pub(crate) fn pkg_progress_effects_or_default(&self) -> bool {
-        self.pkg_progress_effects.unwrap_or(true)
+        self.pkg_progress_effects
+            .unwrap_or(DEFAULT_DECORATIVE_EFFECTS)
     }
 
     /// Ambient-bed on/off (`trail_sound_bed`, default OFF — the drone is
@@ -3538,6 +3622,32 @@ impl Config {
         }
     }
 
+    /// THE `[sparkle_words] enabled` MASTER, resolved — one owner for that key's
+    /// default so no consumer re-types it.
+    ///
+    /// DEFAULT ON, on every platform, and deliberately NOT a member of the
+    /// [`DEFAULT_DECORATIVE_EFFECTS`] family. Two reasons, both checked rather than
+    /// assumed:
+    ///
+    /// * It does not paint OVER terminal output. A matched word gets its animal head
+    ///   pushed `FreeZ::UnderText` (`word_decorations`), so every glyph still draws
+    ///   on top of the fur — the 2026-08 Windows audit's claim that the engine
+    ///   "REPLACES the words fox and dog" is wrong on the code. The resident cat, the
+    ///   trail bloom and the provisioning card's cat are the three that really do
+    ///   cover live pixels, and those are the three `6272bd7a` named.
+    /// * This key is not only a config default: native Settings treats it as a LIVE
+    ///   PRODUCT GATE, with its own disclosure ladder ("Inactive · Sparkle Words
+    ///   master Off"), its own migration path (the patch writer retires it in favour
+    ///   of the two independent toy keys), and a dozen projection tests that read it.
+    ///   Flipping its default by platform is a Settings redesign, not a default
+    ///   change.
+    pub(crate) fn sparkle_words_enabled_or_default(&self) -> bool {
+        self.sparkle_words
+            .as_ref()
+            .and_then(|sparkle| sparkle.enabled)
+            .unwrap_or(true)
+    }
+
     /// Resolve the `[sparkle_words]` table into a renderer-ready [`DecoConfig`],
     /// applying every default + clamp. `None` when the feature is explicitly disabled or
     /// every category is off (the caller then renders byte-identically).
@@ -3954,6 +4064,8 @@ impl Config {
     /// at the display rate with ~0.2ms frame cost (measured, AMD 780M iGPU); the
     /// `perf_reduced` load-shed latch and `motion` policy both drop it under
     /// pressure/accessibility, and `cursor_trail_bloom = false` opts out.
+    /// (Still ON on Windows: it decorates the trail, so it follows whatever
+    /// `cursor_trail` decides — see that key's note.)
     pub(crate) fn cursor_trail_bloom_or_default(&self) -> bool {
         self.cursor_trail_bloom.unwrap_or(true)
     }
@@ -8830,6 +8942,49 @@ impl App {
                 config.cursor_trail_bloom_strength_or_default(),
                 config.cursor_trail_bloom_radius_or_default(),
             );
+            // EFFECT-PIPELINE WARM-UP, and the ONE seam that gets it.
+            //
+            // The nine effect-only cell pipelines are demand-driven: a launch
+            // builds none of them (136.13 ms of dx12 shader compiles a default
+            // config never draws with), and `encode_frame` builds whichever the
+            // frame in front of it actually binds. That is correct for every
+            // enable path — a config reload, the Settings UI, an editor that
+            // starts emitting undercurls — but the frame that FIRST draws a
+            // newly-enabled effect would pay the compile inline, and for
+            // EMBERFORGE fire that is `fire_add` + `fire_over` = 111.07 ms on
+            // one frame. Visible.
+            //
+            // This is a config APPLY, which is exactly and only where an effect
+            // can be switched on by a human: not the launch path (that one runs
+            // `pin_gpu_effect_config`, which deliberately does NOT warm), and not
+            // a frame. Warming here puts every pipeline in place several frames
+            // before the first quad that needs one, where the beat a reload
+            // already costs hides it and nothing is animating. Idempotent, so
+            // every reload after the first is nine `is_some` checks.
+            //
+            // GATED ON THE TRAIL MASTER, because an UNCONDITIONAL warm here just
+            // relocates the defect this whole change removes: it would hand the
+            // `cursor_trail = false` owner the same 136 ms of compiles they never
+            // draw with, moved off the launch and onto their first config save.
+            // `cursor_trail` is the master for the entire cursor-glow family
+            // (`glow_config` folds it into `GlowConfig::enabled`), and that family
+            // is the sole producer of the only four pipelines whose inline build
+            // is a VISIBLE hitch: `fire_add`+`fire_over` (111.07 ms together) and
+            // `rain_glow`+`rain_glow_over` (17.70). With it off none of those four
+            // can be bound at all, so there is nothing to hide.
+            //
+            // The five that remain reachable with the trail off — `deco_over`
+            // (2.72 ms; an undercurl from any editor, no config knob gates it),
+            // `sprite_over` (3.26; wallpaper/pets), `deco_add` (2.06),
+            // `glow_add` (1.64), `cursor_blend` (0.40) — are each well under one
+            // 16.7 ms frame, so the demand path absorbs them where they happen and
+            // a warm would buy nothing. Correctness never rides on this either
+            // way: `encode_frame` ensures whatever the frame binds regardless, so
+            // a wrong guess here costs at most one sub-frame compile, never a
+            // missing effect.
+            if config.warms_effect_pipelines() {
+                g.warm_effect_pipelines();
+            }
         }
 
         // Focus-boost hot-reload: re-fold the want-set NOW (it reads the just-
@@ -9608,6 +9763,30 @@ mod descriptive_title_config_tests {
         let parsed: Config = toml::from_str("cursor_trail_wake_ms = 900\n").unwrap();
         assert_eq!(parsed.cursor_trail_wake_ms, Some(900));
         assert!((parsed.cursor_trail_wake_persist_or_default() - 0.9).abs() < 1e-6);
+    }
+
+    /// The effects-OFF owner must not pay the effect-pipeline warm-up on a config
+    /// save. The nine pipelines are demand-driven so a launch compiles none of
+    /// them; warming them unconditionally at the config-apply seam would hand a
+    /// `cursor_trail = false` config the same 136 ms of never-drawn dx12 compiles,
+    /// merely relocated off the launch onto the first save. With the trail off the
+    /// only pipelines still reachable are sub-frame builds the demand path absorbs.
+    #[test]
+    fn an_effects_off_config_never_warms_the_effect_pipelines() {
+        let off: Config = toml::from_str("cursor_trail = false\n").unwrap();
+        assert!(
+            !off.warms_effect_pipelines(),
+            "`cursor_trail = false` must not compile fire/rain pipelines it can never bind"
+        );
+        // The batteries-on default and an explicit opt-in DO warm: with the trail
+        // live, `fire_add` + `fire_over` alone are 111.07 ms, and paying that
+        // inline on the first frame that ignites is a hitch the eye sees.
+        let on: Config = toml::from_str("cursor_trail = true\n").unwrap();
+        assert!(on.warms_effect_pipelines());
+        assert!(
+            Config::default().warms_effect_pipelines(),
+            "the shipped default leaves the trail on, so the warm still applies"
+        );
     }
     use super::{
         Config, DEFAULT_TITLE_SUMMARY_MODEL, TitleFormat, TitleSummaryProvider,
@@ -12024,6 +12203,65 @@ mod window_theme_tests {
         // Direct parser: unknown -> None (caller defaults).
         assert_eq!(WindowTheme::parse("nope"), None);
         assert_eq!(WindowTheme::parse("auto"), Some(WindowTheme::Auto));
+    }
+}
+
+/// THE DECORATIVE-OVERLAY DEFAULT — [`DEFAULT_DECORATIVE_EFFECTS`] — and the one
+/// law that keeps a platform default from becoming a platform veto.
+#[cfg(test)]
+mod decorative_effect_default_tests {
+    use super::{Config, DEFAULT_DECORATIVE_EFFECTS};
+
+    fn cfg(toml: &str) -> Config {
+        toml::from_str(toml).expect("valid toml")
+    }
+
+    /// THE MINIMAL-FAST DEFAULT: with a FRESH, EMPTY config a Windows terminal puts
+    /// no party trim on the provisioning card, so the card's own "Installing the
+    /// ALab toolchain" line and its byte counter are the only things in that band.
+    ///
+    /// Asserted against `cfg!` (the `tab_band_height` precedent) so the same test is
+    /// honest on every host: elsewhere the delight stays on.
+    #[test]
+    fn decorative_overlays_default_off_on_windows_and_on_elsewhere() {
+        let on = !cfg!(windows);
+        assert_eq!(DEFAULT_DECORATIVE_EFFECTS, on);
+        assert_eq!(
+            Config::default().pkg_progress_effects_or_default(),
+            on,
+            "an empty config must not stand a cat on the provisioning toast"
+        );
+        // A config that merely EXISTS is still a fresh config for this key.
+        assert_eq!(cfg("font_px = 14.0").pkg_progress_effects_or_default(), on);
+    }
+
+    /// …and the switch is a DEFAULT, never a veto: an explicit key wins on every
+    /// platform, in both directions. A Windows user who wants the cat says so and
+    /// gets it.
+    #[test]
+    fn explicit_decorative_keys_win_on_every_platform() {
+        assert!(cfg("pkg_progress_effects = true").pkg_progress_effects_or_default());
+        assert!(!cfg("pkg_progress_effects = false").pkg_progress_effects_or_default());
+    }
+
+    /// THE KEYS THIS FAMILY DOES NOT OWN — pinned so a later hand cannot quietly
+    /// widen it without meeting the cost the constant documents. `cursor_trail` and
+    /// its bloom re-baseline eleven native-Settings projection tests; the word
+    /// engine draws `FreeZ::UnderText` and is a live Settings product gate. All
+    /// three stay ON everywhere until that work is done and reviewed.
+    #[test]
+    fn the_trail_and_the_word_engine_are_not_platform_split_yet() {
+        let fresh = Config::default();
+        assert!(
+            fresh.cursor_trail_or_default(),
+            "the trail master is still ON on every platform — see DEFAULT_DECORATIVE_EFFECTS"
+        );
+        assert!(fresh.cursor_trail_bloom_or_default());
+        assert!(fresh.sparkle_words_enabled_or_default());
+        // …and each still answers to its own key, in both directions.
+        assert!(!cfg("cursor_trail = false").cursor_trail_or_default());
+        assert!(!cfg("cursor_trail_bloom = false").cursor_trail_bloom_or_default());
+        assert!(!cfg("[sparkle_words]\nenabled = false").sparkle_words_enabled_or_default());
     }
 }
 

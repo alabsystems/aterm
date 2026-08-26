@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_effects::cursor_fireball::{CursorFireball, FireballConfig};
 use aterm_effects::cursor_glow::Geom;

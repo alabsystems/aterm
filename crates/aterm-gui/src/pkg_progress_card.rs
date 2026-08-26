@@ -498,7 +498,11 @@ fn phase_label(row: &atpkg::progress::ProgramProgress, queued_pos: Option<usize>
         Phase::Verify => "verifying".to_string(),
         Phase::Extract => {
             if row.bytes_total > 0 {
-                format!("extracting {} of {} MB", mb(row.bytes_done), mb(row.bytes_total))
+                format!(
+                    "extracting {} of {} MB",
+                    mb(row.bytes_done),
+                    mb(row.bytes_total)
+                )
             } else {
                 "extracting".to_string()
             }
@@ -561,6 +565,31 @@ pub(crate) fn display_order(snap: &crate::PkgProgressSnapshot) -> Vec<String> {
         }
     }
     out
+}
+
+/// The party cat's drawn HEIGHT for a given cell height — one copy, read both by
+/// the layout that reserves its air and by the placement that draws it.
+fn cat_height(ch: f32) -> f32 {
+    (ch * 1.35).clamp(18.0, 42.0)
+}
+
+/// Peak excursion of the walking cat's bob, in px. The bob is a `sin`, so it
+/// reaches this far UP as well as down — the reservation must cover the up half or
+/// a walking cat clips its ears into the text on every other frame.
+fn cat_bob_amplitude(ch: f32) -> f32 {
+    ch * 0.08
+}
+
+/// How much extra vertical air the bar row needs so a cat standing on the bar
+/// stays entirely BELOW the text above it.
+///
+/// The cat's feet sit at `bar_y + bar_h·0.35` and its body runs `cat_h` px up from
+/// there (plus `bob` at the top of its stride), while the bar row already offers
+/// `(bar_row_h − bar_h)/2` px of lead-in above the bar. The shortfall is what the
+/// layout inserts between the subtitle and the bar. Never negative: a card whose
+/// bar row is already generous reserves nothing and is byte-identical to before.
+fn cat_clearance_needed(cat_h: f32, cat_bob_amp: f32, bar_h: f32, bar_row_h: f32) -> f32 {
+    (cat_h + cat_bob_amp - bar_h * 0.35 - (bar_row_h - bar_h) * 0.5).max(0.0)
 }
 
 /// Build the card as pure [`DrawPrim`]s + the cat spec. See the module doc for
@@ -633,9 +662,43 @@ pub(crate) fn pkg_progress_tray(
         0.0
     };
     let more_line = if folded > 0 { cv * 1.4 } else { 0.0 };
+    // THE CAT'S OWN AIR. The party cat stands ON the bar, so its body reaches
+    // `cat_h` px UP from the bar's midline — and the bar row was sized for a
+    // capsule, not for an animal. With no reservation the cat's dest rect
+    // overlapped the two text rows directly above it (title + subtitle), and
+    // `blit_cat` is a straight alpha OVER onto the FINISHED tray raster, so the
+    // cat literally painted out the card's own "Installing the ALab toolchain"
+    // line and the "n of m · x of y MB" beneath it. Worse, its whole switch is
+    // `pkg_progress_effects` — `cursor_trail = false` does not reach it — and
+    // `cat_bob` drops to 0 the moment overall bytes stop moving, so a stalled
+    // download left a MOTIONLESS cat sitting on unreadable progress text.
+    //
+    // Those three properties are what the 2026-08 Windows audit reported of the
+    // sprite it caught frozen over the "Installing the ALab toolchain" toast,
+    // occluding its progress text and surviving `cursor_trail = false` — and this
+    // cat is the only decoration on that card that has all three (the resident pet
+    // fails the third: every pet emitter gates on the trail master, so the first
+    // frame after that key goes false draws no pet at all). Attributing the
+    // reported sighting is still an INFERENCE; the overlap itself is not — it is
+    // arithmetic, and `the_party_cat_never_covers_the_cards_own_text` pins it.
+    //
+    // So the layout reserves the space instead: the bar (and everything under it)
+    // moves down by exactly the clearance the cat needs, and the card grows by the
+    // same amount. `chrome.fancy` is already folded in, so an effects-off card is
+    // byte-identical to before — the reservation and the cat appear and vanish
+    // together, and neither can exist without the other.
+    let cat_h = cat_height(ch);
+    let cat_bob_amp = cat_bob_amplitude(ch);
+    let cat_drawn = chrome.fancy && !unknown_version && fx.cat_pose.is_some();
+    let cat_headroom = if cat_drawn {
+        cat_clearance_needed(cat_h, cat_bob_amp, bar_h, bar_row_h)
+    } else {
+        0.0
+    };
     let h = pad_y * 2.0
         + title_h
         + sub_line
+        + cat_headroom
         + bar_row_h
         + note_line
         + shown as f32 * row_h
@@ -730,7 +793,10 @@ pub(crate) fn pkg_progress_tray(
             mb(f.overall.bytes_total)
         )
     } else {
-        format!("{} of {}", f.overall.programs_done, f.overall.programs_total)
+        format!(
+            "{} of {}",
+            f.overall.programs_done, f.overall.programs_total
+        )
     };
     let sub_y = y + pad_y + title_h;
     prims.push(text_prim(
@@ -747,7 +813,7 @@ pub(crate) fn pkg_progress_tray(
     let frac = overall_frac(f);
     let bar_x = x + pad_x;
     let bar_w = w - 2.0 * pad_x;
-    let bar_y = sub_y + sub_line + (bar_row_h - bar_h) * 0.5;
+    let bar_y = sub_y + sub_line + cat_headroom + (bar_row_h - bar_h) * 0.5;
     if chrome.fancy && !unknown_version {
         // Rainbow fill: `Capsule` takes one colour, so the gradient is
         // hue-stepped Panels each showing one clipped WINDOW of the full
@@ -843,12 +909,8 @@ pub(crate) fn pkg_progress_tray(
         .enumerate()
         .map(|(i, n)| (n.as_str(), i + 1))
         .collect();
-    let burst_of = |name: &str| -> Option<f32> {
-        fx.bursts
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, p)| *p)
-    };
+    let burst_of =
+        |name: &str| -> Option<f32> { fx.bursts.iter().find(|(n, _)| n == name).map(|(_, p)| *p) };
     let from_of = |name: &str| -> Option<usize> {
         fx.reorder_from
             .iter()
@@ -906,17 +968,19 @@ pub(crate) fn pkg_progress_tray(
         ));
         // The phase label, right-aligned; a bumped queued row earns its tag.
         let mut label = row.map_or_else(
-            || phase_label(
-                &atpkg::progress::ProgramProgress {
-                    phase: Phase::Queued,
-                    bytes_done: 0,
-                    bytes_total: 0,
-                    build: None,
-                    bumped: false,
-                    error: None,
-                },
-                queue_pos.get(name.as_str()).copied(),
-            ),
+            || {
+                phase_label(
+                    &atpkg::progress::ProgramProgress {
+                        phase: Phase::Queued,
+                        bytes_done: 0,
+                        bytes_total: 0,
+                        build: None,
+                        bumped: false,
+                        error: None,
+                    },
+                    queue_pos.get(name.as_str()).copied(),
+                )
+            },
             |row| phase_label(row, queue_pos.get(name.as_str()).copied()),
         );
         let bumped = row.is_some_and(|r| r.bumped);
@@ -979,7 +1043,9 @@ pub(crate) fn pkg_progress_tray(
             }
         }
         // A completion burst: a small twinkle ring around the row (fancy only).
-        if chrome.fancy && let Some(p) = burst_of(name) {
+        if chrome.fancy
+            && let Some(p) = burst_of(name)
+        {
             let ring_x = x + pad_x * 0.5;
             let ring_w = w - pad_x;
             for k in 0..BURST_SPARKLES {
@@ -991,7 +1057,10 @@ pub(crate) fn pkg_progress_tray(
                     cx,
                     cy,
                     r: rr,
-                    color: rgba(rainbow(fq + p * 0.4), (0x30 as f32 + 0xBF as f32 * tw) as u8),
+                    color: rgba(
+                        rainbow(fq + p * 0.4),
+                        (0x30 as f32 + 0xBF as f32 * tw) as u8,
+                    ),
                     breathe: false,
                 });
             }
@@ -1011,7 +1080,9 @@ pub(crate) fn pkg_progress_tray(
 
     // The 100% celebration: one sweep of the notice's 14-dot twinkle ring
     // around the whole card, hues walking with the sweep.
-    if chrome.fancy && let Some(p) = fx.celebrate {
+    if chrome.fancy
+        && let Some(p) = fx.celebrate
+    {
         for k in 0..CELEBRATE_SPARKLES {
             let fq = k as f32 / CELEBRATE_SPARKLES as f32;
             let (cx, cy) = perimeter_point(x - 3.0, y - 3.0, w + 6.0, h + 6.0, fq + p);
@@ -1033,20 +1104,21 @@ pub(crate) fn pkg_progress_tray(
 
     // The cat rides the bar's leading edge (fancy only; it is the sanctioned
     // cut line and the first thing effects-off removes). Its feet sit on the
-    // bar; the bob is time-driven and therefore amplitude-scaled.
-    let cat = (chrome.fancy && !unknown_version)
+    // bar; the bob is time-driven and therefore amplitude-scaled. The air it
+    // stands in was reserved above (`cat_headroom`) under the SAME `cat_drawn`
+    // predicate and from the SAME `cat_height`/`cat_bob_amplitude` — one copy of
+    // each number, so the reservation cannot drift from the sprite.
+    let cat = cat_drawn
         .then(|| {
             fx.cat_pose.map(|pose| {
                 let bob = if fx.cat_bob > 0.0 {
                     (fx.t * std::f32::consts::TAU * 1.6).sin()
-                        * ch
-                        * 0.08
+                        * cat_bob_amp
                         * chrome.amp.clamp(0.0, 1.0)
                         * fx.cat_bob
                 } else {
                     0.0
                 };
-                let cat_h = (ch * 1.35).clamp(18.0, 42.0);
                 CatPlace {
                     cx: bar_x + bar_w * frac,
                     bottom: bar_y + bar_h * 0.35 + bob,
@@ -1081,7 +1153,13 @@ fn pack_rgb(c: [u8; 3]) -> u32 {
 /// the least-invasive path is this one straight-alpha OVER onto the finished
 /// tray bytes (the raster and the compositor both speak straight alpha).
 /// `place` is in RASTER-LOCAL px (the splice translates, like its prims).
-pub(crate) fn blit_cat(rgba_buf: &mut [u8], pw: u32, ph: u32, place: &CatPlace, chrome: &CardChrome) {
+pub(crate) fn blit_cat(
+    rgba_buf: &mut [u8],
+    pw: u32,
+    ph: u32,
+    place: &CatPlace,
+    chrome: &CardChrome,
+) {
     let r = Roles::from_theme(chrome.theme);
     let h = place.h.round().max(1.0) as u16;
     let aspect = PetBaker::aspect(place.pose);
@@ -1138,8 +1216,7 @@ pub(crate) fn blit_cat(rgba_buf: &mut [u8], pw: u32, ph: u32, place: &CatPlace, 
             for c in 0..3 {
                 let sc = u32::from(src[si + c]);
                 let dc = u32::from(rgba_buf[di + c]);
-                rgba_buf[di + c] =
-                    ((sc * sa + dc * da * (255 - sa) / 255) / oa).min(255) as u8;
+                rgba_buf[di + c] = ((sc * sa + dc * da * (255 - sa) / 255) / oa).min(255) as u8;
             }
             rgba_buf[di + 3] = oa.min(255) as u8;
         }
@@ -1341,7 +1418,14 @@ mod tests {
         );
         // The information survives: every program row and its phase label.
         let t = texts(&card.tray.prims).join("\n");
-        for needle in ["robi", "4.1 of 9.8 MB", "trust", "queued", "ay", "installed"] {
+        for needle in [
+            "robi",
+            "4.1 of 9.8 MB",
+            "trust",
+            "queued",
+            "ay",
+            "installed",
+        ] {
             assert!(t.contains(needle), "missing {needle:?} in:\n{t}");
         }
     }
@@ -1520,7 +1604,9 @@ mod tests {
         // minus padding on each side).
         let (x, _, w, _) = card.tray.card;
         let frac = 18_022_400.0 / 96_411_648.0;
-        let s = TypeStep::Secondary.px_clamped(g.font_px, 12.0, f32::INFINITY).get();
+        let s = TypeStep::Secondary
+            .px_clamped(g.font_px, 12.0, f32::INFINITY)
+            .get();
         let expect = (x + s * 0.9) + (w - 2.0 * s * 0.9) * frac;
         assert!((cat.cx - expect).abs() < 0.6, "cat at the leading edge");
         // And the fx state machine chooses Sit once the snapshot says ended.
@@ -1529,6 +1615,136 @@ mod tests {
         done.file.overall.programs_done = 4;
         let out = advance_fx(&done, Instant::now());
         assert_eq!(out.view.cat_pose, Some(PetGlyphId::PetSit));
+    }
+
+    /// NOTHING DECORATIVE MAY OCCLUDE THE CARD'S OWN WORDS.
+    ///
+    /// The party cat stands ON the progress bar and its body reaches `cat_h`
+    /// (18–42 px) straight up from there, while the bar row was sized for a
+    /// capsule. `blit_cat` is a straight alpha OVER onto the FINISHED tray raster,
+    /// so with no reservation the cat painted out the two text rows above the bar
+    /// — the card's own "Installing the ALab toolchain" title and its "n of m ·
+    /// x of y MB" line. The overlap is arithmetic, and this test is the proof.
+    ///
+    /// It also carries, term for term, the three properties the 2026-08 Windows
+    /// audit reported of the sprite it caught frozen over that toast: it occludes
+    /// the card's progress text (here), its switch is `pkg_progress_effects`
+    /// (folded into `chrome.fancy`) so `cursor_trail = false` does not reach it,
+    /// and `cat_bob` drops to 0 the moment overall bytes stop moving, so a stalled
+    /// download parks a MOTIONLESS cat. Whether it is the same sighting stays an
+    /// inference; the overlap this test pins does not depend on that.
+    ///
+    /// Asserted over a conservative ink box per text run — cap height above the
+    /// baseline, a quarter-em of descender below — at several font sizes, at both
+    /// ends of the bar, and at BOTH bob extremes.
+    ///
+    /// The bob phase matters and its sign is easy to get backwards. `bottom` is
+    /// `bar_y + bar_h·0.35 + bob` in a y-DOWN space, so `sin == +1` pushes the cat
+    /// DOWN (away from the text) and `sin == −1` lifts it UP into the text. The
+    /// dangerous frame is the negative one; both are driven here so a reservation
+    /// that covered only the easy half would fail.
+    #[test]
+    fn the_party_cat_never_covers_the_cards_own_text() {
+        // `bob = sin(t·TAU·1.6)·amp`: t = 1/(4·1.6) puts the sine at +1 (cat
+        // pushed down, the SAFE extreme), t = 3/(4·1.6) at −1 (cat lifted into
+        // the text, the extreme the reservation exists for).
+        for (phase, t) in [("down", 1.0_f32 / (4.0 * 1.6)), ("up", 3.0 / (4.0 * 1.6))] {
+            for font_px in [11.0_f32, 14.0, 18.0, 24.0] {
+                for (frac_done, total) in [(0u64, 96_411_648u64), (18_022_400, 96_411_648)] {
+                    let mut snap = snapshot(true);
+                    snap.file.overall.bytes_done = frac_done;
+                    snap.file.overall.bytes_total = total;
+                    let g = SettingsGeom { font_px, ..geom() };
+                    let walking = FxView {
+                        cat_pose: Some(PetGlyphId::PetWalk1),
+                        cat_bob: 1.0,
+                        t,
+                        ..FxView::still()
+                    };
+                    let card = pkg_progress_tray(
+                        &snap,
+                        &g,
+                        &chrome(Theme::default(), true, 1.0),
+                        &walking,
+                        0.0,
+                    );
+                    let cat = card.cat.expect("the fancy card carries the cat");
+                    let (cy0, cy1) = (cat.bottom - cat.h, cat.bottom);
+                    // VERTICAL BANDS ONLY, deliberately. The cat rides the bar
+                    // from one end to the other and every text run is
+                    // left-aligned inside the same card, so any horizontal test
+                    // would just be a slower way of asking whether this
+                    // particular `frac` happens to dodge this particular string.
+                    // The law is stronger than that: the cat gets its own row,
+                    // and no text row may share it at ANY progress value.
+                    for p in &card.tray.prims {
+                        let DrawPrim::Text {
+                            baseline, s, px, ..
+                        } = p
+                        else {
+                            continue;
+                        };
+                        if s.is_empty() {
+                            continue;
+                        }
+                        // Cap height above the baseline, a quarter-em of
+                        // descender below — a conservative ink box for a run of
+                        // this size.
+                        let (ty0, ty1) = (*baseline - *px, *baseline + *px * 0.25);
+                        assert!(
+                            cy1 <= ty0 || ty1 <= cy0,
+                            "at font_px {font_px} with the bob {phase} the cat band \
+                             {cy0:.1}..{cy1:.1} overlaps {s:?} at {ty0:.1}..{ty1:.1}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// …and the air is reserved ONLY for a cat that exists. An effects-off card
+    /// draws no cat and must be exactly as tall as it always was, so turning the
+    /// trim off cannot leave a band of empty card behind it.
+    #[test]
+    fn the_cats_headroom_appears_and_vanishes_with_the_cat() {
+        let g = geom();
+        let snap = snapshot(true);
+        let plain = pkg_progress_tray(
+            &snap,
+            &g,
+            &chrome(Theme::default(), false, 0.0),
+            &FxView::still(),
+            0.0,
+        );
+        let fancy = pkg_progress_tray(
+            &snap,
+            &g,
+            &chrome(Theme::default(), true, 1.0),
+            &FxView::still(),
+            0.0,
+        );
+        assert!(plain.cat.is_none(), "no cat without effects");
+        assert!(fancy.cat.is_some(), "a cat with effects");
+        let (_, _, _, plain_h) = plain.tray.card;
+        let (_, _, _, fancy_h) = fancy.tray.card;
+        let reserved = cat_clearance_needed(
+            cat_height(g.ch),
+            cat_bob_amplitude(g.ch),
+            TypeStep::Secondary
+                .px_clamped(g.font_px, 12.0, f32::INFINITY)
+                .get()
+                * 0.62,
+            TypeStep::Secondary
+                .px_clamped(g.font_px, 12.0, f32::INFINITY)
+                .get()
+                * 1.32,
+        );
+        assert!(reserved > 0.0, "fixture: this geometry does need headroom");
+        assert!(
+            (fancy_h - plain_h - reserved).abs() < 0.01,
+            "the fancy card is taller by EXACTLY the cat's reservation \
+             ({plain_h} vs {fancy_h}, reserved {reserved})"
+        );
     }
 
     /// The retire hold: a cleanly-ended pass asks for frames through its hold,

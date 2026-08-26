@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_effects::cursor_glow::GlowStyle;
 use aterm_effects::kitty_sing::KittySing;

@@ -15,6 +15,11 @@
 use aterm_render::Frame;
 
 mod format_plan;
+// The one-future park/unpark executor the native init path drives wgpu's async
+// adapter/device acquisition on (retired `pollster`). Native-only: blocking the
+// browser main thread is forbidden, so the wasm path awaits instead.
+#[cfg(not(target_arch = "wasm32"))]
+mod block_on;
 
 // M3 phase B: the EDR present gate's pure decision functions, re-exported so the
 // Tier-1 exhaustive enumeration (tests/hdr_gate.rs) drives the SHIPPING policy.
@@ -25,6 +30,13 @@ pub use format_plan::{
 mod renderer;
 pub use renderer::{
     DropOverlay, GpuRenderer, GpuSurface, PresentCrop, SurfacePresentFailure, TrayQuad, WindowGpu,
+};
+/// THE DEMAND-DRIVEN EFFECT PIPELINES: the nine cell pipelines a launch with
+/// the shipped defaults never compiles (see `renderer::EffectPipelines`). The
+/// enum + name table are re-exported so a test can name a slot and read
+/// `GpuRenderer::effect_pipelines_resident` without knowing the build order.
+pub use renderer::{
+    EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
 };
 /// VIDEO introspection: submitted-destination-frame capture (see `video_tap`).
 pub mod video_tap;
@@ -349,10 +361,14 @@ impl GpuContext {
     /// default low-power adapter (Metal on macOS), subject to the
     /// `ATERM_GPU_*` env overrides (see [`backends_from_env`]).
     ///
-    /// NATIVE ONLY: this uses `pollster::block_on`, which has no browser
-    /// equivalent (blocking the wasm main thread is forbidden). The wasm WebGPU
-    /// path awaits the adapter/device futures instead — see [`GpuContext::request`]
-    /// — so this synchronous constructor is excluded from the wasm32 build.
+    /// NATIVE ONLY: this uses the crate's own `block_on` (`src/block_on.rs`) —
+    /// a private module, so this is deliberately not an intra-doc link;
+    /// rustdoc's `private_intra_doc_links` lint fires on a public item pointing
+    /// at a private path, and `cargo doc` is warning-clean here.
+    /// It has no browser equivalent (blocking the wasm main thread is
+    /// forbidden). The wasm WebGPU path awaits the adapter/device futures
+    /// instead — see [`GpuContext::request`] — so this synchronous constructor
+    /// is excluded from the wasm32 build.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn new() -> Result<Self, String> {
         // This instance must OUTLIVE device creation: it is kept on `GpuContext`
@@ -382,7 +398,7 @@ impl GpuContext {
             wgpu::Instance::new(desc)
         });
         #[allow(unused_mut, reason = "mutated only on the Windows visual-swapchain arm")]
-        let mut ctx = pollster::block_on(Self::from_instance(instance))?;
+        let mut ctx = crate::block_on::block_on(Self::from_instance(instance))?;
         // The visual path is ACTIVE only if the DX12 backend actually won adapter
         // selection (the descriptor option is inert elsewhere). Recorded on the
         // context (renderer decisions) AND the process-global (introspection).
@@ -396,7 +412,7 @@ impl GpuContext {
     }
 
     /// ASYNC adapter+device acquisition on an existing `wgpu::Instance`. Shared by
-    /// the native (`pollster::block_on`) and wasm (`.await`) init paths so both
+    /// the native (`block_on`) and wasm (`.await`) init paths so both
     /// hit the SAME adapter/device descriptors. The instance is moved in and kept
     /// alive on the returned `GpuContext` (surfaces are created from it later).
     ///
@@ -419,7 +435,7 @@ impl GpuContext {
         instance: wgpu::Instance,
         compatible_surface: Option<&wgpu::Surface<'_>>,
     ) -> Result<Self, String> {
-        let adapter_started = web_time::Instant::now();
+        let adapter_started = aterm_time::Instant::now();
         let adapter = match adapter_from_env(&instance).await {
             Some(adapter) => adapter,
             None => instance
@@ -433,7 +449,7 @@ impl GpuContext {
         };
         let info = adapter.get_info();
         startup_probe::record(startup_probe::Leg::GpuAdapter, adapter_started.elapsed());
-        let device_started = web_time::Instant::now();
+        let device_started = aterm_time::Instant::now();
         // WebGL2 has no compute + lower texture/buffer ceilings, so `Limits::
         // default()` is unsatisfiable there (e.g. max_compute_workgroups_per_
         // dimension default 65535 vs WebGL2's 0) and device request fails. On
@@ -458,7 +474,7 @@ impl GpuContext {
             .await
             .map_err(|e| e.to_string())?;
         startup_probe::record(startup_probe::Leg::GpuDevice, device_started.elapsed());
-        let context_tail_started = web_time::Instant::now();
+        let context_tail_started = aterm_time::Instant::now();
         // sRGB texture-VIEW aliasing requires VIEW_FORMATS; absent on GLES/WebGL2.
         let srgb_offscreen = adapter
             .get_downlevel_capabilities()

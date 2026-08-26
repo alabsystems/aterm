@@ -20,5 +20,3 @@ aterm-core = { workspace = true }
 # watcher stack — the core stores an opaque `dyn RowMatch` (RFC R2 purity).
 regex = { workspace = true }
 
-[dev-dependencies]
-web-time = { workspace = true }

@@ -56,7 +56,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 /// A handle to one armed watcher, unique within a [`WatcherSet`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

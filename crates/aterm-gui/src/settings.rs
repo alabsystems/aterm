@@ -975,7 +975,7 @@ impl SettingsState {
     /// that row is being edited, else its configured value / effective placeholder. Used
     /// by the accessibility tree (no caret, unlike the painter's `render_value`); only the
     /// non-default `a11y-accesskit` build consumes it.
-    #[cfg_attr(not(feature = "a11y-accesskit"), allow(dead_code))]
+    #[cfg_attr(not(a11y_tree), allow(dead_code))]
     pub(crate) fn displayed_value(&self, idx: usize) -> String {
         let Some(f) = self.fields.get(idx) else {
             return String::new();

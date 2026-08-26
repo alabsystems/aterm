@@ -20,7 +20,13 @@ spec-anchors = ["dep:aterm-spec"]
 
 [dependencies]
 aterm-pty = { workspace = true }
-rand_core = { workspace = true }
+# THE workspace's one audited entropy surface (`aterm_uds::rand::fill`:
+# getentropy(2) with a bounded read_exact fallback, BCryptGenRandom on Windows,
+# hex encoding proved by its trust-mc harnesses). Session ids and launch nonces
+# mint through it, which is the rule `tools/grep_guard.sh` B4 exists to hold —
+# and it is why this crate needs no `rand_core`. Dependency-free leaf, so it
+# adds no third-party package.
+aterm-uds = { workspace = true }
 # Optional: only pulled in by the off-by-default `spec-anchors` feature, which arms
 # the fd-lifecycle source↔spec anchors on `SinkWriter` (sink.rs).
 aterm-spec = { workspace = true, optional = true }

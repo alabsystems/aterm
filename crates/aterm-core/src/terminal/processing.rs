@@ -21,9 +21,9 @@ use aterm_types::duration_to_nanos;
 #[derive(Debug, Clone, Copy)]
 pub struct ClockReading {
     /// Monotonic instant — drives the bell rate-limit and mode-2026 timeout
-    /// (compared only as deltas, never serialized). `web_time::Instant` is
+    /// (compared only as deltas, never serialized). `aterm_time::Instant` is
     /// std::time on native (byte-identical) and the JS clock on wasm32.
-    pub monotonic: web_time::Instant,
+    pub monotonic: aterm_time::Instant,
     /// Wall-clock epoch milliseconds recorded into OSC 133/633 command and
     /// output marks. `None` when the platform clock is unavailable.
     pub wall_ms: Option<u64>,
@@ -36,7 +36,7 @@ impl ClockReading {
     #[must_use]
     pub fn now() -> Self {
         Self {
-            monotonic: web_time::Instant::now(), // CLOCK-EXEMPT: sole pipeline clock capture (web_time = std on native, JS clock on wasm)
+            monotonic: aterm_time::Instant::now(), // CLOCK-EXEMPT: sole pipeline clock capture (aterm_time = std on native, JS clock on wasm)
             wall_ms: crate::terminal::shell::current_time_ms(), // CLOCK-EXEMPT: sole pipeline clock capture
         }
     }
@@ -141,7 +141,7 @@ impl Terminal {
         // data is useful for development but not worth the overhead in
         // production throughput. Part of throughput optimization Wave 1.
         if self.transient.pipeline_timestamps.profiling_enabled {
-            let entry = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), measures real latency, not grid state (web_time = std on native, JS clock on wasm)
+            let entry = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), measures real latency, not grid state (aterm_time = std on native, JS clock on wasm)
             let parse_start = entry;
             {
                 let (parser, mut handler) = self.split_for_process();
@@ -169,15 +169,15 @@ impl Terminal {
                 self.parked_text_selection.clear();
                 self.transient.pending_parser_reset = false;
             }
-            let parse_end = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (web_time = std on native, JS clock on wasm)
+            let parse_end = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
 
-            let grid_start = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (web_time = std on native, JS clock on wasm)
+            let grid_start = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
             damage_class = self.post_process(lines_before, was_alt);
             // Observation Kernel (L0): evaluate + latch armed watchers at the one
             // seam where this batch's mutation has landed. `process_now` is the
             // injected clock (never read here), so this is replay-deterministic.
             self.observe_at(self.transient.process_now);
-            let grid_end = web_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (web_time = std on native, JS clock on wasm)
+            let grid_end = aterm_time::Instant::now(); // CLOCK-EXEMPT: profiling diagnostic (gated), not grid state (aterm_time = std on native, JS clock on wasm)
 
             self.record_pipeline_timestamps(
                 parse_end - parse_start,
@@ -1377,8 +1377,8 @@ mod tests {
         use super::ClockReading;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
-        // Must match ClockReading.monotonic's type (web_time::Instant = std on native).
-        use web_time::Instant;
+        // Must match ClockReading.monotonic's type (aterm_time::Instant = std on native).
+        use aterm_time::Instant;
 
         // (bytes, monotonic offset ms from base, wall-clock epoch ms).
         // Exercises every clock-dependent site:

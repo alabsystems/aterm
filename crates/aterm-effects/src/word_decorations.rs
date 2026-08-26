@@ -32,7 +32,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_core::render::{FreeSampler, FreeSprite, FreeZ};
 use aterm_core::terminal::{RenderCell, Terminal};
@@ -3886,7 +3886,7 @@ impl WordDecorations {
             // box ([`CompanionOnGlass::body_px`]). One copy of the math, so
             // the box the word-cats yield to is the body the pet actually
             // draws.
-            let (x0, x1, y0, y1) = pet.body_px(geom.cell_w, geom.cell_h, geom.cols)?;
+            let (x0, x1, y0, y1) = pet.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)?;
             Some(FreeSprite {
                 x: x0,
                 y: y0,
@@ -3928,6 +3928,18 @@ impl WordDecorations {
         let mut mote_sprites: [Option<FreeSprite>; crate::kitty_pet::PET_MOTES_MAX] =
             [None; crate::kitty_pet::PET_MOTES_MAX];
         let grid_w = i32::from(geom.cols).saturating_mul(i32::from(geom.cell_w));
+        // …and the VERTICAL bound, which this lane used to be missing. The dest x
+        // below has always been clamped into `[0, grid_w)`; y was left signed and
+        // free, and `FreeSprite`'s plane honours a negative origin (the deliberate
+        // "off-grid peek" — `stamp_free_sprite`). A mote is born at the pet's
+        // `head_anchor`, ~0.6 rows ABOVE the body's row, so a companion resting on
+        // terminal row 0 spawns z's at y ≈ −0.6·cell_h. That is not the empty top
+        // pad: the tab-strip splice shifts every free sprite down by
+        // `strip_rows · cell_h`, which lands the mote INSIDE the strip, on top of
+        // the tab titles — decoration painting over chrome, which nothing in this
+        // lane is allowed to do. (Robi is the deliberate exception and has his own
+        // emitter: he climbs a ladder past the top and swings along the tab bar.)
+        let grid_h = i32::from(geom.rows).saturating_mul(i32::from(geom.cell_h));
         for (slot, m) in mote_sprites.iter_mut().zip(pet.motes.iter().flatten()) {
             let alpha = (f32::from(m.alpha) * f32::from(pet.alpha) / 255.0) as u8;
             if alpha == 0 {
@@ -3959,14 +3971,18 @@ impl WordDecorations {
             };
             let dest =
                 ((f32::from(side) * m.scale).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
-            if i32::from(dest) > grid_w {
+            if i32::from(dest) > grid_w || i32::from(dest) > grid_h {
                 continue;
             }
             let cx = (m.col * f32::from(geom.cell_w)).round() as i32;
             let cy = (m.row * f32::from(geom.cell_h)).round() as i32;
             *slot = Some(FreeSprite {
                 x: (cx - i32::from(dest) / 2).clamp(0, (grid_w - i32::from(dest)).max(0)),
-                y: cy - i32::from(dest) / 2,
+                // The y twin of the x clamp on the line above: a mote drifts, so
+                // hugging the grid edge for the last frames of a z spawned at the
+                // top row is the same graceful bound the horizontal edge already
+                // gives it — and it can never reach the tab strip.
+                y: (cy - i32::from(dest) / 2).clamp(0, (grid_h - i32::from(dest)).max(0)),
                 w: dest,
                 h: dest,
                 ax: tile.ax,
@@ -4037,7 +4053,9 @@ impl WordDecorations {
                 motes: [None; crate::kitty_pet::PET_MOTES_MAX],
                 departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
             };
-            let Some((x0, x1, y0, y1)) = ghost.body_px(geom.cell_w, geom.cell_h, geom.cols) else {
+            let Some((x0, x1, y0, y1)) =
+                ghost.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
+            else {
                 continue;
             };
             *slot = Some(FreeSprite {
@@ -23846,6 +23864,165 @@ mod pet_handoff_emission_tests {
         assert!(
             wd.pet_last_tile.is_some_and(|(.., c, i)| (c, i) == (9, 4)),
             "the held tile now carries look B"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pet_stays_inside_the_grid_tests {
+    use super::*;
+
+    const GEOM: EffectGeom = EffectGeom {
+        cell_w: 9,
+        cell_h: 19,
+        rows: 24,
+        cols: 80,
+    };
+
+    /// A resident standing on terminal ROW 0 — the caret's row on a cleared
+    /// screen, a fresh prompt, or any full-screen TUI whose cursor is at the top
+    /// — with a sleep `z` at its head anchor.
+    ///
+    /// The mote's `row` is the measured one from the orphan report: the pet's row
+    /// minus `head_anchor`'s 0.61 (rounded there to −0.66 against a caret row).
+    fn sleeper_on_the_top_row() -> crate::kitty_pet::PetFrame {
+        let mut motes = [None; crate::kitty_pet::PET_MOTES_MAX];
+        motes[0] = Some(crate::kitty_pet::PetMoteSprite {
+            kind: crate::kitty_pet::PetMoteKind::Zee,
+            col: 12.06,
+            row: -0.66,
+            scale: 0.58,
+            rot: 0.4,
+            alpha: 200,
+        });
+        crate::kitty_pet::PetFrame {
+            alpha: 255,
+            action: crate::kitty_pet::PetAction::Sleep,
+            pose: crate::pet_glyphs_gen::PetGlyphId::PetSleep0,
+            col: 13.0,
+            row: 0.0,
+            lift: 0.0,
+            facing_left: false,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            purr: 0.0,
+            under_ink: false,
+            motes,
+            departures: [None; crate::kitty_pet::PET_DEPARTURES_MAX],
+        }
+    }
+
+    /// NOTHING DECORATIVE MAY LEAVE THE TERMINAL GRID.
+    ///
+    /// `FreeSprite`'s plane takes a SIGNED origin so a sprite can peek off-grid,
+    /// and the host's tab-strip splice shifts every free sprite down by
+    /// `strip_rows · cell_h`. Together those mean a NEGATIVE y is not empty top
+    /// padding — it is the TAB STRIP, over the tab titles and whatever chrome
+    /// shares that band. Both of the pet's lanes used to reach it: `body_px` and
+    /// the mote emitter each clamped x into `[0, grid_w)` and left y free, and the
+    /// art stands 1.7 rows tall on its baseline while motes are born ~0.6 rows
+    /// above it. A companion on row 0 therefore put its head — and its sleep z's —
+    /// outside the terminal it lives in.
+    ///
+    /// Robi is the deliberate exception and is untouched: he is opt-in, has his own
+    /// emitter, and climbing the ladder past the top is his act.
+    #[test]
+    fn a_pet_on_row_zero_emits_no_sprite_above_the_grid() {
+        let mut wd = WordDecorations::default();
+        let mut free: Vec<FreeSprite> = Vec::new();
+        let pet = sleeper_on_the_top_row();
+        let grid_w = i32::from(GEOM.cols) * i32::from(GEOM.cell_w);
+        let grid_h = i32::from(GEOM.rows) * i32::from(GEOM.cell_h);
+        // The two-door bake takes a few frames to land body AND mote (the shared
+        // budget is two bakes per host frame), so drive it until both are up.
+        let mut seen = 0usize;
+        for _ in 0..12 {
+            wd.begin_host_frame();
+            free.clear();
+            wd.pet_cursor(
+                PetCursorFrame {
+                    geom: GEOM,
+                    colors: CatColorKey::default(),
+                    coat: 3,
+                    iris: 1,
+                    pet,
+                },
+                &mut free,
+            );
+            seen = seen.max(free.len());
+            for s in &free {
+                assert!(
+                    s.y >= 0,
+                    "a pet sprite resolved ABOVE the grid at y={} (h={}): after the \
+                     tab-strip splice that is the strip, not padding",
+                    s.y,
+                    s.h
+                );
+                assert!(
+                    s.y + i32::from(s.h) <= grid_h,
+                    "a pet sprite resolved BELOW the grid: y={} h={} grid_h={grid_h}",
+                    s.y,
+                    s.h
+                );
+                assert!(
+                    s.x >= 0 && s.x + i32::from(s.w) <= grid_w,
+                    "…or off the sides"
+                );
+            }
+        }
+        assert!(
+            seen >= 2,
+            "fixture: the body AND the mote must both have been emitted (saw {seen} \
+             sprites at most) or this test proves nothing"
+        );
+    }
+
+    /// The clamp is a BOUND, not a rewrite: a pet in the middle of the grid draws
+    /// at exactly the rect it always did, and the emitted sprite still IS
+    /// `body_px` (the "one copy of the math" law the emitter documents).
+    #[test]
+    fn a_pet_in_open_grid_is_untouched_and_still_matches_body_px() {
+        let mut wd = WordDecorations::default();
+        let mut free: Vec<FreeSprite> = Vec::new();
+        let pet = crate::kitty_pet::PetFrame {
+            row: 9.0,
+            motes: [None; crate::kitty_pet::PET_MOTES_MAX],
+            ..sleeper_on_the_top_row()
+        };
+        let body = pet
+            .body_px(GEOM.cell_w, GEOM.cell_h, GEOM.cols, GEOM.rows)
+            .expect("a visible pet has a body");
+        // Row 9 of 24 with a 1.7-row animal: nothing to clamp.
+        assert_eq!(
+            body.2,
+            ((pet.row + 1.0) * f32::from(GEOM.cell_h)).round() as i32
+                - (crate::kitty_pet::ART_ROWS * f32::from(GEOM.cell_h)).round() as i32,
+            "an interior body keeps its exact unclamped top"
+        );
+        let mut drawn = None;
+        for _ in 0..12 {
+            wd.begin_host_frame();
+            free.clear();
+            wd.pet_cursor(
+                PetCursorFrame {
+                    geom: GEOM,
+                    colors: CatColorKey::default(),
+                    coat: 3,
+                    iris: 1,
+                    pet,
+                },
+                &mut free,
+            );
+            if let Some(s) = free.first() {
+                drawn = Some((s.x, s.y, s.w, s.h));
+                break;
+            }
+        }
+        let (x, y, w, h) = drawn.expect("the body tile lands within the retry window");
+        assert_eq!(
+            (x, y, i32::from(w), i32::from(h)),
+            (body.0, body.2, body.1 - body.0, body.3 - body.2),
+            "the emitted sprite must still BE `body_px`"
         );
     }
 }

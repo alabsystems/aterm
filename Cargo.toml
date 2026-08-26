@@ -68,7 +68,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.59.0"
+version = "0.60.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -102,23 +102,29 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 # anchor emitters submit RefinementEntry/Waiver records into an inventory slice
 # that the spec_xref_closure gate collects at test time (TRUST_NATIVE_TLA, Phase 0).
 inventory = "0.3"
-rand_core = { version = "0.6", features = ["getrandom"] }
 # aterm-gui windowing; aterm-winit-keymap reuses its key enums. TWO consumers,
 # both of them GUI-side and both hard deps — deliberately never an OPTIONAL dep
 # of a platform-free crate, because workspace feature unification turns those on
 # for every consumer in the resolve.
 winit = "0.30"
-# Drop-in std::time replacement: EXACTLY `std::time` on native (zero-cost, byte-identical),
-# JS clock on wasm32 — lets the engine's internal Instant/SystemTime reads run under wasm
-# instead of panicking "time not implemented".
-web-time = "1"
-# Public-domain 8x8 Unicode bitmap faces for PHOSPHOR's bounded dynamic
-# material ROM: real sampled terminal characters, rendered identically in the
-# native and wasm/embedded pipelines without consulting a host font API.
+# DEV-ONLY (aterm-effects `[dev-dependencies]`): the ORACLE for the 499
+# public-domain glyphs PHOSPHOR's material ROM now carries in-tree
+# (crates/aterm-effects/src/matrix_rain/bitmap_font.rs), plus the glyph rows the
+# effects demo examples draw. The data is public domain, so copying it costs
+# nothing and owes nothing; keeping the crate here costs nothing either,
+# because a dev-dependency never enters the shipped graph — and it buys an
+# all-of-Unicode equality test that keeps the copy honest forever.
 font8x8 = { version = "0.3.1", default-features = false, features = ["unicode"] }
 
 # --- internal aterm crates (added by tools/port_crate.sh as each is ported) ---
 aterm-render-api = { path = "crates/aterm-render-api" }
+# The workspace clock (retired `web-time`): EXACTLY `std::time` on native — a
+# re-export, so the engine is byte-identical to one written against std — and a
+# performance.now()/Date.now() shim on wasm32, where `std::time::Instant::now()`
+# panics "time not implemented". Ten crates sample a clock; this is the one seam
+# they all go through, and being first-party it can be verified with the rest of
+# the tree instead of trusted.
+aterm-time = { path = "crates/aterm-time" }
 # L0.5 semantic surface predicates (regex row-match) over the Observation Kernel.
 aterm-observe = { path = "crates/aterm-observe" }
 # L2 agent interface: turn-completion + self-reflection governor over L0/L0.5/L1.

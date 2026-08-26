@@ -55,6 +55,9 @@ pub mod hdr;
 /// path and compiles none of it (the dependency is target-gated to match).
 #[cfg(any(all(unix, not(target_os = "macos")), windows))]
 mod hinted;
+/// The scanline signed-area coverage rasterizer every outline fill in this
+/// crate runs through (retired `ab_glyph_rasterizer`; see `src/raster.rs`).
+pub mod raster;
 pub mod ligature_shaping;
 pub mod procedural;
 pub mod scroll_translate;
@@ -2670,9 +2673,13 @@ pub fn embedded_symbols_font() -> &'static [u8] {
     include_bytes!("../assets/SymbolsNerdFontMono-Regular.ttf")
 }
 
-/// Broad-coverage fallback faces (CJK + symbols), most-preferred first. Both macOS
-/// and Linux paths are listed; the first one that EXISTS is loaded, so a host only
-/// ever pays for its own platform. Override with $ATERM_FALLBACK_FONT. The Linux
+/// Broad-coverage fallback faces (CJK + symbols), most-preferred first. macOS,
+/// Linux and Windows paths are all listed; only the ones that EXIST are loaded, so
+/// a host only ever pays for its own platform. Entries named in
+/// [`NATIVE_SCRIPT_FALLBACK_CANDIDATES`] are ADDITIVE (the scan continues past
+/// them); the first NON-additive face that loads ends the scan, so per platform
+/// exactly one broad backstop is reached and it must be listed LAST.
+/// Override with $ATERM_FALLBACK_FONT. The Linux
 /// entries lead with `DroidSansFallbackFull` (TrueType `glyf` — guaranteed
 /// fontdue-rasterizable, broad CJK) before `NotoSansCJK` (CFF) so the broad face is
 /// always one that actually renders; `fallback_has` is a cmap-only probe, so a face
@@ -2698,20 +2705,88 @@ const FALLBACK_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    // Windows: Microsoft YaHei (TrueType `glyf` — fontdue-rasterizable, broad
-    // CJK), then MS Gothic and the Arial backstop.
+    // Windows. There is NO stock Windows face that is broad the way Arial
+    // Unicode is on macOS — Microsoft splits the world's scripts across
+    // per-script faces — so the Windows arm is a chain of NATIVE-SCRIPT tier
+    // entries (ADDITIVE: the scan keeps going past each) ended by the broad
+    // Latin/Greek/Cyrillic/Hebrew/Arabic backstop, which is the entry that
+    // finally ends the scan. Coverage below was MEASURED face-by-face from the
+    // real cmaps on a stock en-US Windows 11 (and is re-checked at test time by
+    // `windows_fallback_chain_covers_the_scripts_it_claims`), never assumed. A
+    // path that is absent is simply skipped WITHOUT ending the scan, so a host
+    // missing any of these degrades to the rest of the chain.
+    //
+    // WHAT THIS FIXES. The arm used to be `msyh, msgothic, arial` with NONE of
+    // them a tier entry, so `build_fallback_chain` stopped at the first one
+    // that loaded and the whole Windows chain was EXACTLY [Microsoft YaHei]:
+    // `msgothic` and the documented "Arial backstop" were structurally
+    // unreachable. And none of those three carries Hangul AT ALL — walking the
+    // real cmaps, msyh.ttc, msgothic.ttc and arial.ttf each map 0 of the 11172
+    // syllables U+AC00..D7A3 and 0 of the 256 jamo U+1100..11FF, while
+    // malgun.ttf maps 11172/11172 and 256/256. So `한국어` rendered as three
+    // `.notdef` boxes while `日本語` and `中文` were fine.
+    //
+    // WHAT IT COSTS. Every tier entry that EXISTS is read into memory when the
+    // chain is built (lazily, on the first primary-face miss — a pure-ASCII
+    // session pays nothing). Measured file sizes here: YaHei 18.8 MB, Malgun
+    // 12.8 MB, Nirmala 5.1 MB, arial 1.0 MB, ebrima 0.9 MB, Leelawadee 0.4 MB,
+    // Sylfaen 0.2 MB, Gadugi 0.2 MB, MV Boli 0.1 MB — 39.5 MB resident once any
+    // non-Latin glyph is asked for, against 18.8 MB before. That is the price of
+    // not printing tofu; the faces are ordered so the two large CJK ones earn
+    // their place first. `msgothic.ttc` (8.6 MB) is deliberately NOT here: its
+    // measured cmap coverage (Han + kana) is a strict SUBSET of both YaHei and
+    // Malgun Gothic, so as an additive entry it bought 8.6 MB of nothing.
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\msyh.ttc", // Microsoft YaHei: Han + kana (+ Cyrillic/Greek)
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\malgun.ttf", // Malgun Gothic: HANGUL (syllables, jamo, compat jamo)
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\Nirmala.ttc", // Nirmala UI: all 9 Indic scripts + Sinhala
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\LeelawUI.ttf", // Leelawadee UI: Thai, Khmer, Lao
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\sylfaen.ttf", // Sylfaen: Georgian (arial has no Georgian)
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\ebrima.ttf", // Ebrima: Ethiopic, Tifinagh, Vai, N'Ko
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\gadugi.ttf", // Gadugi: Cherokee, Unified Canadian Aboriginal
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\mvboli.ttf", // MV Boli: Thaana (Dhivehi)
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\arial.ttf", // broad backstop: Latin/Greek/Cyrillic/Hebrew/Arabic/Armenian
+];
+
+/// The [`FALLBACK_CANDIDATES`] entries that are the NATIVE-SCRIPT chain tier
+/// (W8): loaded IN ADDITION to (ahead of) the broad face rather than instead of
+/// it, so the chain gains native per-script designs without losing broad
+/// coverage. `build_fallback_chain` keeps scanning past a tier entry and stops
+/// only at the first NON-tier face that loads.
+///
+/// Membership is BY PATH, so a face is additive only where its exact path is
+/// also listed in [`FALLBACK_CANDIDATES`]. Every Windows entry except the final
+/// broad backstop belongs here — otherwise it would end the scan and silently
+/// orphan every candidate after it, which is exactly the defect that made the
+/// Windows chain one face long and left Hangul as tofu. The pure list law is
+/// pinned by `every_windows_candidate_but_the_backstop_is_an_additive_tier`.
+const NATIVE_SCRIPT_FALLBACK_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
     #[cfg(windows)]
     "C:\\Windows\\Fonts\\msyh.ttc",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\msgothic.ttc",
+    "C:\\Windows\\Fonts\\malgun.ttf",
     #[cfg(windows)]
-    "C:\\Windows\\Fonts\\arial.ttf",
+    "C:\\Windows\\Fonts\\Nirmala.ttc",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\LeelawUI.ttf",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\sylfaen.ttf",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\ebrima.ttf",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\gadugi.ttf",
+    #[cfg(windows)]
+    "C:\\Windows\\Fonts\\mvboli.ttf",
 ];
-
-/// The FALLBACK_CANDIDATES entries that are the NATIVE-CJK chain tier (W8):
-/// loaded IN ADDITION to (ahead of) the broad face rather than instead of it,
-/// so the chain gains a native CJK design without losing broad coverage.
-const CJK_NATIVE_FALLBACK_CANDIDATES: &[&str] = &["/System/Library/Fonts/Hiragino Sans GB.ttc"];
 
 /// Monochrome SYMBOL fallback faces, most-preferred first. Override with
 /// `$ATERM_SYMBOL_FONT`. STIX Two Math is the broadest monochrome symbol face
@@ -3950,13 +4025,17 @@ fn first_interned_face(paths: &[String]) -> Option<FallbackFace> {
     })
 }
 
-/// Build the LAZY broad-fallback CHAIN for `paths` (W8): entries of the NATIVE-CJK
-/// tier ([`CJK_NATIVE_FALLBACK_CANDIDATES`]) are ADDITIVE — the scan keeps going
+/// Build the LAZY broad-fallback CHAIN for `paths` (W8): entries of the NATIVE-SCRIPT
+/// tier ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`]) are ADDITIVE — the scan keeps going
 /// after loading one — while the first non-tier (broad) face that loads ends the
 /// scan. On macOS this yields `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
-/// broad backstop second); everywhere else a single broad face; a configured/env
-/// path still wins outright (it loads first and, not being a tier entry, ends the
-/// scan). A face's bytes are interned and its fontdue parse DEFERRED, so this is
+/// broad backstop second); on Windows the per-script faces that exist (YaHei, Malgun
+/// Gothic, Nirmala UI, Leelawadee UI, Sylfaen, Ebrima, Gadugi, MV Boli) followed by
+/// Arial; on Linux a single broad face; a configured/env path still wins outright
+/// (it loads first
+/// and, not being a tier entry, ends the scan). Because every path that fails to read
+/// is SKIPPED rather than fatal, a host missing any of these degrades to the rest of
+/// the chain. A face's bytes are interned and its fontdue parse DEFERRED, so this is
 /// safe to run on a BACKGROUND thread and cheap enough to run anywhere. An EMPTY
 /// result means no candidate loaded.
 fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
@@ -3991,7 +4070,7 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
     // load, the scan continues serially from there, exactly as before.
     let speculative = paths
         .iter()
-        .position(|p| !CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str()))
+        .position(|p| !NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str()))
         .map_or(paths.len(), |first_broad| first_broad + 1);
 
     let parsed: Vec<Option<FallbackFace>> = std::thread::scope(|scope| {
@@ -4015,7 +4094,7 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
         let Some(face) = face else {
             continue; // unreadable or unparsable: skipped, does NOT end the scan
         };
-        let is_native_tier = CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str());
+        let is_native_tier = NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str());
         chain.push(face);
         if !is_native_tier {
             return chain;
@@ -4027,7 +4106,7 @@ fn build_fallback_chain(paths: &[String]) -> Vec<FallbackFace> {
         let Ok(bytes) = font_file::read_font_file(std::path::Path::new(p)) else {
             continue;
         };
-        let is_native_tier = CJK_NATIVE_FALLBACK_CANDIDATES.contains(&p.as_str());
+        let is_native_tier = NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(&p.as_str());
         let Ok(face) = FallbackFace::from_path_bytes(&bytes, Some(p.clone())) else {
             continue;
         };
@@ -6835,7 +6914,7 @@ impl Renderer {
     /// we never re-try. Only seeds the lazy SYSTEM faces; explicit
     /// `add_fallback_bytes` entries are already in the chain and untouched.
     ///
-    /// W8: entries of the NATIVE-CJK tier ([`CJK_NATIVE_FALLBACK_CANDIDATES`])
+    /// W8: entries of the NATIVE-SCRIPT tier ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`])
     /// are ADDITIVE — the scan keeps going after loading one — while the first
     /// non-tier (broad) face that loads ends the scan exactly as before. So on
     /// macOS the chain is `[Hiragino Sans GB, Arial Unicode]` (native CJK first,
@@ -9867,6 +9946,7 @@ impl Renderer {
             sealed: self.admitted_sources_sealed,
             wants_emoji: presentation == ScalarPresentation::Default
                 && aterm_grapheme::is_emoji_presentation(ch),
+            prefers_symbol: font_chain::is_private_use(ch),
         };
         let mut primary_gid: Option<u16> = None;
         let mut probe = RendererProbe {
@@ -15491,28 +15571,28 @@ impl Renderer {
             && scale.ys.max(1) == 1
             && let Some(img) = self.subpx_image(key)
         {
-                if img.width == 0 || img.height == 0 {
-                    return;
-                }
-                let gx0 = cell_x + img.xmin;
-                let gy0 = cell_y + (baseline - img.height as i32 - img.ymin);
-                blit_subpx_1x(
-                    px,
-                    stride,
-                    gx0,
-                    gy0,
-                    img.width,
-                    img.height,
-                    &img.bytes,
-                    color,
-                    bg,
-                    corrected,
-                    scale.clip_y0,
-                    scale.clip_y1,
-                    scale.clip_x0,
-                    scale.clip_x1,
-                );
+            if img.width == 0 || img.height == 0 {
                 return;
+            }
+            let gx0 = cell_x + img.xmin;
+            let gy0 = cell_y + (baseline - img.height as i32 - img.ymin);
+            blit_subpx_1x(
+                px,
+                stride,
+                gx0,
+                gy0,
+                img.width,
+                img.height,
+                &img.bytes,
+                color,
+                bg,
+                corrected,
+                scale.clip_y0,
+                scale.clip_y1,
+                scale.clip_x0,
+                scale.clip_x1,
+            );
+            return;
         }
         // Lift the corrected-alpha memo bank OUT of `self` (one `Option<Box>`
         // move) so it can be handed to the texel loop ALONGSIDE the `&mut
@@ -21130,7 +21210,10 @@ mod tests {
         else {
             panic!("from_bytes retains the primary bytes");
         };
-        assert!(std::sync::Arc::ptr_eq(ra, rb), "source bytes share one copy");
+        assert!(
+            std::sync::Arc::ptr_eq(ra, rb),
+            "source bytes share one copy"
+        );
     }
 
     /// The cache is keyed by CONTENT, so a genuinely different face never
@@ -23759,6 +23842,253 @@ mod tests {
             .collect()
     }
 
+    // ---- W5 (Hangul tofu): the Windows fallback chain -----------------------
+    //
+    // `한국어` rendered as three `.notdef` boxes on Windows while `日本語` and
+    // `中文` were fine. Two facts made that inevitable, and these tests pin both.
+    //
+    //  1. STRUCTURE. `build_fallback_chain` stops at the first NON-additive face
+    //     that loads. Every Windows candidate used to be non-additive, so the
+    //     chain was exactly ONE face (Microsoft YaHei) and every entry behind it
+    //     — including the documented Arial backstop — was unreachable.
+    //  2. COVERAGE. None of msyh.ttc / msgothic.ttc / arial.ttf maps a Hangul
+    //     syllable to a non-zero glyph, so no reachable face could draw one.
+    //
+    // The GUI seals its font generation (`seal_admitted_font_sources`), which
+    // closes the pathname-discovery runtime tier — so the built-in chain is the
+    // LAST line that can cover a script. A gap here IS tofu on screen.
+
+    /// Whether ANY face in `chain` maps `ch` to a real (non-`.notdef`) glyph,
+    /// read from the Unicode cmap — the same authority `fallback_has` uses.
+    #[cfg(windows)]
+    fn chain_covers(chain: &[FallbackFace], ch: char) -> bool {
+        chain.iter().any(|f| {
+            ttf_parser::Face::parse(&f.bytes, f.index)
+                .ok()
+                .and_then(|p| p.glyph_index(ch))
+                .is_some_and(|g| g.0 != 0)
+        })
+    }
+
+    /// FACT 1, as a PURE LIST LAW — no font I/O, so it holds on any machine.
+    ///
+    /// Every Windows candidate except the LAST must be an additive
+    /// ([`NATIVE_SCRIPT_FALLBACK_CANDIDATES`]) entry, and the last must NOT be.
+    /// A non-additive face ends the scan, so a Windows entry that is neither
+    /// last nor additive orphans every candidate behind it — silently, and only
+    /// on Windows. That is precisely how the Hangul face would get lost again.
+    #[test]
+    #[cfg(windows)]
+    fn every_windows_candidate_but_the_backstop_is_an_additive_tier() {
+        let win: Vec<&str> = FALLBACK_CANDIDATES
+            .iter()
+            .copied()
+            .filter(|p| p.starts_with("C:\\Windows\\"))
+            .collect();
+        assert!(
+            win.len() >= 2,
+            "the Windows arm must have per-script faces plus a backstop, got {win:?}"
+        );
+        let (backstop, additive) = win.split_last().expect("non-empty");
+        for p in additive {
+            assert!(
+                NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(p),
+                "{p} is a Windows candidate but not an additive tier entry, so it \
+                 ENDS the chain scan and orphans every candidate after it"
+            );
+        }
+        assert!(
+            !NATIVE_SCRIPT_FALLBACK_CANDIDATES.contains(backstop),
+            "the last Windows candidate ({backstop}) is the broad backstop and must \
+             end the scan, so it must NOT be an additive tier entry"
+        );
+    }
+
+    /// FACT 2 — THE DEFECT ITSELF. The real chain built from the real candidate
+    /// files on this machine must cover Hangul.
+    ///
+    /// Non-vacuity is asserted in-test rather than assumed: the same chain must
+    /// also cover Han (which the pre-fix chain already did), so a chain that
+    /// covered NOTHING could not pass by accident. SKIPs only on a Windows host
+    /// that ships no Hangul face at all, and says so.
+    #[test]
+    #[cfg(windows)]
+    fn windows_fallback_chain_covers_hangul() {
+        let paths = present_fallback_paths();
+        let started = std::time::Instant::now();
+        let chain = build_fallback_chain(&paths);
+        let elapsed = started.elapsed();
+        let resident: usize = chain.iter().map(|f| f.bytes.len()).sum();
+        eprintln!(
+            "chain: {} face(s), {:.1} MB resident, built in {:?}",
+            chain.len(),
+            resident as f64 / (1024.0 * 1024.0),
+            elapsed
+        );
+        assert!(!chain.is_empty(), "no fallback candidate loaded at all");
+        // Control: the chain still covers what it always covered.
+        assert!(
+            chain_covers(&chain, '\u{4E2D}'),
+            "the chain lost Han coverage (中) — this test cannot speak to Hangul"
+        );
+        // The skip guard reads the FILESYSTEM, never the candidate list. Guarding
+        // on the list would make this test SKIP — not fail — the moment someone
+        // dropped the Hangul face from `FALLBACK_CANDIDATES`, i.e. it could not
+        // detect the exact regression it exists to catch.
+        let has_hangul_face = std::path::Path::new("C:\\Windows\\Fonts\\malgun.ttf").is_file();
+        if !has_hangul_face {
+            eprintln!("SKIP: no Hangul face (malgun.ttf) installed on this host");
+            return;
+        }
+        for ch in ['\u{D55C}', '\u{AD6D}', '\u{C5B4}', '\u{AC00}', '\u{D7A3}'] {
+            assert!(
+                chain_covers(&chain, ch),
+                "U+{:04X} has no glyph in the built fallback chain ({} face(s): {:?}) \
+                 — it renders as .notdef tofu",
+                ch as u32,
+                chain.len(),
+                chain
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+        // The additive rule must actually have kept the scan going: a chain that
+        // stopped at the first face could not hold both Han and Hangul faces.
+        assert!(
+            chain.len() >= 2,
+            "the Windows chain collapsed to {} face(s) — the additive tier broke",
+            chain.len()
+        );
+    }
+
+    /// The chain's per-script promise, MEASURED against the faces this host
+    /// actually has. Each script is checked only when the face that is supposed
+    /// to carry it is installed, so this never fails for a missing optional
+    /// font — it fails when a face IS present and the chain still cannot reach
+    /// it, i.e. when the scan stopped early.
+    #[test]
+    #[cfg(windows)]
+    fn windows_fallback_chain_covers_the_scripts_it_claims() {
+        let paths = present_fallback_paths();
+        let chain = build_fallback_chain(&paths);
+        // FILESYSTEM, not the candidate list — see the note in
+        // `windows_fallback_chain_covers_hangul`. If this asked the list, then
+        // deleting a face FROM the list would silently turn its assertion into a
+        // SKIP, and the test could never catch a dropped face.
+        let present = |f: &str| std::path::Path::new(&format!("C:\\Windows\\Fonts\\{f}")).is_file();
+        // (script, sample code point, the candidate that carries it)
+        let claims: &[(&str, char, &str)] = &[
+            ("Han", '\u{4E2D}', "msyh.ttc"),
+            ("Kana", '\u{30C6}', "msyh.ttc"),
+            ("Hangul", '\u{D55C}', "malgun.ttf"),
+            ("Hangul jamo", '\u{1100}', "malgun.ttf"),
+            ("Devanagari", '\u{0915}', "Nirmala.ttc"),
+            ("Tamil", '\u{0B95}', "Nirmala.ttc"),
+            ("Bengali", '\u{0985}', "Nirmala.ttc"),
+            ("Telugu", '\u{0C05}', "Nirmala.ttc"),
+            ("Malayalam", '\u{0D05}', "Nirmala.ttc"),
+            ("Sinhala", '\u{0D85}', "Nirmala.ttc"),
+            ("Thai", '\u{0E01}', "LeelawUI.ttf"),
+            ("Khmer", '\u{1780}', "LeelawUI.ttf"),
+            ("Lao", '\u{0E81}', "LeelawUI.ttf"),
+            ("Georgian", '\u{10D0}', "sylfaen.ttf"),
+            ("Ethiopic", '\u{1200}', "ebrima.ttf"),
+            ("Tifinagh", '\u{2D30}', "ebrima.ttf"),
+            ("Vai", '\u{A500}', "ebrima.ttf"),
+            ("Cherokee", '\u{13A0}', "gadugi.ttf"),
+            ("Canadian Aboriginal", '\u{1401}', "gadugi.ttf"),
+            ("Thaana", '\u{0780}', "mvboli.ttf"),
+            ("Hebrew", '\u{05D0}', "arial.ttf"),
+            ("Arabic", '\u{0627}', "arial.ttf"),
+            ("Armenian", '\u{0531}', "arial.ttf"),
+        ];
+        let mut checked = 0usize;
+        for (script, ch, face) in claims {
+            if !present(face) {
+                eprintln!("SKIP {script}: {face} is not installed here");
+                continue;
+            }
+            assert!(
+                chain_covers(&chain, *ch),
+                "{script} (U+{:04X}) is claimed by {face}, which IS installed, but no \
+                 chain face covers it — the candidate scan never reached it",
+                *ch as u32
+            );
+            checked += 1;
+        }
+        assert!(checked > 0, "no claimed face was installed; nothing proven");
+        eprintln!(
+            "chain of {} face(s) covered {checked} script(s)",
+            chain.len()
+        );
+    }
+
+    /// The RENDER-SIDE end of the same defect: a Hangul syllable must dispatch
+    /// to the broad fallback tier and rasterize with real ink — not land on the
+    /// primary face's `.notdef`. This is what the screenshot showed.
+    #[test]
+    #[cfg(windows)]
+    fn hangul_dispatches_to_the_fallback_tier_with_real_ink() {
+        let Some(mut r) = renderer() else {
+            eprintln!("SKIP: no system mono font found");
+            return;
+        };
+        if !std::path::Path::new("C:\\Windows\\Fonts\\malgun.ttf").is_file() {
+            eprintln!("SKIP: no Hangul face installed on this host");
+            return;
+        }
+        r.debug_block_on_lazy_fallbacks();
+        let ch = '\u{D55C}'; // 한
+        let key = r.glyph_key(ch);
+        // It must be the CHAIN specifically, not merely "some tier". A GUI window
+        // seals its font generation, which closes the pathname-discovery runtime
+        // tier — so a 한 that only `RuntimeFallback` can reach still paints
+        // `.notdef` on screen, which is exactly what the screenshot showed. Only
+        // `FaceId::Fallback` survives the seal.
+        assert_eq!(
+            key.source,
+            FaceId::Fallback,
+            "한 resolved to {:?}, not the broad fallback chain. Primary means the \
+             .notdef tofu box; RuntimeFallback means only the UNSEALED path finds \
+             it, and every GUI window seals — so on screen that is tofu too.",
+            key.source
+        );
+        let img = r.glyph_image(key);
+        assert!(
+            img.width() > 0 && img.height() > 0,
+            "한 rasterized to an empty bitmap"
+        );
+        assert!(
+            img.bytes().iter().any(|&c| c > 0),
+            "한 rasterized with no coverage at all"
+        );
+    }
+
+    /// The bundle also alleged the tofu took the wrong ADVANCE. It does not, and
+    /// this pins the width that was already correct so a fallback-chain change
+    /// cannot quietly narrow it: Hangul syllables are East Asian Wide and occupy
+    /// TWO cells in both ambiguous-width modes, independent of which face draws
+    /// them.
+    #[test]
+    fn hangul_syllables_occupy_two_cells() {
+        use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
+        for ambiguous in [AmbiguousWidth::Single, AmbiguousWidth::Double] {
+            let shaping = TextShapingConfig {
+                ambiguous_width: ambiguous,
+                ..TextShapingConfig::default()
+            };
+            for ch in ['\u{AC00}', '\u{D55C}', '\u{AD6D}', '\u{C5B4}', '\u{D7A3}'] {
+                assert_eq!(
+                    fallback_cell_count(ch, &shaping),
+                    2,
+                    "U+{:04X} must span two cells under {ambiguous:?}",
+                    ch as u32
+                );
+            }
+        }
+    }
+
     /// LAZY-FONT-PARSE, the whole point: building the broad-fallback chain must
     /// NOT fontdue-parse the faces, and neither must probing their coverage.
     ///
@@ -24098,7 +24428,10 @@ mod tests {
         sf.font = LazyFontdue::failed_parse();
         let epoch = r.font_epoch;
         assert!(r.retire_unparsable_styled(0), "a present slot must retire");
-        assert!(r.styled_faces[0].is_none(), "the retired slot must be empty");
+        assert!(
+            r.styled_faces[0].is_none(),
+            "the retired slot must be empty"
+        );
         assert!(r.font_epoch > epoch, "retiring must bump the font epoch");
         assert!(
             !r.retire_unparsable_styled(0),

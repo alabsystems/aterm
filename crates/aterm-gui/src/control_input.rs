@@ -1016,6 +1016,12 @@ pub(crate) fn write_pty(sink: &SinkWriter, data: &[u8]) {
     // Control-driven input measures the same input→present slice a keystroke
     // does, so a driven smoke can assert on typing latency.
     crate::metrics::note_input();
+    // This write NEVER passes the App input seam, so an in-flight
+    // `video ... keys` recording structurally cannot log it. Count the attempts
+    // it carries: the recording reports the total as `unlogged_inputs`, which is
+    // what stops an empty ledger from being indistinguishable from a quiet
+    // screen.
+    crate::note_unseamed_control_bytes(data);
     let _ = sink.write_frame(data);
 }
 
@@ -1083,5 +1089,238 @@ mod tests {
         }
         // An unnamed device button is still rejected — no bogus report.
         assert!(parse_mouse("press thumb3 2 4").is_err());
+    }
+}
+
+#[cfg(test)]
+mod video_keys_ledger_tests {
+    //! The documented key→photon recipe, pinned at the VERB boundary: what the
+    //! active-tab `send`/`feed`/`key` verbs build must reach the opt-in
+    //! `video … keys` ledger, and the one path that structurally cannot be
+    //! logged must be COUNTED instead of silently dropped.
+    //!
+    //! These live beside the verb parsers (rather than beside the recording) so
+    //! the assertions are driven by the REAL `send_bytes`/`feed_bytes`/`parse_key`
+    //! a socket request goes through — the only untested link left between a
+    //! verb and the ledger is the single `control.rs` dispatch arm, which the
+    //! on-glass recording in this change's report exercises end to end.
+
+    use super::{feed_bytes, parse_key, send_bytes, write_pty};
+    use crate::input::InputEvent;
+    use crate::{VideoInputSample, record_controller_video_attempts, video_sample_for_key};
+    use aterm_session::sink::SinkWriter;
+    use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
+
+    /// `video … keys` claims to log "socket input driven through the ACTIVE-TAB
+    /// verbs", and flagless `send`/`feed` ARE active-tab verbs: `control.rs`
+    /// routes both through `front_routed_input` as an `InputEvent::KeySequence`.
+    /// The ledger's classifier had no `KeySequence` arm, so every take driven
+    /// the documented way produced an EMPTY `inputs[]` — a measuring instrument
+    /// reporting zero indistinguishably from one that measured zero.
+    #[test]
+    fn video_keys_ledger_logs_the_send_and_feed_verbs() {
+        // `send 'ls\n'` — the submit form the recipe documents. The trailing
+        // literal `\n` normalizes to CR, the byte Return sends.
+        let bytes = send_bytes("ls\\n");
+        assert_eq!(bytes, b"ls\r".to_vec(), "the verb's bytes, not a stand-in");
+        let mut log = Vec::new();
+        record_controller_video_attempts(&mut log, &InputEvent::KeySequence(bytes), 100, 64);
+        assert_eq!(
+            log,
+            vec![
+                (100, VideoInputSample::Char('l')),
+                (100, VideoInputSample::Char('s')),
+                (100, VideoInputSample::Char('\r')),
+            ],
+            "`send ls\\n` must land three timestamped attempts, not silence"
+        );
+
+        // `feed 1b5b41` — ESC [ A, the escape hatch for the control bytes
+        // `send` cannot carry.
+        let bytes = feed_bytes("1b5b41").expect("valid hex");
+        let mut fed = Vec::new();
+        record_controller_video_attempts(&mut fed, &InputEvent::KeySequence(bytes), 200, 64);
+        assert_eq!(
+            fed,
+            vec![
+                (200, VideoInputSample::Char('\u{1b}')),
+                (200, VideoInputSample::Char('[')),
+                (200, VideoInputSample::Char('A')),
+            ],
+            "`feed` bytes are attempts on the frame clock too"
+        );
+
+        // NON-UTF-8 is still an attempt, never a panic and never a drop: one
+        // replacement per maximal invalid subpart, matching from_utf8_lossy.
+        let raw = [b'a', 0xff, 0xfe, b'b'];
+        let mut lossy = Vec::new();
+        record_controller_video_attempts(
+            &mut lossy,
+            &InputEvent::KeySequence(raw.to_vec()),
+            300,
+            64,
+        );
+        assert_eq!(
+            lossy,
+            vec![
+                (300, VideoInputSample::Char('a')),
+                (300, VideoInputSample::Char('\u{fffd}')),
+                (300, VideoInputSample::Char('\u{fffd}')),
+                (300, VideoInputSample::Char('b')),
+            ]
+        );
+        assert_eq!(
+            lossy.len(),
+            String::from_utf8_lossy(&raw).chars().count(),
+            "the in-place decoder agrees with from_utf8_lossy's char count"
+        );
+
+        // The cap still truncates a large paste-shaped sequence exactly.
+        let mut capped = Vec::new();
+        record_controller_video_attempts(
+            &mut capped,
+            &InputEvent::KeySequence(b"abcdefgh".to_vec()),
+            400,
+            3,
+        );
+        assert_eq!(capped.len(), 3, "the bounded ledger is still bounded");
+    }
+
+    /// A terminal take is driven with `esc`, the arrows and the F-keys, and the
+    /// old `char`-only ledger dropped every one of them: `video 3 keys` +
+    /// `ctl key up` five times produced `inputs: []`. Named keys are now
+    /// SAMPLES, and the three named keys with an unambiguous character keep
+    /// their character representation. Bare modifiers stay out (they express no
+    /// intent and would only add noise to the correlation).
+    #[test]
+    fn video_keys_ledger_names_keys_that_have_no_character() {
+        for (verb, expect) in [
+            ("up", VideoInputSample::Named(NamedKey::ArrowUp)),
+            ("esc", VideoInputSample::Named(NamedKey::Escape)),
+            ("backspace", VideoInputSample::Named(NamedKey::Backspace)),
+            ("f1", VideoInputSample::Named(NamedKey::F1)),
+            ("pagedown", VideoInputSample::Named(NamedKey::PageDown)),
+            // The character-bearing three keep their historical shape.
+            ("enter", VideoInputSample::Char('\n')),
+            ("tab", VideoInputSample::Char('\t')),
+            ("space", VideoInputSample::Char(' ')),
+        ] {
+            let ev = parse_key(verb).unwrap_or_else(|| panic!("`key {verb}` parses"));
+            let mut log = Vec::new();
+            record_controller_video_attempts(&mut log, &ev, 7, 64);
+            assert_eq!(log, vec![(7, expect)], "`key {verb}` must be an attempt");
+        }
+
+        // A bare modifier is not an attempt.
+        assert_eq!(
+            video_sample_for_key(&Key::Named(NamedKey::ShiftLeft)),
+            None,
+            "a bare Shift expresses no input intent"
+        );
+        assert_eq!(video_sample_for_key(&Key::Named(NamedKey::CapsLock)), None);
+
+        // index.json shape: `ch` for characters, `key` for named — both valid
+        // JSON fragments, with control characters escaped.
+        assert_eq!(
+            VideoInputSample::Named(NamedKey::ArrowUp).json_field(),
+            "\"key\":\"ArrowUp\""
+        );
+        assert_eq!(VideoInputSample::Char('a').json_field(), "\"ch\":\"a\"");
+        assert_eq!(
+            VideoInputSample::Char('\r').json_field(),
+            "\"ch\":\"\\u000d\""
+        );
+        assert_eq!(
+            VideoInputSample::Char('"').json_field(),
+            "\"ch\":\"\\\"\"",
+            "a typed quote cannot break the index"
+        );
+    }
+
+    /// The genuinely-unloggable path must be COUNTED, not silently ignored:
+    /// `write_pty` is the control-thread egress `cmd_send`/`cmd_feed` take for a
+    /// BACKGROUND target, and it never reaches the App input seam the ledger
+    /// hooks. A recording can only stay honest by reporting how many of them
+    /// happened during the take.
+    ///
+    /// The assertion is `>=` deliberately: the counter is process-wide and other
+    /// tests in this binary drive the same verbs concurrently, so they can only
+    /// ADD. Neutering the `note_unseamed_control_bytes()` call site makes this
+    /// delta 0 and the test fails.
+    ///
+    /// The unit is the LEDGER's unit — one per attempt that would have become an
+    /// `inputs[]` row — so `write_pty(b"abc")` counts THREE, matching what the
+    /// same three bytes would have logged had they been front-routed. A reader
+    /// comparing `inputs_logged` with `unlogged_inputs` is comparing like with
+    /// like.
+    #[test]
+    fn control_thread_input_egress_is_counted_for_the_video_ledger() {
+        let sink = SinkWriter::new(-1);
+        let before = crate::unseamed_control_inputs();
+        const DRIVES: u64 = 12;
+        for _ in 0..DRIVES {
+            write_pty(&sink, b"x");
+        }
+        let after = crate::unseamed_control_inputs();
+        assert!(
+            after.saturating_sub(before) >= DRIVES,
+            "{DRIVES} control-thread egresses must be countable; saw {} \
+             (an uncounted bypass is exactly the silent zero this instrument must not produce)",
+            after.saturating_sub(before)
+        );
+
+        // Per-ATTEMPT, not per-call: `send hey` at a background target is three
+        // attempts the ledger did not get, and must be reported as three.
+        let before = crate::unseamed_control_inputs();
+        write_pty(&sink, &send_bytes("hey"));
+        assert!(
+            crate::unseamed_control_inputs().saturating_sub(before) >= 3,
+            "a 3-byte background `send` is 3 unlogged attempts, not 1"
+        );
+    }
+
+    /// The disclosure must not cry wolf. `unlogged_inputs` is the count of
+    /// attempts the ledger WOULD have recorded, so an event it never records
+    /// anyway must contribute nothing: a cross-session `focus` reaching the same
+    /// control-thread arm as `key` would otherwise push the count above zero and
+    /// make `index.json` announce a MEASUREMENT GAP for a take that had none —
+    /// the silent zero's mistake pointed the other way.
+    ///
+    /// Asserted on the PURE classifier, not on the process-wide counter: that
+    /// counter is shared with every other test in this binary (the sibling
+    /// wiring test above drives fifteen egresses through it), so an exact
+    /// before/after assertion on it is a race, not a proof. This one is exact
+    /// because it shares no state.
+    #[test]
+    fn unloggable_counter_ignores_events_the_ledger_never_records() {
+        for quiet in [
+            InputEvent::Focus(true),
+            InputEvent::Focus(false),
+            InputEvent::Key {
+                key: Key::Named(NamedKey::ShiftLeft),
+                mods: Modifiers::default(),
+                base_layout: None,
+                event_type: KeyEventType::Press,
+            },
+        ] {
+            assert_eq!(
+                crate::video_attempt_count(&quiet),
+                0,
+                "{quiet:?} is not an input attempt and must not be reported as an unlogged one"
+            );
+        }
+
+        // A real attempt on the same arm still counts, so the gate is a
+        // classifier and not an off switch.
+        assert_eq!(
+            crate::video_attempt_count(&InputEvent::Text("ab".into())),
+            2,
+            "a cross-session paste of two chars IS two attempts this ledger missed"
+        );
+
+        // The raw-byte arm agrees, per attempt, and an empty payload (a
+        // zero-length `feed`) is not an attempt at all.
+        assert_eq!(crate::video_attempt_count_bytes(b""), 0);
+        assert_eq!(crate::video_attempt_count_bytes(&send_bytes("hey")), 3);
     }
 }

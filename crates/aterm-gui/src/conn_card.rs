@@ -252,7 +252,7 @@ impl ConnCardState {
 
     /// Focus `row` and cycle its value by `delta` — the a11y Click's cycle
     /// (a screen reader clicks the chooser row it hears; the row advances).
-    #[cfg_attr(not(feature = "a11y-accesskit"), allow(dead_code))]
+    #[cfg_attr(not(a11y_tree), allow(dead_code))]
     pub(crate) fn cycle_row(&mut self, row: CardRow, delta: isize) {
         self.focus = row;
         self.cycle_value(delta);
@@ -427,7 +427,7 @@ impl ConnCardState {
     }
 
     /// Decode an a11y node id minted by [`conn_card_a11y`] to its target.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn a11y_hit(node: accesskit::NodeId) -> Option<ConnCardHit> {
         match node.0 {
             1 => Some(ConnCardHit::Direction(CardDirection::SrcToDst)),
@@ -738,7 +738,7 @@ pub(crate) fn conn_card_tray(state: &ConnCardState, g: &SettingsGeom, theme: The
 /// card has no dynamic row set, so no epoch is needed): the two cycler rows
 /// (Click cycles their value) and the two buttons. Focus follows the focused
 /// control row.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn conn_card_a11y(state: &ConnCardState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 

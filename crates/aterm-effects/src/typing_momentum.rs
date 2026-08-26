@@ -50,7 +50,7 @@
 //! typing crosses the cat's 0.75 band in ~1.7 s and reaches 1.0 in ~2.9 s —
 //! the arc the raised thresholds in [`crate::kitty_cursor`] are tuned against.
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 /// Exponential decay time constant (seconds). See the module doc: prose
 /// breaths survive, thinking pauses drain — "it decays over time".

@@ -23,7 +23,7 @@
 //! (the resting ember then rides the blink cadence — no perpetual wakeups), and
 //! emits identical premultiplied quads on the CPU and Metal backends.
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_render::{GlowQuad, premul_rgb};
 

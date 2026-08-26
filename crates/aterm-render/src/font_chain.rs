@@ -97,6 +97,19 @@ pub struct ChainPolicy {
     pub sealed: bool,
     /// `aterm_grapheme::is_emoji_presentation(ch)`.
     pub wants_emoji: bool,
+    /// The code point is in a PRIVATE USE AREA (U+E000..F8FF or either
+    /// supplementary PUA plane), so a DEDICATED symbol face outranks the broad
+    /// text chain for it.
+    ///
+    /// PUA carries no Unicode meaning: a text face that maps one is asserting a
+    /// private convention, and the odds it is the SAME convention the author
+    /// meant are poor. Measured: adding a Hangul face to the Windows chain made
+    /// `arial.ttf` reachable, and arial maps exactly ONE private code point —
+    /// U+F301 — so a Nerd Font logo that had always drawn from the bundled
+    /// symbol face silently became arial's dot. Consulting Symbol first for PUA
+    /// stops a broad face winning a range it covers only incidentally, and
+    /// changes nothing for any assigned code point.
+    pub prefers_symbol: bool,
 }
 
 /// Which per-code-point decision map a runtime resolution was recorded in.
@@ -226,6 +239,14 @@ pub const fn io_free_mask(policy: ChainPolicy) -> u8 {
 }
 
 /// Walk the chain. Pure: every fact comes from `probe`, every policy bit from
+
+/// Whether `ch` sits in a Private Use Area — the BMP block plus both
+/// supplementary planes. Used by [`ChainPolicy::prefers_symbol`]; see that
+/// field for why PUA reorders the chain.
+#[must_use]
+pub const fn is_private_use(ch: char) -> bool {
+    matches!(ch, '\u{E000}'..='\u{F8FF}' | '\u{F0000}'..='\u{FFFFD}' | '\u{100000}'..='\u{10FFFD}')
+}
 /// `policy`, and no tier is consulted twice.
 pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy) -> Resolution {
     if probe.covers(Tier::Procedural) {
@@ -234,16 +255,25 @@ pub fn resolve_chain<P: ChainProbe + ?Sized>(probe: &mut P, policy: ChainPolicy)
     if probe.covers(Tier::Primary) {
         return Resolution::Face(FaceId::Primary);
     }
-    if probe.covers(Tier::Fallback) {
+    // The broad chain is probed IN ORDER (P2), but its answer does not win
+    // outright for a PRIVATE-USE point: see `ChainPolicy::prefers_symbol`.
+    let fallback_covers = probe.covers(Tier::Fallback);
+    if fallback_covers && !policy.prefers_symbol {
         return Resolution::Face(FaceId::Fallback);
     }
     // The broad face is still parsing: render `.notdef` for this frame WITHOUT
-    // memoizing and WITHOUT cascading into the synchronous loaders below.
-    if probe.parse_pending(Tier::Fallback) {
+    // memoizing and WITHOUT cascading into the synchronous loaders below. Only
+    // reachable when the broad chain did NOT already answer.
+    if !fallback_covers && probe.parse_pending(Tier::Fallback) {
         return Resolution::Provisional;
     }
     if probe.covers(Tier::Symbol) {
         return Resolution::Face(FaceId::SymbolFallback);
+    }
+    // PUA and the symbol face does not have it after all — the broad chain's
+    // incidental coverage is better than `.notdef`, so it still wins here.
+    if fallback_covers {
+        return Resolution::Face(FaceId::Fallback);
     }
     if probe.parse_pending(Tier::Symbol) {
         return Resolution::Provisional;

@@ -660,7 +660,7 @@ impl PaletteState {
 
     /// Move the cursor to a specific FILTERED-set index (an OS accessibility Focus/Click on a
     /// row lands here), clamped into range and kept on-screen. A no-op when nothing matches.
-    #[cfg_attr(not(feature = "a11y-accesskit"), allow(dead_code))]
+    #[cfg_attr(not(a11y_tree), allow(dead_code))]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -867,7 +867,7 @@ impl PaletteState {
 /// root is `NodeId(0)`; each row id combines a hash of the filtered target set with its slot.
 /// A request queued against an old native view/generation therefore cannot address a new
 /// row after a tab switch. The ListBox container lives at a disjoint sentinel id.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Toggled, Tree, TreeId, TreeUpdate};
 
@@ -943,7 +943,7 @@ pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
 /// Mint a palette row node id from an ALREADY-derived epoch. The single-shot decode path
 /// ([`PaletteState::a11y_filtered_index`]) keeps using the `&self` method; only bulk minting,
 /// where the epoch is loop-invariant, goes through here.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
     accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
 }
@@ -1011,7 +1011,7 @@ impl PaletteState {
     /// AccessKit row identity epoch. Cursor/focus movement deliberately does not enter this
     /// hash (Focus followed by Click remains valid); row targets, lifecycle generations,
     /// enabled state, and filtering do, so stale platform requests fail closed.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1033,14 +1033,14 @@ impl PaletteState {
         }
     }
 
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y_node_id(&self, slot: usize) -> accesskit::NodeId {
         a11y_node_id_for(self.a11y_epoch(), slot)
     }
 
     /// Decode only a node minted by the current filtered target epoch. An old native
     /// generation or tab scope cannot redirect a delayed screen-reader Click.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: accesskit::NodeId) -> Option<usize> {
         let slot = usize::try_from(node.0 & u64::from(u32::MAX))
             .ok()?
@@ -2411,7 +2411,7 @@ mod tests {
     /// ANTI-DIVERGENCE: the a11y MenuItem set equals `filtered()` (the SAME rows the card
     /// paints and `controls menu` reports as `shown=`), focus follows `selected`, and a
     /// DISABLED row omits `Click` (matching `selected_action`'s inert-greyed rule).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn palette_a11y_lists_filtered_rows() {
         use accesskit::{Action, Role};
@@ -2476,7 +2476,7 @@ mod tests {
 
     /// NEGATIVE CONTROL (non-vacuity): typing a filter that narrows the list removes the
     /// corresponding MenuItem nodes — the tree reflects the live model, not a static list.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn palette_a11y_tree_tracks_the_filter() {
         use accesskit::Role;
@@ -2497,7 +2497,7 @@ mod tests {
         assert_eq!(narrowed, s.filtered().len(), "and matches the filtered set");
     }
 
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn native_rows_have_the_same_a11y_title_scope_shortcut_and_enabled_state() {
         use accesskit::Action;
@@ -2562,7 +2562,7 @@ mod tests {
 
     /// A screen-reader Click may arrive after the user switched native tabs. Its node id
     /// must fail closed instead of selecting the same visual slot in the replacement app.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn stale_native_a11y_row_cannot_redirect_after_scope_replacement() {
         let scope = |view, generation, action: &'static str| NativeCommandScope {

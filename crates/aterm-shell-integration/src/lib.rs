@@ -210,8 +210,8 @@ impl ShellNonce {
 
 /// Generate a fresh 32-byte shell-integration capability-nonce (#7960, #7987).
 ///
-/// Uses [`rand_core::OsRng`] — the operating-system CSPRNG — so the nonce
-/// is unpredictable across restarts. The host is responsible for:
+/// Minted from the operating-system CSPRNG — see [`fill_nonce_entropy`] — so
+/// the nonce is unpredictable across restarts. The host is responsible for:
 ///
 /// 1. Installing the raw bytes via `Terminal::authorize_shell_integration`.
 /// 2. Setting `ATERM_SHELL_NONCE=<hex>` in the spawned shell's environment
@@ -219,7 +219,7 @@ impl ShellNonce {
 /// 3. Flipping `TerminalModes::require_shell_integration_nonce` on after
 ///    (1) and (2) are wired.
 #[must_use]
-// Trust: `OsRng::fill_bytes` is an out-of-bundle `rand_core` call whose only panic
+// Trust: the fill bottoms out in an out-of-bundle syscall wrapper whose only panic
 // path is an UNRECOVERABLE OS-entropy failure — a deliberate, documented fail-loud
 // design choice (below): we PREFER that catastrophic-rare panic to silently weakening
 // the nonce. Its panic-freedom is therefore a documented ASSUMPTION on the OS CSPRNG,
@@ -228,15 +228,63 @@ impl ShellNonce {
 // documented-external-assumption tier as the workspace's other skips.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn generate_nonce() -> ShellNonce {
-    use rand_core::{OsRng, RngCore};
     let mut raw = [0u8; SHELL_NONCE_BYTES];
-    // OsRng::fill_bytes is documented infallible — `getrandom` retries
-    // EINTR internally and panics on unrecoverable OS errors, which we
-    // prefer to a silent fallback to a weaker RNG.
-    OsRng.fill_bytes(&mut raw);
+    fill_nonce_entropy(&mut raw);
     let hex = hex_encode(&raw);
     ShellNonce { raw, hex }
 }
+
+/// Fill `buf` from the OS CSPRNG, on the ONE audited entropy surface for this
+/// platform.
+///
+/// Native (unix and Windows) goes through [`aterm_uds::rand::fill`] —
+/// `getentropy(2)` with a bounded `read_exact` fallback, `BCryptGenRandom` on
+/// Windows. That is the rule `tools/grep_guard.sh` B4 enforces after the
+/// 2026-07-04/05 unbounded-`/dev/urandom` kernel panic, and routing here is
+/// what let `rand_core` leave the shipped graph.
+///
+/// `wasm32-unknown-unknown` has no OS entropy syscall and no `aterm-uds`
+/// (there are no Unix-domain sockets in a browser), so it calls the JS
+/// `crypto.getRandomValues` bridge directly — the same source `OsRng` reached
+/// there, one indirection fewer.
+///
+/// # Panics
+/// When the OS CSPRNG is unavailable. Deliberate and documented: a weaker
+/// nonce would silently un-gate shell integration, so this fails loud.
+#[cfg(any(unix, windows))]
+fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
+    aterm_uds::rand::fill(buf).expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
+}
+
+/// `wasm32-unknown-unknown` arm of [`fill_nonce_entropy`].
+///
+/// The predicate matches the manifest's
+/// `[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]`
+/// section EXACTLY, not `not(any(unix, windows))`. The two must partition the
+/// target space identically: a `not(any(unix, windows))` arm also selects
+/// `wasm32-wasip1`, whose manifest section does not apply, so `getrandom` would
+/// not be in the graph and the crate would fail to build on an unresolved path
+/// rather than on a sentence.
+///
+/// # Panics
+/// As the native arm: an unavailable CSPRNG fails loud rather than weakening
+/// the nonce.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn fill_nonce_entropy(buf: &mut [u8; SHELL_NONCE_BYTES]) {
+    getrandom::getrandom(buf).expect("OS CSPRNG unavailable: cannot mint a shell-integration nonce");
+}
+
+// Any target that is neither unix, nor windows, nor wasm32-unknown-unknown has
+// no entropy source declared in this crate's manifest. Say so in one sentence
+// at compile time instead of leaving a reader to decode an unresolved
+// `getrandom::` path — and make adding such a target a deliberate act that
+// names its CSPRNG, since the alternative is a silently weaker nonce.
+#[cfg(not(any(unix, windows, all(target_arch = "wasm32", target_os = "unknown"))))]
+compile_error!(
+    "aterm-shell-integration has no OS entropy source for this target: the capability-nonce \
+     mint routes through aterm-uds on unix/windows and getrandom on wasm32-unknown-unknown. \
+     Add a target section to Cargo.toml and an arm to fill_nonce_entropy before building here."
+);
 
 /// Lowercase hex-encode a 32-byte nonce. Exposed for host-side helpers
 /// that wire a caller-provided nonce (e.g. test fixtures that want

@@ -19,7 +19,7 @@
 //! whole state machine is unit-testable without sleeping or a real PTY — the same
 //! discipline as `aterm-effects`' `cursor_glow`. On native `Instant` is exactly
 //! `std::time::Instant` (byte-identical to the pre-extraction `aterm-gui` build);
-//! on wasm32 it is `web_time::Instant`, so a web host can sample its real
+//! on wasm32 it is `aterm_time::Instant`, so a web host can sample its real
 //! monotonic clock. The host wires four seams:
 //!   1. [`Predictor::predict_char_in_grid`] (or the height-blind
 //!      [`Predictor::predict_char`]) / [`Predictor::predict_backspace`] on a keypress,
@@ -64,7 +64,7 @@
 //!   the whole set — so a wrong guess is corrected within one output burst.
 
 use std::time::Duration;
-use web_time::Instant;
+use aterm_time::Instant;
 
 /// How aggressively to DISPLAY predictions. Tracking happens regardless; this only
 /// gates what is painted. Parsed from the `predictive_echo` config string.

@@ -15,10 +15,18 @@ local-pty = ["dep:aterm-containment"]
 
 [dependencies]
 aterm-containment = { workspace = true, optional = true }
-rand_core = { workspace = true }
 
-# wasm32-unknown-unknown has no OS entropy source: getrandom (pulled in transitively
-# via rand_core's `getrandom` feature for OsRng) needs its `js` backend to compile.
+# THE workspace's one audited entropy surface for the capability-nonce mint
+# (`aterm_uds::rand::fill`: getentropy(2) with a bounded read_exact fallback,
+# BCryptGenRandom on Windows) — the rule `tools/grep_guard.sh` B4 exists to
+# hold. Target-gated because there are no Unix-domain sockets in a browser;
+# aterm-uds is a dependency-free leaf, so it adds no third-party package.
+[target.'cfg(any(unix, windows))'.dependencies]
+aterm-uds = { workspace = true }
+
+# wasm32-unknown-unknown has no OS entropy syscall and no aterm-uds, so the
+# nonce mint calls the JS `crypto.getRandomValues` bridge directly — the same
+# source the retired `rand_core::OsRng` reached there, one indirection fewer.
 # Target-gated, so native builds are unaffected.
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }

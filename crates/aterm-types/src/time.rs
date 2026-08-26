@@ -13,7 +13,7 @@ use core::time::Duration;
 /// Saturates at `u64::MAX` (~584 years) which is unreachable in practice.
 #[must_use]
 #[inline]
-// Skip: `Duration` here is the THIRD-PARTY `web_time::Duration` (the
+// Skip: `Duration` here is the THIRD-PARTY `aterm_time::Duration` (the
 // wasm-compatible shim), whose `as_secs`/`subsec_nanos` bodies are absent
 // from the bundle. Both are plain field reads and the arithmetic below is
 // already saturating (proven). Droppable when dep-body totality lands.

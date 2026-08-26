@@ -28,7 +28,7 @@
 //! `PredictMode::parse` domain as the native `predictive_echo` config knob.
 //!
 //! Unlike the effects clock (a deterministic host-advanced `advance_effects`
-//! stream), this module samples the REAL monotonic clock (`web_time::Instant`:
+//! stream), this module samples the REAL monotonic clock (`aterm_time::Instant`:
 //! std on native, `performance.now()` on wasm32). The predictor's glitch-expiry
 //! self-heal is a wall-clock window (an unechoed guess must vanish ~250 ms
 //! after the real keypress) — the same live-clock seam the native event loop
@@ -40,7 +40,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::AtermGpuTerminal;
 use aterm_predict::PredictMode;
-use web_time::Instant;
+use aterm_time::Instant;
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen)]
 impl AtermGpuTerminal {

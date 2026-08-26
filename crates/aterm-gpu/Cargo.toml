@@ -31,21 +31,21 @@ aterm-render-api = { path = "../aterm-render-api", default-features = false }
 # Fast non-DoS hasher (FxHash) for the per-drawable-cell glyph atlas lookups.
 aterm-hash = { workspace = true }
 # `std::time::Instant::now()` PANICS on wasm32-unknown-unknown ("time not
-# implemented"); web-time shims it to performance.now() there and re-exports
+# implemented"); aterm-time shims it to performance.now() there and re-exports
 # std's Instant natively (byte-identical native). The shimmer/SDR-glow present
 # clocks below use it so GPU init/present never traps in the web renderer —
 # same clock aterm-effects already uses across this crate's wasm closure.
-web-time = { workspace = true }
+aterm-time = { workspace = true }
 wgpu = { version = "29", default-features = false }
 bytemuck = { version = "1", features = ["derive"] }
 # Optional: only pulled in by the off-by-default `spec-anchors` feature.
 aterm-spec = { workspace = true, optional = true }
 
-# Native (non-wasm) GPU backends + the synchronous adapter/device init the native
-# renderer uses. `pollster::block_on` has no browser equivalent, so it is native-only;
-# the wasm WebGPU init path (the aterm-gpu-web crate) awaits the futures instead.
+# Native (non-wasm) GPU backends. The synchronous adapter/device init the native
+# renderer uses is this crate's own `block_on` (src/block_on.rs) — blocking has no
+# browser equivalent, so it is native-only; the wasm WebGPU init path (the
+# aterm-gpu-web crate) awaits the futures instead.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-pollster = "0.3"
 wgpu = { version = "29", default-features = false, features = ["metal", "vulkan", "dx12", "gles", "wgsl"] }
 
 # wasm32: the WebGL2 backend (wgpu's `webgl` feature targets

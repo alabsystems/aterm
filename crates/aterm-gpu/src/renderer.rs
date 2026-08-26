@@ -1733,7 +1733,7 @@ pub struct GpuSurface {
     /// can toggle HDR without changing window size or guaranteeing an
     /// Outdated/Lost acquire, so bounded present-time probing cannot rely on
     /// `Surface::configure` being called first.
-    last_hdr_probe: Option<web_time::Instant>,
+    last_hdr_probe: Option<aterm_time::Instant>,
     /// M5 true vibrancy: whether this surface offers `CompositeAlphaMode::PostMultiplied`
     /// (the non-opaque composite the translucent present needs). Captured from the
     /// surface caps at attach so [`GpuRenderer::present_input`] can flip the swapchain
@@ -1775,7 +1775,7 @@ impl GpuSurface {
 const HDR_COLOR_SPACE_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[must_use]
-fn hdr_color_space_probe_due(last: Option<web_time::Instant>, now: web_time::Instant) -> bool {
+fn hdr_color_space_probe_due(last: Option<aterm_time::Instant>, now: aterm_time::Instant) -> bool {
     match last {
         None => true,
         Some(last) => now.saturating_duration_since(last) >= HDR_COLOR_SPACE_PROBE_INTERVAL,
@@ -2250,7 +2250,7 @@ pub struct WindowGpu {
     /// window A's in-flight rainbow bloom envelope.
     sdr_glow_level: f32,
     /// Timestamp of this window's last SDR crown smoothing step.
-    sdr_glow_level_at: Option<web_time::Instant>,
+    sdr_glow_level_at: Option<aterm_time::Instant>,
     // The PREVIOUS presented frame's input snapshot, kept RESIDENT across frames
     // (never reallocated in steady state): `encode_present_frame` updates it via
     // `clone_from` (Vec::clone_from reuses the destination's grid allocation when
@@ -2454,7 +2454,7 @@ impl WindowGpu {
         &mut self,
         glow_present: bool,
         target: f32,
-        now: web_time::Instant,
+        now: aterm_time::Instant,
     ) -> f32 {
         if !glow_present {
             self.sdr_glow_level = 0.0;
@@ -2660,33 +2660,16 @@ pub struct GpuRenderer {
     atlas_bgl: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     bg_pipeline: wgpu::RenderPipeline,
-    /// The bg quad shader with ALPHA_BLENDING instead of REPLACE, for the
-    /// TRANSLUCENT cursor fill (`cursor_opacity < 1`): the fill blends OVER the
-    /// rendered cell in linear light (== CPU `blend_rect`), and its alpha
-    /// composites Porter-Duff over the target alpha (== the CPU transmittance
-    /// byte). Never bound at the default opacity, so the opaque path keeps the
-    /// exact historical pipeline.
-    cursor_blend_pipeline: wgpu::RenderPipeline,
     glyph_pipeline: wgpu::RenderPipeline,
     color_glyph_pipeline: wgpu::RenderPipeline,
-    /// PREMULTIPLIED ADDITIVE pipeline for the LUMEN cursor aurora (One/One).
-    glow_add_pipeline: wgpu::RenderPipeline,
-    /// PHOSPHOR rain bright-head halos: the glow-add pipeline's radial twin
-    /// (`vs_rain_glow`/`fs_rain_glow`, `RainGlowInstance` layout, same One/One
-    /// blend + additive target) — the only stream with an elliptical falloff.
-    rain_glow_pipeline: wgpu::RenderPipeline,
-    /// `HaloMode::Over` radial VEILS (light-theme smoke/steam): the rain-glow
-    /// pipeline with the deco source-over blend state (ALPHA_BLENDING) on the
-    /// SAME additive target — `fs_rain_glow_over` emits the straight colour
-    /// with the integer falloff weight as alpha, so the fixed-function
-    /// source-over is byte-exact with the CPU `over_rgb` on native.
-    rain_glow_over_pipeline: wgpu::RenderPipeline,
-    /// EMBERFORGE FirePatch pipelines (see `build_cell_pipelines`): the
-    /// per-pixel fire-field pair on the additive Unorm view — `fire_add`
-    /// One/One (`fs_fire_add` == CPU `add_sat(fire_field_add)`), `fire_over`
-    /// deco source-over (`fs_fire_over` == CPU `over_rgb(fire_field_over)`).
-    fire_add_pipeline: wgpu::RenderPipeline,
-    fire_over_pipeline: wgpu::RenderPipeline,
+    /// THE NINE EFFECT-ONLY CELL PIPELINES, built the first frame that binds
+    /// one and not a moment sooner. The translucent-cursor fill, the LUMEN
+    /// aurora/nova, the PHOSPHOR rain halos and their `HaloMode::Over` veils,
+    /// the EMBERFORGE fire-field pair, the sparkle-word deco pair, and the
+    /// shared sprite pipeline all live here. See [`EffectPipelines`] for why
+    /// (136.13 ms of every launch) and for the stream-keyed gate that keeps a
+    /// runtime toggle working.
+    effects: EffectPipelines,
     /// GPU-only cursor-comet BLOOM: the additive composite pipeline + its
     /// bind-group layout, a LINEAR sampler for the half-res upsample, and the
     /// tunables uniform. See [`build_bloom_resources`].
@@ -2736,16 +2719,9 @@ pub struct GpuRenderer {
     /// background's luma into the per-present budget by
     /// `aterm_render::hdr::sdr_glow_budget` (proven bounded ≤ 0.35).
     sdr_glow_boost: f32,
-    /// Sparkle-word feline paw: textured coverage, ALPHA_BLENDING (== CPU `blend`).
-    deco_over_pipeline: wgpu::RenderPipeline,
-    /// Sparkle-word profanity sparkle: textured coverage, One/One premultiplied
-    /// additive (== CPU `add_sat`).
-    deco_add_pipeline: wgpu::RenderPipeline,
     /// The sparkle-word sprite coverage atlas (R8), rebuilt when the cell size
     /// changes. `None` until the first frame that carries decorations.
     deco_atlas: Option<DecoAtlas>,
-    /// Shared RGBA8 sprite pipeline used by rain, cats, and free sprites.
-    sprite_over_pipeline: wgpu::RenderPipeline,
     /// The uploaded RGBA8 peeking-CAT atlas (Sparkle Words v2 `cat_quads`) +
     /// bind group, version-cached so it re-uploads only when the host
     /// `CatBaker` bumps `SceneAtlas::version`. Bound with the NEAREST
@@ -2789,7 +2765,7 @@ pub struct GpuRenderer {
     /// The shimmer's wall-clock origin: `phase = (now - epoch) % 100 s`. The
     /// deliberate present-time wall-clock term of this pass — the documented
     /// bloom-class exception, exactly like the SDR crown's attack envelope.
-    shimmer_epoch: web_time::Instant,
+    shimmer_epoch: aterm_time::Instant,
     /// Test pin for the phase ([`GpuRenderer::set_shimmer_phase_for_test`]):
     /// `Some` replaces the wall clock so readbacks/arms are deterministic.
     shimmer_phase_pin: Option<f32>,
@@ -3889,67 +3865,78 @@ struct ShimmerRegion {
     heat: [f32; SHIMMER_BANDS],
 }
 
-/// Build the six offscreen render pipelines that draw into the `Rgba8Unorm`
-/// framebuffer: the per-cell background fill, the linear-light coverage-blended
-/// mono-glyph pass, the straight-RGBA colour-emoji pass, the LUMEN additive glow
-/// (One/One), and the sparkle-word `deco_over` (alpha) + `deco_add` (additive)
-/// decoration passes. Extracted from [`GpuRenderer::new_with_family`] verbatim. The
-/// bg/glow pipelines bind only the uniforms; the glyph/colour/deco pipelines also
-/// bind the atlas. Base over/replace pipelines target the sRGB view when `srgb`
-/// (downlevel/GLES falls back to the plain Unorm view — see header); the additive
-/// pipelines always target the plain Unorm view.
-/// The 12 per-cell-stream pipelines [`build_cell_pipelines`] returns, in
-/// declaration order: bg, cursor_blend, glyph, color_glyph, glow_add,
-/// rain_glow, rain_glow_over, fire_add, fire_over, deco_over, deco_add,
-/// and the shared RGBA8 sprite-over pipeline.
+/// The two pipeline layouts every cell pipeline is built against: `bg` binds
+/// only the screen uniforms, `glyph` binds the uniforms AND a glyph/sprite
+/// atlas. Both are RETAINED on the renderer (inside [`EffectPipelines`])
+/// because the nine effect pipelines below are built long after
+/// `from_parts` returns — see that type's docs.
+struct CellLayouts {
+    bg: wgpu::PipelineLayout,
+    glyph: wgpu::PipelineLayout,
+}
+
+fn build_cell_layouts(
+    device: &wgpu::Device,
+    uniform_bgl: &wgpu::BindGroupLayout,
+    atlas_bgl: &wgpu::BindGroupLayout,
+) -> CellLayouts {
+    CellLayouts {
+        bg: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aterm-gpu bg layout"),
+            bind_group_layouts: &[Some(uniform_bgl)],
+            immediate_size: 0,
+        }),
+        glyph: device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("aterm-gpu glyph layout"),
+            bind_group_layouts: &[Some(uniform_bgl), Some(atlas_bgl)],
+            immediate_size: 0,
+        }),
+    }
+}
+
+/// The THREE cell pipelines [`build_cell_pipelines`] returns, in declaration
+/// order: bg, glyph, color_glyph.
 type CellPipelines = (
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
-    wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
     wgpu::RenderPipeline,
 );
 
+/// Build the three offscreen render pipelines EVERY frame draws with: the
+/// per-cell background fill, the linear-light coverage-blended mono-glyph pass,
+/// and the straight-RGBA colour-emoji pass. All three target the sRGB view when
+/// `srgb` (downlevel/GLES falls back to the plain Unorm view — see header).
+///
+/// THE OTHER NINE cell pipelines this function used to build are EFFECT-ONLY —
+/// the cursor aurora, the phosphor-rain halos, the EMBERFORGE fire field, the
+/// sparkle-word decorations, the sprite layer, and the translucent-cursor fill.
+/// They are NOT built here. On this machine (RTX-class dx12) the twelve-pipeline
+/// eager build measured **157.92 ms**, of which **136.13 ms** was those nine —
+/// `fire_add` 57.21 and `fire_over` 53.86 alone are two thirds of it — paid on
+/// EVERY launch for pixels the default config never draws (`cursor_trail =
+/// false`, `hdr_glow = false`). They are built on demand instead: see
+/// [`EffectPipelines`].
 fn build_cell_pipelines(
     device: &wgpu::Device,
     shader: &wgpu::ShaderModule,
-    uniform_bgl: &wgpu::BindGroupLayout,
-    atlas_bgl: &wgpu::BindGroupLayout,
-    // The base bg/glyph/deco-over/cursor passes attach off.view_srgb so fixed-function
-    // ALPHA_BLENDING composites in LINEAR light (== CPU `blend`); the ADDITIVE passes
-    // (glow_add/deco_add, One/One) attach off.view (== CPU `add_sat` on native; linear
-    // on downlevel where off.view is sRGB). Both formats come from the single source
-    // of truth (GpuContext::offscreen_srgb_view_format / offscreen_format) so the
+    layouts: &CellLayouts,
+    // The bg/glyph/colour passes attach off.view_srgb so fixed-function
+    // ALPHA_BLENDING composites in LINEAR light (== CPU `blend`). The format comes
+    // from the single source of truth (GpuContext::offscreen_srgb_view_format) so the
     // pipeline target can never drift from its attachment — see crate::format_plan.
     base_target: wgpu::TextureFormat,
-    additive_target: wgpu::TextureFormat,
 ) -> CellPipelines {
-    let bg_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu bg layout"),
-        bind_group_layouts: &[Some(uniform_bgl)],
-        immediate_size: 0,
-    });
-    let glyph_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("aterm-gpu glyph layout"),
-        bind_group_layouts: &[Some(uniform_bgl), Some(atlas_bgl)],
-        immediate_size: 0,
-    });
+    let bg_layout = &layouts.bg;
+    let glyph_layout = &layouts.glyph;
 
-    // Per-pipeline split (crate::startup_probe): which of the twelve cold
+    // Per-pipeline split (crate::startup_probe): which of the three cold
     // shader-compile pairs actually costs, rather than one lump for all of
     // them. A running mark — the descriptors are 40-line literals and a
     // closure around each would restate every one.
-    let mut pipeline_mark = web_time::Instant::now();
+    let mut pipeline_mark = aterm_time::Instant::now();
     let bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu bg pipeline"),
-        layout: Some(&bg_layout),
+        layout: Some(bg_layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_bg"),
@@ -3978,42 +3965,9 @@ fn build_cell_pipelines(
     });
     pipeline_mark = crate::startup_probe::split_cell_pipeline(0, pipeline_mark);
 
-    // Identical to `bg_pipeline` except the blend state: ALPHA_BLENDING for the
-    // translucent-cursor fill (see the `cursor_blend_pipeline` field doc).
-    let cursor_blend_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu cursor blend pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_bg"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<BgInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &BG_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_bg"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: base_target,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(1, pipeline_mark);
-
     let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu glyph pipeline"),
-        layout: Some(&glyph_layout),
+        layout: Some(glyph_layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_glyph"),
@@ -4041,7 +3995,7 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(2, pipeline_mark);
+    pipeline_mark = crate::startup_probe::split_cell_pipeline(1, pipeline_mark);
 
     // Colour-emoji pipeline: same layout/vertex/blend as the mono glyph
     // pipeline, but the `fs_glyph_color` fragment samples an RGBA8 atlas
@@ -4049,7 +4003,7 @@ fn build_cell_pipelines(
     // filterable float texture, so the layout is identical.
     let color_glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("aterm-gpu colour-glyph pipeline"),
-        layout: Some(&glyph_layout),
+        layout: Some(glyph_layout),
         vertex: wgpu::VertexState {
             module: shader,
             entry_point: Some("vs_glyph"),
@@ -4077,318 +4031,630 @@ fn build_cell_pipelines(
         multiview_mask: None,
         cache: None,
     });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(3, pipeline_mark);
+    // Last split: the returned mark has no successor to close against.
+    let _ = crate::startup_probe::split_cell_pipeline(2, pipeline_mark);
+    (bg_pipeline, glyph_pipeline, color_glyph_pipeline)
+}
 
-    // LUMEN aurora pipeline: PREMULTIPLIED ADDITIVE light. Reuses the bg layout +
-    // `vs_bg`/`fs_bg` + `BG_ATTRS` verbatim (fs_bg already returns the full vec4);
-    // the ONLY difference is the blend = One/One (out = src + dst) and a COLOR
-    // write-mask (RGB only — never perturbs the offscreen alpha the blit relies on).
-    // Over the linear Rgba8Unorm target this is min(255, src+dst) for 8-bit operands,
+/// One of the nine EFFECT-ONLY cell pipelines — the ones a launch with the
+/// shipped defaults never binds. Ordered by [`EFFECT_PIPELINE_NAMES`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(usize)]
+pub enum EffectPipeline {
+    /// The bg quad shader with ALPHA_BLENDING instead of REPLACE, for the
+    /// TRANSLUCENT cursor fill (`cursor_opacity < 1`).
+    CursorBlend = 0,
+    /// PREMULTIPLIED ADDITIVE (One/One) for the LUMEN cursor aurora, the
+    /// supernova, and the EMBERFORGE under-glyph light.
+    GlowAdd = 1,
+    /// PHOSPHOR rain bright-head halos + the glow-halo cursor embers: the
+    /// glow-add pipeline's radial twin.
+    RainGlow = 2,
+    /// `HaloMode::Over` radial VEILS: the rain-glow pipeline with the deco
+    /// source-over blend state.
+    RainGlowOver = 3,
+    /// EMBERFORGE FirePatch, One/One half.
+    FireAdd = 4,
+    /// EMBERFORGE FirePatch, source-over half.
+    FireOver = 5,
+    /// Textured coverage, ALPHA_BLENDING: the sparkle-word paw, the W7 AA
+    /// undercurl, and the EMBERFORGE glyph contrast-halo.
+    DecoOver = 6,
+    /// Textured coverage, One/One premultiplied additive: the sparkle-word
+    /// sparkle.
+    DecoAdd = 7,
+    /// Shared RGBA8 sprite pipeline: wallpaper, rain, cats, free sprites.
+    SpriteOver = 8,
+}
+
+/// How many effect pipelines exist. Kept as a `const` (not `SpriteOver as usize
+/// + 1`) so the array length is visible at its definition.
+pub const EFFECT_PIPELINE_COUNT: usize = 9;
+
+/// Names of the [`EFFECT_PIPELINE_COUNT`] slots, in [`EffectPipeline`] order.
+/// Read by tests and by `effect_pipelines_resident` consumers so nobody has to
+/// duplicate the order.
+pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
+    "cursor_blend",
+    "glow_add",
+    "rain_glow",
+    "rain_glow_over",
+    "fire_add",
+    "fire_over",
+    "deco_over",
+    "deco_add",
+    "sprite_over",
+];
+
+/// Every [`EffectPipeline`], in slot order. The single enumeration a warm-up or
+/// a test walks.
+pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
+    EffectPipeline::CursorBlend,
+    EffectPipeline::GlowAdd,
+    EffectPipeline::RainGlow,
+    EffectPipeline::RainGlowOver,
+    EffectPipeline::FireAdd,
+    EffectPipeline::FireOver,
+    EffectPipeline::DecoOver,
+    EffectPipeline::DecoAdd,
+    EffectPipeline::SpriteOver,
+];
+
+/// THE DEMAND-DRIVEN EFFECT PIPELINE CACHE.
+///
+/// Nine of the twelve cell pipelines only ever draw an EFFECT layer: the cursor
+/// aurora/nova, the phosphor-rain halos, the EMBERFORGE fire field, the
+/// sparkle-word decorations, the sprite layer (wallpaper/pets/rain glyphs), and
+/// the translucent-cursor fill. The shipped Windows defaults draw NONE of them
+/// (`cursor_trail = false`, `hdr_glow = false`), yet building them eagerly in
+/// [`GpuRenderer::from_parts`] cost **136.13 ms of every launch** on this
+/// machine — 36% of the whole GPU cold start (`startup_worker_gpu_build_ms =
+/// 376.26`), and every millisecond of it landed on time-to-first-present
+/// because the backend worker had 224 ms still outstanding at the join.
+///
+/// So they are built the first time a frame actually carries the stream that
+/// binds them ([`GpuRenderer::ensure_effect_pipelines`]), and NOT before.
+///
+/// THE GATE IS THE DRAW STREAM, NEVER THE CONFIG. That is deliberate: a gate
+/// reading "was this effect enabled at startup" is wrong the moment the user
+/// hot-reloads their config, toggles the effect in the Settings UI, opens an
+/// editor that emits an undercurl, or lets a pet wander in. A stream-keyed gate
+/// is right by construction for every one of those, because it asks the only
+/// question that matters — *is there something to draw with this pipeline on
+/// THIS frame* — and it asks it every frame.
+///
+/// THE FIRST FRAME THAT TURNS AN EFFECT ON pays its pipeline's build inline.
+/// Measured cold on this machine: `glow_add` 1.64 ms, `deco_add` 2.06,
+/// `deco_over` 2.72, `sprite_over` 3.26, `cursor_blend` 0.40 — all under a
+/// frame — but `rain_glow`+`rain_glow_over` 17.70 together and
+/// `fire_add`+`fire_over` **111.07** together, which is a visible hitch.
+/// [`GpuRenderer::warm_effect_pipelines`] exists for exactly that: the frontend
+/// calls it off the frame path (on a config reload — the seam where an effect
+/// can be switched on) so the pipelines are resident BEFORE the first frame
+/// that draws them, and the hitch never happens.
+struct EffectPipelines {
+    /// The one WGSL module every cell pipeline compiles from. RETAINED (it used
+    /// to be dropped at the end of `from_parts`) because a pipeline built at
+    /// frame N needs it; costs one parsed naga module, ~1.4 ms already spent.
+    shader: wgpu::ShaderModule,
+    layouts: CellLayouts,
+    /// The base (sRGB-typed) offscreen colour-target format — `deco_over` and
+    /// `sprite_over` and the translucent cursor fill attach it.
+    base_target: wgpu::TextureFormat,
+    /// The additive (plain Unorm) offscreen colour-target format — every
+    /// One/One and the two `HaloMode::Over` veil pipelines attach it.
+    additive_target: wgpu::TextureFormat,
+    built: [Option<wgpu::RenderPipeline>; EFFECT_PIPELINE_COUNT],
+    /// How many effect pipelines this renderer has built since construction,
+    /// and the wall time it spent doing it. A standing instrument, like
+    /// [`crate::startup_probe`]: it is what proves a default launch builds NONE
+    /// of them, and what would catch the gate silently re-eagerising.
+    builds: u32,
+    build_ns: u64,
+}
+
+impl EffectPipelines {
+    fn new(
+        shader: wgpu::ShaderModule,
+        layouts: CellLayouts,
+        base_target: wgpu::TextureFormat,
+        additive_target: wgpu::TextureFormat,
+    ) -> Self {
+        Self {
+            shader,
+            layouts,
+            base_target,
+            additive_target,
+            built: [const { None }; EFFECT_PIPELINE_COUNT],
+            builds: 0,
+            build_ns: 0,
+        }
+    }
+
+    /// Build `which` unless it is already resident. Idempotent.
+    fn ensure(&mut self, device: &wgpu::Device, which: EffectPipeline) {
+        if self.built[which as usize].is_some() {
+            return;
+        }
+        let started = aterm_time::Instant::now();
+        let pipeline = build_effect_pipeline(
+            device,
+            &self.shader,
+            &self.layouts,
+            self.base_target,
+            self.additive_target,
+            which,
+        );
+        let elapsed = started.elapsed();
+        self.build_ns = self
+            .build_ns
+            .saturating_add(u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX));
+        self.builds = self.builds.saturating_add(1);
+        // Also book it PROCESS-globally, where `metrics`/`ctl` can read it: the
+        // per-renderer counters above answer for one renderer, and the standing
+        // proof a launch compiles no effect pipeline has to answer for the launch.
+        crate::startup_probe::record_effect_build(which as usize, elapsed);
+        self.built[which as usize] = Some(pipeline);
+    }
+
+    /// The pipeline for `which`. PANICS if it was never ensured — a draw stream
+    /// that binds a pipeline the frame's ensure pass did not ask for is a
+    /// coverage BUG in [`GpuRenderer::ensure_effect_pipelines`], and failing
+    /// loudly in a test beats drawing nothing in production.
+    fn get(&self, which: EffectPipeline) -> &wgpu::RenderPipeline {
+        self.built[which as usize].as_ref().unwrap_or_else(|| {
+            panic!(
+                "effect pipeline `{}` was bound without being ensured this frame \
+                 — add its stream to GpuRenderer::ensure_effect_pipelines",
+                EFFECT_PIPELINE_NAMES[which as usize]
+            )
+        })
+    }
+
+    /// Which slots are resident, in [`EFFECT_PIPELINE_NAMES`] order.
+    fn resident(&self) -> [bool; EFFECT_PIPELINE_COUNT] {
+        std::array::from_fn(|i| self.built[i].is_some())
+    }
+}
+
+/// Build every effect pipeline THIS frame will bind, and no others.
+///
+/// Called once per `encode_frame`, after the instance streams are complete and
+/// before the first upload. The demand set comes from
+/// [`frame_effect_pipelines`], which reads the very vectors the draw streams
+/// bind — so "did this frame need it" is answered by the same fact that decides
+/// whether the draw happens at all, and cannot drift from it.
+///
+/// A FREE function over disjoint `GpuRenderer` fields rather than a `&mut self`
+/// method: by the time `encode_frame` reaches the demand pass it is already
+/// holding a shared borrow of `self.mono_res` (the glyph atlas the draws bind),
+/// so a whole-`self` mutable borrow will not typecheck. Naming the three fields
+/// it actually touches is both the fix and the honest signature.
+///
+/// The steady state is nine `is_empty` checks and an empty loop body: with the
+/// shipped defaults NO stream in the demand set is ever non-empty, so nothing is
+/// ever built.
+fn ensure_effect_pipelines(
+    effects: &mut EffectPipelines,
+    device: &wgpu::Device,
+    inst: &Instances,
+    input: &RenderInput,
+    cursor_opaque: bool,
+) {
+    let want = frame_effect_pipelines(inst, input, cursor_opaque);
+    for (slot, wanted) in want.iter().enumerate() {
+        if *wanted {
+            effects.ensure(device, EFFECT_PIPELINES[slot]);
+        }
+    }
+}
+
+/// WHICH effect pipelines one frame binds — the demand set
+/// [`ensure_effect_pipelines`] builds from.
+///
+/// Pure and GPU-free on purpose: this is the whole correctness surface of the
+/// lazy build (a stream that draws through a pipeline nobody asked for panics
+/// in [`EffectPipelines::get`]), so it is unit-testable without an adapter.
+///
+/// Each entry is the UNION of the streams that bind that pipeline in
+/// `encode_frame`, in the same order the emit macros bind them. Two entries
+/// look past `Instances` on purpose:
+///
+/// * `CursorBlend` is keyed on the cursor MODE, not on a stream: `encode_frame`
+///   resolves the cursor fill pipeline once per frame above the draw guards, so
+///   a translucent cursor binds it even on a frame that draws no cursor at all.
+///   The opaque default routes the same two streams through `bg_pipeline` and
+///   demands nothing.
+/// * `GlowAdd` also answers for the BLOOM extract pass
+///   (`encode_bloom_halo`), which draws `input.cursor_glow_add` through this
+///   pipeline from its own vertex buffer, OUTSIDE the encode. That stream is
+///   row-gated on the way into `inst.glow_add`, so a glow whose rows are all
+///   clean can reach the bloom while `inst.glow_add` is empty — keying on the
+///   INPUT closes that hole.
+fn frame_effect_pipelines(
+    inst: &Instances,
+    input: &RenderInput,
+    cursor_opaque: bool,
+) -> [bool; EFFECT_PIPELINE_COUNT] {
+    let mut want = [false; EFFECT_PIPELINE_COUNT];
+    // KEYED ON THE CURSOR MODE ALONE, not on the two cursor streams. `encode_frame`
+    // resolves `cursor_fill_pipeline` ONCE per frame, ABOVE the `draw_stream!`
+    // guards — so a translucent cursor materialises this pipeline reference
+    // whether or not either stream has anything in it. Keying on the streams as
+    // well would leave the reference unensured on every translucent frame that
+    // draws no cursor (blink-off, `DECTCEM` hidden, cursor scrolled out of view)
+    // and panic in `EffectPipelines::get`. The demand set must cover what the
+    // frame BINDS, and the bind here is unconditional. Costs one 0.40 ms build,
+    // once, and only for a host that actually set `cursor_opacity < 1` — the
+    // opaque default still compiles nothing.
+    want[EffectPipeline::CursorBlend as usize] = !cursor_opaque;
+    want[EffectPipeline::GlowAdd as usize] = !inst.glow_under.is_empty()
+        || !inst.glow_add.is_empty()
+        || !inst.nova_add.is_empty()
+        || !input.cursor_glow_add.is_empty();
+    want[EffectPipeline::RainGlow as usize] =
+        !inst.glow_halo.is_empty() || !inst.rain_add.is_empty();
+    want[EffectPipeline::RainGlowOver as usize] =
+        !inst.glow_halo_over.is_empty() || !inst.rain_add_over.is_empty();
+    want[EffectPipeline::FireAdd as usize] = !inst.fire_add.is_empty();
+    want[EffectPipeline::FireOver as usize] = !inst.fire_over.is_empty();
+    want[EffectPipeline::DecoOver as usize] =
+        !inst.glyph_halo.is_empty() || !inst.curl.is_empty() || !inst.wdeco_over.is_empty();
+    want[EffectPipeline::DecoAdd as usize] = !inst.wdeco_add.is_empty();
+    want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty()
+        || !inst.rain_under.is_empty()
+        || !inst.cat_over.is_empty()
+        || !inst.free_under.is_empty()
+        || !inst.free_over.is_empty();
+    want
+}
+
+/// Build ONE effect pipeline. Every descriptor below is the verbatim literal
+/// that used to sit inline in `build_cell_pipelines`, comments included — the
+/// only change is WHEN it runs.
+fn build_effect_pipeline(
+    device: &wgpu::Device,
+    shader: &wgpu::ShaderModule,
+    layouts: &CellLayouts,
+    base_target: wgpu::TextureFormat,
+    additive_target: wgpu::TextureFormat,
+    which: EffectPipeline,
+) -> wgpu::RenderPipeline {
+    let bg_layout = &layouts.bg;
+    let glyph_layout = &layouts.glyph;
+    // The One/One premultiplied additive blend shared by the aurora, the rain
+    // halos, the fire-add half, and the sparkle-add: out = src + dst. Over the
+    // linear Rgba8Unorm target this is min(255, src+dst) for 8-bit operands,
     // BIT-IDENTICAL to the CPU `add_sat` — so the dazzle costs nothing in parity.
     let add = wgpu::BlendComponent {
         src_factor: wgpu::BlendFactor::One,
         dst_factor: wgpu::BlendFactor::One,
         operation: wgpu::BlendOperation::Add,
     };
-    let glow_add_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu glow additive pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_bg"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<BgInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &BG_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            // Glow is RAW (no sRGB decode): renders into the Unorm view so One/One
-            // add stays byte-exact with the CPU `add_sat` (native); on WebGL2 it
-            // targets the sRGB texture (add in linear) — see additive_target.
-            entry_point: Some("fs_glow"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState {
-                    color: add,
-                    alpha: add,
+    match which {
+        // Identical to `bg_pipeline` except the blend state: ALPHA_BLENDING for the
+        // translucent-cursor fill (see the `CursorBlend` field doc). The fill blends
+        // OVER the rendered cell in linear light (== CPU `blend_rect`), and its alpha
+        // composites Porter-Duff over the target alpha (== the CPU transmittance
+        // byte). Never bound at the default opacity, so the opaque path keeps the
+        // exact historical pipeline.
+        EffectPipeline::CursorBlend => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu cursor blend pipeline"),
+                layout: Some(bg_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_bg"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<BgInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &BG_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_bg"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: base_target,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                 }),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+        // LUMEN aurora pipeline: PREMULTIPLIED ADDITIVE light. Reuses the bg layout +
+        // `vs_bg`/`fs_bg` + `BG_ATTRS` verbatim (fs_bg already returns the full vec4);
+        // the ONLY difference is the blend = One/One (out = src + dst) and a COLOR
+        // write-mask (RGB only — never perturbs the offscreen alpha the blit relies on).
+        EffectPipeline::GlowAdd => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("aterm-gpu glow additive pipeline"),
+            layout: Some(bg_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_bg"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<BgInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &BG_ATTRS,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                // Glow is RAW (no sRGB decode): renders into the Unorm view so One/One
+                // add stays byte-exact with the CPU `add_sat` (native); on WebGL2 it
+                // targets the sRGB texture (add in linear) — see additive_target.
+                entry_point: Some("fs_glow"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: additive_target,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
         }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(4, pipeline_mark);
-
-    // PHOSPHOR rain halo pipeline: the glow-add twin with the radial falloff
-    // shaders + `RainGlowInstance` layout. Same `bg_layout`, One/One blend, and
-    // additive target, so byte-parity with `fs_glow` holds wherever the flat
-    // aurora does — only the per-pixel weight differs.
-    let rain_glow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu rain halo pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_rain_glow"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<RainGlowInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &RAIN_GLOW_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_rain_glow"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState {
-                    color: add,
-                    alpha: add,
+        // PHOSPHOR rain halo pipeline: the glow-add twin with the radial falloff
+        // shaders + `RainGlowInstance` layout. Same `bg_layout`, One/One blend, and
+        // additive target, so byte-parity with `fs_glow` holds wherever the flat
+        // aurora does — only the per-pixel weight differs.
+        EffectPipeline::RainGlow => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu rain halo pipeline"),
+                layout: Some(bg_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_rain_glow"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RainGlowInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &RAIN_GLOW_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_rain_glow"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: additive_target,
+                        blend: Some(wgpu::BlendState {
+                            color: add,
+                            alpha: add,
+                        }),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
                 }),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(5, pipeline_mark);
-
-    // HaloMode::Over radial-veil pipeline: the rain-glow pipeline with the deco
-    // source-over blend state (wgpu::BlendState::ALPHA_BLENDING — the SAME state
-    // `deco_over` proves against the CPU) swapped in, on the SAME additive
-    // (Unorm) target with the COLOR write-mask. `fs_rain_glow_over` computes the
-    // identical integer falloff weight and emits (straight rgb, wt/255), so the
-    // fixed-function `src·a + dst·(1−a)` rounds to the CPU `over_rgb` byte on
-    // native — light-theme smoke/steam veils, byte-exact like the adds.
-    let rain_glow_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu rain halo over pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_rain_glow"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<RainGlowInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &RAIN_GLOW_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_rain_glow_over"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(6, pipeline_mark);
-
-    // EMBERFORGE FirePatch pipelines: the per-pixel fire-field pair. Both run
-    // `vs_fire` over the `FireInstance` layout on the SAME additive (Unorm)
-    // target with the COLOR write-mask; they differ only in fragment + blend:
-    // `fs_fire_add` is One/One premultiplied light (== CPU `add_sat` of
-    // `fire_field_add`, the aurora contract) and `fs_fire_over` is the deco
-    // source-over blend state (== CPU `over_rgb` of `fire_field_over`, the
-    // rain_glow_over contract) — byte-exact wherever the One/One adds are.
-    let fire_add_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu fire add pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_fire"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<FireInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &FIRE_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_fire_add"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState {
-                    color: add,
-                    alpha: add,
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+        // HaloMode::Over radial-veil pipeline: the rain-glow pipeline with the deco
+        // source-over blend state (wgpu::BlendState::ALPHA_BLENDING — the SAME state
+        // `deco_over` proves against the CPU) swapped in, on the SAME additive
+        // (Unorm) target with the COLOR write-mask. `fs_rain_glow_over` computes the
+        // identical integer falloff weight and emits (straight rgb, wt/255), so the
+        // fixed-function `src·a + dst·(1−a)` rounds to the CPU `over_rgb` byte on
+        // native — light-theme smoke/steam veils, byte-exact like the adds.
+        EffectPipeline::RainGlowOver => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu rain halo over pipeline"),
+                layout: Some(bg_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_rain_glow"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<RainGlowInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &RAIN_GLOW_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_rain_glow_over"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: additive_target,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
                 }),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+        // EMBERFORGE FirePatch pipelines: the per-pixel fire-field pair. Both run
+        // `vs_fire` over the `FireInstance` layout on the SAME additive (Unorm)
+        // target with the COLOR write-mask; they differ only in fragment + blend:
+        // `fs_fire_add` is One/One premultiplied light (== CPU `add_sat` of
+        // `fire_field_add`, the aurora contract) and `fs_fire_over` is the deco
+        // source-over blend state (== CPU `over_rgb` of `fire_field_over`, the
+        // rain_glow_over contract) — byte-exact wherever the One/One adds are.
+        EffectPipeline::FireAdd => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("aterm-gpu fire add pipeline"),
+            layout: Some(bg_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_fire"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<FireInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &FIRE_ATTRS,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_fire_add"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: additive_target,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
         }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(7, pipeline_mark);
-    let fire_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu fire over pipeline"),
-        layout: Some(&bg_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_fire"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<FireInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &FIRE_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_fire_over"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(8, pipeline_mark);
-
-    // Sparkle-word decoration pipelines: both reuse the glyph layout + `vs_glyph`
-    // + `GLYPH_ATTRS` (textured quad sampling the deco coverage atlas in group 1),
-    // differing only in fragment shader + blend. `deco_over` is ALPHA_BLENDING
-    // (the feline paw, == CPU `blend`); `deco_add` is One/One premultiplied additive
-    // (the profanity sparkle, == CPU `add_sat`), COLOR write-mask like the aurora.
-    let deco_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu deco-over pipeline"),
-        layout: Some(&glyph_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_glyph"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GlyphInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &GLYPH_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_deco_over"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: base_target,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(9, pipeline_mark);
-    let deco_add_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu deco-add pipeline"),
-        layout: Some(&glyph_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_glyph"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GlyphInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &GLYPH_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_deco_add"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: additive_target,
-                blend: Some(wgpu::BlendState {
-                    color: add,
-                    alpha: add,
+        EffectPipeline::FireOver => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu fire over pipeline"),
+                layout: Some(bg_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_fire"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<FireInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &FIRE_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_fire_over"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: additive_target,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::COLOR,
+                    })],
                 }),
-                write_mask: wgpu::ColorWrites::COLOR,
-            })],
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+        // Sparkle-word decoration pipelines: both reuse the glyph layout + `vs_glyph`
+        // + `GLYPH_ATTRS` (textured quad sampling the deco coverage atlas in group 1),
+        // differing only in fragment shader + blend. `deco_over` is ALPHA_BLENDING
+        // (the feline paw, == CPU `blend`); `deco_add` is One/One premultiplied additive
+        // (the profanity sparkle, == CPU `add_sat`), COLOR write-mask like the aurora.
+        EffectPipeline::DecoOver => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu deco-over pipeline"),
+                layout: Some(glyph_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_glyph"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GlyphInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &GLYPH_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_deco_over"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: base_target,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+        EffectPipeline::DecoAdd => device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("aterm-gpu deco-add pipeline"),
+            layout: Some(glyph_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs_glyph"),
+                compilation_options: Default::default(),
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<GlyphInstance>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &GLYPH_ATTRS,
+                }],
+            },
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs_deco_add"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: additive_target,
+                    blend: Some(wgpu::BlendState {
+                        color: add,
+                        alpha: add,
+                    }),
+                    write_mask: wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            multiview_mask: None,
+            cache: None,
         }),
-        multiview_mask: None,
-        cache: None,
-    });
-    pipeline_mark = crate::startup_probe::split_cell_pipeline(10, pipeline_mark);
-
-    // Shared RGBA8 sprite pipeline for rain, cats, and free sprites.
-    let sprite_over_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("aterm-gpu scene-over pipeline"),
-        layout: Some(&glyph_layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs_glyph"),
-            compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
-                array_stride: std::mem::size_of::<GlyphInstance>() as u64,
-                step_mode: wgpu::VertexStepMode::Instance,
-                attributes: &GLYPH_ATTRS,
-            }],
-        },
-        primitive: wgpu::PrimitiveState::default(),
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs_sprite_over"),
-            compilation_options: Default::default(),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: base_target,
-                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-        }),
-        multiview_mask: None,
-        cache: None,
-    });
-    // Last split: the returned mark has no successor to close against.
-    let _ = crate::startup_probe::split_cell_pipeline(11, pipeline_mark);
-    (
-        bg_pipeline,
-        cursor_blend_pipeline,
-        glyph_pipeline,
-        color_glyph_pipeline,
-        glow_add_pipeline,
-        rain_glow_pipeline,
-        rain_glow_over_pipeline,
-        fire_add_pipeline,
-        fire_over_pipeline,
-        deco_over_pipeline,
-        deco_add_pipeline,
-        sprite_over_pipeline,
-    )
+        // Shared RGBA8 sprite pipeline for rain, cats, and free sprites.
+        EffectPipeline::SpriteOver => {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("aterm-gpu scene-over pipeline"),
+                layout: Some(glyph_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_glyph"),
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<GlyphInstance>() as u64,
+                        step_mode: wgpu::VertexStepMode::Instance,
+                        attributes: &GLYPH_ATTRS,
+                    }],
+                },
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_sprite_over"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: base_target,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        }
+    }
 }
 
 /// Build the format-independent application-present blit infrastructure: the blit shader,
@@ -4555,7 +4821,7 @@ impl GpuRenderer {
     /// Acquire a GPU and a CPU font face. `px`/`theme` must match the CPU
     /// renderer you want to reproduce.
     ///
-    /// NATIVE ONLY: uses `pollster::block_on` (GPU init) + `std::thread::spawn`
+    /// NATIVE ONLY: uses the crate's own `block_on` (GPU init) + `std::thread::spawn`
     /// (font load) + system font discovery, none of which exist on the browser
     /// wasm target. The wasm path builds a [`GpuContext`] asynchronously and a CPU
     /// [`Renderer`] from injected font bytes, then assembles the renderer via
@@ -4585,7 +4851,7 @@ impl GpuRenderer {
         // the font leg did not fit underneath GPU init.
         let family_owned = family.map(String::from);
         let font_handle = std::thread::spawn(move || {
-            let font_started = web_time::Instant::now();
+            let font_started = aterm_time::Instant::now();
             // Warm the printable-ASCII glyph cache here (still off the critical path,
             // overlapping GPU init) so the first frame's atlas build doesn't
             // rasterize them on the hot path. Byte-identical output (cache fill only).
@@ -4602,7 +4868,7 @@ impl GpuRenderer {
             cpu
         });
         let ctx = GpuContext::new()?;
-        let font_join_started = web_time::Instant::now();
+        let font_join_started = aterm_time::Instant::now();
         let cpu = font_handle
             .join()
             .map_err(|_| "font-load thread panicked".to_string())?
@@ -4628,12 +4894,18 @@ impl GpuRenderer {
     ) -> Result<Self, String> {
         let device = &ctx.device;
         // PIPELINE CONSTRUCTION, timed in groups (crate::startup_probe). This
-        // function builds thirteen render pipelines — 26 shader compiles on
-        // Metal — and was the largest un-sized guess inside the frontend's
-        // `backend_finalize` phase. `PipeTotal` is this whole function; the
-        // groups below partition it, and `build_cell_pipelines` splits its
-        // twelve further, one slot each.
-        let from_parts_started = web_time::Instant::now();
+        // function builds FOUR render pipelines — the three cell pipelines every
+        // frame binds plus the bloom composite — and was the largest un-sized
+        // guess inside the frontend's `backend_finalize` phase. `PipeTotal` is
+        // this whole function; the groups below partition it, and
+        // `build_cell_pipelines` splits its three further, one slot each.
+        //
+        // It used to build THIRTEEN, and nine of those only ever drew an effect
+        // the shipped defaults switch off: 136.13 ms of every launch (measured,
+        // dx12/Windows) spent on `fire_add`/`fire_over`/`rain_glow`/… for pixels
+        // that were never drawn. Those nine moved into `EffectPipelines` below,
+        // demand-driven off the first frame that binds them.
+        let from_parts_started = aterm_time::Instant::now();
 
         let shader = crate::startup_probe::timed(crate::startup_probe::Leg::PipeShader, || {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -4642,7 +4914,7 @@ impl GpuRenderer {
             })
         });
 
-        let uniform_atlas_started = web_time::Instant::now();
+        let uniform_atlas_started = aterm_time::Instant::now();
         let (uniform_buf, uniform_bgl, uniform_bg) = build_uniform_resources(device);
         let (atlas_bgl, sampler) = build_atlas_resources(device);
         crate::startup_probe::record(
@@ -4655,29 +4927,16 @@ impl GpuRenderer {
         // off.view. A pipeline and its attachment can no longer drift apart (C1/C2).
         let base_target = ctx.offscreen_srgb_view_format();
         let additive_target = ctx.offscreen_format();
-        let (
-            bg_pipeline,
-            cursor_blend_pipeline,
-            glyph_pipeline,
-            color_glyph_pipeline,
-            glow_add_pipeline,
-            rain_glow_pipeline,
-            rain_glow_over_pipeline,
-            fire_add_pipeline,
-            fire_over_pipeline,
-            deco_over_pipeline,
-            deco_add_pipeline,
-            sprite_over_pipeline,
-        ) = crate::startup_probe::timed(crate::startup_probe::Leg::PipeCell, || {
-            build_cell_pipelines(
-                device,
-                &shader,
-                &uniform_bgl,
-                &atlas_bgl,
-                base_target,
-                additive_target,
-            )
-        });
+        let cell_layouts = build_cell_layouts(device, &uniform_bgl, &atlas_bgl);
+        let (bg_pipeline, glyph_pipeline, color_glyph_pipeline) =
+            crate::startup_probe::timed(crate::startup_probe::Leg::PipeCell, || {
+                build_cell_pipelines(device, &shader, &cell_layouts, base_target)
+            });
+        // The nine effect pipelines are NOT built here — only the material they
+        // will need (the shader module, the two pipeline layouts, and the two
+        // target formats) is retained. Nothing is compiled until a frame binds
+        // one.
+        let effects = EffectPipelines::new(shader, cell_layouts, base_target, additive_target);
 
         let (blit_shader, blit_bgl, blit_layout, blit_sampler, blit_uniform_buf) =
             crate::startup_probe::timed(crate::startup_probe::Leg::PipeBlit, || {
@@ -4695,11 +4954,12 @@ impl GpuRenderer {
                 build_bloom_resources(device, ctx.offscreen_format())
             });
 
-        let vbufs = crate::startup_probe::timed(crate::startup_probe::Leg::PipeVertexBuffers, || {
-            VertexBuffers::new(device)
-        });
+        let vbufs =
+            crate::startup_probe::timed(crate::startup_probe::Leg::PipeVertexBuffers, || {
+                VertexBuffers::new(device)
+            });
 
-        let pipe_tail_started = web_time::Instant::now();
+        let pipe_tail_started = aterm_time::Instant::now();
         let renderer = Self {
             ctx,
             cpu,
@@ -4711,14 +4971,9 @@ impl GpuRenderer {
             atlas_bgl,
             sampler,
             bg_pipeline,
-            cursor_blend_pipeline,
             glyph_pipeline,
             color_glyph_pipeline,
-            glow_add_pipeline,
-            rain_glow_pipeline,
-            rain_glow_over_pipeline,
-            fire_add_pipeline,
-            fire_over_pipeline,
+            effects,
             bloom_bgl,
             bloom_sampler,
             bloom_pipeline,
@@ -4732,10 +4987,7 @@ impl GpuRenderer {
             glow_boost_bgl: None,
             sdr_glow_pipeline: None,
             sdr_glow_boost: 0.0,
-            deco_over_pipeline,
-            deco_add_pipeline,
             deco_atlas: None,
-            sprite_over_pipeline,
             cat_atlas: None,
             free_atlas: None,
             wallpaper_tex: None,
@@ -4744,7 +4996,7 @@ impl GpuRenderer {
             bloom_radius: BLOOM_RADIUS,
             shimmer: None,
             enable_shimmer: true,
-            shimmer_epoch: web_time::Instant::now(),
+            shimmer_epoch: aterm_time::Instant::now(),
             shimmer_phase_pin: None,
             blit_shader,
             blit_bgl,
@@ -6060,8 +6312,7 @@ impl GpuRenderer {
                 // taller than its cell footprint (the lip above the grid). Same
                 // term as the CPU `blit_image_cell` footprint, so the decode
                 // cache keys and the sampled bytes stay byte-identical.
-                let fp_h =
-                    image.image.rows as usize * ch + usize::from(image.image.band_lift_px);
+                let fp_h = image.image.rows as usize * ch + usize::from(image.image.band_lift_px);
                 if fp_w == 0 || fp_h == 0 {
                     continue;
                 }
@@ -6927,7 +7178,7 @@ impl GpuRenderer {
                         config,
                         sdr_format,
                         supports_f16: true,
-                        last_hdr_probe: Some(web_time::Instant::now()),
+                        last_hdr_probe: Some(aterm_time::Instant::now()),
                         post_mult,
                         pre_mult,
                         copyable,
@@ -7010,7 +7261,7 @@ impl GpuRenderer {
             config,
             sdr_format: format,
             supports_f16: caps.formats.contains(&wgpu::TextureFormat::Rgba16Float),
-            last_hdr_probe: Some(web_time::Instant::now()),
+            last_hdr_probe: Some(aterm_time::Instant::now()),
             post_mult,
             pre_mult,
             copyable,
@@ -7062,9 +7313,9 @@ impl GpuRenderer {
             // The wgpu-core pop future is already resolved; `block_on` just
             // unwraps it (no GPU round trip, no event-loop dependency). All
             // three pops ALWAYS run — the stack must be left empty.
-            let validation = pollster::block_on(validation.pop());
-            let internal = pollster::block_on(internal.pop());
-            let oom = pollster::block_on(oom.pop());
+            let validation = crate::block_on::block_on(validation.pop());
+            let internal = crate::block_on::block_on(internal.pop());
+            let oom = crate::block_on::block_on(oom.pop());
             return match validation.or(internal).or(oom) {
                 None => Ok(()),
                 Some(err) => Err(format!(
@@ -7436,7 +7687,7 @@ impl GpuRenderer {
             was_hdr,
             scrgb_retagged,
             reason,
-            web_time::Instant::now(),
+            aterm_time::Instant::now(),
         );
     }
 
@@ -7450,7 +7701,7 @@ impl GpuRenderer {
         was_hdr: bool,
         scrgb_retagged: bool,
         reason: &'static str,
-        validated_at: web_time::Instant,
+        validated_at: aterm_time::Instant,
     ) {
         let plan = crate::format_plan::hdr_reconfigure_plan(was_hdr, scrgb_retagged);
         if plan == crate::format_plan::HdrReconfigurePlan::FallbackToSdr {
@@ -7493,7 +7744,7 @@ impl GpuRenderer {
         if !surf.is_hdr() && !(self.hdr_glow && surf.supports_f16) {
             return;
         }
-        let now = web_time::Instant::now();
+        let now = aterm_time::Instant::now();
         if !hdr_color_space_probe_due(surf.last_hdr_probe, now) {
             return;
         }
@@ -7747,7 +7998,7 @@ impl GpuRenderer {
         // `redraw_total - compose - raster_submit`, contaminated by the post-present
         // tail. A blocking `nextDrawable` here is what queues keyDowns in the OS
         // event queue; measure it directly.
-        let acquire_started = web_time::Instant::now();
+        let acquire_started = aterm_time::Instant::now();
         let frame = match surf.surface.get_current_texture() {
             C::Success(f) | C::Suboptimal(f) => f,
             C::Outdated | C::Lost => {
@@ -7765,7 +8016,7 @@ impl GpuRenderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let work_started = web_time::Instant::now();
+        let work_started = aterm_time::Instant::now();
         self.present_to_view(
             win,
             input,
@@ -8070,7 +8321,7 @@ impl GpuRenderer {
         let sdr_budget = win.advance_sdr_glow_budget(
             glow_present,
             sdr_budget_target,
-            web_time::Instant::now(),
+            aterm_time::Instant::now(),
         );
         let run_sdr_glow = crate::format_plan::sdr_boost_pass(
             format == wgpu::TextureFormat::Rgba16Float,
@@ -8484,7 +8735,7 @@ impl GpuRenderer {
         // A fresh per-present view of the persistent texture — exactly how the
         // swapchain arm views its acquired frame.
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let work_started = web_time::Instant::now();
+        let work_started = aterm_time::Instant::now();
         self.present_to_view(
             win,
             input,
@@ -8530,6 +8781,42 @@ impl GpuRenderer {
             view_formats: &[],
         });
         VirtualTarget { tex, w, h }
+    }
+
+    /// Build EVERY effect pipeline that is not resident yet, off the frame path.
+    ///
+    /// The frontend calls this from the config-apply seam — the one moment an
+    /// effect can be switched on that is NOT a frame — so that the first frame
+    /// which actually draws the newly-enabled effect finds its pipeline already
+    /// built. Without it, turning EMBERFORGE fire on would compile
+    /// `fire_add` + `fire_over` inline on that frame: **111.07 ms** measured
+    /// cold on dx12/Windows, a hitch the eye sees. With it, that cost is paid
+    /// where a config reload already costs a beat and nothing is animating.
+    ///
+    /// NOT called on the launch path, and deliberately so: a launch that never
+    /// touches config never builds a single effect pipeline, which is the whole
+    /// point of [`EffectPipelines`]. Idempotent — the second call is nine
+    /// `is_some` checks.
+    ///
+    /// Correctness never depends on this being called: [`Self::encode_frame`]
+    /// ensures whatever the frame binds regardless. This only decides WHEN.
+    pub fn warm_effect_pipelines(&mut self) {
+        for which in EFFECT_PIPELINES {
+            self.effects.ensure(&self.ctx.device, which);
+        }
+    }
+
+    /// Which effect pipelines this renderer has actually built, in
+    /// [`EFFECT_PIPELINE_NAMES`] order. The standing instrument that proves a
+    /// default launch builds none of them.
+    pub fn effect_pipelines_resident(&self) -> [bool; EFFECT_PIPELINE_COUNT] {
+        self.effects.resident()
+    }
+
+    /// `(count, nanoseconds)` this renderer has spent building effect
+    /// pipelines since construction.
+    pub fn effect_pipeline_build_cost(&self) -> (u32, u64) {
+        (self.effects.builds, self.effects.build_ns)
     }
 
     /// Build + cache the EDR aurora pass resources (M3 phase B) if absent: a
@@ -9057,7 +9344,7 @@ impl GpuRenderer {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            pass.set_pipeline(&self.glow_add_pipeline);
+            pass.set_pipeline(self.effects.get(EffectPipeline::GlowAdd));
             pass.set_bind_group(0, &self.uniform_bg, &[]);
             pass.set_vertex_buffer(0, self.vbufs.bloom_glow.buf.slice(..));
             // The EXTRACT set: the half-res-stable copy when thin quads forced
@@ -9210,6 +9497,15 @@ impl GpuRenderer {
         } else {
             (0, None, 0)
         };
+        // The extract pass binds `GlowAdd` from its OWN vertex buffer, outside
+        // `encode_frame`'s demand pass. `frame_effect_pipelines` keys that slot
+        // on `input.cursor_glow_add` for exactly this reason, and the encode
+        // always runs first — but a belt on the brace costs nine bytes of
+        // comparison and removes the ordering assumption entirely.
+        if glow_count > 0 {
+            self.effects
+                .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
+        }
         let shimmer_region = if self.shimmer_live(input) {
             self.shimmer_region(input, w, h)
         } else {
@@ -9319,6 +9615,10 @@ impl GpuRenderer {
         if glow_count == 0 {
             return glow_count;
         }
+        // See `compose_present_offscreen`: the extract pass binds `GlowAdd`
+        // from its own buffer, outside the encode's demand pass.
+        self.effects
+            .ensure(&self.ctx.device, EffectPipeline::GlowAdd);
         let mut enc = self
             .ctx
             .device
@@ -11713,7 +12013,11 @@ impl GpuRenderer {
         // backdrop margins are live (the strips are pure padding — no cells),
         // else the historical theme_bg (which already carries the M5 glass
         // alpha where that applies).
-        let strip_bg = if backdrop_margins_on { margin_bg } else { theme_bg };
+        let strip_bg = if backdrop_margins_on {
+            margin_bg
+        } else {
+            theme_bg
+        };
         // The selection colours for THIS frame, resolved through the CPU face's
         // `SelectionPalette` — ONE function applies the policy for both
         // backends. Terminal-owned OSC 17/19/21 state wins over the static
@@ -13611,6 +13915,18 @@ impl GpuRenderer {
                 });
             }
         }
+        // EFFECT PIPELINES for THIS frame, built now if this is the first frame
+        // that needs them. The instance streams are complete at this point (the
+        // uploads below read exactly the same vectors), so the demand set is
+        // exact — see `frame_effect_pipelines`. A frame with no effects on it
+        // builds nothing, which for the shipped defaults is every frame.
+        ensure_effect_pipelines(
+            &mut self.effects,
+            &self.ctx.device,
+            &self.inst,
+            input,
+            cursor_opaque,
+        );
         // Cat/free/rain atlas bind groups for the draws below (None when absent this
         // frame; the corresponding streams are then empty, so the draw_stream gate
         // skips them).
@@ -14073,7 +14389,7 @@ impl GpuRenderer {
                     wallpaper_buf,
                     self.inst.wallpaper,
                     Pipe::Wallpaper,
-                    &self.sprite_over_pipeline,
+                    self.effects.get(EffectPipeline::SpriteOver),
                     wallpaper_bind.map(|b| (Atlas::Wallpaper, b))
                 );
                 // bg / under-text sprites — all OVER or REPLACE, composited in
@@ -14126,7 +14442,7 @@ impl GpuRenderer {
                     rain_under_buf,
                     self.inst.rain_under,
                     Pipe::RainUnder,
-                    &self.sprite_over_pipeline,
+                    self.effects.get(EffectPipeline::SpriteOver),
                     rain_bind.map(|b| (Atlas::Rain, b))
                 );
                 // Peeking-CAT sprites in the same under-text slot (the CPU stamps
@@ -14140,7 +14456,7 @@ impl GpuRenderer {
                     cat_over_buf,
                     self.inst.cat_over,
                     Pipe::CatOver,
-                    &self.sprite_over_pipeline,
+                    self.effects.get(EffectPipeline::SpriteOver),
                     cat_bind.map(|b| (Atlas::Cat, b))
                 );
                 // FREE-floating UNDER-TEXT sprites, right after cat_over and
@@ -14154,7 +14470,7 @@ impl GpuRenderer {
                     free_under_buf,
                     self.inst.free_under,
                     Pipe::FreeUnder,
-                    &self.sprite_over_pipeline,
+                    self.effects.get(EffectPipeline::SpriteOver),
                     free_bind.map(|b| (Atlas::Free, b))
                 );
                 // Comet EMBER BED (cursor motion trail): pre-blended solid
@@ -14188,7 +14504,7 @@ impl GpuRenderer {
                     glow_under_buf,
                     self.inst.glow_under,
                     Pipe::GlowAdd,
-                    &self.glow_add_pipeline,
+                    self.effects.get(EffectPipeline::GlowAdd),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // EMBERFORGE per-pixel FIRE FIELD: the full-art flame body in
@@ -14205,7 +14521,7 @@ impl GpuRenderer {
                     fire_add_buf,
                     self.inst.fire_add,
                     Pipe::FireAdd,
-                    &self.fire_add_pipeline,
+                    self.effects.get(EffectPipeline::FireAdd),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 draw_stream!(
@@ -14215,7 +14531,7 @@ impl GpuRenderer {
                     fire_over_buf,
                     self.inst.fire_over,
                     Pipe::FireOver,
-                    &self.fire_over_pipeline,
+                    self.effects.get(EffectPipeline::FireOver),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
             };
@@ -14255,7 +14571,7 @@ impl GpuRenderer {
                     glyph_halo_buf,
                     self.inst.glyph_halo,
                     Pipe::DecoOver,
-                    &self.deco_over_pipeline,
+                    self.effects.get(EffectPipeline::DecoOver),
                     Some((Atlas::Mono, atlas_bind))
                 );
                 // glyph / colour-emoji / z>=0 inline-image / line-deco /
@@ -14316,7 +14632,7 @@ impl GpuRenderer {
                         curl_buf,
                         self.inst.curl,
                         Pipe::DecoOver,
-                        &self.deco_over_pipeline,
+                        self.effects.get(EffectPipeline::DecoOver),
                         Some((Atlas::Deco, db))
                     );
                 }
@@ -14340,7 +14656,7 @@ impl GpuRenderer {
                     glow_add_buf,
                     self.inst.glow_add,
                     Pipe::GlowAdd,
-                    &self.glow_add_pipeline,
+                    self.effects.get(EffectPipeline::GlowAdd),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // GLOW-HALO cursor-effect radial light: right AFTER the aurora
@@ -14353,7 +14669,7 @@ impl GpuRenderer {
                     glow_halo_buf,
                     self.inst.glow_halo,
                     Pipe::RainGlow,
-                    &self.rain_glow_pipeline,
+                    self.effects.get(EffectPipeline::RainGlow),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // GLOW-HALO `HaloMode::Over` veils: the Over half of the
@@ -14368,7 +14684,7 @@ impl GpuRenderer {
                     glow_halo_over_buf,
                     self.inst.glow_halo_over,
                     Pipe::RainGlowOver,
-                    &self.rain_glow_over_pipeline,
+                    self.effects.get(EffectPipeline::RainGlowOver),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // SUPERNOVA additive light: the second One/One stream, right
@@ -14382,7 +14698,7 @@ impl GpuRenderer {
                     nova_add_buf,
                     self.inst.nova_add,
                     Pipe::GlowAdd,
-                    &self.glow_add_pipeline,
+                    self.effects.get(EffectPipeline::GlowAdd),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // PHOSPHOR rain bright-head halos: the third One/One stream,
@@ -14396,7 +14712,7 @@ impl GpuRenderer {
                     rain_add_buf,
                     self.inst.rain_add,
                     Pipe::RainGlow,
-                    &self.rain_glow_pipeline,
+                    self.effects.get(EffectPipeline::RainGlow),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
                 // PHOSPHOR rain `HaloMode::Over` veils: the Over half of the
@@ -14410,7 +14726,7 @@ impl GpuRenderer {
                     rain_add_over_buf,
                     self.inst.rain_add_over,
                     Pipe::RainGlowOver,
-                    &self.rain_glow_over_pipeline,
+                    self.effects.get(EffectPipeline::RainGlowOver),
                     None::<(Atlas, &wgpu::BindGroup)>
                 );
             };
@@ -14426,7 +14742,7 @@ impl GpuRenderer {
                         wdeco_over_buf,
                         self.inst.wdeco_over,
                         Pipe::DecoOver,
-                        &self.deco_over_pipeline,
+                        self.effects.get(EffectPipeline::DecoOver),
                         Some((Atlas::Deco, db))
                     );
                 }
@@ -14445,7 +14761,7 @@ impl GpuRenderer {
                     free_over_buf,
                     self.inst.free_over,
                     Pipe::FreeOver,
-                    &self.sprite_over_pipeline,
+                    self.effects.get(EffectPipeline::SpriteOver),
                     free_bind.map(|b| (Atlas::Free, b))
                 );
             };
@@ -14461,7 +14777,7 @@ impl GpuRenderer {
                         wdeco_add_buf,
                         self.inst.wdeco_add,
                         Pipe::DecoAdd,
-                        &self.deco_add_pipeline,
+                        self.effects.get(EffectPipeline::DecoAdd),
                         Some((Atlas::Deco, db))
                     );
                 }
@@ -14474,7 +14790,10 @@ impl GpuRenderer {
         let (cursor_fill_pipe, cursor_fill_pipeline) = if cursor_opaque {
             (Pipe::Bg, &self.bg_pipeline)
         } else {
-            (Pipe::CursorBlend, &self.cursor_blend_pipeline)
+            (
+                Pipe::CursorBlend,
+                self.effects.get(EffectPipeline::CursorBlend),
+            )
         };
         macro_rules! emit_cursor {
             ($p:ident, $cp:ident, $ca:ident) => {
@@ -14884,22 +15203,305 @@ mod tests {
     // the array `encode_frame` hands to the coalescer), never a copy: see its doc
     // for the wrong-colour regression a twin would hide.
     use super::{
+        EFFECT_PIPELINE_COUNT, EFFECT_PIPELINE_NAMES, EFFECT_PIPELINES, EffectPipeline,
         FRAME_GROUPS, G_BASE_BG, G_BASE_FG, G_CURSOR, G_FREE_OVER, G_GLOW, G_GLOW_UNDER,
-        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB, WindowGpu,
+        G_WDECO_ADD, G_WDECO_OVER, GROUP_SRGB, Instances, WindowGpu, frame_effect_pipelines,
     };
+
+    // ---------------------------------------------------------------------
+    // THE DEMAND SET (`frame_effect_pipelines`) — the whole correctness
+    // surface of the lazy effect-pipeline build. A slot MISSING from the set
+    // is a panic in `EffectPipelines::get` on the frame that binds it; a slot
+    // WRONGLY in the set is a shader compile the launch was meant to avoid.
+    // Both directions are asserted below, per slot.
+    // ---------------------------------------------------------------------
+
+    /// A stream in `Instances` that binds an effect pipeline, named for the
+    /// assertion messages, with a closure that puts ONE instance in it.
+    struct StreamCase {
+        stream: &'static str,
+        want: EffectPipeline,
+        fill: fn(&mut Instances),
+    }
+
+    /// Every `(stream, pipeline)` edge `encode_frame` actually draws, one row
+    /// per `draw_stream!`/`set_pipeline` call site that binds an effect
+    /// pipeline. If a draw site is added without a row here, the
+    /// `..._demands_exactly_its_own_pipeline` test still passes but the LIVE
+    /// frame panics — which is why the row list is enumerated from the call
+    /// sites and not from the enum.
+    fn stream_cases() -> Vec<StreamCase> {
+        fn bg(v: &mut Vec<super::BgInstance>) {
+            v.push(bytemuck::Zeroable::zeroed());
+        }
+        fn gl(v: &mut Vec<super::GlyphInstance>) {
+            v.push(bytemuck::Zeroable::zeroed());
+        }
+        fn rg(v: &mut Vec<super::RainGlowInstance>) {
+            v.push(bytemuck::Zeroable::zeroed());
+        }
+        fn fi(v: &mut Vec<super::FireInstance>) {
+            v.push(bytemuck::Zeroable::zeroed());
+        }
+        vec![
+            StreamCase {
+                stream: "cursor_block",
+                want: EffectPipeline::CursorBlend,
+                fill: |i| bg(&mut i.cursor_block),
+            },
+            StreamCase {
+                stream: "cursor",
+                want: EffectPipeline::CursorBlend,
+                fill: |i| bg(&mut i.cursor),
+            },
+            StreamCase {
+                stream: "glow_under",
+                want: EffectPipeline::GlowAdd,
+                fill: |i| bg(&mut i.glow_under),
+            },
+            StreamCase {
+                stream: "glow_add",
+                want: EffectPipeline::GlowAdd,
+                fill: |i| bg(&mut i.glow_add),
+            },
+            StreamCase {
+                stream: "nova_add",
+                want: EffectPipeline::GlowAdd,
+                fill: |i| bg(&mut i.nova_add),
+            },
+            StreamCase {
+                stream: "glow_halo",
+                want: EffectPipeline::RainGlow,
+                fill: |i| rg(&mut i.glow_halo),
+            },
+            StreamCase {
+                stream: "rain_add",
+                want: EffectPipeline::RainGlow,
+                fill: |i| rg(&mut i.rain_add),
+            },
+            StreamCase {
+                stream: "glow_halo_over",
+                want: EffectPipeline::RainGlowOver,
+                fill: |i| rg(&mut i.glow_halo_over),
+            },
+            StreamCase {
+                stream: "rain_add_over",
+                want: EffectPipeline::RainGlowOver,
+                fill: |i| rg(&mut i.rain_add_over),
+            },
+            StreamCase {
+                stream: "fire_add",
+                want: EffectPipeline::FireAdd,
+                fill: |i| fi(&mut i.fire_add),
+            },
+            StreamCase {
+                stream: "fire_over",
+                want: EffectPipeline::FireOver,
+                fill: |i| fi(&mut i.fire_over),
+            },
+            StreamCase {
+                stream: "glyph_halo",
+                want: EffectPipeline::DecoOver,
+                fill: |i| gl(&mut i.glyph_halo),
+            },
+            StreamCase {
+                stream: "curl",
+                want: EffectPipeline::DecoOver,
+                fill: |i| gl(&mut i.curl),
+            },
+            StreamCase {
+                stream: "wdeco_over",
+                want: EffectPipeline::DecoOver,
+                fill: |i| gl(&mut i.wdeco_over),
+            },
+            StreamCase {
+                stream: "wdeco_add",
+                want: EffectPipeline::DecoAdd,
+                fill: |i| gl(&mut i.wdeco_add),
+            },
+            StreamCase {
+                stream: "wallpaper",
+                want: EffectPipeline::SpriteOver,
+                fill: |i| gl(&mut i.wallpaper),
+            },
+            StreamCase {
+                stream: "rain_under",
+                want: EffectPipeline::SpriteOver,
+                fill: |i| gl(&mut i.rain_under),
+            },
+            StreamCase {
+                stream: "cat_over",
+                want: EffectPipeline::SpriteOver,
+                fill: |i| gl(&mut i.cat_over),
+            },
+            StreamCase {
+                stream: "free_under",
+                want: EffectPipeline::SpriteOver,
+                fill: |i| gl(&mut i.free_under),
+            },
+            StreamCase {
+                stream: "free_over",
+                want: EffectPipeline::SpriteOver,
+                fill: |i| gl(&mut i.free_over),
+            },
+        ]
+    }
+
+    /// THE LAUNCH CLAIM. A frame with no effect layer on it — which is every
+    /// frame under the shipped Windows defaults (`cursor_trail = false`,
+    /// `hdr_glow = false`) — asks for NOTHING, so nothing is compiled. This is
+    /// the 136.13 ms the eager build used to spend on every launch.
+    #[test]
+    fn an_effect_free_frame_demands_no_pipeline() {
+        let inst = Instances::default();
+        let input = aterm_render::RenderInput::default();
+        let want = frame_effect_pipelines(&inst, &input, true);
+        assert_eq!(
+            want,
+            [false; EFFECT_PIPELINE_COUNT],
+            "a plain frame must compile no effect pipeline; demanded {:?}",
+            resident_names(want)
+        );
+    }
+
+    fn resident_names(want: [bool; EFFECT_PIPELINE_COUNT]) -> Vec<&'static str> {
+        EFFECT_PIPELINE_NAMES
+            .iter()
+            .zip(want)
+            .filter(|(_, w)| *w)
+            .map(|(n, _)| *n)
+            .collect()
+    }
+
+    /// Every live stream demands ITS pipeline and no other. Both halves matter:
+    /// the "its" half is what stops the live frame panicking in
+    /// `EffectPipelines::get`; the "no other" half is what stops one effect
+    /// dragging the other eight back onto the launch path.
+    #[test]
+    fn each_stream_demands_exactly_its_own_pipeline() {
+        let input = aterm_render::RenderInput::default();
+        for case in stream_cases() {
+            let mut inst = Instances::default();
+            (case.fill)(&mut inst);
+            // A live cursor stream only reaches the BLEND pipeline when the
+            // cursor is translucent; opaque is the default and routes it
+            // through `bg_pipeline` (see `frame_effect_pipelines`).
+            let cursor_opaque = case.want != EffectPipeline::CursorBlend;
+            let want = frame_effect_pipelines(&inst, &input, cursor_opaque);
+            let mut expected = [false; EFFECT_PIPELINE_COUNT];
+            expected[case.want as usize] = true;
+            assert_eq!(
+                want,
+                expected,
+                "stream `{}` must demand exactly `{}`; demanded {:?}",
+                case.stream,
+                EFFECT_PIPELINE_NAMES[case.want as usize],
+                resident_names(want),
+            );
+        }
+    }
+
+    /// The DEFAULT opaque cursor must never pull the blend pipeline in: those
+    /// two streams are drawn every single frame, so keying the slot on the
+    /// stream alone would re-eagerise it for every launch.
+    #[test]
+    fn an_opaque_cursor_never_demands_the_blend_pipeline() {
+        let mut inst = Instances::default();
+        inst.cursor_block.push(bytemuck::Zeroable::zeroed());
+        inst.cursor.push(bytemuck::Zeroable::zeroed());
+        let input = aterm_render::RenderInput::default();
+        assert_eq!(
+            frame_effect_pipelines(&inst, &input, true),
+            [false; EFFECT_PIPELINE_COUNT],
+            "an opaque cursor draws through bg_pipeline and must compile nothing"
+        );
+        assert!(
+            frame_effect_pipelines(&inst, &input, false)[EffectPipeline::CursorBlend as usize],
+            "a translucent cursor must demand the blend pipeline"
+        );
+    }
+
+    /// A TRANSLUCENT cursor that draws NO cursor quads this frame still binds the
+    /// blend pipeline: `encode_frame` resolves `cursor_fill_pipeline` once per
+    /// frame ABOVE the `draw_stream!` guards, so the reference is materialised
+    /// whether or not either stream is live. Keying the slot on the streams as
+    /// well (as this gate first did) left it unensured here and panicked in
+    /// `EffectPipelines::get` on the very first blink-off frame of a
+    /// `cursor_opacity < 1` host — also reached by a `DECTCEM`-hidden cursor and
+    /// by a cursor scrolled out of the viewport.
+    #[test]
+    fn a_translucent_cursor_demands_the_blend_pipeline_even_with_no_cursor_quads() {
+        let inst = Instances::default(); // blink-off: both cursor streams empty
+        let input = aterm_render::RenderInput::default();
+        assert!(
+            inst.cursor_block.is_empty() && inst.cursor.is_empty(),
+            "precondition: this frame draws no cursor at all"
+        );
+        let want = frame_effect_pipelines(&inst, &input, false);
+        assert!(
+            want[EffectPipeline::CursorBlend as usize],
+            "a translucent cursor binds the blend pipeline unconditionally; \
+             demanding {:?} leaves that bind unensured and panics",
+            resident_names(want)
+        );
+        // ...and it drags in nothing else: the other eight stay off the launch path.
+        let mut expected = [false; EFFECT_PIPELINE_COUNT];
+        expected[EffectPipeline::CursorBlend as usize] = true;
+        assert_eq!(want, expected);
+    }
+
+    /// The BLOOM extract pass binds `GlowAdd` from its OWN vertex buffer,
+    /// outside `encode_frame`'s draw streams, and its source is the UNGATED
+    /// `input.cursor_glow_add`. A glow whose rows are all clean leaves
+    /// `inst.glow_add` empty while the bloom still draws — so the slot is keyed
+    /// on the input too. Without this the first bloomed frame after a clean-row
+    /// glow panics.
+    #[test]
+    fn a_row_gated_glow_still_demands_glow_add_for_the_bloom_pass() {
+        let inst = Instances::default(); // row gate emptied every stream
+        let mut input = aterm_render::RenderInput::default();
+        input.cursor_glow_add.push(GlowQuad {
+            row: 0,
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 4,
+            color: 0x0020_2020,
+        });
+        let want = frame_effect_pipelines(&inst, &input, true);
+        let mut expected = [false; EFFECT_PIPELINE_COUNT];
+        expected[EffectPipeline::GlowAdd as usize] = true;
+        assert_eq!(want, expected);
+    }
+
+    /// The three slot tables are ONE table seen three ways; a slot added to the
+    /// enum without a name (or listed out of order) would silently mislabel
+    /// every residency report.
+    #[test]
+    fn the_effect_pipeline_tables_agree() {
+        assert_eq!(
+            EFFECT_PIPELINE_COUNT,
+            EffectPipeline::SpriteOver as usize + 1
+        );
+        assert_eq!(EFFECT_PIPELINE_NAMES.len(), EFFECT_PIPELINE_COUNT);
+        assert_eq!(EFFECT_PIPELINES.len(), EFFECT_PIPELINE_COUNT);
+        for (slot, which) in EFFECT_PIPELINES.iter().enumerate() {
+            assert_eq!(
+                *which as usize, slot,
+                "EFFECT_PIPELINES is out of slot order"
+            );
+        }
+    }
 
     #[test]
     fn sdr_glow_attack_is_owned_per_window() {
-        let now = web_time::Instant::now();
+        let now = aterm_time::Instant::now();
         let mut a = WindowGpu::new();
         let mut b = WindowGpu::new();
 
         let a_first = a.advance_sdr_glow_budget(true, 0.30, now);
-        let a_second = a.advance_sdr_glow_budget(
-            true,
-            0.30,
-            now + std::time::Duration::from_millis(16),
-        );
+        let a_second =
+            a.advance_sdr_glow_budget(true, 0.30, now + std::time::Duration::from_millis(16));
         assert!(a_first > 0.0 && a_second > a_first);
 
         assert_eq!(b.advance_sdr_glow_budget(false, 0.30, now), 0.0);
@@ -17074,7 +17676,7 @@ ab\r\n",
     /// window's DXGI calls to one per interval.
     #[test]
     fn hdr_state_probe_is_immediate_then_throttled() {
-        let now = web_time::Instant::now();
+        let now = aterm_time::Instant::now();
         assert!(hdr_color_space_probe_due(None, now));
         assert!(!hdr_color_space_probe_due(Some(now), now));
 

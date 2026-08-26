@@ -81,16 +81,25 @@ serde_json = { workspace = true }
 # avoids spawning `shasum` per file across thousands of files without importing a
 # crypto stack. NOT the signature root — that stays `ring` (§8); content-integrity only.
 aterm-digest = { workspace = true }
-# The bundle extractor: read a `.tar.zst` and lay it down through the tar-slip-safe
+# The bundle extractor reads a `.tar.zst` and lays it down through the tar-slip-safe
 # `vet_entry` gate (§9/§15). `zstd` is already a workspace dependency (aterm-scrollback);
-# `tar` is the one genuinely-new external dep the design flags for supply-chain audit
-# (§13/§15) — pinned, with a matching `deny.toml` floor-ban. We drive per-entry
-# extraction manually (NOT tar's own `unpack`) so EVERY entry is vetted before a byte is
-# written, modes are sanitized, and a single escape aborts the whole stage.
-tar = "0.4.44"
+# the TAR side is now first-party — `src/tarread.rs`, a read-only USTAR/PAX/GNU parser —
+# which retired the `tar` crate the design flagged for supply-chain audit (§13/§15),
+# along with the `xattr` and `filetime` packages it dragged in for metadata restoration
+# this extractor never wanted. aterm NEVER WRITES a tar archive, so nothing here needed
+# a writer. Per-entry extraction is still driven manually so EVERY entry is vetted before
+# a byte is written, modes are sanitized, and a single escape aborts the whole stage.
 zstd = { workspace = true }
 
 [dev-dependencies]
+# ORACLE ONLY — never in the shipped graph. The retired reader, kept so
+# `tests/tar_oracle.rs` can prove `src/tarread.rs` agrees with it on
+# accept-or-reject and on every field the extractor reads, over hand-built
+# adversarial headers, real system-`tar` output and tens of thousands of mutated
+# archives. `examples/stage_reverify_harness.rs` also builds its fixture archive
+# with it — writing tar is a TEST-only need, which is exactly why the writer had
+# no business in the shipped binary.
+tar = "0.4.44"
 # Test fixtures must SIGN deterministic manifests
 # (Ed25519KeyPair::from_seed_unchecked + .sign), which needs ring's `alloc` feature.
 # Re-declaring ring here with DEFAULT features pulls alloc into the TEST build only

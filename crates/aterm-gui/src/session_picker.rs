@@ -201,7 +201,7 @@ impl SessionPickerState {
     }
 
     /// Move the cursor to FILTERED index `idx` (a11y Focus/Click land here).
-    #[cfg_attr(not(feature = "a11y-accesskit"), allow(dead_code))]
+    #[cfg_attr(not(a11y_tree), allow(dead_code))]
     pub(crate) fn select(&mut self, idx: usize) {
         self.pointer_over = None;
         self.pointer_armed = None;
@@ -343,7 +343,7 @@ impl SessionPickerState {
     }
 
     /// A11y row-identity epoch over the FILTERED set (the palette's scheme).
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     fn a11y_epoch(&self) -> u32 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -356,7 +356,7 @@ impl SessionPickerState {
     }
 
     /// Decode a node minted by the CURRENT epoch to its filtered index.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     pub(crate) fn a11y_filtered_index(&self, node: accesskit::NodeId) -> Option<usize> {
         let slot = usize::try_from(node.0 & u64::from(u32::MAX))
             .ok()?
@@ -636,7 +636,7 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
 
 /// The picker's accessibility tree — the palette scheme verbatim: a ListBox of
 /// the FILTERED rows, epoch-guarded ids, focus follows the cursor.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn picker_a11y(state: &SessionPickerState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
@@ -681,7 +681,7 @@ pub(crate) fn picker_a11y(state: &SessionPickerState) -> accesskit::TreeUpdate {
 }
 
 /// Mint a row node id (epoch high half, `slot + 1` low — the palette scheme).
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 fn a11y_node_id_for(epoch: u32, slot: usize) -> accesskit::NodeId {
     accesskit::NodeId((u64::from(epoch) << 32) | (slot as u64 + 1))
 }

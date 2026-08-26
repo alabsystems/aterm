@@ -249,7 +249,16 @@ pub(crate) enum EncodeJob {
         /// OS presentation target existed). Disclosed verbatim in index.json's
         /// `meta.mode` with mode-matched `stamp_semantics`.
         mode: crate::VideoMode,
-        inputs: Vec<(u64, char)>,
+        /// Whether the request carried the `keys` flag. Drives the HONESTY
+        /// tokens on the reply line: a recording that opted into the ledger
+        /// always states `inputs=` and `unlogged_inputs=`, so a driver reading
+        /// only the reply can tell "measured zero" from "could not measure".
+        keys_enabled: bool,
+        inputs: Vec<(u64, crate::VideoInputSample)>,
+        /// Input egresses during this take that took the control-thread path
+        /// and therefore CANNOT be in `inputs` (see
+        /// [`crate::unseamed_control_inputs`]).
+        unlogged_inputs: u64,
         started_us: u64,
         dir: crate::control_auth::ConfinedVideoDir,
         reply: std::sync::mpsc::Sender<crate::control::Retained<String>>,
@@ -528,6 +537,208 @@ fn write_snapshot_artifacts_with_hook(
     // transaction is committed. The guards live through this return.
     let _commit_guards = (png_file, text_file, done_file);
     Ok(())
+}
+
+/// The HONESTY tokens a `video ... keys` recording adds to its OK reply line.
+///
+/// A measuring instrument that reports zero must not be indistinguishable from
+/// one that could not measure. When the take opted into the ledger, the reply
+/// always states BOTH counts — `inputs=` (attempts this recording timestamped)
+/// and `unlogged_inputs=` (attempts that took the control-thread path this
+/// ledger structurally cannot see) — so the driver learns at recording time,
+/// from the reply itself, whether an empty `inputs[]` means "nothing happened"
+/// or "it happened somewhere I cannot watch". A take WITHOUT `keys` recorded no
+/// ledger at all and says nothing rather than implying a measured zero.
+///
+/// PURE, and the leading space keeps the client invariant that the recording
+/// path is always the LAST whitespace token of the reply.
+pub(crate) fn video_keys_reply_tokens(keys_enabled: bool, logged: usize, unlogged: u64) -> String {
+    if keys_enabled {
+        format!(" inputs={logged} unlogged_inputs={unlogged}")
+    } else {
+        String::new()
+    }
+}
+
+/// The same disclosure for the MID-FLIGHT `video status` line.
+///
+/// The finalized reply arrives only when the take is over, which is too late to
+/// change how the take is driven. A driver that polls `video status` after its
+/// first few keys must be able to see, right then, that the ledger is empty
+/// BECAUSE its verbs are taking the unobservable path — so `keys=true inputs=0
+/// unlogged=3` is the whole warning, delivered while the recording can still be
+/// saved. A take without `keys` says `keys=false` rather than printing counts
+/// that would read as a measured zero.
+///
+/// PURE. `unlogged` is deliberately spelled without the `_inputs` suffix the
+/// finalized reply uses: this is a running subtotal of a live take, not the
+/// take's published figure, and one token name for two different things would
+/// invite a parser to treat them as interchangeable.
+pub(crate) fn video_keys_status_tokens(keys_enabled: bool, logged: usize, unlogged: u64) -> String {
+    if keys_enabled {
+        format!(" keys=true inputs={logged} unlogged={unlogged}")
+    } else {
+        " keys=false".to_string()
+    }
+}
+
+/// The `analysis.note` for a recording whose `inputs[]` came out EMPTY.
+///
+/// PURE so the three genuinely different situations can be pinned by a unit
+/// test. They must never share a sentence: the old note guessed at three causes
+/// at once (and named `send`/`feed` as an unloggable path, which the active-tab
+/// arms no longer are), so a driver could not tell an idle screen from a
+/// misrouted one.
+pub(crate) fn video_empty_ledger_note(keys_enabled: bool, unlogged: u64) -> String {
+    if !keys_enabled {
+        return "no keystroke ledger was recorded: this take did not pass the `keys` flag. \
+                Re-record as `video <secs> keys` (owner scope) to correlate input with frames."
+            .to_string();
+    }
+    if unlogged > 0 {
+        return format!(
+            "MEASUREMENT GAP, not silence: {unlogged} input attempt(s) reached a PTY in this \
+             process during this take on the CONTROL-THREAD path — a verb aimed at a session that \
+             is NOT the tab on screen (`@<sid>` naming a background tab, which is what `@self` \
+             expands to when the driving session is not front). A BACKGROUND target has no active \
+             tab to touch, so it deliberately never enters the App input seam and this ledger \
+             cannot timestamp it: inputs[] is empty DESPITE those attempts. Drive the tab that is \
+             ON SCREEN — flagless `key`/`ctrl`/`send`/`feed`/`paste`, or an explicit `@<sid>` \
+             naming the front tab, both of which ARE logged — to get key->frame latency."
+        );
+    }
+    "no input reached this instance during the take: the ledger measured zero, it did not fail \
+     to measure (unlogged_inputs is 0, so nothing took the unobservable control-thread path \
+     either). Active-tab `key`/`ctrl`/`send`/`feed`/`paste` and hardware keys are all logged."
+        .to_string()
+}
+
+#[cfg(test)]
+mod video_keys_honesty_tests {
+    use super::{video_empty_ledger_note, video_keys_reply_tokens, video_keys_status_tokens};
+
+    /// The finalized reply comes too late to change how a take is DRIVEN, so the
+    /// mid-flight `video status` line must carry the same disclosure. A driver
+    /// that polls two seconds into a thirty-second take and reads `inputs=0
+    /// unlogged=5` learns, while the take is still salvageable, that its verbs
+    /// are taking the path this ledger cannot watch.
+    #[test]
+    fn status_line_discloses_the_running_ledger_mid_flight() {
+        assert_eq!(
+            video_keys_status_tokens(true, 0, 5),
+            " keys=true inputs=0 unlogged=5",
+            "a live take driven down the unobservable path must say so DURING the take"
+        );
+        assert_eq!(
+            video_keys_status_tokens(true, 9, 0),
+            " keys=true inputs=9 unlogged=0"
+        );
+        // No ledger was requested: say that, rather than printing an
+        // `inputs=0` that reads as a measured zero.
+        assert_eq!(video_keys_status_tokens(false, 0, 0), " keys=false");
+        assert!(
+            !video_keys_status_tokens(false, 0, 0).contains("inputs="),
+            "a take without `keys` must not publish a count it never took"
+        );
+
+        // The status line stays one whitespace-token line with no path to
+        // protect, so the tokens simply append cleanly.
+        let line = format!(
+            "OK recording=true mode=swapchain-tap elapsed_ms=1200 frames=71 resized=false{}",
+            video_keys_status_tokens(true, 3, 0)
+        );
+        assert!(line.ends_with(" keys=true inputs=3 unlogged=0"), "{line}");
+    }
+
+    /// A measuring instrument that reports zero must never be indistinguishable
+    /// from one that could not measure. The three situations behind an empty
+    /// `inputs[]` are genuinely different and must never share a sentence.
+    #[test]
+    fn empty_ledger_note_separates_measured_zero_from_unmeasurable() {
+        // (1) The take never asked for a ledger. Saying "no input attempts
+        // logged" here implied a measurement that was never attempted.
+        let no_flag = video_empty_ledger_note(false, 0);
+        assert!(
+            no_flag.contains("`keys` flag"),
+            "a take without `keys` must say so: {no_flag}"
+        );
+        assert!(
+            !no_flag.contains("measured zero"),
+            "an unrequested ledger never measured anything: {no_flag}"
+        );
+
+        // (2) Input DID happen, on the one path this ledger structurally cannot
+        // observe. The count is stated, so the reader is never left guessing.
+        let gap = video_empty_ledger_note(true, 4);
+        assert!(
+            gap.contains("MEASUREMENT GAP") && gap.contains('4'),
+            "a bypassed drive must be named AND counted: {gap}"
+        );
+        assert!(
+            gap.contains("@<sid>"),
+            "the note must name the path that bypassed it: {gap}"
+        );
+
+        // (3) A genuine zero — and it says so positively, citing the evidence
+        // (`unlogged_inputs` is 0) rather than guessing at causes.
+        let quiet = video_empty_ledger_note(true, 0);
+        assert!(
+            quiet.contains("measured zero"),
+            "a real zero must be claimed as a measurement: {quiet}"
+        );
+        assert!(
+            !quiet.contains("MEASUREMENT GAP"),
+            "a real zero is not a gap: {quiet}"
+        );
+
+        // The stale advice is gone from every branch: flagless `send`/`feed` now
+        // reach the App input seam and ARE logged, so no note may still tell a
+        // driver they "write to the PTY directly and are not input attempts".
+        for note in [&no_flag, &gap, &quiet] {
+            assert!(
+                !note.contains("are not input attempts"),
+                "the send/feed exclusion is obsolete: {note}"
+            );
+            // The note is interpolated RAW into index.json's `"note": "…"`, so a
+            // quote or backslash in any branch would emit a broken artifact —
+            // the instrument destroying the very evidence it exists to publish.
+            assert!(
+                !note.contains('"') && !note.contains('\\'),
+                "a note must stay JSON-safe unescaped: {note}"
+            );
+        }
+    }
+
+    /// The reply line is what a driver reads AT RECORDING TIME. A `keys` take
+    /// always states both counts there; a take without `keys` adds nothing (it
+    /// would otherwise imply a measured zero). The recording path stays the last
+    /// whitespace token — the one client invariant of this reply shape.
+    #[test]
+    fn reply_tokens_state_both_counts_and_keep_the_path_last() {
+        assert_eq!(
+            video_keys_reply_tokens(true, 0, 3),
+            " inputs=0 unlogged_inputs=3",
+            "zero logged with three bypassed must be visible on the reply itself"
+        );
+        assert_eq!(
+            video_keys_reply_tokens(true, 7, 0),
+            " inputs=7 unlogged_inputs=0"
+        );
+        assert_eq!(
+            video_keys_reply_tokens(false, 0, 0),
+            "",
+            "a take without `keys` must not imply a measured zero"
+        );
+        let line = format!(
+            "OK frames=10 dropped=0 head_truncated=false{} /rec/index.json",
+            video_keys_reply_tokens(true, 2, 0)
+        );
+        assert_eq!(
+            line.split_whitespace().last(),
+            Some("/rec/index.json"),
+            "the path must remain the last whitespace token"
+        );
+    }
 }
 
 /// Abort a video export without leaving an `index.json` completion artifact.
@@ -886,7 +1097,9 @@ fn run_encode_job(job: EncodeJob) {
         EncodeJob::VideoDump {
             take,
             mode,
+            keys_enabled,
             inputs,
+            unlogged_inputs,
             started_us,
             dir,
             reply,
@@ -924,19 +1137,14 @@ fn run_encode_job(job: EncodeJob) {
             let fps: Vec<(u64, u64)> = take.frames.iter().map(|f| (f.t_us, frame_fp(f))).collect();
             let mut glyph_lines = String::new();
             let mut lats_ms: Vec<f64> = Vec::new();
-            for (t, ch) in &inputs {
+            for (t, sample) in &inputs {
                 let before = fps.iter().rev().find(|(ft, _)| ft < t);
                 let Some((_, ref_fp)) = before else { continue };
                 let hit = fps
                     .iter()
                     .filter(|(ft, _)| ft >= t)
                     .find(|(_, fp)| fp.abs_diff(*ref_fp) > 200);
-                let esc = match ch {
-                    '"' => "\\\"".to_string(),
-                    '\\' => "\\\\".to_string(),
-                    c if c.is_control() => format!("\\u{:04x}", *c as u32),
-                    c => c.to_string(),
-                };
+                let field = sample.json_field();
                 if !glyph_lines.is_empty() {
                     glyph_lines.push_str(",\n");
                 }
@@ -945,34 +1153,20 @@ fn run_encode_job(job: EncodeJob) {
                         let ms = (ft.saturating_sub(*t)) as f64 / 1000.0;
                         lats_ms.push(ms);
                         glyph_lines.push_str(&format!(
-                            "      {{\"ch\":\"{esc}\",\"t_us\":{t},\"response_ms\":{ms:.1}}}"
+                            "      {{{field},\"t_us\":{t},\"response_ms\":{ms:.1}}}"
                         ));
                     }
                     None => glyph_lines.push_str(&format!(
-                        "      {{\"ch\":\"{esc}\",\"t_us\":{t},\"response_ms\":null}}"
+                        "      {{{field},\"t_us\":{t},\"response_ms\":null}}"
                     )),
                 }
             }
             lats_ms.sort_by(|a, b| a.total_cmp(b));
             let analysis = if inputs.is_empty() {
-                // HONESTY, not blame. An empty log has THREE causes and the
-                // reader cannot tell them apart, so name all three instead of
-                // assuming the driver forgot to type. The third is a real
-                // routing gap worth stating outright: a CROSS-SESSION verb
-                // (`@<sid>`, which is what the recommended `@self` selector
-                // expands to client-side) writes through the seam DIRECTLY on
-                // the control thread and never reaches the App input path this
-                // ledger hooks — so an AI that drove the whole take with
-                // `@self key …` gets an empty log and, until now, was told it
-                // had not typed.
-                "  \"analysis\": {\"note\": \"no input attempts logged. Causes, in order of \
-                 likelihood: (1) nothing was typed during the take; (2) input was driven with \
-                 `send`/`feed`, which write to the PTY directly and are not input attempts; \
-                 (3) input was driven CROSS-SESSION (`@<sid>`, including the expansion of \
-                 `@self`) — that path egresses on the control thread and bypasses this ledger, \
-                 so drive with a FLAGLESS `key` verb (the active tab) when you need the \
-                 keystroke log\"},\n"
-                    .to_string()
+                format!(
+                    "  \"analysis\": {{\"note\": \"{}\"}},\n",
+                    video_empty_ledger_note(keys_enabled, unlogged_inputs)
+                )
             } else if lats_ms.is_empty() {
                 format!(
                     "  \"analysis\": {{\n    \"key_response\": [\n{glyph_lines}\n    ],\n    \
@@ -1064,18 +1258,14 @@ fn run_encode_job(job: EncodeJob) {
                 return;
             }
             let mut input_lines = String::new();
-            for (t, ch) in &inputs {
+            for (t, sample) in &inputs {
                 if !input_lines.is_empty() {
                     input_lines.push_str(",\n");
                 }
-                // Escape the char for JSON (printables only reach here, but be safe).
-                let esc = match ch {
-                    '"' => "\\\"".to_string(),
-                    '\\' => "\\\\".to_string(),
-                    c if c.is_control() => format!("\\u{:04x}", *c as u32),
-                    c => c.to_string(),
-                };
-                input_lines.push_str(&format!("    {{\"t_us\":{t},\"ch\":\"{esc}\"}}"));
+                // `"ch"` for a character-shaped attempt, `"key"` for a named key
+                // that has none (esc / arrows / F-keys). Both are JSON-escaped by
+                // `json_field`.
+                input_lines.push_str(&format!("    {{\"t_us\":{t},{}}}", sample.json_field()));
             }
             let stop_us = crate::metrics::now_us();
             // HONEST COVERAGE: `dropped` on the wire stays the TOTAL loss
@@ -1108,7 +1298,9 @@ fn run_encode_job(job: EncodeJob) {
                 "{{\n  \"meta\": {{\n    \"w\": {}, \"h\": {}, \"device_px\": [{}, {}],\n    \
                  \"half_res\": {}, \"format\": \"{}\", \"mode\": \"{mode_str}\",\n    \
                  \"clock\": \"metrics now_us; same epoch as inputs[] — attempt->later-frame delta = frame.t_us - input.t_us\",\n    \
-                 \"input_semantics\": \"pre-routing character attempts; not PTY-delivery or visible-glyph receipts\",\n    \
+                 \"input_semantics\": \"pre-routing attempts (`ch` = character, `key` = named key with no character); not PTY-delivery or visible-glyph receipts\",\n    \
+                 \"keys_requested\": {keys_enabled}, \"inputs_logged\": {}, \"unlogged_inputs\": {unlogged_inputs},\n    \
+                 \"unlogged_input_semantics\": \"input attempts during this take that reached a PTY on the CONTROL-THREAD path — a verb aimed at a session that is NOT the tab on screen (`@<sid>` naming a background tab; `@self` when the driving session is not front). A background target has no active tab to touch, so it never enters the App input seam this ledger hooks and cannot be timestamped here. Same unit as inputs_logged (one per would-be inputs[] row), process-wide, delta over this take. Non-zero means attempts happened that inputs[] does NOT contain.\",\n    \
                  \"stamp_semantics\": \"{stamp_semantics}\",\n    \
                  \"wall_start_us\": {started_us}, \"wall_stop_us\": {stop_us},\n    \
                  \"requested_ms\": {requested_ms}, \"covered_us\": {covered_us},\n    \
@@ -1123,6 +1315,7 @@ fn run_encode_job(job: EncodeJob) {
                 take.device_px.1,
                 take.half_res,
                 take.format,
+                inputs.len(),
                 take.dropped,
                 take.evicted,
                 take.decimated,
@@ -1188,7 +1381,8 @@ fn run_encode_job(job: EncodeJob) {
                 publication,
                 &reply,
                 format!(
-                    "OK frames={written} dropped={dropped_total} head_truncated={head_truncated} {}\n",
+                    "OK frames={written} dropped={dropped_total} head_truncated={head_truncated}{} {}\n",
+                    video_keys_reply_tokens(keys_enabled, inputs.len(), unlogged_inputs),
                     published_dir.join("index.json").display()
                 ),
             );
@@ -2107,6 +2301,15 @@ impl App {
             output_burst: false,
             pointer: None,
         };
+        // The switch, on the capture path too: an unowned resident retires
+        // outright, so a capture can never immortalize a sprite the live window
+        // has already stopped owning (`retire_pet_without_owner`).
+        crate::app_render::retire_pet_without_owner(
+            pet_mode,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+            &mut ws.cursor_pet,
+        );
         let pet = if windowless {
             ws.cursor_pet.tick_static_capture(pet_sense)
         } else {
@@ -2460,6 +2663,14 @@ impl App {
                 output_burst: false,
                 pointer: None,
             };
+            // The switch (`retire_pet_without_owner`) — the twin of the
+            // composed capture arm's call above.
+            crate::app_render::retire_pet_without_owner(
+                pet_mode,
+                glow_cfg.enabled && cursor_companions_allowed,
+                glow_cfg.style,
+                &mut ws.cursor_pet,
+            );
             let pet = if windowless {
                 ws.cursor_pet.tick_static_capture(pet_sense)
             } else {
@@ -2557,6 +2768,14 @@ impl App {
             output_burst: false,
             pointer: None,
         };
+        // The switch (`retire_pet_without_owner`) — the twin of the composed
+        // capture arm's call.
+        crate::app_render::retire_pet_without_owner(
+            pet_mode,
+            glow_cfg.enabled && cursor_companions_allowed,
+            glow_cfg.style,
+            &mut ws.cursor_pet,
+        );
         let pet = if windowless {
             ws.cursor_pet.tick_static_capture(pet_sense)
         } else {
@@ -2573,7 +2792,14 @@ impl App {
             crate::word_decorations::CompanionOnGlass {
                 cell,
                 body_px: pet_on_glass
-                    .then(|| pet.body_px(effect_geom.cell_w, effect_geom.cell_h, effect_geom.cols))
+                    .then(|| {
+                        pet.body_px(
+                            effect_geom.cell_w,
+                            effect_geom.cell_h,
+                            effect_geom.cols,
+                            effect_geom.rows,
+                        )
+                    })
                     .flatten(),
             }
         });
@@ -8712,7 +8938,9 @@ mod encode_worker_tests {
         run_encode_job(EncodeJob::VideoDump {
             take,
             mode: crate::VideoMode::SwapchainTap,
+            keys_enabled: false,
             inputs: Vec::new(),
+            unlogged_inputs: 0,
             started_us: 0,
             dir,
             reply,
@@ -8773,7 +9001,9 @@ mod encode_worker_tests {
         run_encode_job(EncodeJob::VideoDump {
             take,
             mode: crate::VideoMode::SwapchainTap,
+            keys_enabled: false,
             inputs: Vec::new(),
+            unlogged_inputs: 0,
             started_us: 0,
             dir,
             reply,
@@ -9574,7 +9804,9 @@ mod encode_worker_tests {
         run_encode_job(EncodeJob::VideoDump {
             take,
             mode: crate::VideoMode::SwapchainTap,
+            keys_enabled: false,
             inputs: Vec::new(),
+            unlogged_inputs: 0,
             started_us: 500,
             dir,
             reply: tx,

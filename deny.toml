@@ -152,7 +152,7 @@ allow-wildcard-paths = true
 # with a reason string.
 deny = [
     { name = "ring", version = "<0.17.14", reason = "atpkg's load-bearing Ed25519 verify root (TOOLCHAIN-PACKAGE-MANAGER.md S8/S13): never allow it to drift below the audited, vendored floor on the verify path" },
-    { name = "tar", version = "<0.4.44", reason = "atpkg's bundle extractor (TOOLCHAIN-PACKAGE-MANAGER.md S13/S15): pin the tar reader at/above the audited floor — extraction is attacker-influenced input, so a known-bad tar version must never slip in. NOTE: cargo-deny is not installed in the current dev env, so this floor is inspection-only until it can run (same caveat as the ring ban)" },
+    { name = "tar", version = "<0.4.44", reason = "atpkg's bundle extraction is attacker-influenced input, so the tar READER may never drift below the audited floor. The shipped reader is now first-party (crates/atpkg/src/tarread.rs) and this crate is a dev-dependency ORACLE only (tests/tar_oracle.rs), so today the floor guards the thing the first-party parser is measured against — which is exactly as load-bearing, because an oracle nobody trusts proves nothing. It also fails closed if the crate ever returns to the shipped graph. NOTE: cargo-deny is not installed in the current dev env, so this floor is inspection-only until it can run (same caveat as the ring ban)" },
 ]
 # Crates explicitly allowed to appear more than once (none pinned yet — the
 # warn-level policy above already keeps duplicates non-fatal).

@@ -1115,6 +1115,25 @@ mod tests {
     /// drifted. PROVENANCE: derived 2026-07-14 from the three web modules'
     /// manifests (engine edges default-features = false — the disk tier and
     /// its libc/zstd closure are OUT, unlike the GUI closure).
+    ///
+    /// # `aterm-uds` is an OVER-APPROXIMATION, not browser code
+    ///
+    /// `aterm-uds` is in this pin because `aterm-shell-integration` reaches it
+    /// from a `[target.'cfg(any(unix, windows))'.dependencies]` section, and
+    /// [`classify_section`](super::scan_set) counts cfg-target deps IN on
+    /// every platform. That rule is deliberately fail-closed: the derivation
+    /// does not evaluate cfg predicates, so it cannot prove an edge absent,
+    /// and scanning source a target does not link is safe while missing source
+    /// it does link is not.
+    ///
+    /// It is NOT a claim about the browser bundle. `wasm32-unknown-unknown` is
+    /// neither `unix` nor `windows`, so cargo never resolves that edge for the
+    /// web build: no Unix-domain socket, no `/dev/urandom` fallback and no
+    /// blocking `std::fs` reaches the bundle. The wasm nonce mint takes the
+    /// `cfg(all(target_arch = "wasm32", target_os = "unknown"))` arm, which
+    /// calls `crypto.getRandomValues` through `getrandom` and never mentions
+    /// `aterm-uds`. If the census is ever taught to evaluate cfg predicates,
+    /// this entry is the first one that should disappear.
     #[test]
     fn derived_wasm_closure_matches_the_pinned_canary() {
         const PINNED: &[&str] = &[
@@ -1149,7 +1168,18 @@ mod tests {
             "crates/aterm-shell-integration/src",
             "crates/aterm-sixel/src",
             "crates/aterm-tempfile/src",
+            // Entered the closure when the first-party clock replaced
+            // `web-time`: aterm-core, -types, -effects, -gpu and -predict all
+            // sample time through it, and on wasm it IS the shim that keeps
+            // `Instant::now()` off the panicking std path.
+            "crates/aterm-time/src",
             "crates/aterm-types/src",
+            // NOT browser code — see the over-approximation note on this test.
+            // Reached only through aterm-shell-integration's
+            // `cfg(any(unix, windows))` section, which wasm32-unknown-unknown
+            // never satisfies; the derivation counts cfg-target deps IN on
+            // every platform because it does not evaluate cfg predicates.
+            "crates/aterm-uds/src",
             "crates/aterm-vi/src",
             "crates/aterm-wasm/src",
         ];

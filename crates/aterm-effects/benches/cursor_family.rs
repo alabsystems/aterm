@@ -264,7 +264,7 @@ struct Fixture {
     base: TrailConfig,
     /// This frame's ignited config — what the timed `tick` reads.
     cfg: TrailConfig,
-    now: web_time::Instant,
+    now: aterm_time::Instant,
     dt: Duration,
     out: Vec<TrailCell>,
     row: u16,
@@ -281,7 +281,7 @@ impl Fixture {
             cfg: base,
             // ONE wall sample for the clock's origin; from here the clock is
             // advanced by a fixed dt and never read from the wall again.
-            now: web_time::Instant::now(),
+            now: aterm_time::Instant::now(),
             dt,
             out: Vec::new(),
             row: 0,
@@ -808,7 +808,7 @@ fn bench_count(g: &mut BenchmarkGroup<'_, WallTime>, id: &str, count: usize) {
 struct CadFixture {
     cad: TypingCadence,
     base: TrailConfig,
-    now: web_time::Instant,
+    now: aterm_time::Instant,
     n: u64,
 }
 
@@ -817,7 +817,7 @@ impl CadFixture {
         CadFixture {
             cad: TypingCadence::default(),
             base: shipped_cfg(),
-            now: web_time::Instant::now(),
+            now: aterm_time::Instant::now(),
             n: 0,
         }
     }

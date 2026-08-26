@@ -251,7 +251,7 @@ impl UpdateState {
     /// Updates while checks are enabled, else Close. The paint (`filled` flags) and this
     /// method read the SAME state, so what the user sees as the default IS what Return
     /// triggers. Kept in lockstep with the button-row `filled` flags in `update_tray`.
-    #[cfg(any(test, feature = "a11y-accesskit"))]
+    #[cfg(any(test, a11y_tree))]
     pub(crate) fn default_action(&self) -> UpdateHit {
         if self.has_update() {
             UpdateHit::Install
@@ -441,7 +441,7 @@ impl UpdateState {
 /// builder ([`update_a11y`]) and the action decoder ([`a11y_hit`]), so an OS `Click` on a
 /// button routes to exactly the [`UpdateHit`] the pixels painted there. The ids are fixed
 /// (independent of which optional buttons are present) so the decoder is a plain match.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 fn a11y_button_id(hit: UpdateHit) -> accesskit::NodeId {
     accesskit::NodeId(match hit {
         UpdateHit::Close => 10,
@@ -453,7 +453,7 @@ fn a11y_button_id(hit: UpdateHit) -> accesskit::NodeId {
 /// Decode an accessibility node id back to the [`UpdateHit`] its button fires — the inverse
 /// of [`a11y_button_id`], consulted by the Update branch of `App::on_accessibility_action`.
 /// `None` for the root / a static descriptor node (which carry no action).
-#[cfg(all(test, feature = "a11y-accesskit"))]
+#[cfg(all(test, a11y_tree))]
 pub(crate) fn a11y_hit(node: accesskit::NodeId) -> Option<UpdateHit> {
     match node.0 {
         10 => Some(UpdateHit::Close),
@@ -474,7 +474,7 @@ pub(crate) fn a11y_hit(node: accesskit::NodeId) -> Option<UpdateHit> {
 ///
 /// Id contract (shared with [`a11y_hit`]): root `NodeId(0)`; static lines `NodeId(1..=3)`;
 /// buttons at FIXED ids `Close=10` / `Check=11` / `Install=12`.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 pub(crate) fn update_a11y(state: &UpdateState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Tree, TreeId, TreeUpdate};
 
@@ -1255,7 +1255,7 @@ mod tests {
     /// action — so the a11y buttons are in bijection with the introspected/painted actions.
     /// The focus (default action) differing between the staged and disabled cases is the
     /// non-vacuity control: the tree tracks the model, not a fixed button list.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     #[test]
     fn update_a11y_actions_match_controls() {
         use accesskit::{Action, Role};

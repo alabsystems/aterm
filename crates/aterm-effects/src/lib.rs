@@ -11,7 +11,7 @@
 //!
 //! - **Clockless state machines.** Every `tick`/`rescan` takes an injected
 //!   `now: Instant`; nothing here reads a wall clock on the hot path. On native
-//!   `Instant` is exactly `std::time::Instant`; on wasm32 it is `web_time::Instant`
+//!   `Instant` is exactly `std::time::Instant`; on wasm32 it is `aterm_time::Instant`
 //!   (the engine-wide idiom, see `aterm-core/src/bell.rs`), so a web host can
 //!   synthesize `now` from an `advance(dt)` stream.
 //! - **Render-time overlay only.** Output is the `RenderInput` overlay channels

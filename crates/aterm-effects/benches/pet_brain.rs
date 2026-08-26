@@ -146,7 +146,7 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, black_box, criterion_group, criterion_main,
 };
-use web_time::Instant;
+use aterm_time::Instant;
 
 // ---------------------------------------------------------------- geometry --
 

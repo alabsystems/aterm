@@ -77,8 +77,8 @@ pub(super) struct TransientState {
     /// VT52 cursor addressing state.
     pub(super) vt52_cursor_state: Vt52CursorState,
     /// Timestamp when synchronized output mode (2026) was enabled.
-    /// `web_time::Instant` (std on native, JS clock on wasm) to match `process_now`.
-    pub(super) sync_start: Option<web_time::Instant>,
+    /// `aterm_time::Instant` (std on native, JS clock on wasm) to match `process_now`.
+    pub(super) sync_start: Option<aterm_time::Instant>,
     /// Monotonic count of synchronized-update (mode 2026) WINDOW CLOSES — every
     /// `?2026l`, DECSTR/RIS reset, and timeout force-clear bumps it. A host that
     /// holds presents during a sync window compares this across redraws to tell
@@ -100,7 +100,7 @@ pub(super) struct TransientState {
     /// mode state regardless of real wall-clock pacing. The value is always
     /// overwritten before any reader runs, so its initial/reset value is never
     /// observed.
-    pub(super) process_now: web_time::Instant,
+    pub(super) process_now: aterm_time::Instant,
     /// Wall-clock epoch milliseconds for the current `process_at()` batch — the
     /// single wall reading every shell-integration command/output mark records
     /// (OSC 133/633 marks B/C/D). Captured alongside [`process_now`] so replay
@@ -205,11 +205,11 @@ impl TransientState {
             sync_end_seq: 0,
             // Placeholders; overwritten at the top of every process_at() before
             // any reader runs, so this value is never observed as state.
-            // web_time::Instant::now(): std on native, JS clock on wasm (std panics there).
+            // aterm_time::Instant::now(): std on native, JS clock on wasm (std panics there).
             // The marker below is on the CALL line on purpose: grep_guard family C
             // requires the exemption same-line, and on the preceding line it read as
             // an unexplained clock read (which is what the module-wide C3 now sees).
-            process_now: web_time::Instant::now(), // CLOCK-EXEMPT: seed only
+            process_now: aterm_time::Instant::now(), // CLOCK-EXEMPT: seed only
             process_wall_ms: None,
             sgr_stack: VecDeque::new(),
             pipeline_timestamps: PipelineTimestamps::default(),

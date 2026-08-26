@@ -32,7 +32,7 @@
 //! opts in explicitly — its config surface owns the default).
 
 use std::time::Duration;
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::{ContentScrollState, Terminal};

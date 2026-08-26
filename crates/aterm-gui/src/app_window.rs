@@ -1211,7 +1211,7 @@ impl App {
         // a11y: AccessKit must attach BEFORE the window is first shown, so create it
         // hidden and reveal it right after the adapter is built (feature-gated; the
         // default build keeps winit's visible-by-default).
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         let attrs = attrs.with_visible(false);
         // OVERLAP HANDOFF: EVERY window of a handoff boot is created hidden and
         // revealed only after its first REAL content present (the post-present
@@ -1242,7 +1242,7 @@ impl App {
         // P2: attach this window's AccessKit adapter (events arrive as `Wake::Accessibility`
         // via the proxy), then SHOW the window. Stored into `ws` at the os_window assignment
         // below. `update_if_active` (in app_settings) pushes the Settings tree on change.
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         let a11y_adapter = self
             .proxy
             .clone()
@@ -1252,7 +1252,7 @@ impl App {
         // metrics sized it exactly, pre-join) or the post-join size correction —
         // both strictly after this point, so the adapter always attaches before
         // the first show, as AccessKit requires.
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         if !pending_join && !defer_reveal {
             window.set_visible(true);
         }
@@ -1931,7 +1931,7 @@ impl App {
                         ws.pending_reveal = defer_reveal
                             .then(|| Instant::now() + std::time::Duration::from_millis(1500));
                         ws.win_px = Some(raw_px);
-                        #[cfg(feature = "a11y-accesskit")]
+                        #[cfg(a11y_tree)]
                         {
                             ws.a11y = a11y_adapter;
                         }
@@ -2035,7 +2035,7 @@ impl App {
             ws.pending_reveal =
                 defer_reveal.then(|| Instant::now() + std::time::Duration::from_millis(1500));
             ws.win_px = Some(raw_px);
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             {
                 ws.a11y = a11y_adapter;
             }

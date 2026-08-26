@@ -32,7 +32,7 @@
 //! PORTABLE RASTER (FONT-2): fontdue has no variation API, so the portable path
 //! (non-macOS, and `ATERM_RASTERIZER=fontdue`) cannot ask fontdue for an instance.
 //! [`varied_glyph_raster`] closes that gap: ttf-parser applies the resolved coords to
-//! the glyph OUTLINE and an `ab_glyph_rasterizer` coverage fill (nonzero winding + AA)
+//! the glyph OUTLINE and a [`crate::raster`] coverage fill (nonzero winding + AA)
 //! rasterizes it, so the portable path now draws the RESOLVED instance — not the `fvar`
 //! default — matching the CoreText path's instance (grid geometry + shaping already
 //! followed the coords). The renderer routes the primary face through it on that path
@@ -432,15 +432,27 @@ pub fn varied_glyph_raster_with_face(
     // the grid boundary (see RASTER_PAD). A design-space `x_min` of 0 — which
     // most glyphs of most fonts have — scales to an exactly-0 left edge, which
     // is precisely the case that detonates.
+    //
+    // The grid is sized from the font's DECLARED `glyph_bounding_box`, not from
+    // the outline's observed extrema (`hinted.rs` derives its box from the pen's
+    // extrema and so cannot escape at all). A font whose `glyf` data exceeds its
+    // own declared box therefore pushes points outside this grid — legitimately,
+    // in fonts with a slightly loose bbox, and deliberately in a hostile one.
+    // The outline is NOT clamped here: clipping real ink to a mis-declared box
+    // would visibly cut glyphs from ordinary fonts. Containment is
+    // `crate::raster`'s job instead, where every escape path is bounds-clamped
+    // and every flattening loop capped, so an escape costs the area that left
+    // the grid and nothing else — see that module's `# Hardening` section and
+    // its escape-path tests.
     let pad = RASTER_PAD as f32;
-    let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * RASTER_PAD, h + 2 * RASTER_PAD);
+    let mut ras = crate::raster::Rasterizer::new(w + 2 * RASTER_PAD, h + 2 * RASTER_PAD);
     let mut b = OutlineToRaster {
         ras: &mut ras,
         scale,
         ox: x_min - pad,
         oy: y_max + pad,
-        last: ab_glyph_rasterizer::point(0.0, 0.0),
-        start: ab_glyph_rasterizer::point(0.0, 0.0),
+        last: crate::raster::point(0.0, 0.0),
+        start: crate::raster::point(0.0, 0.0),
     };
     // `outline_glyph` returns None for a glyph with no outline — already handled by the
     // bbox check, but stay defensive (fall back rather than emit an all-zero raster).
@@ -451,12 +463,12 @@ pub fn varied_glyph_raster_with_face(
 }
 
 /// Slack, in px, between the ink box and the coverage grid every
-/// `ab_glyph_rasterizer` fill in this crate actually rasterizes into. The
+/// [`crate::raster`] fill in this crate actually rasterizes into. The
 /// outline is translated by this much so it can NEVER touch the grid's
 /// boundary; [`crop_padded_coverage`] reads the ink box back out, so the
 /// returned mask and its `(width, height, xmin, ymin)` metrics are unchanged.
 ///
-/// WHY (the ppem-19 broken-digit bug): `ab_glyph_rasterizer` marches a
+/// WHY (the ppem-19 broken-digit bug): the rasterizer marches a
 /// segment's `x` INCREMENTALLY down its scanlines (`x += dxdy * dy`), so `x`
 /// at the last scanline drifts a fraction of an ULP off the segment's true
 /// endpoint. That is harmless in the grid's interior — but a segment sitting
@@ -491,7 +503,7 @@ pub(crate) const RASTER_PAD: usize = 1;
 /// ring is discarded: by construction it can only hold antialiasing spill from
 /// an edge that is already inside the box.
 pub(crate) fn crop_padded_coverage(
-    ras: &ab_glyph_rasterizer::Rasterizer,
+    ras: &crate::raster::Rasterizer,
     w: usize,
     h: usize,
 ) -> Vec<u8> {
@@ -510,24 +522,24 @@ pub(crate) fn crop_padded_coverage(
     cov
 }
 
-/// Feeds a ttf-parser glyph outline (design units, y-UP) into an `ab_glyph_rasterizer`
+/// Feeds a ttf-parser glyph outline (design units, y-UP) into a [`crate::raster`]
 /// coverage grid (pixels, y-DOWN, origin at the ink box's top-left).
 struct OutlineToRaster<'a> {
-    ras: &'a mut ab_glyph_rasterizer::Rasterizer,
+    ras: &'a mut crate::raster::Rasterizer,
     scale: f32,
     ox: f32, // ink-box left edge, in px (subtracted)
     oy: f32, // ink-box top edge, in px (y is flipped about it)
-    last: ab_glyph_rasterizer::Point,
-    start: ab_glyph_rasterizer::Point,
+    last: crate::raster::Point,
+    start: crate::raster::Point,
 }
 
 impl OutlineToRaster<'_> {
     #[inline]
-    fn map(&self, x: f32, y: f32) -> ab_glyph_rasterizer::Point {
-        ab_glyph_rasterizer::point(x * self.scale - self.ox, self.oy - y * self.scale)
+    fn map(&self, x: f32, y: f32) -> crate::raster::Point {
+        crate::raster::point(x * self.scale - self.ox, self.oy - y * self.scale)
     }
     /// Close the current contour with an implicit segment back to its start (TrueType/
-    /// CFF outlines are implicitly closed; ab_glyph needs the closing edge for winding).
+    /// CFF outlines are implicitly closed; the rasterizer needs the closing edge for winding).
     fn close_contour(&mut self) {
         if self.last != self.start {
             self.ras.draw_line(self.last, self.start);
@@ -651,7 +663,7 @@ mod tests {
     /// [`RASTER_PAD`] EXISTS, demonstrated on the exact geometry that ate the
     /// hinted `'2'` at ppem 19 — no font, no hinter, just the rasterizer.
     ///
-    /// `ab_glyph_rasterizer` marches a segment's x incrementally
+    /// [`crate::raster`] marches a segment's x incrementally
     /// (`xnext = x + dxdy * dy`), and for the segment
     /// `(1.828125, 0.21875) → (0.0, 0.875)` that arithmetic overshoots to
     /// `-1.19e-7`: `floor()` is `-1`, `linestart + x0i` is negative, and the
@@ -675,8 +687,8 @@ mod tests {
         let ink_at = |pad: usize| {
             let (w, h) = (2usize, 3usize);
             let (gw, gh) = (w + 2 * pad, h + 2 * pad);
-            let mut ras = ab_glyph_rasterizer::Rasterizer::new(gw, gh);
-            let m = |p: &(f32, f32)| ab_glyph_rasterizer::point(p.0 + pad as f32, p.1 + pad as f32);
+            let mut ras = crate::raster::Rasterizer::new(gw, gh);
+            let m = |p: &(f32, f32)| crate::raster::point(p.0 + pad as f32, p.1 + pad as f32);
             for i in 0..3 {
                 ras.draw_line(m(&tri[i]), m(&tri[(i + 1) % 3]));
             }
@@ -738,14 +750,14 @@ mod tests {
                 let bbox = face.glyph_bounding_box(g).expect("an inked glyph has a bbox");
                 let x_min = (f32::from(bbox.x_min) * scale).floor();
                 let y_max = (f32::from(bbox.y_max) * scale).ceil();
-                let mut ras = ab_glyph_rasterizer::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
+                let mut ras = crate::raster::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
                 let mut b = OutlineToRaster {
                     ras: &mut ras,
                     scale,
                     ox: x_min - SLACK as f32,
                     oy: y_max + SLACK as f32,
-                    last: ab_glyph_rasterizer::point(0.0, 0.0),
-                    start: ab_glyph_rasterizer::point(0.0, 0.0),
+                    last: crate::raster::point(0.0, 0.0),
+                    start: crate::raster::point(0.0, 0.0),
                 };
                 face.outline_glyph(g, &mut b)
                     .expect("the glyph we just drew still draws");

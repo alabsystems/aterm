@@ -28,7 +28,7 @@
 //! wakeups), and emits identical premultiplied quads on the CPU and Metal
 //! backends. Honours WATER-1: nothing here is a beam — only water.
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_render::{GlowQuad, premul_rgb};
 

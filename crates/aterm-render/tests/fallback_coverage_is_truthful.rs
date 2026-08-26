@@ -74,9 +74,15 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
     };
     r.debug_block_on_lazy_fallbacks();
     let mut homes = std::collections::BTreeSet::new();
-    for ch in "한국어 조합 테스트".chars().filter(|c| !c.is_whitespace()) {
-        if let Some(path) = r.debug_fallback_pick_path(ch) {
+    let mut resolved = 0usize;
+    let syllables: Vec<char> = "한국어 조합 테스트"
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    for ch in &syllables {
+        if let Some(path) = r.debug_fallback_pick_path(*ch) {
             homes.insert(path);
+            resolved += 1;
         }
     }
     assert!(
@@ -85,4 +91,39 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
          symptom of a face claiming coverage it does not have",
         homes.len()
     );
+    // NON-VACUITY. `homes` is EMPTY when no face resolves any syllable — i.e.
+    // when the whole word is `.notdef` tofu, which is strictly worse than the
+    // split above. `0 <= 1` holds, so this test passed happily through exactly
+    // that state: on Windows the built-in chain carried no Hangul face at all
+    // and `한국어` rendered as three boxes while this gate stayed green. Only
+    // assert where a Hangul face is known to be installed, so a genuinely
+    // font-less host still skips instead of failing.
+    if hangul_face_installed() {
+        assert_eq!(
+            resolved,
+            syllables.len(),
+            "a Hangul face IS installed, but only {resolved} of {} syllables \
+             resolved to any face — the unresolved ones render as tofu",
+            syllables.len()
+        );
+    }
+}
+
+/// Whether this host has a face that is known to carry Hangul, read from the
+/// FILESYSTEM rather than from the candidate list — asking the list would turn
+/// "someone deleted the Hangul face from the chain" into a silent skip, i.e.
+/// precisely the regression the caller exists to catch.
+fn hangul_face_installed() -> bool {
+    const KNOWN_HANGUL_FACES: &[&str] = &[
+        // Windows
+        "C:\\Windows\\Fonts\\malgun.ttf",
+        // macOS (Arial Unicode carries the syllables)
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        // Linux
+        "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    ];
+    KNOWN_HANGUL_FACES
+        .iter()
+        .any(|p| std::path::Path::new(p).is_file())
 }

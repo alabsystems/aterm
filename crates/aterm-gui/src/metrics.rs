@@ -321,8 +321,7 @@ const fn past_arm_window_step(packed: u64, past: bool) -> (u64, bool) {
             next
         }
     };
-    let trigger =
-        seen == PAST_ARM_WINDOW as u64 && bits.count_ones() >= PAST_ARM_WINDOW_TRIGGER;
+    let trigger = seen == PAST_ARM_WINDOW as u64 && bits.count_ones() >= PAST_ARM_WINDOW_TRIGGER;
     ((seen << 32) | bits, trigger)
 }
 
@@ -751,7 +750,15 @@ impl StartupAttachMilestones {
     /// drill-down and `derive_startup_attach` can never disagree about which
     /// pair of points the phase is.
     fn backend_finalize_bounds(self) -> (Instant, Instant) {
-        let [_, _, _, before_backend_finalize, after_backend_finalize, _, _] = self.points;
+        let [
+            _,
+            _,
+            _,
+            before_backend_finalize,
+            after_backend_finalize,
+            _,
+            _,
+        ] = self.points;
         (before_backend_finalize, after_backend_finalize)
     }
 }
@@ -1582,8 +1589,9 @@ pub fn note_capture_episode(active: bool) {
         // Saturating: an unpaired close (a recording finalized twice, or one
         // that began before `reset` zeroed the depth) must not wrap the depth to
         // u64::MAX and taint the ledger for the rest of the process.
-        let _ = CAPTURE_DEPTH
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)));
+        let _ = CAPTURE_DEPTH.try_update(Ordering::Relaxed, Ordering::Relaxed, |d| {
+            Some(d.saturating_sub(1))
+        });
     }
     arm_present_taint();
 }
@@ -2608,8 +2616,14 @@ pub struct Snapshot {
     /// `startup_gpu_font_join_ns`, which is what the GPU leg actually paid.
     pub startup_gpu_font_thread_ns: u64,
     pub startup_gpu_font_join_ns: u64,
-    /// `GpuRenderer::from_parts` — all thirteen pipelines, 26 shader compiles on
-    /// Metal. Parent of every `startup_gpu_pipe_*` field.
+    /// `GpuRenderer::from_parts` — the FOUR pipelines a launch builds (the three
+    /// cell pipelines every frame binds, plus the bloom composite). Parent of
+    /// every `startup_gpu_pipe_*` field.
+    ///
+    /// It was THIRTEEN until the nine effect-only cell pipelines went
+    /// demand-driven (`aterm_gpu::EffectPipeline`): on a dx12 Windows launch
+    /// those nine measured 136.13 ms of a 174.43 ms total, all of it on
+    /// time-to-first-present, for effects the shipped defaults never draw.
     pub startup_gpu_pipelines_ns: u64,
     pub startup_gpu_pipe_shader_ns: u64,
     pub startup_gpu_pipe_uniform_atlas_ns: u64,
@@ -2625,6 +2639,25 @@ pub struct Snapshot {
     /// Per-cell-pipeline split of `startup_gpu_pipe_cell_ns`, in
     /// `aterm_gpu::startup_probe::CELL_PIPELINE_NAMES` order.
     pub startup_gpu_cell_pipeline_ns: [u64; aterm_gpu::startup_probe::CELL_PIPELINE_COUNT],
+    /// How many EFFECT-only cell pipelines this process has compiled on demand,
+    /// and the wall time it spent (`aterm_gpu::startup_probe::effect_build_ledger`).
+    ///
+    /// NOT part of the `startup_gpu_*` partition and deliberately outside its
+    /// reconciliation: those legs close against `startup_worker_gpu_build_ns` and
+    /// are first-write-wins cold-build facts, whereas this ledger ACCUMULATES for
+    /// the life of the process — an effect switched on at minute ten books a
+    /// build here long after the startup partition sealed.
+    ///
+    /// `0 / 0` is the healthy reading for a default launch and is the standing
+    /// proof of the demand-driven design: the nine effect pipelines cost
+    /// **136.13 ms of every launch** while they were built eagerly, for pixels a
+    /// `cursor_trail = false` config never draws.
+    pub effect_pipeline_builds: u64,
+    pub effect_pipeline_build_ns: u64,
+    /// WHICH slots were built, as a bitmask over `aterm_gpu::EffectPipeline as
+    /// usize` (indexes `aterm_gpu::EFFECT_PIPELINE_NAMES`). The count says a
+    /// launch paid for something; only this says what.
+    pub effect_pipeline_built_mask: u64,
 }
 
 /// Read the current counters (lock-free).
@@ -2640,13 +2673,14 @@ pub fn snapshot() -> Snapshot {
     // STARTUP_PRESENT: every stamp it needs is set long before the first
     // present (the join precedes the first frame by construction), and reading
     // them here keeps the immutable present-anchored fact one struct smaller.
-    let (join_entry, join_exit) = INITIAL_ATTACH_MILESTONES
-        .get()
-        .copied()
-        .map_or((None, None), |milestones| {
-            let (entry, exit) = milestones.backend_finalize_bounds();
-            (Some(entry), Some(exit))
-        });
+    let (join_entry, join_exit) =
+        INITIAL_ATTACH_MILESTONES
+            .get()
+            .copied()
+            .map_or((None, None), |milestones| {
+                let (entry, exit) = milestones.backend_finalize_bounds();
+                (Some(entry), Some(exit))
+            });
     let worker = derive_startup_worker(
         BACKEND_WORKER_SPAWN.get().copied(),
         BACKEND_WORKER_DONE.get().copied(),
@@ -2655,6 +2689,12 @@ pub fn snapshot() -> Snapshot {
         join_exit,
     );
     let gpu = derive_startup_gpu(worker.gpu_build_ns);
+    // Read STRAIGHT from the probe, outside `derive_startup_gpu`: the demand-build
+    // ledger is a running total for the life of the process, not a cold-build leg,
+    // so it must not be folded into (or invalidated by) the startup partition's
+    // reconciliation against `gpu_build_ns`.
+    let (effect_builds, effect_build_ns, effect_built_mask) =
+        aterm_gpu::startup_probe::effect_build_ledger();
     Snapshot {
         frames_presented,
         last_present_latency_ns: LAST_PRESENT_LATENCY_NS.load(Ordering::Relaxed),
@@ -2772,6 +2812,9 @@ pub fn snapshot() -> Snapshot {
         startup_gpu_pipe_tail_ns: gpu.pipe_tail_ns,
         startup_gpu_tail_ns: gpu.tail_ns,
         startup_gpu_cell_pipeline_ns: gpu.cell_pipeline_ns,
+        effect_pipeline_builds: effect_builds,
+        effect_pipeline_build_ns: effect_build_ns,
+        effect_pipeline_built_mask: effect_built_mask,
     }
 }
 
@@ -2857,11 +2900,35 @@ mod startup_worker_tests {
         let join_exit = done + Duration::from_millis(1);
         // Each row drops exactly one input; every one must publish nothing.
         for (spawn, done, legs, entry, exit) in [
-            (None, Some(done), Some(legs()), Some(join_entry), Some(join_exit)),
-            (Some(spawn), None, Some(legs()), Some(join_entry), Some(join_exit)),
-            (Some(spawn), Some(done), None, Some(join_entry), Some(join_exit)),
+            (
+                None,
+                Some(done),
+                Some(legs()),
+                Some(join_entry),
+                Some(join_exit),
+            ),
+            (
+                Some(spawn),
+                None,
+                Some(legs()),
+                Some(join_entry),
+                Some(join_exit),
+            ),
+            (
+                Some(spawn),
+                Some(done),
+                None,
+                Some(join_entry),
+                Some(join_exit),
+            ),
             (Some(spawn), Some(done), Some(legs()), None, Some(join_exit)),
-            (Some(spawn), Some(done), Some(legs()), Some(join_entry), None),
+            (
+                Some(spawn),
+                Some(done),
+                Some(legs()),
+                Some(join_entry),
+                None,
+            ),
         ] {
             let sample = derive_startup_worker(spawn, done, legs, entry, exit);
             assert!(!sample.valid);
@@ -3520,8 +3587,9 @@ mod histogram_tests {
             PAST_ARM_HISTORY_BY_OWNER[owner as usize].store(0, Ordering::Relaxed);
             PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].store(0, Ordering::Relaxed);
         };
-        let heals_of =
-            |owner: DeadlineOwner| PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].load(Ordering::Relaxed);
+        let heals_of = |owner: DeadlineOwner| {
+            PAST_ARM_STREAK_HEALS_BY_OWNER[owner as usize].load(Ordering::Relaxed)
+        };
         let now = Instant::now();
         let future = now + Duration::from_millis(5);
         // 1 ms late: UNDER the 250 ms floor, so the consecutive-turn heal
@@ -3618,7 +3686,11 @@ mod histogram_tests {
             Some(now + STALE_ARM_HEAL_FLOOR),
             "the stronger (floor) clamp wins over the frame clamp"
         );
-        assert_eq!(heals_of(left), 2, "an arm the floor heal owns is not re-counted");
+        assert_eq!(
+            heals_of(left),
+            2,
+            "an arm the floor heal owns is not re-counted"
+        );
 
         // Leave neither latch nor window residue behind for other tests.
         assert_eq!(record_deadline(left, Some(future), now), Some(future));
@@ -3798,7 +3870,10 @@ mod histogram_tests {
             "one close does not end two overlapping captures"
         );
         note_capture_episode(false);
-        assert!(!snapshot().capture_active, "the last close ends the episode");
+        assert!(
+            !snapshot().capture_active,
+            "the last close ends the episode"
+        );
         note_capture_episode(false); // unpaired: a double finalize
         assert!(
             !snapshot().capture_active,

@@ -428,9 +428,9 @@ pub struct VideoTap {
     /// Local monotonic origin for the fps gate. The gate only ever compares
     /// spacing on this one clock, so it needs no shared epoch with the
     /// `metrics::now_us` frame stamps.
-    // web-time so the type/clock matches the renderer's wasm-safe present clocks;
+    // aterm-time so the type/clock matches the renderer's wasm-safe present clocks;
     // native builds get std's Instant unchanged (video tap is a native feature).
-    epoch: web_time::Instant,
+    epoch: aterm_time::Instant,
     seq: u64,
     half_res: bool,
     /// Source swapchain geometry/format the ring was built for; a mismatch at
@@ -774,7 +774,7 @@ impl VideoTap {
             fps_cap: opts.fps_cap.map(|f| f.clamp(1, 120)),
             requested_ms: opts.requested_ms,
             next_capture_us: 0,
-            epoch: web_time::Instant::now(),
+            epoch: aterm_time::Instant::now(),
             seq: 0,
             half_res: opts.half_res,
             src_w,
@@ -1761,7 +1761,7 @@ mod tests {
             fps_cap,
             requested_ms: 0,
             next_capture_us: 0,
-            epoch: web_time::Instant::now(),
+            epoch: aterm_time::Instant::now(),
             seq: 0,
             half_res: false,
             src_w: 2,

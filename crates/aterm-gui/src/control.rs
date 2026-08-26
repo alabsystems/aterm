@@ -5241,6 +5241,15 @@ fn cross_input(
             // Cross-session verbs run on the CONTROL thread (expendable): block under
             // SPILL_CAP so a machine-rate driver into a wedged target feels
             // backpressure here rather than growing the target sink's spill.
+            //
+            // This bypasses the App input seam by design, so an in-flight
+            // `video ... keys` recording cannot log it. Count the attempts it
+            // carries so the recording can SAY that, rather than publishing a
+            // silent zero. A `focus` (the other event that reaches this arm) is
+            // not an attempt and the classifier contributes nothing for it —
+            // announcing a gap for a verb the ledger never records would be its
+            // own kind of dishonesty.
+            crate::note_unseamed_control_input(&ev);
             seam_egress(term, &ctx.sink, &ev, EgressMode::Backpressured);
             "OK\n".to_string()
         }

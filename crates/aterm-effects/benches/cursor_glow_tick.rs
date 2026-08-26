@@ -416,7 +416,7 @@ struct Fixture {
     geom: Geom,
     /// The injected clock. Advanced by exactly `dt` per step; never sampled
     /// from the wall (the wall clock belongs to criterion alone).
-    now: web_time::Instant,
+    now: aterm_time::Instant,
     dt: Duration,
     quads: Vec<GlowQuad>,
     row: u16,
@@ -449,7 +449,7 @@ impl Fixture {
             // ONE wall sample, for the clock's origin only: from here the clock
             // is advanced by a fixed dt and never read from the wall again, so
             // the whole run is reproducible.
-            now: web_time::Instant::now(),
+            now: aterm_time::Instant::now(),
             dt,
             quads: Vec::new(),
             row: 4,

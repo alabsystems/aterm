@@ -155,12 +155,22 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Fill `buf` with cryptographically-secure random bytes from the OS CSPRNG.
 /// Panics only if the OS RNG is unavailable (a fatal startup condition).
-// Skip: bottoms out at `rand_core::OsRng::fill_bytes` (absent body wrapping
-// the OS entropy syscall) whose only panic is the documented fatal
-// no-OS-RNG condition — the same audited OsRng assumption as
-// aterm-shell-integration's `generate_nonce`. Verify-only; behavior unchanged.
+///
+/// Routed through [`aterm_uds::rand::fill`] — the workspace's ONE audited
+/// entropy surface (`getentropy(2)` with a bounded `read_exact` fallback on
+/// unix, `BCryptGenRandom` on Windows), the rule `tools/grep_guard.sh` B4
+/// enforces after the 2026-07-04/05 unbounded-`/dev/urandom` kernel panic.
+/// Retiring `rand_core::OsRng` here removes the crate from the shipped graph
+/// AND collapses two entropy surfaces into the audited one.
+// Skip: bottoms out at `aterm_uds::rand::fill`, whose body is the `getentropy(2)`
+// FFI call the verifier cannot see; its only panic here is the deliberate
+// fail-loud `expect` on a fatal no-OS-RNG condition — the same documented
+// external assumption as aterm-shell-integration's `generate_nonce`.
+// Verify-only; behavior unchanged.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn fill_random(buf: &mut [u8]) {
-    use rand_core::RngCore;
-    rand_core::OsRng.fill_bytes(buf);
+    // Fail LOUD rather than mint a guessable session id or launch nonce: an
+    // unavailable OS CSPRNG is a fatal startup condition, and a silent weaker
+    // fallback is exactly the failure this crate's ids must not have.
+    aterm_uds::rand::fill(buf).expect("OS CSPRNG unavailable: cannot mint session identifiers");
 }

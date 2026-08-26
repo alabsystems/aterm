@@ -42,7 +42,7 @@ mod about;
 mod accessibility;
 /// Cross-platform AccessKit adapter for transient/compatibility overlays; native
 /// Settings and Manual use `native_accessibility` below.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 mod accesskit_tree;
 /// Keystroke routing for the native confirmation alerts (the multi-line-paste sheet
 /// and the app-modal close/quit alert): the pure accept/cancel/pass-through decision
@@ -73,7 +73,7 @@ mod app_kitty;
 mod app_launch_successor;
 mod app_mouse;
 mod app_native;
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 mod app_native_accessibility;
 mod app_palette;
 mod app_rename;
@@ -246,7 +246,7 @@ mod menu;
 mod metrics;
 /// W11: MotionPolicy — the single accessibility gate for decorative animation.
 mod motion;
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 mod native_accessibility;
 mod native_app;
 mod native_appearance;
@@ -2679,7 +2679,7 @@ enum Wake {
     /// initial-tree request, an OS action request (a screen reader activated/focused a
     /// control), or deactivation — delivered via the event-loop proxy. Only exists under
     /// the non-default `a11y-accesskit` feature; the production `Wake` never has it.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     Accessibility(accesskit_winit::Event),
     /// Phase 0.5 (A.2.3): a control verb built one or more engine-neutral
     /// [`InputEvent`]s and needs the main thread — the SOLE owner of term
@@ -3271,7 +3271,7 @@ mod pressure_shed_tests {
 
 /// `accesskit_winit::Adapter::with_event_loop_proxy` requires the proxy's event type to
 /// be `From<accesskit_winit::Event>`, so adapter events arrive as `Wake::Accessibility`.
-#[cfg(feature = "a11y-accesskit")]
+#[cfg(a11y_tree)]
 impl From<accesskit_winit::Event> for Wake {
     fn from(event: accesskit_winit::Event) -> Self {
         Wake::Accessibility(event)
@@ -6031,11 +6031,18 @@ struct VideoRec {
     /// Start stamp (µs, `metrics::now_us` clock) for index.json's wall window.
     started_us: u64,
     /// Opt-in input-attempt log (owner-only, recording-lifetime, wiped at dump):
-    /// `(t_us, char)` on the SAME clock as the frame stamps. Entries are observed
+    /// `(t_us, sample)` on the SAME clock as the frame stamps. Entries are observed
     /// before input routing and are not PTY-delivery or visible-frame receipts;
     /// the later frame analysis reports whether any visible response followed.
     keys: bool,
-    key_log: Vec<(u64, char)>,
+    key_log: Vec<(u64, VideoInputSample)>,
+    /// Snapshot of [`unseamed_control_inputs`] taken at begin. Finalize reports
+    /// the DELTA so a `keys` recording can state, as a number, how many input
+    /// egresses happened during the take on a path this ledger structurally
+    /// cannot observe (the cross-session control-thread egress). Without it an
+    /// empty `inputs` array is indistinguishable from "nothing was typed" — the
+    /// exact silent-zero this instrument must never produce.
+    unseamed_at_begin: u64,
     /// Keep redraws flowing so the recording captures the render cadence rather
     /// than an idle screen's (correct) silence.
     /// The recording's honesty label (see [`VideoMode`]), decided at begin and
@@ -6064,61 +6071,256 @@ struct VideoRec {
     reply: std::sync::mpsc::Sender<control::Retained<String>>,
 }
 
-/// Visit the character-shaped ATTEMPTS represented by one controller input
-/// event for the opt-in `video keys` ledger. This is deliberately a pre-routing
-/// observation: it does not claim the event reached a PTY, survived shortcut or
-/// overlay handling, produced predictive echo, or changed a frame. A Kitty key
-/// release may write a CSI-u report to the child, but it is not a second input
-/// attempt and must not become a duplicate sample. `Text`/`Paste` can carry more
-/// than one character, while the control grammar represents Space as a named key.
+/// One entry in the opt-in `video ... keys` ledger.
+///
+/// A terminal's input alphabet is NOT the printable characters: `esc`, the
+/// arrows, the function keys and `backspace` are the keys an interactive TUI
+/// take is usually driven with, and none of them has a character. Representing
+/// the ledger as bare `char` meant every one of those attempts fell out of the
+/// log silently — the instrument reported zero for a take that measured many.
+/// So a sample is either the character-shaped attempt or the NAMED key itself
+/// (carried by value: `NamedKey` is `Copy`, so the input path still allocates
+/// nothing; the encode worker formats the name into JSON).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoInputSample {
+    /// A character-shaped attempt (`key a`, `send hi`, a `Text`/`Paste` run,
+    /// and the three named keys whose character is unambiguous — Space, Enter,
+    /// Tab). Emitted as `"ch"` in index.json.
+    Char(char),
+    /// A named key with no character of its own (`esc`, arrows, F-keys,
+    /// backspace/delete, home/end/page). Emitted as `"key"` in index.json.
+    Named(aterm_types::keyboard::NamedKey),
+}
+
+impl VideoInputSample {
+    /// The index.json object BODY for this sample (no braces), so both the
+    /// `inputs[]` rows and the `analysis.key_response` rows name a sample the
+    /// same way. Runs on the encode worker, never on the input path.
+    pub(crate) fn json_field(self) -> String {
+        match self {
+            VideoInputSample::Char(ch) => {
+                let esc = match ch {
+                    '"' => "\\\"".to_string(),
+                    '\\' => "\\\\".to_string(),
+                    c if c.is_control() => format!("\\u{:04x}", c as u32),
+                    c => c.to_string(),
+                };
+                format!("\"ch\":\"{esc}\"")
+            }
+            // `NamedKey`'s Debug is a bare Rust identifier (`ArrowUp`, `F1`,
+            // `Escape`) — JSON-safe with no escaping needed.
+            VideoInputSample::Named(named) => format!("\"key\":\"{named:?}\""),
+        }
+    }
+}
+
+/// The ledger sample for one engine-level key, or `None` when the key is not an
+/// input ATTEMPT at all (a bare modifier or lock key expresses no intent and
+/// would only add noise to the correlation).
+fn video_sample_for_key(key: &aterm_types::keyboard::Key) -> Option<VideoInputSample> {
+    use aterm_types::keyboard::{Key, NamedKey};
+    match key {
+        Key::Character(ch) => Some(VideoInputSample::Char(*ch)),
+        Key::Named(named) => match named {
+            // The three named keys with an unambiguous character keep their
+            // historical character representation.
+            NamedKey::Space => Some(VideoInputSample::Char(' ')),
+            NamedKey::Enter => Some(VideoInputSample::Char('\n')),
+            NamedKey::Tab => Some(VideoInputSample::Char('\t')),
+            // Bare modifiers / locks are not attempts.
+            NamedKey::ShiftLeft
+            | NamedKey::ShiftRight
+            | NamedKey::ControlLeft
+            | NamedKey::ControlRight
+            | NamedKey::AltLeft
+            | NamedKey::AltRight
+            | NamedKey::SuperLeft
+            | NamedKey::SuperRight
+            | NamedKey::HyperLeft
+            | NamedKey::HyperRight
+            | NamedKey::MetaLeft
+            | NamedKey::MetaRight
+            | NamedKey::CapsLock
+            | NamedKey::NumLock
+            | NamedKey::ScrollLock => None,
+            // Everything else IS an attempt and is now named rather than dropped.
+            other => Some(VideoInputSample::Named(*other)),
+        },
+        // `Key` is `#[non_exhaustive]`: a future variant is not yet classifiable,
+        // and inventing a sample for it would be a fabricated measurement.
+        _ => None,
+    }
+}
+
+/// Visit the ATTEMPTS represented by one controller input event for the opt-in
+/// `video keys` ledger. This is deliberately a pre-routing observation: it does
+/// not claim the event reached a PTY, survived shortcut or overlay handling,
+/// produced predictive echo, or changed a frame. A Kitty key release may write a
+/// CSI-u report to the child, but it is not a second input attempt and must not
+/// become a duplicate sample. `Text`/`Paste` can carry more than one character.
+///
+/// `KeySequence` is the RAW-BYTE event the ACTIVE-TAB `send` and `feed` verbs
+/// build (`control.rs`'s `front_routed_input` arms) — the very verbs the
+/// documented key→photon recipe is driven with. It used to fall through this
+/// match's catch-all, so a whole `video … keys` take driven with `send`/`feed`
+/// produced an EMPTY `inputs` array that was indistinguishable from "the driver
+/// never typed". The bytes are decoded as UTF-8 in place (invalid bytes become
+/// U+FFFD, one per maximal invalid subpart) so the recipe measures what it drove.
 ///
 /// The callback returns whether iteration should continue, letting the caller
 /// stop at the recording's fixed key-log cap without scanning an arbitrarily
 /// large paste.  There is no allocation on the input path.
-fn visit_controller_video_attempt_chars(ev: &InputEvent, mut visit: impl FnMut(char) -> bool) {
-    use aterm_types::keyboard::{Key, KeyEventType, NamedKey};
+fn visit_controller_video_attempt_samples(
+    ev: &InputEvent,
+    mut visit: impl FnMut(VideoInputSample) -> bool,
+) {
+    use aterm_types::keyboard::KeyEventType;
 
     match ev {
         InputEvent::Text(text) | InputEvent::Paste(text) => {
             for ch in text.chars() {
-                if !visit(ch) {
+                if !visit(VideoInputSample::Char(ch)) {
                     break;
                 }
             }
         }
-        InputEvent::Key { event_type, .. } if *event_type == KeyEventType::Release => {}
-        InputEvent::Key {
-            key: Key::Character(ch),
-            ..
-        } => {
-            let _ = visit(*ch);
+        InputEvent::KeySequence(bytes) => {
+            visit_utf8_lossy_chars(bytes, |ch| visit(VideoInputSample::Char(ch)));
         }
-        InputEvent::Key {
-            key: Key::Named(named),
-            ..
-        } => {
-            let ch = match named {
-                NamedKey::Space => Some(' '),
-                NamedKey::Enter => Some('\n'),
-                NamedKey::Tab => Some('\t'),
-                _ => None,
-            };
-            if let Some(ch) = ch {
-                let _ = visit(ch);
+        InputEvent::Key { event_type, .. } if *event_type == KeyEventType::Release => {}
+        InputEvent::Key { key, .. } => {
+            if let Some(sample) = video_sample_for_key(key) {
+                let _ = visit(sample);
             }
         }
         _ => {}
     }
 }
 
+/// Decode `bytes` as UTF-8 IN PLACE (no allocation) and hand each `char` to
+/// `visit`; an invalid sequence yields exactly ONE U+FFFD per maximal invalid
+/// subpart, so the visited count equals `String::from_utf8_lossy(bytes)`'s char
+/// count without building the `String`. Stops early when `visit` returns `false`
+/// (the ledger cap).
+fn visit_utf8_lossy_chars(mut bytes: &[u8], mut visit: impl FnMut(char) -> bool) {
+    while !bytes.is_empty() {
+        match std::str::from_utf8(bytes) {
+            Ok(text) => {
+                for ch in text.chars() {
+                    if !visit(ch) {
+                        return;
+                    }
+                }
+                return;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                // SAFETY-free: `from_utf8` on the validated prefix cannot fail.
+                if let Ok(text) = std::str::from_utf8(&bytes[..valid_up_to]) {
+                    for ch in text.chars() {
+                        if !visit(ch) {
+                            return;
+                        }
+                    }
+                }
+                // One replacement per maximal invalid subpart; `None` means the
+                // tail is a truncated (but so far valid) sequence — the whole
+                // remainder is one subpart and there is nothing after it.
+                let skipped = error.error_len().unwrap_or(bytes.len() - valid_up_to);
+                if !visit(char::REPLACEMENT_CHARACTER) {
+                    return;
+                }
+                bytes = &bytes[valid_up_to + skipped..];
+            }
+        }
+    }
+}
+
 const VIDEO_KEY_LOG_CAP: usize = 1024;
 
-/// Append one controller event's character attempts to the bounded video key
-/// ledger. `cap` is a parameter solely so the Tier-1 conformance test can
-/// exhaust a tiny bounded instance; production always supplies
-/// [`VIDEO_KEY_LOG_CAP`].
+/// Process-wide count of input ATTEMPTS that reached a PTY on the CONTROL
+/// thread, bypassing the `App` input seam the `video ... keys` ledger hooks.
+/// This is the BACKGROUND-target path — a verb whose `@<sid>` names a session
+/// that is not the tab on screen (see `control::front_routed`; a selector that
+/// DOES name the front tab is front-routed and lands in the ledger normally) —
+/// plus the binary push frame's background arm. They deliberately never touch an
+/// active tab they do not own, and therefore CANNOT appear in a recording's
+/// ledger.
+///
+/// The unit is the LEDGER's unit — one per sample that would have become an
+/// `inputs[]` row had the same event gone through the seam — so a recording can
+/// print `inputs_logged` and `unlogged_inputs` side by side and have the two
+/// numbers mean the same thing. That is also why an event the ledger would
+/// never have recorded anyway (`focus`, `resize`, `scroll`, a bare modifier)
+/// contributes NOTHING: counting those would announce a measurement gap where
+/// none exists, which is the silent zero's mistake pointed the other way.
+///
+/// A recording snapshots this at begin and reports the DELTA, so an empty
+/// `inputs` array is never again indistinguishable from a take that genuinely
+/// measured zero: the artifact states, as a number, how many attempts went down
+/// a path it could not observe.
+static UNSEAMED_CONTROL_INPUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many `inputs[]` rows this event WOULD have produced had it gone through
+/// the App input seam — the unit [`UNSEAMED_CONTROL_INPUTS`] is counted in.
+/// Classified by the SAME visitor the seamed path uses, so the logged and the
+/// unlogged counter can never drift apart in what they call an attempt. No
+/// allocation: the visitor borrows.
+///
+/// PURE on purpose. The counter itself is process-wide, so a test can only
+/// assert `>=` on it; the CLASSIFICATION law — a `focus` is not an attempt, a
+/// three-byte `send` is three — is exact, and belongs on a function that shares
+/// no state with anything else running in the test binary.
+pub(crate) fn video_attempt_count(ev: &InputEvent) -> u64 {
+    let mut samples = 0u64;
+    visit_controller_video_attempt_samples(ev, |_| {
+        samples += 1;
+        true
+    });
+    samples
+}
+
+/// [`video_attempt_count`] for a RAW-BYTE egress (a `send`/`feed`/`feed-bin`
+/// aimed at a BACKGROUND session, which writes the payload straight to that
+/// session's PTY). Those bytes are exactly what a front-routed
+/// [`InputEvent::KeySequence`] would have put in the ledger, so they are counted
+/// the same way — decoded in place, no allocation.
+pub(crate) fn video_attempt_count_bytes(data: &[u8]) -> u64 {
+    let mut samples = 0u64;
+    visit_utf8_lossy_chars(data, |_| {
+        samples += 1;
+        true
+    });
+    samples
+}
+
+/// Add one control-thread input event's attempts to [`UNSEAMED_CONTROL_INPUTS`].
+pub(crate) fn note_unseamed_control_input(ev: &InputEvent) {
+    note_unseamed_control_attempts(video_attempt_count(ev));
+}
+
+/// Add one control-thread raw-byte egress's attempts to
+/// [`UNSEAMED_CONTROL_INPUTS`].
+pub(crate) fn note_unseamed_control_bytes(data: &[u8]) {
+    note_unseamed_control_attempts(video_attempt_count_bytes(data));
+}
+
+fn note_unseamed_control_attempts(samples: u64) {
+    if samples > 0 {
+        UNSEAMED_CONTROL_INPUTS.fetch_add(samples, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Read the process-wide unseamed-attempt count (see [`UNSEAMED_CONTROL_INPUTS`]).
+pub(crate) fn unseamed_control_inputs() -> u64 {
+    UNSEAMED_CONTROL_INPUTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Append one controller event's attempts to the bounded video key ledger.
+/// `cap` is a parameter solely so the Tier-1 conformance test can exhaust a
+/// tiny bounded instance; production always supplies [`VIDEO_KEY_LOG_CAP`].
 fn record_controller_video_attempts(
-    key_log: &mut Vec<(u64, char)>,
+    key_log: &mut Vec<(u64, VideoInputSample)>,
     ev: &InputEvent,
     t_us: u64,
     cap: usize,
@@ -6126,11 +6328,11 @@ fn record_controller_video_attempts(
     if key_log.len() >= cap {
         return;
     }
-    visit_controller_video_attempt_chars(ev, |ch| {
+    visit_controller_video_attempt_samples(ev, |sample| {
         if key_log.len() >= cap {
             return false;
         }
-        key_log.push((t_us, ch));
+        key_log.push((t_us, sample));
         true
     });
 }
@@ -7840,7 +8042,7 @@ struct WindowState {
     /// before the window is shown. Fans the Settings `Control` model out to the OS
     /// accessibility tree (`update_if_active(|| accesskit_tree::settings_tree(..))`).
     /// `None` until attached / headless. Only present under the `a11y-accesskit` feature.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     a11y: Option<accesskit_winit::Adapter>,
     /// Has an OS accessibility client actually ATTACHED to this window's adapter?
     ///
@@ -7860,15 +8062,15 @@ struct WindowState {
     /// `AccessibilityDeactivated`. While it is `false`, `push_a11y_tree` bails before building
     /// anything — the exact state `update_if_active` would have discarded, and the same state
     /// headless windows (`a11y: None`) have always been in.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     a11y_active: bool,
     /// AccessKit projection built from the exact `CompiledUi` used by the pending
     /// native frame. Consumed only after that frame presents successfully.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     native_a11y_staged: Option<native_accessibility::StagedNativeAccessibility>,
     /// Stable route table paired with the native tree most recently offered to
     /// AccessKit. View identity plus lifecycle generation reject late OS actions.
-    #[cfg(feature = "a11y-accesskit")]
+    #[cfg(a11y_tree)]
     native_a11y_published: Option<native_accessibility::PublishedNativeAccessibility>,
     /// Exact compiled semantic/layout artifact most recently staged for the
     /// active native app. Control inspection reuses it while its full live-input
@@ -9069,13 +9271,13 @@ impl WindowState {
             #[cfg(test)]
             find_bar_match_work: 0,
             overlay: None,
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             a11y: None,
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             a11y_active: false,
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             native_a11y_staged: None,
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             native_a11y_published: None,
             native_ui_compiled: None,
             settings_card: None,
@@ -11438,7 +11640,13 @@ impl App {
                 self.submit_encode_job(crate::app_introspect::EncodeJob::VideoDump {
                     take,
                     mode: rec.mode,
+                    keys_enabled: rec.keys,
                     inputs: rec.key_log,
+                    // How many input egresses took the control-thread path during
+                    // THIS take. Reported verbatim so a zero-length ledger can
+                    // never be mistaken for a quiet screen.
+                    unlogged_inputs: unseamed_control_inputs()
+                        .saturating_sub(rec.unseamed_at_begin),
                     started_us: rec.started_us,
                     dir: rec.dir,
                     reply: rec.reply,
@@ -13543,7 +13751,7 @@ impl App {
     /// the program echoed; the opt-in `predictive_echo = always` mode's "unsafe at a
     /// password prompt" tradeoff is mitigated by keeping it non-default, not by diverging
     /// the a11y tree from the frame.
-    #[cfg(any(feature = "a11y-appkit", feature = "a11y-accesskit"))]
+    #[cfg(any(feature = "a11y-appkit", a11y_tree))]
     fn grid_snapshot(&self, id: WindowId) -> Option<accessibility::AccessibleSnapshot> {
         let ws = self.windows.get(&id)?;
         let strip = self.tab_strip_rows as usize;
@@ -13569,7 +13777,7 @@ impl App {
         if let Some(snap) = self.grid_snapshot(id) {
             accessibility::apply_to_ns_view(window, &snap);
         }
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         self.push_a11y_tree(id);
     }
 
@@ -13580,7 +13788,7 @@ impl App {
     /// [`WindowState::a11y_active`], which is what actually makes that true; before the latch
     /// existed the whole tree was materialised first and only then discarded.
     #[cfg(all(
-        feature = "a11y-accesskit",
+        a11y_tree,
         not(all(target_os = "macos", feature = "a11y-appkit"))
     ))]
     fn update_accessibility(&mut self, id: WindowId, _window: &Window) {
@@ -13590,7 +13798,7 @@ impl App {
     /// No-op accessibility publish (neither a11y feature enabled).
     #[cfg(not(any(
         all(target_os = "macos", feature = "a11y-appkit"),
-        feature = "a11y-accesskit"
+        a11y_tree
     )))]
     #[inline]
     fn update_accessibility(&mut self, _id: WindowId, _window: &Window) {}
@@ -16706,6 +16914,10 @@ impl ApplicationHandler<Wake> for App {
                                 started_us: crate::metrics::now_us(),
                                 keys,
                                 key_log: Vec::new(),
+                                // Baseline for the "attempts this ledger CANNOT
+                                // see" disclosure; the delta at finalize is the
+                                // count for exactly this take.
+                                unseamed_at_begin: unseamed_control_inputs(),
                                 mode,
                                 // The offscreen loop's sole redraw driver: due
                                 // NOW, so `about_to_wait` arms WaitUntil(now)
@@ -16767,9 +16979,21 @@ impl ApplicationHandler<Wake> for App {
                             })
                             .and_then(|wg| self.backend.gpu_ref().and_then(|g| g.video_status(wg)))
                             .unwrap_or((0, false));
+                        // MID-FLIGHT HONESTY: a `keys` take publishes its running
+                        // ledger counts here, not only in the finalized dump. A
+                        // driver that polls after its first few keys learns
+                        // IMMEDIATELY that it is driving a path this ledger cannot
+                        // watch (inputs=0 unlogged=3) and can switch verbs while
+                        // the take is still worth something — instead of waiting
+                        // out the whole recording to read an empty `inputs[]`.
                         format!(
-                            "OK recording=true mode={} elapsed_ms={elapsed_ms} frames={frames} resized={resized}\n",
-                            rec.mode.as_str()
+                            "OK recording=true mode={} elapsed_ms={elapsed_ms} frames={frames} resized={resized}{}\n",
+                            rec.mode.as_str(),
+                            crate::app_introspect::video_keys_status_tokens(
+                                rec.keys,
+                                rec.key_log.len(),
+                                unseamed_control_inputs().saturating_sub(rec.unseamed_at_begin),
+                            ),
                         )
                     }
                     None if self.video_export.is_busy() => {
@@ -17485,7 +17709,7 @@ impl ApplicationHandler<Wake> for App {
                 }
             }
             // P2: an AccessKit adapter event (initial-tree request / OS action / deactivate).
-            #[cfg(feature = "a11y-accesskit")]
+            #[cfg(a11y_tree)]
             Wake::Accessibility(event) => self.on_accessibility_event(event),
             Wake::CursorMoveLicenseClear { session, reply } => {
                 let canceled = self.clear_move_license_for_session(session);
@@ -17699,7 +17923,7 @@ impl ApplicationHandler<Wake> for App {
         // P2: let this window's AccessKit adapter observe the event (it tracks focus and
         // dispatches OS a11y requests) before aterm handles it. `&event` borrows; the
         // `match event` below moves it afterward.
-        #[cfg(feature = "a11y-accesskit")]
+        #[cfg(a11y_tree)]
         if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone())
             && let Some(adapter) = self.windows.get_mut(&wid).and_then(|ws| ws.a11y.as_mut())
         {
@@ -17803,15 +18027,21 @@ impl ApplicationHandler<Wake> for App {
                     // frame capture. This is not a delivery receipt; later frame-diff
                     // analysis says only whether a visible response followed. Backdate
                     // identically so the correlation includes the queue age metrics see.
+                    //
+                    // Classified through the SAME `video_sample_for_key` the socket
+                    // path uses, so a hardware Enter / Escape / arrow is a named
+                    // sample rather than (as before) nothing at all: the old
+                    // `Key::Character` guard silently dropped every key a TUI take
+                    // is actually driven with.
                     if let Some(rec) = self.video_rec.as_mut()
                         && rec.keys
-                        && rec.key_log.len() < 1024
-                        && let winit::keyboard::Key::Character(s) = &event.logical_key
-                        && let Some(ch) = s.chars().next()
+                        && rec.key_log.len() < VIDEO_KEY_LOG_CAP
+                        && let Some(key) = aterm_winit_keymap::map_logical_key(&event.logical_key)
+                        && let Some(sample) = video_sample_for_key(&key)
                     {
                         rec.key_log.push((
                             crate::metrics::now_us().saturating_sub(queued_ns / 1000),
-                            ch,
+                            sample,
                         ));
                     }
                 }
@@ -35363,8 +35593,8 @@ mod headless_video_tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        Frame, PresentDropAccounting, PresentTarget, VideoCancellation, VideoMode, VideoRec,
-        WindowId, fold_video_deadlines, raw_present_capture_guard,
+        Frame, PresentDropAccounting, PresentTarget, VideoCancellation, VideoInputSample,
+        VideoMode, VideoRec, WindowId, fold_video_deadlines, raw_present_capture_guard,
         record_controller_video_attempts, require_explicit_capture_readback, video_capture_mode,
         video_capture_opacity_requires_abort, video_capture_translucency_guard,
         video_initial_next_frame, video_post_present_should_finalize,
@@ -35466,7 +35696,7 @@ mod headless_video_tests {
             3,
         );
         assert!(model.fire("RecordAttempt", &mut state));
-        assert_eq!(log, vec![(10, 'a')]);
+        assert_eq!(log, vec![(10, VideoInputSample::Char('a'))]);
 
         record_controller_video_attempts(
             &mut log,
@@ -35475,7 +35705,11 @@ mod headless_video_tests {
             3,
         );
         assert!(model.fire("IgnoreRelease", &mut state));
-        assert_eq!(log, vec![(10, 'a')], "release is not a second sample");
+        assert_eq!(
+            log,
+            vec![(10, VideoInputSample::Char('a'))],
+            "release is not a second sample"
+        );
 
         record_controller_video_attempts(
             &mut log,
@@ -35484,7 +35718,11 @@ mod headless_video_tests {
             3,
         );
         assert!(model.fire("RecordAttempt", &mut state));
-        assert_eq!(log.last(), Some(&(12, ' ')), "named Space is represented");
+        assert_eq!(
+            log.last(),
+            Some(&(12, VideoInputSample::Char(' '))),
+            "named Space is represented"
+        );
 
         record_controller_video_attempts(
             &mut log,
@@ -35493,7 +35731,11 @@ mod headless_video_tests {
             3,
         );
         assert!(model.fire("RecordAttempt", &mut state));
-        assert_eq!(log.last(), Some(&(13, 'r')), "repeat records one attempt");
+        assert_eq!(
+            log.last(),
+            Some(&(13, VideoInputSample::Char('r'))),
+            "repeat records one attempt"
+        );
         assert_eq!(log.len() as i64, state["logged"]);
         assert!(model.check_invariant("ExactAttemptLedger", &state));
 
@@ -35506,7 +35748,15 @@ mod headless_video_tests {
         let mut multi = Vec::new();
         record_controller_video_attempts(&mut multi, &InputEvent::Text("ab".into()), 20, 8);
         record_controller_video_attempts(&mut multi, &InputEvent::Paste(" c".into()), 21, 8);
-        assert_eq!(multi, vec![(20, 'a'), (20, 'b'), (21, ' '), (21, 'c')]);
+        assert_eq!(
+            multi,
+            vec![
+                (20, VideoInputSample::Char('a')),
+                (20, VideoInputSample::Char('b')),
+                (21, VideoInputSample::Char(' ')),
+                (21, VideoInputSample::Char('c'))
+            ]
+        );
 
         // Shortcut-shaped negative control: Ctrl-C may be consumed or encoded as
         // a control byte by the later routing seam. The pre-routing ledger still
@@ -35519,7 +35769,7 @@ mod headless_video_tests {
             30,
             3,
         );
-        assert_eq!(shortcut, vec![(30, 'c')]);
+        assert_eq!(shortcut, vec![(30, VideoInputSample::Char('c'))]);
 
         // Negative control: project the historical release-as-sample mutant;
         // the exact-ledger invariant must reject it, so the bind is non-vacuous.
@@ -35850,6 +36100,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::SwapchainTap,
             next_frame: None,
             dir,
@@ -35888,6 +36139,7 @@ mod headless_video_tests {
                 started_us: 0,
                 keys: false,
                 key_log: Vec::new(),
+                unseamed_at_begin: 0,
                 mode,
                 next_frame: None,
                 dir,
@@ -35942,6 +36194,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::SwapchainTap,
             next_frame: Some(Instant::now()),
             dir,
@@ -35978,6 +36231,7 @@ mod headless_video_tests {
                 started_us: 0,
                 keys: false,
                 key_log: Vec::new(),
+                unseamed_at_begin: 0,
                 mode,
                 next_frame: Some(Instant::now()),
                 dir,
@@ -36006,6 +36260,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(Instant::now()),
             dir,
@@ -36047,6 +36302,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(now),
             dir,
@@ -36108,6 +36364,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::SwapchainTap,
             next_frame: None,
             dir,
@@ -36144,6 +36401,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(now - Duration::from_millis(5)),
             dir,
@@ -36175,6 +36433,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(armed_frame),
             dir,
@@ -36216,6 +36475,7 @@ mod headless_video_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            unseamed_at_begin: 0,
             mode: VideoMode::OffscreenPresentReal,
             next_frame: Some(now),
             dir,

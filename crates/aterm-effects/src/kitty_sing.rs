@@ -56,7 +56,7 @@
 
 use std::time::Duration;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_scene::{PathCmd, PathTransform, Tile, fill_path};
 

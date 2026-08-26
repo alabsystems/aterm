@@ -249,10 +249,36 @@ const ALL_STYLES: [GlowStyle; 9] = [
 #[test]
 fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     // Captured on the PRE-license tree (see the module header).
+    //
+    // ONE ENTRY HAS BEEN RE-BASELINED, deliberately and on the record:
+    // `RainbowKitty` (index 2) moved 5_198_079_201_314_408_078 →
+    // 7_427_253_331_732_318_204 when the default dark ribbon's SPECTRUM and
+    // its typed-streak bloom were restored (owner, 2026-08-24: "I want it to
+    // look more like a rainbow!", "there used to be what looked like the jump
+    // streak drawing behind the cursor that was painted as typing"). That is a
+    // repaint of `emit_rainbow_underline_dark`, not a license effect, and no
+    // byte-exact golden can survive an intentional repaint.
+    //
+    // THE CLAUSE THIS FILE PROVES IS UNDAMAGED, and the diff is the proof: the
+    // other EIGHT styles' folds are bit-for-bit the pre-license numbers, and
+    // rainbow's own admission, envelopes, retract and spark population are
+    // untouched by the restoration (only the emitter that turns those sparks
+    // into quads changed). Re-baseline an entry here ONLY for a deliberate,
+    // owner-driven change to that style's emitter — never to quiet a failure
+    // whose cause is the license seam itself, which is the one thing this
+    // number exists to catch.
     const GOLDEN: [u64; 9] = [
         6_526_463_453_780_881_225,
         6_256_934_022_851_981_454,
-        5_198_079_201_314_408_078,
+        // RE-BASELINED 2026-08-26, entry 2 (rainbow) ONLY, for the deliberate
+        // owner-driven palette restoration: *"it's more of just arbitrary
+        // colors?"* The wake's hue spread is now derived from the plume's own
+        // reach (RAINBOW_WAKE_SWEEP_TRAVEL) so a hot plume travels the same
+        // amount of spectrum a resting one does instead of repeating it 6.9
+        // times. Every other style folded BYTE-IDENTICAL across the change,
+        // which is the evidence that only the rainbow emitter moved — the
+        // license seam itself still lays the pixel it always laid.
+        3_323_371_464_999_701_743,
         10_295_259_453_273_105_322,
         3_062_372_403_814_732_219,
         11_710_665_231_074_982_027,

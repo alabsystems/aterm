@@ -89,25 +89,71 @@ fn hex_digit(nibble: u64) -> char {
 
 /// Read 8 bytes of randomness from the OS.
 ///
-/// Falls back to nanosecond timestamp if the OS source is unavailable.
+/// Falls back to [`no_csprng_fallback`] if the OS source is unavailable.
 fn os_random_u64() -> u64 {
     let mut buf = [0u8; 8];
     if read_os_random(&mut buf) {
         u64::from_ne_bytes(buf)
     } else {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            // Equivalent to `d.as_nanos() as u64`: the truncating u128->u64
-            // cast is mod-2^64 reduction, and wrapping u64 arithmetic computes
-            // (secs * 1e9 + subsec_nanos) mod 2^64 exactly. Written this way
-            // because the verifier does not support 128-bit truncating casts.
-            .map(|d| {
-                d.as_secs()
-                    .wrapping_mul(1_000_000_000)
-                    .wrapping_add(u64::from(d.subsec_nanos()))
-            })
-            .unwrap_or(0)
+        no_csprng_fallback()
     }
+}
+
+/// The name seed to use when the OS CSPRNG is unavailable: a nanosecond wall
+/// clock. Not a CSPRNG and not claimed to be one — `unique_name` already mixes
+/// in the pid and a process-monotonic counter, so this only has to break ties
+/// between two processes that started in the same nanosecond.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn no_csprng_fallback() -> u64 {
+    // wasm-clock-guard: allow — this arm is compiled for every target EXCEPT
+    // wasm32-unknown-unknown, whose twin is the next function down. std's clock
+    // exists on all of them; the one target where it panics never sees this
+    // line.
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        // Equivalent to `d.as_nanos() as u64`: the truncating u128->u64
+        // cast is mod-2^64 reduction, and wrapping u64 arithmetic computes
+        // (secs * 1e9 + subsec_nanos) mod 2^64 exactly. Written this way
+        // because the verifier does not support 128-bit truncating casts.
+        .map(|d| {
+            d.as_secs()
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(u64::from(d.subsec_nanos()))
+        })
+        .unwrap_or(0)
+}
+
+/// `wasm32-unknown-unknown` arm of [`no_csprng_fallback`] — the ONE target
+/// where the clock arm above would be worse than useless.
+///
+/// This target has no OS CSPRNG (`read_os_random` is the `false` stub there),
+/// so this arm is not a rare fallback: it is the ONLY seed. And
+/// `std::time::SystemTime::now()` does not merely return a poor value there, it
+/// PANICS — "time not implemented on this platform" — which inside a
+/// wasm-bindgen `&mut self` method poisons the object's `RefCell` and makes
+/// every later access throw. `crates/aterm-gpu/tests/wasm_clock_safety.rs` is
+/// the guard that found this; aterm-tempfile is in `aterm-wasm`'s dependency
+/// closure through `aterm-core` and `aterm-grid`.
+///
+/// So the seed is a process-monotonic counter mixed by a 64-bit
+/// splitmix-style finalizer. There is exactly one wasm instance per module
+/// instantiation and no fork, so the counter alone already makes every name in
+/// this instance distinct — which is all `unique_name` needs from this value.
+/// Deliberately NOT dressed up as randomness: a browser caller that needs
+/// unpredictable bytes must take them from `crypto.getRandomValues`, which is
+/// not something a zero-dependency crate can reach.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn no_csprng_fallback() -> u64 {
+    static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut z = SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    // splitmix64's finalizer: avalanches the counter so consecutive names do
+    // not share a hex prefix. All wrapping, so it is total on every input.
+    // `/ 2^n` is `>> n` for unsigned; spelled as division because the verifier
+    // models unsigned division by a constant and does not model shifts (the
+    // same substitution `unique_name`'s hex loop makes).
+    z = (z ^ (z / 0x4000_0000)).wrapping_mul(0xBF58_476D_1CE4_E5B9); // >> 30
+    z = (z ^ (z / 0x0800_0000)).wrapping_mul(0x94D0_49BB_1331_11EB); // >> 27
+    z ^ (z / 0x8000_0000) // >> 31
 }
 
 // getentropy(2) FIRST, raw device read LAST — the one audited entropy pattern

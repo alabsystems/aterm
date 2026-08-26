@@ -168,27 +168,64 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
     }
 }
 
-/// Resolve a shell NAME the user asked for (config `shell` key, `--shell` flag,
-/// or `%ATERM_SHELL%`) to a runnable program. Precedence per name:
+/// What the spawn's own name resolution made of a requested shell — the verdict
+/// [`resolve_shell_name`] acts on, published so a VALIDATOR can ask the real
+/// resolver instead of modelling it.
+///
+/// Config validation used to re-implement this from POSIX habit (`execve` takes
+/// a path, so "a bare name cannot work") and consequently told Windows users
+/// that `pwsh` was broken and to write `/bin/zsh`. On Windows a bare name is the
+/// NORMAL spelling: it is resolved HERE, before `CreateProcessW` — which is
+/// handed the result as `lpApplicationName` and does no searching of its own.
+/// Exposing the verdict rather than the rule is what keeps the two in step.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellResolution {
+    /// A bare name the spawn's own resolution FOUND (alias discovery or
+    /// `SearchPathW`), carrying the absolute program it will actually run.
+    Resolved(OsString),
+    /// A bare name that resolved to nothing: `CreateProcessW` receives it
+    /// verbatim as `lpApplicationName` and fails `ERROR_FILE_NOT_FOUND`.
+    Unresolved,
+    /// Path-like (`\`, `/`, or a drive colon) — the user gave an explicit path,
+    /// used VERBATIM. No search, and no extension is appended.
+    Verbatim(OsString),
+}
+
+/// Classify a shell NAME exactly as the spawn will (see [`ShellResolution`]).
+/// Precedence per name:
 ///   1. path-like (`\`, `/`, or drive colon) → verbatim (the user gave a path);
 ///   2. a KNOWN ALIAS that is not on PATH → its well-known install location
 ///      ([`discover_shell`] — this is what makes `shell = "bash"` find Git Bash
 ///      even though its `bin` is off the user's PATH);
 ///   3. `SearchPathW` (`.exe` + `%PATHEXT%`) — a bare name on PATH;
-///   4. verbatim fallback → `CreateProcessW` fails cleanly, never a silent
-///      substitution of a different shell than the user named.
-pub(crate) fn resolve_shell_name(name: &OsStr) -> OsString {
+///   4. nothing matched → [`ShellResolution::Unresolved`].
+pub fn classify_shell_name(name: &OsStr) -> ShellResolution {
     let s = name.to_string_lossy();
     if is_path_like(&s) {
-        return name.to_os_string();
+        return ShellResolution::Verbatim(name.to_os_string());
     }
     if let Some(hit) = discover_shell(&s) {
-        return hit;
+        return ShellResolution::Resolved(hit);
     }
     if let Some(hit) = search_path(&s) {
-        return hit;
+        return ShellResolution::Resolved(hit);
     }
-    name.to_os_string()
+    ShellResolution::Unresolved
+}
+
+/// Resolve a shell NAME the user asked for (config `shell` key, `--shell` flag,
+/// or `%ATERM_SHELL%`) to a runnable program.
+///
+/// Defined IN TERMS OF [`classify_shell_name`] so the spawn and the config
+/// validator can never drift: there is one resolution, and this is the arm that
+/// turns its verdict into a program. An unresolved name falls back to the name
+/// verbatim so `CreateProcessW` fails cleanly, never a silent substitution of a
+/// different shell than the user named.
+pub(crate) fn resolve_shell_name(name: &OsStr) -> OsString {
+    match classify_shell_name(name) {
+        ShellResolution::Resolved(hit) | ShellResolution::Verbatim(hit) => hit,
+        ShellResolution::Unresolved => name.to_os_string(),
+    }
 }
 
 /// Find a KNOWN shell by alias at its standard install location — the discovery
@@ -335,6 +372,127 @@ pub(crate) fn resolve_spawn_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ask `CreateProcessW` what it makes of `program` as `lpApplicationName` —
+    /// the exact parameter [`super::super::spawn_shell_with_pid`] passes the
+    /// resolved shell in. `Ok(())` = it would run; `Err(code)` = the Win32 error
+    /// the spawn would surface.
+    ///
+    /// The probe is `CREATE_SUSPENDED` and terminates immediately on success:
+    /// the child runs ZERO instructions, so it never reaches the ntdll console
+    /// init that would allocate a console (and, on a box where Windows Terminal
+    /// is the default terminal, a WINDOW). Measuring must not litter the desktop.
+    fn create_process_verdict(program: &str) -> Result<(), u32> {
+        let app_w = wide_nul(OsStr::new(program));
+        // SAFETY: zeroed STARTUPINFOW is valid once `cb` is set; PROCESS_INFORMATION
+        // is POD out-memory; `app_w` is a NUL-terminated wide string alive across
+        // the call and every other pointer is NULL.
+        unsafe {
+            let mut si: ffi::STARTUPINFOW = std::mem::zeroed();
+            si.cb = u32::try_from(std::mem::size_of::<ffi::STARTUPINFOW>()).unwrap();
+            let mut pi: ffi::PROCESS_INFORMATION = std::mem::zeroed();
+            let ok = ffi::CreateProcessW(
+                app_w.as_ptr(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                0,
+                ffi::CREATE_SUSPENDED,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &si,
+                &mut pi,
+            );
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32);
+            }
+            ffi::TerminateProcess(pi.hProcess, 1);
+            ffi::CloseHandle(pi.hThread);
+            ffi::CloseHandle(pi.hProcess);
+            Ok(())
+        }
+    }
+
+    /// MEASURED, not assumed: what `lpApplicationName` accepts is the entire
+    /// justification for what `--validate-config` accepts and rejects, and a
+    /// validator that models it from POSIX habit is how a Windows user came to
+    /// be told to write `/bin/zsh`. Every arm below is a message that lane emits.
+    ///
+    /// The shape of the contract (and how it differs from `execve`):
+    ///   * an absolute path runs — with EITHER separator, Win32 canonicalizes
+    ///     `/` to `\`, so a forward-slash spelling is not a defect;
+    ///   * no default extension is appended — `…\cmd` is NOT `…\cmd.exe`;
+    ///   * NO path search — a bare name that got past resolution cannot run;
+    ///   * a quoted value is a FILENAME containing `"`, which is not a legal
+    ///     Windows filename character.
+    #[test]
+    fn create_process_application_name_contract() {
+        /// `ERROR_FILE_NOT_FOUND`.
+        const NOT_FOUND: u32 = 2;
+        /// `ERROR_INVALID_NAME`.
+        const INVALID_NAME: u32 = 123;
+
+        let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        let cmd = format!("{sysroot}\\System32\\cmd.exe");
+        assert!(
+            Path::new(&cmd).is_file(),
+            "premise: cmd.exe must exist at {cmd}"
+        );
+
+        assert_eq!(
+            create_process_verdict(&cmd),
+            Ok(()),
+            "an absolute backslash path runs"
+        );
+        assert_eq!(
+            create_process_verdict(&cmd.replace('\\', "/")),
+            Ok(()),
+            "forward slashes are a legal Windows spelling — Win32 canonicalizes them"
+        );
+        assert_eq!(
+            create_process_verdict(cmd.trim_end_matches(".exe")),
+            Err(NOT_FOUND),
+            "lpApplicationName gets NO default extension appended"
+        );
+        assert_eq!(
+            create_process_verdict("cmd.exe"),
+            Err(NOT_FOUND),
+            "lpApplicationName is NEVER PATH-searched (this test's cwd is the crate dir)"
+        );
+        assert_eq!(
+            create_process_verdict(&format!("\"{cmd}\"")),
+            Err(INVALID_NAME),
+            "`shell` names one program: a quoted value is a filename containing a quote"
+        );
+        assert_eq!(
+            create_process_verdict(&format!("\"{cmd}\" /K dir")),
+            Err(INVALID_NAME),
+            "arguments belong in `shell_args`, never inside `shell`"
+        );
+        assert_eq!(
+            create_process_verdict("%COMSPEC%"),
+            Err(NOT_FOUND),
+            "`%VAR%` is never expanded by CreateProcessW"
+        );
+
+        // A `.cmd` SCRIPT reached by full path: `resolve_program_windows`
+        // deliberately resolves the `.cmd`/`.bat` shims Node tooling ships, and
+        // the config validator offers a missing extension back to the author, so
+        // whether a batch file is a runnable `lpApplicationName` decides what
+        // both are allowed to say. Probe a real one under temp.
+        let script_dir = std::env::temp_dir().join(format!("aterm-lpan-{}", std::process::id()));
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let script = script_dir.join("probe.cmd");
+        std::fs::write(&script, b"@echo off\r\nexit /b 0\r\n").unwrap();
+        let batch_verdict = create_process_verdict(&script.display().to_string());
+        let _ = std::fs::remove_dir_all(&script_dir);
+        assert_eq!(
+            batch_verdict,
+            Ok(()),
+            "a full path to a batch file IS a runnable lpApplicationName \
+             (CreateProcess re-invokes the command interpreter for it)"
+        );
+    }
 
     #[test]
     fn family_detection_is_stem_and_case_insensitive() {
@@ -596,6 +754,73 @@ mod tests {
         assert!(is_wsl_shell(OsStr::new("C:\\Windows\\System32\\WSL.EXE")));
         assert!(!is_wsl_shell(OsStr::new("C:\\x\\wslconfig.exe")));
         assert!(!is_wsl_shell(OsStr::new("bash.exe")));
+    }
+
+    /// The verdict config validation reads. A bare name that RESOLVES is the
+    /// normal Windows spelling — the whole reason `--validate-config` must not
+    /// warn about `pwsh` — and `resolve_shell_name` must be exactly this
+    /// classification with the verdict collapsed, so the spawn and the
+    /// validator cannot disagree about the same string.
+    #[test]
+    fn classify_shell_name_is_the_resolution_the_spawn_performs() {
+        // A bare name on PATH: RESOLVED, to the program the spawn will run.
+        let cmd = classify_shell_name(OsStr::new("cmd"));
+        match &cmd {
+            ShellResolution::Resolved(p) => assert!(
+                p.to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with("cmd.exe"),
+                "bare `cmd` resolves to cmd.exe: {p:?}"
+            ),
+            other => panic!("a bare name on PATH must be Resolved, got {other:?}"),
+        }
+        // Case-insensitive, and an explicit extension is fine too.
+        for spelling in ["CMD", "cmd.exe"] {
+            assert!(
+                matches!(
+                    classify_shell_name(OsStr::new(spelling)),
+                    ShellResolution::Resolved(_)
+                ),
+                "{spelling:?} must resolve"
+            );
+        }
+        // A bare name that is nowhere: UNRESOLVED (CreateProcessW would fail).
+        assert_eq!(
+            classify_shell_name(OsStr::new("aterm-no-such-shell-xyz")),
+            ShellResolution::Unresolved
+        );
+        // Path-like, in every Windows spelling: VERBATIM, never searched — and
+        // never second-guessed for existing, which is the validator's job.
+        for path in [
+            "C:\\Windows\\System32\\cmd.exe",
+            "C:/Windows/System32/cmd.exe",
+            "C:\\Program Files\\Git\\bin\\bash.exe",
+            "\\\\server\\share\\sh.exe",
+            "C:cmd", // drive-relative
+            "C:\\nonexistent\\x.exe",
+        ] {
+            assert_eq!(
+                classify_shell_name(OsStr::new(path)),
+                ShellResolution::Verbatim(OsString::from(path)),
+                "{path:?} is path-like and must pass through verbatim"
+            );
+        }
+        // The collapse law: `resolve_shell_name` IS this classification.
+        for name in [
+            "cmd",
+            "aterm-no-such-shell-xyz",
+            "C:\\Windows\\System32\\cmd.exe",
+        ] {
+            let expected = match classify_shell_name(OsStr::new(name)) {
+                ShellResolution::Resolved(p) | ShellResolution::Verbatim(p) => p,
+                ShellResolution::Unresolved => OsString::from(name),
+            };
+            assert_eq!(
+                resolve_shell_name(OsStr::new(name)),
+                expected,
+                "resolve_shell_name must not drift from classify_shell_name for {name:?}"
+            );
+        }
     }
 
     #[test]

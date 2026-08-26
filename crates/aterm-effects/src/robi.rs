@@ -60,7 +60,7 @@
 //! ladder/climb/bars arc — the ladder must stay planted on `holds[0]`, and
 //! up there he is above the text anyway.
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use crate::genome;
 use crate::robi_glyphs_gen::RobiGlyphId;

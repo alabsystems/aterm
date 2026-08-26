@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use crate::dog_glyphs_gen::{DOG_HEADS, DogGlyphId};
 use crate::genome::mix;

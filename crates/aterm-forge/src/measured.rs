@@ -40,8 +40,14 @@
 //! a value disagrees with the measurement, the measurement is right and the
 //! reason for the change belongs in the commit message.
 //!
-//! Last measured: 2026-08-25, on the tree that dropped sha2/hmac and the
-//! `a11y-accesskit` default feature.
+//! Last measured: 2026-08-25, on the tree that retired the SIX-package round:
+//! `pollster`, `ab_glyph_rasterizer`, `rand_core`, `web-time`, `tar` (with
+//! `xattr` and `filetime`) and `font8x8`. Every cell fell, and `workspace` rose
+//! by one because that round created `aterm-time`.
+//!
+//! Two things in this file moved for a reason worth reading before assuming
+//! drift: `LINUX_DOMINATORS`' `sctk-adwaita` GREW, and `MAC_ARM.workspace` went
+//! from 53 to 54. Both are written up where they are pinned.
 
 /// One cell's measured surface, in the order [`crate::resolve::default_cells`]
 /// reports them.
@@ -52,6 +58,12 @@ pub struct Baseline {
     /// Every package in the graph rooted at the shipped `aterm` binary.
     pub resolved: usize,
     /// Workspace members among them — `resolved - third_party`.
+    ///
+    /// This moves too, and not only when a third-party package leaves: 53 → 54
+    /// across every cell when `aterm-time` was created to retire `web-time`. A
+    /// retirement that lands as a new first-party crate ADDS a workspace member
+    /// while removing a third-party one, so `resolved` falls by less than
+    /// `third_party` does.
     pub workspace: usize,
     /// Packages aterm does not own. THE number this crate exists to shrink.
     pub third_party: usize,
@@ -69,10 +81,10 @@ pub struct Baseline {
 
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
-    resolved: 201,
-    workspace: 53,
-    third_party: 148,
-    third_party_loc: 2_054_734,
+    resolved: 194,
+    workspace: 54,
+    third_party: 140,
+    third_party_loc: 2_030_354,
     build_scripts: 26,
     proc_macros: 6,
     duplicate_names: 8,
@@ -80,10 +92,10 @@ pub const MAC_ARM: Baseline = Baseline {
 
 pub const LINUX: Baseline = Baseline {
     cell: "linux",
-    resolved: 240,
-    workspace: 53,
-    third_party: 187,
-    third_party_loc: 3_584_527,
+    resolved: 234,
+    workspace: 54,
+    third_party: 180,
+    third_party_loc: 3_560_712,
     build_scripts: 38,
     proc_macros: 7,
     duplicate_names: 9,
@@ -91,10 +103,10 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 205,
-    workspace: 53,
-    third_party: 152,
-    third_party_loc: 4_486_966,
+    resolved: 199,
+    workspace: 54,
+    third_party: 145,
+    third_party_loc: 4_463_650,
     build_scripts: 27,
     proc_macros: 7,
     duplicate_names: 5,
@@ -102,10 +114,10 @@ pub const WIN: Baseline = Baseline {
 
 pub const WASM: Baseline = Baseline {
     cell: "wasm",
-    resolved: 189,
-    workspace: 53,
-    third_party: 136,
-    third_party_loc: 1_893_018,
+    resolved: 185,
+    workspace: 54,
+    third_party: 131,
+    third_party_loc: 1_870_671,
     build_scripts: 26,
     proc_macros: 7,
     duplicate_names: 4,
@@ -173,7 +185,17 @@ pub const MAC_ARM_DOMINATORS: [Dom; 5] = [
 /// not merely cheaper: dropping the `a11y-accesskit` default removed them and
 /// the 61 packages they alone held in, which is why the linux cell fell from
 /// 301 resolved / 248 third-party to the row in [`LINUX`].
-pub const LINUX_DOMINATORS: [Dom; 1] = [Dom { name: "sctk-adwaita", pkgs: 7, loc: 31_776 }];
+///
+/// `sctk-adwaita` GREW here, from 7 packages / 31,776 LOC, when
+/// `crates/aterm-render` stopped depending on `ab_glyph_rasterizer`. The
+/// package did not leave the linux graph — `winit -> sctk-adwaita -> ab_glyph`
+/// still holds it, which is why linux kept it while mac, win and wasm all shed
+/// it — but it stopped being SHARED, and a package two parents hold in is
+/// billed to neither. Now sctk-adwaita is the only thing keeping it, and the
+/// dominator says so. This is the second time in two rounds that a successful
+/// extraction enlarged a dominator (see [`MAC_ARM_DOMINATORS`] on `wgpu`); it is
+/// the measure working, not drift.
+pub const LINUX_DOMINATORS: [Dom; 1] = [Dom { name: "sctk-adwaita", pkgs: 8, loc: 32_341 }];
 
 /// `ureq` on mac-arm, and the figure the design note recorded for it.
 ///

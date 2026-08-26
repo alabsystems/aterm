@@ -38,7 +38,7 @@
 //! blink cadence, and emits the SAME premultiplied quads on both the CPU and Metal
 //! backends (byte-exact).
 
-use web_time::Instant;
+use aterm_time::Instant;
 
 use aterm_render::{GlowQuad, premul_rgb};
 

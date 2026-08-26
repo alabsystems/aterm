@@ -83,7 +83,7 @@ aterm-shell-integration = { workspace = true }
 aterm-containment = { workspace = true }
 # Internal clock seam: std::time on native (byte-identical), JS clock on wasm32 so
 # the engine's Instant/SystemTime reads don't panic "time not implemented".
-web-time = { workspace = true }
+aterm-time = { workspace = true }
 # Optional: UAX #9 BiDi reordering, pulled in only by the off-by-default `bidi`
 # feature. Not in the default production closure.
 aterm-bidi = { workspace = true, optional = true }

@@ -12,8 +12,8 @@
 // readback, no `putImageData`, on the primary present path.
 //
 // The init path is ASYNC: a browser cannot block the main thread, so adapter +
-// device acquisition is `await`ed (`wasm_bindgen_futures`), NOT `pollster::
-// block_on` (the native aterm-gpu path). The surface is created from the
+// device acquisition is `await`ed (`wasm_bindgen_futures`), NOT blocked on (the
+// native aterm-gpu path's own `block_on`). The surface is created from the
 // `HtmlCanvasElement` via wgpu's `SurfaceTarget::Canvas`. The async core
 // (`GpuContext::from_instance`) and the canvas surface path are backend-agnostic,
 // so the WebGL backend reuses them unchanged.
@@ -2763,7 +2763,7 @@ impl AtermGpuTerminal {
     ///   - `wgpu::Instance` with the WebGL (GL) backend,
     ///   - `instance.create_surface(SurfaceTarget::Canvas(canvas))`,
     ///   - `GpuContext::from_instance_with_surface(instance, Some(&surface)).await`
-    ///     — adapter + device, NO `pollster::block_on`,
+    ///     — adapter + device, NO blocking `block_on`,
     ///   - `GpuRenderer::from_parts(ctx, cpu_face, ..)` — the portable, thread-
     ///     free, font-discovery-free renderer assembly (all wgpu pipelines built),
     ///   - `configure_window_surface(surface, w, h)` — same format selection as

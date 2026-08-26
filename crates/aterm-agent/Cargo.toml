@@ -43,7 +43,6 @@ aterm-digest = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-web-time = { workspace = true }
 aterm-spec = { workspace = true }
 # The E2E loopback-TLS remote-Turn test drives a real `dial_and_relay` bridge and a
 # channel-bound capability. Transport-only test deps; no cycle (aterm-net ⊄ aterm-agent).

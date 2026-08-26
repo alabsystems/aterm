@@ -92,6 +92,9 @@ pub mod net;
 pub mod ops;
 pub mod pin;
 pub mod platform;
+/// The read-only USTAR/PAX/GNU bundle parser the extractor drives (retired the
+/// `tar` crate, and with it `xattr` and `filetime` — aterm never WRITES tar).
+pub mod tarread;
 pub mod progress;
 pub mod provisional;
 pub mod relocate;
