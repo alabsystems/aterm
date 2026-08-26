@@ -6583,8 +6583,9 @@ fn rearm_present_and_request(
 /// Everything the painted tab-strip rows depend on, so a cache hit is a hit for the
 /// RIGHT reason: the strip fingerprint (count + active + titles + metadata), the
 /// column width, whether the staged-update `↻` is showing, which tab the pointer is
-/// on (the hover-only `✕`), and the SOLO band's description.
-type StripCacheKey = (u64, usize, bool, Option<usize>, Option<String>);
+/// on (the hover-only `✕`), whether the pointer is on the `+` (its own hover wash —
+/// not a tab, so no `Option<usize>` can say it), and the SOLO band's description.
+type StripCacheKey = (u64, usize, bool, Option<usize>, bool, Option<String>);
 
 /// LINUX INITIAL-FRAME SETTLE (armed per attach in [`App::attach_os_window`],
 /// consumed by [`App::settle_initial_frame`] on `WindowEvent::Resized`). The
@@ -7582,6 +7583,12 @@ struct WindowState {
     /// `last_strip_fp` so moving BETWEEN tabs repaints and moving WITHIN one does
     /// not. Always `None` while the in-grid strip is disabled.
     strip_hover: Option<usize>,
+    /// Is the pointer on this window's trailing `+` (new-tab) affordance? Its own
+    /// flag because the `+` is NOT a tab, so [`Self::strip_hover`] can never say so
+    /// — which is exactly why hovering the strip's primary button used to change
+    /// zero pixels. Same contract as the hover above: a paint input, folded into
+    /// `last_strip_fp`, always `false` while the in-grid strip is disabled.
+    strip_hover_new_tab: bool,
     /// The last in-grid strip PRESS on a tab chip: when it happened, and which
     /// STABLE tab it landed on. A second press on the SAME tab within
     /// [`MULTI_CLICK_MS`] is a double-click, which opens the inline rename editor.
@@ -9047,6 +9054,7 @@ impl WindowState {
             tab_segments: Vec::new(),
             last_strip_fp: None,
             strip_hover: None,
+            strip_hover_new_tab: false,
             strip_press: None,
             strip_band_press: None,
             strip_drag: None,
@@ -11820,25 +11828,35 @@ impl App {
     ) -> Option<tab_model::VisibleLeafPlan> {
         let ws = self.windows.get(&wid)?;
         let tab = ws.tab_set.get(tab_id)?;
-        Some(tab.visible_plan(
-            tab_model::LogicalRect::new(
-                0.0,
-                0.0,
-                f32::from(ws.cols.max(1)),
-                f32::from(ws.rows.max(1)),
+        Some(self.plan_tab(tab, ws.rows.max(1), ws.cols.max(1)))
+    }
+
+    /// One leaf's sizing contract by content kind — the ONE definition, so the
+    /// unzoomed measuring plan below can never drift from the plan the frame
+    /// consumers actually see.
+    fn leaf_sizing(&self, view: tab_model::ViewId) -> tab_model::LeafSizing {
+        match self.view_store.get(view) {
+            Some(tab_model::View::Terminal(_)) => tab_model::LeafSizing::new(
+                tab_model::LogicalSize::new(2.0, 1.0),
+                tab_model::LogicalSize::new(80.0, 24.0),
             ),
+            Some(tab_model::View::Native(_)) | None => tab_model::LeafSizing::new(
+                tab_model::LogicalSize::new(24.0, 10.0),
+                tab_model::LogicalSize::new(72.0, 36.0),
+            ),
+        }
+    }
+
+    /// Plan one tab over an explicit `rows`×`cols` cell bounds. Split out so a
+    /// caller may plan a tab it has ADJUSTED (see [`Self::focused_pane_cells`],
+    /// which plans the UNZOOMED topology a split is about to produce) without
+    /// duplicating the sizing contract.
+    fn plan_tab(&self, tab: &tab_model::Tab, rows: u16, cols: u16) -> tab_model::VisibleLeafPlan {
+        tab.visible_plan(
+            tab_model::LogicalRect::new(0.0, 0.0, f32::from(cols), f32::from(rows)),
             1.0,
-            |view| match self.view_store.get(view) {
-                Some(tab_model::View::Terminal(_)) => tab_model::LeafSizing::new(
-                    tab_model::LogicalSize::new(2.0, 1.0),
-                    tab_model::LogicalSize::new(80.0, 24.0),
-                ),
-                Some(tab_model::View::Native(_)) | None => tab_model::LeafSizing::new(
-                    tab_model::LogicalSize::new(24.0, 10.0),
-                    tab_model::LogicalSize::new(72.0, 36.0),
-                ),
-            },
-        ))
+            |view| self.leaf_sizing(view),
+        )
     }
 
     /// Canonical content-agnostic geometry for the visible tab.
@@ -12871,7 +12889,46 @@ impl App {
         // `spawn split=<v|h> cwd=<path>`, i.e. the front door's
         // `aterm split-pane -d <dir>`, where the operator named a directory
         // out loud.
-        self.split_focused_pane_in(dir, None);
+        let _ = self.split_focused_pane_in(dir, None);
+    }
+
+    /// The FOCUSED pane's size in CELLS in window `wid`'s active tab — the
+    /// rectangle a split would divide. Reads the terminal projection when the tab
+    /// is all-terminal (the same geometry `ctl panes` reports and the compositor
+    /// blits), and the canonical visible plan for a heterogeneous native/terminal
+    /// tab.
+    ///
+    /// BOTH ARMS MEASURE THE UNZOOMED TOPOLOGY, because a split un-zooms
+    /// ([`pane::PaneTree::split_focused`] / [`tab_model::Tab::split_focused`] both
+    /// clear the flag). A zoomed pane occupies the whole window and is about to
+    /// give that room straight back; measuring it would wave through precisely
+    /// the split that mints an unusable pane with a live shell behind it.
+    ///
+    /// `None` means UNMEASURABLE — the window is gone, or the focused leaf is not
+    /// in the topology it should be in. The caller must refuse on `None`, never
+    /// assume it fits: an unmeasured split is how the leak got in.
+    fn focused_pane_cells(&self, wid: WindowId) -> Option<(u16, u16)> {
+        let ws = self.windows.get(&wid)?;
+        let (rows, cols) = (ws.rows, ws.cols);
+        if let Some(tree) = self.active_tree(wid) {
+            let rect = tree.focused_rect(rows, cols)?;
+            return Some((rect.rows, rect.cols));
+        }
+        // Heterogeneous native/terminal tab: plan it with zoom forced off.
+        let tab = ws.tab_set.get(ws.tab_set.active_id()?)?;
+        let (rows, cols) = (rows.max(1), cols.max(1));
+        let plan = if tab.zoomed {
+            let mut unzoomed = tab.clone();
+            unzoomed.zoomed = false;
+            self.plan_tab(&unzoomed, rows, cols)
+        } else {
+            self.plan_tab(tab, rows, cols)
+        };
+        let leaf = plan.leaves.iter().find(|leaf| leaf.focused)?;
+        Some((
+            (leaf.rect.size.height.round() as u16).max(1),
+            (leaf.rect.size.width.round() as u16).max(1),
+        ))
     }
 
     /// [`App::split_focused_pane`] with an explicit working directory for the
@@ -12879,17 +12936,26 @@ impl App {
     /// parallel one so a split is a split however it was asked for: the same
     /// shared-session refusal, the same family-tree parenting, the same
     /// `resize_panes` follow-up.
-    fn split_focused_pane_in(&mut self, dir: pane::SplitDir, cwd_override: Option<String>) {
+    ///
+    /// `Err(reason)` is an HONEST REFUSAL, in the wording the person is shown:
+    /// the control socket returns it verbatim as `ERR <reason>` and every
+    /// interactive caller has already had it painted as the transient failure
+    /// card. Nothing has been spawned, registered, or mutated on that path.
+    fn split_focused_pane_in(
+        &mut self,
+        dir: pane::SplitDir,
+        cwd_override: Option<String>,
+    ) -> Result<(), String> {
         // The split spawns a NEW session (views=1, never `attach`) owned by the
         // frontmost window, so its output/exit/bell route back to THIS window.
         let Some(owner) = self.frontmost_window else {
-            return;
+            return Err("no window to split".to_string());
         };
         // Splitting is a terminal command. A native leaf can coexist with live
         // terminals in this window, but none of those hidden/sibling sessions is
         // an implicit target.
         let Some(focused_session) = self.focused_session_id(owner) else {
-            return;
+            return Err("the focused pane is not a terminal".to_string());
         };
         let canonical_split = self.active_tree(owner).is_none();
         // INVARIANT: a SHARED (Cmd-Shift-O, views>1) session is NEVER split. A split
@@ -12897,13 +12963,41 @@ impl App {
         // viewed in a co-viewing window that would corrupt the OTHER window's grid
         // (it shares the one live grid). Bail before spawning anything.
         if self.pool.views(focused_session).is_some_and(|v| v > 1) {
-            return;
+            return Err("a shared session is never split".to_string());
+        }
+        // THE MINIMUM PANE (2026-08-25 splits audit). A split whose halves cannot
+        // BOTH be a usable pane is refused HERE — before a PTY, a shell, a view
+        // id, or a tree edit exists. Splitting past this used to mint panes at an
+        // off-grid 1x1 rect that nobody could see or reach, each with a live
+        // `pwsh.exe` + `conhost.exe` behind it; the refusal is the whole point,
+        // and it has to happen before the spawn or the leak happens anyway.
+        //
+        // It FAILS CLOSED. An unmeasurable pane (`None`) is refused too: "we could
+        // not tell" must never spend a shell, because a wrong guess here is the
+        // exact process leak this gate exists to end.
+        let refusal = match self.focused_pane_cells(owner) {
+            None => Some("Split refused: this pane's size could not be measured".to_string()),
+            Some((pane_rows, pane_cols)) if !pane::split_fits_in(dir, pane_rows, pane_cols) => {
+                let (need_rows, need_cols) = pane::split_needs(dir);
+                Some(format!(
+                    "Split refused: this pane is {pane_cols}x{pane_rows} cells; a {} split needs at least {need_cols}x{need_rows}",
+                    dir.human()
+                ))
+            }
+            Some(_) => None,
+        };
+        if let Some(reason) = refusal {
+            // The same two-channel answer every impossible gesture gives: the
+            // card answers the person, the log answers the investigator.
+            eprintln!("aterm-gui: {reason}");
+            self.surface_gesture_failure(&format!("✕ {reason}"));
+            return Err(reason);
         }
         let id = self.next_session_id;
         let (rows, cols) = self.front().map_or((0, 0), |ws| (ws.rows, ws.cols));
         // A real run always has a proxy; guard rather than panic (test-only None).
         let Some(proxy) = self.proxy.clone() else {
-            return;
+            return Err("no event loop to host the new pane".to_string());
         };
         // Spawn at the window grid; `resize_panes` immediately re-sizes every pane
         // (incl. this one) to its computed sub-rect, so the initial size is transient.
@@ -12931,7 +13025,7 @@ impl App {
                         // The only possible failure is exhausting the u64 id
                         // space; dropping the unregistered session closes its
                         // PTY and leaves every live registry untouched.
-                        return;
+                        return Err("the view identity space is exhausted".to_string());
                     }
                 };
                 // The new pane is a child of the pane it was split from (family tree).
@@ -12960,7 +13054,7 @@ impl App {
                 };
                 if !split {
                     self.view_store.remove(view);
-                    return;
+                    return Err("the focused pane vanished before the split".to_string());
                 }
                 self.next_session_id += 1;
                 Self::register_session(&self.store, &session, parent);
@@ -12979,8 +13073,16 @@ impl App {
                 // pane shrank to half; the new pane gets the other half).
                 self.resize_panes(owner);
                 self.sync_window(owner);
+                Ok(())
             }
-            Err(e) => eprintln!("aterm-gui: could not split the pane: {e}"),
+            Err(e) => {
+                // The `New tab` / `New window` shape: the log carries the whole
+                // error, the card carries its first line to the person who
+                // pressed the key and saw nothing happen.
+                eprintln!("aterm-gui: could not split the pane: {e}");
+                self.surface_gesture_failure(&format!("✕ Split failed: {e}"));
+                Err(format!("could not split the pane: {e}"))
+            }
         }
     }
 
@@ -17778,6 +17880,11 @@ impl ApplicationHandler<Wake> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 self.on_cursor_moved(wid, position.x, position.y);
             }
+            // The pointer left the window. `CursorMoved` is the only thing that
+            // clears the tab strip's hover, so without this arm the last chip (or
+            // the `+`) the pointer touched keeps its wash — and its `✕` — for as
+            // long as the pointer is away. See `App::on_cursor_left`.
+            WindowEvent::CursorLeft { .. } => self.on_cursor_left(wid),
             WindowEvent::MouseInput { state, button, .. } => {
                 self.on_mouse_input(wid, state, button);
                 // A tab-strip click closing the last tab sets the clicked window's
@@ -24389,6 +24496,258 @@ mod multi_window_tests {
             app.windows[&wid].word_decos.needs_rescan(epoch),
             "the departed pane took its scan state with it"
         );
+    }
+
+    /// A SPLIT THAT CANNOT FIT IS REFUSED BEFORE ANYTHING IS SPAWNED.
+    ///
+    /// The 2026-08-25 splits audit drove Split repeatedly in a 24x80 window and
+    /// got fourteen panes, five of them at the identical off-grid rect
+    /// `24,79,1x1`, focus on a pane nobody could see — and **fourteen `pwsh.exe`
+    /// + fourteen `conhost.exe` alive**. The leak is the part that matters: the
+    /// old path spawned the shell FIRST and only then asked the tree for room, so
+    /// every invisible pane still cost a real process.
+    ///
+    /// This pins the order: at a size where the split cannot fit, the refusal
+    /// happens and `next_session_id`, the pool, the registry and the tree are all
+    /// untouched — nothing was created to leak. The CONTROL half is what makes it
+    /// non-vacuous: at 24x80 the very same call gets PAST the size gate (it then
+    /// stops at the headless harness's absent event loop, which is a different
+    /// error), so the gate is refusing on size, not refusing everything.
+    #[test]
+    fn a_split_that_cannot_fit_is_refused_before_any_shell_is_spawned() {
+        use crate::pane;
+        let mut app = App::headless_for_test(); // window 0 = 24x80, session 0
+        let wid = WindowId(0);
+
+        // CONTROL: 24x80 has room for a left/right split, so the size gate passes
+        // and the call dies further down, at the harness's `proxy: None`.
+        let allowed = app
+            .split_focused_pane_in(pane::SplitDir::Vertical, None)
+            .expect_err("headless harness has no event loop to spawn into");
+        assert_eq!(
+            allowed, "no event loop to host the new pane",
+            "a 24x80 window must get PAST the size gate"
+        );
+
+        // Now shrink below what a left/right split needs (2*16 + 1 = 33 columns).
+        assert!(app.apply_term_resize(wid, 24, 32), "geometry applies");
+        let sessions_before = app.pool.iter().count();
+        let next_id_before = app.next_session_id;
+        let registry_before = app
+            .store
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot()
+            .len();
+        app.notice = None;
+
+        let refusal = app
+            .split_focused_pane_in(pane::SplitDir::Vertical, None)
+            .expect_err("a 32-column pane cannot hold two 16-column panes");
+        assert!(
+            refusal.starts_with("Split refused: this pane is 32x24 cells"),
+            "the refusal names the pane it measured: {refusal}"
+        );
+        assert!(
+            refusal.contains("left/right split needs at least 33x3"),
+            "and the size it needed: {refusal}"
+        );
+
+        // NOTHING WAS CREATED. This is the anti-leak assertion.
+        assert_eq!(app.pool.iter().count(), sessions_before, "no session pooled");
+        assert_eq!(
+            app.next_session_id, next_id_before,
+            "not even a session id was burned"
+        );
+        assert_eq!(
+            app.store
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .snapshot()
+                .len(),
+            registry_before,
+            "no session registered"
+        );
+        assert_eq!(
+            app.active_tree(wid).map(pane::PaneTree::len),
+            Some(1),
+            "the tree is untouched — no invisible pane"
+        );
+
+        // And the person is TOLD, the way every impossible gesture here answers.
+        let card = app
+            .notice
+            .as_ref()
+            .map(crate::notice::TransientNotice::text)
+            .expect("a refused split paints the failure card");
+        assert!(card.contains("Split refused"), "card text: {card}");
+
+        // The other axis still fits in 24 rows (2*3 + 1 = 7 needed), so the gate
+        // is per-direction, not a blanket "this window is too small".
+        assert_eq!(
+            app.split_focused_pane_in(pane::SplitDir::Horizontal, None)
+                .expect_err("still no event loop"),
+            "no event loop to host the new pane",
+            "a top/bottom split of a 24-row pane is fine"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// ZOOM CANNOT SMUGGLE A SPLIT PAST THE MINIMUM.
+    ///
+    /// A zoomed pane fills the window, but splitting UN-zooms it
+    /// (`PaneTree::split_focused` clears the flag), so the rectangle the split
+    /// actually divides is the pane's unzoomed one. A gate that measured the
+    /// zoomed rect would approve the split on the strength of room the pane is
+    /// about to hand straight back — and spawn the shell for a pane that then has
+    /// nowhere to live. That is the leak wearing a different hat, so it is pinned
+    /// separately: `App::focused_pane_cells` must report the same size zoomed and
+    /// unzoomed, and the shipping path must refuse either way.
+    #[test]
+    fn a_zoomed_pane_is_measured_unzoomed_so_zoom_cannot_smuggle_a_split_through() {
+        use crate::pane;
+        let mut app = App::headless_for_test(); // window 0 = 24x80, session 0
+        let wid = WindowId(0);
+        app.split_active_stub_tab(wid); // 80 -> 40 | divider | 39, focus right
+
+        // Narrow the window until the FOCUSED half is under a left/right split's
+        // 33 columns while the whole window is still comfortably over it.
+        assert!(app.apply_term_resize(wid, 24, 40), "geometry applies");
+        assert_eq!(
+            app.focused_pane_cells(wid),
+            Some((24, 19)),
+            "the focused half of a 40-column window"
+        );
+
+        // ZOOM, through the shipping action a Cmd-Shift-Return takes. On screen
+        // this pane is now the whole 40-column window…
+        app.toggle_pane_zoom();
+        assert_eq!(
+            app.active_tree(wid).map(|t| t.compute_layout(24, 40).len()),
+            Some(1),
+            "zoom really is showing one full-window pane"
+        );
+        // …and 40 columns WOULD clear the 33-column bar, so a gate reading the
+        // zoomed geometry lets this split through. It must not.
+        assert!(
+            pane::split_fits_in(pane::SplitDir::Vertical, 24, 40),
+            "the zoomed rect is big enough — this is the temptation"
+        );
+        assert_eq!(
+            app.focused_pane_cells(wid),
+            Some((24, 19)),
+            "zoom must not inflate the size the split gate measures"
+        );
+
+        let sessions_before = app.pool.iter().count();
+        let next_id_before = app.next_session_id;
+        let refusal = app
+            .split_focused_pane_in(pane::SplitDir::Vertical, None)
+            .expect_err("a zoomed 19-column pane is still a 19-column pane");
+        assert_eq!(
+            refusal,
+            "Split refused: this pane is 19x24 cells; a left/right split needs at least 33x3",
+            "the refusal names the UNZOOMED pane"
+        );
+        assert_eq!(app.pool.iter().count(), sessions_before, "no session pooled");
+        assert_eq!(
+            app.next_session_id, next_id_before,
+            "not even a session id was burned"
+        );
+        assert_eq!(
+            app.active_tree(wid).map(pane::PaneTree::len),
+            Some(2),
+            "the tree is untouched"
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// THE AUDIT'S OWN GESTURE, both halves: the loop now TERMINATES in refusals
+    /// instead of minting ghosts, and a layout that IS over-split (only reachable
+    /// by shrinking the window under it) stays inside the grid.
+    #[test]
+    fn repeated_splits_stop_at_the_minimum_and_shrinking_never_leaves_the_grid() {
+        use crate::pane;
+        let mut app = App::headless_for_test(); // 24x80
+        let wid = WindowId(0);
+
+        // Alternate the two directions thirteen times, exactly as the audit did.
+        // Every gesture goes through the SHIPPING path, `split_focused_pane_in` —
+        // not the predicate — so this pins the refusal where a user meets it. The
+        // headless harness has no event loop, so a gesture that clears the gate
+        // stops one step later at `proxy: None`; that exact error is the signal to
+        // stage the pane the real path would have spawned.
+        let mut refused = Vec::new();
+        for i in 0..13 {
+            let dir = if i % 2 == 0 {
+                pane::SplitDir::Vertical
+            } else {
+                pane::SplitDir::Horizontal
+            };
+            let err = app
+                .split_focused_pane_in(dir, None)
+                .expect_err("headless: nothing can actually spawn");
+            if err == "no event loop to host the new pane" {
+                app.split_active_stub_tab_dir(wid, dir);
+            } else {
+                assert!(
+                    err.starts_with("Split refused: this pane is "),
+                    "the only other outcome is the size refusal, got: {err}"
+                );
+                refused.push(err);
+            }
+        }
+        assert!(
+            !refused.is_empty(),
+            "the loop must stop minting panes at some point"
+        );
+        let tree = app.active_tree(wid).expect("terminal tab");
+        let panes = tree.len();
+        assert!(
+            panes < 14,
+            "the audit got 14 panes out of these gestures; got {panes}"
+        );
+        let rects = tree.compute_layout(24, 80);
+        for r in &rects {
+            assert!(
+                r.rows >= pane::MIN_PANE_ROWS && r.cols >= pane::MIN_PANE_COLS,
+                "every pane the app CREATED is usable: {r:?}"
+            );
+            assert!(
+                r.row_off + r.rows <= 24 && r.col_off + r.cols <= 80,
+                "and on the grid: {r:?}"
+            );
+        }
+        assert!(
+            rects.iter().any(|r| r.session == tree.focus()),
+            "focus is on a pane that exists in the layout"
+        );
+
+        // SECOND HALF — the shrink rule. Drag the window far below what this
+        // layout needs. Panes go sub-minimum (nothing can prevent that), but not
+        // one of them leaves the grid, none is dropped, and growing back is exact.
+        let before = app.active_tree(wid).unwrap().compute_layout(24, 80);
+        assert!(app.apply_term_resize(wid, 3, 8), "shrink applies");
+        let tiny = app.active_tree(wid).unwrap().compute_layout(3, 8);
+        assert_eq!(tiny.len(), panes, "shrinking collapses no pane");
+        for r in &tiny {
+            assert!(r.rows >= 1 && r.cols >= 1, "no 0-extent pane: {r:?}");
+            assert!(
+                r.row_off < 3 && r.col_off < 8,
+                "origin inside the 8x3 grid: {r:?}"
+            );
+            assert!(
+                r.row_off + r.rows <= 3 && r.col_off + r.cols <= 8,
+                "extent inside the 8x3 grid: {r:?}"
+            );
+        }
+        assert!(app.apply_term_resize(wid, 24, 80), "grow back applies");
+        assert_eq!(
+            app.active_tree(wid).unwrap().compute_layout(24, 80),
+            before,
+            "shrink → grow restores the exact geometry"
+        );
+        assert!(app.structural_invariants_ok());
     }
 
     /// Closing a window with a SPLIT (multi-pane) tab must detach EVERY pane's view,

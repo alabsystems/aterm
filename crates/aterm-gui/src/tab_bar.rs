@@ -10,11 +10,15 @@
 //! into panes), a cell-aligned segment carrying its title, an active-tab
 //! highlight, and a close `x`, plus a trailing `+` to open a tab.
 //!
-//! On the Linux/BSD chrome band the strip speaks the CHIP-CARD language
-//! ([`STRIP_CHIP_CARDS`]): every tab is an inset card separated by bare-band
-//! gutter columns, the selection is a filled card (no underline rule), the
-//! selected card's `✕` is resident, and truncation preserves whatever
-//! DISTINGUISHES a tab's title from its neighbours' ([`distinct_chip_labels`]).
+//! On every chrome band — Windows and Linux/BSD alike — the strip speaks the
+//! CHIP-CARD language ([`STRIP_CHIP_CARDS`]): every tab is an inset card
+//! separated by bare-band gutter columns, the selection is a filled card (no
+//! underline rule grazing the descenders), the selected card's `✕` is resident,
+//! and truncation preserves whatever DISTINGUISHES a tab's title from its
+//! neighbours' ([`distinct_chip_labels`]). The cards themselves are painted in
+//! PIXELS by [`pixel_band`], on a canvas lifted to the window's top edge, so
+//! their insets, gutters, corners and vertical centring are not bound to the
+//! terminal's cell grid.
 //!
 //! It is PURE LAYOUT + a small [`RenderCell`] paint, mirroring [`crate::pane`]:
 //! [`layout_segments`] produces the segment list (each a column range + an
@@ -946,6 +950,11 @@ enum StripRole {
     /// The trailing `+` new-tab affordance: a BUTTON — full-strength fg on the body
     /// (NOT the dim inactive treatment), so it meets WCAG-AA contrast on every theme.
     NewTab,
+    /// The `+` UNDER THE POINTER: the band's one hover material
+    /// ([`StripColors::hover_bg`]) under the button's own full-strength ink
+    /// re-floored on it. The button is the strip's primary affordance and had
+    /// no pointer feedback at all — hovering it changed zero pixels.
+    NewTabHover,
     /// The SOLO band's title: full-strength fg on the body, with no raised card and
     /// no selection underline. A one-tab window is not choosing between anything, so
     /// it gets a window title's treatment, not a selected chip's.
@@ -1005,20 +1014,31 @@ const SOLO_TITLE_BAND: bool = cfg!(target_os = "macos");
 /// column between cards), and TAIL-PRESERVING labels (`…/aterm` beats
 /// `user@m17-to…` four times over).
 ///
-/// Windows says NO — not because the language is wrong there, but because its
-/// band is repainted in PIXELS by [`pixel_band`] (UI-face labels, stroked
-/// hairlines), tuned by its own visual pass; the cell tones underneath are that
-/// pass's fixture and must not move under it unseen. macOS says NO because it
-/// has no band at all ([`STRIP_IS_CHROME_BAND`]).
-pub(crate) const STRIP_CHIP_CARDS: bool = STRIP_IS_CHROME_BAND && !cfg!(windows);
+/// WINDOWS NOW SAYS YES TOO. It used to say no — not because the language was
+/// wrong there, but because its band is repainted in PIXELS by [`pixel_band`]
+/// and the cell tones underneath were that pass's fixture, so moving them
+/// "unseen" was the risk. That caution shipped the exact defects the Linux
+/// answer exists to remove, measured on the installed v0.55.0 at font_px 13:
+/// hard-edged whole-cell chips with no top inset or rounded corners; a quiet
+/// tab byte-identical to the band with a half-height 1 px tick standing in for
+/// a card; a `+` box painted in the SELECTED card's own tone; and — because the
+/// cell lane's selection rule is a per-cell underline — a solid accent bar
+/// across the full chip width sitting *inside* the label's descenders. So the
+/// tones move, deliberately and with the pixel band re-tuned around them: the
+/// band raster owns the surfaces on this platform now ([`pixel_band`]), and the
+/// cell tones underneath are the honest transitional frame shown only until the
+/// UI face lands. macOS still says NO because it has no band at all
+/// ([`STRIP_IS_CHROME_BAND`]).
+pub(crate) const STRIP_CHIP_CARDS: bool = STRIP_IS_CHROME_BAND;
 
 /// Whether the strip resolves every chip's label in ONE pass over all the tabs
 /// ([`distinct_chip_labels`]) instead of truncating each title on its own.
 ///
-/// EVERY BAND, including the Windows pixel band — because this is not a TONE.
-/// [`STRIP_CHIP_CARDS`] excludes Windows to keep the cell surfaces from moving
-/// under [`pixel_band`]'s visual pass unseen, and that reasoning is about
-/// SURFACES; the label is text, it reaches the band through the same
+/// EVERY BAND — because this is not a TONE. It landed on Windows a release
+/// before the chip-card surfaces did, while [`STRIP_CHIP_CARDS`] still excluded
+/// that platform to keep the cell tones from moving under [`pixel_band`]'s
+/// visual pass unseen: that caution was about SURFACES; the label is text, it
+/// reaches the band through the same
 /// `put_text` into the same cell row, and the distinct pass spends the same
 /// `title_end - title_start` budget the per-tab `truncate_title` fallback
 /// spends. Only WHICH characters survive the cut changes — which is the whole
@@ -1103,6 +1123,13 @@ struct StripColors {
     /// wash it now sits on (the wash is a step TOWARD the ink, so a tight
     /// scheme can need the label pushed back out).
     hover_fg: [u8; 3],
+    /// [`Self::chip_button_fg`]'s twin for a HOVERED `+`: full-strength ink
+    /// floored against [`Self::hover_bg`], because the button's card takes the
+    /// band's one hover material when the pointer is on it and the ink has to
+    /// be floored against the surface it actually lands on (the same one-more-
+    /// surface rule as [`Self::hover_fg`] — a button is not a dim label, so it
+    /// keeps full strength rather than borrowing the hovered CHIP's ink).
+    button_hover_fg: [u8; 3],
     /// Theme accent used by the selected underline and state marks.
     accent: [u8; 3],
     /// Surface / ink / rule for the `↻` UPDATE CTA ([`StripRole::Update`]).
@@ -1140,9 +1167,9 @@ struct StripColors {
 ///    turned HC on to stop. The active/inactive distinction is carried entirely by
 ///    the `HIGHLIGHT` chip, which under HC is a far louder cue than the theme-derived
 ///    raise ever was.
-///  * **`COLOR_HIGHLIGHT` is reserved for the SELECTED tab.** Off HC the `+` button
-///    shares `raise_bg` with the active chip, which is fine when the raise is a
-///    quiet blend — but with the OS selection colour it is not: the first capture of
+///  * **`COLOR_HIGHLIGHT` is reserved for the SELECTED tab.** The `+` must not
+///    wear the selection's surface — with the OS selection colour that is loud
+///    rather than merely wrong: the first capture of
 ///    this path put an accent-blue `+` immediately beside an accent-blue selected
 ///    tab, two identical loud surfaces where only one of them means anything. The
 ///    `+` (and a hovered chip) therefore take `COLOR_WINDOW`, the plain document
@@ -1167,15 +1194,25 @@ fn forced_strip_colors(hc: crate::chrome_band::ForcedChrome) -> StripColors {
         raise_fg: plain_fg,
         active_fg: ink(hc.highlight_text, hc.highlight),
         inactive_fg: band_fg,
-        // STRIP_CHIP_CARDS is false on Windows and a forced palette only ever comes
-        // from Windows, so the quiet-chip card is never painted here. Take the band
-        // counterparts, exactly as the theme-derived path does off the chip-card
-        // platforms — the struct carries no platform-shaped holes.
+        // THE QUIET CARD COLLAPSES INTO THE BAND, deliberately. Windows now
+        // speaks chip-card ([`STRIP_CHIP_CARDS`]) and a forced palette only ever
+        // comes from Windows, so this IS the palette a quiet chip is painted
+        // with — and an HC scheme publishes no third surface to paint it in. On
+        // all four stock schemes there is no tone between BTNFACE and WINDOW to
+        // borrow, and inventing a blend is precisely what HC exists to stop. So
+        // the quiet card is `BTNFACE` — the band itself, no visible card — and
+        // the structure falls to the seam/border vocabulary HC uses instead of
+        // fills, with the pointer's own `WINDOW` wash still lifting the chip it
+        // is on. The `✕` and the chip's position carry the rest.
         chip_bg: hc.btn_face,
         chip_fg: band_fg,
         chip_button_fg: band_fg,
         hover_bg: hc.window,
         hover_fg: plain_fg,
+        // The hovered `+` sits on `hc.window` like every other hover surface, so
+        // its ink is the OS's plain document text — the same pair the hovered
+        // chip takes. Under a forced palette there is no second ink to derive.
+        button_hover_fg: plain_fg,
         accent: hc.highlight,
         // The `↻` takes the plain document surface, exactly like the `+` and for the
         // same reason: `COLOR_HIGHLIGHT` means SELECTED, and an update alert is not a
@@ -1335,6 +1372,10 @@ fn strip_colors(theme: Theme) -> StripColors {
     // under an ink that was floored against the plain band.
     let hover_bg = crate::chrome_band::mix3(band_bg, fg, hover_t);
     let hover_fg = ink(inactive_fg, hover_bg);
+    // The `+` button's ink when the wash moves under it: full strength (it is a
+    // button, not a dim label), floored against the wash the way every other ink
+    // is floored against its own surface.
+    let button_hover_fg = ink(fg, hover_bg);
     // The quiet chip's card, same construction. `chip_t` is 0.0 off the
     // chip-card platforms, making all three byte-copies of their band
     // counterparts there — computed unconditionally so the struct has no
@@ -1355,6 +1396,7 @@ fn strip_colors(theme: Theme) -> StripColors {
         chip_button_fg,
         hover_bg,
         hover_fg,
+        button_hover_fg,
         accent: rgb(theme.cursor),
         // Byte-identical to what `StripRole::Update` resolved to before the triple
         // existed: the selected pair plus the theme accent as its rule. Only the
@@ -1441,6 +1483,20 @@ pub(crate) fn strip_bleed_tones(theme: Theme) -> Option<(u32, Option<u32>)> {
         let colors = strip_colors(theme);
         (pack(colors.band_bg), colors.seam.map(pack))
     })
+}
+
+/// The band's HOVER wash for `theme` ([`StripColors::hover_bg`]) — the one
+/// surface a pointer's arrival paints, on a chip or on the `+` alike. Exposed
+/// for the pointer tests in `app_mouse`, which drive the real motion hook and
+/// then have to name the tone the rows must be wearing; `StripColors` itself
+/// stays private so nothing outside this file can assemble a strip palette.
+// Its one caller is the band-hover test in `app_mouse.rs`, which is itself gated
+// `cfg(any(windows, target_os = "linux"))` — the platforms that HAVE a chrome
+// band. Matching that gate keeps macOS free of a dead-code warning under the
+// tree's own `clippy --all-targets -D warnings` contract (Cargo.toml).
+#[cfg(all(test, any(windows, target_os = "linux")))]
+pub(crate) fn strip_hover_bg_for_test(theme: Theme) -> [u8; 3] {
+    strip_colors(theme).hover_bg
 }
 
 /// A bare strip-background [`RenderCell`] — used to pre-fill a strip row before
@@ -1576,6 +1632,18 @@ fn strip_cell(ch: char, colors: &StripColors, role: StripRole) -> RenderCell {
             None,
         ),
         StripRole::NewTab => (colors.fg, colors.band_bg, false, UnderlineStyle::None, None),
+        // The hovered `+`: the hover wash the rest of the band uses, under the
+        // button's full-strength ink re-floored on it. On the FLAT strip (macOS)
+        // there is no band for a wash to sit on, so the wash IS the only surface
+        // the button ever gets, which is still the honest "this is a target" cue
+        // the flat strip otherwise has none of.
+        StripRole::NewTabHover => (
+            colors.button_hover_fg,
+            colors.hover_bg,
+            false,
+            UnderlineStyle::None,
+            None,
+        ),
         StripRole::Title => (colors.fg, colors.band_bg, true, UnderlineStyle::None, None),
         // Chip-card band: the update alert keeps its highlighted card but sheds
         // the accent underline with the same retirement the active card made —
@@ -1687,6 +1755,7 @@ pub fn paint_strip(
 ) {
     let paint = StripPaint {
         hovered,
+        new_tab_hovered: false,
         subtitle: None,
         rename: None,
     };
@@ -1707,6 +1776,13 @@ pub(crate) struct StripPaint<'a> {
     /// clicking). On a chrome band the hovered chip also takes the
     /// [`StripRole::Hover`] wash — paint only, same reserved geometry.
     pub hovered: Option<usize>,
+    /// Is the pointer on the trailing `+` (new-tab) affordance? A tab index
+    /// cannot say so — the `+` is not a tab — which is precisely why hovering
+    /// the strip's primary button used to change zero pixels. Fed from the same
+    /// per-motion hit test as [`Self::hovered`] and folded into the same strip
+    /// cache key, so the wash appears and clears with the pointer and a sweep
+    /// WITHIN the button still costs nothing.
+    pub new_tab_hovered: bool,
     /// The lone tab's one-line description ([`solo_subtitle`]), drawn dim after
     /// the centred title. `None` = nothing the title does not already say.
     pub subtitle: Option<&'a str>,
@@ -2011,6 +2087,13 @@ fn paint_strip_impl(
                 // `start_col + 1`), so it costs zero title width and cannot
                 // move a hit target — `hit_test` still answers `Select(i)` for
                 // the column.
+                //
+                // NO PLATFORM TAKES THIS ARM TODAY: every strip that has a band
+                // now speaks chip-card, and the one platform without cards has
+                // no band either ([`STRIP_IS_CHROME_BAND`]). It stays because it
+                // is the shape a band WITHOUT cards would have to take, and
+                // because [`strip_separates`] — the rule about which chips earn
+                // an edge — is a real rule with its own proof, not a leftover.
                 if STRIP_IS_CHROME_BAND
                     && !STRIP_CHIP_CARDS
                     && strip_separates(i, active, paint.hovered)
@@ -2137,12 +2220,21 @@ fn paint_strip_impl(
                 let card = seg
                     .start_col
                     .saturating_add(u16::from(STRIP_IS_CHROME_BAND));
+                // POINTER FEEDBACK: the button takes the band's hover wash while
+                // the pointer is on it — the cue it never had. Cheap and
+                // change-gated exactly like the chips' (the flag is a strip
+                // cache-key term), so a sweep within the button costs nothing.
+                let plus_role = if paint.new_tab_hovered {
+                    StripRole::NewTabHover
+                } else {
+                    StripRole::NewTab
+                };
                 for c in card..seg.end_col {
-                    put(row, c, ' ', StripRole::NewTab);
+                    put(row, c, ' ', plus_role);
                 }
                 // Centre the `+` in the 3-cell ` + ` affordance (on a band the card is
                 // the trailing two cells, so this is its leading one).
-                put(row, seg.start_col + 1, '+', StripRole::NewTab);
+                put(row, seg.start_col + 1, '+', plus_role);
             }
             TabHit::Update => {
                 // The leading `↻` update-ready alert — a raised highlighted button.
@@ -3216,19 +3308,20 @@ fn common_suffix_bytes(a: &str, b: &str) -> usize {
 /// is not a per-cell font bit: the band's TEXT stops being cells at all and
 /// becomes pixels.
 ///
-/// TWO LANES, ONE MODULE. Windows keeps the shipped TEXT-OVER-CELLS band: a
-/// transparent raster of labels and marks whose cell backgrounds (band tone,
-/// raised chip, hover wash) show through — tuned by its own visual pass, and
-/// byte-identical here. Linux goes further ([`BAND_OWNS_SURFACES`]): the raster
-/// paints the SURFACES too — the band fill, rounded tab cards, the hover wash,
-/// the `+` button's square — because the cell-quantised chip cards underneath
-/// can put no measurement where the design needs one (a `+` centred to the
-/// half-cell, card padding in whole columns, corners that cannot round). The
-/// Linux raster also claims the FULL OPTICAL BAND as its canvas — `band_top_px`
-/// of chrome lip plus the strip's cell rows — through the inline-image seam's
-/// chrome-band lift ([`aterm_core::grid::extra::ImageData::band_lift_px`]),
-/// which is what lets a card be optically centred in a native-height bar
-/// instead of bottom-anchored in the last cell row.
+/// ONE LANE, BOTH PLATFORMS. The raster paints the SURFACES too — the band
+/// fill, rounded tab cards, the hover wash, the `+` button's square — because
+/// the cell-quantised chip cards underneath can put no measurement where the
+/// design needs one (a `+` centred to the half-cell, card padding in whole
+/// columns, corners that cannot round). It also claims the FULL OPTICAL BAND as
+/// its canvas — `band_top_px` of chrome lip plus the strip's cell rows —
+/// through the inline-image seam's chrome-band lift
+/// ([`aterm_core::grid::extra::ImageData::band_lift_px`]), which is what lets a
+/// card be optically centred in a native-height bar instead of bottom-anchored
+/// in the last cell row. Windows was excluded from this for one release —
+/// "those bytes must not move under the visual pass that tuned them" — and what
+/// shipped instead was a card glued to the bottom of a 32 px band with 19 dead
+/// rows above the label and the selection rule cutting through its descenders.
+/// The bytes moved.
 ///
 /// MECHANISM. [`raster_band`] rasterizes every label/affordance of the strip into
 /// ONE transparent straight-alpha RGBA image (via the settings tray's shared
@@ -3306,24 +3399,31 @@ pub(crate) mod pixel_band {
     /// its own chrome.
     const STRIP_LABEL_LOGICAL_PX: f32 = 13.0;
 
-    /// Does the band raster paint the strip's SURFACES — band fill, rounded tab
-    /// cards, hover wash, the `+` button's square — instead of only text and
-    /// marks over the cell backgrounds?
+    /// THE BAND OWNS ITS SURFACES. Wherever this module compiles the raster
+    /// paints the band fill, the rounded tab cards, the hover wash and the `+`
+    /// button's square — not merely text and marks over cell backgrounds.
     ///
-    /// LINUX says yes: its cell chip-cards were rejected twice on glass ("the +
-    /// button is off center and the padding and spacing and UX are all ugly"),
-    /// and every one of those complaints is cell quantisation — a 7-9 px cell is
-    /// the only unit the cell painter can centre, pad, or space with. The pixel
-    /// lane owns the whole optical band (the image carries
+    /// The cell chip-cards were rejected twice on glass ("the + button is off
+    /// center and the padding and spacing and UX are all ugly"), and every one
+    /// of those complaints is cell quantisation: a 7-9 px cell is the only unit
+    /// the cell painter can centre, pad, or space with. The pixel lane owns the
+    /// whole optical band (the image carries
     /// [`aterm_core::grid::extra::ImageData::band_lift_px`] so its canvas starts
     /// at the WINDOW top, not the grid top) and draws an opaque, designed bar:
     /// cards optically centred between the band top and the seam, gutters and
     /// margins in px, corners actually rounded.
     ///
-    /// WINDOWS says no — its band was tuned by its own visual pass as
-    /// text-over-cell-surfaces, and those bytes must not move under it. macOS
-    /// has no band at all ([`STRIP_IS_CHROME_BAND`]).
-    const BAND_OWNS_SURFACES: bool = cfg!(target_os = "linux");
+    /// This module is compiled for exactly the platforms whose strip speaks the
+    /// chip-card language ([`STRIP_CHIP_CARDS`] — Windows and Linux; macOS has
+    /// no band at all), and the two must not drift: a surface-owning raster over
+    /// a cell lane that still paints flush whole-cell chips would put square
+    /// corners under every rounded card the instant the raster declined. The
+    /// assertion below is that agreement, checked at compile time.
+    const _: () = assert!(
+        STRIP_CHIP_CARDS,
+        "the pixel band paints chip-card surfaces; the cell lane beneath it must \
+         speak the same language (STRIP_CHIP_CARDS)"
+    );
 
     /// Device-pixel geometry of the strip band for ONE window (mixed-DPI: every
     /// term is this window's own).
@@ -3339,9 +3439,8 @@ pub(crate) mod pixel_band {
         pub strip_rows: usize,
         /// Band pixels ABOVE the grid (`pad_top + head`): the off-grid lip the
         /// `ChromeBleed` paints in the band tone. Part of the OPTICAL band, so
-        /// the centring math must see it — and on the surface-owning lane
-        /// ([`BAND_OWNS_SURFACES`]) part of the CANVAS itself, reached through
-        /// the image seam's chrome-band lift.
+        /// the centring math must see it — and part of the CANVAS itself,
+        /// reached through the image seam's chrome-band lift.
         pub band_top_px: usize,
         /// The window's scale factor (drives the label size).
         pub scale: f32,
@@ -3351,9 +3450,10 @@ pub(crate) mod pixel_band {
         /// `band_top_px + (strip_rows − 1)·cell_h + DecoMetrics::underline_y`,
         /// resolved through the renderer's own deco law
         /// (`Backend::deco_metrics_for`) so the band and the rule that will be
-        /// drawn OVER it cannot disagree. The surface-owning lane centres its
-        /// cards in `[0, seam_top_px)` and keeps them clear of the rule;
-        /// `None` (the Windows lane) changes nothing.
+        /// drawn OVER it cannot disagree. The cards are centred in
+        /// `[0, seam_top_px)` and kept clear of the rule; `None` (a caller with
+        /// no resolved deco law, and the pure fixtures) falls back to clearing a
+        /// hairline's worth off the canvas bottom instead.
         pub seam_top_px: Option<usize>,
     }
 
@@ -3420,16 +3520,11 @@ pub(crate) mod pixel_band {
             return None;
         }
         let img_w = cols.checked_mul(cell_w)?;
-        // The strip's cell rows, and the raster CANVAS. The Windows lane rasters
-        // the cell rows alone; the surface-owning lane claims the whole optical
-        // band — the `lift` rides on the image (`ImageData::band_lift_px`), so
-        // both renderers place this canvas's top row at the WINDOW's top edge.
+        // The strip's cell rows, and the raster CANVAS: the whole optical band.
+        // The `lift` rides on the image (`ImageData::band_lift_px`), so both
+        // renderers place this canvas's top row at the WINDOW's top edge.
         let cells_h = geometry.strip_rows.checked_mul(cell_h)?;
-        let lift = if BAND_OWNS_SURFACES {
-            geometry.band_top_px
-        } else {
-            0
-        };
+        let lift = geometry.band_top_px;
         let img_h = cells_h.checked_add(lift)?;
         if img_w > usize::from(u16::MAX) || img_h > usize::from(u16::MAX) {
             return None;
@@ -3448,34 +3543,22 @@ pub(crate) mod pixel_band {
         // the canvas reaches.
         let band_h = (geometry.band_top_px + cells_h) as f32;
         let label_px = band_label_px(band_h, scale);
-        // The surface-owning lane's resolved design (None on the Windows lane).
-        let design = BAND_OWNS_SURFACES.then(|| BandDesign::resolve(&geometry, img_h, label_px));
-        // Cap-centred baseline. The SURFACE-OWNING lane centres in its own
-        // content region — the canvas from the window's top edge down to the
-        // seam rule ([`BandDesign::resolve`]) — with the clamp merely defensive,
-        // because the canvas reaches the whole band.
+        // The resolved design: every px the card row is drawn from.
+        let design = BandDesign::resolve(&geometry, img_h, label_px);
+        // Cap-centred baseline, in the design's own content region — the canvas
+        // from the window's top edge down to the seam rule
+        // ([`BandDesign::resolve`]), with the clamp merely defensive because the
+        // canvas reaches the whole band.
         //
-        // The WINDOWS lane keeps its shipped compromise, byte for byte: the
-        // ideal cap-centred baseline for the full band ([`crate::tray_raster::
-        // row_baseline`] over `[-band_top, band_h)` in image coordinates) lands
-        // ~4 px above the image's own top with a real `head` band, and the
-        // floor (`0.9·label_px`, the ASCENDER) pulls it back down — the label
-        // sits as high as that raster can reach. Lowering the floor is not the
-        // fix (it would clip the tips of `l`/`d`/`\`, which a path separator
-        // hits on every tab); adopting the Linux lane's lifted canvas is, and
-        // is left to that lane's own visual pass.
-        let baseline = match &design {
-            Some(design) => design.baseline,
-            None => crate::tray_raster::row_baseline(
-                -(geometry.band_top_px as f32),
-                band_h,
-                label_px,
-            )
-            .clamp(
-                label_px * 0.9,
-                (img_h as f32 - label_px * 0.28).max(label_px * 0.9),
-            ),
-        };
+        // THIS IS WHAT THE LIFT BOUGHT. A canvas that starts at the GRID top
+        // instead can only centre in its own last cell row: the ideal cap-centred
+        // baseline for the full band lands above the image's own first row, the
+        // ascender floor (`0.9·label_px`) pulls it back down, and the label ends
+        // up as high as that raster can reach — 19 dead rows above the ink and
+        // the descenders dying on the chip's last row, measured at font_px 13.
+        // Lowering the floor was never the fix (it clips the tips of `l`/`d`/`\`,
+        // which a path separator hits on every tab); reaching the whole band is.
+        let baseline = design.baseline;
         // The optical centre every non-text mark aligns to (the label's cap-box
         // midline, so ✕ / + / icons and the text read as ONE centred row).
         let cy = baseline - label_px * 0.35;
@@ -3494,23 +3577,20 @@ pub(crate) mod pixel_band {
         let mut fallback: Vec<(u16, u16)> = Vec::new();
         let mut drew_any = false;
 
-        // SURFACE-OWNING lane: the canvas is an OPAQUE bar, band tone edge to
-        // edge, and every card is painted here in px — the cell backgrounds
-        // beneath never show through a covered column (which is what frees the
-        // cards to round their corners over a clean ground). Uncovered
-        // (fallback) columns still show the cell lane's chip cards, seam
-        // included, exactly as shipped.
-        if design.is_some() {
-            prims.push(DrawPrim::Panel {
-                x: 0.0,
-                y: 0.0,
-                w: img_w as f32,
-                h: img_h as f32,
-                radius: 0.0,
-                fill: rgba(colors.band_bg, 255),
-                blur: false,
-            });
-        }
+        // The canvas is an OPAQUE bar, band tone edge to edge, and every card is
+        // painted here in px — the cell backgrounds beneath never show through a
+        // covered column (which is what frees the cards to round their corners
+        // over a clean ground). Uncovered (fallback) columns still show the cell
+        // lane's chip cards, seam included, exactly as shipped.
+        prims.push(DrawPrim::Panel {
+            x: 0.0,
+            y: 0.0,
+            w: img_w as f32,
+            h: img_h as f32,
+            radius: 0.0,
+            fill: rgba(colors.band_bg, 255),
+            blur: false,
+        });
 
         // EVERY BAND: the distinct pass resolves all chip labels in ONE look at
         // every title (the cell painter's rule) — a per-tab cut must never
@@ -3523,7 +3603,7 @@ pub(crate) mod pixel_band {
         // Hoisted out of the loop with the labels because both are the same
         // question — does the SELECTION earn semibold — and the fit has to
         // measure with the face the pen will draw with.
-        let wants_semibold = design.as_ref().is_none_or(|design| design.active_semibold);
+        let wants_semibold = design.active_semibold;
         let mut labels = resolve_band_labels(input, active, cols, cw, label_px, wants_semibold);
         for seg in input.segments {
             let end = seg.end_col.min(cols as u16);
@@ -3576,13 +3656,13 @@ pub(crate) mod pixel_band {
                         fallback.push((seg.start_col, end));
                         continue;
                     }
-                    // SURFACE-OWNING lane: this tab's CARD — a rounded rect
-                    // inset from the segment's cell-quantised span by the
-                    // design's gutter, optically centred between the band top
-                    // and the seam. The segment stays the hit region (clicks a
-                    // couple of px outside the visual card still land on the
-                    // tab — the forgiving edge every native strip has).
-                    if let Some(design) = &design {
+                    // This tab's CARD — a rounded rect inset from the segment's
+                    // cell-quantised span by the design's gutter, optically
+                    // centred between the band top and the seam. The segment
+                    // stays the hit region (clicks a couple of px outside the
+                    // visual card still land on the tab — the forgiving edge
+                    // every native strip has).
+                    {
                         let card_bg = if is_active {
                             Some(colors.active_bg)
                         } else if is_hovered {
@@ -3608,100 +3688,52 @@ pub(crate) mod pixel_band {
                             }
                         }
                     }
-                    let (ink, face) = match &design {
-                        // The design lane's inks follow the SURFACE each label
-                        // actually sits on (the cell lane's own ladder): the
-                        // selected card's floored pair, the hover wash's, the
-                        // quiet chip's — or the bare band's on a flat-quiet
-                        // candidate. Weight is a design decision, not a reflex:
-                        // semibold only where the candidate says the selection
-                        // earns it.
-                        Some(design) => {
-                            let active_face = if design.active_semibold {
-                                TextFace::UiBold
-                            } else {
-                                TextFace::Ui
-                            };
-                            if is_active {
-                                (colors.active_fg, active_face)
-                            } else if is_hovered {
-                                (colors.hover_fg, TextFace::Ui)
-                            } else if design.quiet_cards {
-                                (colors.chip_fg, TextFace::Ui)
-                            } else {
-                                (colors.inactive_fg, TextFace::Ui)
-                            }
-                        }
-                        None => {
-                            if is_active {
-                                (colors.active_fg, TextFace::UiBold)
-                            } else if is_hovered {
-                                (colors.hover_fg, TextFace::Ui)
-                            } else {
-                                (colors.inactive_fg, TextFace::Ui)
-                            }
+                    // The inks follow the SURFACE each label actually sits on
+                    // (the cell lane's own ladder): the selected card's floored
+                    // pair, the hover wash's, the quiet chip's — or the bare
+                    // band's on a flat-quiet candidate. Weight is a design
+                    // decision, not a reflex: semibold only where the candidate
+                    // says the selection earns it.
+                    let (ink, face) = {
+                        let active_face = if design.active_semibold {
+                            TextFace::UiBold
+                        } else {
+                            TextFace::Ui
+                        };
+                        if is_active {
+                            (colors.active_fg, active_face)
+                        } else if is_hovered {
+                            (colors.hover_fg, TextFace::Ui)
+                        } else if design.quiet_cards {
+                            (colors.chip_fg, TextFace::Ui)
+                        } else {
+                            (colors.inactive_fg, TextFace::Ui)
                         }
                     };
-                    // Leading separator: the cell painter's `│`, as a real 1 px
-                    // hairline (band furniture, not a font glyph) — shortened off
-                    // the band edges the way native strips draw theirs. WINDOWS
-                    // lane only: the design lane's cards and gutters carry the
+                    // NO LEADING `│` SEPARATOR. The cards and gutters carry the
                     // structure themselves, the way a libadwaita bar's do — a
                     // rule flush against a rounded card reads as grime.
-                    if design.is_none()
-                        && strip_separates(i, active, input.paint.hovered)
-                        && let Some(seam) = colors.seam
-                    {
-                        let half = (band_h * 0.28).max(3.0);
-                        let y0 = (cy - half).max(0.0);
-                        let y1 = (cy + half).min(img_h as f32);
-                        if y1 > y0 {
-                            prims.push(DrawPrim::Stroke {
-                                x: (f32::from(seg.start_col) + 0.5).mul_add(cw, -0.5),
-                                y: y0,
-                                w: 1.0,
-                                h: y1 - y0,
-                                radius: 0.0,
-                                width: 1.0,
-                                color: rgba(seam, 255),
-                            });
-                        }
-                    }
                     if let (Some(icon_start), Some(kind)) =
                         (layout.icon_start, item.and_then(|it| it.icon))
                     {
-                        let color = match &design {
-                            // The design lane's icon takes the LABEL's own ink —
-                            // one ink per surface, so a mark can never read a
-                            // step louder than the title it accompanies.
-                            Some(_) => ink,
-                            None => {
-                                if is_active {
-                                    colors.fg
-                                } else {
-                                    colors.inactive_fg
-                                }
-                            }
-                        };
+                        // The icon takes the LABEL's own ink — one ink per
+                        // surface, so a mark can never read a step louder than
+                        // the title it accompanies.
                         draw_icon_prims(
                             &mut prims,
                             tab_icon_primitives(kind),
                             (f32::from(icon_start) + f32::from(ICON_COLS) * 0.5) * cw,
                             cy,
                             ((2.0 * cw).min(band_h) * 0.85).max(6.0),
-                            color,
+                            ink,
                         );
                     }
                     if let (Some(item), Some(col)) = (item, layout.status_col) {
                         let color = if item.dirty || item.attention {
                             colors.accent
-                        } else if design.is_some() {
+                        } else {
                             // One ink per surface (see the icon above).
                             ink
-                        } else if is_active {
-                            colors.fg
-                        } else {
-                            colors.inactive_fg
                         };
                         draw_icon_prims(
                             &mut prims,
@@ -3743,12 +3775,7 @@ pub(crate) mod pixel_band {
                             variable_pen.as_ref().and_then(|pen| {
                                 let run = pen.shape(&label, label_px)?;
                                 let run = pen.fit(run, span_px, label_px)?;
-                                let x = match &design {
-                                    Some(_) => {
-                                        ((span_px - run.width) * 0.5).max(0.0) + x0
-                                    }
-                                    None => x0,
-                                };
+                                let x = ((span_px - run.width) * 0.5).max(0.0) + x0;
                                 Some(variable_label_overlay(
                                     &run, x, baseline, img_h, span_px, ink,
                                 ))
@@ -3767,17 +3794,12 @@ pub(crate) mod pixel_band {
                                 // what the resolve pass exists to replace: it
                                 // can only shorten, and a shortening the strip
                                 // never saw can hand two chips one string.
-                                let x = match &design {
-                                    // Centred by the SAME measure the pen draws
-                                    // with, so alignment and paint cannot drift.
-                                    Some(_) => {
-                                        let width = crate::tray_raster::ui_text_width_for(
-                                            face, &label, label_px,
-                                        );
-                                        ((span_px - width) * 0.5).max(0.0) + x0
-                                    }
-                                    None => x0,
-                                };
+                                // Centred by the SAME measure the pen draws
+                                // with, so alignment and paint cannot drift.
+                                let width = crate::tray_raster::ui_text_width_for(
+                                    face, &label, label_px,
+                                );
+                                let x = ((span_px - width) * 0.5).max(0.0) + x0;
                                 prims.push(DrawPrim::ClipPush {
                                     x: x0,
                                     y: 0.0,
@@ -3799,12 +3821,11 @@ pub(crate) mod pixel_band {
                     }
                     // The close mark — two round-capped strokes, not a font's ✕
                     // (code-native chrome never depends on a face covering
-                    // U+2715). HOVER-ONLY on the Windows lane, as on the native
-                    // strip; the design lane additionally keeps it RESIDENT on
-                    // the selected card (the cell chip-card band's own policy —
-                    // the tab you are IN always shows its way out).
+                    // U+2715). Revealed on HOVER, as on the native strip, and
+                    // kept RESIDENT on the selected card (the chip-card band's
+                    // own policy — the tab you are IN always shows its way out).
                     if let Some(cx) = seg.close_col
-                        && (input.paint.hovered == Some(i) || (design.is_some() && is_active))
+                        && (input.paint.hovered == Some(i) || is_active)
                     {
                         let center = (f32::from(cx) + 0.5) * cw;
                         let r = (label_px * 0.26).max(2.0);
@@ -3833,47 +3854,48 @@ pub(crate) mod pixel_band {
                     // The `+`. Code-native strokes: crisp at every DPI, no face
                     // dependency.
                     //
-                    // WINDOWS lane: centred in its two-cell card (the cell
-                    // painter's card — the leading pad cell stays band, see the
-                    // gutter note in `paint_strip_impl`), byte-identical.
+                    // THE off-centre `+` was the named complaint, and it was pure
+                    // cell arithmetic — the glyph centred on the card cells while
+                    // the hit region was the whole segment, so it hung half a
+                    // cell off its own target. Here the button is a FIXED SQUARE
+                    // quiet card centred on the segment's true px centre — glyph
+                    // centre, card centre and hit-region centre are one point —
+                    // sized to the card row and aligned to it.
                     //
-                    // DESIGN lane: THE off-centre `+` was the named complaint,
-                    // and it was pure cell arithmetic — the glyph centred on the
-                    // card cells while the hit region was the whole segment, so
-                    // it hung half a cell off its own target. Here the button is
-                    // a FIXED SQUARE quiet card centred on the segment's true px
-                    // centre — glyph centre, card centre and hit-region centre
-                    // are one point — sized to the card row and aligned to it.
-                    let (center, ink) = match &design {
-                        Some(design) => {
-                            let seg0 = f32::from(seg.start_col) * cw;
-                            let seg1 = f32::from(end) * cw;
-                            let center = (seg0 + seg1) * 0.5;
-                            let card_h = design.card_bot - design.card_top;
-                            let side = card_h.min(seg1 - seg0 - 2.0 * design.gap_h);
-                            if design.quiet_button && side > 4.0 {
-                                prims.push(DrawPrim::Panel {
-                                    x: center - side * 0.5,
-                                    y: design.card_top + (card_h - side) * 0.5,
-                                    w: side,
-                                    h: side,
-                                    radius: design.radius.min(side * 0.5),
-                                    fill: rgba(colors.chip_bg, 255),
-                                    blur: false,
-                                });
-                            }
-                            let ink = if design.quiet_button {
-                                colors.chip_button_fg
-                            } else {
-                                colors.fg
-                            };
-                            (center, rgba(ink, 255))
+                    // POINTER FEEDBACK. Hovering the `+` used to change exactly
+                    // zero pixels: the cell lane never re-roled it, and the band
+                    // never asked. It is the strip's primary affordance and the
+                    // one control a pointer lands on most, so it takes the SAME
+                    // hover wash a quiet chip does (one hover material for the
+                    // whole band) with its own full-strength ink re-floored
+                    // against that wash ([`StripColors::button_hover_fg`]).
+                    let (center, ink) = {
+                        let seg0 = f32::from(seg.start_col) * cw;
+                        let seg1 = f32::from(end) * cw;
+                        let center = (seg0 + seg1) * 0.5;
+                        let card_h = design.card_bot - design.card_top;
+                        let side = card_h.min(seg1 - seg0 - 2.0 * design.gap_h);
+                        let hot = input.paint.new_tab_hovered;
+                        if design.quiet_button && side > 4.0 {
+                            prims.push(DrawPrim::Panel {
+                                x: center - side * 0.5,
+                                y: design.card_top + (card_h - side) * 0.5,
+                                w: side,
+                                h: side,
+                                radius: design.radius.min(side * 0.5),
+                                fill: rgba(
+                                    if hot { colors.hover_bg } else { colors.chip_bg },
+                                    255,
+                                ),
+                                blur: false,
+                            });
                         }
-                        None => {
-                            let card0 = f32::from(seg.start_col + 1) * cw;
-                            let card1 = f32::from(end) * cw;
-                            ((card0 + card1) * 0.5, rgba(colors.raise_fg, 255))
-                        }
+                        let ink = match (design.quiet_button, hot) {
+                            (true, false) => colors.chip_button_fg,
+                            (true, true) => colors.button_hover_fg,
+                            (false, _) => colors.fg,
+                        };
+                        (center, rgba(ink, 255))
                     };
                     let r = (label_px * 0.30).max(2.5);
                     let w = (label_px / 8.5).max(1.2);
@@ -3899,12 +3921,10 @@ pub(crate) mod pixel_band {
                     // The `↻` update alert keeps its glyph — it is the terminal
                     // family's mark today and the Mono arm of the tray pen draws
                     // the SAME face the cells did, only now vertically centred
-                    // with the rest of the band. The design lane seats it on the
-                    // update CTA's own card (the highlighted treatment the cell
-                    // lane gives it), centred like every other chip.
-                    let card0 = f32::from(seg.start_col) * cw;
-                    let card1 = f32::from(end.saturating_sub(1)) * cw;
-                    if let Some(design) = &design {
+                    // with the rest of the band. It sits on the update CTA's own
+                    // card (the highlighted treatment the cell lane gives it),
+                    // centred like every other chip.
+                    {
                         let x0 = f32::from(seg.start_col).mul_add(cw, design.gap_h);
                         let x1 = f32::from(end).mul_add(cw, -design.gap_h);
                         if x1 > x0 {
@@ -3919,16 +3939,12 @@ pub(crate) mod pixel_band {
                             });
                         }
                     }
-                    let x = match &design {
-                        // Centred on the CARD the design lane just painted (the
-                        // full segment span, gutter-inset symmetrically), not on
-                        // the Windows lane's cell pair.
-                        Some(_) => {
-                            let seg0 = f32::from(seg.start_col) * cw;
-                            let seg1 = f32::from(end) * cw;
-                            (seg0 + seg1) * 0.5 - label_px * 0.3
-                        }
-                        None => (card0 + card1) * 0.5 - label_px * 0.3,
+                    // Centred on the CARD just painted (the full segment span,
+                    // gutter-inset symmetrically).
+                    let x = {
+                        let seg0 = f32::from(seg.start_col) * cw;
+                        let seg1 = f32::from(end) * cw;
+                        (seg0 + seg1) * 0.5 - label_px * 0.3
                     };
                     prims.push(text_prim(
                         x,
@@ -3937,11 +3953,7 @@ pub(crate) mod pixel_band {
                         TypeStep::Body.px(label_px),
                         TextWeight::Bold,
                         TextFace::Mono,
-                        rgba(if design.is_some() {
-                            colors.update_fg
-                        } else {
-                            colors.active_fg
-                        }, 255),
+                        rgba(colors.update_fg, 255),
                     ));
                     drew_any = true;
                 }
@@ -3987,10 +3999,9 @@ pub(crate) mod pixel_band {
             // OVER the covered cells' (mono) glyphs, under the decorations —
             // the suppression contract the whole design keys on.
             z_index: 0,
-            // The surface-owning lane's canvas starts at the WINDOW's top edge:
-            // its first `lift` rows land on the chrome lip above the grid (the
-            // renderers' chrome-band lift). 0 on the Windows lane — the shipped
-            // cell-rows-only band, byte for byte.
+            // The canvas starts at the WINDOW's top edge: its first `lift` rows
+            // land on the chrome lip above the grid (the renderers' chrome-band
+            // lift). 0 only where the strip has no lip of its own.
             band_lift_px: lift as u16,
         });
 
@@ -4042,8 +4053,8 @@ pub(crate) mod pixel_band {
             .max(6.0)
     }
 
-    /// The SURFACE-OWNING lane's resolved metrics ([`BAND_OWNS_SURFACES`]) —
-    /// every px the card row is drawn from, derived once per raster. All values
+    /// The band's resolved metrics — every px the card row is drawn from,
+    /// derived once per raster. All values
     /// are canvas coordinates (0 = the window's top edge; the canvas carries the
     /// chrome lip via the image lift).
     struct BandDesign {
@@ -4984,10 +4995,9 @@ pub(crate) mod pixel_band {
                 "each ref names its own tile"
             );
             let (_, w, h) = image_of(&rows);
-            // The Windows lane's canvas is 1:1 with the cell footprint; the
-            // surface-owning lane's adds the chrome lip, carried as the image's
-            // band lift so the renderers seat the canvas at the window top.
-            let lift = if BAND_OWNS_SURFACES { BAND_TOP } else { 0 };
+            // The canvas is the cell footprint PLUS the chrome lip, carried as
+            // the image's band lift so the renderers seat it at the window top.
+            let lift = BAND_TOP;
             assert_eq!((w, h), (80 * CELL_W, CELL_H + lift), "canvas vs footprint");
             assert_eq!((first.cols, first.rows, first.z_index), (80, 1, 0));
             assert_eq!(usize::from(first.band_lift_px), lift);
@@ -5017,54 +5027,36 @@ pub(crate) mod pixel_band {
                 usize::from(layout.title_start) * CELL_W,
                 usize::from(layout.title_end) * CELL_W,
             );
-            if BAND_OWNS_SURFACES {
-                // DESIGN lane: the canvas is opaque (alpha is no ink detector)
-                // and the title is CENTRED in its span. Classify ink as pixels
-                // far from every surface tone, then hold the run to its span
-                // and to the content region's optical centre.
-                let colors = strip_colors_with_active(Theme::default(), None);
-                let surfaces = [colors.band_bg, colors.active_bg, colors.chip_bg];
-                let (x0, y0, x1, y1) = ink_bbox_off_surfaces(
-                    &rgba, w, h, span.0, span.1, &surfaces,
-                )
-                .expect("the active title inks its span");
-                assert!(
-                    x0 >= span.0 && x1 <= span.1,
-                    "ink stays in span: {x0}..{x1} vs {span:?}"
-                );
-                // Centred: the run's middle within a couple px of the span's.
-                let span_mid = (span.0 + span.1) as f32 / 2.0;
-                let ink_mid_x = (x0 + x1) as f32 / 2.0;
-                assert!(
-                    (ink_mid_x - span_mid).abs() <= 3.0,
-                    "run centred in span: {ink_mid_x} vs {span_mid}"
-                );
-                // Optically centred in the CONTENT region (the canvas above the
-                // seam clearance — geometry has no resolved seam here, so the
-                // fallback hairline clearance applies).
-                let content_h = h as f32 - 2.0;
-                let ink_mid_y = (y0 + y1) as f32 / 2.0;
-                assert!(
-                    (ink_mid_y - content_h / 2.0).abs() <= 3.0,
-                    "ink mid {ink_mid_y} vs content centre {} (bbox y {y0}..{y1})",
-                    content_h / 2.0
-                );
-            } else {
-                let (x0, y0, x1, y1) = ink_bbox(&rgba, w, h, 0, w).expect("the band has ink");
-                // Segment 0's title ink starts inside its span (left-aligned); the
-                // ✕ is hover-only so nothing else inks left of the next chip.
-                assert!(x0 >= span.0 && x0 < span.1, "ink starts in span: {x0} vs {span:?}");
-                let _ = x1;
-                // Vertical centring in the OPTICAL band (lip + row): the ink's
-                // cap-ish middle sits near the band centre, expressed in image rows.
-                let band_centre = (BAND_TOP + CELL_H) as f32 / 2.0 - BAND_TOP as f32;
-                let ink_mid = (y0 + y1) as f32 / 2.0;
-                assert!(
-                    (ink_mid - band_centre).abs() <= 3.0,
-                    "ink mid {ink_mid} vs band centre {band_centre} (bbox y {y0}..{y1})"
-                );
-                assert!(y0 > 0 && y1 < h, "ink stays inside the image rows");
-            }
+            // The canvas is opaque (alpha is no ink detector) and the title is
+            // CENTRED in its span. Classify ink as pixels far from every surface
+            // tone, then hold the run to its span and to the content region's
+            // optical centre.
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let surfaces = [colors.band_bg, colors.active_bg, colors.chip_bg];
+            let (x0, y0, x1, y1) =
+                ink_bbox_off_surfaces(&rgba, w, h, span.0, span.1, &surfaces)
+                    .expect("the active title inks its span");
+            assert!(
+                x0 >= span.0 && x1 <= span.1,
+                "ink stays in span: {x0}..{x1} vs {span:?}"
+            );
+            // Centred: the run's middle within a couple px of the span's.
+            let span_mid = (span.0 + span.1) as f32 / 2.0;
+            let ink_mid_x = (x0 + x1) as f32 / 2.0;
+            assert!(
+                (ink_mid_x - span_mid).abs() <= 3.0,
+                "run centred in span: {ink_mid_x} vs {span_mid}"
+            );
+            // Optically centred in the CONTENT region (the canvas above the
+            // seam clearance — geometry has no resolved seam here, so the
+            // fallback hairline clearance applies).
+            let content_h = h as f32 - 2.0;
+            let ink_mid_y = (y0 + y1) as f32 / 2.0;
+            assert!(
+                (ink_mid_y - content_h / 2.0).abs() <= 3.0,
+                "ink mid {ink_mid_y} vs content centre {} (bbox y {y0}..{y1})",
+                content_h / 2.0
+            );
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
@@ -5078,6 +5070,7 @@ pub(crate) mod pixel_band {
             let titles = vec!["alpha".to_string(), "beta".to_string()];
             let paint = StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -5383,7 +5376,7 @@ pub(crate) mod pixel_band {
         /// pathological all-caps title [`fit_label`] exists for, as a closed
         /// form, so this law is pinned on a host with no system font at all
         /// (CI) and on both lanes alike: the string the fit resolves is not a
-        /// function of `BAND_OWNS_SURFACES`, only of the span and the face.
+        /// function of the lane, only of the span and the face.
         fn wide_face(_tab: usize, s: &str) -> f32 {
             s.chars().count() as f32 * (CELL_W as f32 * 1.5)
         }
@@ -5673,17 +5666,17 @@ pub(crate) mod pixel_band {
             assert_eq!(fitted[1].1, "…$HOME/trust", "an uncontested label is untouched");
         }
 
-        /// WINDOWS SHIPS THIS PASS TOO — [`STRIP_DISTINCT_LABELS`] is true on
-        /// every band — and its lane is the one no host here can raster: no
-        /// design, labels left-aligned, the cell painter's surfaces under them,
-        /// and a title window one cell WIDER than the chip-card lane's because
-        /// [`STRIP_CHIP_CARDS`] spends no interior pad there. What is
-        /// host-independent is every string the pass resolves, so both lanes'
-        /// windows are driven from here against the same pathological face.
-        /// Neither may collapse two chips into one, and neither may hand a chip
-        /// a number that is not its own position.
+        /// TWO TITLE WINDOWS, ONE PASS. A chip-card band spends one interior
+        /// cell on the card's own pad ([`tab_content_layout`]); a PADLESS strip
+        /// (the macOS in-grid fallback, and any future band without cards) hands
+        /// the label that cell back, so the same strip resolves against a window
+        /// one cell wider. `tab_content_layout` reads that pad off the build, so
+        /// a host can only ever exercise ONE of them — and the pass's promises
+        /// are host-independent, so both windows are driven from here against
+        /// the same pathological face. Neither may collapse two chips into one,
+        /// and neither may hand a chip a number that is not its own position.
         #[test]
-        fn both_band_lanes_resolve_the_same_strip_distinctly() {
+        fn both_title_windows_resolve_the_same_strip_distinctly() {
             assert_eq!(
                 STRIP_DISTINCT_LABELS, STRIP_IS_CHROME_BAND,
                 "the pass runs wherever the band does — Windows included"
@@ -5704,7 +5697,7 @@ pub(crate) mod pixel_band {
             // the one it is. `tab_content_layout` reads that pad off the build,
             // so the two windows are computed here instead.
             let mut widths = Vec::new();
-            for (lane, pad) in [("windows", 0u16), ("chip-card", 1u16)] {
+            for (lane, pad) in [("padless", 0u16), ("chip-card", 1u16)] {
                 let entries: Vec<BandLabel> = segments
                     .iter()
                     .filter_map(|seg| match seg.kind {
@@ -5753,8 +5746,8 @@ pub(crate) mod pixel_band {
             }
             assert!(
                 widths[0] > widths[1],
-                "fixture: the two lanes really are different windows ({widths:?}) \
-                 — the Windows band spends no card pad"
+                "fixture: the two windows really are different ({widths:?}) — a \
+                 padless strip spends no card pad"
             );
         }
 
@@ -6061,10 +6054,10 @@ pub(crate) mod pixel_band {
                     );
                     let rows = raster_band(&input, &[]).expect("band");
                     let (rgba, w, h) = image_of(&rows);
-                    // Composite over the band tone (the Linux canvas is opaque
-                    // anyway; the Windows lane's transparent pixels are the
-                    // cell background, which IS this colour) and magnify, so a
-                    // 13 px label can be judged on screen.
+                    // Composite over the band tone (the canvas is opaque anyway;
+                    // any transparent pixel is the cell background, which IS
+                    // this colour) and magnify, so a 13 px label can be judged
+                    // on screen.
                     let ground = strip_colors_with_active(input.theme, None).band_bg;
                     const ZOOM: usize = 3;
                     let mut rgb = Vec::with_capacity(w * h * ZOOM * ZOOM * 3);
@@ -6118,19 +6111,16 @@ pub(crate) mod pixel_band {
             assert_eq!(rows.len(), 2);
             assert!(rows[1].iter().all(|(_, r)| r.cell_row == 1));
             let (_, w, h) = image_of(&rows);
-            let lift = if BAND_OWNS_SURFACES { BAND_TOP } else { 0 };
+            let lift = BAND_TOP;
             assert_eq!((w, h), (60 * CELL_W, 2 * CELL_H + lift));
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
-        /// DESIGN-LANE GEOMETRY LAW ([`BAND_OWNS_SURFACES`]), pure — no fonts:
+        /// THE CARD-ROW GEOMETRY LAW, pure — no fonts:
         /// the card row is symmetric in the content region, clears the resolved
         /// seam, and can never round past a pill.
         #[test]
         fn design_card_row_is_centred_in_the_content_and_clears_the_seam() {
-            if !BAND_OWNS_SURFACES {
-                return;
-            }
             for (band_top, cell_h, strip_rows, underline_y, scale) in [
                 (16usize, 18usize, 1usize, 15usize, 1.0f32),
                 (2, 21, 1, 17, 1.0),
@@ -6178,7 +6168,7 @@ pub(crate) mod pixel_band {
         /// through under a rounded card.
         #[test]
         fn design_canvas_is_opaque_edge_to_edge() {
-            if !BAND_OWNS_SURFACES || !with_ui_faces() {
+            if !with_ui_faces() {
                 return;
             }
             let metadata = plain(2);
@@ -6205,7 +6195,7 @@ pub(crate) mod pixel_band {
         /// pixel centre — the same centre its hit region has — to the pixel.
         #[test]
         fn design_plus_glyph_is_dead_centred_on_its_hit_region() {
-            if !BAND_OWNS_SURFACES || !with_ui_faces() {
+            if !with_ui_faces() {
                 return;
             }
             let metadata = plain(2);
@@ -6262,7 +6252,7 @@ pub(crate) mod pixel_band {
         /// one.
         #[test]
         fn design_cards_clear_the_resolved_seam_row() {
-            if !BAND_OWNS_SURFACES || !with_ui_faces() {
+            if !with_ui_faces() {
                 return;
             }
             let metadata = plain(2);
@@ -6285,6 +6275,339 @@ pub(crate) mod pixel_band {
                     );
                 }
             }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// One canvas pixel as RGB.
+        fn px_at(rgba: &[u8], w: usize, x: usize, y: usize) -> [u8; 3] {
+            let i = (y * w + x) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2]]
+        }
+
+        /// `(band_top_px, cell_h, underline_y)` — the optical bands the WINDOWS
+        /// metrics actually produce, READ OFF GLASS at 96 dpi (`ctl dims` +
+        /// the seam row in a `ctl image` capture) for the four font sizes a
+        /// user picks. The synthetic head keeps the band 32 px at every one of
+        /// them, which is why `band_top` shrinks as `cell_h` grows:
+        ///
+        /// | `font_px` | cell   | `pad_top + head` | seam row |
+        /// |----------:|:-------|-----------------:|---------:|
+        /// | 11        | 6×13   | 2 + 17 = 19      | 29       |
+        /// | 13        | 8×15   | 2 + 15 = 17      | 29       |
+        /// | 16        | 9×19   | 2 + 11 = 13      | 28       |
+        /// | 20        | 12×23  | 2 + 7  = 9       | 27       |
+        ///
+        /// The 13 px row is the one the audit measured on the installed build:
+        /// a 32 px band whose selection rule sat at y=29, with the label's ink
+        /// at y=19..28 and its descenders bleeding to y=31.
+        const WIN_BANDS: [(usize, usize, usize); 4] =
+            [(19, 13, 10), (17, 15, 12), (13, 19, 15), (9, 23, 18)];
+
+        /// A one-window band at `(band_top, cell_h, underline_y)`.
+        fn win_geometry(cols: usize, (band_top, cell_h, underline_y): (usize, usize, usize)) -> BandGeometry {
+            BandGeometry {
+                cols,
+                cell_w: CELL_W,
+                cell_h,
+                strip_rows: 1,
+                band_top_px: band_top,
+                scale: 1.0,
+                seam_top_px: Some(band_top + underline_y),
+            }
+        }
+
+        /// THE BLOCKER, PINNED IN PIXELS. On the band Windows shipped, the label
+        /// was baseline-bound to the last CELL row of a 32 px bar: at font_px 13
+        /// its ink ran y=19..28 with NINETEEN dead rows above it, its descenders
+        /// bled to y=31 on the chip's last row, and a solid accent rule crossed
+        /// the full chip width at y=29 — through those very descenders. The
+        /// lifted canvas is what buys the room, so this holds the law it buys at
+        /// every band the Windows metrics produce: the run sits INSIDE its card,
+        /// is not bottom-heavy, starts above the card's own midline, and every
+        /// descender clears the seam the cell lane stamps over this raster.
+        #[test]
+        fn the_label_is_centred_in_its_card_with_descender_room_at_every_font_px() {
+            if !with_ui_faces() {
+                return;
+            }
+            let colors = strip_colors_with_active(Theme::default(), None);
+            for win in WIN_BANDS {
+                let (band_top, cell_h, underline_y) = win;
+                let metadata = plain(2);
+                let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+                // ASCENDER and DESCENDER in one run, so the bbox is the label's
+                // true optical extent rather than an x-height band.
+                let titles = vec!["Apply".to_string(), "gypsy".to_string()];
+                let geometry = win_geometry(80, win);
+                let input =
+                    band(&segments, &titles, &metadata, StripPaint::default(), geometry);
+                let rows = raster_band(&input, &[]).expect("band");
+                let (rgba, w, h) = image_of(&rows);
+                assert_eq!(
+                    h,
+                    band_top + cell_h,
+                    "the canvas is the WHOLE optical band, lip included"
+                );
+                let seg = segments[0];
+                let layout = tab_content_layout(&seg, metadata[0]);
+                let span = (
+                    usize::from(layout.title_start) * CELL_W,
+                    usize::from(layout.title_end) * CELL_W,
+                );
+                let (_, y0, _, y1) = ink_bbox_off_surfaces(
+                    &rgba,
+                    w,
+                    h,
+                    span.0,
+                    span.1,
+                    &[colors.band_bg, colors.active_bg, colors.chip_bg],
+                )
+                .expect("the active title inks its span");
+                let label_px = band_label_px(h as f32, 1.0);
+                let d = BandDesign::resolve(&geometry, h, label_px);
+                assert!(
+                    y0 as f32 >= d.card_top - 1.0 && y1 as f32 <= d.card_bot + 1.0,
+                    "{win:?}: ink {y0}..{y1} escapes its card {}..{}",
+                    d.card_top,
+                    d.card_bot
+                );
+                // NOT BOTTOM-HEAVY: the air above the run and the air below it
+                // agree to within a descender's depth (the cap box is what the
+                // baseline centres, so the tail hangs past the mirror).
+                let above = y0 as f32 - d.card_top;
+                let below = d.card_bot - y1 as f32;
+                assert!(
+                    (above - below).abs() <= label_px * 0.5,
+                    "{win:?}: air above {above} vs below {below} (ink {y0}..{y1}, card {}..{}, label {label_px})",
+                    d.card_top,
+                    d.card_bot
+                );
+                // THE NINETEEN DEAD ROWS, as an assertion: the run's TOP is
+                // above the card's own midline. The shipped band put it below.
+                let card_mid = (d.card_top + d.card_bot) * 0.5;
+                assert!(
+                    (y0 as f32) < card_mid,
+                    "{win:?}: the run starts at {y0}, below the card's midline {card_mid}"
+                );
+                // DESCENDER ROOM: the last inked row clears the seam rule.
+                assert!(
+                    y1 <= band_top + underline_y,
+                    "{win:?}: descenders reach {y1}, seam rule at {}",
+                    band_top + underline_y
+                );
+            }
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// EVERY TAB IS A CARD. The band Windows shipped drew flush whole-cell
+        /// chips: the active fill spanned y=0..31 of a 32 px band — no top
+        /// inset, square corners — and a QUIET tab was byte-identical to the
+        /// band with a half-height 1 px tick standing in for a card. Here every
+        /// chip is an inset rounded card floating on bare band, and the quiet
+        /// one is a real surface.
+        #[test]
+        fn quiet_and_selected_chips_are_inset_rounded_cards_on_bare_band() {
+            if !with_ui_faces() {
+                return;
+            }
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let win = WIN_BANDS[1];
+            let metadata = plain(3);
+            let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
+            let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+            let geometry = win_geometry(90, win);
+            let input = band(&segments, &titles, &metadata, StripPaint::default(), geometry);
+            let rows = raster_band(&input, &[]).expect("band");
+            let (rgba, w, h) = image_of(&rows);
+            let label_px = band_label_px(h as f32, 1.0);
+            let d = BandDesign::resolve(&geometry, h, label_px);
+            let card = |seg: &TabSegment| {
+                (
+                    (f32::from(seg.start_col) * CELL_W as f32 + d.gap_h).round() as usize,
+                    (f32::from(seg.end_col) * CELL_W as f32 - d.gap_h).round() as usize,
+                )
+            };
+            for (i, seg) in segments
+                .iter()
+                .filter(|s| matches!(s.kind, TabHit::Select(_)))
+                .enumerate()
+            {
+                let (x0, x1) = card(seg);
+                let mid_x = (x0 + x1) / 2;
+                let fill = if i == 0 { colors.active_bg } else { colors.chip_bg };
+                // The card's own surface, sampled ABOVE the label's own rows and
+                // clear of the corner radius.
+                let inside = px_at(&rgba, w, mid_x, (d.card_top as usize) + 2);
+                assert_eq!(inside, fill, "tab {i}: the card carries its own tone");
+                // A QUIET card is a real surface, not the band wearing a tick.
+                if i > 0 {
+                    assert_ne!(
+                        fill, colors.band_bg,
+                        "tab {i}: a quiet chip must not be byte-identical to the band"
+                    );
+                }
+                // TOP INSET: the row just above the card is bare band, so the
+                // card floats instead of being glued to the window's edge.
+                assert_eq!(
+                    px_at(&rgba, w, mid_x, d.card_top as usize - 1),
+                    colors.band_bg,
+                    "tab {i}: bare band above the card (top inset)"
+                );
+                assert_eq!(
+                    px_at(&rgba, w, mid_x, d.card_bot as usize + 1),
+                    colors.band_bg,
+                    "tab {i}: bare band below the card (bottom inset)"
+                );
+                // ROUNDED: the card's literal corner pixel is not the fill —
+                // the radius ate it. A square chip fails here.
+                assert_ne!(
+                    px_at(&rgba, w, x0, d.card_top as usize),
+                    fill,
+                    "tab {i}: the corner is rounded, not square"
+                );
+            }
+            // SUB-CELL GUTTERS: between two neighbouring cards the band shows
+            // through, and it is `2·gap_h` px wide — not one whole cell.
+            let a = card(&segments[0]);
+            let b = card(&segments[1]);
+            assert!(b.0 > a.1, "the cards do not touch");
+            for x in a.1..b.0 {
+                assert_eq!(
+                    px_at(&rgba, w, x, (d.card_top as usize) + 2),
+                    colors.band_bg,
+                    "the gutter at x={x} is bare band"
+                );
+            }
+            assert!(
+                b.0 - a.1 < CELL_W,
+                "the gutter is SUB-CELL ({} px vs a {CELL_W} px cell)",
+                b.0 - a.1
+            );
+            let _ = h;
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// THE `+` IS A BUTTON, NOT A COPY OF THE SELECTED TAB — and it answers
+        /// the pointer. The shipped Windows band painted the `+` box in
+        /// `#525256`, byte-identical to the ACTIVE tab card one gutter away, and
+        /// hovering it changed exactly zero pixels.
+        #[test]
+        fn the_plus_is_its_own_surface_and_lights_under_the_pointer() {
+            if !with_ui_faces() {
+                return;
+            }
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let win = WIN_BANDS[1];
+            let metadata = plain(2);
+            let segments = layout_segments_with_metadata(80, 2, &metadata, 0, false);
+            let titles = vec!["one".to_string(), "two".to_string()];
+            let geometry = win_geometry(80, win);
+            let plus = segments
+                .iter()
+                .find(|s| matches!(s.kind, TabHit::NewTab))
+                .copied()
+                .expect("an 80-col two-tab strip keeps its +");
+            // A point on the button's square but OFF the glyph's own strokes:
+            // a quarter of the way in from the square's left edge.
+            let label_px = band_label_px(
+                (geometry.band_top_px + geometry.cell_h) as f32,
+                1.0,
+            );
+            let d = BandDesign::resolve(
+                &geometry,
+                geometry.band_top_px + geometry.cell_h,
+                label_px,
+            );
+            let seg0 = f32::from(plus.start_col) * CELL_W as f32;
+            let seg1 = f32::from(plus.end_col) * CELL_W as f32;
+            let centre = (seg0 + seg1) * 0.5;
+            let side = (d.card_bot - d.card_top).min(seg1 - seg0 - 2.0 * d.gap_h);
+            // Mid-HEIGHT (no corner radius there) and a third of the way out
+            // toward the square's edge — past the glyph's own arms (`label_px *
+            // 0.30` plus its stroke) and short of the rounded rim.
+            let probe = (
+                (centre - side * 0.35).round() as usize,
+                (d.card_top + (d.card_bot - d.card_top) * 0.5).round() as usize,
+            );
+            let sample = |hot: bool| {
+                let paint = StripPaint {
+                    hovered: None,
+                    new_tab_hovered: hot,
+                    subtitle: None,
+                    rename: None,
+                };
+                let input = band(&segments, &titles, &metadata, paint, geometry);
+                let rows = raster_band(&input, &[]).expect("band");
+                let (rgba, w, _) = image_of(&rows);
+                px_at(&rgba, w, probe.0, probe.1)
+            };
+            let quiet = sample(false);
+            assert_eq!(quiet, colors.chip_bg, "the resting `+` sits on the quiet chip tone");
+            assert_ne!(
+                quiet, colors.active_bg,
+                "…which is NOT the selected card's tone — the primary affordance \
+                 must not read as one more selected tab"
+            );
+            let hot = sample(true);
+            assert_ne!(quiet, hot, "hovering the `+` changes pixels");
+            assert_eq!(hot, colors.hover_bg, "…to the band's own hover material");
+            crate::tray_raster::clear_ui_fonts_for_test();
+        }
+
+        /// HOVER IS VISIBLE, AND IT BRINGS THE ✕. On the shipped band a hovered
+        /// quiet tab lifted by one barely-there step and offered no close
+        /// affordance at all.
+        #[test]
+        fn hovering_a_quiet_chip_lifts_its_card_and_reveals_the_close_mark() {
+            if !with_ui_faces() {
+                return;
+            }
+            let colors = strip_colors_with_active(Theme::default(), None);
+            let win = WIN_BANDS[1];
+            let metadata = plain(3);
+            let segments = layout_segments_with_metadata(90, 3, &metadata, 0, false);
+            let titles = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+            let geometry = win_geometry(90, win);
+            let seg = segments[1];
+            let close = seg.close_col.expect("a 30-col chip reserves its ✕");
+            let label_px = band_label_px((win.0 + win.1) as f32, 1.0);
+            let d = BandDesign::resolve(&geometry, win.0 + win.1, label_px);
+            let probe_y = d.card_top as usize + 2;
+            // Clear of the corner radius, and above the label's own rows.
+            let probe_x =
+                (f32::from(seg.start_col) * CELL_W as f32 + d.gap_h).round() as usize + 10;
+            let close_span = (
+                usize::from(close) * CELL_W,
+                usize::from(close + 1) * CELL_W,
+            );
+            let sample = |hovered: Option<usize>| {
+                let paint = StripPaint {
+                    hovered,
+                    new_tab_hovered: false,
+                    subtitle: None,
+                    rename: None,
+                };
+                let input = band(&segments, &titles, &metadata, paint, geometry);
+                let rows = raster_band(&input, &[]).expect("band");
+                let (rgba, w, h) = image_of(&rows);
+                let card = px_at(&rgba, w, probe_x, probe_y);
+                let mark = ink_bbox_off_surfaces(
+                    &rgba,
+                    w,
+                    h,
+                    close_span.0,
+                    close_span.1,
+                    &[colors.band_bg, colors.chip_bg, colors.hover_bg, colors.active_bg],
+                );
+                (card, mark.is_some())
+            };
+            let (quiet_card, quiet_mark) = sample(None);
+            let (hot_card, hot_mark) = sample(Some(1));
+            assert_eq!(quiet_card, colors.chip_bg, "resting: the quiet chip's own card");
+            assert_eq!(hot_card, colors.hover_bg, "hovered: the wash a full rung up");
+            assert_ne!(quiet_card, hot_card, "the hover is a REAL surface change");
+            assert!(!quiet_mark, "a quiet chip shows no ✕ (the mis-click trap)");
+            assert!(hot_mark, "…and the hovered one does");
             crate::tray_raster::clear_ui_fonts_for_test();
         }
     }
@@ -6429,6 +6752,66 @@ mod tests {
         }
     }
 
+    /// THE `+` ANSWERS THE POINTER. It is the strip's primary affordance and it
+    /// had no hover state at all — a tab index cannot name it, so the hover feed
+    /// never reached it and putting the pointer on it changed zero pixels. This
+    /// is the CELL lane's half (the transitional frame before the UI face
+    /// lands); the band's own half is `the_plus_is_its_own_surface_and_lights_
+    /// under_the_pointer`.
+    #[test]
+    fn the_new_tab_button_takes_the_hover_wash_under_the_pointer() {
+        let theme = Theme::default();
+        let colors = strip_colors(theme);
+        let metadata = [TabStripMetadata::from_presentation(
+            &crate::tab_model::TabPresentation::terminal("one"),
+        )];
+        let segs = layout_segments_with_metadata(40, 1, &metadata, 0, false);
+        let plus = segs
+            .iter()
+            .find(|s| s.kind == TabHit::NewTab)
+            .copied()
+            .expect("a one-tab strip still offers the +");
+        let paint = |hot: bool| {
+            let mut row = vec![blank_cell(theme); 40];
+            paint_strip_with_metadata(
+                &mut row,
+                &segs,
+                &["one".to_string()],
+                &metadata,
+                StripPaint {
+                    hovered: None,
+                    new_tab_hovered: hot,
+                    subtitle: None,
+                    rename: None,
+                },
+                0,
+                theme,
+                None,
+            );
+            row
+        };
+        let quiet = paint(false);
+        let hot = paint(true);
+        let button = plus.start_col as usize + 1;
+        assert_ne!(
+            quiet[button].bg, hot[button].bg,
+            "hovering the `+` must change its surface"
+        );
+        assert_eq!(
+            hot[button].bg, colors.hover_bg,
+            "…to the band's one hover material, the same one a chip takes"
+        );
+        assert_ne!(
+            hot[button].bg, colors.active_bg,
+            "…and never to the SELECTED card's tone"
+        );
+        // The glyph is still there, and still legible on the moved ground.
+        assert_eq!(hot[button].ch, '+');
+        assert_eq!(hot[button].fg, colors.button_hover_fg);
+        // Paint only: the wash never moves a hit target.
+        assert_eq!(hit_test(&segs, plus.start_col), Some(TabHit::NewTab));
+    }
+
     /// THE CONNECTOR HIT REGION (design §3.1 [v5]): a chip with status marks
     /// gains a `connector_col` at EXACTLY the cell the painter puts the status
     /// canvas on, and that cell hit-tests to [`TabHit::Connector`]; the close
@@ -6472,6 +6855,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: None,
             },
@@ -6541,6 +6925,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: None,
             },
@@ -6582,6 +6967,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -6650,6 +7036,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -6702,6 +7089,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: Some("~/aterm"),
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -6745,6 +7133,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -6794,6 +7183,7 @@ mod tests {
             StripPaint {
                 // Hovered, and STILL no ✕: a title band has none to reveal.
                 hovered: Some(0),
+                new_tab_hovered: false,
                 subtitle: Some("~/aterm"),
                 rename: None,
             },
@@ -6856,6 +7246,7 @@ mod tests {
                 &metadata,
                 StripPaint {
                     hovered,
+                    new_tab_hovered: false,
                     subtitle: None,
                     rename: None,
                 },
@@ -7109,6 +7500,7 @@ mod tests {
             // glyph assertion below is about the HOVERED tab.
             StripPaint {
                 hovered: Some(0),
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: None,
             },
@@ -7279,6 +7671,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: Some(0),
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: None,
             },
@@ -7781,11 +8174,11 @@ mod tests {
         // expectation that moves with the band's geometry — and the mover is
         // the CHIP-CARD INTERIOR PAD, not the OS: `~/aterm/crates` is exactly
         // 14 cells, and [`tab_content_layout`] spends one title cell on the
-        // pad only where [`STRIP_CHIP_CARDS`] holds. Pad taken (Linux): the
-        // remainder is a cell too wide, the plain tail cut fills the span.
-        // Padless (macOS — measured here, the word cut lands at avail 15 —
-        // and Windows, whose band hands every chip at least that): the exact
-        // fit keeps the whole cwd, `~` included. Branch on the same const the
+        // pad only where [`STRIP_CHIP_CARDS`] holds. Pad taken (every chrome
+        // band — Windows and Linux): the remainder is a cell too wide, the
+        // plain tail cut fills the span. Padless (macOS's in-grid fallback —
+        // measured here, the word cut lands at avail 15): the exact fit keeps
+        // the whole cwd, `~` included. Branch on the same const the
         // layout spends, so each platform asserts its true geometry (runtime,
         // not `cfg` — this test runs everywhere, per the module's
         // test-portability rule). Same distinguishing tail either way, and
@@ -8321,20 +8714,18 @@ mod tests {
     /// two shells in one cwd both render `~\aterm · Typing a command`, and the
     /// head cut handed the pixel band two byte-identical chips — neither
     /// tellable from the other. The distinct pass was gated on
-    /// [`STRIP_CHIP_CARDS`], which excludes Windows to protect the band's
-    /// TONES; the label is not a tone, so it now runs on every band
-    /// ([`STRIP_DISTINCT_LABELS`]) and the painter takes what it resolved.
+    /// [`STRIP_CHIP_CARDS`], which then excluded Windows to protect the band's
+    /// TONES; the label is not a tone, so it moved to its own gate and runs on
+    /// every band ([`STRIP_DISTINCT_LABELS`]), with the painter taking what it
+    /// resolved. The tones have since moved too — Windows speaks chip-card now
+    /// — but the two gates stay separate questions, and this is the one that
+    /// answers "can a reader tell two tabs apart".
     #[cfg(windows)]
     #[test]
     fn the_windows_band_resolves_its_labels_together_not_one_at_a_time() {
         assert!(
             STRIP_DISTINCT_LABELS,
             "the Windows band resolves labels as a group"
-        );
-        assert!(
-            !STRIP_CHIP_CARDS,
-            "while its TONES stay the pixel band's own — the two gates are \
-             deliberately different questions"
         );
         // The pair the glass capture showed, at the width it showed them. The
         // separator is written `/` here only because the property under test is
@@ -8628,6 +9019,7 @@ mod tests {
             &metadata,
             StripPaint {
                 hovered: None,
+                new_tab_hovered: false,
                 subtitle: None,
                 rename: Some(StripRenameField {
                     tab: 0,
@@ -9228,6 +9620,27 @@ mod tests {
                 assert!(
                     chip >= 3.0,
                     "{name}: quiet-chip label contrast {chip:.2} < 3.0:1"
+                );
+            }
+            // The `+` under the POINTER: its own full-strength ink on the hover
+            // wash. The wash is a step toward the ink like every other surface
+            // here, and the button is the one control that must stay legible at
+            // exactly the moment a pointer is on it.
+            if STRIP_IS_CHROME_BAND {
+                let button = rgb(c.button_hover_fg).contrast(rgb(c.hover_bg));
+                assert!(
+                    button >= 3.0,
+                    "{name}: hovered '+' contrast {button:.2} < 3.0:1"
+                );
+                // …and the hover is a REAL surface change, or the feedback the
+                // wash exists to give is invisible.
+                assert_ne!(
+                    c.hover_bg, c.chip_bg,
+                    "{name}: the hover wash is byte-identical to the quiet chip"
+                );
+                assert_ne!(
+                    c.hover_bg, c.active_bg,
+                    "{name}: the hover wash impersonates the SELECTED card"
                 );
             }
             // The active card must be a DISTINCT surface from the body, or the

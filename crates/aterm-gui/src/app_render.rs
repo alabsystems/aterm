@@ -23889,21 +23889,28 @@ impl App {
         // early-out below for exactly that reason.
         //
         // C3: with a real WinUI-height band the strip above the grid is no longer a
-        // 2 px lip but ~11 px of chrome, and a FLAT fill there leaves the raised
+        // 2 px lip but ~11 px of chrome, and a FLAT fill there would leave a raised
         // active chip painting only its own cell row — a card glued to the bottom of
-        // the band with dead space above it, which is the very defect the taller band
-        // exists to close. `top_extends_cells` makes each COLUMN carry its own
-        // background through that strip instead, so the chip reaches the window's top
-        // edge. Windows-only, and only while the synthetic head is actually reserving
-        // pixels: with `head == 0` the strip IS just the top pad, where the flat fill
-        // is right. LINUX has a synthetic head too, but deliberately keeps the FLAT
-        // fill: its pixel band paints the whole lip itself (cards floating in the
-        // band, not columns extruded to the window edge — see
-        // `tab_bar::pixel_band::BAND_OWNS_SURFACES`), and under the band's
-        // font-not-yet-landed cell fallback a flat lip above quiet chip cards is the
-        // honest transitional frame, where extruded card columns would flash the
-        // exact glued-slab look the pixel design replaces.
-        let extend_top = cfg!(windows) && self.win_head(wid) > 0;
+        // the band with dead space above it. `top_extends_cells` was the cell lane's
+        // answer: each COLUMN carries its own background through the lip, so the chip
+        // reaches the window's top edge.
+        //
+        // THE CHIP-CARD BAND ([`tab_bar::STRIP_CHIP_CARDS`]) answers it differently
+        // and better, so the extrusion is OFF — everywhere, unconditionally. The
+        // pixel band paints the whole lip itself (cards FLOATING in the band, inset
+        // top and bottom, corners rounded), and extruding a card's columns to the
+        // window edge under that would put a hard-edged slab behind every rounded
+        // card. Under the band's font-not-yet-landed cell fallback a flat lip above
+        // quiet chip cards is the honest transitional frame; extruded card columns
+        // there would flash the exact glued-slab look the pixel design replaces.
+        //
+        // A LITERAL, not a predicate: every band this build ships speaks chip-card
+        // ([`tab_bar::STRIP_CHIP_CARDS`] is `!macos`, and macOS paints no band at
+        // all), so a `!STRIP_CHIP_CARDS && …` guard here would be a permanently
+        // false expression dressed as a live decision. The renderer keeps the
+        // capability (`ChromeBleed::top_extends_cells`, with its own proofs in
+        // `aterm-render`) for a band WITHOUT cards; reviving it is one word here.
+        let extend_top = false;
         // CHROME-resolved, like the strip rows themselves (`chrome_palette_theme`):
         // the gutters this fills are part of the band, and filling them from the
         // terminal theme under a forced Linux `window_theme` left a terminal-dark
@@ -23938,6 +23945,13 @@ impl App {
         // cache key, so moving the pointer between tabs repaints the strip — and,
         // just as importantly, moving it WITHIN a tab does not.
         let hovered = self.windows.get(&wid).and_then(|ws| ws.strip_hover);
+        // …and whether it is on the `+`, which no tab index can say. Same cache
+        // contract: a key term, so the button's wash appears and clears with the
+        // pointer and a sweep WITHIN the button repaints nothing.
+        let plus_hovered = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.strip_hover_new_tab);
         // The lone tab's description, from the same composed session chrome the
         // native strip's solo band and the hover card render. Only a one-tab window
         // has a solo band, so this is at most one `Option<String>` per rebuild.
@@ -24016,7 +24030,8 @@ impl App {
                         && key.1 == cols
                         && key.2 == show_update
                         && key.3 == hovered
-                        && key.4 == subtitle
+                        && key.4 == plus_hovered
+                        && key.5 == subtitle
                 })
         });
         if !hit {
@@ -24066,6 +24081,7 @@ impl App {
                 if r + 1 == strip && !segments.is_empty() {
                     let paint = tab_bar::StripPaint {
                         hovered,
+                        new_tab_hovered: plus_hovered,
                         subtitle: subtitle.as_deref(),
                         rename: rename.as_ref().map(|(tab, text, cursor)| {
                             tab_bar::StripRenameField {
@@ -24108,6 +24124,7 @@ impl App {
             let strip_band = {
                 let paint = tab_bar::StripPaint {
                     hovered,
+                    new_tab_hovered: plus_hovered,
                     subtitle: subtitle.as_deref(),
                     rename: rename
                         .as_ref()
@@ -24117,13 +24134,18 @@ impl App {
                             cursor: *cursor,
                         }),
                 };
-                // The seam's resolved canvas position (Linux design lane): the
-                // deco underline the cell lane stamps across the strip's LAST
-                // row, through the PURE per-window read so mixed-DPI windows
-                // resolve their own bands. Every input is already a band-key
-                // term (cell metrics, font epoch → deco tables and adjusts land
-                // with a backend rebuild + epoch bump), so no new key term.
-                #[cfg(target_os = "linux")]
+                // The seam's resolved canvas position: the deco underline the
+                // cell lane stamps across the strip's LAST row, through the PURE
+                // per-window read so mixed-DPI windows resolve their own bands.
+                // Every input is already a band-key term (cell metrics, font
+                // epoch → deco tables and adjusts land with a backend rebuild +
+                // epoch bump), so no new key term.
+                //
+                // WHY BOTH PLATFORMS NOW. This is the line the band's cards are
+                // centred ABOVE; without it the card row falls back to clearing
+                // one hairline off the canvas bottom — a guess. On Windows at
+                // font_px 13 the real rule sits at y=29 of a 32 px band, THREE
+                // rows the cards and their descenders must stay out of, not one.
                 let seam_top_px = self.windows.get(&wid).map(|ws| {
                     band_key.2
                         + strip.saturating_sub(1) * band_key.1
@@ -24132,8 +24154,6 @@ impl App {
                             .deco_metrics_for(ws.metrics.font_px)
                             .underline_y
                 });
-                #[cfg(not(target_os = "linux"))]
-                let seam_top_px = None;
                 tab_bar::pixel_band::raster_band(
                     &tab_bar::pixel_band::BandInput {
                         segments: &segments,
@@ -24162,7 +24182,14 @@ impl App {
                 ws.cached_strip_rows = rows;
                 ws.cached_strip_images = strip_images;
                 ws.cached_strip_rename_caret = strip_rename_caret;
-                ws.last_strip_fp = Some((tab_strip, cols, show_update, hovered, subtitle));
+                ws.last_strip_fp = Some((
+                    tab_strip,
+                    cols,
+                    show_update,
+                    hovered,
+                    plus_hovered,
+                    subtitle,
+                ));
                 #[cfg(any(windows, target_os = "linux"))]
                 {
                     ws.cached_strip_band = strip_band;

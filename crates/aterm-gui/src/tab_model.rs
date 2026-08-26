@@ -2085,6 +2085,70 @@ mod tests {
         assert_eq!(tab.focus, views[0], "close repairs focus deterministically");
     }
 
+    /// THE SHRINK RULE, canonical half. `pane::PaneTree` and this planner are the
+    /// two engines that place panes, and the 2026-08-25 splits audit found the
+    /// first one emitting rects OFF the window grid when a layout was squeezed
+    /// under what it needs. That rule — *shrinking clamps; it never restructures,
+    /// never drops a pane, and never leaves the grid* — has to hold here too or
+    /// "consistent" is only prose.
+    ///
+    /// This planner reaches it a different way: `constrained_extent` returns
+    /// `(first, available - first)`, so the two children plus the divider gap TILE
+    /// the parent exactly and no rect can escape by construction. The difference
+    /// worth stating out loud is the floor: `PaneTree` keeps one cell per pane and
+    /// lets panes COINCIDE on the last row/column, while this planner keeps them
+    /// disjoint and lets an extent reach ZERO. Both keep every leaf, both leave the
+    /// tree untouched, and both round-trip when the window grows back.
+    #[test]
+    fn shrinking_a_canonical_plan_stays_inside_the_bounds_and_drops_no_leaf() {
+        let (_, views) = view_store_with(4);
+        let mut tab = Tab::new(
+            TabId::from_stored(1),
+            views[0],
+            TabPresentation::terminal("one"),
+        );
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[1]));
+        assert!(tab.split_focused(SplitAxis::Vertical, views[2]));
+        assert!(tab.split_focused(SplitAxis::Horizontal, views[3]));
+        let sizing = |_| LeafSizing::new(LogicalSize::new(16.0, 3.0), LogicalSize::new(80.0, 24.0));
+        let roomy = tab.visible_plan(LogicalRect::new(0.0, 0.0, 200.0, 48.0), 1.0, sizing);
+        assert_eq!(roomy.leaves.len(), 4);
+
+        for w in 0u16..=8 {
+            for h in 0u16..=8 {
+                let bounds = LogicalRect::new(0.0, 0.0, f32::from(w), f32::from(h));
+                let plan = tab.visible_plan(bounds, 1.0, sizing);
+                assert_eq!(plan.leaves.len(), 4, "shrinking never drops a leaf");
+                for leaf in &plan.leaves {
+                    let r = leaf.rect;
+                    assert!(
+                        r.size.width >= 0.0 && r.size.height >= 0.0,
+                        "no negative extent at {w}x{h}: {r:?}"
+                    );
+                    assert!(
+                        r.origin.x >= plan.bounds.origin.x - f32::EPSILON
+                            && r.origin.y >= plan.bounds.origin.y - f32::EPSILON,
+                        "origin inside the {w}x{h} bounds: {r:?}"
+                    );
+                    assert!(
+                        r.origin.x + r.size.width
+                            <= plan.bounds.origin.x + plan.bounds.size.width + f32::EPSILON
+                            && r.origin.y + r.size.height
+                                <= plan.bounds.origin.y + plan.bounds.size.height + f32::EPSILON,
+                        "extent inside the {w}x{h} bounds: {r:?}"
+                    );
+                }
+            }
+        }
+
+        // Reversible: the tree was only ever READ.
+        let regrown = tab.visible_plan(LogicalRect::new(0.0, 0.0, 200.0, 48.0), 1.0, sizing);
+        assert_eq!(
+            regrown.leaves, roomy.leaves,
+            "shrink -> grow restores the exact geometry"
+        );
+    }
+
     #[test]
     fn zoom_focus_and_presentation_are_content_agnostic() {
         let (_, views) = view_store_with(2);

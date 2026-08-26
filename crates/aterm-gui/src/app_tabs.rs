@@ -2142,6 +2142,14 @@ impl App {
     // stage their 2-pane split through this exact helper (src/bench_support.rs).
     #[cfg(any(test, feature = "bench-support"))]
     pub(crate) fn split_active_stub_tab(&mut self, wid: WindowId) -> u64 {
+        self.split_active_stub_tab_dir(wid, pane::SplitDir::Vertical)
+    }
+
+    /// [`Self::split_active_stub_tab`] in a named direction — the minimum-pane
+    /// tests need the audit's ALTERNATING gesture (left/right, top/bottom, …),
+    /// which is what drove the tree deep enough to mint off-grid panes.
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn split_active_stub_tab_dir(&mut self, wid: WindowId, dir: pane::SplitDir) -> u64 {
         let sid = self.next_session_id;
         self.next_session_id += 1;
         let stub = crate::stub_session(sid);
@@ -2151,10 +2159,7 @@ impl App {
             .expect("stub view identity space");
         self.pool.insert(stub);
         if let Some(t) = self.active_tree_mut(wid) {
-            assert!(
-                t.split_focused(pane::SplitDir::Vertical, sid),
-                "stub split must succeed"
-            );
+            assert!(t.split_focused(dir, sid), "stub split must succeed");
         }
         let active = self.windows.get(&wid).map_or(0, |ws| ws.tabs.active);
         assert!(self.sync_tab_model_from_layout(wid, active));
@@ -2216,9 +2221,10 @@ impl App {
     /// The registry diff is what makes one function serve both: a split spawns
     /// exactly one new session too, so the newborn is found the same way and the
     /// same sid contract holds. It rides the identical `App::split_focused_pane`
-    /// path a Cmd-D chord takes — including its refusal to split a SHARED
-    /// session, which surfaces here as "session did not spawn" rather than as a
-    /// corrupted co-viewing window.
+    /// path a Cmd-D chord takes — including its refusals (a SHARED session is
+    /// never split; a pane too small to halve is never split), each of which
+    /// arrives here as its own honest reason rather than as a corrupted
+    /// co-viewing window or an invisible 1x1 pane with a live shell behind it.
     pub(crate) fn spawn_tab_session(
         &mut self,
         cwd: Option<String>,
@@ -2232,7 +2238,13 @@ impl App {
             g.snapshot().iter().map(|h| h.sid.clone()).collect()
         };
         match split {
-            Some(dir) => self.split_focused_pane_in(dir, cwd),
+            // A REFUSED split is not "nothing spawned" — it is a reason, and the
+            // operator gets it verbatim (`ERR Split refused: this pane is 19x11
+            // cells; a left/right split needs at least 33x3`) instead of the
+            // registry-diff's generic shrug. Nothing was spawned, so returning
+            // here skips a diff that could only report the same emptiness with
+            // less information.
+            Some(dir) => self.split_focused_pane_in(dir, cwd)?,
             None => self.open_tab_in_cwd(front, cwd.as_deref()),
         }
         let after = {

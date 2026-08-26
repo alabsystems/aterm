@@ -1355,29 +1355,66 @@ impl App {
         // that left the pointer over the same INDEX must still repaint, which the
         // step does for itself.
         self.advance_strip_drag(wid, geom, x, y);
-        let hovered = self.strip_col_at_with(wid, geom, x, y).and_then(|col| {
+        // ONE hit test, TWO hover states. The `+` is not a tab, so an
+        // `Option<usize>` cannot carry it — and for one release that meant the
+        // strip's primary button had no pointer feedback at all. Resolved from
+        // the SAME hit so the two can never both be lit (a column belongs to one
+        // segment) and so the pointer leaving one clears the other.
+        let hit = self.strip_col_at_with(wid, geom, x, y).and_then(|col| {
             let segs = self
                 .windows
                 .get(&wid)
                 .map(|ws| ws.tab_segments.as_slice())?;
-            match crate::tab_bar::hit_test(segs, col)? {
-                // The connector (status-mark cell) is part of its chip, so
-                // hovering it must not drop the chip's hover state — that cell
-                // hovered as Select before design §3.1 [v5] made it a hit.
-                crate::tab_bar::TabHit::Select(index)
-                | crate::tab_bar::TabHit::Connector(index) => Some(index),
-                // The `+` and the `↻` are not tabs; the pointer is in the strip but
-                // on no tab, so nothing reveals a `✕`.
-                _ => None,
-            }
+            crate::tab_bar::hit_test(segs, col)
         });
+        let hovered = match hit {
+            // The connector (status-mark cell) is part of its chip, so
+            // hovering it must not drop the chip's hover state — that cell
+            // hovered as Select before design §3.1 [v5] made it a hit.
+            Some(
+                crate::tab_bar::TabHit::Select(index)
+                | crate::tab_bar::TabHit::Connector(index),
+            ) => Some(index),
+            // The `+` and the `↻` are not tabs; the pointer is in the strip but
+            // on no tab, so nothing reveals a `✕`.
+            _ => None,
+        };
+        let on_new_tab = matches!(hit, Some(crate::tab_bar::TabHit::NewTab));
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if ws.strip_hover == hovered {
+        if ws.strip_hover == hovered && ws.strip_hover_new_tab == on_new_tab {
             return;
         }
         ws.strip_hover = hovered;
+        ws.strip_hover_new_tab = on_new_tab;
+        if let Some(window) = &ws.os_window {
+            window.request_redraw();
+        }
+    }
+
+    /// THE POINTER LEFT THE WINDOW — clear the strip's hover state.
+    ///
+    /// [`Self::track_strip_hover`] is driven by `CursorMoved`, and a pointer that
+    /// leaves the window stops sending those: whatever was lit at the last motion
+    /// INSIDE stays lit while the pointer is in another app entirely. Measured on
+    /// glass (2026-08-25, windowed, three tabs, font_px 13): parking the pointer on
+    /// the `+` washed its card to `hover_bg`, and moving the pointer clean off the
+    /// window left that wash on the surface — a control advertising a pointer that
+    /// is not there, and a `✕` offering itself on a chip nobody is pointing at.
+    ///
+    /// One clear for BOTH hover states, and change-gated like the tracker: a leave
+    /// with nothing lit costs nothing, and the redraw is what re-runs
+    /// `splice_tab_strip_with` (whose cache key carries both flags).
+    pub(crate) fn on_cursor_left(&mut self, wid: WindowId) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if ws.strip_hover.is_none() && !ws.strip_hover_new_tab {
+            return;
+        }
+        ws.strip_hover = None;
+        ws.strip_hover_new_tab = false;
         if let Some(window) = &ws.os_window {
             window.request_redraw();
         }
@@ -6818,6 +6855,166 @@ mod tests {
             "…because it pops the tab card"
         );
         app.on_mouse_input(wid, ElementState::Released, WinitMouseButton::Right);
+    }
+
+    /// THE `+` HOVER, END TO END. The strip's primary affordance had no pointer
+    /// feedback: `strip_hover` is an `Option<usize>` of TAB indices and the `+`
+    /// is not a tab, so the per-motion hit test threw the `NewTab` arm away and
+    /// hovering the button changed exactly zero pixels. Three links are pinned
+    /// here, because breaking any one of them puts that silence back:
+    /// the motion hook records the button (and clears it on leaving), the strip
+    /// CACHE KEY carries the flag (or the repaint is a hit and the wash never
+    /// reaches the rows), and the painted row actually moves.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn hovering_the_new_tab_button_records_it_and_repaints_the_strip() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        app.splice_tab_strip_with(wid, 1);
+        let seg = |want_plus: bool| {
+            app.windows[&wid]
+                .tab_segments
+                .iter()
+                .find(|s| matches!(s.kind, crate::tab_bar::TabHit::NewTab) == want_plus)
+                .copied()
+                .expect("the strip laid out both a chip and a +")
+        };
+        let plus = seg(true);
+        let chip = seg(false);
+        let point = |col: u16| {
+            (
+                pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
+                top + ch as f64 * 0.5,
+            )
+        };
+        let button_col = plus.start_col + 1;
+        // Reads the LIVE painted row, so it takes `app` as an argument rather
+        // than capturing it — the pointer events below need `&mut app`.
+        let bg_of = |app: &crate::App, col: u16| {
+            app.windows[&wid].cached_strip_rows[0][col as usize].bg
+        };
+        let resting = bg_of(&app, button_col);
+
+        // (1) the motion hook records the button…
+        let p = point(button_col);
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert!(
+            app.windows[&wid].strip_hover_new_tab,
+            "the pointer is on the `+`"
+        );
+        assert_eq!(
+            app.windows[&wid].strip_hover, None,
+            "…and the `+` is not a tab, so no chip is hovered"
+        );
+
+        // (2) …the cache key carries it, so the next splice REBUILDS…
+        // (3) …and the rebuilt row shows the wash.
+        app.splice_tab_strip_with(wid, 1);
+        let hot = bg_of(&app, button_col);
+        assert_ne!(
+            resting, hot,
+            "the repaint must reach the rows — a cache key without the flag \
+             would hit and paint the resting button forever"
+        );
+        assert_eq!(
+            hot,
+            crate::tab_bar::strip_hover_bg_for_test(app.chrome_palette_theme()),
+            "the button takes the band's own hover material"
+        );
+
+        // Leaving for a CHIP clears the button and lights the tab instead.
+        let q = point(chip.start_col + 1);
+        app.on_cursor_moved(wid, q.0, q.1);
+        assert!(
+            !app.windows[&wid].strip_hover_new_tab,
+            "leaving the `+` clears its wash"
+        );
+        assert_eq!(app.windows[&wid].strip_hover, Some(0));
+        app.splice_tab_strip_with(wid, 1);
+        assert_eq!(
+            bg_of(&app, button_col),
+            resting,
+            "…and the button is back to resting"
+        );
+    }
+
+    /// THE POINTER LEAVING THE WINDOW CLEARS THE STRIP'S HOVER. `CursorMoved` is
+    /// the only thing that drives [`App::track_strip_hover`], so a pointer that
+    /// walks off the window simply stops reporting and whatever was lit at the
+    /// last motion INSIDE stays lit. Measured on glass (2026-08-25, windowed,
+    /// three tabs, font_px 13): the `+` kept its `hover_bg` wash while the pointer
+    /// sat 236 px outside the window's right edge. Both hover states are pinned
+    /// here — a chip's (which reveals a `✕` on a tab nobody is pointing at) and
+    /// the `+`'s — plus the redraw that carries the clear to the rows.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn the_pointer_leaving_the_window_clears_both_strip_hovers() {
+        let mut app = crate::App::headless_for_test();
+        let wid = crate::WindowId(0);
+        app.tab_strip_rows = 1;
+        let (cw, ch) = app.win_cell_size(wid);
+        let pad = app.win_pad(wid) as f64;
+        let top = (app.win_pad_top(wid) + app.win_head(wid)) as f64;
+        app.splice_tab_strip_with(wid, 1);
+        let seg = |want_plus: bool| {
+            app.windows[&wid]
+                .tab_segments
+                .iter()
+                .find(|s| matches!(s.kind, crate::tab_bar::TabHit::NewTab) == want_plus)
+                .copied()
+                .expect("the strip laid out both a chip and a +")
+        };
+        let plus = seg(true);
+        let chip = seg(false);
+        let point = |col: u16| {
+            (
+                pad + f64::from(col) * cw as f64 + cw as f64 * 0.5,
+                top + ch as f64 * 0.5,
+            )
+        };
+        let button_col = plus.start_col + 1;
+        let bg_of =
+            |app: &crate::App, col: u16| app.windows[&wid].cached_strip_rows[0][col as usize].bg;
+        let resting_button = bg_of(&app, button_col);
+        let resting_chip = bg_of(&app, chip.start_col + 1);
+
+        // The `+` lit, then the pointer leaves.
+        let p = point(button_col);
+        app.on_cursor_moved(wid, p.0, p.1);
+        assert!(app.windows[&wid].strip_hover_new_tab);
+        app.splice_tab_strip_with(wid, 1);
+        assert_ne!(resting_button, bg_of(&app, button_col), "the `+` is lit");
+        app.on_cursor_left(wid);
+        assert!(
+            !app.windows[&wid].strip_hover_new_tab,
+            "leaving the window clears the `+` wash"
+        );
+        app.splice_tab_strip_with(wid, 1);
+        assert_eq!(
+            bg_of(&app, button_col),
+            resting_button,
+            "…and the clear reaches the painted row"
+        );
+
+        // A CHIP lit, then the pointer leaves. The harness window has ONE tab and
+        // that tab is the SELECTED one, whose card and `✕` are the same painted
+        // either way ([`crate::tab_bar::strip_cell`]: hover never overrides the
+        // selection, and the chip-card band keeps the selected `✕` resident), so
+        // the chip's half is pinned at the STATE — which is what feeds the wash
+        // and the hover-only `✕` on every unselected chip.
+        let _ = resting_chip;
+        let q = point(chip.start_col + 1);
+        app.on_cursor_moved(wid, q.0, q.1);
+        assert_eq!(app.windows[&wid].strip_hover, Some(0), "the chip is hovered");
+        app.on_cursor_left(wid);
+        assert_eq!(
+            app.windows[&wid].strip_hover, None,
+            "leaving the window clears the chip's wash and its `✕`"
+        );
     }
 
     /// I10/I11: the hover cursor resolves BY LOCATION. Over plain grid cells the

@@ -13519,7 +13519,8 @@ mod theme_live_tests {
         let before = render(app.backend.ready_mut());
 
         // Seed the strip cache so its invalidation is observable (non-vacuous).
-        app.windows.get_mut(&wid).unwrap().last_strip_fp = Some((0xFEED, 80, false, None, None));
+        app.windows.get_mut(&wid).unwrap().last_strip_fp =
+            Some((0xFEED, 80, false, None, false, None));
 
         let tp = aterm_types::scheme::builtin("Dracula")
             .unwrap()
